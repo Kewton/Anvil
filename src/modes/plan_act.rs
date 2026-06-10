@@ -188,8 +188,18 @@ pub fn request_has_explicit_no_edit(raw: &str) -> bool {
     contains_any(
         &lower,
         &[
-            "do not modify",
-            "don't modify",
+            "do not modify files",
+            "do not modify any files",
+            "do not modify the file",
+            "do not modify this file",
+            "do not modify anything",
+            "do not modify the repository",
+            "do not modify the workspace",
+            "don't modify files",
+            "don't modify any files",
+            "don't modify the file",
+            "don't modify this file",
+            "don't modify anything",
             "do not edit",
             "don't edit",
             "do not change",
@@ -951,6 +961,7 @@ mod tests {
     #[test]
     fn classifier_detects_english_negated_edit_phrases() {
         for phrase in [
+            "Please review the code but do not modify any files.",
             "Please review the code but do not edit anything.",
             "Read the file, don't edit it.",
             "Summarize the architecture; no edits.",
@@ -1018,5 +1029,17 @@ mod tests {
                 "phrase missing explicit-no-edit evidence: {phrase}",
             );
         }
+    }
+
+    #[test]
+    fn classifier_does_not_treat_no_code_edits_as_global_no_edit() {
+        let classification =
+            classify_work_mode_json("Investigate options and write report.md. Do not modify code.");
+
+        assert_ne!(classification.work_mode, WorkMode::AnswerOnly);
+        assert!(
+            !classification.evidence.contains(&"explicit-no-edit"),
+            "code-only prohibition must not disable non-code artifacts"
+        );
     }
 }

@@ -452,17 +452,42 @@ pub(super) fn request_asks_for_ops_task(request: &str, lower: &str) -> bool {
             "release",
             "operation",
         ],
-    ) || contains_any(
-        request,
-        &[
-            "デプロイ",
-            "ロールバック",
-            "運用",
-            "監視",
-            "リリース",
-            "手順",
-        ],
-    )
+    ) || request_asks_for_command_observation_artifact(request, lower)
+        || contains_any(
+            request,
+            &[
+                "デプロイ",
+                "ロールバック",
+                "運用",
+                "監視",
+                "リリース",
+                "手順",
+            ],
+        )
+}
+
+pub(super) fn request_asks_for_command_observation_artifact(request: &str, lower: &str) -> bool {
+    let command_action =
+        contains_any(lower, &["run ", "execute "]) || contains_any(request, &["実行", "起動"]);
+    let observation_output =
+        contains_any(
+            lower,
+            &[
+                "observation",
+                "observed",
+                "capture",
+                "captured",
+                "stdout",
+                "stderr",
+                "exit code",
+                "exit status",
+                "current directory",
+                "file list",
+            ],
+        ) || contains_any(request, &["観測", "結果", "標準出力", "終了コード"]);
+    let artifact_action = contains_any(lower, &["write", "create", "document", "report"])
+        || contains_any(request, &["書いて", "作成", "出力", "記録"]);
+    command_action && observation_output && artifact_action
 }
 
 pub(super) fn mentions_stack_as_build_target(request: &str, lower: &str) -> bool {
@@ -527,6 +552,7 @@ pub(super) fn request_asks_for_implementation_artifact(
     // answer-only with no obligation.
     if request_negates_implementation_artifacts(request, lower)
         || crate::modes::plan_act::request_has_explicit_no_edit(request)
+        || request_asks_for_command_observation_artifact(request, lower)
     {
         return false;
     }

@@ -7,9 +7,9 @@
 //! - `tool_specs_for_policy` — filters the registered tool specs to
 //!   the `EffectiveToolPolicy`'s allowed-name list (when set).
 //! - `local_llm_small_edit_target` — picks an Edit target for the
-//!   small-edit protocol that local LLMs prefer (Act mode +
-//!   repo_edit_required + task expects repo change + no successful
-//!   non-plan repo edit yet + target already read).
+//!   small-edit protocol that local LLMs prefer (Act mode + edit required by
+//!   WorkMode or ObjectiveContract artifact + task expects repo change + no
+//!   successful non-plan repo edit yet + target already read).
 //! - `mode_policy_message` — renders the per-`WorkMode` `[Mode Policy]`
 //!   system note (Auto returns None).
 //!
@@ -46,7 +46,7 @@ pub(super) fn local_llm_small_edit_target(agent: &Agent) -> Option<PathBuf> {
         return None;
     }
     if agent.session.mode_state.mode != ExecutionMode::Act
-        || !agent.session.mode_state.policy().repo_edit_required
+        || !super::workspace_access::repo_edit_required_by_mode_or_objective(agent)
         || !super::workspace_access::active_task_expects_repo_change(agent)
     {
         return None;

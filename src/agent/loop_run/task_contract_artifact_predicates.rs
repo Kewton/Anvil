@@ -6,7 +6,7 @@
 use super::completion_evidence::{CompletionEvidence, EvidenceSet};
 use super::task_contract::{
     ArtifactExcerpts, ArtifactObligation, ArtifactRole, ArtifactState, DeliverableKind,
-    DeliverableSchema, ObjectiveEvidenceKind, TaskContract, TaskKind,
+    DeliverableSchema, ObjectiveEvidenceKind, StructuredColumnPolicy, TaskContract, TaskKind,
     artifact_identity_path_ready_for_verification, is_deterministic_completion_authority_evidence,
     normalized_artifact_path_eq, observed_artifacts, role_from_repo_edit,
 };
@@ -150,6 +150,7 @@ fn structured_record_excerpt_satisfies_obligations(contract: &TaskContract, exce
             excerpt,
             &schema.columns,
             &schema.expected_rows,
+            schema.column_policy,
         )
     })
 }
@@ -286,6 +287,7 @@ fn data_output_identity_excerpt_satisfies(identity: &ArtifactObligation, excerpt
         excerpt,
         &schema.columns,
         &schema.expected_rows,
+        schema.column_policy,
     )
 }
 
@@ -305,6 +307,11 @@ fn data_output_structured_evidence_observed(
                     .is_none_or(|schema| {
                         if !schema.expected_rows.is_empty() {
                             return false;
+                        }
+                        if schema.column_policy == StructuredColumnPolicy::Exact {
+                            let observed = sorted_strings(columns.clone());
+                            let expected = sorted_strings(schema.columns.clone());
+                            return observed == expected;
                         }
                         schema
                             .columns
@@ -397,6 +404,11 @@ fn artifact_identity_observed_in_evidence(
                             if !schema.expected_rows.is_empty() {
                                 return false;
                             }
+                            if schema.column_policy == StructuredColumnPolicy::Exact {
+                                let observed = sorted_strings(columns.clone());
+                                let expected = sorted_strings(schema.columns.clone());
+                                return observed == expected;
+                            }
                             schema
                                 .columns
                                 .iter()
@@ -409,4 +421,10 @@ fn artifact_identity_observed_in_evidence(
             }
             _ => false,
         })
+}
+
+fn sorted_strings(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
 }

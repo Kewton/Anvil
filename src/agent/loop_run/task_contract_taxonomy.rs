@@ -175,10 +175,26 @@ pub(super) struct TaskDeliverable {
     pub(super) required_sections: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StructuredColumnPolicy {
+    RequiredOnly,
+    Exact,
+}
+
+impl StructuredColumnPolicy {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            StructuredColumnPolicy::RequiredOnly => "required_only",
+            StructuredColumnPolicy::Exact => "exact",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StructuredRecordSchema {
     pub(super) columns: Vec<String>,
     pub(super) expected_rows: Vec<Vec<String>>,
+    pub(super) column_policy: StructuredColumnPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -163,6 +163,15 @@ def setup_data_orders(root: Path) -> None:
     )
 
 
+def setup_data_profile(root: Path) -> None:
+    write(
+        root / "input" / "profile.json",
+        """
+        {"id": 7, "total": 42, "name": "local"}
+        """,
+    )
+
+
 def setup_ops_health(root: Path) -> None:
     script = root / "scripts" / "health.sh"
     write(
@@ -193,6 +202,18 @@ def grade_data_csv(root: Path) -> tuple[bool, bool, bool, str]:
     lines = [line.strip() for line in read(path).splitlines() if line.strip()]
     ok = lines == ["id,total", "1,10", "2,25"]
     return ok, ok, True, "" if ok else f"unexpected CSV: {lines!r}"
+
+
+def grade_data_json(root: Path) -> tuple[bool, bool, bool, str]:
+    path = root / "output" / "profile-summary.json"
+    if not path.exists():
+        return False, False, False, "output/profile-summary.json missing"
+    try:
+        value = json.loads(read(path))
+    except json.JSONDecodeError as exc:
+        return False, False, False, f"invalid JSON: {exc}"
+    ok = value == {"id": 7, "total": 42}
+    return ok, ok, True, "" if ok else f"unexpected JSON: {value!r}"
 
 
 def grade_research(root: Path) -> tuple[bool, bool, bool, str]:
@@ -400,6 +421,14 @@ CASES: dict[str, Case] = {
         "Read input/orders.csv and create output/order-summary.csv with exactly the same columns id,total and the same two data rows. This is a data-only task; do not create source code or tests.",
         setup_data_orders,
         grade_data_csv,
+        ("input/", "output/"),
+    ),
+    "data_json": Case(
+        "data_json",
+        "data",
+        "Read input/profile.json and create output/profile-summary.json with exactly the top-level fields id,total and no extra top-level fields. Preserve the id and total values from input/profile.json. This is a data-only task; do not create source code or tests.",
+        setup_data_profile,
+        grade_data_json,
         ("input/", "output/"),
     ),
     "research_cache": Case(
@@ -695,6 +724,17 @@ def write_summary(run_dir: Path, rows: list[dict[str, str]]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=["wp10", "wp11"], required=True)
+    parser.add_argument(
+        "--case-sequence",
+        default="",
+        help="Optional comma-separated case ids. When set, overrides the suite default sequence.",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=["no_pam", "pam"],
+        default="no_pam",
+        help="Variant used with --case-sequence.",
+    )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--out-root", default="workspace/v0.6.11/eval-runs")
     parser.add_argument("--anvil-bin", default="target/debug/anvil")
@@ -713,7 +753,17 @@ def main() -> int:
     if run_dir.exists():
         raise SystemExit(f"run dir already exists: {run_dir}")
     run_dir.mkdir(parents=True)
-    seqs = case_sequence(args.suite)
+    if args.case_sequence.strip():
+        seqs = [
+            (args.variant, case_id.strip())
+            for case_id in args.case_sequence.split(",")
+            if case_id.strip()
+        ]
+        unknown = [case_id for _, case_id in seqs if case_id not in CASES]
+        if unknown:
+            raise SystemExit(f"unknown case id(s): {', '.join(unknown)}")
+    else:
+        seqs = case_sequence(args.suite)
     rows: list[dict[str, str]] = []
     for idx, (variant, case_id) in enumerate(seqs, start=1):
         case = CASES[case_id]

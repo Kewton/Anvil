@@ -201,10 +201,12 @@ fn schema_signature(schema: &DeliverableSchema) -> String {
         DeliverableSchema::StructuredRecord(StructuredRecordSchema {
             columns,
             expected_rows,
+            column_policy,
         }) => format!(
-            "structured_record columns={} expected_rows={}",
+            "structured_record columns={} expected_rows={} column_policy={}",
             columns.join("|"),
-            expected_rows.len()
+            expected_rows.len(),
+            column_policy.label()
         ),
         DeliverableSchema::JsonFields(fields) => format!("json_fields {}", fields.join("|")),
         DeliverableSchema::RequiredSections(sections) => {

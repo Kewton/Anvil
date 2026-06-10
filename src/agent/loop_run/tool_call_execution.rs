@@ -392,6 +392,12 @@ fn observe_evidence_from_bash_outcome(
         agent.task_contract_evidence_set_this_turn.push(evidence);
         return;
     };
+    let observation = super::evidence_observation::EvidenceObservation::from_completion_evidence(
+        &evidence,
+        super::task_contract::ObjectiveEvidenceKind::TestRun,
+        Some(super::evidence_runner::EvidenceRunnerKind::CodingBuildTest),
+        super::evidence_observation::EvidenceObservationSource::CompletionEvidence,
+    );
     agent.evidence_set_this_turn.push(evidence.clone());
     agent
         .task_contract_evidence_set_this_turn
@@ -407,6 +413,13 @@ fn observe_evidence_from_bash_outcome(
             "command_class": class.as_str(),
         }),
     );
+    if let Some(observation) = observation {
+        super::evidence_observation::log_evidence_observation_observed(
+            agent.current_turn_index,
+            0,
+            &observation,
+        );
+    }
 }
 
 fn observe_task_evidence_runner_command(
@@ -442,6 +455,12 @@ fn observe_task_evidence_runner_command(
     ) else {
         return;
     };
+    let observation = super::evidence_observation::EvidenceObservation::from_completion_evidence(
+        &evidence,
+        objective.evidence_kind,
+        Some(runner.kind()),
+        super::evidence_observation::EvidenceObservationSource::EvidenceRunner,
+    );
     agent.evidence_set_this_turn.push(evidence.clone());
     agent.task_contract_evidence_set_this_turn.push(evidence);
     crate::logging::log_completion_evidence_observed(
@@ -454,6 +473,13 @@ fn observe_task_evidence_runner_command(
             "safety_boundary_passed": safety_boundary_passed,
         }),
     );
+    if let Some(observation) = observation {
+        super::evidence_observation::log_evidence_observation_observed(
+            agent.current_turn_index,
+            0,
+            &observation,
+        );
+    }
 }
 
 #[cfg(test)]

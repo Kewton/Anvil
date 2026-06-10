@@ -237,6 +237,31 @@ fn explicit_no_edit_research_report_stays_answer_only() {
     }
 }
 
+#[test]
+fn no_code_research_report_still_creates_report_obligation() {
+    for request in [
+        "Investigate the options and produce a report in report.md, but do not modify code",
+        "Investigate the options and produce a report in report.md, but do not create source code or tests",
+    ] {
+        let contract = TaskContract::from_request(request);
+        assert_eq!(
+            contract.task_kind,
+            TaskKind::Research,
+            "no-code research report must stay Research: {request:?}"
+        );
+        assert!(
+            contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs),
+            "no-code must forbid implementation artifacts without suppressing the requested report artifact: {request:?}"
+        );
+        assert!(
+            report_intended_research(request),
+            "no-code report request must stay report-intended: {request:?}"
+        );
+    }
+}
+
 // PR2-002: token-boundary aware output context. A word merely *containing* a
 // preposition substring ("investigate" ⊃ "in") is not an output context, and an
 // explicit input verb wins even for an output-looking file name.

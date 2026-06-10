@@ -89,8 +89,9 @@ pub(super) use super::task_contract_request_inference::{
     SETUP_MARKER_NEEDLES_ASCII, SETUP_MARKER_NEEDLES_JP, infer_intent, infer_project_language,
     infer_project_shape, infer_verification_requirement, lower_contains_setup_token_unnegated,
     preferred_runner_for_language, project_intent_confidence, request_asks_for_code_work,
-    request_asks_for_data_task, request_asks_for_implementation_artifact,
-    request_asks_for_ops_task, request_asks_for_research_task, request_asks_for_test_artifact,
+    request_asks_for_command_observation_artifact, request_asks_for_data_task,
+    request_asks_for_implementation_artifact, request_asks_for_ops_task,
+    request_asks_for_research_task, request_asks_for_test_artifact,
     request_contains_jp_setup_marker_unnegated, request_forbidden_artifact_roles,
     request_has_explicit_coding_subject, request_negates_test_artifacts,
     request_negates_usage_docs_artifacts,
@@ -98,8 +99,8 @@ pub(super) use super::task_contract_request_inference::{
 pub(super) use super::task_contract_taxonomy::{
     ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema, DeliverableSpec,
     EvidenceSpec, ObjectiveDeliverableKind, ObjectiveEvidenceKind, ObjectiveKind, ProjectLanguage,
-    ProjectShape, StructuredRecordSchema, TaskDeliverable, TaskIntent, TaskKind,
-    VerificationRequirement,
+    ProjectShape, StructuredColumnPolicy, StructuredRecordSchema, TaskDeliverable, TaskIntent,
+    TaskKind, VerificationRequirement,
 };
 use crate::tools::bash::BashCommandClass;
 
@@ -299,10 +300,25 @@ impl DeliverableObligation {
         columns: Vec<String>,
         expected_rows: Vec<Vec<String>>,
     ) -> Self {
+        Self::structured_record_with_column_policy(
+            path,
+            columns,
+            expected_rows,
+            StructuredColumnPolicy::RequiredOnly,
+        )
+    }
+
+    pub(super) fn structured_record_with_column_policy(
+        path: impl Into<String>,
+        columns: Vec<String>,
+        expected_rows: Vec<Vec<String>>,
+        column_policy: StructuredColumnPolicy,
+    ) -> Self {
         let path = validated_obligation_path(path.into());
         let schema = StructuredRecordSchema {
             columns,
             expected_rows,
+            column_policy,
         };
         Self {
             role: ArtifactRole::DataOutput,
@@ -315,7 +331,12 @@ impl DeliverableObligation {
                 Vec::new()
             } else {
                 vec![format!(
-                    "structured output includes columns: {}",
+                    "structured output includes {}columns: {}",
+                    if schema.column_policy == StructuredColumnPolicy::Exact {
+                        "exactly "
+                    } else {
+                        ""
+                    },
                     schema.columns.join(", ")
                 )]
             }
@@ -480,6 +501,10 @@ fn objective_contract_obligation_prompt_line(obligation: &ArtifactObligation) ->
             if obligation.format == Some(DeliverableFormat::Json) {
                 parts.push(format!(
                     "write a JSON object with exactly these top-level fields and no extra top-level fields: {columns}"
+                ));
+            } else if schema.column_policy == StructuredColumnPolicy::Exact {
+                parts.push(format!(
+                    "include exactly these columns and no extra columns: {columns}"
                 ));
             } else {
                 parts.push(format!("include required columns: {columns}"));
@@ -1628,6 +1653,12 @@ fn infer_task_kind(
     if code_work {
         return TaskKindInference {
             kind: TaskKind::Coding,
+            matched: true,
+        };
+    }
+    if request_asks_for_command_observation_artifact(request, lower) {
+        return TaskKindInference {
+            kind: TaskKind::Ops,
             matched: true,
         };
     }
@@ -3561,6 +3592,52 @@ mod tests {
     }
 
     #[test]
+    fn raw_command_observation_request_creates_ops_artifact_obligation() {
+        for request in [
+            "Run pwd and write ops-observation.md containing the exact observed directory. Do not modify code.",
+            "Run ./scripts/health.sh and write reports/health-check.md containing the command, stdout, stderr, and exit code. Do not modify scripts/health.sh.",
+        ] {
+            let expected_path = if request.contains("reports/health-check.md") {
+                "reports/health-check.md"
+            } else {
+                "ops-observation.md"
+            };
+            let expected_command = if request.contains("./scripts/health.sh") {
+                "./scripts/health.sh"
+            } else {
+                "pwd"
+            };
+            let contract = TaskContract::from_request(request);
+
+            assert_eq!(contract.task_kind, TaskKind::Ops, "{request}");
+            assert!(
+                contract
+                    .required_artifacts
+                    .contains(&ArtifactRole::UsageDocs),
+                "{request}"
+            );
+            let obligation = required_obligation(&contract, ArtifactRole::UsageDocs, expected_path);
+            assert_eq!(obligation.kind, DeliverableKind::CommandOutput);
+            assert!(
+                obligation
+                    .acceptance_criteria
+                    .contains(&format!("command:{expected_command}")),
+                "{request}: {:?}",
+                obligation.acceptance_criteria
+            );
+            assert_eq!(
+                contract.objective_contract().evidence_kind,
+                ObjectiveEvidenceKind::SafetyBoundaryEvidence
+            );
+
+            let mut observed = EvidenceSet::new();
+            observed.push(command_observation(expected_command, 0));
+            observed.push(repo_edit_path(RepoEditCategory::Docs, expected_path));
+            assert_eq!(contract.evaluate(&observed), CompletionDecision::Done);
+        }
+    }
+
+    #[test]
     fn completion_policy_classifies_artifact_only_pytest_request() {
         let contract = TaskContract::from_request("pytest を実行してテストを通してください");
         assert_eq!(
@@ -4809,7 +4886,8 @@ mod tests {
                 target_hint: Some(RecoveryTargetHint { reason, .. }),
             } if missing == vec![ArtifactRole::DataOutput]
                 && reason.contains("schema_mismatch")
-                && reason.contains("exactly: status, duration_seconds, warnings")
+                && reason.contains("columns must match exactly")
+                && reason.contains("expected status, duration_seconds, warnings")
                 && reason.contains("x")
         ));
     }
@@ -5874,6 +5952,13 @@ Create the README file."#;
                 .map(|schema| schema.columns.as_slice()),
             Some(["Category".to_string(), "Total".to_string()].as_slice())
         );
+        assert_eq!(
+            obligation
+                .structured_record_schema
+                .as_ref()
+                .map(|schema| schema.column_policy),
+            Some(StructuredColumnPolicy::RequiredOnly)
+        );
 
         let mut evidence = EvidenceSet::new();
         evidence.push(repo_edit_path(RepoEditCategory::Data, "output.csv"));
@@ -5919,6 +6004,81 @@ Create the README file."#;
                 artifacts: &artifacts,
                 repair_state: &repair_state,
                 artifact_excerpts: &matching_columns,
+                missing_verifier_suppress_retry: false,
+                owned_test_artifacts: &[],
+            }),
+            ArtifactRecoveryAction::Done
+        );
+    }
+
+    #[test]
+    fn data_task_exact_columns_blocks_extra_columns_without_literal_rows() {
+        let contract = TaskContract::from_request(
+            "Read input/orders.csv and create output/order-summary.csv with exactly the same columns id,total and the same two data rows. This is a data-only task; do not create source code or tests.",
+        );
+        let obligation = required_obligation(
+            &contract,
+            ArtifactRole::DataOutput,
+            "output/order-summary.csv",
+        );
+        let schema = obligation
+            .structured_record_schema
+            .as_ref()
+            .expect("data output carries structured schema");
+        assert_eq!(schema.columns, vec!["id".to_string(), "total".to_string()]);
+        assert_eq!(schema.column_policy, StructuredColumnPolicy::Exact);
+        assert!(
+            schema.expected_rows.is_empty(),
+            "same input rows are not literal row values in the prompt"
+        );
+
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(
+            RepoEditCategory::Data,
+            "output/order-summary.csv",
+        ));
+        let repair_state = VerifierRepairState::None;
+        let artifacts = [ArtifactState::exists(
+            ArtifactRole::DataOutput,
+            "output/order-summary.csv",
+        )];
+        let extra_column = build_excerpts(&[(
+            ArtifactRole::DataOutput,
+            "id,total,same\n1,10,10\n2,25,25\n",
+        )]);
+
+        let action = plan_artifact_recovery(ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &artifacts,
+            repair_state: &repair_state,
+            artifact_excerpts: &extra_column,
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        });
+
+        assert!(
+            matches!(
+                action,
+                ArtifactRecoveryAction::Continue {
+                    ref missing,
+                    target_hint: Some(ref target),
+                } if missing == &vec![ArtifactRole::DataOutput]
+                    && target.path == "output/order-summary.csv"
+                    && target.reason.contains("columns must match exactly")
+                    && target.reason.contains("observed id, same, total")
+            ),
+            "exact-column data output must reject extra columns, got {action:?}"
+        );
+
+        let exact_columns = build_excerpts(&[(ArtifactRole::DataOutput, "id,total\n1,10\n2,25\n")]);
+        assert_eq!(
+            plan_artifact_recovery(ArtifactRecoveryInputs {
+                contract: &contract,
+                evidence: &evidence,
+                artifacts: &artifacts,
+                repair_state: &repair_state,
+                artifact_excerpts: &exact_columns,
                 missing_verifier_suppress_retry: false,
                 owned_test_artifacts: &[],
             }),
@@ -5976,7 +6136,7 @@ Create the README file."#;
                     target_hint: Some(ref target),
                 } if missing == &vec![ArtifactRole::DataOutput]
                     && target.path == "data/output.csv"
-                    && target.reason.contains("expected rows")
+                    && target.reason.contains("columns must match exactly")
             ),
             "explicit data rows must block extra-column output, got {action:?}"
         );

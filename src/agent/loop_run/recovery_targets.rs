@@ -9,8 +9,9 @@
 //!   target chain (forced-small-edit → post-scaffold edit recovery →
 //!   post-scaffold continuation recovery).
 //! - `repo_change_no_edit_recovery_target` (private) — repo-change
-//!   policy's target chain (Act mode + repo-edit required + active
-//!   task expects a repo change + no successful non-plan edit yet →
+//!   policy's target chain (Act mode + edit required by WorkMode or
+//!   ObjectiveContract artifact + active task expects a repo change + no
+//!   successful non-plan edit yet →
 //!   artifact-recovery path / first-existing-impl-target /
 //!   latest-turn-preferred-read-edit target / last-read-tool fallback).
 //! - `push_repo_change_no_edit_recovery_note` — pushes a system note
@@ -48,7 +49,7 @@ pub(super) fn focused_edit_recovery_target(agent: &Agent) -> Option<PathBuf> {
 
 fn repo_change_no_edit_recovery_target(agent: &Agent) -> Option<PathBuf> {
     if agent.session.mode_state.mode != ExecutionMode::Act
-        || !agent.session.mode_state.policy().repo_edit_required
+        || !super::workspace_access::repo_edit_required_by_mode_or_objective(agent)
         || !super::workspace_access::active_task_expects_repo_change(agent)
         || has_successful_non_plan_repo_edit(
             &agent.session.messages,

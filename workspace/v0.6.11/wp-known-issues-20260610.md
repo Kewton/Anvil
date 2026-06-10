@@ -62,3 +62,10 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 - Research and ops failed 0/2 each with `missing_repo_edits`; non-coding objective admission still carries coding/edit-obligation leakage.
 - FastAPI failed 5/6 with `repair_exhausted` around 422 request/response mismatches. Generic API schema reconciliation remains a high-priority repair gap.
 - Python markdown had one externally passing row with `repair_exhausted`; terminal/evidence alignment remains incomplete even when artifacts pass local checks.
+
+## WP-C: Non-Coding DeliverableObligation
+
+- Initial mixed smoke recovered Research but Ops remained 0/6 with `missing_repo_edits`. Log inspection showed the model attempted the correct `Write(reports/health-check.md)`, but controller policy had selected a local small-edit target on `scripts/health.sh` and exposed only `Edit`.
+- Root cause was contract admission, not model unwillingness: command-observation report requests could still be classified as Coding or Research before reaching Ops.
+- After separating command-observation artifacts from implementation inference, Ops recovered to 6/6 pass and `done`.
+- Ops high_quality remains 3/6 because some runs create temporary stdout/stderr/exit-code files outside the requested report artifact. This should be addressed as artifact-scope hygiene, not by weakening terminal projection.

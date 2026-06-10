@@ -8,8 +8,9 @@ use super::completion_evidence::classify_repo_edit_path;
 use super::contract_request_signals::negated_artifact_list_contains;
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, DeliverableKind, DeliverableSchema, ProjectIntent,
-    ProjectLanguage, ProjectShape, TaskKind, request_asks_for_data_output_artifact_with_scan,
-    request_asks_for_ops_task, request_negates_test_artifacts, role_from_repo_edit,
+    ProjectLanguage, ProjectShape, StructuredColumnPolicy, TaskKind,
+    request_asks_for_data_output_artifact_with_scan, request_asks_for_ops_task,
+    request_negates_test_artifacts, role_from_repo_edit,
 };
 use super::task_contract_data_output_context::{
     data_path_has_output_context_with_scan, explicit_path_with_data_extension_with_scan,
@@ -225,20 +226,36 @@ pub(super) fn inferred_ops_obligations_from_request(
         return Vec::new();
     }
     let required_sections = required_ops_sections_from_request(request);
+    let command_observations = required_command_observations_from_request(request);
+    let explicit_docs = explicit_artifact_obligations_from_request(request)
+        .into_iter()
+        .filter(|identity| identity.role == ArtifactRole::UsageDocs)
+        .collect::<Vec<_>>();
+    if !command_observations.is_empty() && !explicit_docs.is_empty() {
+        return explicit_docs
+            .into_iter()
+            .map(|identity| {
+                ArtifactObligation::command_output(
+                    identity.path,
+                    required_sections.clone(),
+                    command_observations.clone(),
+                )
+            })
+            .collect();
+    }
     if request_asks_for_ops_task(request, lower) {
         return vec![ArtifactObligation::ops_runbook(
             default_ops_runbook_path_from_request(request),
             required_sections,
         )];
     }
-    explicit_artifact_obligations_from_request(request)
+    explicit_docs
         .into_iter()
-        .filter(|identity| identity.role == ArtifactRole::UsageDocs)
         .map(|identity| {
             ArtifactObligation::command_output(
                 identity.path,
                 required_sections.clone(),
-                required_command_observations_from_request(request),
+                command_observations.clone(),
             )
         })
         .collect()
@@ -283,11 +300,20 @@ fn run_clause_command_observations_from_request(request: &str) -> Vec<String> {
     let after_start = run_idx + "run ".len();
     let after = &request[after_start..];
     let after_lower = &lower[after_start..];
-    let end = [", then", " then ", ". ", "\n"]
-        .into_iter()
-        .filter_map(|marker| after_lower.find(marker))
-        .min()
-        .unwrap_or(after.len());
+    let end = [
+        ", then",
+        " then ",
+        " and write ",
+        " and create ",
+        " and document ",
+        " and report ",
+        ". ",
+        "\n",
+    ]
+    .into_iter()
+    .filter_map(|marker| after_lower.find(marker))
+    .min()
+    .unwrap_or(after.len());
     after[..end]
         .split([',', ';'])
         .flat_map(|chunk| chunk.split(" and "))
@@ -298,7 +324,8 @@ fn run_clause_command_observations_from_request(request: &str) -> Vec<String> {
 fn normalize_required_command_observation(raw: &str) -> Option<String> {
     let command = raw
         .trim()
-        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ':' | '.'));
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '`' | ':'))
+        .trim_end_matches('.');
     if command.is_empty()
         || command.len() > 80
         || command.chars().any(|ch| {
@@ -368,11 +395,41 @@ pub(super) fn inferred_data_obligations_from_request_with_scan(
     });
     let columns = extract_required_columns_from_request(request);
     let expected_rows = extract_expected_rows_from_request(request, &columns);
-    vec![ArtifactObligation::structured_record_with_expected_rows(
+    let column_policy = extract_column_policy_from_request(request);
+    vec![ArtifactObligation::structured_record_with_column_policy(
         path,
         columns,
         expected_rows,
+        column_policy,
     )]
+}
+
+fn extract_column_policy_from_request(request: &str) -> StructuredColumnPolicy {
+    let lower = request.to_ascii_lowercase();
+    let Some(column_index) = lower.find("column") else {
+        return StructuredColumnPolicy::RequiredOnly;
+    };
+    let start = column_index.saturating_sub(48);
+    let end = lower.len().min(column_index + 96);
+    let window = &lower[start..end];
+    if contains_any(
+        window,
+        &[
+            "exactly the same column",
+            "exactly same column",
+            "same columns",
+            "same column",
+            "exactly columns",
+            "exactly column",
+            "only columns",
+            "only column",
+            "no extra column",
+        ],
+    ) {
+        StructuredColumnPolicy::Exact
+    } else {
+        StructuredColumnPolicy::RequiredOnly
+    }
 }
 
 fn extract_required_columns_from_request(request: &str) -> Vec<String> {
@@ -394,6 +451,9 @@ fn extract_required_columns_from_request(request: &str) -> Vec<String> {
     for (index, token) in tokens.iter().enumerate() {
         let lower = token.to_ascii_lowercase();
         if structured_row_count_token_before_row_marker(&tokens, index) {
+            break;
+        }
+        if structured_row_context_token_before_row_marker(&tokens, index) {
             break;
         }
         if matches!(
@@ -434,6 +494,18 @@ fn structured_row_count_token_before_row_marker(tokens: &[&str], index: usize) -
         .iter()
         .skip(index + 1)
         .take(3)
+        .map(|token| token.to_ascii_lowercase())
+        .any(|token| matches!(token.as_str(), "row" | "rows" | "record" | "records"))
+}
+
+fn structured_row_context_token_before_row_marker(tokens: &[&str], index: usize) -> bool {
+    if !matches!(tokens[index].to_ascii_lowercase().as_str(), "same" | "data") {
+        return false;
+    }
+    tokens
+        .iter()
+        .skip(index + 1)
+        .take(4)
         .map(|token| token.to_ascii_lowercase())
         .any(|token| matches!(token.as_str(), "row" | "rows" | "record" | "records"))
 }

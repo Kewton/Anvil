@@ -5,7 +5,7 @@ use super::semantic_failure::SemanticFailureReport;
 use super::spec_authority::SpecAuthorityInput;
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema,
-    TaskKind,
+    StructuredColumnPolicy, TaskKind,
 };
 use crate::tools::bash::BashCommandClass;
 
@@ -830,6 +830,7 @@ fn verifier_diagnostic_for_obligation_parts(
             excerpt,
             &schema.columns,
             &schema.expected_rows,
+            schema.column_policy,
         ) {
             return Some(diagnostic);
         }
@@ -941,7 +942,12 @@ fn data_artifact_diagnostic(
     excerpt: &str,
     required_columns: &[String],
 ) -> Option<VerifierDiagnostic> {
-    if let Some(message) = json_object_exact_columns_diagnostic(path, excerpt, required_columns) {
+    if let Some(message) = structured_data_exact_columns_diagnostic(
+        path,
+        excerpt,
+        required_columns,
+        StructuredColumnPolicy::RequiredOnly,
+    ) {
         return Some(VerifierDiagnostic::new(
             task_kind,
             VerifierDiagnosticCode::SchemaMismatch,
@@ -983,7 +989,14 @@ fn data_schema_obligation_diagnostic(
     excerpt: &str,
     required_columns: &[String],
 ) -> Option<VerifierDiagnostic> {
-    data_schema_obligation_diagnostic_with_rows(task_kind, path, excerpt, required_columns, &[])
+    data_schema_obligation_diagnostic_with_rows(
+        task_kind,
+        path,
+        excerpt,
+        required_columns,
+        &[],
+        StructuredColumnPolicy::RequiredOnly,
+    )
 }
 
 fn data_schema_obligation_diagnostic_with_rows(
@@ -992,11 +1005,14 @@ fn data_schema_obligation_diagnostic_with_rows(
     excerpt: &str,
     required_columns: &[String],
     expected_rows: &[Vec<String>],
+    column_policy: StructuredColumnPolicy,
 ) -> Option<VerifierDiagnostic> {
     if required_columns.is_empty() {
         return data_artifact_diagnostic(task_kind, path, excerpt, required_columns);
     }
-    if let Some(message) = json_object_exact_columns_diagnostic(path, excerpt, required_columns) {
+    if let Some(message) =
+        structured_data_exact_columns_diagnostic(path, excerpt, required_columns, column_policy)
+    {
         return Some(VerifierDiagnostic::new(
             task_kind,
             VerifierDiagnosticCode::SchemaMismatch,
@@ -1061,6 +1077,7 @@ pub(super) fn structured_data_schema_obligation_pass_with_rows(
     excerpt: &str,
     required_columns: &[String],
     expected_rows: &[Vec<String>],
+    column_policy: StructuredColumnPolicy,
 ) -> bool {
     data_schema_obligation_diagnostic_with_rows(
         TaskKind::Data,
@@ -1068,27 +1085,37 @@ pub(super) fn structured_data_schema_obligation_pass_with_rows(
         excerpt,
         required_columns,
         expected_rows,
+        column_policy,
     )
     .is_none()
 }
 
-fn json_object_exact_columns_diagnostic(
+fn structured_data_exact_columns_diagnostic(
     path: &str,
     excerpt: &str,
     required_columns: &[String],
+    column_policy: StructuredColumnPolicy,
 ) -> Option<String> {
-    if required_columns.is_empty() || !path_has_extension(Some(path), "json") {
+    if required_columns.is_empty() {
         return None;
     }
-    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(excerpt)
-    else {
+    let json_object = path_has_extension(Some(path), "json");
+    if !json_object && column_policy != StructuredColumnPolicy::Exact {
         return None;
+    }
+    let observed = if json_object {
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(excerpt)
+        else {
+            return None;
+        };
+        sorted_unique(map.keys().cloned().collect())
+    } else {
+        sorted_unique(observed_data_columns(Some(path), excerpt, required_columns))
     };
-    let observed = sorted_unique(map.keys().cloned().collect());
     let required = sorted_unique(required_columns.to_vec());
     (observed != required).then(|| {
         format!(
-            "JSON object top-level fields must be exactly: {}; observed fields: {}; remove extra fields and add missing required fields",
+            "structured data columns must match exactly: expected {}; observed {}; remove extra fields and add missing required fields",
             display_schema_columns(required_columns),
             display_schema_columns(&observed)
         )
@@ -2518,8 +2545,9 @@ mod tests {
         assert!(
             diagnostic
                 .message
-                .contains("JSON object top-level fields must be exactly: topic, status")
+                .contains("structured data columns must match exactly")
         );
+        assert!(diagnostic.message.contains("expected topic, status"));
         assert!(diagnostic.message.contains("description"));
     }
 
@@ -2563,6 +2591,39 @@ mod tests {
         );
         assert!(diagnostic.message.contains("Category"));
         assert!(diagnostic.message.contains("Description"));
+    }
+
+    #[test]
+    fn data_schema_exact_column_policy_rejects_extra_csv_columns() {
+        let required = vec!["id".to_string(), "total".to_string()];
+        let diagnostic = data_schema_obligation_diagnostic_with_rows(
+            TaskKind::Data,
+            "output/order-summary.csv",
+            "id,total,same\n1,10,10\n2,25,25\n",
+            &required,
+            &[],
+            StructuredColumnPolicy::Exact,
+        )
+        .expect("extra CSV column must fail exact column policy");
+
+        assert_eq!(diagnostic.code, VerifierDiagnosticCode::SchemaMismatch);
+        assert_eq!(diagnostic.role, ArtifactRole::DataOutput);
+        assert!(diagnostic.message.contains("columns must match exactly"));
+        assert!(diagnostic.message.contains("expected id, total"));
+        assert!(diagnostic.message.contains("observed id, same, total"));
+
+        assert!(
+            data_schema_obligation_diagnostic_with_rows(
+                TaskKind::Data,
+                "output/order-summary.csv",
+                "id,total,same\n1,10,10\n2,25,25\n",
+                &required,
+                &[],
+                StructuredColumnPolicy::RequiredOnly,
+            )
+            .is_none(),
+            "required-only policy preserves existing superset acceptance"
+        );
     }
 
     #[test]

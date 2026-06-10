@@ -63,7 +63,7 @@ pub(super) fn run_turn(
 
     let mut action_expectation =
         recovery::classify_action_expectation(input, agent.session.mode_state.mode);
-    if !agent.session.mode_state.policy().repo_edit_required {
+    if !super::workspace_access::repo_edit_required_by_mode_or_objective(agent) {
         action_expectation = recovery::ActionExpectation::None;
     }
     let requires_action = action_expectation != recovery::ActionExpectation::None;

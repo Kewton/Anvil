@@ -141,25 +141,22 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
             job.record_in_scope_edit();
         }
     }
+    let repo_edit_evidence = super::completion_evidence::CompletionEvidence::RepoEdit {
+        category,
+        count: 1,
+        path: Some(relative_path.clone()),
+    };
     agent
         .evidence_set_this_turn
-        .push(super::completion_evidence::CompletionEvidence::RepoEdit {
-            category,
-            count: 1,
-            path: Some(relative_path.clone()),
-        });
+        .push(repo_edit_evidence.clone());
     if super::task_contract::repo_edit_satisfies_artifact_recovery_target(
         category,
         &relative_path,
         agent.current_artifact_recovery_target.as_ref(),
     ) {
-        agent.task_contract_evidence_set_this_turn.push(
-            super::completion_evidence::CompletionEvidence::RepoEdit {
-                category,
-                count: 1,
-                path: Some(relative_path.clone()),
-            },
-        );
+        agent
+            .task_contract_evidence_set_this_turn
+            .push(repo_edit_evidence.clone());
         // Issue #636: capture bounded post-edit excerpt for the
         // current role so `plan_artifact_recovery` can assert that the
         // edit actually carries the requested behavior. Silent skip on
@@ -195,6 +192,20 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
             "path": relative_path,
         }),
     );
+    if let Some(observation) =
+        super::evidence_observation::EvidenceObservation::from_completion_evidence(
+            &repo_edit_evidence,
+            super::task_contract::ObjectiveEvidenceKind::FileLayoutCheck,
+            None,
+            super::evidence_observation::EvidenceObservationSource::CompletionEvidence,
+        )
+    {
+        super::evidence_observation::log_evidence_observation_observed(
+            agent.current_turn_index,
+            0,
+            &observation,
+        );
+    }
     // Issue #659 Task 2.5: write-through seed into the ArtifactLedger
     // SSOT. `relative_path` has already passed the workspace-relative
     // / scaffold-delta / no-op guards; the legacy

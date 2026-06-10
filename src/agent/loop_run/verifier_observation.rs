@@ -20,7 +20,12 @@
 //! re-export (DR3-001).
 
 use super::Agent;
+use super::evidence_observation::{
+    EvidenceObservation, EvidenceObservationSource, log_evidence_observation_observed,
+};
+use super::evidence_runner::EvidenceRunnerKind;
 use super::small_helpers::rfc3339_now_utc;
+use super::task_contract::ObjectiveEvidenceKind;
 use super::verifier_orchestration::{
     build_task_contract_verifier_exit_zero_evidence,
     build_task_contract_verifier_exit_zero_evidence_bound,
@@ -48,6 +53,12 @@ pub(super) fn record_task_contract_verifier_invocation(
 
 pub(super) fn observe_task_contract_verifier_exit_zero(agent: &mut Agent, command: &str) {
     if let Some(evidence) = build_task_contract_verifier_exit_zero_evidence(command) {
+        let observation = EvidenceObservation::from_completion_evidence(
+            &evidence,
+            ObjectiveEvidenceKind::TestRun,
+            Some(EvidenceRunnerKind::CodingBuildTest),
+            EvidenceObservationSource::Verifier,
+        );
         agent.evidence_set_this_turn.push(evidence.clone());
         agent.task_contract_evidence_set_this_turn.push(evidence);
         log_completion_evidence_observed(
@@ -59,6 +70,9 @@ pub(super) fn observe_task_contract_verifier_exit_zero(agent: &mut Agent, comman
                 "source": "task_contract_verifier",
             }),
         );
+        if let Some(observation) = observation {
+            log_evidence_observation_observed(agent.current_turn_index, 0, &observation);
+        }
     }
 }
 
@@ -77,6 +91,12 @@ pub(super) fn observe_task_contract_verifier_exit_zero_bound(
     if let Some(evidence) =
         build_task_contract_verifier_exit_zero_evidence_bound(command, bound_count)
     {
+        let observation = EvidenceObservation::from_completion_evidence(
+            &evidence,
+            ObjectiveEvidenceKind::TestRun,
+            Some(EvidenceRunnerKind::CodingBuildTest),
+            EvidenceObservationSource::Verifier,
+        );
         agent.evidence_set_this_turn.push(evidence.clone());
         agent.task_contract_evidence_set_this_turn.push(evidence);
         log_completion_evidence_observed(
@@ -89,5 +109,8 @@ pub(super) fn observe_task_contract_verifier_exit_zero_bound(
                 "bound_test_artifacts_count": bound_count,
             }),
         );
+        if let Some(observation) = observation {
+            log_evidence_observation_observed(agent.current_turn_index, 0, &observation);
+        }
     }
 }

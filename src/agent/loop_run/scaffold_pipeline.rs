@@ -2031,7 +2031,7 @@ pub(super) fn maybe_apply_local_llm_small_edit_fallback(
 
 pub(super) fn local_llm_small_edit_fallback_target(agent: &Agent) -> Option<PathBuf> {
     if agent.session.mode_state.mode != ExecutionMode::Act
-        || !agent.session.mode_state.policy().repo_edit_required
+        || !super::workspace_access::repo_edit_required_by_mode_or_objective(agent)
         || !super::workspace_access::active_task_expects_repo_change(agent)
     {
         return None;

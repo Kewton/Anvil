@@ -463,6 +463,7 @@ pub(crate) mod completion_evidence;
 // `safe_stop_verifier_missing`; runtime-specific differences stay in data
 // enums/adapters. `pub(super)` only, no facade re-export (DR3-001).
 mod evidence_binding;
+mod evidence_observation;
 mod evidence_runner;
 mod worker_contract;
 // Issue #994 (parent #988, Issue F): ContractConflictJob — typed arbitration of
