@@ -258,6 +258,8 @@ pub struct PamEvalSummary {
     pub mode: String,
     pub decision_type: String,
     pub decision_types: Vec<String>,
+    #[serde(default = "default_pam_availability")]
+    pub availability: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub affected_targets: Vec<PamEvalTarget>,
     pub actual_injected_count: u32,
@@ -271,19 +273,53 @@ pub struct PamEvalSummary {
 
 impl PamEvalSummary {
     pub fn skipped(reason: impl Into<String>) -> Self {
+        let unused_reason = reason.into();
+        let availability =
+            Self::derive_availability("not_used", 0, 0, 0, Some(unused_reason.as_str()));
         Self {
             mode: "not_used".to_string(),
             decision_type: "not_used".to_string(),
             decision_types: vec!["not_used".to_string()],
+            availability: availability.to_string(),
             affected_targets: Vec::new(),
             actual_injected_count: 0,
             suppressed_count: 0,
             would_inject_in_live_count: 0,
             advisory_only: true,
             completion_judgement_override: false,
-            unused_reason: Some(reason.into()),
+            unused_reason: Some(unused_reason),
         }
     }
+
+    pub fn derive_availability(
+        mode: &str,
+        actual_injected_count: u32,
+        suppressed_count: u32,
+        would_inject_in_live_count: u32,
+        unused_reason: Option<&str>,
+    ) -> &'static str {
+        match unused_reason {
+            Some("disabled") | Some("plan_mode") => return "disabled",
+            Some("photon_unavailable") | Some("context_pack_failed") => return "failed",
+            Some("shadow_mode") => return "not_injected",
+            Some("canary_gate") => return "not_injected",
+            Some(_) if mode == "not_used" => return "not_injected",
+            _ => {}
+        }
+        if actual_injected_count > 0 {
+            "injected"
+        } else if suppressed_count > 0 {
+            "blocked_warning"
+        } else if would_inject_in_live_count > 0 {
+            "not_injected"
+        } else {
+            "not_injected"
+        }
+    }
+}
+
+fn default_pam_availability() -> String {
+    "unknown".to_string()
 }
 
 /// Issue #867: bounded PAM advisory attribution target for eval logs.
@@ -1073,6 +1109,7 @@ fn failure_authority_for_eval(
 
 fn pam_variant_for_eval(pam_eval: Option<&PamEvalSummary>) -> &'static str {
     match pam_eval {
+        Some(summary) if summary.availability == "failed" => "pam_unavailable",
         Some(summary) if summary.mode != "not_used" => "pam_on",
         Some(_) => "pam_off",
         None => "unknown",
@@ -1457,6 +1494,61 @@ mod tests {
         assert_eq!(rec.evaluation_taxonomy.task_kind, "docs");
         assert_eq!(rec.evaluation_taxonomy.anvil_terminal_class, "non_success");
         assert_eq!(rec.evaluation_taxonomy.failure_authority, "verifier_setup");
+    }
+
+    #[test]
+    fn pam_eval_summary_reports_availability_separately_from_terminal_authority() {
+        assert_eq!(PamEvalSummary::skipped("disabled").availability, "disabled");
+        assert_eq!(
+            PamEvalSummary::skipped("photon_unavailable").availability,
+            "failed"
+        );
+        assert_eq!(
+            PamEvalSummary::derive_availability("live", 1, 0, 0, None),
+            "injected"
+        );
+        assert_eq!(
+            PamEvalSummary::derive_availability("live", 0, 2, 0, None),
+            "blocked_warning"
+        );
+        assert_eq!(
+            PamEvalSummary::derive_availability("shadow", 0, 0, 1, None),
+            "not_injected"
+        );
+    }
+
+    #[test]
+    fn evaluation_taxonomy_separates_pam_unavailable_from_no_pam() {
+        let mut rec = build_eval_record(
+            "sess-pam-unavailable",
+            12345,
+            "Update README.md with usage documentation",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        rec.pam_eval = Some(PamEvalSummary::skipped("context_pack_failed"));
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.pam_variant, "pam_unavailable");
+        assert_eq!(
+            rec.pam_eval.as_ref().map(|pam| pam.availability.as_str()),
+            Some("failed")
+        );
     }
 
     // Issue #922 (P5): eval research case — a research/report task is recorded

@@ -63,6 +63,18 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 - FastAPI failed 5/6 with `repair_exhausted` around 422 request/response mismatches. Generic API schema reconciliation remains a high-priority repair gap.
 - Python markdown had one externally passing row with `repair_exhausted`; terminal/evidence alignment remains incomplete even when artifacts pass local checks.
 
+## WP-A: EvidenceObservation Skeleton
+
+- Evidence observation is now a typed boundary, but early adoption is still intentionally narrow.
+- The skeleton improves logging and future extension points; it does not by itself repair evidence/action convergence.
+- Future evidence additions should be typed observations, not scattered terminal-label string checks.
+
+## WP-B: Data Schema Evidence
+
+- Data schema evidence improved data-only completion checks, but coverage remains limited to simple structured CSV/JSON-style obligations.
+- Exact content validation should be expanded through typed schema/manifest parsers, not benchmark-specific literal matching.
+- False-done risk is lower for simple data rows, but richer transformations still need evidence-side observation before improvement can be claimed.
+
 ## WP-C: Non-Coding DeliverableObligation
 
 - Initial mixed smoke recovered Research but Ops remained 0/6 with `missing_repo_edits`. Log inspection showed the model attempted the correct `Write(reports/health-check.md)`, but controller policy had selected a local small-edit target on `scripts/health.sh` and exposed only `Edit`.
@@ -94,3 +106,11 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 - The remaining FastAPI failures are still convergence problems: one row ignored the JSON body binding even with typed context present, and another row invented exact `201` status despite `expected_status=unspecified`.
 - Repair diagnosis can identify the right hypothesis, but bounded repair proposals may still be rejected as malformed or ambiguous before convergence.
 - Future work should add evidence-side API contract observation and repair binding, not framework-specific string rules.
+
+## WP-G: PAM Availability Reporting
+
+- PAM availability is now visible separately from task outcome in eval logs and the WP matrix.
+- Real LLM no-PAM smoke reported `no_pam:disabled` for 5/5 rows and passed 5/5 high-quality.
+- Real LLM PAM smoke reported `pam:failed` with `unused_reason=context_pack_failed` for 5/5 rows and still passed 5/5 high-quality, showing PAM failure is not mixed into terminal failure.
+- A taxonomy follow-up smoke recorded `evaluation_taxonomy.pam_variant=pam_unavailable` for the failed-PAM path.
+- PAM effectiveness is still not measured because no context was injected in the local smoke. Future improvement claims need runs with `pam_availability=injected`.

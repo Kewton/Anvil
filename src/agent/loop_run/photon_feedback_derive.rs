@@ -1041,6 +1041,11 @@ pub(super) fn update_photon_context_pack_render(
 pub(super) fn invoke_photon_context_pack(agent: &mut Agent) {
     clear_photon_context_pack_injection_tracking(agent);
 
+    if !agent.config.photon_enabled {
+        agent.record_pam_unused_reason("disabled");
+        return;
+    }
+
     // DR2-001: photon インライン呼び出しで借用チェッカー衝突を回避
     if agent.photon.is_none() {
         agent.record_pam_unused_reason("photon_unavailable");

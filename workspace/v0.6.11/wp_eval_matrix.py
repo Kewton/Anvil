@@ -41,6 +41,9 @@ RESULT_FIELDS = [
     "false_missing",
     "repair_exhausted",
     "max_iterations",
+    "pam_availability",
+    "pam_injected_count",
+    "pam_unused_reason",
     "notes",
 ]
 
@@ -510,6 +513,51 @@ def case_sequence(suite: str) -> list[tuple[str, str]]:
     raise ValueError(f"unknown suite: {suite}")
 
 
+def latest_eval_record(state_dir: Path) -> dict[str, object]:
+    latest: dict[str, object] = {}
+    for path in sorted(state_dir.glob("sessions/*/logs/eval.jsonl")):
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    latest = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+    return latest
+
+
+def pam_availability_from_eval(variant: str, record: dict[str, object]) -> tuple[str, str, str]:
+    pam_eval = record.get("pam_eval")
+    if not isinstance(pam_eval, dict):
+        return ("unknown", "0", "")
+    availability = str(pam_eval.get("availability") or "")
+    injected_count = str(pam_eval.get("actual_injected_count") or 0)
+    unused_reason = str(pam_eval.get("unused_reason") or "")
+    if availability:
+        return (availability, injected_count, unused_reason)
+    if variant == "no_pam" and unused_reason == "photon_unavailable":
+        return ("disabled", injected_count, unused_reason)
+    if unused_reason in {"photon_unavailable", "context_pack_failed"}:
+        return ("failed", injected_count, unused_reason)
+    if unused_reason in {"disabled", "plan_mode"}:
+        return ("disabled", injected_count, unused_reason)
+    try:
+        actual = int(injected_count)
+        suppressed = int(pam_eval.get("suppressed_count") or 0)
+        would = int(pam_eval.get("would_inject_in_live_count") or 0)
+    except (TypeError, ValueError):
+        return ("unknown", injected_count, unused_reason)
+    if actual > 0:
+        return ("injected", injected_count, unused_reason)
+    if suppressed > 0:
+        return ("blocked_warning", injected_count, unused_reason)
+    if would > 0 or variant == "pam":
+        return ("not_injected", injected_count, unused_reason)
+    return ("disabled", injected_count, unused_reason)
+
+
 def run_one(
     *,
     suite: str,
@@ -622,6 +670,10 @@ def run_one(
     false_missing = passed and ("missing" in exit_reason or "safe_stop" in exit_reason)
     repair_exhausted = "repair_exhausted" in exit_reason or "repair_safe_stop" in exit_reason or "repair_exhausted" in output
     max_iter = "max_iterations" in exit_reason or "max iterations" in output.lower()
+    eval_record = latest_eval_record(state_dir)
+    pam_availability, pam_injected_count, pam_unused_reason = pam_availability_from_eval(
+        variant, eval_record
+    )
 
     return {
         "suite": suite,
@@ -642,6 +694,9 @@ def run_one(
         "false_missing": bool_s(false_missing),
         "repair_exhausted": bool_s(repair_exhausted),
         "max_iterations": bool_s(max_iter),
+        "pam_availability": pam_availability,
+        "pam_injected_count": pam_injected_count,
+        "pam_unused_reason": pam_unused_reason,
         "notes": notes,
     }
 
@@ -661,6 +716,7 @@ def summarize(rows: list[dict[str, str]]) -> dict[str, object]:
         if row["high_quality"] == "true":
             bucket["hq"] += 1
     by_variant: dict[str, dict[str, int]] = {}
+    by_pam_availability: dict[str, dict[str, int]] = {}
     for row in rows:
         variant = row["variant"]
         bucket = by_variant.setdefault(variant, {"total": 0, "pass": 0, "hq": 0})
@@ -669,6 +725,16 @@ def summarize(rows: list[dict[str, str]]) -> dict[str, object]:
             bucket["pass"] += 1
         if row["high_quality"] == "true":
             bucket["hq"] += 1
+        availability = row.get("pam_availability") or "unknown"
+        availability_key = f"{variant}:{availability}"
+        avail_bucket = by_pam_availability.setdefault(
+            availability_key, {"total": 0, "pass": 0, "hq": 0}
+        )
+        avail_bucket["total"] += 1
+        if row["pass"] == "true":
+            avail_bucket["pass"] += 1
+        if row["high_quality"] == "true":
+            avail_bucket["hq"] += 1
     return {
         "total": total,
         "pass": count("pass"),
@@ -680,6 +746,7 @@ def summarize(rows: list[dict[str, str]]) -> dict[str, object]:
         "max_iterations": count("max_iterations"),
         "by_case": by_case,
         "by_variant": by_variant,
+        "by_pam_availability": by_pam_availability,
     }
 
 
@@ -706,6 +773,17 @@ def write_summary(run_dir: Path, rows: list[dict[str, str]]) -> None:
     ]
     for variant, bucket in sorted(summary["by_variant"].items()):
         lines.append(f"| {variant} | {bucket['pass']} | {bucket['hq']} | {bucket['total']} |")
+    lines.extend(
+        [
+            "",
+            "## By PAM Availability",
+            "",
+            "| variant:availability | pass | high_quality | total |",
+            "| --- | ---: | ---: | ---: |",
+        ]
+    )
+    for key, bucket in sorted(summary["by_pam_availability"].items()):
+        lines.append(f"| {key} | {bucket['pass']} | {bucket['hq']} | {bucket['total']} |")
     lines.extend(["", "## By Case", "", "| case | pass | high_quality | total |", "| --- | ---: | ---: | ---: |"])
     for case_id, bucket in sorted(summary["by_case"].items()):
         lines.append(f"| {case_id} | {bucket['pass']} | {bucket['hq']} | {bucket['total']} |")
