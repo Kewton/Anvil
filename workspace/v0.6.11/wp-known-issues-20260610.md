@@ -22,3 +22,10 @@ This file tracks known issues observed while executing WP4-WP11. It is separate 
 - Existing-project feature improvement exposed a false-done path. This was fixed by requiring fresh repo edit evidence before accepting verifier success for coding change contracts.
 - After the false-done guard, the same scenario now fails closed with `missing_repo_edits`; it still needs WP7/WP9 work to recover into the correct implementation edit.
 - TDD order is not strictly enforced by the controller; a successful TDD smoke still wrote implementation before tests on one attempt path.
+
+## WP7: RepairTargetDecision Typed Delta
+
+- Typed delta and ledger facts are now emitted on the live repair path, but this is primarily observability/prompt-boundary improvement. It does not by itself make hard repairs converge.
+- A verification-only coding request with existing source/test artifacts still stops at `missing_repo_edits` because the WP6 fresh-edit guard cannot distinguish "verify existing artifacts" from "build/modify/fix source". This should be addressed by a typed verification-only objective or a more precise edit-obligation predicate.
+- A Python repair smoke successfully fixed the implementation, but then stopped at `repair_safe_stop: verifier_unavailable`; manual `PYTHONPATH=. pytest -q tests/test_calculator.py` passed. The remaining issue is verifier rerun binding/import environment, not target selection.
+- `tool_failure` is part of the delta vocabulary, but live tool-failure recovery paths are not fully migrated to emit it through `RepairTargetDecision` yet.

@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use super::authoring_style::AuthoringStyleDecision;
+use super::repair_target_decision::RepairTargetDeltaKind;
 use super::scaffold_pipeline::ScaffoldFramework;
 use super::task_contract::{
     ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema, ObjectiveContract,
@@ -788,6 +789,8 @@ pub(super) struct TestAuthorWorkerRequest {
     target_test_path: PathBuf,
     allowed_write_scope: Vec<PathBuf>,
     evidence_command: String,
+    repair_delta_kind: RepairTargetDeltaKind,
+    ledger_facts: String,
     output_contract: &'static str,
 }
 
@@ -864,11 +867,13 @@ impl DiagnosticRepairTargetRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DiagnosticRepairWorkerRequest {
     pub(super) worker_contract: WorkerContract,
+    repair_delta_kind: RepairTargetDeltaKind,
     failure_kind: EvidenceFailureKind,
     target_role: DiagnosticRepairTargetRole,
     target_path: PathBuf,
     allowed_change_kind: String,
     evidence_command: String,
+    ledger_facts: String,
     diagnostic: String,
     output_contract: &'static str,
 }
@@ -876,6 +881,10 @@ pub(super) struct DiagnosticRepairWorkerRequest {
 impl DiagnosticRepairWorkerRequest {
     pub(super) fn failure_kind(&self) -> EvidenceFailureKind {
         self.failure_kind
+    }
+
+    pub(super) fn repair_delta_kind(&self) -> RepairTargetDeltaKind {
+        self.repair_delta_kind
     }
 
     pub(super) fn target_role(&self) -> DiagnosticRepairTargetRole {
@@ -894,6 +903,10 @@ impl DiagnosticRepairWorkerRequest {
         &self.evidence_command
     }
 
+    pub(super) fn ledger_facts(&self) -> &str {
+        &self.ledger_facts
+    }
+
     pub(super) fn diagnostic(&self) -> &str {
         &self.diagnostic
     }
@@ -908,8 +921,10 @@ impl DiagnosticRepairWorkerRequest {
         let diagnostic = super::task_contract::mask_and_cap_recovery_field(&self.diagnostic);
         let evidence_command =
             super::task_contract::mask_and_cap_recovery_field(&self.evidence_command);
+        let ledger_facts = super::task_contract::mask_and_cap_recovery_field(&self.ledger_facts);
         format!(
-            "[DiagnosticRepairWorker] EvidenceFailedJob owns this turn. failure_kind={failure_kind}; target_role={target_role}; target={target}; allowed_change_kind={allowed_change_kind}; evidence_command={evidence_command}. Diagnostic: {diagnostic}. Next required action: {next_required_action}. Keep the change bounded to that target and failure. Do not switch files, run verification, or finish with prose.",
+            "[DiagnosticRepairWorker] EvidenceFailedJob owns this turn. repair_delta={repair_delta}; ledger_facts={ledger_facts}; failure_kind={failure_kind}; target_role={target_role}; target={target}; allowed_change_kind={allowed_change_kind}; evidence_command={evidence_command}. Treat repair_delta and ledger_facts as primary control data; treat Diagnostic as auxiliary failure text. Diagnostic: {diagnostic}. Next required action: {next_required_action}. Keep the change bounded to that target and failure. Do not switch files, run verification, or finish with prose.",
+            repair_delta = self.repair_delta_kind.as_str(),
             failure_kind = self.failure_kind.label(),
             target_role = self.target_role.label(),
             allowed_change_kind = self.allowed_change_kind,
@@ -930,6 +945,14 @@ impl TestAuthorWorkerRequest {
         &self.evidence_command
     }
 
+    pub(super) fn repair_delta_kind(&self) -> RepairTargetDeltaKind {
+        self.repair_delta_kind
+    }
+
+    pub(super) fn ledger_facts(&self) -> &str {
+        &self.ledger_facts
+    }
+
     pub(super) fn output_contract(&self) -> &'static str {
         self.output_contract
     }
@@ -937,8 +960,10 @@ impl TestAuthorWorkerRequest {
     pub(super) fn policy_message(&self) -> String {
         let target = self.target_test_path.to_string_lossy();
         format!(
-            "[TestAuthorWorker] MissingEvidenceJob owns this turn. Create or update `{target}` only, using exactly one Write or Edit tool call. The required evidence command is `{}`. Output runnable tests; do not answer in prose, do not call Bash, and do not change unrelated files.",
-            self.evidence_command
+            "[TestAuthorWorker] MissingEvidenceJob owns this turn. repair_delta={}; ledger_facts={}. Create or update `{target}` only, using exactly one Write or Edit tool call. The required evidence command is `{}`. Output runnable tests; do not answer in prose, do not call Bash, and do not change unrelated files.",
+            self.repair_delta_kind.as_str(),
+            self.ledger_facts,
+            self.evidence_command,
         )
     }
 }
@@ -976,6 +1001,19 @@ pub(super) fn test_author_worker_request_for_missing_evidence(
         "evidence_command",
         evidence_command.as_str(),
     ));
+    let repair_delta_kind = RepairTargetDeltaKind::MissingEvidence;
+    let ledger_facts = format!(
+        "target_path_present=true; evidence_command_present=true; implementation_context_present={}",
+        implementation_context.is_some()
+    );
+    context_pack.push(ContextPackEntry::new(
+        ContextPackKind::Repair,
+        "repair_delta",
+        format!(
+            "repair_delta_kind={}; ledger_facts={ledger_facts}",
+            repair_delta_kind.as_str()
+        ),
+    ));
     context_pack.push(ContextPackEntry::new(
         ContextPackKind::Target,
         "implementation_context",
@@ -989,6 +1027,8 @@ pub(super) fn test_author_worker_request_for_missing_evidence(
         target_test_path: target_test_path.clone(),
         allowed_write_scope: vec![target_test_path],
         evidence_command,
+        repair_delta_kind,
+        ledger_facts,
         output_contract: "exactly_one_write_or_edit_tool_call_creating_or_updating_the_owned_test_artifact",
     })
 }
@@ -1027,6 +1067,13 @@ pub(super) fn diagnostic_repair_worker_request_for_evidence_failed(
     } else {
         allowed_change_kind.trim().to_string()
     };
+    let repair_delta_kind = diagnostic_repair_delta_kind(failure_kind, target_role);
+    let ledger_facts = format!(
+        "target_path_present={}; evidence_command_present={}; diagnostic_failure_kind={}",
+        !target_hint.path.trim().is_empty(),
+        evidence_command.trim() != "rerun configured evidence command",
+        failure_kind.label()
+    );
     let mut context_pack =
         WorkerContract::from_task_contract(contract, WorkerKind::DiagnosticRepair).context_pack;
     context_pack.push(ContextPackEntry::new(
@@ -1042,7 +1089,11 @@ pub(super) fn diagnostic_repair_worker_request_for_evidence_failed(
     context_pack.push(ContextPackEntry::new(
         ContextPackKind::Repair,
         "allowed_change_kind",
-        allowed_change_kind.as_str(),
+        format!(
+            "allowed_change_kind={}; repair_delta_kind={}; ledger_facts={ledger_facts}",
+            allowed_change_kind,
+            repair_delta_kind.as_str()
+        ),
     ));
     context_pack.push(ContextPackEntry::new(
         ContextPackKind::Evidence,
@@ -1057,13 +1108,38 @@ pub(super) fn diagnostic_repair_worker_request_for_evidence_failed(
     DiagnosticRepairWorkerRequest {
         worker_contract: WorkerContract::from_task_contract(contract, WorkerKind::DiagnosticRepair)
             .with_context_pack(context_pack),
+        repair_delta_kind,
         failure_kind,
         target_role,
         target_path,
         allowed_change_kind,
         evidence_command,
+        ledger_facts,
         diagnostic: diagnostic.to_string(),
         output_contract: "single_bounded_repair_tool_action_for_the_declared_target_and_failure",
+    }
+}
+
+fn diagnostic_repair_delta_kind(
+    failure_kind: EvidenceFailureKind,
+    target_role: DiagnosticRepairTargetRole,
+) -> RepairTargetDeltaKind {
+    match failure_kind {
+        EvidenceFailureKind::SetupManifestMissing => RepairTargetDeltaKind::MissingEvidence,
+        EvidenceFailureKind::ContentSectionMissing | EvidenceFailureKind::SourceEvidenceMissing => {
+            RepairTargetDeltaKind::MissingDeliverable
+        }
+        EvidenceFailureKind::AssertionMismatch
+            if target_role == DiagnosticRepairTargetRole::TestArtifact =>
+        {
+            RepairTargetDeltaKind::StyleMismatch
+        }
+        EvidenceFailureKind::CompileError
+        | EvidenceFailureKind::ImportNameMismatch
+        | EvidenceFailureKind::SignatureMismatch
+        | EvidenceFailureKind::AssertionMismatch
+        | EvidenceFailureKind::SchemaMismatch
+        | EvidenceFailureKind::Unknown => RepairTargetDeltaKind::EvidenceFailed,
     }
 }
 
@@ -1948,7 +2024,21 @@ mod tests {
             &[PathBuf::from("tests/lib.rs")]
         );
         assert_eq!(request.evidence_command(), "cargo test");
+        assert_eq!(
+            request.repair_delta_kind(),
+            RepairTargetDeltaKind::MissingEvidence
+        );
+        assert!(
+            request
+                .ledger_facts()
+                .contains("evidence_command_present=true")
+        );
         assert!(request.policy_message().contains("TestAuthorWorker"));
+        assert!(
+            request
+                .policy_message()
+                .contains("repair_delta=missing_evidence")
+        );
         assert!(
             request
                 .worker_contract
@@ -2092,6 +2182,15 @@ mod tests {
         assert_eq!(request.allowed_change_kind(), "implementation");
         assert_eq!(request.evidence_command(), "cargo test");
         assert_eq!(
+            request.repair_delta_kind(),
+            RepairTargetDeltaKind::EvidenceFailed
+        );
+        assert!(
+            request
+                .ledger_facts()
+                .contains("diagnostic_failure_kind=compile_error")
+        );
+        assert_eq!(
             request.output_contract(),
             "single_bounded_repair_tool_action_for_the_declared_target_and_failure"
         );
@@ -2099,6 +2198,11 @@ mod tests {
             request
                 .policy_message("exactly one compact Edit on the declared target")
                 .contains("DiagnosticRepairWorker")
+        );
+        assert!(
+            request
+                .policy_message("exactly one compact Edit on the declared target")
+                .contains("Treat repair_delta and ledger_facts as primary control data")
         );
         let diagnostic_entries = request
             .worker_contract
@@ -2140,6 +2244,18 @@ mod tests {
         );
         assert_eq!(request.allowed_change_kind(), "test");
         assert_eq!(request.evidence_command(), "node --test tests/main.test.js");
+
+        let style_request = diagnostic_repair_worker_request_for_evidence_failed(
+            &contract,
+            "AssertionError: expected generated test expectation does not match the public contract",
+            &target_hint,
+            "test",
+            Some("node --test tests/main.test.js"),
+        );
+        assert_eq!(
+            style_request.repair_delta_kind(),
+            RepairTargetDeltaKind::StyleMismatch
+        );
     }
 
     #[test]
@@ -2164,6 +2280,10 @@ mod tests {
             docs_request.failure_kind(),
             EvidenceFailureKind::ContentSectionMissing
         );
+        assert_eq!(
+            docs_request.repair_delta_kind(),
+            RepairTargetDeltaKind::MissingDeliverable
+        );
         assert_eq!(docs_request.target_role(), DiagnosticRepairTargetRole::Docs);
         assert_eq!(docs_request.allowed_change_kind(), "docs");
 
@@ -2186,6 +2306,10 @@ mod tests {
         assert_eq!(
             data_request.failure_kind(),
             EvidenceFailureKind::SchemaMismatch
+        );
+        assert_eq!(
+            data_request.repair_delta_kind(),
+            RepairTargetDeltaKind::EvidenceFailed
         );
         assert_eq!(data_request.target_role(), DiagnosticRepairTargetRole::Data);
         assert_eq!(data_request.allowed_change_kind(), "data_schema");
@@ -2670,6 +2794,10 @@ mod tests {
         );
 
         assert_eq!(request.failure_kind(), EvidenceFailureKind::CompileError);
+        assert_eq!(
+            request.repair_delta_kind(),
+            RepairTargetDeltaKind::EvidenceFailed
+        );
         assert_eq!(
             request.target_role(),
             DiagnosticRepairTargetRole::Implementation
