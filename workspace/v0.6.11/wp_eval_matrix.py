@@ -189,6 +189,26 @@ def setup_ops_health(root: Path) -> None:
     script.chmod(0o755)
 
 
+def setup_feature_discount(root: Path) -> None:
+    write(
+        root / "discounts.py",
+        """
+        def final_price(price, percent):
+            return price
+        """,
+    )
+    write(
+        root / "tests" / "test_discounts.py",
+        """
+        from discounts import final_price
+
+
+        def test_zero_discount_keeps_price():
+            assert final_price(10, 0) == 10
+        """,
+    )
+
+
 def grade_docs(root: Path) -> tuple[bool, bool, bool, str]:
     path = root / "runbooks" / "local-agent-triage.md"
     if not path.exists():
@@ -235,6 +255,32 @@ def grade_ops(root: Path) -> tuple[bool, bool, bool, str]:
     text = read(path).lower()
     ok = "status=ok" in text and ("exit code" in text or "exit=0" in text or "exit status 0" in text)
     return ok, ok, True, "" if ok else "report does not capture command output and exit code"
+
+
+def grade_feature_discount(root: Path) -> tuple[bool, bool, bool, str]:
+    if not (root / "discounts.py").exists():
+        return False, False, False, "discounts.py missing"
+    if not (root / "tests" / "test_discounts.py").exists():
+        return False, False, False, "tests/test_discounts.py missing"
+    pytest_run = run_cmd(["python3", "-m", "pytest", "-q", "tests/test_discounts.py"], root, timeout=120)
+    if pytest_run.returncode != 0:
+        return False, False, False, f"pytest failed: {(pytest_run.stdout + pytest_run.stderr)[-300:]}"
+    check = run_cmd(
+        [
+            "python3",
+            "-c",
+            (
+                "from discounts import final_price; "
+                "assert final_price(100, 15) == 85.0; "
+                "assert final_price(19.99, 10) == 17.99; "
+                "assert final_price(10, 0) == 10"
+            ),
+        ],
+        root,
+        timeout=60,
+    )
+    ok = check.returncode == 0
+    return ok, ok, ok, "" if ok else f"direct behavior check failed: {(check.stdout + check.stderr)[-300:]}"
 
 
 def grade_python_sales(root: Path) -> tuple[bool, bool, bool, str]:
@@ -417,6 +463,14 @@ CASES: dict[str, Case] = {
         setup_empty,
         grade_python_markdown,
         ("markdown_lint.py", "tests/", "good.md", "bad.md"),
+    ),
+    "feature_discount": Case(
+        "feature_discount",
+        "feature",
+        "Improve the existing discounts.py function final_price(price, percent). It should return the price after applying the percentage discount, rounded to 2 decimal places. Keep the existing zero-discount behavior and update tests/test_discounts.py. Do not create documentation or unrelated files.",
+        setup_feature_discount,
+        grade_feature_discount,
+        ("discounts.py", "tests/", "__pycache__/"),
     ),
     "data_csv": Case(
         "data_csv",
