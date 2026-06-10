@@ -39,6 +39,8 @@
 use std::path::Path;
 
 use super::auto_test::{AutoTestPlan, AutoTestResult, VerifierCommand};
+#[cfg(test)]
+use super::completion_evidence::RepoEditCategory;
 use super::completion_evidence::{
     CompletionEvidence, EvidenceSet, is_completion_verifier_command,
     redact_verifier_command_for_storage,
@@ -1348,6 +1350,19 @@ pub(super) fn task_contract_needs_verification(
         .is_some_and(|contract| matches!(contract.evaluate(evidence), CompletionDecision::Verify))
 }
 
+fn task_contract_blocks_verifier_pass(
+    mode: ExecutionMode,
+    contract: Option<&TaskContract>,
+    evidence: &EvidenceSet,
+) -> Option<CompletionDecision> {
+    if mode == ExecutionMode::Plan {
+        return None;
+    }
+    contract
+        .map(|contract| contract.evaluate(evidence))
+        .filter(|decision| !matches!(decision, CompletionDecision::Done))
+}
+
 pub(super) fn task_contract_no_verifier_note(
     attempt: usize,
     attempt_limit: usize,
@@ -2579,14 +2594,31 @@ pub(super) fn handle_task_contract_verifier_pass(
     previous_repair_context: Option<RepairJob>,
     command: String,
 ) -> super::actor_loop_flow::TaskContractVerifierFlowOutcome {
-    if task_contract_needs_verification(
+    if let Some(decision) = task_contract_blocks_verifier_pass(
         agent.session.mode_state.mode,
         args.task_contract,
         &agent.task_contract_evidence_set_this_turn,
     ) {
+        let (reason, error_text) = match decision {
+            CompletionDecision::Continue { .. } => (
+                ExitReason::MissingRepoEdits,
+                "verifier passed but requested repository edit evidence was not recorded"
+                    .to_string(),
+            ),
+            CompletionDecision::Verify => (
+                ExitReason::MissingVerification,
+                "verifier passed but verifier evidence could not be recorded".to_string(),
+            ),
+            CompletionDecision::SafeStop { reason } => {
+                let (exit_reason, _) =
+                    super::actor_loop_flow::task_contract_verifier_safe_stop_mapping(reason);
+                (exit_reason, exit_reason.default_error_text().to_string())
+            }
+            CompletionDecision::Done => unreachable!("filtered above"),
+        };
         return super::actor_loop_flow::TaskContractVerifierFlowOutcome::Exit {
-            reason: ExitReason::MissingVerification,
-            error_text: "verifier passed but verifier evidence could not be recorded".to_string(),
+            reason,
+            error_text,
         };
     }
     let safe_command = crate::session::feedback::mask_secrets(&command).replace('`', "\\`");
@@ -3567,6 +3599,55 @@ pub(super) fn run_verifier_diagnostic_pass(agent: &mut Agent) -> VerifierDiagnos
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifier_pass_guard_blocks_coding_change_without_fresh_repo_edit() {
+        let contract = TaskContract::from_request(
+            "In calculator.py, add multiply(a, b). In tests/test_calculator.py, add tests for multiply. Preserve add and subtract behavior. Run the test suite.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "python3 -m pytest -q".to_string(),
+            bound_test_artifacts_count: Some(1),
+        });
+
+        let decision =
+            task_contract_blocks_verifier_pass(ExecutionMode::Act, Some(&contract), &evidence);
+
+        assert!(
+            matches!(decision, Some(CompletionDecision::Continue { .. })),
+            "verifier pass without fresh edit must not reach done: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn verifier_pass_guard_allows_coding_change_with_fresh_repo_edit() {
+        let contract = TaskContract::from_request(
+            "In calculator.py, add multiply(a, b). In tests/test_calculator.py, add tests for multiply. Preserve add and subtract behavior. Run the test suite.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::RepoEdit {
+            category: RepoEditCategory::Impl,
+            count: 1,
+            path: Some("calculator.py".to_string()),
+        });
+        evidence.push(CompletionEvidence::RepoEdit {
+            category: RepoEditCategory::Test,
+            count: 1,
+            path: Some("tests/test_calculator.py".to_string()),
+        });
+        evidence.push(CompletionEvidence::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "python3 -m pytest -q".to_string(),
+            bound_test_artifacts_count: Some(1),
+        });
+
+        let decision =
+            task_contract_blocks_verifier_pass(ExecutionMode::Act, Some(&contract), &evidence);
+
+        assert_eq!(decision, None);
+    }
 
     #[test]
     fn post_apply_candidate_defers_coding_unavailable_to_full_verifier() {

@@ -80,6 +80,7 @@ pub(super) struct ContractBoundGenerationPlan {
     authoring_style_policy: &'static str,
     authoring_style_decision: AuthoringStyleDecision,
     test_binding_policy: &'static str,
+    failure_taxonomy: &'static str,
     declared_artifacts: String,
     declared_expectations: String,
 }
@@ -146,6 +147,7 @@ impl ContractBoundGenerationPlan {
             ),
             authoring_style_decision: execution.authoring_style_decision,
             test_binding_policy: test_binding_policy_for(execution.runtime_profile),
+            failure_taxonomy: failure_taxonomy_for(execution),
             declared_artifacts: declared_artifacts_summary(&execution.deliverables),
             declared_expectations: declared_expectations_summary(execution),
         })
@@ -176,13 +178,14 @@ impl ContractBoundGenerationPlan {
             .collect::<Vec<_>>()
             .join(" -> ");
         format!(
-            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; authoring_style_decision={}; authoring_style_policy={}; test_binding_policy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
+            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; authoring_style_decision={}; authoring_style_policy={}; test_binding_policy={}; failure_taxonomy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
             self.alignment_predicate,
             self.runtime_profile.label(),
             runtime_constraint_for(self.runtime_profile),
             self.authoring_style_decision.summary(),
             self.authoring_style_policy,
             self.test_binding_policy,
+            self.failure_taxonomy,
             self.declared_artifacts,
             self.declared_expectations,
             phase_text
@@ -338,6 +341,21 @@ fn test_binding_policy_for(runtime_profile: RuntimeProfile) -> &'static str {
     }
 }
 
+fn failure_taxonomy_for(execution: &TaskExecutionContract) -> &'static str {
+    if execution.evidence.required
+        && has_roles(
+            &execution.deliverables,
+            &[ArtifactRole::Implementation, ArtifactRole::Test],
+        )
+    {
+        return "missing_deliverable|missing_evidence|evidence_runner_binding|evidence_failed|authoring_style_mismatch|contract_expectation_drift";
+    }
+    if execution.evidence.required {
+        return "missing_deliverable|missing_evidence|evidence_runner_binding|evidence_failed|contract_expectation_drift";
+    }
+    "missing_deliverable|contract_expectation_drift"
+}
+
 fn has_roles(deliverables: &[ExecutionDeliverable], roles: &[ArtifactRole]) -> bool {
     roles.iter().all(|role| {
         deliverables
@@ -442,6 +460,10 @@ mod tests {
             plan.policy_message()
                 .contains("prefer one coherent whole-file update")
         );
+        assert!(
+            plan.policy_message()
+                .contains("authoring_style_mismatch|contract_expectation_drift")
+        );
     }
 
     #[test]
@@ -466,6 +488,10 @@ mod tests {
                 && phase.worker_kind == WorkerKind::Data
         }));
         assert!(!plan.policy_message().contains("cargo"));
+        assert!(
+            plan.policy_message()
+                .contains("missing_deliverable|contract_expectation_drift")
+        );
     }
 
     #[test]

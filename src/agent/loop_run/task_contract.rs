@@ -1271,7 +1271,30 @@ impl TaskContract {
                 return CompletionDecision::SafeStop { reason };
             }
         }
+        if self.requires_fresh_repo_edit_before_done() && !evidence_has_repo_edit(evidence) {
+            return CompletionDecision::Continue {
+                missing: self.fresh_repo_edit_missing_roles(),
+            };
+        }
         CompletionDecision::Done
+    }
+
+    fn requires_fresh_repo_edit_before_done(&self) -> bool {
+        self.task_kind == TaskKind::Coding
+            && matches!(
+                self.intent,
+                TaskIntent::Build | TaskIntent::Modify | TaskIntent::Fix
+            )
+            && self.completion_policy.verification_required()
+            && (!self.required_artifacts.is_empty()
+                || self.required_behavior.confidence >= required_behavior::LOW_CONFIDENCE_THRESHOLD)
+    }
+
+    fn fresh_repo_edit_missing_roles(&self) -> Vec<ArtifactRole> {
+        if self.required_artifacts.is_empty() {
+            return vec![ArtifactRole::Implementation];
+        }
+        self.required_artifacts.clone()
     }
 
     /// Issue #652 PR-004: legacy generic retry budget for the
@@ -2041,6 +2064,12 @@ fn done_gate_safe_stop_reason(
         return SafeStopReason::VerifierWeak;
     }
     SafeStopReason::VerifierMissing
+}
+
+fn evidence_has_repo_edit(evidence: &EvidenceSet) -> bool {
+    evidence
+        .iter()
+        .any(|item| matches!(item, CompletionEvidence::RepoEdit { .. }))
 }
 
 /// Issue #920: intentional 1:1 decision point — every role has a distinct,
@@ -7010,6 +7039,43 @@ Create the README file."#;
         evidence.push(repo_edit(RepoEditCategory::Test));
         evidence.push(build_test_bound(1));
         let owned = vec!["tests/test_x.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert_eq!(decision, CompletionDecision::Done);
+    }
+
+    #[test]
+    fn coding_change_request_with_bound_verifier_still_requires_fresh_repo_edit() {
+        // WP6 regression guard: an existing test suite passing is not
+        // completion authority for a coding change request unless this turn
+        // produced an in-scope repository edit.
+        let contract = TaskContract::from_request(
+            "In calculator.py, add multiply(a, b). In tests/test_calculator.py, add tests for multiply. Preserve add and subtract behavior. Run the test suite.",
+        );
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert!(contract.completion_policy.verification_required());
+        let mut evidence = EvidenceSet::new();
+        evidence.push(build_test_bound(1));
+        let owned = vec!["tests/test_calculator.py".to_string()];
+        let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
+        assert!(
+            matches!(decision, CompletionDecision::Continue { .. }),
+            "fresh-edit-less coding change must not Done; got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn coding_change_request_with_fresh_repo_edit_and_bound_verifier_can_done() {
+        let contract = TaskContract::from_request(
+            "In calculator.py, add multiply(a, b). In tests/test_calculator.py, add tests for multiply. Preserve add and subtract behavior. Run the test suite.",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(repo_edit_path(RepoEditCategory::Impl, "calculator.py"));
+        evidence.push(repo_edit_path(
+            RepoEditCategory::Test,
+            "tests/test_calculator.py",
+        ));
+        evidence.push(build_test_bound(1));
+        let owned = vec!["tests/test_calculator.py".to_string()];
         let decision = contract.evaluate_with_owned_test_artifacts(&evidence, &owned);
         assert_eq!(decision, CompletionDecision::Done);
     }
