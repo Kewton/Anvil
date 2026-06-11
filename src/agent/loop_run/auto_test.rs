@@ -6093,6 +6093,7 @@ dev = [
             decision,
             CompletionDecision::SafeStop {
                 reason: SafeStopReason::VerifierMissing,
+                weak_reason: None,
             },
             "py_compile + required-tests + empty owned must SafeStop, got {decision:?}"
         );

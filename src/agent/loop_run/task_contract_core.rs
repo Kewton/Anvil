@@ -74,6 +74,7 @@ pub(super) enum CompletionDecision {
     /// judgement #2).
     SafeStop {
         reason: SafeStopReason,
+        weak_reason: Option<super::verifier_weak_reason::VerifierWeakReason>,
     },
 }
 

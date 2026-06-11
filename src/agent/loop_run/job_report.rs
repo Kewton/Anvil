@@ -51,6 +51,10 @@ pub(super) struct SafeStopLinkage {
     /// SafeStop reason label (e.g. `"verifier_weak"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Additional typed detail for `reason == "verifier_weak"`.
+    /// Omitted for non-weak safe-stops and older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weak_reason: Option<String>,
     /// `true` if `agent.safe_stop.report` was emitted this turn (after
     /// the job Report was emitted).
     #[serde(default)]
@@ -434,6 +438,10 @@ impl super::Agent {
         let safe_stop = match linkage_reason_override {
             Some(reason) => SafeStopLinkage {
                 reason: Some(reason),
+                weak_reason: self
+                    .turn_state
+                    .verifier_weak_reason_this_turn
+                    .map(|reason| reason.label().to_string()),
                 report_emitted: true,
             },
             None => self.snapshot_safe_stop_linkage(),
@@ -694,6 +702,10 @@ impl super::Agent {
             .map(|r| r.as_str().to_string());
         SafeStopLinkage {
             reason,
+            weak_reason: self
+                .turn_state
+                .verifier_weak_reason_this_turn
+                .map(|reason| reason.label().to_string()),
             report_emitted: true,
         }
     }
@@ -976,16 +988,22 @@ mod tests {
     fn safe_stop_linkage_serde_round_trip_with_defaults() {
         let l = SafeStopLinkage {
             reason: Some("verifier_weak".to_string()),
+            weak_reason: Some("structured_selection_unbound".to_string()),
             report_emitted: true,
         };
         let s = serde_json::to_string(&l).unwrap();
         let back: SafeStopLinkage = serde_json::from_str(&s).unwrap();
         assert_eq!(back.reason.as_deref(), Some("verifier_weak"));
+        assert_eq!(
+            back.weak_reason.as_deref(),
+            Some("structured_selection_unbound")
+        );
         assert!(back.report_emitted);
 
         // Defaults round-trip cleanly (missing fields).
         let default: SafeStopLinkage = serde_json::from_str("{}").unwrap();
         assert_eq!(default.reason, None);
+        assert_eq!(default.weak_reason, None);
         assert!(!default.report_emitted);
     }
 

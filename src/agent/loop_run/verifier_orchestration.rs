@@ -2400,6 +2400,8 @@ pub(super) fn handle_weak_task_contract_verifier_selection(
     detected_source: &'static str,
     owned_test_artifacts_count: usize,
 ) -> TaskContractVerifierOutcome {
+    let weak_reason = super::verifier_weak_reason::structured_selection_unbound_reason();
+    agent.turn_state.verifier_weak_reason_this_turn = Some(weak_reason);
     if !agent.session.verifier_safe_stop_emitted_this_turn {
         agent.session.verifier_safe_stop_emitted_this_turn = true;
         log_llm_event(
@@ -2410,6 +2412,8 @@ pub(super) fn handle_weak_task_contract_verifier_selection(
                 "iter_index": agent.session.iter_count_this_turn,
                 "owned_test_artifacts_count": owned_test_artifacts_count,
                 "command_runner": detected_source,
+                "weak_reason": weak_reason.label(),
+                "repairability_hint": weak_reason.repairability_hint(),
                 "auto_test_detected": true,
                 "test_execution_required": true,
             }),
@@ -2419,6 +2423,7 @@ pub(super) fn handle_weak_task_contract_verifier_selection(
     agent.session.record_feedback_if_unset(frame);
     TaskContractVerifierOutcome::SafeStop {
         reason: super::task_contract::SafeStopReason::VerifierWeak,
+        weak_reason: Some(weak_reason),
     }
 }
 
@@ -2426,8 +2431,12 @@ pub(super) fn handle_task_contract_verifier_safe_stop(
     agent: &mut Agent,
     last_iter: usize,
     reason: super::task_contract::SafeStopReason,
+    weak_reason: Option<super::verifier_weak_reason::VerifierWeakReason>,
     source: &'static str,
 ) -> super::actor_loop_flow::TaskContractVerifierFlowOutcome {
+    if let Some(weak_reason) = weak_reason {
+        agent.turn_state.verifier_weak_reason_this_turn = Some(weak_reason);
+    }
     let (mapped_reason, log_outcome) =
         super::actor_loop_flow::task_contract_verifier_safe_stop_mapping(reason);
     log_llm_event(
@@ -2437,6 +2446,7 @@ pub(super) fn handle_task_contract_verifier_safe_stop(
             "turn_index": agent.current_turn_index,
             "iter": last_iter,
             "outcome": log_outcome,
+            "weak_reason": weak_reason.map(|reason| reason.label()),
             "source": source,
         }),
     );
@@ -2638,7 +2648,10 @@ pub(super) fn handle_task_contract_verifier_pass(
                 ExitReason::MissingVerification,
                 "verifier passed but verifier evidence could not be recorded".to_string(),
             ),
-            CompletionDecision::SafeStop { reason } => {
+            CompletionDecision::SafeStop {
+                reason,
+                weak_reason: _,
+            } => {
                 let (exit_reason, _) =
                     super::actor_loop_flow::task_contract_verifier_safe_stop_mapping(reason);
                 (exit_reason, exit_reason.default_error_text().to_string())
@@ -2958,14 +2971,16 @@ pub(super) fn drive_task_contract_verifier(
                 error_text: error,
             }
         }
-        TaskContractVerifierOutcome::SafeStop { reason } => {
-            handle_task_contract_verifier_safe_stop(
-                agent,
-                args.last_iter,
-                reason,
-                "task_contract_verifier",
-            )
-        }
+        TaskContractVerifierOutcome::SafeStop {
+            reason,
+            weak_reason,
+        } => handle_task_contract_verifier_safe_stop(
+            agent,
+            args.last_iter,
+            reason,
+            weak_reason,
+            "task_contract_verifier",
+        ),
     }
 }
 

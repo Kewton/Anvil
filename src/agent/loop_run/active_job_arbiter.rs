@@ -1676,6 +1676,7 @@ mod tests {
             missing_verifier_next_action: Some(next_action.clone()),
             task_contract_action: Some(ArtifactRecoveryAction::SafeStop {
                 reason: super::super::task_contract::SafeStopReason::VerifierMissing,
+                weak_reason: None,
             }),
             ..loop_inputs()
         });
@@ -1688,6 +1689,7 @@ mod tests {
             &action,
             Some(&ArtifactRecoveryAction::SafeStop {
                 reason: super::super::task_contract::SafeStopReason::VerifierMissing,
+                weak_reason: None,
             }),
         );
         assert_eq!(

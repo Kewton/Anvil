@@ -1829,14 +1829,22 @@ mod tests {
     fn task_contract_verifier_with_structured_weak_returns_safe_stop_verifier_weak() {
         let outcome = TaskContractVerifierOutcome::SafeStop {
             reason: SafeStopReason::VerifierWeak,
+            weak_reason: Some(super::verifier_weak_reason::structured_selection_unbound_reason()),
         };
         // Pin the variant: it must carry the typed reason so downstream
         // matches stay exhaustive (no `_ =>` fallback).
         match outcome {
-            TaskContractVerifierOutcome::SafeStop { reason } => {
+            TaskContractVerifierOutcome::SafeStop {
+                reason,
+                weak_reason,
+            } => {
                 let (mapped, tag) = task_contract_verifier_safe_stop_mapping(reason);
                 assert_eq!(mapped, ExitReason::SafeStopVerifierWeak);
                 assert_eq!(tag, "safe_stop_verifier_weak");
+                assert_eq!(
+                    weak_reason.map(|reason| reason.label()),
+                    Some("structured_selection_unbound")
+                );
             }
             other => panic!("expected SafeStop, got {other:?}"),
         }
@@ -1846,9 +1854,10 @@ mod tests {
     fn task_contract_verifier_with_structured_missing_returns_safe_stop_verifier_missing() {
         let outcome = TaskContractVerifierOutcome::SafeStop {
             reason: SafeStopReason::VerifierMissing,
+            weak_reason: None,
         };
         match outcome {
-            TaskContractVerifierOutcome::SafeStop { reason } => {
+            TaskContractVerifierOutcome::SafeStop { reason, .. } => {
                 let (mapped, tag) = task_contract_verifier_safe_stop_mapping(reason);
                 assert_eq!(mapped, ExitReason::SafeStopVerifierMissing);
                 assert_eq!(tag, "safe_stop_verifier_missing");
@@ -1863,7 +1872,8 @@ mod tests {
         assert_eq!(
             outcome,
             TaskContractVerifierOutcome::SafeStop {
-                reason: SafeStopReason::VerifierMissing
+                reason: SafeStopReason::VerifierMissing,
+                weak_reason: None,
             }
         );
     }
@@ -1881,9 +1891,11 @@ mod tests {
         // retry vs ExitReason::SafeStopVerifier* respectively.
         let safe_stop_w = TaskContractVerifierOutcome::SafeStop {
             reason: SafeStopReason::VerifierWeak,
+            weak_reason: Some(super::verifier_weak_reason::structured_selection_unbound_reason()),
         };
         let safe_stop_m = TaskContractVerifierOutcome::SafeStop {
             reason: SafeStopReason::VerifierMissing,
+            weak_reason: None,
         };
         let no_verifier = TaskContractVerifierOutcome::NoVerifier;
         assert_ne!(safe_stop_w, no_verifier);

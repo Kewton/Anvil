@@ -266,11 +266,13 @@ fn handle_repair_job_verifier_safe_stop(
     agent: &mut Agent,
     last_iter: usize,
     reason: SafeStopReason,
+    weak_reason: Option<super::verifier_weak_reason::VerifierWeakReason>,
 ) -> TaskContractVerifierFlowOutcome {
     let outcome = super::verifier_orchestration::handle_task_contract_verifier_safe_stop(
         agent,
         last_iter,
         reason,
+        weak_reason,
         "repair_job_verifier",
     );
     if let Some(job) = agent.repair_job.as_mut() {
@@ -610,9 +612,10 @@ fn drive_repair_job_verifier(
                 error_text: error,
             }
         }
-        TaskContractVerifierOutcome::SafeStop { reason } => {
-            handle_repair_job_verifier_safe_stop(agent, args.last_iter, reason)
-        }
+        TaskContractVerifierOutcome::SafeStop {
+            reason,
+            weak_reason,
+        } => handle_repair_job_verifier_safe_stop(agent, args.last_iter, reason, weak_reason),
     }
 }
 

@@ -1163,6 +1163,7 @@ impl TaskContract {
             if owned_test_artifacts.is_empty() {
                 return CompletionDecision::SafeStop {
                     reason: SafeStopReason::VerifierMissing,
+                    weak_reason: None,
                 };
             }
             // Sub-gate 2 (PR-001 + Issue #661 iteration-3 Task 4.1/4.2):
@@ -1185,8 +1186,11 @@ impl TaskContract {
             //   * only `None` evidence + no Weak metadata
             //                                  → VerifierMissing
             if !has_bound_build_test_verifier(evidence) {
-                let reason = done_gate_safe_stop_reason(evidence, weak_metadata);
-                return CompletionDecision::SafeStop { reason };
+                let (reason, weak_reason) = done_gate_safe_stop_reason(evidence, weak_metadata);
+                return CompletionDecision::SafeStop {
+                    reason,
+                    weak_reason,
+                };
             }
         }
         if self.requires_fresh_repo_edit_before_done() && !evidence_has_repo_edit(evidence) {
@@ -1476,7 +1480,7 @@ fn missing_labels(decision: &CompletionDecision) -> Vec<&'static str> {
         // Issue #651: SafeStop labels mirror the log-payload `dispatched`
         // tags so unit tests can assert the reason without reaching into
         // log_llm_event output.
-        CompletionDecision::SafeStop { reason } => match reason {
+        CompletionDecision::SafeStop { reason, .. } => match reason {
             SafeStopReason::VerifierWeak => vec!["verifier_weak"],
             SafeStopReason::VerifierMissing => vec!["verifier_missing"],
         },
@@ -1966,28 +1970,20 @@ fn has_bound_build_test_verifier(evidence: &EvidenceSet) -> bool {
 fn done_gate_safe_stop_reason(
     evidence: &EvidenceSet,
     weak_metadata: Option<usize>,
-) -> SafeStopReason {
-    let has_bound_zero = evidence.iter().any(|item| {
-        matches!(
-            item,
-            CompletionEvidence::VerifierExitZero {
-                class: BashCommandClass::BuildTest,
-                bound_test_artifacts_count: Some(0),
-                ..
-            }
-        )
-    });
-    if has_bound_zero {
-        return SafeStopReason::VerifierWeak;
+) -> (
+    SafeStopReason,
+    Option<super::verifier_weak_reason::VerifierWeakReason>,
+) {
+    if let Some(reason) =
+        super::verifier_weak_reason::done_gate_weak_reason(evidence, weak_metadata)
+    {
+        return (SafeStopReason::VerifierWeak, Some(reason));
     }
     // No bound evidence at all — caller may still carry Weak metadata
     // from `OwnedTestVerifierPlan::Weak { owned_test_artifacts_count > 0 }`,
     // which back-ports the Weak reason. `Some(0)` is treated as absence
     // (the design pins the source to `count > 0`).
-    if matches!(weak_metadata, Some(n) if n > 0) {
-        return SafeStopReason::VerifierWeak;
-    }
-    SafeStopReason::VerifierMissing
+    (SafeStopReason::VerifierMissing, None)
 }
 
 fn evidence_has_repo_edit(evidence: &EvidenceSet) -> bool {
@@ -7012,6 +7008,7 @@ Create the README file."#;
     fn missing_labels_for_safe_stop_weak_returns_verifier_weak() {
         let decision = CompletionDecision::SafeStop {
             reason: SafeStopReason::VerifierWeak,
+            weak_reason: None,
         };
         assert_eq!(missing_labels(&decision), vec!["verifier_weak"]);
     }
@@ -7020,6 +7017,7 @@ Create the README file."#;
     fn missing_labels_for_safe_stop_missing_returns_verifier_missing() {
         let decision = CompletionDecision::SafeStop {
             reason: SafeStopReason::VerifierMissing,
+            weak_reason: None,
         };
         assert_eq!(missing_labels(&decision), vec!["verifier_missing"]);
     }
@@ -7028,11 +7026,13 @@ Create the README file."#;
     fn safe_stop_decision_converts_to_safe_stop_recovery_action() {
         let action = ArtifactRecoveryAction::from(CompletionDecision::SafeStop {
             reason: SafeStopReason::VerifierWeak,
+            weak_reason: None,
         });
         assert_eq!(
             action,
             ArtifactRecoveryAction::SafeStop {
                 reason: SafeStopReason::VerifierWeak,
+                weak_reason: None,
             }
         );
     }
@@ -7064,6 +7064,7 @@ Create the README file."#;
             decision,
             CompletionDecision::SafeStop {
                 reason: SafeStopReason::VerifierMissing,
+                weak_reason: None,
             }
         );
     }
@@ -7111,6 +7112,7 @@ Create the README file."#;
             decision,
             CompletionDecision::SafeStop {
                 reason: SafeStopReason::VerifierMissing,
+                weak_reason: None,
             },
             "unbound verifier evidence must not satisfy Done"
         );
@@ -7362,6 +7364,9 @@ Create the README file."#;
             decision,
             CompletionDecision::SafeStop {
                 reason: SafeStopReason::VerifierWeak,
+                weak_reason: Some(
+                    crate::agent::loop_run::verifier_weak_reason::VerifierWeakReason::ExitZeroWithoutOwnedBinding
+                ),
             },
             "Some(0) evidence must collapse to VerifierWeak, not Done / VerifierMissing"
         );
@@ -7386,6 +7391,9 @@ Create the README file."#;
             decision,
             CompletionDecision::SafeStop {
                 reason: SafeStopReason::VerifierWeak,
+                weak_reason: Some(
+                    crate::agent::loop_run::verifier_weak_reason::VerifierWeakReason::ExitZeroWithoutOwnedBinding
+                ),
             }
         );
     }
@@ -7410,6 +7418,9 @@ Create the README file."#;
             decision,
             CompletionDecision::SafeStop {
                 reason: SafeStopReason::VerifierWeak,
+                weak_reason: Some(
+                    crate::agent::loop_run::verifier_weak_reason::VerifierWeakReason::WeakPlanMetadataOnly
+                ),
             }
         );
     }
@@ -7430,6 +7441,7 @@ Create the README file."#;
             decision,
             CompletionDecision::SafeStop {
                 reason: SafeStopReason::VerifierMissing,
+                weak_reason: None,
             }
         );
     }
@@ -7465,6 +7477,7 @@ Create the README file."#;
             decision,
             CompletionDecision::SafeStop {
                 reason: SafeStopReason::VerifierMissing,
+                weak_reason: None,
             }
         );
     }

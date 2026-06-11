@@ -1523,7 +1523,7 @@ fn sync_post_tool_contract_recovery_target(
             );
         }
         super::task_contract::ArtifactRecoveryAction::Done => {}
-        super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
+        super::task_contract::ArtifactRecoveryAction::SafeStop { reason, .. } => {
             super::artifact_recovery_flow::clear_artifact_recovery_target(
                 agent,
                 task_contract_safe_stop_clear_tag(reason),
@@ -2483,8 +2483,11 @@ pub(super) fn handle_actor_loop_task_contract_reply(
         super::task_contract::ArtifactRecoveryAction::Done => {
             ActorLoopTaskContractReplyOutcome::Proceed
         }
-        super::task_contract::ArtifactRecoveryAction::SafeStop { reason } => {
-            handle_actor_loop_task_contract_safe_stop(agent, *reason, args.last_iter)
+        super::task_contract::ArtifactRecoveryAction::SafeStop {
+            reason,
+            weak_reason,
+        } => {
+            handle_actor_loop_task_contract_safe_stop(agent, *reason, *weak_reason, args.last_iter)
         }
     }
 }
@@ -2952,8 +2955,12 @@ fn emit_command_observation_evidence_request(
 pub(super) fn handle_actor_loop_task_contract_safe_stop(
     agent: &mut Agent,
     reason: super::task_contract::SafeStopReason,
+    weak_reason: Option<super::verifier_weak_reason::VerifierWeakReason>,
     last_iter: usize,
 ) -> ActorLoopTaskContractReplyOutcome {
+    if let Some(weak_reason) = weak_reason {
+        agent.turn_state.verifier_weak_reason_this_turn = Some(weak_reason);
+    }
     let (mapped_reason, log_outcome) = task_contract_verifier_safe_stop_mapping(reason);
     crate::logging::log_llm_event(
         "agent.task_contract.safe_stop",
@@ -2962,6 +2969,7 @@ pub(super) fn handle_actor_loop_task_contract_safe_stop(
             "turn_index": agent.current_turn_index,
             "iter": last_iter,
             "outcome": log_outcome,
+            "weak_reason": weak_reason.map(|reason| reason.label()),
         }),
     );
     ActorLoopTaskContractReplyOutcome::Exit {
@@ -5287,7 +5295,7 @@ pub(super) fn task_contract_action_completion_exit(
             ExitReason::MissingRepoEdits,
             "task contract did not produce evidence-based completion".to_string(),
         )),
-        Some(super::task_contract::ArtifactRecoveryAction::SafeStop { reason }) => {
+        Some(super::task_contract::ArtifactRecoveryAction::SafeStop { reason, .. }) => {
             let (exit_reason, _) = task_contract_verifier_safe_stop_mapping(*reason);
             Some((exit_reason, exit_reason.default_error_text().to_string()))
         }
@@ -5578,6 +5586,7 @@ mod tests {
     fn task_contract_completion_gate_preserves_safe_stop_reason() {
         let action = super::super::task_contract::ArtifactRecoveryAction::SafeStop {
             reason: super::super::task_contract::SafeStopReason::VerifierMissing,
+            weak_reason: None,
         };
         let (reason, text) = task_contract_action_completion_exit(Some(&action))
             .expect("safe stop must terminate completion");

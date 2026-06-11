@@ -9,6 +9,7 @@ use super::failure_packet::FailurePacketTimeoutKind;
 use super::project_probe::ProjectUnit;
 use super::task_contract::SafeStopReason;
 use super::task_workspace_scope::TaskWorkspaceScope;
+use super::verifier_weak_reason::VerifierWeakReason;
 
 /// Normalized outcome of one task-contract verifier invocation.
 ///
@@ -34,6 +35,7 @@ pub(super) enum TaskContractVerifierOutcome {
     /// bound to the task-owned test artifacts.
     SafeStop {
         reason: SafeStopReason,
+        weak_reason: Option<VerifierWeakReason>,
     },
 }
 
@@ -307,6 +309,7 @@ pub(super) fn task_contract_structured_missing_outcome(
     if owned_test_artifacts_count == 0 {
         TaskContractVerifierOutcome::SafeStop {
             reason: SafeStopReason::VerifierMissing,
+            weak_reason: None,
         }
     } else {
         TaskContractVerifierOutcome::NoVerifier
@@ -610,7 +613,8 @@ mod tests {
         assert_eq!(
             task_contract_structured_missing_outcome(0),
             TaskContractVerifierOutcome::SafeStop {
-                reason: SafeStopReason::VerifierMissing
+                reason: SafeStopReason::VerifierMissing,
+                weak_reason: None,
             }
         );
         assert_eq!(
@@ -653,7 +657,8 @@ mod tests {
             ),
             TaskContractVerifierSelection::StructuredMissing {
                 outcome: TaskContractVerifierOutcome::SafeStop {
-                    reason: SafeStopReason::VerifierMissing
+                    reason: SafeStopReason::VerifierMissing,
+                    weak_reason: None,
                 },
                 owned_test_artifacts_count: 0
             }
@@ -679,7 +684,8 @@ mod tests {
             ),
             TaskContractVerifierSelection::StructuredMissing {
                 outcome: TaskContractVerifierOutcome::SafeStop {
-                    reason: SafeStopReason::VerifierMissing
+                    reason: SafeStopReason::VerifierMissing,
+                    weak_reason: None,
                 },
                 owned_test_artifacts_count: 0
             }

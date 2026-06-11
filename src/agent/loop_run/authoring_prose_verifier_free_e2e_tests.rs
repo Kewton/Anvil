@@ -119,7 +119,8 @@ mod tests {
                 !matches!(
                     decision,
                     CompletionDecision::SafeStop {
-                        reason: SafeStopReason::VerifierMissing | SafeStopReason::VerifierWeak
+                        reason: SafeStopReason::VerifierMissing | SafeStopReason::VerifierWeak,
+                        ..
                     }
                 ),
                 "{request}: prose must not SafeStop on missing/weak verifier (got {decision:?})"

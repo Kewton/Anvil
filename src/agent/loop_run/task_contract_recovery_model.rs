@@ -11,6 +11,7 @@ use super::task_contract::{
     ArtifactRole, ArtifactState, CompletionDecision, RecoveryTargetHint, SafeStopReason,
     TaskContract,
 };
+use super::verifier_weak_reason::VerifierWeakReason;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ArtifactRecoveryAction {
@@ -25,6 +26,7 @@ pub(super) enum ArtifactRecoveryAction {
     Done,
     SafeStop {
         reason: SafeStopReason,
+        weak_reason: Option<VerifierWeakReason>,
     },
 }
 
@@ -52,7 +54,13 @@ impl From<CompletionDecision> for ArtifactRecoveryAction {
             },
             CompletionDecision::Verify => ArtifactRecoveryAction::RunVerifier,
             CompletionDecision::Done => ArtifactRecoveryAction::Done,
-            CompletionDecision::SafeStop { reason } => ArtifactRecoveryAction::SafeStop { reason },
+            CompletionDecision::SafeStop {
+                reason,
+                weak_reason,
+            } => ArtifactRecoveryAction::SafeStop {
+                reason,
+                weak_reason,
+            },
         }
     }
 }

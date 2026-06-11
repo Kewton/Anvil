@@ -11,6 +11,8 @@ pub(super) struct TurnState {
     pub(super) last_behavior_contract_projection_event:
         Option<super::required_behavior::BehaviorProjectionEventKey>,
     pub(super) last_verifier_invoked_payload_digest: Option<[u8; 8]>,
+    pub(super) verifier_weak_reason_this_turn:
+        Option<super::verifier_weak_reason::VerifierWeakReason>,
     pub(super) external_import_rejected_emitted: bool,
     pub(super) last_pam_decision_this_turn: Option<super::pam_advisory::PamAdvisoryDecision>,
     pub(super) last_pam_unused_reason_this_turn: Option<String>,
@@ -24,6 +26,7 @@ impl TurnState {
             job_report_dedup_keys: std::collections::HashSet::new(),
             last_behavior_contract_projection_event: None,
             last_verifier_invoked_payload_digest: None,
+            verifier_weak_reason_this_turn: None,
             external_import_rejected_emitted: false,
             last_pam_decision_this_turn: None,
             last_pam_unused_reason_this_turn: None,
@@ -36,6 +39,7 @@ impl TurnState {
         self.job_report_dedup_keys.clear();
         self.last_behavior_contract_projection_event = None;
         self.last_verifier_invoked_payload_digest = None;
+        self.verifier_weak_reason_this_turn = None;
         self.external_import_rejected_emitted = false;
     }
 
@@ -75,6 +79,7 @@ impl TurnState {
             && self.job_report_dedup_keys.is_empty()
             && self.last_behavior_contract_projection_event.is_none()
             && self.last_verifier_invoked_payload_digest.is_none()
+            && self.verifier_weak_reason_this_turn.is_none()
             && !self.external_import_rejected_emitted
     }
 }
@@ -112,6 +117,8 @@ mod tests {
             },
         );
         state.last_verifier_invoked_payload_digest = Some([0xAB; 8]);
+        state.verifier_weak_reason_this_turn =
+            Some(super::super::verifier_weak_reason::structured_selection_unbound_reason());
         state.external_import_rejected_emitted = true;
 
         assert!(!state.dedup_state_is_empty());

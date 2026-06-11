@@ -157,6 +157,7 @@ mod tests {
 
         let safe_stop = ArtifactRecoveryAction::SafeStop {
             reason: SafeStopReason::VerifierMissing,
+            weak_reason: None,
         };
         assert!(!recoverable_action_available(Some(&safe_stop)));
         assert!(safe_boundary_action(Some(&safe_stop)));
@@ -207,6 +208,7 @@ mod tests {
     fn safe_boundary_terminal_is_not_converted_into_recovery() {
         let action = ArtifactRecoveryAction::SafeStop {
             reason: SafeStopReason::VerifierWeak,
+            weak_reason: None,
         };
         let ledger = ControllerPolicyLedger::default();
         assert_eq!(

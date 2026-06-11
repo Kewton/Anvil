@@ -78,7 +78,7 @@ pub(super) fn reconcile_post_tool_action(
             }
         }
         ArtifactRecoveryAction::Done => PostToolReconciliationStatus::Done,
-        ArtifactRecoveryAction::SafeStop { reason } => {
+        ArtifactRecoveryAction::SafeStop { reason, .. } => {
             PostToolReconciliationStatus::Blocked { reason: *reason }
         }
     };
