@@ -187,7 +187,7 @@ impl ContractBoundGenerationPlan {
             .collect::<Vec<_>>()
             .join(" -> ");
         format!(
-            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; runtime_capability_authority={}; authoring_style_decision={}; authoring_style_enforcement={}; authoring_style_policy={}; evidence_runner_policy={}; test_binding_policy={}; failure_taxonomy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. If declared_expectations contains api_contracts with request_body=json, implement request_json_body_fields as JSON request-body object fields, not query or form parameters. If api_contracts has expected_status=unspecified, tests must not assert an exact HTTP status invented from words like created; assert response success only when needed. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
+            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; runtime_capability_authority={}; authoring_style_decision={}; authoring_style_enforcement={}; authoring_style_policy={}; evidence_runner_policy={}; test_binding_policy={}; failure_taxonomy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. If declared_expectations contains api_contracts with request_body=json, implement request_json_body_fields as JSON request-body object fields, not query, form, or separate top-level handler parameters. If api_contracts has status_assertion_policy=no_exact_http_status, tests must not compare status_code to a numeric literal invented from words like created; use a success/non-error predicate only when a status check is needed. If api_contracts contains response_shape=empty_collection, tests may assert that response shape for the declared endpoint in isolation, but must not infer cross-endpoint persistence, post-to-list mutation, list length after writes, or ordering unless declared. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
             self.alignment_predicate,
             self.runtime_profile.label(),
             runtime_constraint_for(self.runtime_profile),
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn generation_packet_includes_generic_json_body_binding_policy_for_api_contracts() {
         let contract = TaskContract::from_request(
-            "Create app.py and tests/test_app.py for an API. Implement POST /notes accepting JSON with title and body, returning the created note with id=1.",
+            "Create app.py and tests/test_app.py for an API. Implement GET /notes returning an empty list and POST /notes accepting JSON with title and body, returning the created note with id=1.",
         );
         let execution = TaskExecutionContract::from_task_contract(&contract)
             .with_runtime_profile(RuntimeProfile::Python)
@@ -639,16 +639,28 @@ mod tests {
         );
         assert!(message.contains("expected_status=unspecified"), "{message}");
         assert!(
+            message.contains("status_assertion_policy=no_exact_http_status"),
+            "{message}"
+        );
+        assert!(
             message
                 .contains("implement request_json_body_fields as JSON request-body object fields"),
             "{message}"
         );
         assert!(
-            message.contains("not query or form parameters"),
+            message.contains("not query, form, or separate top-level handler parameters"),
             "{message}"
         );
         assert!(
-            message.contains("tests must not assert an exact HTTP status"),
+            message.contains("tests must not compare status_code to a numeric literal"),
+            "{message}"
+        );
+        assert!(
+            message.contains("response_shape=empty_collection"),
+            "{message}"
+        );
+        assert!(
+            message.contains("must not infer cross-endpoint persistence"),
             "{message}"
         );
     }

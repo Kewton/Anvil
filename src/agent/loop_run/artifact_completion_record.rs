@@ -190,7 +190,7 @@ mod tests {
             "{context}"
         );
         assert!(
-            context.contains("not query or form parameters"),
+            context.contains("not query, form, or separate top-level handler parameters"),
             "{context}"
         );
     }

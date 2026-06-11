@@ -40,6 +40,22 @@ pub(super) struct ApiContractExpectation {
     pub(super) request_json_fields: Vec<String>,
     pub(super) expected_status: Option<u16>,
     pub(super) response_fields: Vec<String>,
+    pub(super) response_shape: ApiResponseShapeExpectation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ApiResponseShapeExpectation {
+    Unspecified,
+    EmptyCollection,
+}
+
+impl ApiResponseShapeExpectation {
+    fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Unspecified => None,
+            Self::EmptyCollection => Some("empty_collection"),
+        }
+    }
 }
 
 impl ApiContractExpectation {
@@ -62,7 +78,10 @@ impl ApiContractExpectation {
         }
         match self.expected_status {
             Some(status) => parts.push(format!("expected_status={status}")),
-            None => parts.push("expected_status=unspecified".to_string()),
+            None => {
+                parts.push("expected_status=unspecified".to_string());
+                parts.push("status_assertion_policy=no_exact_http_status".to_string());
+            }
         }
         if !self.response_fields.is_empty() {
             parts.push(format!(
@@ -73,6 +92,9 @@ impl ApiContractExpectation {
                     .collect::<Vec<_>>()
                     .join("|")
             ));
+        }
+        if let Some(shape) = self.response_shape.label() {
+            parts.push(format!("response_shape={shape}"));
         }
         parts.join(",")
     }
@@ -225,6 +247,7 @@ pub(super) fn extract_api_contract_expectations(request: &str) -> Vec<ApiContrac
             request_json_fields,
             expected_status: expected_status_from_clause(clause),
             response_fields,
+            response_shape: response_shape_from_clause(clause),
         });
     }
     expectations
@@ -382,7 +405,7 @@ pub(super) fn api_contract_artifact_directed_context(
     let summary = api_contract_summary(expectations)?;
     let summary = super::task_contract::mask_and_cap_recovery_field(&summary);
     Some(format!(
-        "Typed API contract context: api_contracts={summary}. If api_contracts contains request_body=json, implement request_json_body_fields as JSON request-body object fields, not query or form parameters."
+        "Typed API contract context: api_contracts={summary}. If api_contracts contains request_body=json, implement request_json_body_fields as JSON request-body object fields, not query, form, or separate top-level handler parameters. If api_contracts contains status_assertion_policy=no_exact_http_status, do not introduce numeric status-code requirements. If api_contracts contains response_shape=empty_collection, keep it as the declared endpoint response shape and do not infer cross-endpoint persistence unless declared."
     ))
 }
 
@@ -486,6 +509,14 @@ fn response_fields_from_clause(clause: &str, request_json_fields: &[String]) -> 
         }
     }
     fields
+}
+
+fn response_shape_from_clause(clause: &str) -> ApiResponseShapeExpectation {
+    if clause.contains("empty list") || clause.contains("empty array") {
+        ApiResponseShapeExpectation::EmptyCollection
+    } else {
+        ApiResponseShapeExpectation::Unspecified
+    }
 }
 
 fn expected_status_from_clause(clause: &str) -> Option<u16> {
@@ -618,8 +649,27 @@ mod tests {
         assert_eq!(expectations[0].method, HttpMethod::Get);
         assert_eq!(expectations[0].path, "/notes");
         assert!(expectations[0].response_fields.is_empty());
+        assert_eq!(
+            expectations[0].response_shape,
+            ApiResponseShapeExpectation::EmptyCollection
+        );
         assert_eq!(expectations[1].method, HttpMethod::Post);
         assert_eq!(expectations[1].request_json_fields, vec!["title", "body"]);
+    }
+
+    #[test]
+    fn projects_empty_collection_response_shape_without_persistence_assumption() {
+        let expectations = extract_api_contract_expectations(
+            "GET /notes returning an empty list and POST /notes accepting JSON with title and body.",
+        );
+        let summary = api_contract_summary(&expectations).expect("summary");
+
+        assert!(summary.contains("method=GET,path=/notes"), "{summary}");
+        assert!(
+            summary.contains("response_shape=empty_collection"),
+            "{summary}"
+        );
+        assert!(!summary.contains("stateful_collection"), "{summary}");
     }
 
     #[test]
@@ -639,6 +689,10 @@ mod tests {
         let summary = api_contract_summary(&expectations).expect("summary");
 
         assert!(summary.contains("expected_status=unspecified"), "{summary}");
+        assert!(
+            summary.contains("status_assertion_policy=no_exact_http_status"),
+            "{summary}"
+        );
         assert!(!summary.contains("expected_status=201"), "{summary}");
     }
 
@@ -750,7 +804,7 @@ mod tests {
 
         assert_eq!(
             payload["observation"].as_str().unwrap_or_default(),
-            "kind=request_schema_mismatch; expected=method=POST,path=/notes,request_body=json,request_binding=json_body_object,request_json_body_fields=title|body,expected_status=unspecified,response_fields=id; observed=method=POST,path=/notes,request_json_body_fields=title|body,request_binding_issue=json_body_fields_not_bound,status_policy=unspecified,diagnostic_expected_status=422,observed_status=422; repair_hint=bind_declared_fields_from_json_request_body_object_not_query_or_form_params"
+            "kind=request_schema_mismatch; expected=method=POST,path=/notes,request_body=json,request_binding=json_body_object,request_json_body_fields=title|body,expected_status=unspecified,status_assertion_policy=no_exact_http_status,response_fields=id; observed=method=POST,path=/notes,request_json_body_fields=title|body,request_binding_issue=json_body_fields_not_bound,status_policy=unspecified,diagnostic_expected_status=422,observed_status=422; repair_hint=bind_declared_fields_from_json_request_body_object_not_query_or_form_params"
         );
     }
 
@@ -767,6 +821,10 @@ mod tests {
 
         assert!(delta.contains("kind=status_mismatch"), "{delta}");
         assert!(delta.contains("expected_status=unspecified"), "{delta}");
+        assert!(
+            delta.contains("status_assertion_policy=no_exact_http_status"),
+            "{delta}"
+        );
         assert!(
             delta.contains("do_not_invent_exact_http_status_when_expected_status_unspecified"),
             "{delta}"

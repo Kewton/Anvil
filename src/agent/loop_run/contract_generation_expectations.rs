@@ -400,7 +400,15 @@ mod tests {
             summary.contains("response_fields=id|title|body"),
             "{summary}"
         );
-        assert!(!summary.contains("expected_status="), "{summary}");
+        assert!(
+            summary.contains("response_shape=empty_collection"),
+            "{summary}"
+        );
+        assert!(summary.contains("expected_status=unspecified"), "{summary}");
+        assert!(
+            summary.contains("status_assertion_policy=no_exact_http_status"),
+            "{summary}"
+        );
     }
 
     #[test]
