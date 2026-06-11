@@ -191,6 +191,7 @@ mod working_memory_messages;
 mod artifact_recovery_flow;
 mod artifact_target_alignment;
 mod authoring_style;
+mod behavior_delta_obligation;
 // Artifact-recovery target installer (projection-write half)
 // extracted from `turn.rs` (parent #680). Hosts
 // `set_artifact_recovery_target_for_decision`,

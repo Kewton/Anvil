@@ -90,6 +90,15 @@ pub(super) fn populate_task_contract_authority(agent: &mut Agent) {
         )),
     };
     emit_semantic_candidate_shadow(agent, &contract);
+    if let Some(delta) =
+        super::behavior_delta_obligation::project_behavior_delta_obligation(&contract)
+    {
+        super::behavior_delta_obligation::log_behavior_delta_shadow(
+            agent.session_store.session_id(),
+            agent.current_turn_index,
+            &delta,
+        );
+    }
     let _ = agent.task_contract_this_turn.set(contract);
 }
 
