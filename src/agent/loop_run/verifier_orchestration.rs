@@ -1319,7 +1319,7 @@ pub(super) fn model_assessment_to_verifier_repair_assessment(
         .chain(secondary_repair_candidates.iter().cloned())
         .take(3)
         .collect::<Vec<_>>();
-    let repair_target_hint = repair_plan
+    let mut repair_target_hint = repair_plan
         .first()
         .cloned()
         .or_else(|| {
@@ -1351,6 +1351,17 @@ pub(super) fn model_assessment_to_verifier_repair_assessment(
                     .and_then(|hint| admit_repair_target_hint(hint, admission))
             })
         });
+    if repair_target_hint.is_none() {
+        let fallback_plan = no_progress_fallback_repair_plan(
+            context,
+            &explicit_repair_plan,
+            &explicit_repair_candidates,
+        );
+        if !fallback_plan.is_empty() {
+            repair_plan = fallback_plan;
+            repair_target_hint = repair_plan.first().cloned();
+        }
+    }
 
     VerifierRepairAssessment {
         failure_kind,
