@@ -85,6 +85,10 @@ pub fn run_session<C: MinimalChatClient>(
                 session.native_tools_disabled = true;
                 continue;
             }
+            Err(err) if is_tool_call_parser_failure(&err) => {
+                pending_feedback = Some(feedback_state.malformed_tool_call(&err));
+                continue;
+            }
             Err(err) => return Err(err),
         };
 
@@ -190,6 +194,12 @@ fn is_native_tool_parser_failure(error: &str) -> bool {
     lower.contains("native tool parser failed")
         || lower.contains("unexpected end element")
         || lower.contains("unexpected eof")
+}
+
+fn is_tool_call_parser_failure(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("tool call parser failed")
 }
 
 #[cfg(test)]
@@ -321,6 +331,45 @@ mod tests {
         assert_eq!(reply, "done after downgrade");
         assert_eq!(client.native_modes, vec![true, false]);
         assert!(session.native_tools_disabled);
+    }
+
+    #[test]
+    fn xml_parser_failure_uses_ephemeral_feedback_and_retries() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_err("tool call parser failed: unterminated <anvil_tool_call> block");
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "fixed.txt", "content": "ok"}),
+            )],
+        );
+        client.push_reply("done", Vec::new());
+        let mut session = SessionSnapshot::default();
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "create fixed.txt",
+            &config(temp.path().to_path_buf(), 4),
+        )
+        .unwrap();
+
+        assert_eq!(reply, "done");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("fixed.txt")).unwrap(),
+            "ok"
+        );
+        assert!(client.feedback_seen);
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|m| m.content.starts_with(MINIMAL_FEEDBACK_PREFIX)),
+            "ephemeral feedback must not be persisted to the session"
+        );
     }
 
     #[test]

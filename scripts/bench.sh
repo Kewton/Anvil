@@ -8,6 +8,8 @@
 #   --engine <name>   legacy|minimal（デフォルト: legacy）
 #   --engines <list>  カンマ区切りで複数 engine（例: legacy,minimal）
 #   --runs <n>        実行回数（デフォルト: 5）
+#   --max-iterations <n>
+#                     YAML の args.max_iterations を全 case で上書き
 #   --dry-run         anvil 呼び出しを echo で代替
 #   --pam-ab          Same prompt suite with PAM enabled and disabled
 #   --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
@@ -36,6 +38,8 @@ Usage: scripts/bench.sh <benchmark-name> [options]
   --engine <name>   legacy|minimal（デフォルト: legacy）
   --engines <list>  カンマ区切りで複数 engine（例: legacy,minimal）
   --runs <n>        実行回数（デフォルト: 5）
+  --max-iterations <n>
+                    YAML の args.max_iterations を全 case で上書き
   --no-precautions  Reminder Sidecar を無効化（ANVIL_NO_REMINDER=1）
   --no-case-memory  Case memory を無効化（ANVIL_NO_CASE_RETRIEVAL=1 ANVIL_NO_CASE_RECORD=1）
   --no-auto-test    Auto test を無効化（ANVIL_NO_AUTO_TEST=1）
@@ -58,6 +62,7 @@ models_arg=""
 engine_arg=""
 engines_arg=""
 runs=5
+max_iterations_override=""
 DRY_RUN=0
 no_precautions=0
 no_case_memory=0
@@ -107,6 +112,11 @@ while [[ $# -gt 0 ]]; do
     --runs)
       [[ $# -ge 2 ]] || { echo "Error: --runs requires a value" >&2; exit 1; }
       runs="$2"
+      shift 2
+      ;;
+    --max-iterations)
+      [[ $# -ge 2 ]] || { echo "Error: --max-iterations requires a value" >&2; exit 1; }
+      max_iterations_override="$2"
       shift 2
       ;;
     --no-precautions)
@@ -179,6 +189,11 @@ fi
 
 if ! [[ "$runs" =~ ^[1-9][0-9]*$ ]]; then
   echo "Error: --runs must be a positive integer, got: $runs" >&2
+  exit 1
+fi
+
+if ! { [[ -z "$max_iterations_override" ]] || [[ "$max_iterations_override" =~ ^[1-9][0-9]*$ ]]; }; then
+  echo "Error: --max-iterations must be a positive integer, got: $max_iterations_override" >&2
   exit 1
 fi
 
@@ -658,6 +673,9 @@ for model in "${cleaned_models[@]}"; do
       chat_retries=$(yq -r ".cases[$case_idx].args.chat_retries // .args.chat_retries // \"\"" "$BENCH_YAML")
       sidecar_model=$(yq -r ".cases[$case_idx].args.sidecar_model // .args.sidecar_model // \"\"" "$BENCH_YAML")
     fi
+    if [[ -n "$max_iterations_override" ]]; then
+      max_iterations="$max_iterations_override"
+    fi
 
     if [[ -z "$case_name" || "$case_name" == "null" ]]; then
       echo "Error: empty benchmark case name" >&2
@@ -752,11 +770,11 @@ for model in "${cleaned_models[@]}"; do
 
         start=$SECONDS
         if [[ "$DRY_RUN" -eq 1 ]]; then
-          echo "(dry-run) anvil --oneshot --prompt ... --state-dir $STATE_DIR --model $model --engine $engine --case $case_name --pam-variant $pam_variant" \
+          echo "(dry-run) anvil --oneshot --offline --yes --prompt ... --state-dir $STATE_DIR --model $model --engine $engine --case $case_name --pam-variant $pam_variant" \
             > ../stdout.log
           rc=0
         else
-          anvil_args=(--oneshot --offline --prompt "$prompt" --state-dir "$STATE_DIR" --model "$model")
+          anvil_args=(--oneshot --offline --yes --prompt "$prompt" --state-dir "$STATE_DIR" --model "$model")
           if [[ "$engine_cli_explicit" -eq 1 ]]; then
             anvil_args+=(--engine "$engine")
           fi

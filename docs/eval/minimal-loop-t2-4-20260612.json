@@ -1,0 +1,141 @@
+{
+  "baseline_dir": ".anvil/benchmarks/20260612T051125-combined-t2-4",
+  "experiment_dir": ".anvil/benchmarks/20260612T051125-combined-t2-4",
+  "failure_categories": {
+    "baseline": {
+      "completed": 60,
+      "control_loop_exhausted": 6,
+      "missing_deliverable": 40,
+      "missing_evidence": 19
+    },
+    "experiment": {
+      "completed": 95,
+      "failed": 30
+    }
+  },
+  "generated_at": "2026-06-11T22:13:58Z",
+  "metrics": {
+    "elapsed_s": {
+      "baseline": {
+        "ci_high": 82.41298974810923,
+        "ci_low": 50.69101025189079,
+        "mean": 66.552,
+        "n": 125
+      },
+      "delta": -11.312000000000005,
+      "delta_pct": -0.16997235244620754,
+      "experiment": {
+        "ci_high": 70.40950958460488,
+        "ci_low": 40.07049041539512,
+        "mean": 55.24,
+        "n": 125
+      },
+      "verdict": "improved"
+    },
+    "error_500_count": {
+      "baseline": {
+        "ci_high": 0.0,
+        "ci_low": 0.0,
+        "mean": 0.0,
+        "n": 125
+      },
+      "delta": 0.0,
+      "delta_pct": null,
+      "experiment": {
+        "ci_high": 0.0,
+        "ci_low": 0.0,
+        "mean": 0.0,
+        "n": 125
+      },
+      "verdict": "unchanged"
+    },
+    "iter_count": {
+      "baseline": {
+        "ci_high": 2.9557039837391312,
+        "ci_low": 2.468296016260869,
+        "mean": 2.712,
+        "n": 125
+      },
+      "delta": 1.1722105263157894,
+      "delta_pct": 0.4322310200279459,
+      "experiment": {
+        "ci_high": 4.291562642219357,
+        "ci_low": 3.4768584104122224,
+        "mean": 3.8842105263157896,
+        "n": 95
+      },
+      "verdict": "regressed"
+    },
+    "page_tsx_has_game_keywords": {
+      "baseline": {
+        "ci_high": 0.43449149475208104,
+        "ci_low": 0.0,
+        "mean": 0.0,
+        "n": 5
+      },
+      "delta": 0.0,
+      "delta_pct": null,
+      "experiment": {
+        "ci_high": 0.5615060804490177,
+        "ci_low": 0.0,
+        "mean": 0.0,
+        "n": 3
+      },
+      "verdict": "unchanged"
+    },
+    "postcheck_success": {
+      "baseline": {
+        "ci_high": 0.3304611041202084,
+        "ci_low": 0.18056639010525916,
+        "mean": 0.248,
+        "n": 125
+      },
+      "delta": -0.07999999999999999,
+      "delta_pct": null,
+      "experiment": {
+        "ci_high": 0.24321075117462784,
+        "ci_low": 0.11258737613828976,
+        "mean": 0.168,
+        "n": 125
+      },
+      "verdict": "regressed"
+    },
+    "rc": {
+      "baseline": {
+        "ci_high": 1.0,
+        "ci_low": 0.9701835432034374,
+        "mean": 1.0,
+        "n": 125
+      },
+      "delta": -0.24,
+      "delta_pct": null,
+      "experiment": {
+        "ci_high": 0.826400398499301,
+        "ci_low": 0.6780950439664865,
+        "mean": 0.76,
+        "n": 125
+      },
+      "verdict": "regressed"
+    },
+    "we_total": {
+      "baseline": {
+        "ci_high": 1.9616328248121215,
+        "ci_low": 1.5423671751878785,
+        "mean": 1.752,
+        "n": 125
+      },
+      "delta": -0.928,
+      "delta_pct": null,
+      "experiment": {
+        "ci_high": 1.0329317414079102,
+        "ci_low": 0.6150682585920896,
+        "mean": 0.824,
+        "n": 125
+      },
+      "verdict": "informational"
+    }
+  },
+  "model_slug": "qwen3.6-27b-coding-nvfp4:legacy->minimal",
+  "schema_version": 1,
+  "threshold": 0.05
+}

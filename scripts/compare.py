@@ -39,7 +39,7 @@ from typing import Any, Callable, Literal
 SCHEMA_VERSION = 1
 DEFAULT_THRESHOLD_PCT = 0.05  # continuous metrics: relative-delta threshold (5%)
 DEFAULT_THRESHOLD_ABS = 0.05  # bool_rate metrics: absolute-delta threshold (5pt)
-MAX_RUNS = 100  # DoS guard
+MAX_RUNS = 500  # DoS guard; supports 20-30 scenarios x 5 runs x engine matrices.
 MIN_VALID_RUNS = 3  # below this -> exit 3
 ALPHA = 0.05  # 95% CI
 UMASK = 0o077
@@ -475,6 +475,13 @@ def _analyze_one(
         _warn(f"analyze_run.py spawn failed for {run_dir}: {e}")
         return None
     if result.returncode != 0:
+        fallback = _analyze_meta_only(run_dir)
+        if fallback is not None:
+            _warn(
+                f"analyze_run.py rc={result.returncode} for {run_dir}; "
+                "using meta.json fallback"
+            )
+            return fallback
         _warn(
             f"analyze_run.py rc={result.returncode} for {run_dir}: "
             f"{(result.stderr or '').strip()}"
@@ -493,6 +500,56 @@ def _analyze_one(
         _warn(f"analyze_run.py schema_version={sv} for {run_dir}, skipping")
         return None
     return data
+
+
+def _analyze_meta_only(run_dir: Path) -> dict[str, Any] | None:
+    """Build minimal comparable metrics from run-dir/meta.json.
+
+    Some failed Anvil runs exit before a session.json is copied. Those runs are
+    still valid benchmark failures and must count toward rc / elapsed /
+    postcheck rates.
+    """
+    meta_path = run_dir / "meta.json"
+    if not _is_regular_file(meta_path):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+
+    rc = meta.get("rc")
+    elapsed_s = meta.get("elapsed_s")
+    success = meta.get("success_check_success")
+    failure_kind = meta.get("failure_kind")
+    failure_class = failure_kind if isinstance(failure_kind, str) and failure_kind else "run_error"
+    terminal_state = "completed" if rc == 0 else "failed"
+
+    return {
+        "schema_version": 1,
+        "run_id": run_dir.name,
+        "rc": rc,
+        "elapsed_s": elapsed_s,
+        "iter_count": None,
+        "error_500_count": 0,
+        "we_total": 0,
+        "postcheck_success": success,
+        "postcheck_reason": meta.get("success_check_reason"),
+        "success_check_success": success,
+        "success_check_reason": meta.get("success_check_reason"),
+        "engine": meta.get("engine"),
+        "task_kind": meta.get("task_kind"),
+        "pam_variant": meta.get("pam_variant"),
+        "failure_kind": failure_kind,
+        "generic_terminal_state": terminal_state,
+        "failure_observation": {
+            "failure_class": failure_class,
+            "terminal_state": terminal_state,
+            "postcheck_success": success,
+        },
+        "page_tsx_has_game_keywords": None,
+    }
 
 
 # ---------------------------------------------------------------------------
