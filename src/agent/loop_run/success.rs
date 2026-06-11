@@ -645,6 +645,13 @@ impl Agent {
                     let weak_reason =
                         super::verifier_weak_reason::structured_selection_unbound_reason();
                     self.turn_state.verifier_weak_reason_this_turn = Some(weak_reason);
+                    super::verifier_weak_repair_target::log_shadow_repair_target(
+                        &session_id,
+                        self.current_turn_index,
+                        self.session.iter_count_this_turn,
+                        "success_verifier_skill",
+                        weak_reason,
+                    );
                     if !self.session.verifier_safe_stop_emitted_this_turn {
                         self.session.verifier_safe_stop_emitted_this_turn = true;
                         log_llm_event(

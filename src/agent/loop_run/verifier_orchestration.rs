@@ -2436,6 +2436,13 @@ pub(super) fn handle_task_contract_verifier_safe_stop(
 ) -> super::actor_loop_flow::TaskContractVerifierFlowOutcome {
     if let Some(weak_reason) = weak_reason {
         agent.turn_state.verifier_weak_reason_this_turn = Some(weak_reason);
+        super::verifier_weak_repair_target::log_shadow_repair_target(
+            agent.session_store.session_id(),
+            agent.current_turn_index,
+            agent.session.iter_count_this_turn,
+            source,
+            weak_reason,
+        );
     }
     let (mapped_reason, log_outcome) =
         super::actor_loop_flow::task_contract_verifier_safe_stop_mapping(reason);
