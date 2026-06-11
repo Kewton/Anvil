@@ -22,8 +22,8 @@ use super::verifier_orchestration::{
 mod inner {
     use super::super::actor_loop_flow::{
         reply_looks_like_future_work, should_apply_repo_change_partial_progress_recovery,
-        task_contract_continue_requires_tool_recovery,
     };
+    use super::super::actor_loop_phase_decision::task_contract_continue_requires_tool_recovery;
     use super::super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
     use super::super::progress_text::truncate;
     use super::super::scaffold_pipeline::task_requires_nextjs_scaffold;

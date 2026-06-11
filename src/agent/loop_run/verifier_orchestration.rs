@@ -2445,7 +2445,7 @@ pub(super) fn handle_task_contract_verifier_safe_stop(
         );
     }
     let (mapped_reason, log_outcome) =
-        super::actor_loop_flow::task_contract_verifier_safe_stop_mapping(reason);
+        super::actor_loop_phase_decision::task_contract_verifier_safe_stop_mapping(reason);
     log_llm_event(
         "agent.task_contract.safe_stop",
         serde_json::json!({
@@ -2660,7 +2660,9 @@ pub(super) fn handle_task_contract_verifier_pass(
                 weak_reason: _,
             } => {
                 let (exit_reason, _) =
-                    super::actor_loop_flow::task_contract_verifier_safe_stop_mapping(reason);
+                    super::actor_loop_phase_decision::task_contract_verifier_safe_stop_mapping(
+                        reason,
+                    );
                 (exit_reason, exit_reason.default_error_text().to_string())
             }
             CompletionDecision::Done => unreachable!("filtered above"),

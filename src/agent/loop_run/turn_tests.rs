@@ -78,8 +78,8 @@ use crate::session::feedback::{FeedbackFrameDraft, build_feedback_frame};
 mod tests {
     use super::super::actor_loop_flow::{
         answer_only_reply_is_inadequate, normalize_plan_exploration_key,
-        task_contract_verifier_safe_stop_mapping,
     };
+    use super::super::actor_loop_phase_decision::task_contract_verifier_safe_stop_mapping;
     use super::super::photon_feedback_derive::request_explicitly_requests_script_execution;
     use super::ExitReason;
     use super::{
@@ -1359,13 +1359,13 @@ mod tests {
     #[test]
     fn task_contract_safe_stop_clear_tag_matches_reason() {
         assert_eq!(
-            super::super::actor_loop_flow::task_contract_safe_stop_clear_tag(
+            super::super::actor_loop_phase_decision::task_contract_safe_stop_clear_tag(
                 super::task_contract::SafeStopReason::VerifierWeak
             ),
             "task_contract_safe_stop_verifier_weak"
         );
         assert_eq!(
-            super::super::actor_loop_flow::task_contract_safe_stop_clear_tag(
+            super::super::actor_loop_phase_decision::task_contract_safe_stop_clear_tag(
                 super::task_contract::SafeStopReason::VerifierMissing
             ),
             "task_contract_safe_stop_verifier_missing"

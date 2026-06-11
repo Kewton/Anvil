@@ -54,6 +54,10 @@ use crate::tools::registry::resolve_plan_mode_write_target;
 
 use super::Agent;
 use super::active_job_arbiter::{LoopControlAction, RecoveryDispatchGate, RecoveryOwner};
+use super::actor_loop_phase_decision::{
+    task_contract_action_completion_exit, task_contract_continue_requires_tool_recovery,
+    task_contract_safe_stop_clear_tag, task_contract_verifier_safe_stop_mapping,
+};
 use super::controller_policy::ControllerRecoveryStrategy;
 use super::interrupt::{InterruptFlag, InterruptMonitor};
 use super::lifecycle;
@@ -5148,19 +5152,6 @@ pub(super) fn missing_repo_change_retry_status_note(
     }
 }
 
-pub(super) fn task_contract_safe_stop_clear_tag(
-    reason: super::task_contract::SafeStopReason,
-) -> &'static str {
-    match reason {
-        super::task_contract::SafeStopReason::VerifierWeak => {
-            "task_contract_safe_stop_verifier_weak"
-        }
-        super::task_contract::SafeStopReason::VerifierMissing => {
-            "task_contract_safe_stop_verifier_missing"
-        }
-    }
-}
-
 pub(super) fn focused_policy_retry_exhausted(focused_retry_present: bool, retries: usize) -> bool {
     focused_retry_present && retries >= 3
 }
@@ -5263,50 +5254,6 @@ pub(super) fn reply_looks_like_future_work(reply: &str) -> bool {
     future_markers
         .iter()
         .any(|marker| normalized.contains(marker))
-}
-
-pub(super) fn task_contract_verifier_safe_stop_mapping(
-    reason: super::task_contract::SafeStopReason,
-) -> (ExitReason, &'static str) {
-    match reason {
-        super::task_contract::SafeStopReason::VerifierWeak => {
-            (ExitReason::SafeStopVerifierWeak, "safe_stop_verifier_weak")
-        }
-        super::task_contract::SafeStopReason::VerifierMissing => (
-            ExitReason::SafeStopVerifierMissing,
-            "safe_stop_verifier_missing",
-        ),
-    }
-}
-
-pub(super) fn task_contract_continue_requires_tool_recovery(
-    action: Option<&super::task_contract::ArtifactRecoveryAction>,
-    current_reply_tool_calls: usize,
-) -> bool {
-    matches!(
-        action,
-        Some(super::task_contract::ArtifactRecoveryAction::Continue { .. })
-    ) && current_reply_tool_calls == 0
-}
-
-pub(super) fn task_contract_action_completion_exit(
-    action: Option<&super::task_contract::ArtifactRecoveryAction>,
-) -> Option<(ExitReason, String)> {
-    match action {
-        None | Some(super::task_contract::ArtifactRecoveryAction::Done) => None,
-        Some(
-            super::task_contract::ArtifactRecoveryAction::Continue { .. }
-            | super::task_contract::ArtifactRecoveryAction::RunVerifier
-            | super::task_contract::ArtifactRecoveryAction::RepairArtifact { .. },
-        ) => Some((
-            ExitReason::MissingRepoEdits,
-            "task contract did not produce evidence-based completion".to_string(),
-        )),
-        Some(super::task_contract::ArtifactRecoveryAction::SafeStop { reason, .. }) => {
-            let (exit_reason, _) = task_contract_verifier_safe_stop_mapping(*reason);
-            Some((exit_reason, exit_reason.default_error_text().to_string()))
-        }
-    }
 }
 
 pub(super) fn increment_artifact_completion_role_attempt(
@@ -5568,41 +5515,6 @@ pub(super) fn plan_phase_from_sections(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn task_contract_completion_gate_allows_only_done_or_no_contract() {
-        assert!(task_contract_action_completion_exit(None).is_none());
-        assert!(
-            task_contract_action_completion_exit(Some(
-                &super::super::task_contract::ArtifactRecoveryAction::Done
-            ))
-            .is_none()
-        );
-
-        let continue_action = super::super::task_contract::ArtifactRecoveryAction::Continue {
-            missing: vec![super::super::task_contract::ArtifactRole::Implementation],
-            target_hint: None,
-        };
-        let (reason, text) = task_contract_action_completion_exit(Some(&continue_action))
-            .expect("non-done contract action must block completion");
-        assert_eq!(reason, ExitReason::MissingRepoEdits);
-        assert!(text.contains("evidence-based completion"));
-    }
-
-    #[test]
-    fn task_contract_completion_gate_preserves_safe_stop_reason() {
-        let action = super::super::task_contract::ArtifactRecoveryAction::SafeStop {
-            reason: super::super::task_contract::SafeStopReason::VerifierMissing,
-            weak_reason: None,
-        };
-        let (reason, text) = task_contract_action_completion_exit(Some(&action))
-            .expect("safe stop must terminate completion");
-        assert_eq!(reason, ExitReason::SafeStopVerifierMissing);
-        assert_eq!(
-            text,
-            ExitReason::SafeStopVerifierMissing.default_error_text()
-        );
-    }
 
     #[test]
     fn pre_model_contract_sync_installs_missing_test_target_before_policy_selection() {

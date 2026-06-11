@@ -75,6 +75,7 @@ mod active_job_arbiter;
 // is intentionally *not* re-exported (DR3-001) — `turn.rs` is the only
 // in-crate consumer via `super::actor_loop_flow::*`.
 mod actor_loop_flow;
+mod actor_loop_phase_decision;
 mod cargo_manifest_summary;
 mod node_test_evidence_quality;
 mod objective_contract_projection;
