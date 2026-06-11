@@ -42,7 +42,7 @@ impl TestExpectationAudit {
 
     fn policy_message(&self) -> String {
         format!(
-            "[Test Expectation Audit] worker={}; source={}; test={}; before writing or repairing tests, classify each assertion expectation as explicit_user_request, declared_public_contract, existing_required_behavior, language_runtime_fact, or unsupported_assumption. Keep exact product expectations only when supported by explicit_user_request, declared_public_contract, or existing_required_behavior. Use language_runtime_fact only for mechanics, not to turn incidental implementation behavior into product assertions. For HTTP APIs with no exact status declared, numeric status-code assertions are unsupported; use success/non-error only when needed. Treat an empty collection response shape as the declared endpoint shape only; do not infer cross-endpoint persistence, post-to-list mutation, list length after writes, or ordering unless declared. For underspecified dimensions such as tie-breaking, ordering, rounding, randomness, filesystem order, or locale, use non-ambiguous fixtures or property assertions instead of exact literals. Preserve existing required behavior and keep tests aligned with the source API.",
+            "[Test Expectation Audit] worker={}; source={}; test={}; before writing or repairing tests, classify each assertion expectation as explicit_user_request, declared_public_contract, existing_required_behavior, language_runtime_fact, or unsupported_assumption. Keep exact product expectations only when supported by explicit_user_request, declared_public_contract, or existing_required_behavior. Use language_runtime_fact only for mechanics, not to turn incidental implementation behavior into product assertions. For HTTP APIs with no exact status declared, numeric status-code assertions are unsupported; use success/non-error only when needed. Treat an empty collection response shape as the declared endpoint shape only; do not infer cross-endpoint persistence, post-to-list mutation, list length after writes, or ordering unless declared. For diagnostic text, exact human-readable wording, line formats, punctuation, and numeric wording are unsupported unless declared; assert category, presence, or command success/failure semantics instead. For underspecified dimensions such as tie-breaking, ordering, rounding, randomness, filesystem order, or locale, use non-ambiguous fixtures or property assertions instead of exact literals. Preserve existing required behavior and keep tests aligned with the source API.",
             WorkerKind::TestAuthor.label(),
             self.source_path,
             self.test_path
@@ -80,6 +80,7 @@ mod tests {
         );
         assert!(message.content.contains("tie-breaking"));
         assert!(message.content.contains("numeric status-code assertions"));
+        assert!(message.content.contains("exact human-readable wording"));
         assert!(message.content.contains("property assertions"));
         assert!(message.content.contains("test_author"));
     }

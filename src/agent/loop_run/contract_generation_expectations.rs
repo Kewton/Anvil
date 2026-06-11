@@ -131,6 +131,7 @@ fn test_api_expectation(execution: &TaskExecutionContract) -> Option<String> {
     if let Some(summary) = public_contract_summary(&execution.public_contract) {
         parts.push(format!("contract={summary}"));
     }
+    parts.push("assertion_policy=no_exact_diagnostic_text_unless_declared".to_string());
     (!parts.is_empty()).then(|| parts.join(","))
 }
 
@@ -355,6 +356,10 @@ mod tests {
             summary.contains("evidence=test_run(required),command=python -m unittest"),
             "{summary}"
         );
+        assert!(
+            summary.contains("assertion_policy=no_exact_diagnostic_text_unless_declared"),
+            "{summary}"
+        );
     }
 
     #[test]
@@ -407,6 +412,10 @@ mod tests {
         assert!(summary.contains("expected_status=unspecified"), "{summary}");
         assert!(
             summary.contains("status_assertion_policy=no_exact_http_status"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("assertion_policy=no_exact_diagnostic_text_unless_declared"),
             "{summary}"
         );
     }

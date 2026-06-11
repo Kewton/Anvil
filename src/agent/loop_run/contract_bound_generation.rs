@@ -187,7 +187,7 @@ impl ContractBoundGenerationPlan {
             .collect::<Vec<_>>()
             .join(" -> ");
         format!(
-            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; runtime_capability_authority={}; authoring_style_decision={}; authoring_style_enforcement={}; authoring_style_policy={}; evidence_runner_policy={}; test_binding_policy={}; failure_taxonomy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. If declared_expectations contains api_contracts with request_body=json, implement request_json_body_fields as JSON request-body object fields, not query, form, or separate top-level handler parameters. If api_contracts has status_assertion_policy=no_exact_http_status, tests must not compare status_code to a numeric literal invented from words like created; use a success/non-error predicate only when a status check is needed. If api_contracts contains response_shape=empty_collection, tests may assert that response shape for the declared endpoint in isolation, but must not infer cross-endpoint persistence, post-to-list mutation, list length after writes, or ordering unless declared. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
+            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; runtime_capability_authority={}; authoring_style_decision={}; authoring_style_enforcement={}; authoring_style_policy={}; evidence_runner_policy={}; test_binding_policy={}; failure_taxonomy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. If declared_expectations contains api_contracts with request_body=json, implement request_json_body_fields as JSON request-body object fields, not query, form, or separate top-level handler parameters. If api_contracts has status_assertion_policy=no_exact_http_status, tests must not compare status_code to a numeric literal invented from words like created; use a success/non-error predicate only when a status check is needed. If api_contracts contains response_shape=empty_collection, tests may assert that response shape for the declared endpoint in isolation, but must not infer cross-endpoint persistence, post-to-list mutation, list length after writes, or ordering unless declared. If test_api has assertion_policy=no_exact_diagnostic_text_unless_declared, tests must not assert exact human-readable diagnostic wording, line formats, punctuation, or numeric message text unless declared; assert category, presence, or command success/failure semantics instead. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
             self.alignment_predicate,
             self.runtime_profile.label(),
             runtime_constraint_for(self.runtime_profile),
@@ -661,6 +661,14 @@ mod tests {
         );
         assert!(
             message.contains("must not infer cross-endpoint persistence"),
+            "{message}"
+        );
+        assert!(
+            message.contains("assertion_policy=no_exact_diagnostic_text_unless_declared"),
+            "{message}"
+        );
+        assert!(
+            message.contains("tests must not assert exact human-readable diagnostic wording"),
             "{message}"
         );
     }

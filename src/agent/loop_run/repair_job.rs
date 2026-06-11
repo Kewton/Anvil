@@ -1081,6 +1081,7 @@ impl RepairJob {
             }
             RepairJobEvent::PlanAccepted => {
                 self.diagnostic_unavailable = false;
+                self.rejected_attempts.clear();
             }
             RepairJobEvent::AmbiguousAuthority => {
                 if let Some(key) = self.current_repair_attempt_key(None) {
@@ -4292,6 +4293,45 @@ mod tests {
             job.next_action(),
             RepairNextAction::SafeStop {
                 reason: RepairTerminalReason::PatchRejectedRepeatedly
+            }
+        );
+    }
+
+    #[test]
+    fn repair_job_plan_accepted_clears_previous_patch_rejections() {
+        let target = recovery_target(ArtifactRole::Implementation, "markdown_lint.py");
+        let key = RepairAttemptKey::from_target(
+            &target,
+            Some(AllowedChangeKind::FixImplementationBehavior),
+        );
+        let mut job = RepairJob {
+            assessment: Some(verifier_assessment_for_target(target.clone())),
+            repair_target_hint: Some(target.clone()),
+            assessment_attempts: crate::agent::loop_run::verifier_diagnostic_attempt::VERIFIER_DIAGNOSTIC_ATTEMPT_LIMIT,
+            ..RepairJob::new_for_test()
+        };
+
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key: key.clone(),
+            reason: RejectedAttemptReason::MalformedPatch,
+        });
+        job.apply_event(RepairJobEvent::PatchRejected {
+            key,
+            reason: RejectedAttemptReason::AmbiguousAuthority,
+        });
+        assert!(matches!(
+            job.next_action(),
+            RepairNextAction::SafeStop {
+                reason: RepairTerminalReason::PatchRejectedRepeatedly
+            }
+        ));
+
+        job.apply_event(RepairJobEvent::PlanAccepted);
+
+        assert_eq!(
+            job.next_action(),
+            RepairNextAction::RequestPatch {
+                target_hint: target
             }
         );
     }
