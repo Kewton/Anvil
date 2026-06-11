@@ -7,10 +7,11 @@
 
 use std::path::{Path, PathBuf};
 
-use super::authoring_style::AuthoringStyleDecision;
+use super::authoring_style::{AuthoringStyleDecision, StyleAuthority};
 use super::contract_generation_expectations::{
     declared_artifacts_summary, declared_expectations_summary,
 };
+use super::evidence_runner::{EvidenceRunner, evidence_runner_for_task_kind};
 use super::task_contract::ArtifactRole;
 use super::worker_contract::{
     ExecutionDeliverable, RuntimeProfile, TaskExecutionContract, WorkerKind,
@@ -79,6 +80,9 @@ pub(super) struct ContractBoundGenerationPlan {
     runtime_profile: RuntimeProfile,
     authoring_style_policy: &'static str,
     authoring_style_decision: AuthoringStyleDecision,
+    authoring_style_enforcement: &'static str,
+    evidence_runner_policy: String,
+    runtime_capability_authority: &'static str,
     test_binding_policy: &'static str,
     failure_taxonomy: &'static str,
     declared_artifacts: String,
@@ -146,6 +150,11 @@ impl ContractBoundGenerationPlan {
                 execution.runtime_profile,
             ),
             authoring_style_decision: execution.authoring_style_decision,
+            authoring_style_enforcement: authoring_style_enforcement_for(
+                execution.authoring_style_decision.authority,
+            ),
+            evidence_runner_policy: evidence_runner_policy_for(execution),
+            runtime_capability_authority: "context_only_not_completion_or_style_authority",
             test_binding_policy: test_binding_policy_for(execution.runtime_profile),
             failure_taxonomy: failure_taxonomy_for(execution),
             declared_artifacts: declared_artifacts_summary(&execution.deliverables),
@@ -178,12 +187,15 @@ impl ContractBoundGenerationPlan {
             .collect::<Vec<_>>()
             .join(" -> ");
         format!(
-            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; authoring_style_decision={}; authoring_style_policy={}; test_binding_policy={}; failure_taxonomy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. If declared_expectations contains api_contracts with request_body=json, implement request_json_body_fields as JSON request-body object fields, not query or form parameters. If api_contracts has expected_status=unspecified, tests must not assert an exact HTTP status invented from words like created; assert response success only when needed. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
+            "[Contract-Bound Generation] Use small phases derived from the sealed ObjectiveContract, not raw prompt reinterpretation. alignment={}; runtime={}; runtime_constraint={}; runtime_capability_authority={}; authoring_style_decision={}; authoring_style_enforcement={}; authoring_style_policy={}; evidence_runner_policy={}; test_binding_policy={}; failure_taxonomy={}; declared_artifacts={}; declared_expectations={}; phases={}. Treat contract_alignment and interface_schema_expectation as internal checklist phases before writing files; do not spend a final answer on them. A deliverable phase is complete only after its target role/path satisfies its predicate. If declared_expectations contains api_contracts with request_body=json, implement request_json_body_fields as JSON request-body object fields, not query or form parameters. If api_contracts has expected_status=unspecified, tests must not assert an exact HTTP status invented from words like created; assert response success only when needed. For tests, assert only behavior declared by the ObjectiveContract or user request; do not invent tie-breaks, ordering, error modes, dependencies, or APIs. When a required artifact is small, prefer one coherent whole-file update over fragile fragment insertion, while preserving existing required behavior. Do not final-answer between required deliverable phases; after each write, continue to the next phase or repair only the failed contract delta.",
             self.alignment_predicate,
             self.runtime_profile.label(),
             runtime_constraint_for(self.runtime_profile),
+            self.runtime_capability_authority,
             self.authoring_style_decision.summary(),
+            self.authoring_style_enforcement,
             self.authoring_style_policy,
+            self.evidence_runner_policy,
             self.test_binding_policy,
             self.failure_taxonomy,
             self.declared_artifacts,
@@ -341,6 +353,25 @@ fn test_binding_policy_for(runtime_profile: RuntimeProfile) -> &'static str {
     }
 }
 
+fn authoring_style_enforcement_for(authority: StyleAuthority) -> &'static str {
+    match authority {
+        StyleAuthority::ExplicitUserRequest
+        | StyleAuthority::ExistingProjectConvention
+        | StyleAuthority::RuntimeCapability => "authoritative_for_artifact_shape",
+        StyleAuthority::ModelRobustDefault => {
+            "advisory_model_robust_default_preference_not_runner_authority"
+        }
+        StyleAuthority::Unknown => "unspecified_do_not_force_style",
+    }
+}
+
+fn evidence_runner_policy_for(execution: &TaskExecutionContract) -> String {
+    let runner_kind = evidence_runner_for_task_kind(execution.objective_kind.to_task_kind())
+        .map(|runner| runner.kind().as_str())
+        .unwrap_or("none");
+    format!("runner_kind={runner_kind},authority=verification_only_not_authoring_style")
+}
+
 fn failure_taxonomy_for(execution: &TaskExecutionContract) -> &'static str {
     if execution.evidence.required
         && has_roles(
@@ -418,6 +449,9 @@ mod tests {
                 && phase.worker_kind == WorkerKind::TestAuthor
         }));
         assert!(plan.policy_message().contains("runtime=python"));
+        assert!(plan.policy_message().contains(
+            "runtime_capability_authority=context_only_not_completion_or_style_authority"
+        ));
         assert!(
             plan.policy_message()
                 .contains("do_not_assume_python_version_specific_stdlib_modules")
@@ -433,6 +467,19 @@ mod tests {
         assert!(
             plan.policy_message()
                 .contains("style=unittest_class_style,authority=explicit_user_request"),
+            "{}",
+            plan.policy_message()
+        );
+        assert!(
+            plan.policy_message()
+                .contains("authoring_style_enforcement=authoritative_for_artifact_shape"),
+            "{}",
+            plan.policy_message()
+        );
+        assert!(
+            plan.policy_message().contains(
+                "evidence_runner_policy=runner_kind=coding_build_test,authority=verification_only_not_authoring_style"
+            ),
             "{}",
             plan.policy_message()
         );
@@ -463,6 +510,46 @@ mod tests {
         assert!(
             plan.policy_message()
                 .contains("authoring_style_mismatch|contract_expectation_drift")
+        );
+    }
+
+    #[test]
+    fn ambiguous_python_generation_keeps_runner_style_and_runtime_boundaries_separate() {
+        let contract = TaskContract::from_request(
+            "Create markdown_lint.py and tests/test_markdown_lint.py. Add tests and verify them.",
+        );
+        let execution = TaskExecutionContract::from_task_contract(&contract)
+            .with_runtime_profile(RuntimeProfile::Python)
+            .with_evidence_command("pytest");
+        let plan = ContractBoundGenerationPlan::from_execution_contract(&execution)
+            .expect("python coding contract should produce a generation plan");
+        let message = plan.policy_message();
+
+        assert!(
+            message.contains("authoring_style_decision=style=pytest_function_style,authority=model_robust_default"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "authoring_style_enforcement=advisory_model_robust_default_preference_not_runner_authority"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "evidence_runner_policy=runner_kind=coding_build_test,authority=verification_only_not_authoring_style"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "runtime_capability_authority=context_only_not_completion_or_style_authority"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("python_evidence_runner_is_not_test_authoring_style"),
+            "{message}"
         );
     }
 
