@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use super::authoring_style::{AuthoringStyleDecision, StyleAuthority};
+use super::authoring_style::AuthoringStyleDecision;
 use super::task_contract::{
     ArtifactObligation, ArtifactRole, DeliverableFormat, DeliverableKind, DeliverableSchema,
     ObjectiveDeliverableKind, ObjectiveEvidenceKind, ObjectiveKind, ProjectLanguage, ProjectShape,
@@ -149,17 +149,10 @@ impl SemanticCandidate {
 }
 
 pub(super) fn limited_semantic_candidate_adoption_enabled(contract: &TaskContract) -> bool {
-    match contract.task_kind {
-        TaskKind::Docs
-        | TaskKind::Data
-        | TaskKind::Research
-        | TaskKind::Ops
-        | TaskKind::Authoring => true,
-        TaskKind::Coding => !matches!(
-            contract.authoring_style_decision.authority,
-            StyleAuthority::Unknown
-        ),
-    }
+    matches!(
+        contract.task_kind,
+        TaskKind::Docs | TaskKind::Data | TaskKind::Ops
+    )
 }
 
 fn compatibility_risks_from_contract(contract: &TaskContract) -> Vec<String> {
@@ -372,6 +365,57 @@ mod tests {
 
         assert!(limited_semantic_candidate_adoption_enabled(&contract));
         assert!(decision.is_authoritative());
+        assert_eq!(
+            decision.reason_labels(),
+            vec!["equivalent_stable_task_kind"]
+        );
+    }
+
+    #[test]
+    fn limited_adoption_accepts_equivalent_data_and_ops_candidates() {
+        for kind in [TaskKind::Data, TaskKind::Ops] {
+            let contract =
+                TaskContract::from_request_with_kind("Create the requested artifact.", Some(kind));
+            let candidate = SemanticCandidate::deterministic_shadow_from_contract(&contract);
+
+            let decision = super::super::task_contract_admission::admit_semantic_candidate(
+                super::super::task_contract_admission::SemanticCandidateAdmissionInput {
+                    candidate: &candidate,
+                    contract: &contract,
+                    allow_equivalent_current_behavior: limited_semantic_candidate_adoption_enabled(
+                        &contract,
+                    ),
+                },
+            );
+
+            assert_eq!(contract.task_kind, kind);
+            assert!(limited_semantic_candidate_adoption_enabled(&contract));
+            assert!(decision.is_authoritative());
+        }
+    }
+
+    #[test]
+    fn limited_adoption_keeps_research_authoring_and_coding_shadow_only() {
+        for kind in [TaskKind::Research, TaskKind::Authoring, TaskKind::Coding] {
+            let contract =
+                TaskContract::from_request_with_kind("Create the requested artifact.", Some(kind));
+            let candidate = SemanticCandidate::deterministic_shadow_from_contract(&contract);
+
+            let decision = super::super::task_contract_admission::admit_semantic_candidate(
+                super::super::task_contract_admission::SemanticCandidateAdmissionInput {
+                    candidate: &candidate,
+                    contract: &contract,
+                    allow_equivalent_current_behavior: limited_semantic_candidate_adoption_enabled(
+                        &contract,
+                    ),
+                },
+            );
+
+            assert_eq!(contract.task_kind, kind);
+            assert!(!limited_semantic_candidate_adoption_enabled(&contract));
+            assert!(!decision.is_authoritative());
+            assert_eq!(decision.reason_labels(), vec!["shadow_only"]);
+        }
     }
 
     #[test]

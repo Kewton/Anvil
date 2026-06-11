@@ -147,6 +147,7 @@ impl SemanticCandidateAdmissionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SemanticCandidateAdmissionReason {
     ShadowOnly,
+    EquivalentStableTaskKind,
     ExplicitFactConflict,
     LowerConfidenceThanContract,
     MissingArtifactIdentity,
@@ -159,6 +160,7 @@ impl SemanticCandidateAdmissionReason {
     fn label(self) -> &'static str {
         match self {
             Self::ShadowOnly => "shadow_only",
+            Self::EquivalentStableTaskKind => "equivalent_stable_task_kind",
             Self::ExplicitFactConflict => "explicit_fact_conflict",
             Self::LowerConfidenceThanContract => "lower_confidence_than_contract",
             Self::MissingArtifactIdentity => "missing_artifact_identity",
@@ -225,7 +227,7 @@ pub(super) fn admit_semantic_candidate(
     if inputs.allow_equivalent_current_behavior {
         return SemanticCandidateAdmissionDecision {
             status: SemanticCandidateAdmissionStatus::Admitted,
-            reasons: Vec::new(),
+            reasons: vec![SemanticCandidateAdmissionReason::EquivalentStableTaskKind],
             disagreements,
         };
     }
@@ -358,7 +360,10 @@ mod tests {
 
         assert_eq!(decision.status, SemanticCandidateAdmissionStatus::Admitted);
         assert!(decision.is_authoritative());
-        assert!(decision.reasons.is_empty());
+        assert_eq!(
+            decision.reason_labels(),
+            vec!["equivalent_stable_task_kind"]
+        );
         assert!(decision.disagreements.is_empty());
         assert_eq!(contract.task_kind, TaskKind::Coding);
     }
