@@ -3,18 +3,21 @@
 //! This module projects from the sealed `TaskContract`; it does not rescan the
 //! raw user prompt and does not grant completion authority in WP4.
 
+use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
 use super::task_contract::{TaskContract, TaskIntent, TaskKind};
 use crate::logging::log_llm_event;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BehaviorDeltaAuthority {
     ShadowOnly,
+    Required,
 }
 
 impl BehaviorDeltaAuthority {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::ShadowOnly => "shadow_only",
+            Self::Required => "required",
         }
     }
 }
@@ -66,6 +69,33 @@ pub(super) fn project_behavior_delta_obligation(
     })
 }
 
+pub(super) fn project_required_behavior_delta_obligation(
+    contract: &TaskContract,
+) -> Option<BehaviorDeltaObligation> {
+    let mut obligation = project_behavior_delta_obligation(contract)?;
+    if contract.required_artifact_identities.is_empty() {
+        return None;
+    }
+    obligation.authority = BehaviorDeltaAuthority::Required;
+    Some(obligation)
+}
+
+pub(super) fn required_behavior_delta_missing_source_edit(
+    contract: &TaskContract,
+    evidence: &EvidenceSet,
+) -> bool {
+    project_required_behavior_delta_obligation(contract).is_some()
+        && !evidence.iter().any(|item| {
+            matches!(
+                item,
+                CompletionEvidence::RepoEdit {
+                    category: RepoEditCategory::Impl,
+                    ..
+                }
+            )
+        })
+}
+
 pub(super) fn log_behavior_delta_shadow(
     session_id: &str,
     turn_index: usize,
@@ -80,6 +110,26 @@ pub(super) fn log_behavior_delta_shadow(
             "goal_present": !obligation.behavior_goal.is_empty(),
             "affected_surface_present": obligation.affected_surface.is_some(),
             "expected_observable_count": obligation.expected_observable_behavior.len(),
+            "completion_authority": false,
+        }),
+    );
+}
+
+pub(super) fn log_behavior_delta_required(
+    session_id: &str,
+    turn_index: usize,
+    obligation: &BehaviorDeltaObligation,
+) {
+    log_llm_event(
+        "agent.behavior_delta.required",
+        serde_json::json!({
+            "session_id": session_id,
+            "turn_index": turn_index,
+            "authority": obligation.authority.label(),
+            "goal_present": !obligation.behavior_goal.is_empty(),
+            "affected_surface_present": obligation.affected_surface.is_some(),
+            "expected_observable_count": obligation.expected_observable_behavior.len(),
+            "requires_current_source_edit": true,
             "completion_authority": false,
         }),
     );
@@ -116,5 +166,65 @@ mod tests {
         let contract = TaskContract::from_request("Explain how the cache works");
 
         assert!(project_behavior_delta_obligation(&contract).is_none());
+    }
+
+    #[test]
+    fn required_delta_requires_current_source_edit_for_feature_change() {
+        let contract = TaskContract::from_request(
+            "Improve the existing discounts.py function final_price(price, percent). It should return the price after applying the percentage discount, rounded to 2 decimal places. Keep the existing zero-discount behavior and update tests/test_discounts.py.",
+        );
+        assert!(project_required_behavior_delta_obligation(&contract).is_some());
+
+        let evidence = EvidenceSet::new();
+        assert!(required_behavior_delta_missing_source_edit(
+            &contract, &evidence
+        ));
+    }
+
+    #[test]
+    fn test_only_edit_does_not_satisfy_required_delta_source_edit() {
+        let contract = TaskContract::from_request(
+            "Improve existing discounts.py final_price behavior and update tests/test_discounts.py",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::RepoEdit {
+            category: RepoEditCategory::Test,
+            count: 1,
+            path: Some("tests/test_discounts.py".to_string()),
+        });
+
+        assert!(required_behavior_delta_missing_source_edit(
+            &contract, &evidence
+        ));
+    }
+
+    #[test]
+    fn implementation_edit_satisfies_required_delta_source_edit() {
+        let contract = TaskContract::from_request(
+            "Improve existing discounts.py final_price behavior and update tests/test_discounts.py",
+        );
+        let mut evidence = EvidenceSet::new();
+        evidence.push(CompletionEvidence::RepoEdit {
+            category: RepoEditCategory::Impl,
+            count: 1,
+            path: Some("discounts.py".to_string()),
+        });
+
+        assert!(!required_behavior_delta_missing_source_edit(
+            &contract, &evidence
+        ));
+    }
+
+    #[test]
+    fn build_request_does_not_require_behavior_delta_source_edit() {
+        let contract = TaskContract::from_request(
+            "Create a Python CLI in main.py that prints JSON totals and add tests.",
+        );
+        let evidence = EvidenceSet::new();
+
+        assert!(project_required_behavior_delta_obligation(&contract).is_none());
+        assert!(!required_behavior_delta_missing_source_edit(
+            &contract, &evidence
+        ));
     }
 }

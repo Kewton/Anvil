@@ -95,6 +95,43 @@ pub(super) fn task_contract_recovery_action(
             owned_test_artifacts: &owned_test_artifacts,
         },
     );
+    if matches!(
+        action,
+        super::task_contract::ArtifactRecoveryAction::RunVerifier
+    ) && super::behavior_delta_obligation::required_behavior_delta_missing_source_edit(
+        contract,
+        &agent.task_contract_evidence_set_this_turn,
+    ) {
+        if let Some(obligation) =
+            super::behavior_delta_obligation::project_required_behavior_delta_obligation(contract)
+        {
+            super::behavior_delta_obligation::log_behavior_delta_required(
+                agent.session_store.session_id(),
+                agent.current_turn_index,
+                &obligation,
+            );
+        }
+        let missing = vec![super::task_contract::ArtifactRole::Implementation];
+        let decision = super::task_contract::CompletionDecision::Continue {
+            missing: missing.clone(),
+        };
+        let target_hint =
+            super::task_contract_recovery_planning::recovery_target_hint_for_missing_with_contract(
+                contract,
+                &artifacts,
+                &agent.task_contract_excerpts,
+                &missing,
+            )
+            .or_else(|| task_contract_recovery_target(agent, &decision));
+        return finalize_recovery_action(
+            agent,
+            contract,
+            super::task_contract::ArtifactRecoveryAction::Continue {
+                missing,
+                target_hint,
+            },
+        );
+    }
     if !matches!(
         action,
         super::task_contract::ArtifactRecoveryAction::Continue { .. }
@@ -369,6 +406,50 @@ mod tests {
     };
     use crate::config::Config;
     use crate::session::store::ConversationMessage;
+
+    #[test]
+    fn behavior_delta_blocks_preexisting_verifier_until_source_edit() {
+        let (mut agent, _temp) = test_agent_with_config(Config::default());
+        let request = "Improve the existing discounts.py function final_price(price, percent). It should return the price after applying the percentage discount, rounded to 2 decimal places. Keep the existing zero-discount behavior and update tests/test_discounts.py.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        super::super::task_classification::populate_task_contract_authority(&mut agent);
+        std::fs::create_dir_all(agent.work_root.join("tests")).unwrap();
+        std::fs::write(
+            agent.work_root.join("discounts.py"),
+            "def final_price(price, percent):\n    return price\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.work_root.join("tests/test_discounts.py"),
+            "from discounts import final_price\n\n\ndef test_zero_discount():\n    assert final_price(10, 0) == 10\n",
+        )
+        .unwrap();
+        let contract = TaskContract::from_request(request);
+
+        let action = task_contract_recovery_action(&mut agent, &contract, None, 0);
+
+        assert!(
+            matches!(
+                action,
+                ArtifactRecoveryAction::Continue {
+                    ref missing,
+                    target_hint: Some(RecoveryTargetHint {
+                        role: ArtifactRole::Implementation,
+                        ref path,
+                        ..
+                    }),
+                } if missing == &vec![ArtifactRole::Implementation] && path == "discounts.py"
+            ),
+            "pre-existing verifier evidence must not satisfy a current behavior delta before source edit: {action:?}"
+        );
+    }
 
     #[test]
     fn completion_probe_does_not_override_missing_owned_test_repair() {
