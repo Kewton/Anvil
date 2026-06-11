@@ -128,6 +128,8 @@ fn r1b_pam_eval_summary_serializes_advisory_impact() {
         mode: "live".to_string(),
         decision_type: "prompt_context_injection".to_string(),
         decision_types: vec!["prompt_context_injection".to_string()],
+        availability: PamEvalSummary::derive_availability("live", 2, 1, 0, None).to_string(),
+        failure_phase: None,
         affected_targets: vec![anvil::session::eval_log::PamEvalTarget {
             target_type: "prompt_context".to_string(),
             target: "context_pack_prompt".to_string(),
@@ -494,6 +496,7 @@ fn r9_oversized_record_is_dropped() {
             },
             0,
         )),
+        shadow_terminal_projection: None,
         recovery_strategy_count: 0,
         recovery_strategies: vec![],
         evaluation_taxonomy: EvaluationTaxonomySummary {

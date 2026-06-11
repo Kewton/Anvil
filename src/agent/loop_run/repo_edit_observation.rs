@@ -292,6 +292,77 @@ fn maybe_record_no_op_command_observation_binding(
     true
 }
 
+/// Issue #919 (CB-001): production promotion of an edited Authoring UsageDocs
+/// artifact to a path-matched `CompletionEvidence::ReportCompletenessPass`.
+///
+/// The DR3-002 completion gate (`task_contract::required_role_satisfied_by_evidence`)
+/// rejects raw `RepoEdit(Docs)` as Authoring completion authority; it only
+/// accepts a path-matched accept-tier pass. The verifier-driven recovery path
+/// already runs `authoring_accept_tier_diagnostic`, but `observe_evidence_from_repo_edit`
+/// (the production Write/Edit observation entry point) never promoted a
+/// sufficient first-shot artifact, so a real Authoring write stayed
+/// `Continue { UsageDocs }` until retry exhaustion.
+///
+/// Gates (all must hold; non-Authoring kinds and non-matching paths are
+/// untouched so Docs/Data/Research/Ops/Coding behavior is preserved):
+///   1. the active task-contract authority resolves to `TaskKind::Authoring`;
+///   2. `relative_path` matches a required UsageDocs obligation under the same
+///      `normalized_artifact_path_eq` identity the completion gate uses; and
+///   3. `authoring_accept_tier_diagnostic` PASSES (returns `None`) for the
+///      bounded excerpt against the obligation's requested sections.
+///
+/// Security/containment: `relative_path` is the already-admitted
+/// workspace-relative path from this observation (it passed the
+/// workspace-relative normalization, artifact admission, user-deliverable and
+/// scaffold/no-op gates above); `excerpt` is the existing 8 KiB-capped
+/// `bounded_post_edit_excerpt`. No raw obligation text and no new file read.
+fn maybe_promote_authoring_accept_tier(agent: &mut Agent, relative_path: &str, excerpt: &str) {
+    use super::task_contract::{ArtifactRole, TaskKind, normalized_artifact_path_eq};
+
+    let Some(contract) = super::task_classification::task_contract_authority(agent) else {
+        return;
+    };
+    if contract.task_kind != TaskKind::Authoring {
+        return;
+    }
+    // Match the edited path against a required UsageDocs obligation using the
+    // exact identity predicate the completion gate consumes, so multi-file
+    // Authoring promotes the correct obligation (and its requested sections).
+    let Some(obligation) = contract
+        .required_identities_for_role(ArtifactRole::UsageDocs)
+        .into_iter()
+        .find(|identity| normalized_artifact_path_eq(relative_path, &identity.path))
+    else {
+        return;
+    };
+    // Accept tier: min length + (if requested) the M-of-N section surface. A
+    // `None` return means the artifact PASSES; `Some(_)` means it fails the
+    // accept tier and must stay `Continue` (no pass pushed).
+    if super::verifier::authoring_accept_tier_diagnostic(
+        TaskKind::Authoring,
+        relative_path,
+        excerpt,
+        &obligation.required_sections,
+    )
+    .is_some()
+    {
+        return;
+    }
+    agent.task_contract_evidence_set_this_turn.push(
+        super::completion_evidence::CompletionEvidence::ReportCompletenessPass {
+            path: Some(relative_path.to_string()),
+        },
+    );
+    crate::logging::log_completion_evidence_observed(
+        agent.current_turn_index,
+        0,
+        "authoring_accept_tier_pass",
+        serde_json::json!({
+            "path_hash": stable_path_hash(&mask_secrets(relative_path)),
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
@@ -397,75 +468,4 @@ mod tests {
             CompletionDecision::Done
         );
     }
-}
-
-/// Issue #919 (CB-001): production promotion of an edited Authoring UsageDocs
-/// artifact to a path-matched `CompletionEvidence::ReportCompletenessPass`.
-///
-/// The DR3-002 completion gate (`task_contract::required_role_satisfied_by_evidence`)
-/// rejects raw `RepoEdit(Docs)` as Authoring completion authority; it only
-/// accepts a path-matched accept-tier pass. The verifier-driven recovery path
-/// already runs `authoring_accept_tier_diagnostic`, but `observe_evidence_from_repo_edit`
-/// (the production Write/Edit observation entry point) never promoted a
-/// sufficient first-shot artifact, so a real Authoring write stayed
-/// `Continue { UsageDocs }` until retry exhaustion.
-///
-/// Gates (all must hold; non-Authoring kinds and non-matching paths are
-/// untouched so Docs/Data/Research/Ops/Coding behavior is preserved):
-///   1. the active task-contract authority resolves to `TaskKind::Authoring`;
-///   2. `relative_path` matches a required UsageDocs obligation under the same
-///      `normalized_artifact_path_eq` identity the completion gate uses; and
-///   3. `authoring_accept_tier_diagnostic` PASSES (returns `None`) for the
-///      bounded excerpt against the obligation's requested sections.
-///
-/// Security/containment: `relative_path` is the already-admitted
-/// workspace-relative path from this observation (it passed the
-/// workspace-relative normalization, artifact admission, user-deliverable and
-/// scaffold/no-op gates above); `excerpt` is the existing 8 KiB-capped
-/// `bounded_post_edit_excerpt`. No raw obligation text and no new file read.
-fn maybe_promote_authoring_accept_tier(agent: &mut Agent, relative_path: &str, excerpt: &str) {
-    use super::task_contract::{ArtifactRole, TaskKind, normalized_artifact_path_eq};
-
-    let Some(contract) = super::task_classification::task_contract_authority(agent) else {
-        return;
-    };
-    if contract.task_kind != TaskKind::Authoring {
-        return;
-    }
-    // Match the edited path against a required UsageDocs obligation using the
-    // exact identity predicate the completion gate consumes, so multi-file
-    // Authoring promotes the correct obligation (and its requested sections).
-    let Some(obligation) = contract
-        .required_identities_for_role(ArtifactRole::UsageDocs)
-        .into_iter()
-        .find(|identity| normalized_artifact_path_eq(relative_path, &identity.path))
-    else {
-        return;
-    };
-    // Accept tier: min length + (if requested) the M-of-N section surface. A
-    // `None` return means the artifact PASSES; `Some(_)` means it fails the
-    // accept tier and must stay `Continue` (no pass pushed).
-    if super::verifier::authoring_accept_tier_diagnostic(
-        TaskKind::Authoring,
-        relative_path,
-        excerpt,
-        &obligation.required_sections,
-    )
-    .is_some()
-    {
-        return;
-    }
-    agent.task_contract_evidence_set_this_turn.push(
-        super::completion_evidence::CompletionEvidence::ReportCompletenessPass {
-            path: Some(relative_path.to_string()),
-        },
-    );
-    crate::logging::log_completion_evidence_observed(
-        agent.current_turn_index,
-        0,
-        "authoring_accept_tier_pass",
-        serde_json::json!({
-            "path_hash": stable_path_hash(&mask_secrets(relative_path)),
-        }),
-    );
 }

@@ -305,7 +305,7 @@ impl PamEvalSummary {
         mode: &str,
         actual_injected_count: u32,
         suppressed_count: u32,
-        would_inject_in_live_count: u32,
+        _would_inject_in_live_count: u32,
         unused_reason: Option<&str>,
     ) -> &'static str {
         match unused_reason {
@@ -321,8 +321,6 @@ impl PamEvalSummary {
             "injected"
         } else if suppressed_count > 0 {
             "blocked_warning"
-        } else if would_inject_in_live_count > 0 {
-            "not_injected"
         } else {
             "not_injected"
         }
@@ -338,13 +336,13 @@ impl PamEvalSummary {
             Some(reason) if reason.starts_with("context_pack_failed:") => reason
                 .split_once(':')
                 .map(|(_, phase)| phase)
-                .and_then(|phase| match phase {
-                    "sidecar_call" => Some("sidecar_call"),
-                    "empty_response" => Some("empty_response"),
-                    "parse_failure" => Some("parse_failure"),
-                    "timeout" => Some("timeout"),
-                    "input_empty" => Some("input_empty"),
-                    _ => Some("context_pack_call"),
+                .map(|phase| match phase {
+                    "sidecar_call" => "sidecar_call",
+                    "empty_response" => "empty_response",
+                    "parse_failure" => "parse_failure",
+                    "timeout" => "timeout",
+                    "input_empty" => "input_empty",
+                    _ => "context_pack_call",
                 }),
             _ => None,
         }

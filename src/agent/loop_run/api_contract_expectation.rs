@@ -102,19 +102,19 @@ impl ApiContractExpectation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ApiContractObservationKind {
-    RequestSchemaMismatch,
-    StatusMismatch,
-    ResponseShapeMismatch,
-    ApiContractMismatch,
+    RequestSchema,
+    Status,
+    ResponseShape,
+    Contract,
 }
 
 impl ApiContractObservationKind {
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::RequestSchemaMismatch => "request_schema_mismatch",
-            Self::StatusMismatch => "status_mismatch",
-            Self::ResponseShapeMismatch => "response_shape_mismatch",
-            Self::ApiContractMismatch => "api_contract_mismatch",
+            Self::RequestSchema => "request_schema_mismatch",
+            Self::Status => "status_mismatch",
+            Self::ResponseShape => "response_shape_mismatch",
+            Self::Contract => "api_contract_mismatch",
         }
     }
 }
@@ -197,7 +197,7 @@ impl ApiContractObservation {
 
     fn repair_hint(&self) -> Option<String> {
         match self.kind {
-            ApiContractObservationKind::RequestSchemaMismatch
+            ApiContractObservationKind::RequestSchema
                 if self.request_binding_issue
                     == Some(ApiRequestBindingIssue::JsonBodyFieldsNotBound) =>
             {
@@ -206,7 +206,7 @@ impl ApiContractObservation {
                         .to_string(),
                 )
             }
-            ApiContractObservationKind::StatusMismatch => {
+            ApiContractObservationKind::Status => {
                 match self.status.as_ref().map(|status| status.policy) {
                     Some(ApiExpectedStatusPolicy::Unspecified) => Some(
                         "do_not_invent_exact_http_status_when_expected_status_unspecified"
@@ -312,7 +312,7 @@ pub(super) fn observe_api_contract_mismatch(
     let lower = diagnostic.to_ascii_lowercase();
     let kind = api_observation_kind(&lower);
     let expectation = select_api_observation_expectation(expectations, kind)?;
-    let request_binding_issue = (kind == ApiContractObservationKind::RequestSchemaMismatch
+    let request_binding_issue = (kind == ApiContractObservationKind::RequestSchema
         && !expectation.request_json_fields.is_empty())
     .then_some(ApiRequestBindingIssue::JsonBodyFieldsNotBound);
     let status = observe_api_status(expectations, diagnostic, kind);
@@ -328,13 +328,13 @@ pub(super) fn observe_api_contract_mismatch(
 
 fn api_observation_kind(lower_diagnostic: &str) -> ApiContractObservationKind {
     if lower_diagnostic.contains("422") || lower_diagnostic.contains("unprocessable entity") {
-        ApiContractObservationKind::RequestSchemaMismatch
+        ApiContractObservationKind::RequestSchema
     } else if lower_diagnostic.contains("status") || lower_diagnostic.contains("status_code") {
-        ApiContractObservationKind::StatusMismatch
+        ApiContractObservationKind::Status
     } else if lower_diagnostic.contains("response") || lower_diagnostic.contains("json") {
-        ApiContractObservationKind::ResponseShapeMismatch
+        ApiContractObservationKind::ResponseShape
     } else {
-        ApiContractObservationKind::ApiContractMismatch
+        ApiContractObservationKind::Contract
     }
 }
 
@@ -343,19 +343,19 @@ fn select_api_observation_expectation(
     kind: ApiContractObservationKind,
 ) -> Option<&ApiContractExpectation> {
     match kind {
-        ApiContractObservationKind::RequestSchemaMismatch => expectations
+        ApiContractObservationKind::RequestSchema => expectations
             .iter()
             .find(|expectation| !expectation.request_json_fields.is_empty())
             .or_else(|| expectations.first()),
-        ApiContractObservationKind::StatusMismatch => expectations
+        ApiContractObservationKind::Status => expectations
             .iter()
             .find(|expectation| expectation.expected_status.is_some())
             .or_else(|| expectations.first()),
-        ApiContractObservationKind::ResponseShapeMismatch => expectations
+        ApiContractObservationKind::ResponseShape => expectations
             .iter()
             .find(|expectation| !expectation.response_fields.is_empty())
             .or_else(|| expectations.first()),
-        ApiContractObservationKind::ApiContractMismatch => expectations.first(),
+        ApiContractObservationKind::Contract => expectations.first(),
     }
 }
 
@@ -365,7 +365,7 @@ fn observe_api_status(
     kind: ApiContractObservationKind,
 ) -> Option<ApiStatusObservation> {
     let codes = status_codes_from_text(diagnostic);
-    if kind != ApiContractObservationKind::StatusMismatch && !codes.contains(&422) {
+    if kind != ApiContractObservationKind::Status && !codes.contains(&422) {
         return None;
     }
     let policy = expectations
@@ -731,10 +731,7 @@ mod tests {
         )
         .expect("api observation");
 
-        assert_eq!(
-            observation.kind,
-            ApiContractObservationKind::RequestSchemaMismatch
-        );
+        assert_eq!(observation.kind, ApiContractObservationKind::RequestSchema);
         assert_eq!(observation.method, HttpMethod::Post);
         assert_eq!(observation.path, "/notes");
         assert_eq!(observation.request_json_fields, vec!["title", "body"]);
@@ -762,7 +759,7 @@ mod tests {
         )
         .expect("api observation");
 
-        assert_eq!(observation.kind, ApiContractObservationKind::StatusMismatch);
+        assert_eq!(observation.kind, ApiContractObservationKind::Status);
         let status = observation.status.as_ref().expect("status observation");
         assert_eq!(status.policy, ApiExpectedStatusPolicy::Unspecified);
         assert_eq!(status.expected_from_diagnostic, Some(201));
@@ -784,7 +781,7 @@ mod tests {
         )
         .expect("api observation");
 
-        assert_eq!(observation.kind, ApiContractObservationKind::StatusMismatch);
+        assert_eq!(observation.kind, ApiContractObservationKind::Status);
         assert_eq!(
             observation.status.as_ref().map(|status| status.policy),
             Some(ApiExpectedStatusPolicy::Explicit(201))
