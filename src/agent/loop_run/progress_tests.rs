@@ -5010,6 +5010,81 @@ E   assert [{'id': 1}] == []\n";
     }
 
     #[test]
+    fn verifier_diagnostic_keeps_only_safe_target_after_no_progress_bans_all_candidates() {
+        let temp = tempdir().unwrap();
+        let work_root = temp.path().to_path_buf();
+        let source = work_root.join("markdown_lint.py");
+        let test = work_root.join("tests").join("test_markdown_lint.py");
+        std::fs::create_dir_all(test.parent().unwrap()).unwrap();
+        std::fs::write(&source, "def lint(content):\n    return []\n").unwrap();
+        std::fs::write(&test, "def test_lint():\n    assert lint('x') == []\n").unwrap();
+        let mut context = verifier_repair_context_from_failure(
+            &work_root,
+            "python3 -B -m pytest -p no:cacheprovider",
+            "FAILED tests/test_markdown_lint.py::test_lint - TypeError\n",
+            &[
+                "markdown_lint.py".to_string(),
+                "tests/test_markdown_lint.py".to_string(),
+            ],
+            3,
+            None,
+        );
+        let scope = context
+            .no_progress_cluster_scope()
+            .expect("scope available from failure signature");
+        context.no_progress_policy.record_no_progress(
+            &scope,
+            super::super::task_contract::ArtifactRole::Implementation,
+            "markdown_lint.py",
+        );
+        context.no_progress_policy.record_no_progress(
+            &scope,
+            super::super::task_contract::ArtifactRole::Test,
+            "tests/test_markdown_lint.py",
+        );
+        assert!(context.no_progress_selection_banned(
+            super::super::task_contract::ArtifactRole::Test,
+            "tests/test_markdown_lint.py"
+        ));
+        let parsed = super::parse_verifier_repair_assessment_reply(
+            r#"{
+                "failure_kind":"test_bug",
+                "probable_cause_role":"test",
+                "repair_targets":[
+                    {"path":"tests/test_markdown_lint.py","confidence":0.95,"reason":"diagnostic found a test binding bug"}
+                ],
+                "repair_plan":[
+                    {"target":"tests/test_markdown_lint.py","intent":"fix generated test binding","confidence":0.95}
+                ],
+                "do_not_edit_tests_without_evidence":true
+            }"#,
+        )
+        .expect("diagnostic json should parse");
+
+        let ws = super::super::task_workspace_scope::TaskWorkspaceScope::detect(&work_root, "");
+        let admission = super::RepairTargetAdmissionContext::owned_for_test(&work_root, &ws);
+        let assessment = super::model_assessment_to_verifier_repair_assessment(
+            &work_root, &context, parsed, &admission,
+        );
+
+        assert_eq!(
+            assessment
+                .repair_target_hint
+                .as_ref()
+                .map(|hint| hint.path.as_str()),
+            Some("tests/test_markdown_lint.py"),
+            "a high-confidence owned diagnostic target should remain available when every candidate is otherwise no-progress banned"
+        );
+        assert_eq!(
+            assessment
+                .repair_plan
+                .first()
+                .map(|hint| hint.path.as_str()),
+            Some("tests/test_markdown_lint.py")
+        );
+    }
+
+    #[test]
     fn verifier_diagnostic_stale_assertion_retargets_test_after_improved_non_test_repair() {
         let temp = tempdir().unwrap();
         let work_root = temp.path().to_path_buf();

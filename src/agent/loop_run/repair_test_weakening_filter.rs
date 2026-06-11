@@ -1,6 +1,7 @@
 use super::repair_assertion_analysis::{
-    assert_line_update_has_observed_pair, changed_assert_equalities, changed_assert_lines,
-    changed_non_assert_lines, count_assert_lines, observed_assert_equal_pairs,
+    assert_line_update_has_observed_pair, changed_assert_comparisons, changed_assert_equalities,
+    changed_assert_lines, changed_non_assert_lines, count_assert_lines,
+    observed_assert_equal_pairs, observed_assert_not_equal_failed_values,
     python_assert_line_is_obvious_weakening, python_assert_line_observes_fixture_state,
 };
 use super::repair_python_test_analysis::{
@@ -55,6 +56,9 @@ fn classify_allowed_change_kind(
         return None;
     }
     if observed_assert_update_matches_repair_context(context, before, after) {
+        return Some(AllowedChangeKind::ExpectedLiteral);
+    }
+    if observed_not_equal_assert_update_matches_repair_context(context, before, after) {
         return Some(AllowedChangeKind::ExpectedLiteral);
     }
     if disconnected_fixture_assertion_update_matches(context, before, after) {
@@ -145,6 +149,51 @@ fn observed_assert_update_matches_repair_context(
                     .any(|(actual, expected)| actual == new_expected && expected == old_expected)
         })
     })
+}
+
+fn observed_not_equal_assert_update_matches_repair_context(
+    context: &super::repair_job::RepairJob,
+    before: &str,
+    after: &str,
+) -> bool {
+    let deleted_asserts = changed_assert_comparisons(before, after);
+    let added_asserts = changed_assert_comparisons(after, before);
+    if deleted_asserts.is_empty()
+        || added_asserts.is_empty()
+        || deleted_asserts.len() != added_asserts.len()
+    {
+        return false;
+    }
+
+    let failed_values = observed_not_equal_failed_values_for_repair_context(context);
+    if failed_values.is_empty() {
+        return false;
+    }
+
+    deleted_asserts
+        .iter()
+        .all(|(old_lhs, old_operator, old_expected)| {
+            old_operator == "!="
+                && failed_values.iter().any(|value| value == old_expected)
+                && added_asserts
+                    .iter()
+                    .any(|(new_lhs, new_operator, new_expected)| {
+                        new_operator == "==" && old_lhs == new_lhs && old_expected == new_expected
+                    })
+        })
+        && added_asserts
+            .iter()
+            .all(|(new_lhs, new_operator, new_expected)| {
+                new_operator == "=="
+                    && failed_values.iter().any(|value| value == new_expected)
+                    && deleted_asserts
+                        .iter()
+                        .any(|(old_lhs, old_operator, old_expected)| {
+                            old_operator == "!="
+                                && old_lhs == new_lhs
+                                && old_expected == new_expected
+                        })
+            })
 }
 
 fn disconnected_fixture_assertion_update_matches(
@@ -242,6 +291,23 @@ fn observed_pairs_for_repair_context(
         observed_assert_equal_pairs(&repair_context_diagnostic_text(context))
     } else {
         pairs
+    }
+}
+
+fn observed_not_equal_failed_values_for_repair_context(
+    context: &super::repair_job::RepairJob,
+) -> Vec<String> {
+    let packet = super::failure_packet::FailurePacket::from_repair_job(context);
+    let values = packet
+        .observed_expected_pairs
+        .into_iter()
+        .filter(|pair| pair.assertion_shape == "assert_not_equal_failed")
+        .map(|pair| pair.expected)
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        observed_assert_not_equal_failed_values(&repair_context_diagnostic_text(context))
+    } else {
+        values
     }
 }
 
@@ -561,5 +627,71 @@ E           ValueError: median() arg is an empty sequence"#;
         );
 
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn generated_test_not_equal_expectation_repair_preserves_assertion_subject() {
+        let before = r####"
+def test_heading_jump_down():
+    result = run_lint("### H3\n\n# H1\n")
+    assert result.returncode != 0
+"####;
+        let after = r####"
+def test_heading_jump_down():
+    result = run_lint("### H3\n\n# H1\n")
+    assert result.returncode == 0
+"####;
+        let output = r#"FAILED tests/test_markdown_lint.py::test_heading_jump_down
+>       assert result.returncode != 0
+E       AssertionError: assert 0 != 0"#;
+        let job = test_bug_repair_job_with_output(output);
+
+        let filtered = filter_weakening_for_observed_assert_update(
+            vec![
+                WeakeningPattern::AssertionDeleted,
+                WeakeningPattern::LiteralOnlyExpectedChange,
+            ],
+            &job,
+            before,
+            after,
+        );
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn generated_test_not_equal_repair_rejects_subject_change() {
+        let before = r####"
+def test_heading_jump_down():
+    result = run_lint("### H3\n\n# H1\n")
+    assert result.returncode != 0
+"####;
+        let after = r####"
+def test_heading_jump_down():
+    result = run_lint("### H3\n\n# H1\n")
+    assert result.stderr == 0
+"####;
+        let output = r#"FAILED tests/test_markdown_lint.py::test_heading_jump_down
+>       assert result.returncode != 0
+E       AssertionError: assert 0 != 0"#;
+        let job = test_bug_repair_job_with_output(output);
+
+        let filtered = filter_weakening_for_observed_assert_update(
+            vec![
+                WeakeningPattern::AssertionDeleted,
+                WeakeningPattern::LiteralOnlyExpectedChange,
+            ],
+            &job,
+            before,
+            after,
+        );
+
+        assert_eq!(
+            filtered,
+            vec![
+                WeakeningPattern::AssertionDeleted,
+                WeakeningPattern::LiteralOnlyExpectedChange,
+            ]
+        );
     }
 }

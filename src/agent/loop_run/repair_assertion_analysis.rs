@@ -79,6 +79,23 @@ pub(super) fn changed_assert_equalities(left: &str, right: &str) -> Vec<(String,
     changed
 }
 
+pub(super) fn changed_assert_comparisons(left: &str, right: &str) -> Vec<(String, String, String)> {
+    let mut right_lines = line_count_map(right);
+    let mut changed = Vec::new();
+    for line in left.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Some(count) = right_lines.get_mut(line)
+            && *count > 0
+        {
+            *count -= 1;
+            continue;
+        }
+        if let Some(parts) = assert_comparison_parts(line) {
+            changed.push(parts);
+        }
+    }
+    changed
+}
+
 pub(super) fn observed_assert_equal_pairs(text: &str) -> Vec<(String, String)> {
     text.lines()
         .filter_map(|line| {
@@ -88,6 +105,18 @@ pub(super) fn observed_assert_equal_pairs(text: &str) -> Vec<(String, String)> {
                 normalize_assert_literal_token(actual)?,
                 normalize_assert_literal_token(expected)?,
             ))
+        })
+        .collect()
+}
+
+pub(super) fn observed_assert_not_equal_failed_values(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let (_, tail) = line.split_once("assert ")?;
+            let (actual, expected) = tail.split_once("!=")?;
+            let actual = normalize_assert_literal_token(actual)?;
+            let expected = normalize_assert_literal_token(expected)?;
+            (actual == expected).then_some(actual)
         })
         .collect()
 }
@@ -197,6 +226,21 @@ fn assert_equality_parts(line: &str) -> Option<(String, String)> {
     Some((lhs.trim().to_string(), normalize_assert_literal_token(rhs)?))
 }
 
+fn assert_comparison_parts(line: &str) -> Option<(String, String, String)> {
+    let trimmed = line.trim_start();
+    let body = trimmed.strip_prefix("assert ")?;
+    for operator in ["==", "!="] {
+        if let Some((lhs, rhs)) = body.split_once(operator) {
+            return Some((
+                lhs.trim().to_string(),
+                operator.to_string(),
+                normalize_assert_literal_token(rhs)?,
+            ));
+        }
+    }
+    None
+}
+
 fn normalize_assert_literal_token(raw: &str) -> Option<String> {
     let token = raw
         .trim()
@@ -251,5 +295,36 @@ E       assert 3 == 2
             "assert len(items) == 3",
             &pairs,
         ));
+    }
+
+    #[test]
+    fn observed_not_equal_failure_extracts_equal_value() {
+        let values =
+            observed_assert_not_equal_failed_values("E       AssertionError: assert 0 != 0");
+
+        assert_eq!(values, vec!["0".to_string()]);
+    }
+
+    #[test]
+    fn changed_assert_comparisons_reports_operator_updates() {
+        let before = "assert result.returncode != 0\n";
+        let after = "assert result.returncode == 0\n";
+
+        assert_eq!(
+            changed_assert_comparisons(before, after),
+            vec![(
+                "result.returncode".to_string(),
+                "!=".to_string(),
+                "0".to_string()
+            )]
+        );
+        assert_eq!(
+            changed_assert_comparisons(after, before),
+            vec![(
+                "result.returncode".to_string(),
+                "==".to_string(),
+                "0".to_string()
+            )]
+        );
     }
 }

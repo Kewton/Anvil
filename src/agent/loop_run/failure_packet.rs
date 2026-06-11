@@ -480,6 +480,12 @@ fn extract_observed_expected_pairs(output: &str) -> Vec<ObservedExpectedPair> {
                 ObservedExpectedPair::new(&observed, &expected, "assert_equal"),
             );
         }
+        for value in observed_failed_not_equal_values_from_assert_line(line) {
+            push_pair(
+                &mut pairs,
+                ObservedExpectedPair::new(&value, &value, "assert_not_equal_failed"),
+            );
+        }
         if let Some((observed, expected)) = observed_expected_from_unittest_assertion_line(line) {
             push_pair(
                 &mut pairs,
@@ -527,6 +533,21 @@ fn observed_expected_pairs_from_assert_line(line: &str) -> Vec<(String, String)>
     pairs
 }
 
+fn observed_failed_not_equal_values_from_assert_line(line: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = line;
+    while let Some((_, tail)) = rest.split_once("assert ") {
+        if let Some(value) = observed_failed_not_equal_value_from_assert_tail(tail) {
+            values.push(value);
+        }
+        rest = tail;
+        if values.len() >= MAX_OBSERVED_EXPECTED_PAIRS {
+            break;
+        }
+    }
+    values
+}
+
 fn observed_expected_from_unittest_assertion_line(line: &str) -> Option<(String, String)> {
     let tail = line.trim().strip_prefix("AssertionError:")?.trim();
     let (observed, expected) = tail.split_once(" != ")?;
@@ -540,6 +561,13 @@ fn observed_expected_from_assert_tail(tail: &str) -> Option<(String, String)> {
     let observed = normalize_observed_expected_token(observed)?;
     let expected = normalize_observed_expected_token(expected)?;
     (observed != expected).then_some((observed, expected))
+}
+
+fn observed_failed_not_equal_value_from_assert_tail(tail: &str) -> Option<String> {
+    let (observed, expected) = tail.split_once("!=")?;
+    let observed = normalize_observed_expected_token(observed)?;
+    let expected = normalize_observed_expected_token(expected)?;
+    (observed == expected).then_some(observed)
 }
 
 fn normalize_observed_expected_token(raw: &str) -> Option<String> {
@@ -663,6 +691,27 @@ AssertionError: 'hello' != 'world'
                 "hello",
                 "world",
                 "unittest_assert_equal"
+            )]
+        );
+    }
+
+    #[test]
+    fn failure_packet_extracts_failed_not_equal_pairs() {
+        let output = r####"
+    def test_heading_jump_down():
+        result = run_lint("### H3\n\n# H1\n")
+>       assert result.returncode != 0
+E       AssertionError: assert 0 != 0
+"####;
+
+        let pairs = extract_observed_expected_pairs(output);
+
+        assert_eq!(
+            pairs,
+            vec![ObservedExpectedPair::new(
+                "0",
+                "0",
+                "assert_not_equal_failed"
             )]
         );
     }
