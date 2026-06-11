@@ -2981,6 +2981,29 @@ pub(super) fn drive_task_contract_verifier(
         TaskContractVerifierOutcome::SafeStop {
             reason,
             weak_reason,
+        } if super::verifier_weak_repair_target::active_reason_for_safe_stop(
+            reason,
+            weak_reason,
+        )
+        .is_some() =>
+        {
+            let weak_reason = super::verifier_weak_repair_target::active_reason_for_safe_stop(
+                reason,
+                weak_reason,
+            )
+            .expect("guarded Some");
+            super::verifier_weak_repair_target::log_active_repair_target(
+                agent.session_store.session_id(),
+                agent.current_turn_index,
+                agent.session.iter_count_this_turn,
+                "task_contract_verifier",
+                weak_reason,
+            );
+            handle_task_contract_verifier_no_verifier(agent, args)
+        }
+        TaskContractVerifierOutcome::SafeStop {
+            reason,
+            weak_reason,
         } => handle_task_contract_verifier_safe_stop(
             agent,
             args.last_iter,

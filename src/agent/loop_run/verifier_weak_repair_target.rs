@@ -22,6 +22,19 @@ impl VerifierWeakRepairTargetKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VerifierWeakRepairAdoption {
+    Adopt,
+}
+
+impl VerifierWeakRepairAdoption {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Adopt => "active_limited",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct VerifierWeakRepairTarget {
     pub(super) reason: VerifierWeakReason,
     pub(super) job_kind: VerifierWeakRepairTargetKind,
@@ -71,6 +84,50 @@ pub(super) fn log_shadow_repair_target(
     );
 }
 
+pub(super) fn active_adoption(
+    reason: VerifierWeakReason,
+) -> (VerifierWeakRepairTarget, VerifierWeakRepairAdoption) {
+    (
+        shadow_repair_target(reason),
+        VerifierWeakRepairAdoption::Adopt,
+    )
+}
+
+pub(super) fn active_reason_for_safe_stop(
+    safe_stop_reason: super::task_contract::SafeStopReason,
+    weak_reason: Option<VerifierWeakReason>,
+) -> Option<VerifierWeakReason> {
+    match (safe_stop_reason, weak_reason) {
+        (super::task_contract::SafeStopReason::VerifierWeak, Some(reason)) => Some(reason),
+        (super::task_contract::SafeStopReason::VerifierWeak, None)
+        | (super::task_contract::SafeStopReason::VerifierMissing, _) => None,
+    }
+}
+
+pub(super) fn log_active_repair_target(
+    session_id: &str,
+    turn_index: usize,
+    iter_index: usize,
+    source: &'static str,
+    reason: VerifierWeakReason,
+) {
+    let (target, adoption) = active_adoption(reason);
+    log_llm_event(
+        "agent.verifier.weak_repair_adopted",
+        serde_json::json!({
+            "session_id": session_id,
+            "turn_index": turn_index,
+            "iter_index": iter_index,
+            "source": source,
+            "weak_reason": target.reason.label(),
+            "target_job": target.job_kind.label(),
+            "expected_delta": target.expected_delta,
+            "adoption_state": adoption.label(),
+            "terminal_behavior": "bounded_missing_evidence_repair",
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +157,41 @@ mod tests {
             "rerun_verifier_with_owned_test_binding"
         );
         assert_eq!(target.adoption_state, "shadow_only");
+    }
+
+    #[test]
+    fn active_adoption_preserves_projected_target() {
+        let (target, adoption) = active_adoption(VerifierWeakReason::WeakPlanMetadataOnly);
+
+        assert_eq!(
+            target.job_kind,
+            VerifierWeakRepairTargetKind::MissingEvidenceJob
+        );
+        assert_eq!(adoption.label(), "active_limited");
+    }
+
+    #[test]
+    fn active_reason_requires_typed_weak_reason() {
+        assert_eq!(
+            active_reason_for_safe_stop(
+                super::super::task_contract::SafeStopReason::VerifierWeak,
+                Some(VerifierWeakReason::StructuredSelectionUnbound),
+            ),
+            Some(VerifierWeakReason::StructuredSelectionUnbound)
+        );
+        assert_eq!(
+            active_reason_for_safe_stop(
+                super::super::task_contract::SafeStopReason::VerifierWeak,
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            active_reason_for_safe_stop(
+                super::super::task_contract::SafeStopReason::VerifierMissing,
+                Some(VerifierWeakReason::StructuredSelectionUnbound),
+            ),
+            None
+        );
     }
 }
