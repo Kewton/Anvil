@@ -61,6 +61,9 @@ fn classify_allowed_change_kind(
     if observed_not_equal_assert_update_matches_repair_context(context, before, after) {
         return Some(AllowedChangeKind::ExpectedLiteral);
     }
+    if contract_conflict_assert_update_matches_repair_context(context, before, after) {
+        return Some(AllowedChangeKind::ExpectedLiteral);
+    }
     if disconnected_fixture_assertion_update_matches(context, before, after) {
         return Some(AllowedChangeKind::DisconnectedFixtureObservation);
     }
@@ -194,6 +197,66 @@ fn observed_not_equal_assert_update_matches_repair_context(
                                 && old_expected == new_expected
                         })
             })
+}
+
+fn contract_conflict_assert_update_matches_repair_context(
+    context: &super::repair_job::RepairJob,
+    before: &str,
+    after: &str,
+) -> bool {
+    if !test_expectation_contract_conflict_allowed_by_authority(context) {
+        return false;
+    }
+    let deleted_asserts = changed_assert_comparisons(before, after);
+    let added_asserts = changed_assert_comparisons(after, before);
+    if deleted_asserts.is_empty()
+        || added_asserts.is_empty()
+        || deleted_asserts.len() != added_asserts.len()
+    {
+        return false;
+    }
+
+    deleted_asserts
+        .iter()
+        .all(|(old_lhs, _old_operator, _old_expected)| {
+            added_asserts
+                .iter()
+                .any(|(new_lhs, _new_operator, _new_expected)| old_lhs == new_lhs)
+        })
+        && added_asserts
+            .iter()
+            .all(|(new_lhs, _new_operator, _new_expected)| {
+                deleted_asserts
+                    .iter()
+                    .any(|(old_lhs, _old_operator, _old_expected)| old_lhs == new_lhs)
+            })
+}
+
+fn test_expectation_contract_conflict_allowed_by_authority(
+    context: &super::repair_job::RepairJob,
+) -> bool {
+    let Some(plan) = context.semantic_plan.as_ref() else {
+        return false;
+    };
+    if !matches!(
+        plan.semantic_cause,
+        super::VerifierDiagnosticFailureKind::TestBug
+    ) && !matches!(
+        plan.semantic_report.failure_kind,
+        super::VerifierDiagnosticFailureKind::TestBug
+    ) {
+        return false;
+    }
+    if plan.preferred_repair_role != super::task_contract::ArtifactRole::Test {
+        return false;
+    }
+    if matches!(
+        plan.spec_authority,
+        super::spec_authority::SpecAuthority::LlmGeneratedTest
+    ) {
+        return false;
+    }
+    super::contract_conflict_job::classify_contract_conflict(&plan.semantic_report).is_some()
 }
 
 fn disconnected_fixture_assertion_update_matches(
@@ -489,6 +552,46 @@ mod tests {
         }
     }
 
+    fn implementation_contract_conflict_job_with_output(output_excerpt: &str) -> RepairJob {
+        let report = parse_semantic_failure_report(&serde_json::json!({
+            "failure_kind": "test_bug",
+            "confidence": 0.95,
+            "preferred_repair_role": "test",
+            "repair_hypothesis": "generated test expectation contradicts implementation contract",
+            "failure_clusters": [{
+                "observed": "implementation reports heading jumps over one level as invalid",
+                "expected": "generated tests contain conflicting downward heading expectations",
+                "input_shape": "cli markdown fixture",
+                "assertion_shape": "returncode expectation",
+                "involved_artifacts": ["implementation", "test", "usage_docs"],
+                "affected_cases": ["test_valid_heading_reset"],
+            }],
+            "contract_conflict": {
+                "implementation": "heading jumps greater than one are invalid",
+                "test": "some generated downward jump tests expect valid",
+                "usage_docs": "heading jumps greater than one are invalid"
+            }
+        }))
+        .expect("semantic report parses");
+        let cluster_id = report.failure_clusters[0].cluster_key.clone();
+
+        RepairJob {
+            output_excerpt: output_excerpt.to_string(),
+            semantic_plan: Some(SemanticRepairPlan {
+                semantic_report: report,
+                failure_cluster_id: cluster_id,
+                semantic_cause: VerifierDiagnosticFailureKind::TestBug,
+                spec_authority: SpecAuthority::ImplementationContract,
+                preferred_repair_role: ArtifactRole::Test,
+                repair_hypothesis: "generated test expectation contradicts implementation contract"
+                    .to_string(),
+                expected_improvement: None,
+                assessment_generation_at_creation: 0,
+            }),
+            ..RepairJob::new_for_test()
+        }
+    }
+
     #[test]
     fn missing_import_parser_extracts_symbol_and_module() {
         let parsed = missing_import_name_from_output(
@@ -675,6 +778,68 @@ def test_heading_jump_down():
 >       assert result.returncode != 0
 E       AssertionError: assert 0 != 0"#;
         let job = test_bug_repair_job_with_output(output);
+
+        let filtered = filter_weakening_for_observed_assert_update(
+            vec![
+                WeakeningPattern::AssertionDeleted,
+                WeakeningPattern::LiteralOnlyExpectedChange,
+            ],
+            &job,
+            before,
+            after,
+        );
+
+        assert_eq!(
+            filtered,
+            vec![
+                WeakeningPattern::AssertionDeleted,
+                WeakeningPattern::LiteralOnlyExpectedChange,
+            ]
+        );
+    }
+
+    #[test]
+    fn contract_conflict_expectation_repair_allows_subject_preserving_operator_update() {
+        let before = r####"
+def test_valid_heading_reset():
+    result = run_lint("### H3\n\n# H1\n")
+    assert result.returncode == 0
+"####;
+        let after = r####"
+def test_valid_heading_reset():
+    result = run_lint("### H3\n\n# H1\n")
+    assert result.returncode != 0
+"####;
+        let output = r#"FAILED tests/test_markdown_lint.py::test_valid_heading_reset"#;
+        let job = implementation_contract_conflict_job_with_output(output);
+
+        let filtered = filter_weakening_for_observed_assert_update(
+            vec![
+                WeakeningPattern::AssertionDeleted,
+                WeakeningPattern::LiteralOnlyExpectedChange,
+            ],
+            &job,
+            before,
+            after,
+        );
+
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn contract_conflict_expectation_repair_rejects_subject_change() {
+        let before = r####"
+def test_valid_heading_reset():
+    result = run_lint("### H3\n\n# H1\n")
+    assert result.returncode == 0
+"####;
+        let after = r####"
+def test_valid_heading_reset():
+    result = run_lint("### H3\n\n# H1\n")
+    assert result.stderr != 0
+"####;
+        let output = r#"FAILED tests/test_markdown_lint.py::test_valid_heading_reset"#;
+        let job = implementation_contract_conflict_job_with_output(output);
 
         let filtered = filter_weakening_for_observed_assert_update(
             vec![
