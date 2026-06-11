@@ -113,6 +113,9 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
         pre_tool_hash.as_ref().and_then(Option::as_deref),
         current_hash.as_deref(),
     ) {
+        if maybe_record_no_op_command_observation_binding(agent, category, &relative_path) {
+            return;
+        }
         crate::logging::log_completion_evidence_observed(
             agent.current_turn_index,
             0,
@@ -220,6 +223,178 @@ pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
             &relative_path,
             role,
             &scope,
+        );
+    }
+}
+
+fn maybe_record_no_op_command_observation_binding(
+    agent: &mut Agent,
+    category: super::completion_evidence::RepoEditCategory,
+    relative_path: &str,
+) -> bool {
+    use super::task_contract::{
+        ObjectiveEvidenceKind, normalized_artifact_path_eq, role_from_repo_edit,
+    };
+
+    let Some(role) = role_from_repo_edit(category) else {
+        return false;
+    };
+    let Some(contract) = super::task_classification::task_contract_authority(agent) else {
+        return false;
+    };
+    let objective = contract.objective_contract();
+    if objective.evidence_kind != ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        || !objective.requires_evidence()
+        || !objective.required_deliverables().contains(&role)
+        || !super::objective_evidence::command_observation_evidence_collected_for_contract(
+            &agent.task_contract_evidence_set_this_turn,
+            &contract,
+        )
+        || !contract
+            .required_identities_for_role(role)
+            .iter()
+            .any(|identity| normalized_artifact_path_eq(relative_path, &identity.path))
+    {
+        return false;
+    }
+
+    let repo_edit_evidence = super::completion_evidence::CompletionEvidence::RepoEdit {
+        category,
+        count: 1,
+        path: Some(relative_path.to_string()),
+    };
+    agent
+        .task_contract_evidence_set_this_turn
+        .push(repo_edit_evidence.clone());
+    crate::logging::log_completion_evidence_observed(
+        agent.current_turn_index,
+        0,
+        "repo_edit_no_op_command_binding",
+        serde_json::json!({
+            "category": format!("{:?}", category),
+            "path": relative_path,
+        }),
+    );
+    if let Some(observation) =
+        super::evidence_observation::EvidenceObservation::from_completion_evidence(
+            &repo_edit_evidence,
+            ObjectiveEvidenceKind::FileLayoutCheck,
+            None,
+            super::evidence_observation::EvidenceObservationSource::CompletionEvidence,
+        )
+    {
+        super::evidence_observation::log_evidence_observation_observed(
+            agent.current_turn_index,
+            0,
+            &observation,
+        );
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::agent::loop_run::commands::test_agent_with_config;
+    use crate::agent::loop_run::completion_evidence::CompletionEvidence;
+    use crate::agent::loop_run::file_excerpt::current_file_hash_for_relative_path;
+    use crate::agent::loop_run::project_profile::parse_project_profile_confirmation;
+    use crate::agent::loop_run::task_contract::{CompletionDecision, TaskContract};
+    use crate::config::Config;
+    use crate::session::store::ConversationMessage;
+
+    use super::*;
+
+    fn seed_command_observation_contract(
+        agent: &mut crate::agent::loop_run::Agent,
+        request: &str,
+    ) -> Rc<TaskContract> {
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"cli",
+                "deliverable_kind":"document",
+                "primary_artifacts":["reports/health-check.md"],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":"./scripts/health.sh",
+                "confidence":1.0,
+                "reason":"the document must be grounded in an observed local command"
+            }"#,
+        )
+        .expect("profile");
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        let contract = Rc::new(TaskContract::from_request_with_kind_and_project_profile(
+            request,
+            None,
+            Some(&profile),
+        ));
+        agent
+            .task_contract_this_turn
+            .set(contract.clone())
+            .expect("unset task contract cell");
+        contract
+    }
+
+    #[test]
+    fn no_op_write_after_command_observation_binds_existing_artifact_without_ledger_edit() {
+        let (mut agent, temp) = test_agent_with_config(Config::default());
+        let request = "Run ./scripts/health.sh and write reports/health-check.md containing the command, stdout, stderr, and exit code.";
+        let contract = seed_command_observation_contract(&mut agent, request);
+        let rel = "reports/health-check.md";
+        std::fs::create_dir_all(temp.path().join("reports")).unwrap();
+        std::fs::write(
+            temp.path().join(rel),
+            "# Health Check Report\n\n## Command\n\n./scripts/health.sh\n",
+        )
+        .unwrap();
+        let hash =
+            current_file_hash_for_relative_path(&agent.work_root, rel).expect("current hash");
+        agent
+            .turn_pre_tool_file_hashes
+            .insert(rel.to_string(), Some(hash));
+        agent
+            .task_contract_evidence_set_this_turn
+            .push(CompletionEvidence::CommandObservation {
+                command: "bash ./scripts/health.sh 2>stderr.tmp; echo \"EXIT_CODE=$?\"; cat stderr.tmp; rm stderr.tmp".to_string(),
+                exit_status: 0,
+                safety_boundary_passed: true,
+            });
+
+        observe_evidence_from_repo_edit(&mut agent, rel);
+
+        assert!(
+            agent
+                .task_contract_evidence_set_this_turn
+                .iter()
+                .any(|item| matches!(
+                    item,
+                    CompletionEvidence::RepoEdit { path: Some(path), .. } if path == rel
+                )),
+            "no-op binding should be visible to task-contract evidence"
+        );
+        assert!(
+            !agent.turn_edited_relative_paths.contains(rel),
+            "no-op binding must not masquerade as a real file edit"
+        );
+        assert_eq!(
+            agent.artifact_ledger.event_count(),
+            0,
+            "no-op binding must not seed the artifact ledger"
+        );
+        assert_eq!(
+            contract.evaluate(&agent.task_contract_evidence_set_this_turn),
+            CompletionDecision::Done
         );
     }
 }

@@ -6,7 +6,9 @@ use super::protocol::{
     requested_paths_from_text,
 };
 use super::summary::{ExitReason, LoopStats};
-use super::task_contract::{ArtifactExcerpts, ArtifactRole, CompletionDecision, TaskContract};
+use super::task_contract::{
+    ArtifactExcerpts, ArtifactRole, CompletionDecision, TaskContract, TaskKind,
+};
 use super::task_workspace_scope::TaskWorkspaceScope;
 use super::tester;
 use super::verifier_skill::VerifierInputs;
@@ -762,11 +764,19 @@ pub(super) fn completion_credit_reconciliation_allows_done(
     owned_test_artifacts: &[String],
     current_terminal: ExitReason,
 ) -> bool {
-    terminal_allows_completion_credit_reconciliation(current_terminal)
+    (terminal_allows_completion_credit_reconciliation(current_terminal)
+        || terminal_allows_non_coding_completion_credit_reconciliation(contract, current_terminal))
         && matches!(
             contract.evaluate_with_owned_test_artifacts(evidence, owned_test_artifacts),
             CompletionDecision::Done
         )
+}
+
+fn terminal_allows_non_coding_completion_credit_reconciliation(
+    contract: &TaskContract,
+    reason: ExitReason,
+) -> bool {
+    reason == ExitReason::MaxIterations && contract.task_kind != TaskKind::Coding
 }
 
 pub(super) fn recent_successful_bash_commands_since_last_user(
@@ -1277,6 +1287,105 @@ mod tests {
                 "{terminal:?} should reconcile to done when objective-bound evidence is complete"
             );
         }
+    }
+
+    #[test]
+    fn completion_credit_reconciliation_promotes_non_coding_max_iterations_with_done_evidence() {
+        let request = "Run pwd and capture the observation.";
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"command_observation",
+                "primary_artifacts":[],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"the objective is observing a shell command result"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        assert_eq!(
+            contract.task_kind,
+            super::super::task_contract::TaskKind::Ops
+        );
+
+        let mut evidence = ES::new();
+        evidence.push(CE::CommandObservation {
+            command: "pwd".to_string(),
+            exit_status: 0,
+            safety_boundary_passed: true,
+        });
+
+        assert!(
+            completion_credit_reconciliation_allows_done(
+                &contract,
+                &evidence,
+                &[],
+                ExitReason::MaxIterations,
+            ),
+            "non-coding objective-bound evidence should reconcile max_iterations to done"
+        );
+    }
+
+    #[test]
+    fn completion_credit_reconciliation_rejects_coding_max_iterations_even_with_done_evidence() {
+        let contract =
+            TaskContract::from_request("Implement feature X and add tests for the behavior.");
+        let evidence = coding_contract_evidence(Some(1));
+        let owned = vec!["tests/feature_test.rs".to_string()];
+
+        assert!(
+            !completion_credit_reconciliation_allows_done(
+                &contract,
+                &evidence,
+                &owned,
+                ExitReason::MaxIterations,
+            ),
+            "coding max_iterations remains unsafe to promote because it may hide unfinished repair"
+        );
+    }
+
+    #[test]
+    fn completion_credit_reconciliation_rejects_failed_non_coding_max_iterations_evidence() {
+        let request = "Run pwd and capture the observation.";
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"command_observation",
+                "primary_artifacts":[],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"the objective is observing a shell command result"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        let mut evidence = ES::new();
+        evidence.push(CE::CommandObservation {
+            command: "pwd".to_string(),
+            exit_status: 1,
+            safety_boundary_passed: true,
+        });
+
+        assert!(
+            !completion_credit_reconciliation_allows_done(
+                &contract,
+                &evidence,
+                &[],
+                ExitReason::MaxIterations,
+            ),
+            "failed command observation must not become completion credit"
+        );
     }
 
     #[test]

@@ -933,7 +933,7 @@ impl DiagnosticRepairWorkerRequest {
         let api_contract_delta =
             super::task_contract::mask_and_cap_recovery_field(&self.api_contract_delta);
         format!(
-            "[DiagnosticRepairWorker] EvidenceFailedJob owns this turn. repair_delta={repair_delta}; ledger_facts={ledger_facts}; api_contract_delta={api_contract_delta}; failure_kind={failure_kind}; target_role={target_role}; target={target}; allowed_change_kind={allowed_change_kind}; evidence_command={evidence_command}. Treat repair_delta, ledger_facts, and api_contract_delta as primary control data; treat Diagnostic as auxiliary failure text. Diagnostic: {diagnostic}. Next required action: {next_required_action}. Keep the change bounded to that target and failure. Do not switch files, run verification, or finish with prose.",
+            "[DiagnosticRepairWorker] EvidenceFailedJob owns this turn. repair_delta={repair_delta}; ledger_facts={ledger_facts}; api_contract_delta={api_contract_delta}; failure_kind={failure_kind}; target_role={target_role}; target={target}; allowed_change_kind={allowed_change_kind}; evidence_command={evidence_command}. Treat repair_delta and ledger_facts as primary control data; api_contract_delta is also controller data when present; treat Diagnostic as auxiliary failure text. Diagnostic: {diagnostic}. Next required action: {next_required_action}. Keep the change bounded to that target and failure. Do not switch files, run verification, or finish with prose.",
             repair_delta = self.repair_delta_kind.as_str(),
             failure_kind = self.failure_kind.label(),
             target_role = self.target_role.label(),
@@ -1109,19 +1109,21 @@ pub(super) fn diagnostic_repair_worker_request_for_evidence_failed(
         ),
     ));
     context_pack.push(ContextPackEntry::new(
-        ContextPackKind::Repair,
-        "api_contract_delta",
-        api_contract_delta.as_str(),
+        ContextPackKind::Diagnostic,
+        "diagnostic",
+        format!("failure_kind={}; {diagnostic}", failure_kind.label()),
     ));
+    if api_contract_delta != "none" {
+        context_pack.push(ContextPackEntry::new(
+            ContextPackKind::Repair,
+            "api_contract_delta",
+            api_contract_delta.as_str(),
+        ));
+    }
     context_pack.push(ContextPackEntry::new(
         ContextPackKind::Evidence,
         "evidence_command",
         evidence_command.as_str(),
-    ));
-    context_pack.push(ContextPackEntry::new(
-        ContextPackKind::Diagnostic,
-        "diagnostic",
-        format!("failure_kind={}; {diagnostic}", failure_kind.label()),
     ));
     DiagnosticRepairWorkerRequest {
         worker_contract: WorkerContract::from_task_contract(contract, WorkerKind::DiagnosticRepair)

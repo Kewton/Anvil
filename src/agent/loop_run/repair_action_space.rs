@@ -7,6 +7,7 @@
 
 use super::repair_action::RepairAction;
 use super::task_contract::{ArtifactRole, RecoveryTargetHint};
+use crate::session::feedback::mask_secrets;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RepairActionPlan {
@@ -36,11 +37,12 @@ impl RepairActionPlanStatus {
 
 impl RepairActionPlan {
     pub(super) fn to_json_value(&self) -> serde_json::Value {
+        let target_path = self.target_path.as_deref().map(mask_secrets);
         serde_json::json!({
             "status": self.status.label(),
             "target_artifact": {
                 "role": self.target_role.map(ArtifactRole::label),
-                "path": self.target_path,
+                "path": target_path,
             },
             "allowed_change_kind": self.allowed_change_kind,
             "allowed_tool_category": self.allowed_tool_category,

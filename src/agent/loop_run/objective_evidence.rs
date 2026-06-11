@@ -105,18 +105,42 @@ fn command_observation_matches_required(actual: &str, required: &str) -> bool {
             && observed_command_heads(actual)
                 .iter()
                 .any(|head| *head == required_tokens[0]))
+        || observed_command_segments(actual)
+            .iter()
+            .any(|segment| shell_wrapper_segment_runs_required(segment, &required_tokens))
 }
 
 fn observed_command_heads(command: &str) -> Vec<&str> {
-    command
-        .split(['\n', ';'])
-        .flat_map(|line| line.split("&&"))
-        .flat_map(|segment| segment.split("||"))
+    observed_command_segments(command)
+        .into_iter()
         .filter_map(|segment| {
             let head = segment.split_whitespace().next()?;
             (!head.is_empty()).then_some(head)
         })
         .collect()
+}
+
+fn observed_command_segments(command: &str) -> Vec<&str> {
+    command
+        .split(['\n', ';'])
+        .flat_map(|line| line.split("&&"))
+        .flat_map(|segment| segment.split("||"))
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+fn shell_wrapper_segment_runs_required(segment: &str, required_tokens: &[&str]) -> bool {
+    let tokens = segment.split_whitespace().collect::<Vec<_>>();
+    let Some(wrapper) = tokens.first().copied() else {
+        return false;
+    };
+    if !matches!(wrapper, "bash" | "sh" | "zsh") || tokens.len() <= required_tokens.len() {
+        return false;
+    }
+    tokens[1..]
+        .windows(required_tokens.len())
+        .any(|window| window == required_tokens)
 }
 
 fn successful_command_observation_requirements_satisfied(
@@ -220,7 +244,7 @@ fn observed_deliverable_role(evidence: &CompletionEvidence) -> Option<ArtifactRo
 mod tests {
     use super::super::completion_evidence::RepoEditCategory;
     use super::super::task_contract::{
-        ObjectiveAuxiliaryContext, ObjectiveAuthority, ObjectiveDeliverableKind, ObjectiveKind,
+        ObjectiveAuthority, ObjectiveAuxiliaryContext, ObjectiveDeliverableKind, ObjectiveKind,
         TaskKind,
     };
     use super::*;
@@ -240,6 +264,22 @@ mod tests {
             "ls"
         ));
         assert!(!command_observation_matches_required("echo pwd", "pwd"));
+    }
+
+    #[test]
+    fn command_observation_accepts_required_command_run_through_shell_wrapper() {
+        assert!(command_observation_matches_required(
+            "bash ./scripts/health.sh 2>reports/stderr.txt",
+            "./scripts/health.sh"
+        ));
+        assert!(command_observation_matches_required(
+            "sh -c ./scripts/health.sh",
+            "./scripts/health.sh"
+        ));
+        assert!(!command_observation_matches_required(
+            "echo ./scripts/health.sh",
+            "./scripts/health.sh"
+        ));
     }
 
     #[test]

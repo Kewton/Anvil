@@ -5064,7 +5064,8 @@ Create the README file."#;
     }
 
     #[test]
-    fn command_observation_profile_requires_real_command_evidence_without_runner_hint() {
+    fn command_observation_profile_requires_artifact_and_real_command_evidence_without_runner_hint()
+    {
         let request = "Run pwd and capture the observation. Do not create source code, tests, Cargo.toml, package.json, or setup files.";
         let profile = super::super::project_profile::parse_project_profile_confirmation(
             r#"{
@@ -5087,10 +5088,29 @@ Create the README file."#;
         assert!(contract.objective_contract().requires_evidence());
 
         let empty = EvidenceSet::new();
-        assert_eq!(contract.evaluate(&empty), CompletionDecision::Verify);
+        assert_eq!(
+            contract.evaluate(&empty),
+            CompletionDecision::Continue {
+                missing: vec![ArtifactRole::UsageDocs]
+            }
+        );
 
         let mut observed = EvidenceSet::new();
         observed.push(command_observation("pwd", 0));
+        assert_eq!(
+            contract.evaluate(&observed),
+            CompletionDecision::Continue {
+                missing: vec![ArtifactRole::UsageDocs]
+            }
+        );
+        let required_doc = contract
+            .required_identities_for_role(ArtifactRole::UsageDocs)
+            .into_iter()
+            .next()
+            .expect("usage docs obligation")
+            .path
+            .clone();
+        observed.push(repo_edit_path(RepoEditCategory::Docs, &required_doc));
         assert_eq!(contract.evaluate(&observed), CompletionDecision::Done);
     }
 

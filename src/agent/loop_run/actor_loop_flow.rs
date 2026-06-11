@@ -2947,10 +2947,10 @@ fn emit_command_observation_evidence_request(
     let task = super::task_contract::mask_and_cap_recovery_field(&active_request);
     let note = match phase {
         CommandObservationEvidencePhase::CollectCommand => format!(
-            "[Command Observation Evidence] The required artifact exists, but the objective still lacks actual command-observation evidence. Use Bash now to execute the local command explicitly requested in the active task. After all required Bash commands succeed, update the required artifact so its recorded output is based on the observed result. Do not invent command output from the workspace path. Active task: {task}",
+            "[Command Observation Evidence] The required artifact exists, but the objective still lacks actual command-observation evidence. Use Bash now to execute the local command explicitly requested in the active task; a plain-text reply is invalid for this phase. The current TOOLS AVAILABLE NOW section is authoritative; ignore earlier assistant statements that Bash was unavailable. When capturing stdout, stderr, or exit code, do not leave temporary files in the workspace: use shell variables, command substitution, or remove any temp files in the same Bash command. After all required Bash commands succeed, update the required artifact so its recorded output is based on the observed result. Do not invent command output from the workspace path. Active task: {task}",
         ),
         CommandObservationEvidencePhase::BindArtifact => format!(
-            "[Command Observation Artifact Binding] Command observation evidence exists, but the required artifact is not yet bound to that observation. Use Write or Edit on the required artifact now so it records the observed Bash output. Do not call Bash again unless a required command is still missing. Active task: {task}",
+            "[Command Observation Artifact Binding] Command observation evidence exists, but the required artifact is not yet bound to that observation. Use Write or Edit on the required artifact now so it records the observed Bash output; if the artifact already appears correct, still rewrite or edit it from the observed result so the binding is explicit. Do not call Bash again unless a required command is still missing. Active task: {task}",
         ),
     };
     super::message_push::push_system_note(agent, note);
