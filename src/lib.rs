@@ -72,9 +72,6 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
-    if config.engine == Engine::Minimal {
-        return Err("minimal engine is not implemented yet".to_string());
-    }
     config.cwd = ensure_workspace_root(&config.cwd)?;
 
     let state_root = resolve_state_root(&config)?;
@@ -115,7 +112,7 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         config.ollama_host.clone(),
         config.chat_timeout_secs,
         config.context_budget,
-        2_048,
+        config.num_predict,
     )?;
     let available_models = client.list_models()?;
     let models = select_models(
@@ -177,27 +174,6 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         None
     };
 
-    // Acquire the fixed-footer lease before constructing `Agent` so the
-    // handle can be plumbed into the agent. Phase A: `acquire` always
-    // returns a disabled handle (cargo non-TTY harness short-circuits and
-    // the install path is itself still skeleton-only), so the lease is
-    // safe to take on every non-sessions path. AC9's strict zero-acquire
-    // for the oneshot path lands in Phase C alongside the real worker
-    // install (issue #430). The lease drops at the end of `run_cli`.
-    // `_footer_lease` (underscore-prefixed but NOT bare `_`) keeps the lease
-    // alive for the full `run_cli` scope; bare `_` would drop immediately.
-    let _footer_lease = FooterLease::acquire(&config);
-    let footer_handle = _footer_lease.handle_clone();
-
-    let mut agent = Agent::new(
-        config,
-        models,
-        client,
-        session_store,
-        session,
-        footer_handle,
-    );
-
     // Banner: REPL / resume get stdout; oneshot gets stderr so stdout stays
     // clean for script consumers.
     if is_oneshot {
@@ -216,6 +192,38 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         );
     }
 
+    if config.engine == Engine::Minimal {
+        return run_minimal_engine(
+            config,
+            models,
+            client,
+            session_store,
+            session,
+            resume_prompt,
+        );
+    }
+
+    // Acquire the fixed-footer lease before constructing `Agent` so the
+    // handle can be plumbed into the legacy agent. Phase A: `acquire` always
+    // returns a disabled handle (cargo non-TTY harness short-circuits and
+    // the install path is itself still skeleton-only), so the lease is
+    // safe to take on every legacy non-sessions path. AC9's strict zero-acquire
+    // for the oneshot path lands in Phase C alongside the real worker
+    // install (issue #430). The lease drops at the end of `run_cli`.
+    // `_footer_lease` (underscore-prefixed but NOT bare `_`) keeps the lease
+    // alive for the full `run_cli` scope; bare `_` would drop immediately.
+    let _footer_lease = FooterLease::acquire(&config);
+    let footer_handle = _footer_lease.handle_clone();
+
+    let mut agent = Agent::new(
+        config,
+        models,
+        client,
+        session_store,
+        session,
+        footer_handle,
+    );
+
     if let Some(prompt) = resume_prompt {
         // Resume: replay the last user turn, then fall into the REPL loop
         // (banner has already been printed above).
@@ -231,6 +239,52 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     }
 
     agent.run_repl_loop()
+}
+
+fn run_minimal_engine(
+    config: Config,
+    models: RuntimeModels,
+    mut client: OllamaClient,
+    session_store: SessionStore,
+    mut session: session::store::SessionSnapshot,
+    resume_prompt: Option<String>,
+) -> Result<(), String> {
+    let prompt = match resume_prompt {
+        Some(prompt) => prompt,
+        None => match &config.prompt {
+            Some(prompt) => prompt.clone(),
+            None => stdin_prompt()?.ok_or_else(|| {
+                "minimal engine currently requires --prompt, stdin, or --resume".to_string()
+            })?,
+        },
+    };
+
+    let work_root = session
+        .active_root
+        .clone()
+        .unwrap_or_else(|| config.cwd.clone());
+    let loop_config = agent::minimal_loop::MinimalLoopConfig {
+        work_root: work_root.clone(),
+        mode: session.mode_state.mode,
+        context_budget: config.context_budget,
+        max_iterations: config.max_iterations,
+        auto_approve: config.yes_mode,
+        offline: config.offline,
+        cancel_flag: None,
+    };
+    let reply = agent::minimal_loop::run_session(
+        &mut client,
+        &models.main,
+        &mut session,
+        &prompt,
+        &loop_config,
+    )?;
+    session.active_root = (work_root != config.cwd).then_some(work_root);
+    session_store.save(&session)?;
+    if !reply.is_empty() {
+        println!("{reply}");
+    }
+    Ok(())
 }
 
 /// Lightweight state-root resolver for the `sessions` subcommand path, where

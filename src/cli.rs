@@ -18,6 +18,9 @@ pub struct CliArgs {
     pub ollama_host: Option<String>,
     #[arg(long = "context-budget")]
     pub context_budget: Option<usize>,
+    /// Override Ollama num_predict. Defaults to 2048 for legacy and 8192 for minimal.
+    #[arg(long = "num-predict")]
+    pub num_predict: Option<usize>,
     #[arg(long = "max-iterations")]
     pub max_iterations: Option<usize>,
     #[arg(long = "chat-timeout-secs")]
@@ -276,6 +279,7 @@ mod tests {
             sidecar_model: None,
             ollama_host: None,
             context_budget: None,
+            num_predict: None,
             max_iterations: None,
             chat_timeout_secs: None,
             chat_retries: None,
@@ -368,6 +372,15 @@ mod tests {
 
         let parsed = CliArgs::parse_from(["anvil", "--engine", "minimal"]);
         assert_eq!(parsed.engine, Some(Engine::Minimal));
+    }
+
+    #[test]
+    fn num_predict_flag_defaults_none_and_parses_value() {
+        let args = base_args();
+        assert_eq!(args.num_predict, None);
+
+        let parsed = CliArgs::parse_from(["anvil", "--num-predict", "8192"]);
+        assert_eq!(parsed.num_predict, Some(8192));
     }
 
     #[test]

@@ -1230,6 +1230,7 @@ mod tests {
             requested_sidecar_model: None,
             ollama_host: "http://127.0.0.1:11434".to_string(),
             context_budget: 24_000,
+            num_predict: 2_048,
             max_iterations: 12,
             chat_timeout_secs: 300,
             chat_retries: 2,

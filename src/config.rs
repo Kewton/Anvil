@@ -252,6 +252,7 @@ pub struct Config {
     pub requested_sidecar_model: Option<String>,
     pub ollama_host: String,
     pub context_budget: usize,
+    pub num_predict: usize,
     pub max_iterations: usize,
     pub chat_timeout_secs: u64,
     pub chat_retries: usize,
@@ -352,6 +353,7 @@ pub struct PartialConfig {
     pub sidecar_model: Option<String>,
     pub ollama_host: Option<String>,
     pub context_budget: Option<usize>,
+    pub num_predict: Option<usize>,
     pub max_iterations: Option<usize>,
     pub chat_timeout_secs: Option<u64>,
     pub chat_retries: Option<usize>,
@@ -438,6 +440,7 @@ impl Config {
             sidecar_model: args.sidecar_model.clone(),
             ollama_host: args.ollama_host.clone(),
             context_budget: args.context_budget,
+            num_predict: args.num_predict,
             max_iterations: args.max_iterations,
             chat_timeout_secs: args.chat_timeout_secs,
             chat_retries: args.chat_retries,
@@ -490,12 +493,19 @@ impl Config {
         }
         let photon_enabled = !offline && merged.photon_enabled.unwrap_or(false);
 
+        let engine = merged.engine.unwrap_or_default();
+        let default_num_predict = match engine {
+            Engine::Legacy => 2_048,
+            Engine::Minimal => 8_192,
+        };
+
         let config = Self {
             cwd,
             requested_model: merged.model,
             requested_sidecar_model: merged.sidecar_model,
             ollama_host,
             context_budget: merged.context_budget.unwrap_or(24_000),
+            num_predict: merged.num_predict.unwrap_or(default_num_predict),
             max_iterations: merged.max_iterations.unwrap_or(50),
             chat_timeout_secs: merged.chat_timeout_secs.unwrap_or(300),
             chat_retries: merged.chat_retries.unwrap_or(2),
@@ -507,7 +517,7 @@ impl Config {
             auto_plan: merged.auto_plan.unwrap_or(false),
             offline,
             deterministic_fallback: merged.deterministic_fallback.unwrap_or_default(),
-            engine: merged.engine.unwrap_or_default(),
+            engine,
             prompt: args.prompt,
             state_dir_override: merged.state_dir_override,
             resume: ResumeRequest::from_flag(args.resume),
@@ -572,6 +582,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         }
         if config.context_budget.is_some() {
             merged.context_budget = config.context_budget;
+        }
+        if config.num_predict.is_some() {
+            merged.num_predict = config.num_predict;
         }
         if config.max_iterations.is_some() {
             merged.max_iterations = config.max_iterations;
@@ -686,6 +699,7 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         context_budget: map
             .get("context_budget")
             .and_then(|value| value.parse().ok()),
+        num_predict: map.get("num_predict").and_then(|value| value.parse().ok()),
         max_iterations: map
             .get("max_iterations")
             .and_then(|value| value.parse().ok()),
@@ -767,6 +781,9 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
             .ok()
             .or_else(|| env::var("ANVIL_PROVIDER_URL").ok()),
         context_budget: env::var("ANVIL_CONTEXT_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+        num_predict: env::var("ANVIL_NUM_PREDICT")
             .ok()
             .and_then(|value| value.parse().ok()),
         max_iterations: env::var("ANVIL_MAX_ITERATIONS")

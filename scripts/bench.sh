@@ -5,6 +5,8 @@
 #   benchmark-name    benchmarks/ 配下の yaml ファイル名（拡張子なし）
 #   --model <name>    使用モデル
 #   --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
+#   --engine <name>   legacy|minimal（デフォルト: legacy）
+#   --engines <list>  カンマ区切りで複数 engine（例: legacy,minimal）
 #   --runs <n>        実行回数（デフォルト: 5）
 #   --dry-run         anvil 呼び出しを echo で代替
 #   --pam-ab          Same prompt suite with PAM enabled and disabled
@@ -31,6 +33,8 @@ Usage: scripts/bench.sh <benchmark-name> [options]
                     ※ first-write: planned for future, not yet supported
   --model <name>    使用モデル
   --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
+  --engine <name>   legacy|minimal（デフォルト: legacy）
+  --engines <list>  カンマ区切りで複数 engine（例: legacy,minimal）
   --runs <n>        実行回数（デフォルト: 5）
   --no-precautions  Reminder Sidecar を無効化（ANVIL_NO_REMINDER=1）
   --no-case-memory  Case memory を無効化（ANVIL_NO_CASE_RETRIEVAL=1 ANVIL_NO_CASE_RECORD=1）
@@ -51,6 +55,8 @@ EOF
 benchmark_name=""
 model_arg=""
 models_arg=""
+engine_arg=""
+engines_arg=""
 runs=5
 DRY_RUN=0
 no_precautions=0
@@ -86,6 +92,16 @@ while [[ $# -gt 0 ]]; do
     --models)
       [[ $# -ge 2 ]] || { echo "Error: --models requires a value" >&2; exit 1; }
       models_arg="$2"
+      shift 2
+      ;;
+    --engine)
+      [[ $# -ge 2 ]] || { echo "Error: --engine requires a value" >&2; exit 1; }
+      engine_arg="$2"
+      shift 2
+      ;;
+    --engines)
+      [[ $# -ge 2 ]] || { echo "Error: --engines requires a value" >&2; exit 1; }
+      engines_arg="$2"
       shift 2
       ;;
     --runs)
@@ -153,6 +169,11 @@ fi
 
 if [[ -n "$model_arg" && -n "$models_arg" ]]; then
   echo "Error: --model and --models are mutually exclusive" >&2
+  exit 1
+fi
+
+if [[ -n "$engine_arg" && -n "$engines_arg" ]]; then
+  echo "Error: --engine and --engines are mutually exclusive" >&2
   exit 1
 fi
 
@@ -259,9 +280,10 @@ slugify() {
 
 # -------- write_meta_json --------
 write_meta_json() {
-  # $1=rc, $2=elapsed_s, $3=model, $4=start_ts, $5=run_dir, $6=case, $7=task_kind, $8=pam_variant
+  # $1=rc, $2=elapsed_s, $3=model, $4=start_ts, $5=run_dir, $6=case, $7=task_kind, $8=pam_variant, $9=engine, $10=success_check_success, $11=success_check_reason
   local _rc="$1" _elapsed="$2" _model="$3" _start_ts="$4" _run_dir="$5"
   local _case="${6:-default}" _task_kind="${7:-coding}" _pam_variant="${8:-default}"
+  local _engine="${9:-legacy}" _success_check_success="${10:-null}" _success_check_reason="${11:-}"
   if [[ -z "$_run_dir" ]]; then
     return 0
   fi
@@ -274,6 +296,9 @@ write_meta_json() {
     --arg case "$_case" \
     --arg task_kind "$_task_kind" \
     --arg pam_variant "$_pam_variant" \
+    --arg engine "$_engine" \
+    --argjson success_check_success "$_success_check_success" \
+    --arg success_check_reason "$_success_check_reason" \
     '{
       rc: $rc,
       elapsed_s: $elapsed_s,
@@ -281,9 +306,103 @@ write_meta_json() {
       start_ts: $start_ts,
       case: $case,
       task_kind: $task_kind,
-      pam_variant: $pam_variant
+      pam_variant: $pam_variant,
+      engine: $engine,
+      success_check_success: $success_check_success,
+      success_check_reason: (if $success_check_reason == "" then null else $success_check_reason end)
     }' \
     > "$_run_dir/meta.json"
+}
+
+validate_engine() {
+  local e="$1"
+  case "$e" in
+    legacy|minimal) ;;
+    *)
+      echo "Error: engine must be legacy or minimal, got: $e" >&2
+      exit 1
+      ;;
+  esac
+}
+
+SUCCESS_CHECK_SUCCESS="null"
+SUCCESS_CHECK_REASON="no_success_check"
+evaluate_success_check() {
+  # $1=case_idx
+  local case_idx="$1"
+  local selector
+  if [[ "$case_count" -eq 0 ]]; then
+    selector='(.success_check // {})'
+  else
+    selector="(.cases[$case_idx].success_check // .success_check // {})"
+  fi
+
+  local has_check
+  has_check=$(yq -r "$selector | has(\"files\") or has(\"commands\")" "$BENCH_YAML")
+  if [[ "$has_check" != "true" ]]; then
+    SUCCESS_CHECK_SUCCESS="null"
+    SUCCESS_CHECK_REASON="no_success_check"
+    return 0
+  fi
+
+  local ok=1
+  local reasons=()
+  local file_count command_count
+  file_count=$(yq -r "$selector | (.files // []) | length" "$BENCH_YAML")
+  command_count=$(yq -r "$selector | (.commands // []) | length" "$BENCH_YAML")
+
+  for (( check_idx=0; check_idx<file_count; check_idx++ )); do
+    local rel min_lines path line_count
+    rel=$(yq -r "$selector | .files[$check_idx].path // .files[$check_idx] // \"\"" "$BENCH_YAML")
+    min_lines=$(yq -r "$selector | .files[$check_idx].min_lines // \"\"" "$BENCH_YAML")
+    if [[ -z "$rel" || "$rel" == "null" || "$rel" == /* || "$rel" == *..* ]]; then
+      ok=0
+      reasons+=("invalid_file_check")
+      continue
+    fi
+    path="$WORKDIR/$rel"
+    if [[ ! -f "$path" ]]; then
+      ok=0
+      reasons+=("missing_file:$rel")
+      continue
+    fi
+    if [[ -n "$min_lines" && "$min_lines" != "null" ]]; then
+      if ! [[ "$min_lines" =~ ^[0-9]+$ ]]; then
+        ok=0
+        reasons+=("invalid_min_lines:$rel")
+        continue
+      fi
+      line_count=$(wc -l < "$path" | tr -d '[:space:]')
+      if [[ "$line_count" -lt "$min_lines" ]]; then
+        ok=0
+        reasons+=("min_lines:$rel:$line_count<$min_lines")
+      fi
+    fi
+  done
+
+  for (( check_idx=0; check_idx<command_count; check_idx++ )); do
+    local command
+    command=$(yq -r "$selector | .commands[$check_idx].command // .commands[$check_idx] // \"\"" "$BENCH_YAML")
+    if [[ -z "$command" || "$command" == "null" ]]; then
+      ok=0
+      reasons+=("invalid_command_check")
+      continue
+    fi
+    if ! (cd "$WORKDIR" && bash -lc "$command" >/dev/null 2>&1); then
+      ok=0
+      reasons+=("command_failed:$check_idx")
+    fi
+  done
+
+  if [[ "$ok" -eq 1 ]]; then
+    SUCCESS_CHECK_SUCCESS="true"
+    SUCCESS_CHECK_REASON="ok"
+  else
+    SUCCESS_CHECK_SUCCESS="false"
+    local joined
+    joined=$(IFS=','; echo "${reasons[*]}")
+    SUCCESS_CHECK_REASON="$joined"
+  fi
 }
 
 # -------- validate_models_array --------
@@ -420,6 +539,22 @@ else
   models_array=("$model_arg")
 fi
 
+# -------- engine list parse --------
+engines_array=()
+engine_path_segment=0
+engine_cli_explicit=0
+if [[ -n "$engines_arg" ]]; then
+  IFS=',' read -ra engines_array <<< "$engines_arg"
+  engine_path_segment=1
+  engine_cli_explicit=1
+elif [[ -n "$engine_arg" ]]; then
+  engines_array=("$engine_arg")
+  engine_path_segment=1
+  engine_cli_explicit=1
+else
+  engines_array=("legacy")
+fi
+
 # trim whitespace & drop empties
 cleaned_models=()
 for m in "${models_array[@]}"; do
@@ -436,12 +571,30 @@ if [[ ${#cleaned_models[@]} -eq 0 ]]; then
   exit 1
 fi
 
+cleaned_engines=()
+for e in "${engines_array[@]}"; do
+  e_trim="${e#"${e%%[![:space:]]*}"}"
+  e_trim="${e_trim%"${e_trim##*[![:space:]]}"}"
+  if [[ -n "$e_trim" ]]; then
+    validate_engine "$e_trim"
+    for seen in "${cleaned_engines[@]+"${cleaned_engines[@]}"}"; do
+      [[ "$seen" == "$e_trim" ]] && { echo "Error: duplicate engine: $e_trim" >&2; exit 1; }
+    done
+    cleaned_engines+=("$e_trim")
+  fi
+done
+if [[ ${#cleaned_engines[@]} -eq 0 ]]; then
+  echo "Error: no valid engines specified" >&2
+  exit 1
+fi
+
 # validate models (character set, duplicate, slug collision)
 validate_models_array
 
 # -------- trap (registered after cleaned_models is populated) --------
 CURRENT_RUN=""
 CURRENT_MODEL=""
+CURRENT_ENGINE="legacy"
 CURRENT_CASE="default"
 CURRENT_TASK_KIND="coding"
 CURRENT_PAM_VARIANT="default"
@@ -459,6 +612,7 @@ on_interrupt() {
   if [[ "$META_WRITTEN" -eq 0 && -n "$CURRENT_RUN_DIR" ]]; then
     write_meta_json 130 0 "${CURRENT_MODEL:-unknown}" "${CURRENT_START_TS:-}" "$CURRENT_RUN_DIR" \
       "${CURRENT_CASE:-default}" "${CURRENT_TASK_KIND:-coding}" "${CURRENT_PAM_VARIANT:-default}" \
+      "${CURRENT_ENGINE:-legacy}" "null" "interrupted" \
       || true
   fi
   if [[ -n "$models_arg" ]]; then
@@ -484,7 +638,11 @@ for model in "${cleaned_models[@]}"; do
   model_idx=$((model_idx + 1))
   model_slug=$(slugify "$model")
 
-  for (( case_idx=0; case_idx<case_loop_count; case_idx++ )); do
+  engine_idx=0
+  for engine in "${cleaned_engines[@]}"; do
+    engine_idx=$((engine_idx + 1))
+
+    for (( case_idx=0; case_idx<case_loop_count; case_idx++ )); do
     if [[ "$case_count" -eq 0 ]]; then
       case_name="default"
       task_kind="coding"
@@ -525,19 +683,23 @@ for model in "${cleaned_models[@]}"; do
 
     for pam_variant in "${pam_variants[@]}"; do
       for (( run=1; run<=runs; run++ )); do
-        printf '[model %d/%d | case %d/%d | %s | run %d/%d] %s\n' \
-          "$model_idx" "${#cleaned_models[@]}" "$((case_idx + 1))" "$case_loop_count" \
-          "$pam_variant" "$run" "$runs" "$model" >&2
+        printf '[model %d/%d | engine %d/%d | case %d/%d | %s | run %d/%d] %s / %s\n' \
+          "$model_idx" "${#cleaned_models[@]}" "$engine_idx" "${#cleaned_engines[@]}" \
+          "$((case_idx + 1))" "$case_loop_count" "$pam_variant" "$run" "$runs" "$model" "$engine" >&2
 
         CURRENT_RUN="$run"
         CURRENT_MODEL="$model"
+        CURRENT_ENGINE="$engine"
         CURRENT_CASE="$case_name"
         CURRENT_TASK_KIND="$task_kind"
         CURRENT_PAM_VARIANT="$pam_variant"
         RUN_LOGGED=0
         META_WRITTEN=0
 
-        if [[ "$case_slug" == "default" && "$pam_variant" == "default" ]]; then
+        if [[ "$engine_path_segment" -eq 1 ]]; then
+          RUN_DIR="$BENCH_ROOT/$model_slug/$engine/$case_slug/$pam_variant/run-$run"
+          workdir_rel="$model_slug/$engine/$case_slug/$pam_variant/run-$run/workdir"
+        elif [[ "$case_slug" == "default" && "$pam_variant" == "default" ]]; then
           RUN_DIR="$BENCH_ROOT/$model_slug/run-$run"
           workdir_rel="$model_slug/run-$run/workdir"
         else
@@ -590,11 +752,14 @@ for model in "${cleaned_models[@]}"; do
 
         start=$SECONDS
         if [[ "$DRY_RUN" -eq 1 ]]; then
-          echo "(dry-run) anvil --oneshot --prompt ... --state-dir $STATE_DIR --model $model --case $case_name --pam-variant $pam_variant" \
+          echo "(dry-run) anvil --oneshot --prompt ... --state-dir $STATE_DIR --model $model --engine $engine --case $case_name --pam-variant $pam_variant" \
             > ../stdout.log
           rc=0
         else
           anvil_args=(--oneshot --offline --prompt "$prompt" --state-dir "$STATE_DIR" --model "$model")
+          if [[ "$engine_cli_explicit" -eq 1 ]]; then
+            anvil_args+=(--engine "$engine")
+          fi
           if [[ -n "$max_iterations" ]]; then
             anvil_args+=(--max-iterations "$max_iterations")
           fi
@@ -621,6 +786,7 @@ for model in "${cleaned_models[@]}"; do
           rc=$?
         fi
         elapsed=$(( SECONDS - start ))
+        evaluate_success_check "$case_idx"
 
         # session.json copy (nullglob → empty array if no match)
         # bash 3.2 + set -u needs guard for empty array expansion
@@ -663,7 +829,8 @@ for model in "${cleaned_models[@]}"; do
 
         # Write run-dir/meta.json so analyze_run.py can read rc/elapsed_s
         if write_meta_json "$rc" "$elapsed" "$model" "$CURRENT_START_TS" "$RUN_DIR" \
-          "$case_name" "$task_kind" "$pam_variant"; then
+          "$case_name" "$task_kind" "$pam_variant" "$engine" \
+          "$SUCCESS_CHECK_SUCCESS" "$SUCCESS_CHECK_REASON"; then
           META_WRITTEN=1
         else
           echo "warning: meta.json write failed" >&2
@@ -684,6 +851,9 @@ for model in "${cleaned_models[@]}"; do
               pam_variant: .pam_variant,
               postcheck_success: .postcheck_success,
               postcheck_reason: .postcheck_reason,
+              success_check_success: .success_check_success,
+              success_check_reason: .success_check_reason,
+              engine: .engine,
               tool_call_count: .tool_call_total,
               failure_kind: .failure_kind,
               token_prompt: .token_prompt,
@@ -705,6 +875,7 @@ for model in "${cleaned_models[@]}"; do
         cd "$REPO_ROOT" || { echo "Error: cd $REPO_ROOT failed" >&2; exit 1; }
       done
     done
+  done
   done
 
   if [[ -n "$models_arg" ]]; then

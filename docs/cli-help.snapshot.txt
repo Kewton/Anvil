@@ -17,6 +17,8 @@ Options:
           
       --context-budget <CONTEXT_BUDGET>
           
+      --num-predict <NUM_PREDICT>
+          Override Ollama num_predict. Defaults to 2048 for legacy and 8192 for minimal
       --max-iterations <MAX_ITERATIONS>
           
       --chat-timeout-secs <CHAT_TIMEOUT_SECS>

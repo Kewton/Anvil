@@ -34,6 +34,7 @@ fn minimal_args(cwd: &std::path::Path) -> CliArgs {
         sidecar_model: None,
         ollama_host: None,
         context_budget: None,
+        num_predict: None,
         max_iterations: None,
         chat_timeout_secs: None,
         chat_retries: None,
