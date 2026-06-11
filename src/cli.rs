@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::DeterministicFallbackMode;
+use crate::config::{DeterministicFallbackMode, Engine};
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "anvil")]
@@ -48,6 +48,8 @@ pub struct CliArgs {
     /// legacy full template recovery. `support-only` and `full` remain aliases.
     #[arg(long = "deterministic-fallback", value_enum)]
     pub deterministic_fallback: Option<DeterministicFallbackMode>,
+    #[arg(long = "engine", value_enum)]
+    pub engine: Option<Engine>,
     /// Issue #634: experimental opt-in for specialized fallback paths
     /// (FastAPI scaffold / Python CSV / FizzBuzz / fixed arithmetic patch /
     /// qwen3.5 固有 deterministic edit). Default off. Template 系は
@@ -287,6 +289,7 @@ mod tests {
             auto_plan: false,
             offline: false,
             deterministic_fallback: None,
+            engine: None,
             experimental_specialized_fallback: None,
             no_footer: false,
             resume: None,
@@ -356,6 +359,15 @@ mod tests {
 
         let parsed = CliArgs::parse_from(["anvil", "--auto-plan"]);
         assert!(parsed.auto_plan);
+    }
+
+    #[test]
+    fn engine_flag_defaults_none_and_parses_minimal() {
+        let args = base_args();
+        assert_eq!(args.engine, None);
+
+        let parsed = CliArgs::parse_from(["anvil", "--engine", "minimal"]);
+        assert_eq!(parsed.engine, Some(Engine::Minimal));
     }
 
     #[test]

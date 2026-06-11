@@ -25,7 +25,7 @@ use agent::loop_run::commands::{
     print_startup_banner, print_startup_banner_stderr_oneshot, short_id,
 };
 use cli::{CliArgs, Command};
-use config::Config;
+use config::{Config, Engine};
 use model_registry::{RuntimeModels, select_models};
 use ollama::client::OllamaClient;
 use session::compact::find_last_user_prompt;
@@ -71,6 +71,9 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     let (mut config, warnings) = Config::load(args)?;
     for warning in &warnings {
         eprintln!("warning: {warning}");
+    }
+    if config.engine == Engine::Minimal {
+        return Err("minimal engine is not implemented yet".to_string());
     }
     config.cwd = ensure_workspace_root(&config.cwd)?;
 

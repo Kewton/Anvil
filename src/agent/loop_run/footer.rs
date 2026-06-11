@@ -1241,6 +1241,7 @@ mod tests {
             auto_plan: false,
             offline: false,
             deterministic_fallback: Default::default(),
+            engine: Default::default(),
             prompt: None,
             state_dir_override: None,
             resume: Default::default(),

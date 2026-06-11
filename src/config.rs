@@ -149,6 +149,37 @@ impl FromStr for DeterministicFallbackMode {
     }
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum Engine {
+    #[default]
+    Legacy,
+    Minimal,
+}
+
+impl fmt::Display for Engine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Legacy => "legacy",
+            Self::Minimal => "minimal",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl FromStr for Engine {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "minimal" => Ok(Self::Minimal),
+            other => Err(format!("unknown engine: {other}")),
+        }
+    }
+}
+
 /// Identifies where a `log_level` / legacy `debug` setting was read from, so
 /// `resolve_log_level` can emit source-appropriate warning messages.
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +263,7 @@ pub struct Config {
     pub auto_plan: bool,
     pub offline: bool,
     pub deterministic_fallback: DeterministicFallbackMode,
+    pub engine: Engine,
     pub prompt: Option<String>,
     pub state_dir_override: Option<PathBuf>,
     pub resume: ResumeRequest,
@@ -330,6 +362,7 @@ pub struct PartialConfig {
     pub auto_plan: Option<bool>,
     pub offline: Option<bool>,
     pub deterministic_fallback: Option<DeterministicFallbackMode>,
+    pub engine: Option<Engine>,
     pub state_dir_override: Option<PathBuf>,
     /// `Some(false)` when an explicit disable signal is present
     /// (`--no-footer` / non-empty `ANVIL_NO_FOOTER` / `.anvil/config` `footer=false`).
@@ -415,6 +448,7 @@ impl Config {
             auto_plan: args.auto_plan.then_some(true),
             offline: args.offline.then_some(true),
             deterministic_fallback: args.deterministic_fallback,
+            engine: args.engine,
             state_dir_override: args.state_dir.clone(),
             // CLI footer flag is "disable-only": `--no-footer` emits Some(false),
             // omission emits None so file/env/default can still apply.
@@ -473,6 +507,7 @@ impl Config {
             auto_plan: merged.auto_plan.unwrap_or(false),
             offline,
             deterministic_fallback: merged.deterministic_fallback.unwrap_or_default(),
+            engine: merged.engine.unwrap_or_default(),
             prompt: args.prompt,
             state_dir_override: merged.state_dir_override,
             resume: ResumeRequest::from_flag(args.resume),
@@ -567,6 +602,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         }
         if config.deterministic_fallback.is_some() {
             merged.deterministic_fallback = config.deterministic_fallback;
+        }
+        if config.engine.is_some() {
+            merged.engine = config.engine;
         }
         if config.state_dir_override.is_some() {
             merged.state_dir_override = config.state_dir_override.clone();
@@ -664,6 +702,9 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         deterministic_fallback: map
             .get("deterministic_fallback")
             .and_then(|value| value.parse::<DeterministicFallbackMode>().ok()),
+        engine: map
+            .get("engine")
+            .and_then(|value| value.parse::<Engine>().ok()),
         state_dir_override: map.get("state_dir").map(PathBuf::from),
         // Only emit Some(false) for explicit disable; any other value (true /
         // unrecognized / missing) leaves footer as None so default wins.
@@ -756,6 +797,9 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
         deterministic_fallback: env::var("ANVIL_DETERMINISTIC_FALLBACK")
             .ok()
             .and_then(|value| value.parse::<DeterministicFallbackMode>().ok()),
+        engine: env::var("ANVIL_ENGINE")
+            .ok()
+            .and_then(|value| value.parse::<Engine>().ok()),
         state_dir_override: env::var("ANVIL_STATE_DIR").ok().map(PathBuf::from),
         // POSIX `NO_COLOR` convention: any non-empty value disables; matches
         // `ANVIL_NO_SPINNER` / `ANVIL_NO_INTERRUPT` precedent (see spinner.rs).

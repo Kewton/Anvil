@@ -47,6 +47,7 @@ fn minimal_args(cwd: &std::path::Path) -> CliArgs {
         auto_plan: false,
         offline: false,
         deterministic_fallback: None,
+        engine: None,
         experimental_specialized_fallback: None,
         no_footer: false,
         resume: None,
