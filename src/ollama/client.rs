@@ -249,6 +249,7 @@ impl OllamaClient {
         let temperature = if tool_mode { 0.3 } else { 0.7 };
         let tool_names_vec = tool_names(tools.unwrap_or(&[]));
         let prompt = flatten_messages_to_chatml(messages);
+        let prompt_metrics = logging::build_prompt_log_metrics(messages, prompt.clone());
 
         logging::log_llm_event(
             "ollama.generate.request",
@@ -262,6 +263,7 @@ impl OllamaClient {
                 "num_predict": self.max_predict,
                 "tools": tool_names_vec,
                 "messages": messages,
+                "prompt_metrics": prompt_metrics,
             }),
         );
 
@@ -349,6 +351,8 @@ impl OllamaClient {
         F: FnMut(&str) -> Result<(), String>,
     {
         let tool_names_vec = tool_names(tools);
+        let final_prompt = flatten_messages_to_chatml(messages);
+        let prompt_metrics = logging::build_prompt_log_metrics(messages, final_prompt);
 
         logging::log_llm_event(
             "ollama.chat.request",
@@ -362,6 +366,7 @@ impl OllamaClient {
                 "format": response_format,
                 "tools": tool_names_vec,
                 "messages": messages,
+                "prompt_metrics": prompt_metrics,
             }),
         );
 
