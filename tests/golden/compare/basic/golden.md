@@ -16,3 +16,10 @@
 | postcheck_success | 0.667 [0.208, 0.939] (n=3) | 1.000 [0.438, 1.000] (n=3) | 0.333 | null | ✅ improved |
 | rc | 0.667 [0.208, 0.939] (n=3) | 1.000 [0.438, 1.000] (n=3) | 0.333 | null | ✅ improved |
 | we_total | 0.667 [-0.768, 2.101] (n=3) | 1.000 [1.000, 1.000] (n=3) | 0.333 | null | ℹ️ informational |
+
+## failure categories
+
+| category | baseline | experiment |
+|---|---:|---:|
+| completed | 2 | 3 |
+| unknown | 1 | 0 |

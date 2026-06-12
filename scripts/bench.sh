@@ -8,6 +8,7 @@
 #   --engine <name>   legacy|minimal（デフォルト: legacy）
 #   --engines <list>  カンマ区切りで複数 engine（例: legacy,minimal）
 #   --runs <n>        実行回数（デフォルト: 5）
+#   --cases <list>    カンマ区切りで実行する case 名を絞り込み
 #   --max-iterations <n>
 #                     YAML の args.max_iterations を全 case で上書き
 #   --dry-run         anvil 呼び出しを echo で代替
@@ -43,6 +44,7 @@ Usage: scripts/bench.sh <benchmark-name> [options]
   --engine <name>   legacy|minimal（デフォルト: legacy）
   --engines <list>  カンマ区切りで複数 engine（例: legacy,minimal）
   --runs <n>        実行回数（デフォルト: 5）
+  --cases <list>    カンマ区切りで実行する case 名を絞り込み
   --max-iterations <n>
                     YAML の args.max_iterations を全 case で上書き
   --no-precautions  Reminder Sidecar を無効化（ANVIL_NO_REMINDER=1）
@@ -74,6 +76,7 @@ models_arg=""
 engine_arg=""
 engines_arg=""
 runs=5
+cases_arg=""
 max_iterations_override=""
 DRY_RUN=0
 no_precautions=0
@@ -135,6 +138,11 @@ while [[ $# -gt 0 ]]; do
     --runs)
       [[ $# -ge 2 ]] || { echo "Error: --runs requires a value" >&2; exit 1; }
       runs="$2"
+      shift 2
+      ;;
+    --cases)
+      [[ $# -ge 2 ]] || { echo "Error: --cases requires a value" >&2; exit 1; }
+      cases_arg="$2"
       shift 2
       ;;
     --max-iterations)
@@ -578,6 +586,76 @@ case_index_for_name() {
   return 1
 }
 
+selected_case_indices=()
+selected_case_names=()
+case_filter_enabled=0
+parse_case_filter() {
+  selected_case_indices=()
+  selected_case_names=()
+  case_filter_enabled=0
+  if [[ -z "$cases_arg" ]]; then
+    if [[ "$case_count" -eq 0 ]]; then
+      selected_case_indices=(0)
+      selected_case_names=("default")
+    else
+      local idx name
+      for (( idx=0; idx<case_count; idx++ )); do
+        name=$(yq -r ".cases[$idx].name // \"case-$((idx + 1))\"" "$BENCH_YAML")
+        selected_case_indices+=("$idx")
+        selected_case_names+=("$name")
+      done
+    fi
+    return 0
+  fi
+
+  case_filter_enabled=1
+  local raw_cases=() raw trimmed idx seen
+  IFS=',' read -ra raw_cases <<< "$cases_arg"
+  for raw in "${raw_cases[@]}"; do
+    trimmed="${raw#"${raw%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    if [[ -z "$trimmed" ]]; then
+      echo "Error: --cases contains an empty case name" >&2
+      exit 1
+    fi
+    seen=0
+    for name in "${selected_case_names[@]+"${selected_case_names[@]}"}"; do
+      if [[ "$name" == "$trimmed" ]]; then
+        seen=1
+        break
+      fi
+    done
+    if [[ "$seen" -eq 1 ]]; then
+      echo "Error: duplicate --cases entry: $trimmed" >&2
+      exit 1
+    fi
+    if ! idx=$(case_index_for_name "$trimmed"); then
+      echo "Error: unknown benchmark case in --cases: $trimmed" >&2
+      exit 1
+    fi
+    selected_case_indices+=("$idx")
+    selected_case_names+=("$trimmed")
+  done
+  if [[ ${#selected_case_indices[@]} -eq 0 ]]; then
+    echo "Error: --cases selected no benchmark cases" >&2
+    exit 1
+  fi
+}
+
+case_selected_for_recheck() {
+  local wanted="$1"
+  local selected
+  if [[ "$case_filter_enabled" -eq 0 ]]; then
+    return 0
+  fi
+  for selected in "${selected_case_names[@]+"${selected_case_names[@]}"}"; do
+    if [[ "$selected" == "$wanted" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 resolve_recheck_workdir() {
   local root_real="$1"
   local workdir_rel="$2"
@@ -624,6 +702,9 @@ run_recheck() {
   local case_idx resolved_workdir recheck_success recheck_reason
   tail -n +2 "$summary" | while IFS=$'\t' read -r run model case_name pam_variant rc elapsed workdir_rel session_copied extras_json; do
     if [[ -z "${run:-}" ]]; then
+      continue
+    fi
+    if ! case_selected_for_recheck "$case_name"; then
       continue
     fi
     if ! case_idx=$(case_index_for_name "$case_name"); then
@@ -775,6 +856,7 @@ generate_matrix_report() {
 }
 
 if [[ -n "$recheck_root" ]]; then
+  parse_case_filter
   run_recheck "$recheck_root"
   exit $?
 fi
@@ -838,6 +920,7 @@ fi
 
 # validate models (character set, duplicate, slug collision)
 validate_models_array
+parse_case_filter
 
 # -------- trap (registered after cleaned_models is populated) --------
 CURRENT_RUN=""
@@ -879,10 +962,7 @@ if [[ "$pam_ab" -eq 1 ]]; then
   pam_variants=("pam_on" "pam_off")
 fi
 
-case_loop_count="$case_count"
-if [[ "$case_loop_count" -eq 0 ]]; then
-  case_loop_count=1
-fi
+case_loop_count="${#selected_case_indices[@]}"
 
 model_idx=0
 for model in "${cleaned_models[@]}"; do
@@ -893,7 +973,8 @@ for model in "${cleaned_models[@]}"; do
   for engine in "${cleaned_engines[@]}"; do
     engine_idx=$((engine_idx + 1))
 
-    for (( case_idx=0; case_idx<case_loop_count; case_idx++ )); do
+    for (( selected_pos=0; selected_pos<case_loop_count; selected_pos++ )); do
+      case_idx="${selected_case_indices[$selected_pos]}"
     if [[ "$case_count" -eq 0 ]]; then
       case_name="default"
       task_kind="coding"
@@ -939,7 +1020,7 @@ for model in "${cleaned_models[@]}"; do
       for (( run=1; run<=runs; run++ )); do
         printf '[model %d/%d | engine %d/%d | case %d/%d | %s | run %d/%d] %s / %s\n' \
           "$model_idx" "${#cleaned_models[@]}" "$engine_idx" "${#cleaned_engines[@]}" \
-          "$((case_idx + 1))" "$case_loop_count" "$pam_variant" "$run" "$runs" "$model" "$engine" >&2
+          "$((selected_pos + 1))" "$case_loop_count" "$pam_variant" "$run" "$runs" "$model" "$engine" >&2
 
         CURRENT_RUN="$run"
         CURRENT_MODEL="$model"
@@ -1022,6 +1103,7 @@ for model in "${cleaned_models[@]}"; do
             [[ -n "$max_iterations" ]] && printf 'MAX_ITERATIONS=%s\n' "$max_iterations"
             [[ -n "$chat_retries" ]] && printf 'CHAT_RETRIES=%s\n' "$chat_retries"
             [[ -n "$sidecar_model" ]] && printf 'SIDECAR_MODEL=%s\n' "$sidecar_model"
+            [[ -n "$cases_arg" ]] && printf 'CASES=%s\n' "$cases_arg"
             printf '%s\n' "${env_kv[@]+"${env_kv[@]}"}"
           } | jq -R -s 'split("\n") | map(select(length > 0))'
         )
