@@ -4,6 +4,8 @@
 
 - [Task15 feedback rerun](minimal-loop-t2-4-task15-feedback-rerun-20260612.md):
   first admitted Phase 3 mechanism, minimal 80/125.
+- [Task15 non-fired run variance](t2-4-run-variance.md):
+  GPU-free estimate of scenario-level run-to-run variance.
 - [Task14 recheck baseline](minimal-loop-t2-4-recheck-20260612.md):
   check-only baseline before Task15, minimal 69/125 and legacy-lite 66/125.
 - [Mechanism ledger](mechanism-ledger.md):
@@ -15,6 +17,7 @@
 - [Parser-fix rerun](minimal-loop-t2-4-rerun-20260612.md)
 - [Task14 recheck baseline](minimal-loop-t2-4-recheck-20260612.md)
 - [Task15 feedback rerun](minimal-loop-t2-4-task15-feedback-rerun-20260612.md)
+- [Task15 non-fired run variance](t2-4-run-variance.md)
 
 ## Triage
 
