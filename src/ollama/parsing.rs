@@ -7,6 +7,8 @@ use crate::logging;
 use crate::ollama::xml_fallback::{ToolCall, extract_tool_calls};
 use crate::tools::registry::ToolSpec;
 
+const ENV_NO_NATIVE_XML_SALVAGE: &str = "ANVIL_NO_NATIVE_XML_SALVAGE";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantReply {
     pub content: String,
@@ -296,10 +298,35 @@ fn finalize_native_reply(
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
 ) -> Result<AssistantReply, String> {
+    finalize_native_reply_with_salvage(
+        message,
+        tool_names,
+        done_reason,
+        prompt_tokens,
+        completion_tokens,
+        !native_xml_salvage_disabled(),
+    )
+}
+
+fn finalize_native_reply_with_salvage(
+    message: ChatMessage,
+    tool_names: &[String],
+    done_reason: &str,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    native_xml_salvage_enabled: bool,
+) -> Result<AssistantReply, String> {
     let tool_calls = parse_native_tool_calls(message.tool_calls, tool_names)?;
-    detect_malformed_tool_call(&message.content, &tool_calls, done_reason)?;
+    let content = message.content;
+    let (tool_calls, content) = maybe_salvage_native_xml_content(
+        content,
+        tool_calls,
+        tool_names,
+        native_xml_salvage_enabled,
+    );
+    detect_malformed_tool_call(&content.raw, &tool_calls, done_reason)?;
     let reply = AssistantReply {
-        content: crate::ollama::xml_fallback::strip_think_tags(&message.content),
+        content: content.reply,
         tool_calls,
         prompt_tokens,
         completion_tokens,
@@ -314,6 +341,73 @@ fn finalize_native_reply(
         }),
     );
     Ok(reply)
+}
+
+struct NativeContent {
+    raw: String,
+    reply: String,
+}
+
+fn maybe_salvage_native_xml_content(
+    content: String,
+    native_tool_calls: Vec<ToolCall>,
+    tool_names: &[String],
+    enabled: bool,
+) -> (Vec<ToolCall>, NativeContent) {
+    if !native_tool_calls.is_empty() || !enabled || !has_closed_anvil_tool_call(&content) {
+        return (
+            native_tool_calls,
+            NativeContent {
+                reply: crate::ollama::xml_fallback::strip_think_tags(&content),
+                raw: content,
+            },
+        );
+    }
+
+    let (xml_tool_calls, cleaned_content) = extract_tool_calls(&content, tool_names);
+    if xml_tool_calls.is_empty() {
+        return (
+            native_tool_calls,
+            NativeContent {
+                reply: crate::ollama::xml_fallback::strip_think_tags(&content),
+                raw: content,
+            },
+        );
+    }
+
+    let salvaged_names = xml_tool_calls
+        .iter()
+        .map(|tool_call| tool_call.name.clone())
+        .collect::<Vec<_>>();
+    logging::log_llm_event(
+        "ollama.chat.native_xml_salvage",
+        json!({
+            "tool_call_count": xml_tool_calls.len(),
+            "tool_names": salvaged_names,
+            "content_chars": content.chars().count(),
+        }),
+    );
+
+    (
+        xml_tool_calls,
+        NativeContent {
+            raw: content,
+            reply: cleaned_content,
+        },
+    )
+}
+
+fn has_closed_anvil_tool_call(content: &str) -> bool {
+    let stripped = crate::ollama::xml_fallback::strip_think_tags(content);
+    stripped.contains("<anvil_tool_call") && stripped.contains("</anvil_tool_call>")
+}
+
+fn native_xml_salvage_disabled() -> bool {
+    native_xml_salvage_disabled_with(|key| std::env::var_os(key))
+}
+
+fn native_xml_salvage_disabled_with(get_env: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    get_env(ENV_NO_NATIVE_XML_SALVAGE).is_some_and(|value| !value.is_empty())
 }
 
 fn parse_native_tool_calls(
@@ -409,7 +503,12 @@ fn detect_malformed_tool_call(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_chat_response, parse_generate_response};
+    use std::ffi::OsString;
+
+    use super::{
+        ChatMessage, ENV_NO_NATIVE_XML_SALVAGE, finalize_native_reply_with_salvage,
+        native_xml_salvage_disabled_with, parse_chat_response, parse_generate_response,
+    };
 
     #[test]
     fn parse_generate_response_rejects_truncated_tool_call() {
@@ -505,5 +604,57 @@ mod tests {
         let reply = parse_chat_response(body, &["Write".to_string()]).unwrap();
         assert_eq!(reply.tool_calls.len(), 1);
         assert_eq!(reply.tool_calls[0].arguments["content"], "HELLO");
+    }
+
+    #[test]
+    fn parse_chat_response_salvages_closed_xml_content_when_native_tool_calls_empty() {
+        let body = r#"{
+          "message": {
+            "role": "assistant",
+            "content": "<anvil_tool_call>{\"name\":\"Read\",\"arguments\":{\"path\":\"Cargo.toml\"}}</anvil_tool_call>",
+            "tool_calls": []
+          },
+          "done_reason": "stop"
+        }"#;
+
+        let reply = parse_chat_response(body, &["Read".to_string()]).unwrap();
+
+        assert_eq!(reply.content, "");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].name, "Read");
+        assert_eq!(reply.tool_calls[0].arguments["path"], "Cargo.toml");
+    }
+
+    #[test]
+    fn native_xml_salvage_can_be_disabled_by_policy() {
+        let message = ChatMessage {
+            content:
+                "<anvil_tool_call>{\"name\":\"Read\",\"arguments\":{\"path\":\"Cargo.toml\"}}</anvil_tool_call>"
+                    .to_string(),
+            tool_calls: Vec::new(),
+        };
+
+        let err = finalize_native_reply_with_salvage(
+            message,
+            &["Read".to_string()],
+            "stop",
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("malformed tool call"), "got: {err}");
+    }
+
+    #[test]
+    fn native_xml_salvage_off_flag_uses_non_empty_env() {
+        assert!(native_xml_salvage_disabled_with(|key| {
+            (key == ENV_NO_NATIVE_XML_SALVAGE).then(|| OsString::from("1"))
+        }));
+        assert!(!native_xml_salvage_disabled_with(|key| {
+            (key == ENV_NO_NATIVE_XML_SALVAGE).then(OsString::new)
+        }));
+        assert!(!native_xml_salvage_disabled_with(|_| None));
     }
 }

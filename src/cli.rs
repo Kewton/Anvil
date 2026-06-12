@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::DeterministicFallbackMode;
+use crate::config::{DeterministicFallbackMode, Engine};
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "anvil")]
@@ -18,6 +18,9 @@ pub struct CliArgs {
     pub ollama_host: Option<String>,
     #[arg(long = "context-budget")]
     pub context_budget: Option<usize>,
+    /// Override Ollama num_predict. Defaults to 2048 for legacy and 8192 for minimal.
+    #[arg(long = "num-predict")]
+    pub num_predict: Option<usize>,
     #[arg(long = "max-iterations")]
     pub max_iterations: Option<usize>,
     #[arg(long = "chat-timeout-secs")]
@@ -48,6 +51,8 @@ pub struct CliArgs {
     /// legacy full template recovery. `support-only` and `full` remain aliases.
     #[arg(long = "deterministic-fallback", value_enum)]
     pub deterministic_fallback: Option<DeterministicFallbackMode>,
+    #[arg(long = "engine", value_enum)]
+    pub engine: Option<Engine>,
     /// Issue #634: experimental opt-in for specialized fallback paths
     /// (FastAPI scaffold / Python CSV / FizzBuzz / fixed arithmetic patch /
     /// qwen3.5 固有 deterministic edit). Default off. Template 系は
@@ -274,6 +279,7 @@ mod tests {
             sidecar_model: None,
             ollama_host: None,
             context_budget: None,
+            num_predict: None,
             max_iterations: None,
             chat_timeout_secs: None,
             chat_retries: None,
@@ -287,6 +293,7 @@ mod tests {
             auto_plan: false,
             offline: false,
             deterministic_fallback: None,
+            engine: None,
             experimental_specialized_fallback: None,
             no_footer: false,
             resume: None,
@@ -356,6 +363,24 @@ mod tests {
 
         let parsed = CliArgs::parse_from(["anvil", "--auto-plan"]);
         assert!(parsed.auto_plan);
+    }
+
+    #[test]
+    fn engine_flag_defaults_none_and_parses_minimal() {
+        let args = base_args();
+        assert_eq!(args.engine, None);
+
+        let parsed = CliArgs::parse_from(["anvil", "--engine", "minimal"]);
+        assert_eq!(parsed.engine, Some(Engine::Minimal));
+    }
+
+    #[test]
+    fn num_predict_flag_defaults_none_and_parses_value() {
+        let args = base_args();
+        assert_eq!(args.num_predict, None);
+
+        let parsed = CliArgs::parse_from(["anvil", "--num-predict", "8192"]);
+        assert_eq!(parsed.num_predict, Some(8192));
     }
 
     #[test]

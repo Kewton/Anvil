@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use anvil::cli::CliArgs;
 use anvil::config::{
-    Config, DeterministicFallbackMode, LogLevel, PartialConfig, load_config_file, load_env_config,
-    merge_partial_configs, parse_key_value_config,
+    Config, DeterministicFallbackMode, Engine, LogLevel, PartialConfig, load_config_file,
+    load_env_config, merge_partial_configs, parse_key_value_config,
 };
 
 #[test]
@@ -78,6 +78,14 @@ fn merge_offline_prefers_later_sources() {
         },
     ]);
     assert_eq!(merged.offline, Some(true));
+}
+
+#[test]
+fn engine_parses_and_defaults_to_legacy() {
+    assert_eq!(Engine::default(), Engine::Legacy);
+    assert_eq!("legacy".parse::<Engine>().unwrap(), Engine::Legacy);
+    assert_eq!("minimal".parse::<Engine>().unwrap(), Engine::Minimal);
+    assert_eq!(Engine::Legacy.to_string(), "legacy");
 }
 
 #[test]
@@ -170,6 +178,21 @@ fn merge_experimental_specialized_fallback_prefers_later_sources() {
         PartialConfig::default(),
     ]);
     assert_eq!(merged.experimental_specialized_fallback, Some(true));
+}
+
+#[test]
+fn merge_engine_prefers_later_sources() {
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            engine: Some(Engine::Legacy),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            engine: Some(Engine::Minimal),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(merged.engine, Some(Engine::Minimal));
 }
 
 /// Issue #634: `parse_key_value_config` accepts the new
@@ -535,6 +558,7 @@ fn minimal_args(cwd: &std::path::Path) -> CliArgs {
         sidecar_model: None,
         ollama_host: None,
         context_budget: None,
+        num_predict: None,
         max_iterations: None,
         chat_timeout_secs: None,
         chat_retries: None,
@@ -548,12 +572,79 @@ fn minimal_args(cwd: &std::path::Path) -> CliArgs {
         auto_plan: false,
         offline: false,
         deterministic_fallback: None,
+        engine: None,
         experimental_specialized_fallback: None,
         no_footer: false,
         resume: None,
         state_dir: None,
         command: None,
     }
+}
+
+#[test]
+fn config_load_defaults_engine_to_legacy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+    assert_eq!(cfg.engine, Engine::Legacy);
+    assert_eq!(cfg.num_predict, 2_048);
+}
+
+#[test]
+fn config_load_defaults_minimal_num_predict_to_8192() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut args = minimal_args(tmp.path());
+    args.engine = Some(Engine::Minimal);
+    let (cfg, _) = Config::load(args).unwrap();
+    assert_eq!(cfg.engine, Engine::Minimal);
+    assert_eq!(cfg.num_predict, 8_192);
+}
+
+#[test]
+fn config_load_num_predict_override_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut args = minimal_args(tmp.path());
+    args.engine = Some(Engine::Minimal);
+    args.num_predict = Some(4_096);
+    let (cfg, _) = Config::load(args).unwrap();
+    assert_eq!(cfg.num_predict, 4_096);
+}
+
+#[test]
+fn config_file_engine_minimal_is_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config");
+    std::fs::write(&config_path, "engine = minimal\n").unwrap();
+    let mut warnings: Vec<String> = Vec::new();
+    let cfg = load_config_file(&config_path, &mut warnings).unwrap();
+    assert_eq!(cfg.engine, Some(Engine::Minimal));
+}
+
+#[test]
+fn config_file_num_predict_is_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config");
+    std::fs::write(&config_path, "num_predict = 4096\n").unwrap();
+    let mut warnings: Vec<String> = Vec::new();
+    let cfg = load_config_file(&config_path, &mut warnings).unwrap();
+    assert_eq!(cfg.num_predict, Some(4_096));
+}
+
+#[test]
+fn env_config_reads_engine() {
+    with_env(&[("ANVIL_ENGINE", Some("minimal"))], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.engine, Some(Engine::Minimal));
+    });
+}
+
+#[test]
+fn env_config_reads_num_predict() {
+    with_env(&[("ANVIL_NUM_PREDICT", Some("4096"))], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.num_predict, Some(4_096));
+    });
 }
 
 const PHOTON_ENV_VARS: &[(&str, Option<&str>)] = &[

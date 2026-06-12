@@ -17,6 +17,8 @@ Options:
           
       --context-budget <CONTEXT_BUDGET>
           
+      --num-predict <NUM_PREDICT>
+          Override Ollama num_predict. Defaults to 2048 for legacy and 8192 for minimal
       --max-iterations <MAX_ITERATIONS>
           
       --chat-timeout-secs <CHAT_TIMEOUT_SECS>
@@ -41,6 +43,8 @@ Options:
           
       --deterministic-fallback <DETERMINISTIC_FALLBACK>
           Control deterministic recovery. `hint-only` only nudges the model, `minimal-patch` writes support files only, and `full-template` preserves legacy full template recovery. `support-only` and `full` remain aliases [possible values: off, hint-only, minimal-patch, full-template]
+      --engine <ENGINE>
+          [possible values: legacy, minimal]
       --experimental-specialized-fallback <EXPERIMENTAL_SPECIALIZED_FALLBACK>
           Issue #634: experimental opt-in for specialized fallback paths (FastAPI scaffold / Python CSV / FizzBuzz / fixed arithmetic patch / qwen3.5 固有 deterministic edit). Default off. Template 系は `--deterministic-fallback full-template` との AND 条件で発火。 [possible values: true, false]
       --no-footer

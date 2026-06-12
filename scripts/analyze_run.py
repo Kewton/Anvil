@@ -570,11 +570,14 @@ def _read_meta(run_dir: Path) -> dict[str, Any]:
     fallback = {
         "case": "default",
         "elapsed_s": None,
+        "engine": "legacy",
         "failure_authority": None,
         "pam_variant": "default",
         "postcheck_reason": None,
         "postcheck_success": None,
         "rc": None,
+        "success_check_reason": None,
+        "success_check_success": None,
         "task_kind": DEFAULT_TASK_KIND,
         "_task_kind_source": "default",
     }
@@ -627,6 +630,7 @@ def _read_meta(run_dir: Path) -> dict[str, Any]:
     return {
         "case": _safe_meta_string(data, "case") or "default",
         "elapsed_s": elapsed_s,
+        "engine": _safe_meta_string(data, "engine") or "legacy",
         "failure_authority": _normalize_failure_authority(
             _safe_meta_string(data, "failure_authority")
         ),
@@ -634,6 +638,8 @@ def _read_meta(run_dir: Path) -> dict[str, Any]:
         "postcheck_reason": _safe_meta_string(data, "postcheck_reason"),
         "postcheck_success": _safe_bool(data, "postcheck_success"),
         "rc": rc,
+        "success_check_reason": _safe_meta_string(data, "success_check_reason"),
+        "success_check_success": _safe_bool(data, "success_check_success"),
         "task_kind": task_kind,
         "_task_kind_source": task_kind_source,
     }
@@ -2072,7 +2078,10 @@ def main(argv: list[str]) -> int:
     if not isinstance(recovery_strategies, list):
         recovery_strategies = []
 
-    if isinstance(meta.get("postcheck_success"), bool):
+    if isinstance(meta.get("success_check_success"), bool):
+        postcheck_success = meta["success_check_success"]
+        postcheck_reason = meta["success_check_reason"] or "success_check"
+    elif isinstance(meta.get("postcheck_success"), bool):
         postcheck_success = meta["postcheck_success"]
         postcheck_reason = meta["postcheck_reason"] or "meta_postcheck"
     else:
@@ -2178,6 +2187,7 @@ def main(argv: list[str]) -> int:
         **({"task_kind_misroute": True} if task_kind_misroute else {}),
         "deliverable_kind": deliverable_kind,
         "elapsed_s": meta["elapsed_s"],
+        "engine": meta["engine"],
         "evidence_kind": evidence_kind,
         "error_500_count": error_500_count,
         "evaluation_taxonomy": {
@@ -2207,6 +2217,8 @@ def main(argv: list[str]) -> int:
         "recovery_strategy_count": recovery_strategy_count,
         "run_id": session_metrics["run_id"],
         "schema_version": SCHEMA_VERSION,
+        "success_check_reason": meta["success_check_reason"],
+        "success_check_success": meta["success_check_success"],
         "task_kind": task_kind,
         "token_completion": token_completion,
         "token_prompt": token_prompt,
