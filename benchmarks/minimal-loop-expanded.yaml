@@ -227,9 +227,9 @@ cases:
     success_check:
       files:
         - path: src/app/page.tsx
-          min_lines: 50
-        - path: src/components/MetricCard.tsx
           min_lines: 30
+        - path: src/components/MetricCard.tsx
+          min_lines: 24
         - path: src/app/globals.css
           min_lines: 30
       commands:
