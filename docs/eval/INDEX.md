@@ -18,6 +18,8 @@
   tool-affordance mismatch behind many offline Bash `mkdir` blocks.
 - [Benchmark seed smoke](seed-smoke.md):
   Task24 seeded rerun gate check before Cycle 3.
+- [Cycle 3 narrow seeded rerun](cycle3-narrow-seeded-rerun.md):
+  Task25 blocked-mkdir trap verification before the full matrix.
 
 ## T2-4 Reports
 
@@ -29,6 +31,7 @@
 - [Task15 non-fired run variance](t2-4-run-variance.md)
 - [Task18 recheck](minimal-loop-t2-4-task18-recheck-20260612.md)
 - [Phase 3 cycle 1 evaluation](minimal-loop-phase3-cycle1-evaluation-20260612.md)
+- [Cycle 3 narrow seeded rerun](cycle3-narrow-seeded-rerun.md)
 
 ## Triage
 
