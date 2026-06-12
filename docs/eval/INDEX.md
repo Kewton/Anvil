@@ -16,6 +16,8 @@
   admitted minimal-loop mechanisms and audit status.
 - [Blocked mkdir trap triage](triage/blocked-mkdir-trap.md):
   tool-affordance mismatch behind many offline Bash `mkdir` blocks.
+- [Benchmark seed smoke](seed-smoke.md):
+  Task24 seeded rerun gate check before Cycle 3.
 
 ## T2-4 Reports
 
