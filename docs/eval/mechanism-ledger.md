@@ -8,7 +8,7 @@ addition must have a measured reason, an off flag, and a current audit status.
 
 | id | mechanism | status | admitted by | final audit date |
 |---|---|---|---|---|
-| M001 | completion-without-write feedback | admitted | #1036 | 2026-06-12 |
+| M001 | completion-without-write feedback | admitted | #1036 | 2026-06-13 |
 
 ## M001: Completion-Without-Write Feedback
 
@@ -27,7 +27,7 @@ addition must have a measured reason, an off flag, and a current audit status.
 | admission benchmark | `minimal-loop-expanded`, 25 scenarios x 5 runs |
 | admission report | [minimal-loop-t2-4-task15-feedback-rerun-20260612.md](minimal-loop-t2-4-task15-feedback-rerun-20260612.md) |
 | baseline report | [minimal-loop-t2-4-recheck-20260612.md](minimal-loop-t2-4-recheck-20260612.md) |
-| final audit date | 2026-06-12 |
+| final audit date | 2026-06-13 |
 
 Admission result:
 
@@ -62,8 +62,12 @@ Audit notes:
   environment allowed a failure path where M001 fired, the model tried
   `Bash mkdir`, offline policy blocked it, and the session did not recover to
   `Write`.
-- After #1045 and #1046, M001's marginal contribution may change. Re-run M001
-  on/off ablation in the next full matrix, planned as Task26, and record the
-  pure contribution even if it shrinks.
+- After #1045 and #1046, M001's marginal contribution was expected to change,
+  so Task26 re-ran an on/off ablation and recorded the pure contribution.
+- Task26 fulfilled that reservation after the blocked-`mkdir` trap fixes:
+  [Cycle 3 full matrix](cycle3-full-matrix-20260613.md) measured the same
+  binary with M001 on/off under seeded 25x5 runs. M001 on scored 88/125 versus
+  M001 off at 64/125, a +24 run contribution. Pure no-edit failures dropped
+  from 50 to 16. Mean elapsed time increased from 28.5s to 39.7s.
 - Future reviews should compare against this ledger before admitting another
   feedback or recovery mechanism.
