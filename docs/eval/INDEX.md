@@ -9,3 +9,5 @@
   watchlist.
 - [Cycle 2 loss triage](triage/cycle2-loss-triage.md): residual losses after
   M001 admission.
+- [Blocked mkdir trap triage](triage/blocked-mkdir-trap.md): investigation and
+  tool-affordance fix for the dominant offline Bash block.
