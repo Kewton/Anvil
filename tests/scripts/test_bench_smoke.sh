@@ -229,6 +229,49 @@ for engine in legacy minimal; do
   done
 done
 
+original_summary_cksum=$(cksum "$summary" | awk '{ print $1 ":" $2 }')
+rm -f "$BENCH_ROOT/smoke-model/legacy/crash/pam_on/run-1/workdir/result.txt"
+bash scripts/bench.sh bench-smoke-fixture --recheck-root "$BENCH_ROOT" \
+  > "$tmp/recheck.stdout" 2> "$tmp/recheck.stderr" || {
+  echo "FAIL: bench.sh recheck mode failed" >&2
+  cat "$tmp/recheck.stderr" >&2
+  exit 1
+}
+if [[ "$(cksum "$summary" | awk '{ print $1 ":" $2 }')" != "$original_summary_cksum" ]]; then
+  echo "FAIL: recheck mode modified summary.tsv" >&2
+  exit 1
+fi
+recheck_summary="$BENCH_ROOT/summary.recheck.tsv"
+if [[ ! -f "$recheck_summary" ]]; then
+  echo "FAIL: summary.recheck.tsv missing" >&2
+  exit 1
+fi
+recheck_header=$(head -n 1 "$recheck_summary")
+expected_recheck_header=$'run\tmodel\tcase\tpam_variant\trc\telapsed_sec\tworkdir\tsession_copied\textras_json\trecheck_success_check_success\trecheck_success_check_reason'
+if [[ "$recheck_header" != "$expected_recheck_header" ]]; then
+  echo "FAIL: summary.recheck.tsv header mismatch" >&2
+  echo "  got:      $recheck_header" >&2
+  echo "  expected: $expected_recheck_header" >&2
+  exit 1
+fi
+recheck_rows=$(($(wc -l < "$recheck_summary") - 1))
+if [[ "$recheck_rows" -ne 12 ]]; then
+  echo "FAIL: expected 12 recheck data rows, got $recheck_rows" >&2
+  exit 1
+fi
+awk -F'\t' '$3 == "docs" && $4 == "pam_on" && $0 ~ "/legacy/" { print $10 "\t" $11 }' "$recheck_summary" \
+  | grep -Fx $'true\tok' >/dev/null || {
+  echo "FAIL: recheck mode did not preserve a passing docs row" >&2
+  cat "$recheck_summary" >&2
+  exit 1
+}
+awk -F'\t' '$3 == "crash" && $4 == "pam_on" && $0 ~ "/legacy/" { print $10 "\t" $11 }' "$recheck_summary" \
+  | grep -E $'^false\t.*missing_file:result.txt' >/dev/null || {
+  echo "FAIL: recheck mode did not detect the modified crash artifact" >&2
+  cat "$recheck_summary" >&2
+  exit 1
+}
+
 run_dir="$BENCH_ROOT/smoke-model/legacy/docs/pam_on/run-1"
 rc_val=$(jq -r '.rc' "$run_dir/meta.json")
 elapsed_val=$(jq -r '.elapsed_s' "$run_dir/meta.json")

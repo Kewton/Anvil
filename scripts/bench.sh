@@ -11,6 +11,9 @@
 #   --max-iterations <n>
 #                     YAML の args.max_iterations を全 case で上書き
 #   --dry-run         anvil 呼び出しを echo で代替
+#   --recheck-root <path>
+#                     既存 BENCH_ROOT に success_check を再適用して
+#                     summary.recheck.tsv を出力（Ollama/GPU 不要）
 #   --pam-ab          Same prompt suite with PAM enabled and disabled
 #   --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
 #   --help            この用例を表示して終了
@@ -45,6 +48,9 @@ Usage: scripts/bench.sh <benchmark-name> [options]
   --no-auto-test    Auto test を無効化（ANVIL_NO_AUTO_TEST=1）
   --pam-ab          Same prompt suite with PAM enabled and disabled
   --dry-run         anvil 呼び出しを echo で代替
+  --recheck-root <path>
+                    既存 BENCH_ROOT に success_check を再適用して
+                    summary.recheck.tsv を出力（Ollama/GPU 不要）
   --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
   --help            この用例を表示して終了
 
@@ -68,6 +74,7 @@ no_precautions=0
 no_case_memory=0
 no_auto_test=0
 pam_ab=0
+recheck_root=""
 # BENCH_DEBUG toggles `--trace` on the anvil invocation. Allowed values: "0" or "1".
 BENCH_DEBUG="${BENCH_DEBUG:-1}"
 case "$BENCH_DEBUG" in
@@ -139,6 +146,11 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN=1
       shift
       ;;
+    --recheck-root)
+      [[ $# -ge 2 ]] || { echo "Error: --recheck-root requires a value" >&2; exit 1; }
+      recheck_root="$2"
+      shift 2
+      ;;
     --bench-no-debug)
       BENCH_DEBUG=0
       shift
@@ -171,7 +183,7 @@ if [[ -z "$benchmark_name" ]]; then
   exit 1
 fi
 
-if [[ -z "$model_arg" && -z "$models_arg" ]]; then
+if [[ -z "$recheck_root" && -z "$model_arg" && -z "$models_arg" ]]; then
   echo "Error: --model or --models is required" >&2
   usage >&2
   exit 1
@@ -273,7 +285,7 @@ fi
 # "${ANVIL_BIN:-}", which would always see the empty local value.
 _anvil_bin_env="${ANVIL_BIN:-}"
 ANVIL_BIN=""
-if [[ "$DRY_RUN" -eq 0 ]]; then
+if [[ -z "$recheck_root" && "$DRY_RUN" -eq 0 ]]; then
   if [[ -n "$_anvil_bin_env" ]]; then
     ANVIL_BIN="$_anvil_bin_env"
   elif [[ -x "$REPO_ROOT/target/release/anvil" ]]; then
@@ -297,8 +309,11 @@ fi
 umask 077
 
 # -------- BENCH_ROOT --------
-BENCH_ROOT="$REPO_ROOT/.anvil/benchmarks/$(date +%Y%m%dT%H%M%S)-$$"
-mkdir -p "$BENCH_ROOT"
+BENCH_ROOT=""
+if [[ -z "$recheck_root" ]]; then
+  BENCH_ROOT="$REPO_ROOT/.anvil/benchmarks/$(date +%Y%m%dT%H%M%S)-$$"
+  mkdir -p "$BENCH_ROOT"
+fi
 
 # -------- yaml validation --------
 case_count=$(yq -r '(.cases // []) | length' "$BENCH_YAML")
@@ -323,7 +338,9 @@ else
 fi
 
 # -------- summary.tsv header --------
-printf 'run\tmodel\tcase\tpam_variant\trc\telapsed_sec\tworkdir\tsession_copied\textras_json\n' > "$BENCH_ROOT/summary.tsv"
+if [[ -z "$recheck_root" ]]; then
+  printf 'run\tmodel\tcase\tpam_variant\trc\telapsed_sec\tworkdir\tsession_copied\textras_json\n' > "$BENCH_ROOT/summary.tsv"
+fi
 
 # -------- validate_model --------
 validate_model() {
@@ -511,6 +528,93 @@ evaluate_success_check() {
   fi
 }
 
+case_index_for_name() {
+  local wanted="$1"
+  local idx name
+  if [[ "$case_count" -eq 0 ]]; then
+    [[ "$wanted" == "default" ]] && { printf '0'; return 0; }
+    return 1
+  fi
+  for (( idx=0; idx<case_count; idx++ )); do
+    name=$(yq -r ".cases[$idx].name // \"case-$((idx + 1))\"" "$BENCH_YAML")
+    if [[ "$name" == "$wanted" ]]; then
+      printf '%s' "$idx"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_recheck_workdir() {
+  local root_real="$1"
+  local workdir_rel="$2"
+  local candidate resolved
+  if [[ -z "$workdir_rel" || "$workdir_rel" == "N/A" || "$workdir_rel" == /* || "$workdir_rel" == *..* ]]; then
+    return 1
+  fi
+  candidate="$root_real/$workdir_rel"
+  if [[ ! -d "$candidate" ]]; then
+    return 1
+  fi
+  resolved=$(realpath "$candidate" 2>/dev/null || true)
+  if [[ -z "$resolved" || "$resolved" != "$root_real"/* ]]; then
+    return 1
+  fi
+  printf '%s' "$resolved"
+}
+
+run_recheck() {
+  local root_input="$1"
+  local root_real summary out tmp header
+  root_real=$(realpath "$root_input" 2>/dev/null || true)
+  if [[ -z "$root_real" || ! -d "$root_real" ]]; then
+    echo "Error: --recheck-root must point to an existing BENCH_ROOT: $root_input" >&2
+    return 1
+  fi
+  summary="$root_real/summary.tsv"
+  if [[ ! -f "$summary" || -L "$summary" ]]; then
+    echo "Error: summary.tsv not found under --recheck-root: $summary" >&2
+    return 1
+  fi
+
+  header=$(head -n 1 "$summary")
+  if [[ "$header" != $'run\tmodel\tcase\tpam_variant\trc\telapsed_sec\tworkdir\tsession_copied\textras_json' ]]; then
+    echo "Error: unsupported summary.tsv header in $summary" >&2
+    return 1
+  fi
+
+  out="$root_real/summary.recheck.tsv"
+  tmp=$(mktemp "$root_real/.summary.recheck.tsv.XXXXXX") || return 1
+  printf '%s\trecheck_success_check_success\trecheck_success_check_reason\n' "$header" > "$tmp"
+
+  local run model case_name pam_variant rc elapsed workdir_rel session_copied extras_json
+  local case_idx resolved_workdir recheck_success recheck_reason
+  tail -n +2 "$summary" | while IFS=$'\t' read -r run model case_name pam_variant rc elapsed workdir_rel session_copied extras_json; do
+    if [[ -z "${run:-}" ]]; then
+      continue
+    fi
+    if ! case_idx=$(case_index_for_name "$case_name"); then
+      recheck_success="false"
+      recheck_reason="unknown_case:$case_name"
+    elif ! resolved_workdir=$(resolve_recheck_workdir "$root_real" "$workdir_rel"); then
+      recheck_success="false"
+      recheck_reason="missing_workdir"
+    else
+      WORKDIR="$resolved_workdir"
+      evaluate_success_check "$case_idx"
+      recheck_success="$SUCCESS_CHECK_SUCCESS"
+      recheck_reason="$SUCCESS_CHECK_REASON"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$run" "$model" "$case_name" "$pam_variant" "$rc" "$elapsed" \
+      "$workdir_rel" "$session_copied" "$extras_json" \
+      "$recheck_success" "$recheck_reason" >> "$tmp"
+  done
+
+  mv "$tmp" "$out" || { rm -f "$tmp"; return 1; }
+  echo "Recheck results: $out"
+}
+
 # -------- validate_models_array --------
 validate_models_array() {
   local seen_models=() seen_slugs=()
@@ -636,6 +740,11 @@ generate_matrix_report() {
 
   mv "$tmp" "$bench_root/matrix-report.md" || { rm -f "$tmp"; return 1; }
 }
+
+if [[ -n "$recheck_root" ]]; then
+  run_recheck "$recheck_root"
+  exit $?
+fi
 
 # -------- model list parse --------
 models_array=()
