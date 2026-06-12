@@ -1069,7 +1069,7 @@ pub(crate) fn enforce_offline_policy(
             | BashCommandClass::Dangerous
     ) {
         return Err(format!(
-            "offline mode only allows read-only, build-test, or local script-run shell commands: {}",
+            "offline mode only allows read-only, build-test, or local script-run shell commands: {}. To create files, call Write directly; Write creates parent directories automatically.",
             command.trim()
         ));
     }
@@ -1789,6 +1789,20 @@ mod tests {
         );
         assert!(enforce_offline_policy("rm -rf /", BashCommandClass::Dangerous, true).is_err());
         assert!(enforce_offline_policy("ls", BashCommandClass::ReadOnly, true).is_ok());
+    }
+
+    #[test]
+    fn enforce_offline_policy_points_file_creation_to_write() {
+        let err = enforce_offline_policy("mkdir -p src", BashCommandClass::General, true)
+            .expect_err("offline must reject general mkdir");
+        assert!(
+            err.contains("call Write directly"),
+            "offline mkdir rejection should name the replacement tool: {err}"
+        );
+        assert!(
+            err.contains("Write creates parent directories automatically"),
+            "offline mkdir rejection should explain that separate mkdir is unnecessary: {err}"
+        );
     }
 
     // ---------------------------------------------------------------------
