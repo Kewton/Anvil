@@ -72,9 +72,11 @@ cases:
     success_check:
       files:
         - path: src/dateRange.js
-          min_lines: 25
+          min_lines: 12
       commands:
         - grep -R "inclusiveDays" src/dateRange.js
+        - >
+          node -e "const fs = require('fs'); const vm = require('vm'); let src = fs.readFileSync('src/dateRange.js', 'utf8'); src = src.replace(/export\\s+function\\s+inclusiveDays/, 'function inclusiveDays'); const sandbox = { module: { exports: {} }, exports: {} }; vm.runInNewContext(src + '; module.exports.inclusiveDays = module.exports.inclusiveDays || (typeof inclusiveDays !== \"undefined\" ? inclusiveDays : undefined);', sandbox); const fn = sandbox.module.exports.inclusiveDays; if (typeof fn !== 'function') process.exit(1); if (fn('2024-01-01', '2024-01-01') !== 1) process.exit(1); if (fn('2024-01-02', '2024-01-01') !== 0) process.exit(1);"
 
   - name: fix-python-slugify
     task_kind: coding
