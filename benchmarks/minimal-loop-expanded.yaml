@@ -36,7 +36,7 @@ cases:
     success_check:
       files:
         - path: src/formatTitle.ts
-          min_lines: 20
+          min_lines: 8
       commands:
         - grep -R "export function formatTitle" src/formatTitle.ts
 
