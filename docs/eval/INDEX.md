@@ -22,6 +22,10 @@
   Task24 seeded rerun gate check before Cycle 3.
 - [Cycle 3 narrow seeded rerun](cycle3-narrow-seeded-rerun.md):
   Task25 blocked-mkdir trap verification before the full matrix.
+- [Cycle 3 full matrix](cycle3-full-matrix-20260613.md):
+  Task26 seeded 27B M001 on/off ablation and 8B frontier run.
+- [Capability frontier](frontier.md):
+  model-by-model minimal-loop benchmark rows.
 
 ## T2-4 Reports
 
@@ -34,6 +38,8 @@
 - [Task18 recheck](minimal-loop-t2-4-task18-recheck-20260612.md)
 - [Phase 3 cycle 1 evaluation](minimal-loop-phase3-cycle1-evaluation-20260612.md)
 - [Cycle 3 narrow seeded rerun](cycle3-narrow-seeded-rerun.md)
+- [Cycle 3 full matrix](cycle3-full-matrix-20260613.md)
+- [Capability frontier](frontier.md)
 
 ## Triage
 
