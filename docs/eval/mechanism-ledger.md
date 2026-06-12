@@ -35,6 +35,17 @@ Admission result:
 - Final Task18 recheck baseline: minimal+M001 83/125 vs legacy-lite 71/125.
 - Elapsed mean remained faster: 38.5 sec vs 66.6 sec.
 
+Re-audit reservation:
+
+- The admission measurement above includes possible confounding from the
+  [blocked-mkdir trap](triage/blocked-mkdir-trap.md).
+- At admission time, the environment allowed a failure path where M001 fired,
+  the model tried `Bash mkdir`, offline policy blocked it, and the session did
+  not recover to `Write`.
+- After `#1045` and `#1046`, M001's marginal contribution may change. Re-run
+  M001 on/off ablation in the next full matrix, planned as Task26, and record
+  the pure contribution even if it shrinks.
+
 Configuration:
 
 - Off flag: `ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK=1`
