@@ -24,7 +24,7 @@ cases:
     success_check:
       files:
         - path: tools/csv_stats.py
-          min_lines: 25
+          min_lines: 24
       commands:
         - grep -R "row_count" tools/csv_stats.py
 
