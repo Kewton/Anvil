@@ -216,6 +216,45 @@ fi
 # -------- repo root --------
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
+# -------- build metadata --------
+git_commit() {
+  git -C "$REPO_ROOT" rev-parse --verify HEAD 2>/dev/null || true
+}
+
+git_dirty_flag() {
+  if ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf 'false'
+    return 0
+  fi
+  if [[ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null || true)" ]]; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+file_mtime_epoch() {
+  local path="$1"
+  stat -f '%m' "$path" 2>/dev/null || stat -c '%Y' "$path" 2>/dev/null || true
+}
+
+iso_from_epoch() {
+  local epoch="$1"
+  if [[ -z "$epoch" ]]; then
+    return 0
+  fi
+  date -u -r "$epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+    || date -u -d "@$epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+    || true
+}
+
+BENCH_GIT_COMMIT=$(git_commit)
+BENCH_GIT_DIRTY=$(git_dirty_flag)
+BENCH_GIT_REVISION="$BENCH_GIT_COMMIT"
+if [[ -n "$BENCH_GIT_REVISION" && "$BENCH_GIT_DIRTY" == "true" ]]; then
+  BENCH_GIT_REVISION="$BENCH_GIT_REVISION-dirty"
+fi
+
 # -------- benchmark-name validation --------
 if ! [[ "$benchmark_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "Error: invalid benchmark-name: $benchmark_name" >&2
@@ -246,6 +285,13 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
     echo "  Run 'cargo build --release' or set ANVIL_BIN" >&2
     exit 1
   fi
+fi
+
+ANVIL_BIN_REAL=""
+ANVIL_BIN_MTIME=""
+if [[ -n "$ANVIL_BIN" ]]; then
+  ANVIL_BIN_REAL=$(realpath "$ANVIL_BIN" 2>/dev/null || printf '%s' "$ANVIL_BIN")
+  ANVIL_BIN_MTIME=$(iso_from_epoch "$(file_mtime_epoch "$ANVIL_BIN")")
 fi
 
 umask 077
@@ -295,10 +341,11 @@ slugify() {
 
 # -------- write_meta_json --------
 write_meta_json() {
-  # $1=rc, $2=elapsed_s, $3=model, $4=start_ts, $5=run_dir, $6=case, $7=task_kind, $8=pam_variant, $9=engine, $10=success_check_success, $11=success_check_reason
+  # $1=rc, $2=elapsed_s, $3=model, $4=start_ts, $5=run_dir, $6=case, $7=task_kind, $8=pam_variant, $9=engine, $10=success_check_success, $11=success_check_reason, $12=active_flags_json
   local _rc="$1" _elapsed="$2" _model="$3" _start_ts="$4" _run_dir="$5"
   local _case="${6:-default}" _task_kind="${7:-coding}" _pam_variant="${8:-default}"
   local _engine="${9:-legacy}" _success_check_success="${10:-null}" _success_check_reason="${11:-}"
+  local _active_flags_json="${12:-[]}"
   if [[ -z "$_run_dir" ]]; then
     return 0
   fi
@@ -314,6 +361,12 @@ write_meta_json() {
     --arg engine "$_engine" \
     --argjson success_check_success "$_success_check_success" \
     --arg success_check_reason "$_success_check_reason" \
+    --arg build_git_commit "$BENCH_GIT_COMMIT" \
+    --argjson build_git_dirty "$BENCH_GIT_DIRTY" \
+    --arg build_git_revision "$BENCH_GIT_REVISION" \
+    --arg build_binary_path "$ANVIL_BIN_REAL" \
+    --arg build_time "$ANVIL_BIN_MTIME" \
+    --argjson active_flags "$_active_flags_json" \
     '{
       rc: $rc,
       elapsed_s: $elapsed_s,
@@ -324,7 +377,15 @@ write_meta_json() {
       pam_variant: $pam_variant,
       engine: $engine,
       success_check_success: $success_check_success,
-      success_check_reason: (if $success_check_reason == "" then null else $success_check_reason end)
+      success_check_reason: (if $success_check_reason == "" then null else $success_check_reason end),
+      build: {
+        git_commit: (if $build_git_commit == "" then null else $build_git_commit end),
+        git_dirty: $build_git_dirty,
+        git_revision: (if $build_git_revision == "" then null else $build_git_revision end),
+        binary_path: (if $build_binary_path == "" then null else $build_binary_path end),
+        build_time: (if $build_time == "" then null else $build_time end)
+      },
+      active_flags: $active_flags
     }' \
     > "$_run_dir/meta.json"
 }
@@ -615,6 +676,7 @@ CURRENT_TASK_KIND="coding"
 CURRENT_PAM_VARIANT="default"
 CURRENT_RUN_DIR=""
 CURRENT_START_TS=""
+CURRENT_ACTIVE_FLAGS_JSON="[]"
 RUN_LOGGED=0
 META_WRITTEN=0
 on_interrupt() {
@@ -627,7 +689,7 @@ on_interrupt() {
   if [[ "$META_WRITTEN" -eq 0 && -n "$CURRENT_RUN_DIR" ]]; then
     write_meta_json 130 0 "${CURRENT_MODEL:-unknown}" "${CURRENT_START_TS:-}" "$CURRENT_RUN_DIR" \
       "${CURRENT_CASE:-default}" "${CURRENT_TASK_KIND:-coding}" "${CURRENT_PAM_VARIANT:-default}" \
-      "${CURRENT_ENGINE:-legacy}" "null" "interrupted" \
+      "${CURRENT_ENGINE:-legacy}" "null" "interrupted" "${CURRENT_ACTIVE_FLAGS_JSON:-[]}" \
       || true
   fi
   if [[ -n "$models_arg" ]]; then
@@ -767,6 +829,18 @@ for model in "${cleaned_models[@]}"; do
         elif [[ "$pam_variant" == "pam_off" ]]; then
           env_kv+=("ANVIL_PAM_ADVISORY_ENABLED=false")
         fi
+        active_flags_json=$(
+          {
+            printf 'BENCH_DEBUG=%s\n' "$BENCH_DEBUG"
+            printf 'ANVIL_BIN=%s\n' "$ANVIL_BIN_REAL"
+            printf 'ENGINE=%s\n' "$engine"
+            [[ -n "$max_iterations" ]] && printf 'MAX_ITERATIONS=%s\n' "$max_iterations"
+            [[ -n "$chat_retries" ]] && printf 'CHAT_RETRIES=%s\n' "$chat_retries"
+            [[ -n "$sidecar_model" ]] && printf 'SIDECAR_MODEL=%s\n' "$sidecar_model"
+            printf '%s\n' "${env_kv[@]+"${env_kv[@]}"}"
+          } | jq -R -s 'split("\n") | map(select(length > 0))'
+        )
+        CURRENT_ACTIVE_FLAGS_JSON="$active_flags_json"
 
         start=$SECONDS
         if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -848,7 +922,7 @@ for model in "${cleaned_models[@]}"; do
         # Write run-dir/meta.json so analyze_run.py can read rc/elapsed_s
         if write_meta_json "$rc" "$elapsed" "$model" "$CURRENT_START_TS" "$RUN_DIR" \
           "$case_name" "$task_kind" "$pam_variant" "$engine" \
-          "$SUCCESS_CHECK_SUCCESS" "$SUCCESS_CHECK_REASON"; then
+          "$SUCCESS_CHECK_SUCCESS" "$SUCCESS_CHECK_REASON" "$active_flags_json"; then
           META_WRITTEN=1
         else
           echo "warning: meta.json write failed" >&2
@@ -890,6 +964,7 @@ for model in "${cleaned_models[@]}"; do
 
         CURRENT_RUN_DIR=""
         CURRENT_START_TS=""
+        CURRENT_ACTIVE_FLAGS_JSON="[]"
         cd "$REPO_ROOT" || { echo "Error: cd $REPO_ROOT failed" >&2; exit 1; }
       done
     done

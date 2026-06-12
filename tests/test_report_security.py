@@ -160,6 +160,19 @@ class TestReportSecurity(unittest.TestCase):
         # scratch should not appear as a row
         self.assertEqual(r.stdout.count("qwen3 |"), 1)
 
+    def test_engine_case_variant_layout_discovered(self) -> None:
+        bench_root = self.tmp / "bench-root"
+        bench_root.mkdir()
+        _make_run_dir(
+            bench_root / "qwen3" / "minimal" / "docs" / "default" / "run-1",
+            rid="engine-layout",
+        )
+
+        r = _run(str(bench_root))
+        self.assertEqual(r.returncode, 0, msg=r.stderr)
+        self.assertIn("| 1 | qwen3", r.stdout)
+        self.assertNotIn("(no runs discovered)", r.stdout)
+
     # ------------------------------------------------------------------
     # analyze_run.py failure: warn and continue
     # ------------------------------------------------------------------

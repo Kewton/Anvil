@@ -219,8 +219,11 @@ def _discover_runs(bench_root: Path) -> list[tuple[str, int, Path]]:
     Supports both legacy flat layout:
       <root>/<model>/run-N
 
-    and suite/PAM layout:
+    suite/PAM layout:
       <root>/<model>/<case>/<pam_variant>/run-N
+
+    and engine/case/PAM layout:
+      <root>/<model>/<engine>/<case>/<pam_variant>/run-N
     """
     runs: list[tuple[str, int, Path]] = []
     try:
@@ -239,42 +242,43 @@ def _discover_runs(bench_root: Path) -> list[tuple[str, int, Path]]:
         if _resolve_in(model_dir, bench_root) is None:
             _warn(f"skipping model dir outside BENCH_ROOT: {model_dir.name}")
             continue
-        try:
-            run_children = sorted(model_dir.iterdir(), key=_run_sort_key)
-        except OSError as e:
-            _warn(f"cannot list {model_dir.name}: {e}")
-            continue
-        for child in run_children:
-            if RUN_DIR_RE.match(child.name):
-                if _append_run(runs, bench_root, model_dir.name, child):
-                    _warn(f"reached MAX_RUNS={MAX_RUNS}, truncating discovery")
-                    return runs
-                continue
-            if not _valid_suite_dir(child, bench_root):
-                continue
-            try:
-                case_children = sorted(child.iterdir(), key=_run_sort_key)
-            except OSError as e:
-                _warn(f"cannot list {child}: {e}")
-                continue
-            for nested in case_children:
-                if RUN_DIR_RE.match(nested.name):
-                    if _append_run(runs, bench_root, model_dir.name, nested):
-                        _warn(f"reached MAX_RUNS={MAX_RUNS}, truncating discovery")
-                        return runs
-                    continue
-                if not _valid_suite_dir(nested, bench_root):
-                    continue
-                try:
-                    variant_children = sorted(nested.iterdir(), key=_run_sort_key)
-                except OSError as e:
-                    _warn(f"cannot list {nested}: {e}")
-                    continue
-                for run_dir in variant_children:
-                    if _append_run(runs, bench_root, model_dir.name, run_dir):
-                        _warn(f"reached MAX_RUNS={MAX_RUNS}, truncating discovery")
-                        return runs
+        if _discover_model_runs(runs, bench_root, model_dir.name, model_dir, 4):
+            _warn(f"reached MAX_RUNS={MAX_RUNS}, truncating discovery")
+            return runs
     return runs
+
+
+def _discover_model_runs(
+    runs: list[tuple[str, int, Path]],
+    bench_root: Path,
+    model_slug: str,
+    parent: Path,
+    depth_remaining: int,
+) -> bool:
+    """Recursively discover run dirs below one model dir with bounded depth."""
+    try:
+        children = sorted(parent.iterdir(), key=_run_sort_key)
+    except OSError as e:
+        _warn(f"cannot list {parent}: {e}")
+        return False
+    for child in children:
+        if RUN_DIR_RE.match(child.name):
+            if _append_run(runs, bench_root, model_slug, child):
+                return True
+            continue
+        if depth_remaining <= 0:
+            continue
+        if not _valid_suite_dir(child, bench_root):
+            continue
+        if _discover_model_runs(
+            runs,
+            bench_root,
+            model_slug,
+            child,
+            depth_remaining - 1,
+        ):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 #   * --pam-ab expands the same prompt suite into pam_on/pam_off variants
 #   * run-dir contains session.json, meta.json, logs/llm-io.jsonl
 #   * meta.json "rc" and "elapsed_s" are numeric
+#   * meta.json records build provenance and active flags
 
 set -euo pipefail
 
@@ -61,6 +62,7 @@ echo '{"schema_version":1,"session_id":"fake","final_outcome":"done","pam_eval":
 exit 0
 EOF
 chmod +x "$fake_anvil"
+fake_anvil_real=$(realpath "$fake_anvil" 2>/dev/null || printf '%s' "$fake_anvil")
 
 # --- fake benchmark yaml ---
 bench_yaml_dir="$REPO_ROOT/benchmarks"
@@ -148,6 +150,19 @@ for engine in legacy minimal; do
         '.engine == $engine and .success_check_success == true and .success_check_reason == "ok"' \
         "$run_dir/meta.json" >/dev/null || {
         echo "FAIL: meta engine/success_check mismatch in $run_dir/meta.json" >&2
+        cat "$run_dir/meta.json" >&2
+        exit 1
+      }
+      jq -e --arg bin "$fake_anvil_real" --arg engine "$engine" --arg pam "ANVIL_PAM_ADVISORY_ENABLED=$expected_pam" \
+        '(.build.git_dirty | type == "boolean")
+         and (.build.git_revision == null or (.build.git_revision | type == "string"))
+         and .build.binary_path == $bin
+         and (.build.build_time == null or (.build.build_time | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")))
+         and (.active_flags | index("BENCH_DEBUG=1"))
+         and (.active_flags | index($pam))
+         and (.active_flags | index("ENGINE=" + $engine))' \
+        "$run_dir/meta.json" >/dev/null || {
+        echo "FAIL: meta build/active_flags mismatch in $run_dir/meta.json" >&2
         cat "$run_dir/meta.json" >&2
         exit 1
       }
