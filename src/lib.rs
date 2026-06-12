@@ -271,6 +271,8 @@ fn run_minimal_engine(
         auto_approve: config.yes_mode,
         offline: config.offline,
         cancel_flag: None,
+        completion_without_write_feedback:
+            !agent::minimal_loop::completion_without_write_feedback_disabled_from_env(),
     };
     let reply = agent::minimal_loop::run_session(
         &mut client,

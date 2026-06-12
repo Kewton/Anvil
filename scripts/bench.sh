@@ -46,6 +46,9 @@ Usage: scripts/bench.sh <benchmark-name> [options]
   --no-precautions  Reminder Sidecar を無効化（ANVIL_NO_REMINDER=1）
   --no-case-memory  Case memory を無効化（ANVIL_NO_CASE_RETRIEVAL=1 ANVIL_NO_CASE_RECORD=1）
   --no-auto-test    Auto test を無効化（ANVIL_NO_AUTO_TEST=1）
+  --no-minimal-completion-without-write-feedback
+                    Minimal の no-write completion feedback を無効化
+                    （ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK=1）
   --pam-ab          Same prompt suite with PAM enabled and disabled
   --dry-run         anvil 呼び出しを echo で代替
   --recheck-root <path>
@@ -73,6 +76,7 @@ DRY_RUN=0
 no_precautions=0
 no_case_memory=0
 no_auto_test=0
+no_minimal_completion_without_write_feedback=0
 pam_ab=0
 recheck_root=""
 # BENCH_DEBUG toggles `--trace` on the anvil invocation. Allowed values: "0" or "1".
@@ -136,6 +140,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-auto-test)
       no_auto_test=1
+      shift
+      ;;
+    --no-minimal-completion-without-write-feedback)
+      no_minimal_completion_without_write_feedback=1
       shift
       ;;
     --pam-ab)
@@ -949,6 +957,7 @@ for model in "${cleaned_models[@]}"; do
         # Unset ANVIL_NO_* from caller env to prevent baseline cell contamination.
         unset ANVIL_NO_REMINDER ANVIL_NO_CASE_RETRIEVAL ANVIL_NO_CASE_RECORD \
               ANVIL_NO_AUTO_TEST ANVIL_NO_TESTER ANVIL_NO_REPO_GRAPH \
+              ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK \
               ANVIL_CASE_RECORD_DRY_RUN ANVIL_CASE_RETRIEVAL_DRY_RUN \
               ANVIL_PAM_ADVISORY_ENABLED
 
@@ -962,6 +971,9 @@ for model in "${cleaned_models[@]}"; do
         fi
         if [[ "$no_auto_test" -eq 1 ]]; then
           env_kv+=("ANVIL_NO_AUTO_TEST=1")
+        fi
+        if [[ "$no_minimal_completion_without_write_feedback" -eq 1 ]]; then
+          env_kv+=("ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK=1")
         fi
         if [[ "$pam_variant" == "pam_on" ]]; then
           env_kv+=("ANVIL_PAM_ADVISORY_ENABLED=true")

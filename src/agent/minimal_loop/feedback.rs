@@ -3,6 +3,7 @@ pub const MINIMAL_FEEDBACK_PREFIX: &str = "[minimal-feedback]";
 #[derive(Debug, Default, Clone)]
 pub struct FeedbackState {
     empty_response_sent: bool,
+    completion_without_write_sent: bool,
     missing_tool_sent: bool,
     edit_anchor_sent: bool,
 }
@@ -25,6 +26,16 @@ impl FeedbackState {
         self.missing_tool_sent = true;
         Some(format!(
             "{MINIMAL_FEEDBACK_PREFIX}\nThe user asked for a repository change. Use exactly one relevant tool call next instead of only describing the work."
+        ))
+    }
+
+    pub fn completion_without_write(&mut self) -> Option<String> {
+        if self.completion_without_write_sent {
+            return None;
+        }
+        self.completion_without_write_sent = true;
+        Some(format!(
+            "{MINIMAL_FEEDBACK_PREFIX}\nNo file changes have been made in this session. If the task requires creating or modifying files, do that now with Write or Edit. If no file change is needed, say so and finish."
         ))
     }
 
@@ -86,6 +97,8 @@ mod tests {
 
         assert!(state.empty_response().is_some());
         assert!(state.empty_response().is_none());
+        assert!(state.completion_without_write().is_some());
+        assert!(state.completion_without_write().is_none());
         assert!(state.missing_tool_call("fix src/lib.rs").is_some());
         assert!(state.missing_tool_call("fix src/lib.rs").is_none());
         assert!(
