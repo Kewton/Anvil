@@ -134,9 +134,11 @@ cases:
     success_check:
       files:
         - path: src/retry_policy.py
-          min_lines: 25
+          min_lines: 12
       commands:
         - grep -R "should_retry" src/retry_policy.py
+        - >
+          python3 -c "import importlib.util; spec = importlib.util.spec_from_file_location('retry_policy', 'src/retry_policy.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); fn = mod.should_retry; assert fn(429, 1); assert fn(500, 2); assert fn(599, 2); assert not fn(404, 1); assert not fn(200, 1); assert not fn(429, 3); assert not fn(500, 3)"
 
   - name: fix-css-token-doc
     task_kind: docs
