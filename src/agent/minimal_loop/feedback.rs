@@ -38,9 +38,9 @@ impl FeedbackState {
         ))
     }
 
-    pub fn malformed_tool_call(&self, error: &str) -> String {
+    pub fn malformed_tool_call_xml_fallback(&self, error: &str) -> String {
         format!(
-            "{MINIMAL_FEEDBACK_PREFIX}\nYour previous tool call was malformed and was not executed ({error}). Reply with exactly one complete <anvil_tool_call>{{\"name\":\"ToolName\",\"arguments\":{{...}}}}</anvil_tool_call> block, or plain text if the task is already complete."
+            "{MINIMAL_FEEDBACK_PREFIX}\nYour previous tool call was malformed and was not executed ({error}). Native tool calls are disabled for the rest of this session. Reply with exactly one complete <anvil_tool_call>{{\"name\":\"ToolName\",\"arguments\":{{...}}}}</anvil_tool_call> block, or plain text if the task is already complete."
         )
     }
 }
@@ -100,7 +100,7 @@ mod tests {
         );
         assert!(
             state
-                .malformed_tool_call("tool call parser failed")
+                .malformed_tool_call_xml_fallback("tool call parser failed")
                 .starts_with(MINIMAL_FEEDBACK_PREFIX)
         );
     }

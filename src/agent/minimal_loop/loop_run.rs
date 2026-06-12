@@ -10,7 +10,7 @@ use crate::util::workspace_paths::WorkspacePolicy;
 
 use super::compact::compact_if_needed;
 use super::feedback::FeedbackState;
-use super::prompt::build_system_prompt;
+use super::prompt::{PromptToolMode, build_system_prompt};
 
 pub trait MinimalChatClient {
     fn chat(
@@ -67,26 +67,38 @@ pub fn run_session<C: MinimalChatClient>(
     let mut iterations = 0usize;
     while iterations < config.max_iterations {
         iterations += 1;
-        let tools = tool_specs_for_mode(&registry, config.mode);
+        let available_tools = tool_specs_for_mode(&registry, config.mode);
+        let request_tools = if native_tools_enabled {
+            available_tools.clone()
+        } else {
+            Vec::new()
+        };
         compact_if_needed(&mut session.messages, config.context_budget);
         let request_messages = build_request_messages(
             session,
-            &registry,
+            &available_tools,
             &config.work_root,
+            prompt_tool_mode(native_tools_enabled),
             pending_feedback.as_deref(),
         );
-        let reply = match client.chat(model, &request_messages, &tools, native_tools_enabled) {
+        let reply = match client.chat(
+            model,
+            &request_messages,
+            &request_tools,
+            native_tools_enabled,
+        ) {
             Ok(reply) => {
                 pending_feedback = None;
                 reply
             }
             Err(err) if native_tools_enabled && is_native_tool_parser_failure(&err) => {
-                native_tools_enabled = false;
-                session.native_tools_disabled = true;
+                downgrade_to_xml_fallback(session, &mut native_tools_enabled);
+                pending_feedback = Some(feedback_state.malformed_tool_call_xml_fallback(&err));
                 continue;
             }
             Err(err) if is_tool_call_parser_failure(&err) => {
-                pending_feedback = Some(feedback_state.malformed_tool_call(&err));
+                downgrade_to_xml_fallback(session, &mut native_tools_enabled);
+                pending_feedback = Some(feedback_state.malformed_tool_call_xml_fallback(&err));
                 continue;
             }
             Err(err) => return Err(err),
@@ -155,14 +167,16 @@ pub fn run_session<C: MinimalChatClient>(
 
 fn build_request_messages(
     session: &SessionSnapshot,
-    registry: &ToolRegistry,
+    tools: &[ToolSpec],
     work_root: &std::path::Path,
+    prompt_tool_mode: PromptToolMode,
     ephemeral_feedback: Option<&str>,
 ) -> Vec<ConversationMessage> {
     let mut messages = Vec::with_capacity(session.messages.len() + 2);
     messages.push(ConversationMessage::system(build_system_prompt(
         work_root,
-        registry.specs(),
+        tools,
+        prompt_tool_mode,
     )));
     messages.extend(
         session
@@ -175,6 +189,19 @@ fn build_request_messages(
         messages.push(ConversationMessage::user(feedback.to_string()));
     }
     messages
+}
+
+fn prompt_tool_mode(native_tools_enabled: bool) -> PromptToolMode {
+    if native_tools_enabled {
+        PromptToolMode::Native
+    } else {
+        PromptToolMode::XmlFallback
+    }
+}
+
+fn downgrade_to_xml_fallback(session: &mut SessionSnapshot, native_tools_enabled: &mut bool) {
+    *native_tools_enabled = false;
+    session.native_tools_disabled = true;
 }
 
 fn tool_specs_for_mode(registry: &ToolRegistry, mode: ExecutionMode) -> Vec<ToolSpec> {
@@ -219,6 +246,9 @@ mod tests {
     struct MockClient {
         responses: VecDeque<MockResponse>,
         native_modes: Vec<bool>,
+        tool_counts: Vec<usize>,
+        system_prompts: Vec<String>,
+        feedback_messages: Vec<String>,
         feedback_seen: bool,
     }
 
@@ -248,8 +278,15 @@ mod tests {
         ) -> Result<AssistantReply, String> {
             assert_eq!(messages[0].role, "system");
             assert_eq!(messages.iter().filter(|m| m.role == "system").count(), 1);
-            assert!(!tools.is_empty());
             self.native_modes.push(native_tools_enabled);
+            self.tool_counts.push(tools.len());
+            self.system_prompts.push(messages[0].content.clone());
+            self.feedback_messages
+                .extend(messages.iter().filter_map(|m| {
+                    m.content
+                        .starts_with(MINIMAL_FEEDBACK_PREFIX)
+                        .then(|| m.content.clone())
+                }));
             self.feedback_seen |= messages
                 .iter()
                 .any(|m| m.content.starts_with(MINIMAL_FEEDBACK_PREFIX));
@@ -258,6 +295,18 @@ mod tests {
                 MockResponse::Err(err) => Err(err),
             }
         }
+    }
+
+    const TYPE_A_CSV_WRONG_CLOSER_PAYLOAD: &str = r#"<anvil_tool_call>{"name":"Write","arguments":{"path":"tools/csv_stats.py","content":"import csv\nimport sys\n\n\ndef main():\n    if len(sys.argv) < 2:\n        print(\"Usage: python csv_stats.py <csv_path>\")\n        sys.exit(1)\n\n    csv_path = sys.argv[1]\n\n    with open(csv_path, newline=\"\") as f:\n        reader = csv.reader(f)\n        rows = list(reader)\n\n    row_count = len(rows)\n    column_count = len(rows[0]) if rows else 0\n\n    print(f\"row_count={row_count}\")\n    print(f\"column_count={column_count}\")\n\n\nif __name__ == \"__main__\":\n    main()\n"}}
+</function>
+</tool_call>"#;
+
+    const TYPE_A_MARKDOWN_UNTERMINATED_PAYLOAD: &str = r##"<anvil_tool_call>{"name":"Write","arguments":{"path":"reports/local-llm-brief.md","content":"# Local LLM Trade-offs: A Concise Research Brief\n\n| Factor | Impact |\n|---|---|\n| Latency | Local inference depends on GPU memory and model size. |\n| Privacy | Local execution keeps prompts and files on the workstation. |\n"}}"##;
+
+    fn parser_failure_for_type_a_payload(payload: &str) -> String {
+        assert!(payload.contains("<anvil_tool_call>"));
+        assert!(!payload.contains("</anvil_tool_call>"));
+        "tool call parser failed: unterminated <anvil_tool_call> block".to_string()
     }
 
     fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -330,11 +379,16 @@ mod tests {
 
         assert_eq!(reply, "done after downgrade");
         assert_eq!(client.native_modes, vec![true, false]);
+        assert_eq!(client.tool_counts[1], 0);
+        assert!(!client.system_prompts[0].contains("<anvil_tool_call>"));
+        assert!(client.system_prompts[1].contains("<anvil_tool_call>"));
+        assert_eq!(client.feedback_messages.len(), 1);
+        assert!(client.feedback_messages[0].contains("<anvil_tool_call>"));
         assert!(session.native_tools_disabled);
     }
 
     #[test]
-    fn xml_parser_failure_uses_ephemeral_feedback_and_retries() {
+    fn xml_parser_failure_downgrades_to_xml_feedback_and_retries() {
         let temp = tempfile::tempdir().unwrap();
         let mut client = MockClient::default();
         client.push_err("tool call parser failed: unterminated <anvil_tool_call> block");
@@ -350,7 +404,7 @@ mod tests {
 
         let reply = run_session(
             &mut client,
-            "qwen3:8b",
+            "qwen3.6:27b-coding-nvfp4",
             &mut session,
             "create fixed.txt",
             &config(temp.path().to_path_buf(), 4),
@@ -363,6 +417,11 @@ mod tests {
             "ok"
         );
         assert!(client.feedback_seen);
+        assert_eq!(client.native_modes[0], true);
+        assert_eq!(client.native_modes[1], false);
+        assert_eq!(client.tool_counts[1], 0);
+        assert!(client.feedback_messages[0].contains("Native tool calls are disabled"));
+        assert!(session.native_tools_disabled);
         assert!(
             !session
                 .messages
@@ -370,6 +429,37 @@ mod tests {
                 .any(|m| m.content.starts_with(MINIMAL_FEEDBACK_PREFIX)),
             "ephemeral feedback must not be persisted to the session"
         );
+    }
+
+    #[test]
+    fn type_a_deepdive_payloads_trigger_session_downgrade() {
+        for payload in [
+            TYPE_A_CSV_WRONG_CLOSER_PAYLOAD,
+            TYPE_A_MARKDOWN_UNTERMINATED_PAYLOAD,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut client = MockClient::default();
+            let err = parser_failure_for_type_a_payload(payload);
+            client.push_err(&err);
+            client.push_reply("done after downgrade", Vec::new());
+            let mut session = SessionSnapshot::default();
+
+            let reply = run_session(
+                &mut client,
+                "qwen3.6:27b-coding-nvfp4",
+                &mut session,
+                "answer",
+                &config(temp.path().to_path_buf(), 3),
+            )
+            .unwrap();
+
+            assert_eq!(reply, "done after downgrade");
+            assert_eq!(client.native_modes, vec![true, false]);
+            assert_eq!(client.tool_counts[0], 6);
+            assert_eq!(client.tool_counts[1], 0);
+            assert!(client.feedback_messages[0].contains("<anvil_tool_call>"));
+            assert!(session.native_tools_disabled);
+        }
     }
 
     #[test]
