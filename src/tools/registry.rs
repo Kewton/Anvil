@@ -405,7 +405,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Write",
-            "Create or overwrite a file. Use repository-relative paths.",
+            "Create or overwrite a file. Parent directories are created automatically. Use repository-relative paths.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -896,6 +896,20 @@ mod tests {
                 "{tool_name} description must not contradict the system prompt: {description}"
             );
         }
+    }
+
+    #[test]
+    fn write_tool_description_mentions_parent_directory_creation() {
+        let specs = default_tool_specs();
+        let description = specs
+            .iter()
+            .find(|spec| spec.function.name == "Write")
+            .map(|spec| spec.function.description.as_str())
+            .expect("Write tool spec");
+        assert!(
+            description.contains("Parent directories are created automatically"),
+            "Write description should tell the model not to call Bash mkdir first: {description}"
+        );
     }
 
     #[test]
