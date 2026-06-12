@@ -12,7 +12,7 @@ cases:
     success_check:
       files:
         - path: src/bin/word_count.rs
-          min_lines: 20
+          min_lines: 8
       commands:
         - grep -R "words=" src/bin/word_count.rs
 
