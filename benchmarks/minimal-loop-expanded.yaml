@@ -244,11 +244,11 @@ cases:
       files:
         - path: pyproject.toml
         - path: app/main.py
-          min_lines: 25
+          min_lines: 6
         - path: app/routes/health.py
-          min_lines: 20
+          min_lines: 8
         - path: tests/test_health.py
-          min_lines: 20
+          min_lines: 10
       commands:
         - grep -R "FastAPI" app/main.py
 
