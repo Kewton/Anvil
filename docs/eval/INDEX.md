@@ -16,6 +16,8 @@
   admitted minimal-loop mechanisms and audit status.
 - [Blocked mkdir trap triage](triage/blocked-mkdir-trap.md):
   tool-affordance mismatch behind many offline Bash `mkdir` blocks.
+- [Blocked script-run triage](triage/blocked-script-run.md):
+  local `cd ... && python/node ...` validation blocked by offline Bash policy.
 - [Benchmark seed smoke](seed-smoke.md):
   Task24 seeded rerun gate check before Cycle 3.
 - [Cycle 3 narrow seeded rerun](cycle3-narrow-seeded-rerun.md):
@@ -39,3 +41,4 @@
 - [Parser feedback loop deepdive](triage/t2-4-parser-feedback-loop-deepdive-20260612.md)
 - [Cycle 2 loss triage](triage/cycle2-loss-triage.md)
 - [Blocked mkdir trap triage](triage/blocked-mkdir-trap.md)
+- [Blocked script-run triage](triage/blocked-script-run.md)
