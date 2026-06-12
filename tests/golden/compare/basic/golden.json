@@ -1,6 +1,15 @@
 {
   "baseline_dir": "<REPO_ROOT>/tests/golden/compare/basic/baseline",
   "experiment_dir": "<REPO_ROOT>/tests/golden/compare/basic/experiment",
+  "failure_categories": {
+    "baseline": {
+      "completed": 2,
+      "unknown": 1
+    },
+    "experiment": {
+      "completed": 3
+    }
+  },
   "generated_at": "2026-01-01T00:00:00Z",
   "metrics": {
     "elapsed_s": {

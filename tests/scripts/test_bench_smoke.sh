@@ -148,6 +148,39 @@ if [[ "$rows" -ne 16 ]]; then
   exit 1
 fi
 
+bash scripts/bench.sh bench-smoke-fixture --model "smoke-filter" --runs 1 --engine minimal \
+  --cases docs,crash --bench-no-debug --no-bench-seed \
+  > "$tmp/bench-filter.stdout" 2> "$tmp/bench-filter.stderr" || {
+  echo "FAIL: bench.sh --cases run failed" >&2
+  cat "$tmp/bench-filter.stderr" >&2
+  exit 1
+}
+BENCH_ROOT_FILTER=$(awk '/^Done\. Results: / { sub(/^Done\. Results: /, ""); sub(/\/summary\.tsv$/, ""); print }' \
+  "$tmp/bench-filter.stdout")
+filter_summary="$BENCH_ROOT_FILTER/summary.tsv"
+filter_rows=$(($(wc -l < "$filter_summary") - 1))
+if [[ "$filter_rows" -ne 2 ]]; then
+  echo "FAIL: expected 2 filtered data rows, got $filter_rows" >&2
+  cat "$filter_summary" >&2
+  exit 1
+fi
+if awk -F'\t' 'NR > 1 && $3 != "docs" && $3 != "crash" { bad = 1 } END { exit bad }' "$filter_summary"; then
+  :
+else
+  echo "FAIL: --cases emitted an unselected case" >&2
+  cat "$filter_summary" >&2
+  exit 1
+fi
+run_dir_filter="$BENCH_ROOT_FILTER/smoke-filter/minimal/docs/default/run-1"
+jq -e '(.active_flags | index("CASES=docs,crash"))
+       and .bench_seed == null
+       and .bench_seed_enabled == false' \
+  "$run_dir_filter/meta.json" >/dev/null || {
+  echo "FAIL: --cases/--no-bench-seed meta mismatch in $run_dir_filter/meta.json" >&2
+  cat "$run_dir_filter/meta.json" >&2
+  exit 1
+}
+
 for engine in legacy minimal; do
   for case_name in docs data; do
     for pam_variant in pam_on pam_off; do
@@ -329,6 +362,26 @@ awk -F'\t' '$3 == "crash" && $4 == "pam_on" && $0 ~ "/legacy/" { print $10 "\t" 
   exit 1
 }
 
+bash scripts/bench.sh bench-smoke-fixture --recheck-root "$BENCH_ROOT" --cases docs \
+  > "$tmp/recheck-filter.stdout" 2> "$tmp/recheck-filter.stderr" || {
+  echo "FAIL: bench.sh filtered recheck mode failed" >&2
+  cat "$tmp/recheck-filter.stderr" >&2
+  exit 1
+}
+filtered_recheck_rows=$(($(wc -l < "$recheck_summary") - 1))
+if [[ "$filtered_recheck_rows" -ne 4 ]]; then
+  echo "FAIL: expected 4 filtered recheck rows, got $filtered_recheck_rows" >&2
+  cat "$recheck_summary" >&2
+  exit 1
+fi
+if awk -F'\t' 'NR > 1 && $3 != "docs" { bad = 1 } END { exit bad }' "$recheck_summary"; then
+  :
+else
+  echo "FAIL: filtered recheck emitted an unselected case" >&2
+  cat "$recheck_summary" >&2
+  exit 1
+fi
+
 run_dir="$BENCH_ROOT/smoke-model/legacy/docs/pam_on/run-1"
 rc_val=$(jq -r '.rc' "$run_dir/meta.json")
 elapsed_val=$(jq -r '.elapsed_s' "$run_dir/meta.json")
@@ -370,6 +423,7 @@ jq -e '.bench_seed == null and .bench_seed_enabled == false
 
 # Cleanup the generated BENCH_ROOT (under repo .anvil)
 rm -rf "$BENCH_ROOT"
+rm -rf "$BENCH_ROOT_FILTER"
 rm -rf "$BENCH_ROOT_NOSEED"
 
 echo "PASS: bench.sh smoke test"

@@ -322,12 +322,12 @@ mod tests {
             self.native_modes.push(native_tools_enabled);
             self.tool_counts.push(tools.len());
             self.system_prompts.push(messages[0].content.clone());
-            self.feedback_messages
-                .extend(messages.iter().filter_map(|m| {
-                    m.content
-                        .starts_with(MINIMAL_FEEDBACK_PREFIX)
-                        .then(|| m.content.clone())
-                }));
+            self.feedback_messages.extend(
+                messages
+                    .iter()
+                    .filter(|m| m.content.starts_with(MINIMAL_FEEDBACK_PREFIX))
+                    .map(|m| m.content.clone()),
+            );
             self.feedback_seen |= messages
                 .iter()
                 .any(|m| m.content.starts_with(MINIMAL_FEEDBACK_PREFIX));
@@ -461,8 +461,8 @@ mod tests {
             "ok"
         );
         assert!(client.feedback_seen);
-        assert_eq!(client.native_modes[0], true);
-        assert_eq!(client.native_modes[1], false);
+        assert!(client.native_modes[0]);
+        assert!(!client.native_modes[1]);
         assert_eq!(client.tool_counts[1], 0);
         assert!(client.feedback_messages[0].contains("Native tool calls are disabled"));
         assert!(session.native_tools_disabled);
