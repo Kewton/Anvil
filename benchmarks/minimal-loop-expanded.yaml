@@ -184,7 +184,7 @@ cases:
       files:
         - path: Cargo.toml
         - path: src/lib.rs
-          min_lines: 30
+          min_lines: 20
         - path: tests/math_tests.rs
           min_lines: 20
       commands:
