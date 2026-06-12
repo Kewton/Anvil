@@ -32,10 +32,13 @@ cat > "$fake_anvil" <<'EOF'
 # Parse --state-dir and write a session directory.
 set -euo pipefail
 state_dir=""
+prompt=""
 prev=""
 for arg in "$@"; do
   if [[ "$prev" == "--state-dir" ]]; then
     state_dir="$arg"
+  elif [[ "$prev" == "--prompt" ]]; then
+    prompt="$arg"
   fi
   prev="$arg"
 done
@@ -46,6 +49,14 @@ fi
 uuid="00000000-0000-4000-8000-000000000001"
 session_dir="$state_dir/sessions/$uuid"
 mkdir -p "$session_dir/logs"
+if [[ "$prompt" == "fail logs only" ]]; then
+  echo '{"ts_ms":1,"event":"ollama.generate.start","payload":{"failure_fixture":true}}' \
+    > "$session_dir/logs/llm-io.jsonl"
+  echo '{"schema_version":1,"session_id":"fake","final_outcome":"error"}' \
+    > "$session_dir/logs/eval.jsonl"
+  echo "fake anvil: failed before session flush" >&2
+  exit 1
+fi
 cat > "$session_dir/session.json" <<JSON
 {"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","seed":"${ANVIL_BENCH_SEED:-unset}","messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
 JSON
@@ -60,6 +71,7 @@ chmod +x "$fake_anvil"
 # --- fake benchmark yaml ---
 bench_yaml_dir="$REPO_ROOT/benchmarks"
 bench_yaml="$bench_yaml_dir/bench-smoke-fixture.yaml"
+bench_fail_yaml="$bench_yaml_dir/bench-smoke-fail-fixture.yaml"
 mkdir -p "$bench_yaml_dir"
 cat > "$bench_yaml" <<'EOF'
 args:
@@ -70,7 +82,14 @@ cases:
   - name: data
     prompt: transform CSV rows
 EOF
-trap 'rm -rf "$tmp"; rm -f "$bench_yaml"' EXIT
+cat > "$bench_fail_yaml" <<'EOF'
+args:
+  max_iterations: 1
+cases:
+  - name: fail-logs-only
+    prompt: fail logs only
+EOF
+trap 'rm -rf "$tmp"; rm -f "$bench_yaml" "$bench_fail_yaml"' EXIT
 
 # --- invoke bench.sh ---
 export ANVIL_BIN="$fake_anvil"
@@ -189,6 +208,41 @@ jq -e '.seed == "unset"' "$no_seed_run_dir/session.json" >/dev/null || {
   exit 1
 }
 rm -rf "$BENCH_ROOT_NO_SEED"
+
+# Failed runs can have structured logs before session.json is flushed. Preserve
+# those logs for triage even when session.json cannot be copied.
+bash scripts/bench.sh bench-smoke-fail-fixture --model "smoke-model" --runs 1 \
+  > "$tmp/bench-fail.stdout" 2> "$tmp/bench-fail.stderr" || {
+  echo "FAIL: bench.sh fail-fixture wrapper should still complete" >&2
+  cat "$tmp/bench-fail.stderr" >&2
+  exit 1
+}
+BENCH_ROOT_FAIL=$(awk '/^Done\. Results: / { sub(/^Done\. Results: /, ""); sub(/\/summary\.tsv$/, ""); print }' \
+  "$tmp/bench-fail.stdout")
+fail_run_dir="$BENCH_ROOT_FAIL/smoke-model/fail-logs-only/default/run-1"
+if [[ ! -f "$fail_run_dir/logs/llm-io.jsonl" || ! -f "$fail_run_dir/logs/eval.jsonl" ]]; then
+  echo "FAIL: failed run logs were not copied" >&2
+  find "$fail_run_dir" -maxdepth 4 -type f >&2 || true
+  exit 1
+fi
+if [[ -e "$fail_run_dir/session.json" ]]; then
+  echo "FAIL: fail fixture should not create copied session.json" >&2
+  cat "$fail_run_dir/session.json" >&2
+  exit 1
+fi
+fail_rc=$(jq -r '.rc' "$fail_run_dir/meta.json")
+if [[ "$fail_rc" != "1" ]]; then
+  echo "FAIL: fail fixture meta rc mismatch: $fail_rc" >&2
+  cat "$fail_run_dir/meta.json" >&2
+  exit 1
+fi
+fail_session_copied=$(awk -F'\t' 'NR == 2 { print $8 }' "$BENCH_ROOT_FAIL/summary.tsv")
+if [[ "$fail_session_copied" != "0" ]]; then
+  echo "FAIL: fail fixture should report session_copied=0" >&2
+  cat "$BENCH_ROOT_FAIL/summary.tsv" >&2
+  exit 1
+fi
+rm -rf "$BENCH_ROOT_FAIL"
 
 # Optional: analyze_run.py should succeed on the produced run-dir
 if command -v python3 >/dev/null 2>&1; then
