@@ -307,7 +307,7 @@ cases:
         - path: reports/sales-analysis.md
           min_lines: 40
       commands:
-        - grep -R "top products" reports/sales-analysis.md
+        - grep -Ri "top products" reports/sales-analysis.md
 
   - name: non-coding-research-brief
     task_kind: research
