@@ -9,12 +9,14 @@
 #   --dry-run         anvil 呼び出しを echo で代替
 #   --pam-ab          Same prompt suite with PAM enabled and disabled
 #   --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
+#   --no-bench-seed  ベンチ用の Ollama seed 注入を無効化
 #   --help            この用例を表示して終了
 #
 # Environment:
 #   BENCH_DEBUG=1 (default) anvil を --trace 付きで起動し、詳細ログを stderr に流す
 #                           （llm-io.jsonl は log level によらず常時保存される）
 #   BENCH_DEBUG=0           --trace を付けない。--bench-no-debug と等価。
+#   ANVIL_NO_BENCH_SEED=1   ベンチ用の Ollama seed 注入を無効化。
 #
 # Examples:
 #   scripts/bench.sh heavy --model qwen3.5:122b --runs 5
@@ -38,6 +40,7 @@ Usage: scripts/bench.sh <benchmark-name> [options]
   --pam-ab          Same prompt suite with PAM enabled and disabled
   --dry-run         anvil 呼び出しを echo で代替
   --bench-no-debug  anvil に --trace を付けない（BENCH_DEBUG=0 と同義）
+  --no-bench-seed   ベンチ用の Ollama seed 注入を無効化
   --help            この用例を表示して終了
 
 Examples:
@@ -57,12 +60,21 @@ no_precautions=0
 no_case_memory=0
 no_auto_test=0
 pam_ab=0
+bench_seed_enabled=1
 # BENCH_DEBUG toggles `--trace` on the anvil invocation. Allowed values: "0" or "1".
 BENCH_DEBUG="${BENCH_DEBUG:-1}"
 case "$BENCH_DEBUG" in
   0|1) ;;
   *)
     echo "Error: BENCH_DEBUG must be 0 or 1 (got: $BENCH_DEBUG)" >&2
+    exit 1
+    ;;
+esac
+case "${ANVIL_NO_BENCH_SEED:-0}" in
+  ""|0) ;;
+  1) bench_seed_enabled=0 ;;
+  *)
+    echo "Error: ANVIL_NO_BENCH_SEED must be 0 or 1 (got: $ANVIL_NO_BENCH_SEED)" >&2
     exit 1
     ;;
 esac
@@ -115,6 +127,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --bench-no-debug)
       BENCH_DEBUG=0
+      shift
+      ;;
+    --no-bench-seed)
+      bench_seed_enabled=0
       shift
       ;;
     --)
@@ -257,11 +273,17 @@ slugify() {
   printf '%s' "$1" | sed 's/[^A-Za-z0-9._-]/-/g'
 }
 
+# derive_bench_seed <benchmark> <case> <pam_variant> <run_index>
+derive_bench_seed() {
+  printf '%s|%s|%s|%s' "$1" "$2" "$3" "$4" | cksum | awk '{ print $1 }'
+}
+
 # -------- write_meta_json --------
 write_meta_json() {
-  # $1=rc, $2=elapsed_s, $3=model, $4=start_ts, $5=run_dir, $6=case, $7=task_kind, $8=pam_variant
+  # $1=rc, $2=elapsed_s, $3=model, $4=start_ts, $5=run_dir, $6=case, $7=task_kind, $8=pam_variant, $9=bench_seed
   local _rc="$1" _elapsed="$2" _model="$3" _start_ts="$4" _run_dir="$5"
   local _case="${6:-default}" _task_kind="${7:-coding}" _pam_variant="${8:-default}"
+  local _bench_seed="${9:-}"
   if [[ -z "$_run_dir" ]]; then
     return 0
   fi
@@ -274,6 +296,7 @@ write_meta_json() {
     --arg case "$_case" \
     --arg task_kind "$_task_kind" \
     --arg pam_variant "$_pam_variant" \
+    --arg bench_seed "$_bench_seed" \
     '{
       rc: $rc,
       elapsed_s: $elapsed_s,
@@ -281,7 +304,9 @@ write_meta_json() {
       start_ts: $start_ts,
       case: $case,
       task_kind: $task_kind,
-      pam_variant: $pam_variant
+      pam_variant: $pam_variant,
+      bench_seed: (if $bench_seed == "" then null else ($bench_seed | tonumber) end),
+      bench_seed_enabled: ($bench_seed != "")
     }' \
     > "$_run_dir/meta.json"
 }
@@ -447,6 +472,7 @@ CURRENT_TASK_KIND="coding"
 CURRENT_PAM_VARIANT="default"
 CURRENT_RUN_DIR=""
 CURRENT_START_TS=""
+CURRENT_BENCH_SEED=""
 RUN_LOGGED=0
 META_WRITTEN=0
 on_interrupt() {
@@ -459,6 +485,7 @@ on_interrupt() {
   if [[ "$META_WRITTEN" -eq 0 && -n "$CURRENT_RUN_DIR" ]]; then
     write_meta_json 130 0 "${CURRENT_MODEL:-unknown}" "${CURRENT_START_TS:-}" "$CURRENT_RUN_DIR" \
       "${CURRENT_CASE:-default}" "${CURRENT_TASK_KIND:-coding}" "${CURRENT_PAM_VARIANT:-default}" \
+      "${CURRENT_BENCH_SEED:-}" \
       || true
   fi
   if [[ -n "$models_arg" ]]; then
@@ -548,6 +575,11 @@ for model in "${cleaned_models[@]}"; do
         STATE_DIR="$RUN_DIR/state"
         CURRENT_RUN_DIR="$RUN_DIR"
         CURRENT_START_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        if [[ "$bench_seed_enabled" -eq 1 ]]; then
+          CURRENT_BENCH_SEED=$(derive_bench_seed "$benchmark_name" "$case_name" "$pam_variant" "$run")
+        else
+          CURRENT_BENCH_SEED=""
+        fi
 
         # STATE_DIR assert: absolute path & no ..
         if [[ "$STATE_DIR" != /* ]]; then
@@ -569,7 +601,7 @@ for model in "${cleaned_models[@]}"; do
         unset ANVIL_NO_REMINDER ANVIL_NO_CASE_RETRIEVAL ANVIL_NO_CASE_RECORD \
               ANVIL_NO_AUTO_TEST ANVIL_NO_TESTER ANVIL_NO_REPO_GRAPH \
               ANVIL_CASE_RECORD_DRY_RUN ANVIL_CASE_RETRIEVAL_DRY_RUN \
-              ANVIL_PAM_ADVISORY_ENABLED
+              ANVIL_PAM_ADVISORY_ENABLED ANVIL_BENCH_SEED
 
         # Build env_kv array from feature flags (bash array, no eval)
         declare -a env_kv=()
@@ -586,6 +618,9 @@ for model in "${cleaned_models[@]}"; do
           env_kv+=("ANVIL_PAM_ADVISORY_ENABLED=true")
         elif [[ "$pam_variant" == "pam_off" ]]; then
           env_kv+=("ANVIL_PAM_ADVISORY_ENABLED=false")
+        fi
+        if [[ -n "$CURRENT_BENCH_SEED" ]]; then
+          env_kv+=("ANVIL_BENCH_SEED=$CURRENT_BENCH_SEED")
         fi
 
         start=$SECONDS
@@ -663,7 +698,7 @@ for model in "${cleaned_models[@]}"; do
 
         # Write run-dir/meta.json so analyze_run.py can read rc/elapsed_s
         if write_meta_json "$rc" "$elapsed" "$model" "$CURRENT_START_TS" "$RUN_DIR" \
-          "$case_name" "$task_kind" "$pam_variant"; then
+          "$case_name" "$task_kind" "$pam_variant" "$CURRENT_BENCH_SEED"; then
           META_WRITTEN=1
         else
           echo "warning: meta.json write failed" >&2
@@ -702,6 +737,7 @@ for model in "${cleaned_models[@]}"; do
 
         CURRENT_RUN_DIR=""
         CURRENT_START_TS=""
+        CURRENT_BENCH_SEED=""
         cd "$REPO_ROOT" || { echo "Error: cd $REPO_ROOT failed" >&2; exit 1; }
       done
     done
