@@ -12,6 +12,9 @@ use super::compact::compact_if_needed;
 use super::feedback::FeedbackState;
 use super::prompt::{PromptToolMode, build_system_prompt};
 
+pub const NO_COMPLETION_WITHOUT_WRITE_FEEDBACK_FLAG: &str =
+    "ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK";
+
 pub trait MinimalChatClient {
     fn chat(
         &mut self,
@@ -43,6 +46,7 @@ pub struct MinimalLoopConfig {
     pub auto_approve: bool,
     pub offline: bool,
     pub cancel_flag: Option<Arc<AtomicBool>>,
+    pub completion_without_write_feedback: bool,
 }
 
 pub fn run_session<C: MinimalChatClient>(
@@ -59,6 +63,8 @@ pub fn run_session<C: MinimalChatClient>(
     let mut feedback_state = FeedbackState::default();
     let mut pending_feedback: Option<String> = None;
     let mut tool_calls_seen = false;
+    let mut write_or_edit_calls_seen = false;
+    let mut completion_without_write_feedback_sent = false;
 
     session
         .messages
@@ -117,7 +123,19 @@ pub fn run_session<C: MinimalChatClient>(
                 pending_feedback = Some(feedback);
                 continue;
             }
-            if !tool_calls_seen
+            if should_send_completion_without_write_feedback(
+                config,
+                write_or_edit_calls_seen,
+                completion_without_write_feedback_sent,
+            ) && let Some(feedback) = feedback_state.completion_without_write()
+            {
+                completion_without_write_feedback_sent = true;
+                pending_feedback = Some(feedback);
+                continue;
+            }
+            if config.mode == ExecutionMode::Act
+                && !tool_calls_seen
+                && !completion_without_write_feedback_sent
                 && let Some(feedback) = feedback_state.missing_tool_call(user_prompt)
             {
                 pending_feedback = Some(feedback);
@@ -142,6 +160,9 @@ pub fn run_session<C: MinimalChatClient>(
         };
 
         for call in tool_calls {
+            if is_write_or_edit_tool(&call.name) {
+                write_or_edit_calls_seen = true;
+            }
             let result = match registry.execute(&call.name, &call.arguments, &tool_context) {
                 Ok(result) => result,
                 Err(err) => {
@@ -163,6 +184,26 @@ pub fn run_session<C: MinimalChatClient>(
         "minimal loop reached max_iterations ({})",
         config.max_iterations
     ))
+}
+
+pub fn completion_without_write_feedback_disabled_from_env() -> bool {
+    std::env::var_os(NO_COMPLETION_WITHOUT_WRITE_FEEDBACK_FLAG)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn should_send_completion_without_write_feedback(
+    config: &MinimalLoopConfig,
+    write_or_edit_calls_seen: bool,
+    completion_without_write_feedback_sent: bool,
+) -> bool {
+    config.mode == ExecutionMode::Act
+        && config.completion_without_write_feedback
+        && !write_or_edit_calls_seen
+        && !completion_without_write_feedback_sent
+}
+
+fn is_write_or_edit_tool(name: &str) -> bool {
+    matches!(name, "Write" | "Edit")
 }
 
 fn build_request_messages(
@@ -326,6 +367,7 @@ mod tests {
             auto_approve: true,
             offline: false,
             cancel_flag: None,
+            completion_without_write_feedback: true,
         }
     }
 
@@ -366,6 +408,7 @@ mod tests {
         let mut client = MockClient::default();
         client.push_err("native tool parser failed: unexpected eof");
         client.push_reply("done after downgrade", Vec::new());
+        client.push_reply("done after downgrade", Vec::new());
         let mut session = SessionSnapshot::default();
 
         let reply = run_session(
@@ -378,12 +421,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(reply, "done after downgrade");
-        assert_eq!(client.native_modes, vec![true, false]);
+        assert_eq!(client.native_modes, vec![true, false, false]);
         assert_eq!(client.tool_counts[1], 0);
         assert!(!client.system_prompts[0].contains("<anvil_tool_call>"));
         assert!(client.system_prompts[1].contains("<anvil_tool_call>"));
-        assert_eq!(client.feedback_messages.len(), 1);
+        assert_eq!(client.feedback_messages.len(), 2);
         assert!(client.feedback_messages[0].contains("<anvil_tool_call>"));
+        assert!(client.feedback_messages[1].contains("No file changes"));
         assert!(session.native_tools_disabled);
     }
 
@@ -442,6 +486,7 @@ mod tests {
             let err = parser_failure_for_type_a_payload(payload);
             client.push_err(&err);
             client.push_reply("done after downgrade", Vec::new());
+            client.push_reply("done after downgrade", Vec::new());
             let mut session = SessionSnapshot::default();
 
             let reply = run_session(
@@ -454,10 +499,11 @@ mod tests {
             .unwrap();
 
             assert_eq!(reply, "done after downgrade");
-            assert_eq!(client.native_modes, vec![true, false]);
+            assert_eq!(client.native_modes, vec![true, false, false]);
             assert_eq!(client.tool_counts[0], 6);
             assert_eq!(client.tool_counts[1], 0);
             assert!(client.feedback_messages[0].contains("<anvil_tool_call>"));
+            assert!(client.feedback_messages[1].contains("No file changes"));
             assert!(session.native_tools_disabled);
         }
     }
@@ -520,5 +566,118 @@ mod tests {
                 .any(|m| m.content.starts_with(MINIMAL_FEEDBACK_PREFIX)),
             "ephemeral feedback must not be persisted to the session"
         );
+    }
+
+    #[test]
+    fn completion_without_write_feedback_then_write_then_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply("I will create README.md.", Vec::new());
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "README.md", "content": "# Demo\n"}),
+            )],
+        );
+        client.push_reply("done", Vec::new());
+        let mut session = SessionSnapshot::default();
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "create README.md",
+            &config(temp.path().to_path_buf(), 4),
+        )
+        .unwrap();
+
+        assert_eq!(reply, "done");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("README.md")).unwrap(),
+            "# Demo\n"
+        );
+        assert_eq!(client.feedback_messages.len(), 1);
+        assert!(client.feedback_messages[0].contains("No file changes"));
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|m| m.content.starts_with(MINIMAL_FEEDBACK_PREFIX)),
+            "ephemeral feedback must not be persisted to the session"
+        );
+    }
+
+    #[test]
+    fn completion_without_write_feedback_accepts_second_no_tool_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply("I will create README.md.", Vec::new());
+        client.push_reply("No file change is needed.", Vec::new());
+        let mut session = SessionSnapshot::default();
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "create README.md",
+            &config(temp.path().to_path_buf(), 4),
+        )
+        .unwrap();
+
+        assert_eq!(reply, "No file change is needed.");
+        assert_eq!(client.feedback_messages.len(), 1);
+        assert!(client.feedback_messages[0].contains("No file changes"));
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|m| m.content.starts_with(MINIMAL_FEEDBACK_PREFIX)),
+            "ephemeral feedback must not be persisted to the session"
+        );
+    }
+
+    #[test]
+    fn completion_without_write_feedback_can_be_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply("Here is the explanation.", Vec::new());
+        let mut session = SessionSnapshot::default();
+        let mut cfg = config(temp.path().to_path_buf(), 4);
+        cfg.completion_without_write_feedback = false;
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "explain this repository",
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(reply, "Here is the explanation.");
+        assert!(client.feedback_messages.is_empty());
+    }
+
+    #[test]
+    fn completion_without_write_feedback_does_not_fire_in_plan_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply("Plan: create README.md after review.", Vec::new());
+        let mut session = SessionSnapshot::default();
+        let mut cfg = config(temp.path().to_path_buf(), 4);
+        cfg.mode = ExecutionMode::Plan;
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "create README.md",
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(reply, "Plan: create README.md after review.");
+        assert!(client.feedback_messages.is_empty());
     }
 }
