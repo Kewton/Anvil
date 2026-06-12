@@ -6,7 +6,7 @@
 #   * summary.tsv row count and column order match
 #   * --pam-ab expands the same prompt suite into pam_on/pam_off variants
 #   * run-dir contains session.json, meta.json, logs/llm-io.jsonl
-#   * meta.json "rc" and "elapsed_s" are numeric
+#   * meta.json "rc", "elapsed_s", and bench seed fields are valid
 
 set -euo pipefail
 
@@ -47,7 +47,7 @@ uuid="00000000-0000-4000-8000-000000000001"
 session_dir="$state_dir/sessions/$uuid"
 mkdir -p "$session_dir/logs"
 cat > "$session_dir/session.json" <<JSON
-{"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
+{"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","seed":"${ANVIL_BENCH_SEED:-unset}","messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
 JSON
 echo '{"ts_ms":1,"event":"ollama.generate.start","payload":{}}' \
   > "$session_dir/logs/llm-io.jsonl"
@@ -131,6 +131,19 @@ for case_name in docs data; do
       cat "$run_dir/session.json" >&2
       exit 1
     }
+    seed_val=$(jq -r '.bench_seed' "$run_dir/meta.json")
+    seed_enabled=$(jq -r '.bench_seed_enabled' "$run_dir/meta.json")
+    if ! [[ "$seed_val" =~ ^[0-9]+$ && "$seed_enabled" == "true" ]]; then
+      echo "FAIL: meta.json bench_seed invalid in $run_dir/meta.json" >&2
+      cat "$run_dir/meta.json" >&2
+      exit 1
+    fi
+    jq -e --arg seed "$seed_val" '.seed == $seed' "$run_dir/session.json" >/dev/null || {
+      echo "FAIL: ANVIL_BENCH_SEED env mismatch in $run_dir/session.json" >&2
+      cat "$run_dir/session.json" >&2
+      cat "$run_dir/meta.json" >&2
+      exit 1
+    }
   done
 done
 
@@ -154,6 +167,28 @@ if ! [[ "$elapsed_val" =~ ^[0-9]+$ ]]; then
   echo "FAIL: meta.json elapsed_s is not numeric: $elapsed_val" >&2
   exit 1
 fi
+
+# Seed injection can be disabled for ablation.
+bash scripts/bench.sh bench-smoke-fixture --model "smoke-model" --runs 1 --no-bench-seed \
+  > "$tmp/bench-no-seed.stdout" 2> "$tmp/bench-no-seed.stderr" || {
+  echo "FAIL: bench.sh --no-bench-seed non-zero exit" >&2
+  cat "$tmp/bench-no-seed.stderr" >&2
+  exit 1
+}
+BENCH_ROOT_NO_SEED=$(awk '/^Done\. Results: / { sub(/^Done\. Results: /, ""); sub(/\/summary\.tsv$/, ""); print }' \
+  "$tmp/bench-no-seed.stdout")
+no_seed_run_dir="$BENCH_ROOT_NO_SEED/smoke-model/docs/default/run-1"
+jq -e '.bench_seed == null and .bench_seed_enabled == false' "$no_seed_run_dir/meta.json" >/dev/null || {
+  echo "FAIL: --no-bench-seed meta.json mismatch" >&2
+  cat "$no_seed_run_dir/meta.json" >&2
+  exit 1
+}
+jq -e '.seed == "unset"' "$no_seed_run_dir/session.json" >/dev/null || {
+  echo "FAIL: --no-bench-seed env leaked into fake anvil" >&2
+  cat "$no_seed_run_dir/session.json" >&2
+  exit 1
+}
+rm -rf "$BENCH_ROOT_NO_SEED"
 
 # Optional: analyze_run.py should succeed on the produced run-dir
 if command -v python3 >/dev/null 2>&1; then
