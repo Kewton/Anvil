@@ -153,7 +153,7 @@ suite/PAM run の場合は以下の入れ子 layout もサポートする。
 - 入力パスは `Path.resolve(strict=True)` 後に top-level symlink を拒否
 - `scripts/analyze_run.py` は compare.py と同一 repo の regular file のみ許可
 - `subprocess.run` 呼び出しは `shell=False`、`PYTHONPATH` 等を遮断した env、`-I` で isolated mode
-- `run-*` は `MAX_RUNS = 100` で上限、超過は exit 1
+- `run-*` は `MAX_RUNS = 500` で上限、超過は exit 1
 - `os.umask(0o077)` を `main` の先頭で設定
 
 ## 8. バージョン管理

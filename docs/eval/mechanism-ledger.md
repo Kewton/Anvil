@@ -1,61 +1,69 @@
-# Minimal Loop Mechanism Ledger
+# Mechanism Ledger
 
-This ledger records admitted minimal-loop mechanisms so Phase 3 additions stay
-small, measured, and reversible.
+This ledger records every mechanism admitted into `minimal_loop`. It is intended
+to make growth visible: each new feedback, guard, recovery path, or prompt
+addition must have a measured reason, an off flag, and a current audit status.
 
-## M001: completion-without-write feedback
+## Entries
 
-Status: admitted (2026-06-12)
+| id | mechanism | status | admitted by | final audit date |
+|---|---|---|---|---|
+| M001 | completion-without-write feedback | admitted | #1036 | 2026-06-12 |
 
-Introduced by: `#1036`
+## M001: Completion-Without-Write Feedback
 
-Final audit date: 2026-06-12
-
-Admission report:
-[Minimal Loop Phase 3 Cycle 1 Evaluation](minimal-loop-phase3-cycle1-evaluation-20260612.md)
-
-Target scenarios:
-
-- `new-python-csv-small`
-- `fix-rust-parser-error`
-- `fix-readme-command`
-- `fix-python-slugify`
-
-Mechanism:
-
-- Trigger once per session when the model returns a no-tool completion before
-  any `Write` or `Edit` has executed.
-- Inject a neutral user-role ephemeral feedback asking the model to create or
-  modify files if the task requires it, or finish if no file change is needed.
-- Accept the next no-tool completion to prevent loops.
+| field | value |
+|---|---|
+| mechanism | completion-without-write feedback |
+| PR | #1036 |
+| status | admitted |
+| trigger | Act-mode no-tool completion while session has observed zero `Write`/`Edit` calls |
+| action | Inject one user-role ephemeral feedback message; accept the second no-tool response |
+| target scenarios | `new-python-csv-small`, `fix-rust-parser-error`, `fix-readme-command`, `fix-python-slugify` |
+| injection size | 196 chars, 35 whitespace words, approximately 61 minimal-loop tokens |
+| off flag | `ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK=1` |
+| bench option | `--no-minimal-completion-without-write-feedback` |
+| admission model | `qwen3.6:27b-coding-nvfp4` |
+| admission benchmark | `minimal-loop-expanded`, 25 scenarios x 5 runs |
+| admission report | [minimal-loop-t2-4-task15-feedback-rerun-20260612.md](minimal-loop-t2-4-task15-feedback-rerun-20260612.md) |
+| baseline report | [minimal-loop-t2-4-recheck-20260612.md](minimal-loop-t2-4-recheck-20260612.md) |
+| final audit date | 2026-06-12 |
 
 Admission result:
 
-- Target set improved from 7/20 to 17/20 in the Task15 real rerun.
-- Final Task18 recheck baseline: minimal+M001 83/125 vs legacy-lite 71/125.
-- Elapsed mean remained faster: 38.5 sec vs 66.6 sec.
+| metric | before | after | delta |
+|---|---:|---:|---:|
+| overall minimal success | 69/125 | 80/125 | +11 |
+| target scenarios total | 7/20 | 17/20 | +10 |
+| legacy-lite reference | 66/125 | 66/125 | n/a |
+| minimal elapsed mean | 28.9 sec | 38.5 sec | +9.6 sec |
 
-Re-audit reservation:
+Final Task18 recheck baseline:
 
-- The admission measurement above includes possible confounding from the
-  [blocked-mkdir trap](triage/blocked-mkdir-trap.md).
-- At admission time, the environment allowed a failure path where M001 fired,
-  the model tried `Bash mkdir`, offline policy blocked it, and the session did
-  not recover to `Write`.
-- After `#1045` and `#1046`, M001's marginal contribution may change. Re-run
-  M001 on/off ablation in the next full matrix, planned as Task26, and record
-  the pure contribution even if it shrinks.
+| metric | value |
+|---|---:|
+| minimal+M001 success | 83/125 |
+| legacy-lite reference | 71/125 |
+| minimal elapsed mean | 38.5 sec |
+| legacy-lite elapsed mean | 66.6 sec |
 
-Configuration:
+Audit notes:
 
-- Off flag: `ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK=1`
-- Admission model: `qwen3.6:27b-coding-nvfp4`
-- Injected text: 210 characters, 38 whitespace-delimited words. The token count
-  is tokenizer-dependent; this is treated as a small one-message injection.
-
-Open watchlist:
-
-- `multi-file-rust-library`: one-run regression while feedback fired in all
-  runs; currently within n=5 noise.
-- `fix-js-date-helper`, `new-python-csv-small`, `non-coding-runbook`: remaining
-  losses require separate triage before any M002 admission.
+- The mechanism passed the primary admission criterion: all four target
+  no-edit-loop scenarios improved.
+- `scaffold-fastapi-service` regressed from 5/5 to 1/5, but the mechanism did
+  not fire in that scenario's runs, so current evidence does not support a
+  direct causal link.
+- `multi-file-rust-library` regressed from 5/5 to 4/5 and feedback fired in all
+  five runs; this remains the only watchlist item with plausible mechanism
+  involvement, but the observed delta is one run at n=5.
+- The admission measurement includes possible confounding from the
+  [blocked-mkdir trap](triage/blocked-mkdir-trap.md). At admission time, the
+  environment allowed a failure path where M001 fired, the model tried
+  `Bash mkdir`, offline policy blocked it, and the session did not recover to
+  `Write`.
+- After #1045 and #1046, M001's marginal contribution may change. Re-run M001
+  on/off ablation in the next full matrix, planned as Task26, and record the
+  pure contribution even if it shrinks.
+- Future reviews should compare against this ledger before admitting another
+  feedback or recovery mechanism.

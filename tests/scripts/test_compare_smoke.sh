@@ -22,11 +22,12 @@ trap 'rm -rf "$tmp"' EXIT
 SLUG="smoke-model"
 
 build_run() {
-  # $1=run-dir, $2=rc, $3=elapsed_s, $4=run_id, $5=iter_count
+  # $1=run-dir, $2=rc, $3=elapsed_s, $4=run_id, $5=iter_count, $6=engine
   local dir="$1" rc="$2" elapsed="$3" rid="$4" iters="$5"
+  local engine="${6:-legacy}"
   mkdir -p "$dir"
   cat > "$dir/meta.json" <<EOF
-{"rc": $rc, "elapsed_s": $elapsed, "model": "$SLUG", "start_ts": "2026-01-01T00:00:00Z"}
+{"rc": $rc, "elapsed_s": $elapsed, "model": "$SLUG", "engine": "$engine", "start_ts": "2026-01-01T00:00:00Z"}
 EOF
   python3 - "$dir/session.json" "$rid" "$iters" <<'PY'
 import json, sys
@@ -90,7 +91,34 @@ assert data["schema_version"] == 1, data
 assert data["model_slug"] == slug, data
 assert "metrics" in data and isinstance(data["metrics"], dict), data
 assert "rc" in data["metrics"], data
+assert "failure_categories" in data, data
 print("json validated")
+PY
+
+# --- engine mode ---
+engine_root="$tmp/engine-root"
+build_run "$engine_root/$SLUG/legacy/docs/default/run-1" 0 120 "el1" 10 legacy
+build_run "$engine_root/$SLUG/legacy/docs/default/run-2" 0 130 "el2" 11 legacy
+build_run "$engine_root/$SLUG/legacy/docs/default/run-3" 1 125 "el3" 9 legacy
+build_run "$engine_root/$SLUG/minimal/docs/default/run-1" 0 100 "em1" 8 minimal
+build_run "$engine_root/$SLUG/minimal/docs/default/run-2" 0 110 "em2" 9 minimal
+build_run "$engine_root/$SLUG/minimal/docs/default/run-3" 0 105 "em3" 7 minimal
+
+engine_json="$tmp/engine.json"
+if ! COMPARE_NOW=2026-01-01T00:00:00Z \
+  python3 "$SCRIPT" --format json --engines legacy,minimal "$engine_root" > "$engine_json" 2> "$tmp/engine.err"; then
+  echo "FAIL: compare.py engine mode exit non-zero" >&2
+  cat "$tmp/engine.err" >&2
+  exit 1
+fi
+python3 - "$engine_json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+assert data["model_slug"].endswith(":legacy->minimal"), data
+assert "rc" in data["metrics"], data
+assert "failure_categories" in data, data
+print("engine json validated")
 PY
 
 echo "PASS: compare.py smoke test"

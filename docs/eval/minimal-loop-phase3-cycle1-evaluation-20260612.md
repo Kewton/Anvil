@@ -1,10 +1,10 @@
 # Minimal Loop Phase 3 Cycle 1 Evaluation
 
 - Date: 2026-06-12 JST
-- Branch recorded on: `develop`
 - Benchmark: `minimal-loop-expanded`
 - Model: `qwen3.6:27b-coding-nvfp4`
 - Mechanism under admission: completion-without-write feedback (#1036)
+- Current mechanism ledger entry: [mechanism-ledger.md](mechanism-ledger.md)
 
 ## Executive Summary
 
@@ -22,12 +22,22 @@ Minimal with the admitted mechanism is +12 runs over legacy-lite and remains
 1.7x faster on elapsed mean. The main admission target set improved from 7/20
 to 17/20 in the actual Task15 rerun.
 
-This does not prove that all +15 runs over the fixed-binary minimal baseline
-come from the mechanism. The non-fired-run variance analysis showed substantial
-run-to-run movement. It does show that the mechanism clears the admission bar
+The result is not proof that all +15 runs over the fixed-binary minimal baseline
+come from the mechanism. The non-fired-run variance analysis shows substantial
+run-to-run movement. It is proof that the mechanism clears the admission bar
 under the current benchmark discipline and should remain enabled by default.
 
-## Source Runs
+## Data Sources
+
+| document | role |
+|---|---|
+| [minimal-loop-t2-4-recheck-20260612.md](minimal-loop-t2-4-recheck-20260612.md) | Task14 check-only baseline before Task15 |
+| [minimal-loop-t2-4-task15-feedback-rerun-20260612.md](minimal-loop-t2-4-task15-feedback-rerun-20260612.md) | GPU/Ollama Task15 rerun with the feedback mechanism enabled |
+| [t2-4-run-variance.md](t2-4-run-variance.md) | GPU-free estimate of run-to-run variance from Task15 non-fired runs |
+| [minimal-loop-t2-4-task18-recheck-20260612.md](minimal-loop-t2-4-task18-recheck-20260612.md) | Final post-hoc recheck after check false-negative fixes |
+| [mechanism-ledger.md](mechanism-ledger.md) | Admission ledger for mechanism M001 |
+
+## What Was Re-run
 
 Task15 was a real GPU/Ollama benchmark run:
 
@@ -92,26 +102,27 @@ The following table uses the Task18 recheck as the current baseline.
 | `scaffold-next-dashboard` | 0/5 | 1/5 | 1/5 | +1 |
 | `scaffold-rust-cli` | 0/5 | 0/5 | 0/5 | +0 |
 
-## Confirmed Findings
+## Interpretation
+
+### Confirmed
 
 - The admitted mechanism directly addresses the observed no-edit-loop failure
-  class and moved the target set by +10 runs in the real Task15 rerun.
+  class and moves the target set by +10 runs in the real Task15 rerun.
 - The current headline comparison is 83/125 minimal vs 71/125 legacy-lite.
 - The speed advantage remains material: 38.5 sec vs 66.6 sec elapsed mean.
 - The mechanism is small, deterministic, and has an explicit off flag:
   `ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK=1`.
 
-## Limits Of Interpretation
+### Not Confirmed
 
-- The full aggregate gain cannot be attributed only to the mechanism. In the
-  non-fired subset, Task15 runs where feedback did not fire still moved from
-  42/77 to 57/77.
+- The full aggregate gain cannot be attributed only to the mechanism. In Task17,
+  Task15 runs where feedback did not fire still moved from 42/77 to 57/77.
 - Single-scenario n=5 swings are not reliable causal evidence. Treat +/-2 runs
   as ordinary noise and +/-3 or larger as a triage trigger.
 - `scaffold-fastapi-service` is not evidence against the mechanism: it regressed
   from 5/5 to 1/5, but feedback did not fire in any of those five runs.
 
-## Watchlist
+### Watchlist
 
 | item | status | next action |
 |---|---|---|

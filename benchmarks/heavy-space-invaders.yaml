@@ -20,3 +20,11 @@ args:
   max_iterations: 40
   chat_retries: 2
   sidecar_model: qwen3.5:9b
+success_check:
+  files:
+    - path: src/components/SpaceInvaders.tsx
+      min_lines: 120
+    - path: src/app/page.tsx
+  commands:
+    - test -f src/components/SpaceInvaders.tsx
+    - grep -R "SpaceInvaders" src/app/page.tsx

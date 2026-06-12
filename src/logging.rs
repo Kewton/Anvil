@@ -9,9 +9,79 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::LogLevel;
 use crate::session::feedback::mask_secrets;
+use crate::session::store::ConversationMessage;
 
 static LLM_IO_LOGGER: OnceLock<Mutex<File>> = OnceLock::new();
 static LLM_IO_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+pub const LLM_IO_PROMPT_SCHEMA_VERSION: u64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PromptLogMetrics {
+    pub schema_version: u64,
+    pub final_prompt: String,
+    pub prompt_char_count: usize,
+    pub approx_prompt_tokens: usize,
+    pub injection_blocks: Vec<PromptInjectionBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PromptInjectionBlock {
+    pub index: usize,
+    pub kind: String,
+    pub role: String,
+    pub name: Option<String>,
+    pub char_count: usize,
+    pub approx_tokens: usize,
+    pub tool_call_count: usize,
+}
+
+pub fn build_prompt_log_metrics(
+    messages: &[ConversationMessage],
+    final_prompt: String,
+) -> PromptLogMetrics {
+    let prompt_char_count = final_prompt.chars().count();
+    let injection_blocks = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| PromptInjectionBlock {
+            index,
+            kind: prompt_block_kind(index, message).to_string(),
+            role: message.role.clone(),
+            name: message.name.clone(),
+            char_count: message.content.chars().count(),
+            approx_tokens: approximate_message_tokens(message),
+            tool_call_count: message.tool_calls.len(),
+        })
+        .collect();
+
+    PromptLogMetrics {
+        schema_version: LLM_IO_PROMPT_SCHEMA_VERSION,
+        final_prompt,
+        prompt_char_count,
+        approx_prompt_tokens: approximate_text_tokens(prompt_char_count),
+        injection_blocks,
+    }
+}
+
+fn prompt_block_kind(index: usize, message: &ConversationMessage) -> &'static str {
+    match message.role.as_str() {
+        "system" if index == 0 => "system_prompt",
+        "system" => "system_injection",
+        "user" => "user_message",
+        "assistant" => "assistant_history",
+        "tool" => "tool_result",
+        _ => "message",
+    }
+}
+
+fn approximate_message_tokens(message: &ConversationMessage) -> usize {
+    approximate_text_tokens(message.content.chars().count()) + message.tool_calls.len() * 32 + 12
+}
+
+fn approximate_text_tokens(char_count: usize) -> usize {
+    char_count.div_ceil(4)
+}
 
 pub fn init_logging(log_level: LogLevel, log_path: &Path) -> Result<(), String> {
     let directive = log_level.env_filter();

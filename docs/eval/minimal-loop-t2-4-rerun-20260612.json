@@ -1,0 +1,159 @@
+{
+  "date_jst": "2026-06-12",
+  "model": "qwen3.6:27b-coding-nvfp4",
+  "benchmark": "minimal-loop-expanded",
+  "conditions": [
+    "--max-iterations 12",
+    "--no-auto-test",
+    "--no-precautions",
+    "--no-case-memory",
+    "--bench-no-debug"
+  ],
+  "merged_fixes": [
+    {
+      "pr": 1021,
+      "title": "Restore minimal loop XML fallback downgrade",
+      "merge_commit": "e0813d824c8befb898ce528e20c08c10e477e40d"
+    },
+    {
+      "pr": 1022,
+      "title": "Salvage XML tool content in native replies",
+      "merge_commit": "767f7836470231362f134f13d21d91fd53b84a02"
+    }
+  ],
+  "roots": {
+    "legacy_source": ".anvil/benchmarks/20260612T024532-70925",
+    "minimal_source": ".anvil/benchmarks/20260612T105012-57478",
+    "combined": ".anvil/benchmarks/20260612T105012-combined-t2-4-rerun"
+  },
+  "row_summary": {
+    "legacy_initial": {
+      "rows": 125,
+      "rc0": 125,
+      "rc_nonzero": 0,
+      "success_check_ok": 46,
+      "success_check_ng": 79,
+      "success_check_null": 0,
+      "elapsed_total_sec": 8319
+    },
+    "minimal_initial": {
+      "rows": 125,
+      "rc0": 95,
+      "rc_nonzero": 30,
+      "success_check_ok": 35,
+      "success_check_ng": 60,
+      "success_check_null": 30,
+      "elapsed_total_sec": 6905
+    },
+    "minimal_rerun": {
+      "rows": 125,
+      "rc0": 96,
+      "rc_nonzero": 29,
+      "success_check_ok": 37,
+      "success_check_ng": 59,
+      "success_check_null": 29,
+      "elapsed_total_sec": 7779
+    }
+  },
+  "scenario_summary_minimal_rerun": [
+    {"scenario": "fix-css-token-doc", "rc0": 5, "rc_nonzero": 0, "success_ok": 4, "success_ng": 1, "success_null": 0},
+    {"scenario": "fix-js-date-helper", "rc0": 4, "rc_nonzero": 1, "success_ok": 0, "success_ng": 4, "success_null": 1},
+    {"scenario": "fix-json-normalizer", "rc0": 5, "rc_nonzero": 0, "success_ok": 0, "success_ng": 5, "success_null": 0},
+    {"scenario": "fix-python-retry-policy", "rc0": 2, "rc_nonzero": 3, "success_ok": 2, "success_ng": 0, "success_null": 3},
+    {"scenario": "fix-python-slugify", "rc0": 3, "rc_nonzero": 2, "success_ok": 3, "success_ng": 0, "success_null": 2},
+    {"scenario": "fix-readme-command", "rc0": 4, "rc_nonzero": 1, "success_ok": 3, "success_ng": 1, "success_null": 1},
+    {"scenario": "fix-rust-parser-error", "rc0": 3, "rc_nonzero": 2, "success_ok": 1, "success_ng": 2, "success_null": 2},
+    {"scenario": "fix-shell-safe-clean", "rc0": 3, "rc_nonzero": 2, "success_ok": 1, "success_ng": 2, "success_null": 2},
+    {"scenario": "long-session-data-report", "rc0": 5, "rc_nonzero": 0, "success_ok": 0, "success_ng": 5, "success_null": 0},
+    {"scenario": "long-session-large-component", "rc0": 5, "rc_nonzero": 0, "success_ok": 1, "success_ng": 4, "success_null": 0},
+    {"scenario": "long-session-read-edit", "rc0": 5, "rc_nonzero": 0, "success_ok": 1, "success_ng": 4, "success_null": 0},
+    {"scenario": "multi-file-docs-and-examples", "rc0": 5, "rc_nonzero": 0, "success_ok": 5, "success_ng": 0, "success_null": 0},
+    {"scenario": "multi-file-node-package", "rc0": 2, "rc_nonzero": 3, "success_ok": 1, "success_ng": 1, "success_null": 3},
+    {"scenario": "multi-file-python-package", "rc0": 4, "rc_nonzero": 1, "success_ok": 3, "success_ng": 1, "success_null": 1},
+    {"scenario": "multi-file-rust-library", "rc0": 5, "rc_nonzero": 0, "success_ok": 0, "success_ng": 5, "success_null": 0},
+    {"scenario": "new-large-react-kanban", "rc0": 5, "rc_nonzero": 0, "success_ok": 5, "success_ng": 0, "success_null": 0},
+    {"scenario": "new-markdown-release-notes", "rc0": 5, "rc_nonzero": 0, "success_ok": 5, "success_ng": 0, "success_null": 0},
+    {"scenario": "new-python-csv-small", "rc0": 0, "rc_nonzero": 5, "success_ok": 0, "success_ng": 0, "success_null": 5},
+    {"scenario": "new-rust-cli-small", "rc0": 5, "rc_nonzero": 0, "success_ok": 0, "success_ng": 5, "success_null": 0},
+    {"scenario": "new-typescript-formatter", "rc0": 2, "rc_nonzero": 3, "success_ok": 0, "success_ng": 2, "success_null": 3},
+    {"scenario": "non-coding-research-brief", "rc0": 0, "rc_nonzero": 5, "success_ok": 0, "success_ng": 0, "success_null": 5},
+    {"scenario": "non-coding-runbook", "rc0": 4, "rc_nonzero": 1, "success_ok": 2, "success_ng": 2, "success_null": 1},
+    {"scenario": "scaffold-fastapi-service", "rc0": 5, "rc_nonzero": 0, "success_ok": 0, "success_ng": 5, "success_null": 0},
+    {"scenario": "scaffold-next-dashboard", "rc0": 5, "rc_nonzero": 0, "success_ok": 0, "success_ng": 5, "success_null": 0},
+    {"scenario": "scaffold-rust-cli", "rc0": 5, "rc_nonzero": 0, "success_ok": 0, "success_ng": 5, "success_null": 0}
+  ],
+  "compare": {
+    "schema_version": 1,
+    "model_slug": "qwen3.6-27b-coding-nvfp4:legacy->minimal",
+    "generated_at": "2026-06-12T04:05:20Z",
+    "threshold": 0.05,
+    "metrics": {
+      "elapsed_s": {
+        "baseline": {"mean": 66.552, "ci_low": 50.69101025189079, "ci_high": 82.41298974810923, "n": 125},
+        "experiment": {"mean": 62.232, "ci_low": 45.984021597282506, "ci_high": 78.47997840271749, "n": 125},
+        "delta": -4.320000000000007,
+        "delta_pct": -0.06491164803461966,
+        "verdict": "improved"
+      },
+      "error_500_count": {
+        "baseline": {"mean": 0.0, "ci_low": 0.0, "ci_high": 0.0, "n": 125},
+        "experiment": {"mean": 0.0, "ci_low": 0.0, "ci_high": 0.0, "n": 125},
+        "delta": 0.0,
+        "delta_pct": null,
+        "verdict": "unchanged"
+      },
+      "iter_count": {
+        "baseline": {"mean": 2.712, "ci_low": 2.468296016260869, "ci_high": 2.9557039837391312, "n": 125},
+        "experiment": {"mean": 4.020833333333333, "ci_low": 3.6594981003642864, "ci_high": 4.38216856630238, "n": 96},
+        "delta": 1.3088333333333328,
+        "delta_pct": 0.4826081612586035,
+        "verdict": "regressed"
+      },
+      "page_tsx_has_game_keywords": {
+        "baseline": {"mean": 0.0, "ci_low": 0.0, "ci_high": 0.43449149475208104, "n": 5},
+        "experiment": {"mean": 0.0, "ci_low": 0.0, "ci_high": 0.48990002040399916, "n": 4},
+        "delta": 0.0,
+        "delta_pct": null,
+        "verdict": "unchanged"
+      },
+      "postcheck_success": {
+        "baseline": {"mean": 0.248, "ci_low": 0.18056639010525916, "ci_high": 0.3304611041202084, "n": 125},
+        "experiment": {"mean": 0.16, "ci_low": 0.10602751316968752, "ci_high": 0.23424767745197506, "n": 125},
+        "delta": -0.088,
+        "delta_pct": null,
+        "verdict": "regressed"
+      },
+      "rc": {
+        "baseline": {"mean": 1.0, "ci_low": 0.9701835432034374, "ci_high": 1.0, "n": 125},
+        "experiment": {"mean": 0.768, "ci_low": 0.6866850458237092, "ci_high": 0.8333333333333334, "n": 125},
+        "delta": -0.23199999999999998,
+        "delta_pct": null,
+        "verdict": "regressed"
+      },
+      "we_total": {
+        "baseline": {"mean": 1.752, "ci_low": 1.5423671751878785, "ci_high": 1.9616328248121215, "n": 125},
+        "experiment": {"mean": 1.008, "ci_low": 0.7615855488108729, "ci_high": 1.254414451189127, "n": 125},
+        "delta": -0.744,
+        "delta_pct": null,
+        "verdict": "informational"
+      }
+    },
+    "failure_categories": {
+      "baseline": {
+        "completed": 60,
+        "control_loop_exhausted": 6,
+        "missing_deliverable": 40,
+        "missing_evidence": 19
+      },
+      "experiment": {
+        "completed": 96,
+        "failed": 29
+      }
+    }
+  },
+  "log_observations": {
+    "parser_failure_text_occurrences": 352,
+    "native_xml_salvage_activations": 0
+  },
+  "assessment": "The parser fixes are merged, but the expected large recovery did not appear. Minimal remains worse than legacy on rc, postcheck_success, and iter_count, and the previously critical new-python-csv-small and non-coding-research-brief scenarios remain 0/5 on rc."
+}

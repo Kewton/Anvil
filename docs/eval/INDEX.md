@@ -1,13 +1,36 @@
 # Evaluation Index
 
-## Minimal Loop
+## Current Baselines
 
+- [Task15 feedback rerun](minimal-loop-t2-4-task15-feedback-rerun-20260612.md):
+  first admitted Phase 3 mechanism, minimal 80/125.
+- [Task15 non-fired run variance](t2-4-run-variance.md):
+  GPU-free estimate of scenario-level run-to-run variance.
+- [Task18 recheck](minimal-loop-t2-4-task18-recheck-20260612.md):
+  updated baseline after the remaining check false-negative fixes.
 - [Phase 3 cycle 1 evaluation](minimal-loop-phase3-cycle1-evaluation-20260612.md):
-  admission decision and current baseline for the first admitted minimal-loop
-  mechanism.
-- [Mechanism ledger](mechanism-ledger.md): admitted minimal-loop mechanisms and
-  watchlist.
-- [Cycle 2 loss triage](triage/cycle2-loss-triage.md): residual losses after
-  M001 admission.
-- [Blocked mkdir trap triage](triage/blocked-mkdir-trap.md): investigation and
-  tool-affordance fix for the dominant offline Bash block.
+  admission decision and current baseline for the first admitted mechanism.
+- [Task14 recheck baseline](minimal-loop-t2-4-recheck-20260612.md):
+  check-only baseline before Task15, minimal 69/125 and legacy-lite 66/125.
+- [Mechanism ledger](mechanism-ledger.md):
+  admitted minimal-loop mechanisms and audit status.
+- [Blocked mkdir trap triage](triage/blocked-mkdir-trap.md):
+  tool-affordance mismatch behind many offline Bash `mkdir` blocks.
+
+## T2-4 Reports
+
+- [llm-io schema](llm-io-schema.md)
+- [Initial T2-4 comparison](minimal-loop-t2-4-20260612.md)
+- [Parser-fix rerun](minimal-loop-t2-4-rerun-20260612.md)
+- [Task14 recheck baseline](minimal-loop-t2-4-recheck-20260612.md)
+- [Task15 feedback rerun](minimal-loop-t2-4-task15-feedback-rerun-20260612.md)
+- [Task15 non-fired run variance](t2-4-run-variance.md)
+- [Task18 recheck](minimal-loop-t2-4-task18-recheck-20260612.md)
+- [Phase 3 cycle 1 evaluation](minimal-loop-phase3-cycle1-evaluation-20260612.md)
+
+## Triage
+
+- [Parser contamination triage](triage/t2-4-parser-contamination.md)
+- [Parser feedback loop deepdive](triage/t2-4-parser-feedback-loop-deepdive-20260612.md)
+- [Cycle 2 loss triage](triage/cycle2-loss-triage.md)
+- [Blocked mkdir trap triage](triage/blocked-mkdir-trap.md)
