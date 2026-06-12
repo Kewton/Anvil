@@ -390,6 +390,36 @@ write_meta_json() {
     > "$_run_dir/meta.json"
 }
 
+summary_extras_from_meta_json() {
+  local _run_dir="$1"
+  local _meta="$_run_dir/meta.json"
+  if [[ ! -f "$_meta" || -L "$_meta" ]] || ! command -v jq &>/dev/null; then
+    printf 'null'
+    return 0
+  fi
+  jq -c 'if type == "object" then {
+    anvil_score: null,
+    task_kind: (.task_kind // null),
+    pam_variant: (.pam_variant // null),
+    postcheck_success: (
+      if (.success_check_success | type) == "boolean" then .success_check_success
+      elif (.postcheck_success | type) == "boolean" then .postcheck_success
+      else null end
+    ),
+    postcheck_reason: (.success_check_reason // .postcheck_reason // null),
+    success_check_success: (
+      if (.success_check_success | type) == "boolean" then .success_check_success
+      else null end
+    ),
+    success_check_reason: (.success_check_reason // null),
+    engine: (.engine // null),
+    tool_call_count: null,
+    failure_kind: null,
+    token_prompt: null,
+    token_completion: null
+  } else null end' "$_meta" 2>/dev/null || printf 'null'
+}
+
 validate_engine() {
   local e="$1"
   case "$e" in
@@ -931,13 +961,13 @@ for model in "${cleaned_models[@]}"; do
         # -------- analyze_run.py per-cell invocation (DR2-002, DR4-001) --------
         # Absolute path + symlink check (DR4-001: prevent hijack from benchmark workdir)
         ANALYZE_RUN="$REPO_ROOT/scripts/analyze_run.py"
-        extras_json="null"
+        extras_json=$(summary_extras_from_meta_json "$RUN_DIR")
         if [[ -f "$ANALYZE_RUN" && ! -L "$ANALYZE_RUN" ]] && command -v python3 &>/dev/null; then
           # python3 -I: isolated mode (no PYTHONPATH/sitecustomize from environment)
           raw_json=$(python3 -I "$ANALYZE_RUN" "$RUN_DIR" 2>/dev/null || echo "null")
           # jq -c: compact JSON + validate + whitelist fields (DR4-003: TSV/Markdown injection)
           if command -v jq &>/dev/null; then
-            extras_json=$(printf '%s' "$raw_json" | jq -c '{
+            analyzed_extras_json=$(printf '%s' "$raw_json" | jq -c 'select(type == "object") | {
               anvil_score: .anvil_score,
               task_kind: .task_kind,
               pam_variant: .pam_variant,
@@ -950,9 +980,10 @@ for model in "${cleaned_models[@]}"; do
               failure_kind: .failure_kind,
               token_prompt: .token_prompt,
               token_completion: .token_completion
-            }' 2>/dev/null || echo "null")
-          else
-            extras_json="null"
+            }' 2>/dev/null || true)
+            if [[ -n "$analyzed_extras_json" && "$analyzed_extras_json" != "null" ]]; then
+              extras_json="$analyzed_extras_json"
+            fi
           fi
         fi
 

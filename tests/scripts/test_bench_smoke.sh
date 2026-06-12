@@ -34,6 +34,7 @@ cat > "$fake_anvil" <<'EOF'
 set -euo pipefail
 state_dir=""
 engine="legacy"
+prompt=""
 prev=""
 for arg in "$@"; do
   if [[ "$prev" == "--state-dir" ]]; then
@@ -42,11 +43,19 @@ for arg in "$@"; do
   if [[ "$prev" == "--engine" ]]; then
     engine="$arg"
   fi
+  if [[ "$prev" == "--prompt" ]]; then
+    prompt="$arg"
+  fi
   prev="$arg"
 done
 if [[ -z "$state_dir" ]]; then
   echo "fake anvil: --state-dir missing" >&2
   exit 1
+fi
+printf 'ok\n' > result.txt
+if [[ "$prompt" == *"exit after artifact without session"* ]]; then
+  echo "fake anvil: crash after artifact" >&2
+  exit 7
 fi
 uuid="00000000-0000-4000-8000-000000000001"
 session_dir="$state_dir/sessions/$uuid"
@@ -54,7 +63,6 @@ mkdir -p "$session_dir/logs"
 cat > "$session_dir/session.json" <<JSON
 {"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","engine":"$engine","messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
 JSON
-printf 'ok\n' > result.txt
 echo '{"ts_ms":1,"event":"ollama.generate.start","payload":{}}' \
   > "$session_dir/logs/llm-io.jsonl"
 echo '{"schema_version":1,"session_id":"fake","final_outcome":"done","pam_eval":{"advisory_only":true}}' \
@@ -82,6 +90,8 @@ cases:
     prompt: update README copy
   - name: data
     prompt: transform CSV rows
+  - name: crash
+    prompt: exit after artifact without session
 EOF
 trap 'rm -rf "$tmp"; rm -f "$bench_yaml"' EXIT
 
@@ -121,8 +131,8 @@ if [[ "$header" != "$expected_header" ]]; then
 fi
 
 rows=$(($(wc -l < "$summary") - 1))
-if [[ "$rows" -ne 8 ]]; then
-  echo "FAIL: expected 8 data rows, got $rows" >&2
+if [[ "$rows" -ne 12 ]]; then
+  echo "FAIL: expected 12 data rows, got $rows" >&2
   exit 1
 fi
 
@@ -174,12 +184,52 @@ run_dir="$BENCH_ROOT/smoke-model/legacy/docs/pam_on/run-1"
 
 pam_on_count=$(awk -F'\t' 'NR > 1 && $4 == "pam_on" { n++ } END { print n + 0 }' "$summary")
 pam_off_count=$(awk -F'\t' 'NR > 1 && $4 == "pam_off" { n++ } END { print n + 0 }' "$summary")
-if [[ "$pam_on_count" -ne 4 || "$pam_off_count" -ne 4 ]]; then
-  echo "FAIL: expected 4 pam_on and 4 pam_off rows" >&2
+if [[ "$pam_on_count" -ne 6 || "$pam_off_count" -ne 6 ]]; then
+  echo "FAIL: expected 6 pam_on and 6 pam_off rows" >&2
   cat "$summary" >&2
   exit 1
 fi
 
+for engine in legacy minimal; do
+  for pam_variant in pam_on pam_off; do
+    run_dir="$BENCH_ROOT/smoke-model/$engine/crash/$pam_variant/run-1"
+    if [[ -e "$run_dir/session.json" ]]; then
+      echo "FAIL: crash run unexpectedly copied session.json: $run_dir/session.json" >&2
+      exit 1
+    fi
+    for f in meta.json workdir workdir/result.txt; do
+      if [[ ! -e "$run_dir/$f" ]]; then
+        echo "FAIL: missing crash artifact $run_dir/$f" >&2
+        exit 1
+      fi
+    done
+    jq -e --arg engine "$engine" \
+      '.rc == 7 and .engine == $engine and .success_check_success == true and .success_check_reason == "ok"' \
+      "$run_dir/meta.json" >/dev/null || {
+      echo "FAIL: crash meta mismatch in $run_dir/meta.json" >&2
+      cat "$run_dir/meta.json" >&2
+      exit 1
+    }
+    crash_row=$(awk -F'\t' -v engine="$engine" -v pam="$pam_variant" \
+      '$3 == "crash" && $4 == pam && $0 ~ ("/" engine "/") { print $0 }' "$summary")
+    crash_session_copied=$(printf '%s\n' "$crash_row" | awk -F'\t' '{ print $8 }')
+    crash_extras=$(printf '%s\n' "$crash_row" | awk -F'\t' '{ print $9 }')
+    if [[ "$crash_session_copied" != "0" ]]; then
+      echo "FAIL: crash summary session_copied should be 0" >&2
+      echo "$crash_row" >&2
+      exit 1
+    fi
+    printf '%s' "$crash_extras" | jq -e --arg engine "$engine" \
+      '.engine == $engine and .success_check_success == true and .success_check_reason == "ok" and .tool_call_count == null' \
+      >/dev/null || {
+      echo "FAIL: crash summary extras did not fall back to meta.json" >&2
+      echo "$crash_row" >&2
+      exit 1
+    }
+  done
+done
+
+run_dir="$BENCH_ROOT/smoke-model/legacy/docs/pam_on/run-1"
 rc_val=$(jq -r '.rc' "$run_dir/meta.json")
 elapsed_val=$(jq -r '.elapsed_s' "$run_dir/meta.json")
 if ! [[ "$rc_val" =~ ^[0-9]+$ ]]; then
