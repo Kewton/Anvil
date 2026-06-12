@@ -657,29 +657,41 @@ for model in "${cleaned_models[@]}"; do
         fi
         elapsed=$(( SECONDS - start ))
 
-        # session.json copy (nullglob → empty array if no match)
-        # bash 3.2 + set -u needs guard for empty array expansion
+        # session/log copy (nullglob → empty array if no match). Select the
+        # latest session directory rather than anchoring on session.json:
+        # failed runs can have llm-io/eval logs even when session.json was not
+        # flushed before process exit.
         session_copied=0
-        latest_session=""
-        session_json_list=("$STATE_DIR/sessions/"*/session.json)
-        if [[ ${#session_json_list[@]} -gt 0 ]]; then
-          for f in "${session_json_list[@]}"; do
-            latest_session="$f"
+        latest_session_dir=""
+        session_dir_list=("$STATE_DIR/sessions/"*)
+        if [[ ${#session_dir_list[@]} -gt 0 ]]; then
+          for d in "${session_dir_list[@]}"; do
+            if [[ -d "$d" && ! -L "$d" ]]; then
+              latest_session_dir="$d"
+            fi
           done
         fi
-        if [[ -n "$latest_session" && -f "$latest_session" && ! -L "$latest_session" ]]; then
-          # reject symlinks before copy to prevent information leakage
-          real_session=$(realpath "$latest_session" 2>/dev/null || true)
+        if [[ -n "$latest_session_dir" ]]; then
+          # reject symlinks / path escapes before copy to prevent information leakage
+          real_session_dir=$(realpath "$latest_session_dir" 2>/dev/null || true)
           real_state=$(realpath "$STATE_DIR" 2>/dev/null || true)
-          if [[ -n "$real_session" && -n "$real_state" && "$real_session" == "$real_state"/* ]]; then
-            if cp "$latest_session" ../session.json; then
-              session_copied=1
-            else
-              echo "warning: session.json copy failed" >&2
+          if [[ -n "$real_session_dir" && -n "$real_state" && "$real_session_dir" == "$real_state"/* ]]; then
+            latest_session="$latest_session_dir/session.json"
+            if [[ -f "$latest_session" && ! -L "$latest_session" ]]; then
+              real_session=$(realpath "$latest_session" 2>/dev/null || true)
+              if [[ -n "$real_session" && "$real_session" == "$real_state"/* ]]; then
+                if cp "$latest_session" ../session.json; then
+                  session_copied=1
+                else
+                  echo "warning: session.json copy failed" >&2
+                fi
+              else
+                echo "warning: session.json path outside STATE_DIR, skipping copy" >&2
+              fi
             fi
 
             # Copy structured logs from the state-dir session directory (if present).
-            session_id=$(basename "$(dirname "$latest_session")")
+            session_id=$(basename "$latest_session_dir")
             if [[ "$session_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
               for log_name in llm-io.jsonl eval.jsonl; do
                 log_src="$STATE_DIR/sessions/$session_id/logs/$log_name"
