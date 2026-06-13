@@ -24,6 +24,8 @@
   Task25 blocked-mkdir trap verification before the full matrix.
 - [Cycle 3 full matrix](cycle3-full-matrix-20260613.md):
   Task26 seeded 27B M001 on/off ablation and 8B frontier run.
+- [Cycle 3 Task29 rebaseline and vibe-local comparison](cycle3-task29-vibe-local-comparison-20260613.md):
+  Task29-inclusive full matrix, same-model vibe-local comparison, and focused 4-scenario rerun.
 - [Capability frontier](frontier.md):
   model-by-model minimal-loop benchmark rows.
 
@@ -39,6 +41,7 @@
 - [Phase 3 cycle 1 evaluation](minimal-loop-phase3-cycle1-evaluation-20260612.md)
 - [Cycle 3 narrow seeded rerun](cycle3-narrow-seeded-rerun.md)
 - [Cycle 3 full matrix](cycle3-full-matrix-20260613.md)
+- [Cycle 3 Task29 rebaseline and vibe-local comparison](cycle3-task29-vibe-local-comparison-20260613.md)
 - [Capability frontier](frontier.md)
 
 ## Triage
