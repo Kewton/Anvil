@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -478,7 +478,11 @@ pub fn run_with_outcome(
     if let Some(reason) = check_blocked_command(&normalized) {
         return Err(render_block_error(&reason));
     }
-    let class = classify_command(&normalized);
+    let classification = classify_command_for_execution(&normalized, cwd);
+    if let Some(cd_wrapper) = classification.cd_wrapper.as_ref() {
+        log_cd_wrapper_reclassified(cd_wrapper, classification.class);
+    }
+    let class = classification.class;
     enforce_offline_policy(&normalized, class, offline)?;
 
     let mut cmd = Command::new("sh");
@@ -644,6 +648,136 @@ pub fn classify_command(command: &str) -> BashCommandClass {
     } else {
         BashCommandClass::General
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BashExecutionClassification {
+    class: BashCommandClass,
+    cd_wrapper: Option<CdWrapperClassification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CdWrapperClassification {
+    tail_class: BashCommandClass,
+}
+
+fn classify_command_for_execution(command: &str, cwd: &Path) -> BashExecutionClassification {
+    if let Some(cd_wrapper) = classify_cd_wrapper_command(command, cwd) {
+        return BashExecutionClassification {
+            class: cd_wrapper.tail_class,
+            cd_wrapper: Some(cd_wrapper),
+        };
+    }
+    BashExecutionClassification {
+        class: classify_command(command),
+        cd_wrapper: None,
+    }
+}
+
+fn classify_cd_wrapper_command(command: &str, cwd: &Path) -> Option<CdWrapperClassification> {
+    let parts = split_shell_control_segments(command);
+    if parts.len() != 3 || parts[1] != "&&" {
+        return None;
+    }
+
+    let cd_dir = parse_cd_dir(parts[0])?;
+    if !cd_dir_is_cwd_or_descendant(cwd, &cd_dir) {
+        return None;
+    }
+
+    let tail_class = classify_command(parts[2]);
+    Some(CdWrapperClassification { tail_class })
+}
+
+fn parse_cd_dir(segment: &str) -> Option<PathBuf> {
+    let words = split_simple_shell_words(segment.trim())?;
+    if words.len() != 2 || words[0] != "cd" {
+        return None;
+    }
+    let dir = &words[1];
+    if dir.is_empty() || dir == "-" {
+        return None;
+    }
+    Some(PathBuf::from(dir))
+}
+
+fn cd_dir_is_cwd_or_descendant(cwd: &Path, dir: &Path) -> bool {
+    let cwd_canon = std::fs::canonicalize(cwd).ok();
+    let target = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        cwd.join(dir)
+    };
+    let target_canon = std::fs::canonicalize(target).ok();
+    match (cwd_canon, target_canon) {
+        (Some(cwd_canon), Some(target_canon)) => {
+            target_canon == cwd_canon || target_canon.starts_with(&cwd_canon)
+        }
+        _ => false,
+    }
+}
+
+fn split_simple_shell_words(input: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_word = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                in_word = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                in_word = true;
+            }
+            '\\' if !in_single => {
+                let next = chars.next()?;
+                current.push(next);
+                in_word = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            c => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+
+    if in_single || in_double {
+        return None;
+    }
+    if in_word {
+        words.push(current);
+    }
+    Some(words)
+}
+
+fn log_cd_wrapper_reclassified(
+    cd_wrapper: &CdWrapperClassification,
+    effective_class: BashCommandClass,
+) {
+    crate::logging::log_llm_event(
+        "tool.bash.cd_wrapper_reclassified",
+        serde_json::json!({
+            "shape": "cd_and_tail",
+            "tail_class": cd_wrapper.tail_class.as_str(),
+            "effective_class": effective_class.as_str(),
+            "offline_allowed_class": matches!(
+                effective_class,
+                BashCommandClass::ScriptRun | BashCommandClass::BuildTest
+            ),
+        }),
+    );
 }
 
 /// Issue #664 (AD2 / AD12 / DR1-001 案 B): thin wrapper over
@@ -1276,12 +1410,13 @@ pub(crate) fn terminate_child(child: &mut Child) {
 mod tests {
     use super::{
         BashCommandClass, BlockCategory, BlockReason, ENV_SETUP_TIMEOUT, LONG_RUNNING_TIMEOUT,
-        check_blocked_command, classify_command, command_uses_network, enforce_offline_policy,
-        has_shell_control_operator, is_env_setup_command, is_setup_command,
-        launches_persistent_service, likely_long_running_command, match_dangerous_verb,
-        matches_device_redirect, matches_fork_bomb, matches_kill_signal_one,
-        normalize_background_command, normalize_noninteractive_scaffold_command,
-        render_block_error, requests_background_execution, run, run_with_outcome, select_timeout,
+        check_blocked_command, classify_command, classify_command_for_execution,
+        command_uses_network, enforce_offline_policy, has_shell_control_operator,
+        is_env_setup_command, is_setup_command, launches_persistent_service,
+        likely_long_running_command, match_dangerous_verb, matches_device_redirect,
+        matches_fork_bomb, matches_kill_signal_one, normalize_background_command,
+        normalize_noninteractive_scaffold_command, render_block_error,
+        requests_background_execution, run, run_with_outcome, select_timeout,
         split_shell_control_segments, strip_trailing_background_operator,
     };
     use std::time::{Duration, Instant};
@@ -1603,6 +1738,116 @@ mod tests {
             classify_command("echo hello > output.txt"),
             BashCommandClass::Mutating
         );
+    }
+
+    #[test]
+    fn cd_wrapper_python_inline_is_allowed_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && python3 -c \"print(1)\"", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::ScriptRun);
+        assert!(classification.cd_wrapper.is_some());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_ok());
+    }
+
+    #[test]
+    fn cd_wrapper_node_script_is_allowed_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && node test.js", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::ScriptRun);
+        assert!(classification.cd_wrapper.is_some());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_ok());
+    }
+
+    #[test]
+    fn cd_wrapper_python_file_is_allowed_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && python3 test_slugify.py", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::ScriptRun);
+        assert!(classification.cd_wrapper.is_some());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_ok());
+    }
+
+    #[test]
+    fn cd_wrapper_build_test_tail_is_allowed_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && cargo test", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::BuildTest);
+        assert!(classification.cd_wrapper.is_some());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_ok());
+    }
+
+    #[test]
+    fn cd_wrapper_outside_cwd_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = "cd /tmp && python3 -c \"print(1)\"";
+        let classification = classify_command_for_execution(cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::General);
+        assert!(classification.cd_wrapper.is_none());
+        assert!(enforce_offline_policy(cmd, classification.class, true).is_err());
+    }
+
+    #[test]
+    fn cd_wrapper_three_chain_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && python3 test.py && rm out", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::General);
+        assert!(classification.cd_wrapper.is_none());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_err());
+    }
+
+    #[test]
+    fn cd_wrapper_env_setup_tail_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && npm install", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::EnvSetup);
+        assert!(classification.cd_wrapper.is_some());
+        let err = enforce_offline_policy(&cmd, classification.class, true)
+            .expect_err("offline must reject cd-wrapped env setup");
+        assert!(err.contains("env-setup"));
+    }
+
+    #[test]
+    fn cd_wrapper_network_tail_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && curl https://example.com", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::Network);
+        assert!(classification.cd_wrapper.is_some());
+        let err = enforce_offline_policy(&cmd, classification.class, true)
+            .expect_err("offline must reject cd-wrapped network command");
+        assert!(err.contains("network"));
+    }
+
+    #[test]
+    fn cd_wrapper_path_escape_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().parent().expect("tempdir has parent");
+        let cmd = format!("cd {} && python3 -c \"print(1)\"", parent.display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::General);
+        assert!(classification.cd_wrapper.is_none());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cd_wrapper_symlink_escape_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let link = dir.path().join("outside-link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let cmd = format!("cd {} && python3 -c \"print(1)\"", link.display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::General);
+        assert!(classification.cd_wrapper.is_none());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_err());
     }
 
     #[test]
