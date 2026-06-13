@@ -86,3 +86,24 @@ Events:
 
 Non-streaming payloads include `model`, `stream`, and truncated raw `body`.
 Streaming payloads include `stream: true` and truncated line `chunks`.
+
+## Runtime Tool Events
+
+Runtime events are emitted by deterministic controller code when a tool-policy
+decision needs later measurement.
+
+### `tool.bash.cd_wrapper_reclassified`
+
+Emitted when Bash recognizes the narrow `cd <dir> && <tail>` wrapper form and
+classifies `<tail>` as the effective command class. The `<dir>` must resolve to
+the current tool cwd or a descendant; otherwise this event is not emitted and
+the command is classified normally.
+
+Stable payload fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `shape` | string | Currently always `cd_and_tail`. |
+| `tail_class` | string | Classification of `<tail>`, using `BashCommandClass::as_str()`. |
+| `effective_class` | string | Class applied to the full command. |
+| `offline_allowed_class` | boolean | Whether the effective class is one of the offline-allowed classes introduced by this wrapper path: `script_run` or `build_test`. |
