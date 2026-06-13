@@ -34,6 +34,7 @@
 - [llm-io schema](llm-io-schema.md)
 - [Initial T2-4 comparison](minimal-loop-t2-4-20260612.md)
 - [Parser-fix rerun](minimal-loop-t2-4-rerun-20260612.md)
+- [Fixed-binary parser-fix rerun](minimal-loop-t2-4-fixed-binary-rerun-20260612.md)
 - [Task14 recheck baseline](minimal-loop-t2-4-recheck-20260612.md)
 - [Task15 feedback rerun](minimal-loop-t2-4-task15-feedback-rerun-20260612.md)
 - [Task15 non-fired run variance](t2-4-run-variance.md)
@@ -48,6 +49,9 @@
 
 - [Parser contamination triage](triage/t2-4-parser-contamination.md)
 - [Parser feedback loop deepdive](triage/t2-4-parser-feedback-loop-deepdive-20260612.md)
+- [Parser fix efficacy triage](triage/t2-4-rerun-fix-efficacy.md)
+- [Dead scenarios check audit](triage/t2-4-dead-scenarios.md)
+- [Minimal loss cluster triage](triage/t2-4-minimal-loss-clusters.md)
 - [Cycle 2 loss triage](triage/cycle2-loss-triage.md)
 - [Blocked mkdir trap triage](triage/blocked-mkdir-trap.md)
 - [Blocked script-run triage](triage/blocked-script-run.md)

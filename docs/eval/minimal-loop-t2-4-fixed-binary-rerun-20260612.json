@@ -1,0 +1,99 @@
+{
+  "date_jst": "2026-06-12",
+  "model": "qwen3.6:27b-coding-nvfp4",
+  "benchmark": "minimal-loop-expanded",
+  "conditions": [
+    "--max-iterations 12",
+    "--no-auto-test",
+    "--no-precautions",
+    "--no-case-memory",
+    "--bench-no-debug"
+  ],
+  "roots": {
+    "legacy_source": ".anvil/benchmarks/20260612T024532-70925",
+    "minimal_source": ".anvil/benchmarks/20260612T145227-40162",
+    "combined": ".anvil/benchmarks/20260612T145227-combined-t2-4-fixed-rerun",
+    "discarded_sandbox_attempt": ".anvil/benchmarks/20260612T144807-25898"
+  },
+  "merged_prs": {
+    "1021": "e0813d824c8befb898ce528e20c08c10e477e40d",
+    "1022": "767f7836470231362f134f13d21d91fd53b84a02",
+    "1024": "1964e054a5dac98a0bfc8215884e4f15e03ec3da"
+  },
+  "build": {
+    "command": "cargo build --release",
+    "binary_path": "/Users/maenokota/share/work/github_kewton/Anvil-develop/workspace/minimal-loop-plan/target/release/anvil",
+    "binary_mtime_jst": "2026-06-12T14:46:47+0900",
+    "git_commit": "1964e054a5dac98a0bfc8215884e4f15e03ec3da",
+    "git_dirty": true,
+    "git_revision": "1964e054a5dac98a0bfc8215884e4f15e03ec3da-dirty",
+    "build_time_utc": "2026-06-12T05:46:47Z"
+  },
+  "row_summary": {
+    "legacy_initial": {
+      "rows": 125,
+      "rc0": 125,
+      "rc_nonzero": 0,
+      "success_check_ok_with_meta_fallback": 46,
+      "success_check_ng": 79,
+      "success_check_null": 0,
+      "postcheck_ok_from_summary": 31,
+      "elapsed_total_sec": 8319
+    },
+    "minimal_fixed_binary_rerun": {
+      "rows": 125,
+      "rc0": 124,
+      "rc_nonzero": 1,
+      "success_check_ok_with_meta_fallback": 45,
+      "success_check_ng": 80,
+      "success_check_null": 0,
+      "success_check_ok_from_summary_only": 44,
+      "postcheck_ok_from_summary": 24,
+      "elapsed_total_sec": 3610
+    }
+  },
+  "scenario_success_check_with_meta_fallback": {
+    "fix-css-token-doc": {"legacy": "5/5", "minimal": "3/5", "delta": -2},
+    "fix-js-date-helper": {"legacy": "5/5", "minimal": "1/5", "delta": -4},
+    "fix-json-normalizer": {"legacy": "0/5", "minimal": "0/5", "delta": 0},
+    "fix-python-retry-policy": {"legacy": "0/5", "minimal": "5/5", "delta": 5},
+    "fix-python-slugify": {"legacy": "4/5", "minimal": "2/5", "delta": -2},
+    "fix-readme-command": {"legacy": "5/5", "minimal": "2/5", "delta": -3},
+    "fix-rust-parser-error": {"legacy": "5/5", "minimal": "1/5", "delta": -4},
+    "fix-shell-safe-clean": {"legacy": "2/5", "minimal": "5/5", "delta": 3},
+    "long-session-data-report": {"legacy": "0/5", "minimal": "0/5", "delta": 0},
+    "long-session-large-component": {"legacy": "0/5", "minimal": "1/5", "delta": 1},
+    "long-session-read-edit": {"legacy": "0/5", "minimal": "1/5", "delta": 1},
+    "multi-file-docs-and-examples": {"legacy": "0/5", "minimal": "2/5", "delta": 2},
+    "multi-file-node-package": {"legacy": "0/5", "minimal": "5/5", "delta": 5},
+    "multi-file-python-package": {"legacy": "0/5", "minimal": "2/5", "delta": 2},
+    "multi-file-rust-library": {"legacy": "0/5", "minimal": "0/5", "delta": 0},
+    "new-large-react-kanban": {"legacy": "0/5", "minimal": "2/5", "delta": 2},
+    "new-markdown-release-notes": {"legacy": "5/5", "minimal": "5/5", "delta": 0},
+    "new-python-csv-small": {"legacy": "5/5", "minimal": "0/5", "delta": -5},
+    "new-rust-cli-small": {"legacy": "0/5", "minimal": "0/5", "delta": 0},
+    "new-typescript-formatter": {"legacy": "0/5", "minimal": "0/5", "delta": 0},
+    "non-coding-research-brief": {"legacy": "5/5", "minimal": "5/5", "delta": 0},
+    "non-coding-runbook": {"legacy": "5/5", "minimal": "3/5", "delta": -2},
+    "scaffold-fastapi-service": {"legacy": "0/5", "minimal": "0/5", "delta": 0},
+    "scaffold-next-dashboard": {"legacy": "0/5", "minimal": "0/5", "delta": 0},
+    "scaffold-rust-cli": {"legacy": "0/5", "minimal": "0/5", "delta": 0}
+  },
+  "compare_py": {
+    "elapsed_s": {"baseline_mean": 66.552, "experiment_mean": 28.88, "delta": -37.672, "verdict": "improved"},
+    "postcheck_success": {"baseline_mean": 0.248, "experiment_mean": 0.2, "delta": -0.048, "verdict": "unchanged"},
+    "rc": {"baseline_mean": 1.0, "experiment_mean": 0.992, "delta": -0.008, "verdict": "unchanged"},
+    "iter_count": {"baseline_mean": 2.712, "experiment_mean": 3.3629032258064515, "delta": 0.6509032258064513, "verdict": "regressed"},
+    "failure_categories": {
+      "baseline": {"completed": 60, "control_loop_exhausted": 6, "missing_deliverable": 40, "missing_evidence": 19},
+      "experiment": {"completed": 124, "failed": 1}
+    }
+  },
+  "parser_fix_evidence": {
+    "tool_call_parser_failed": 0,
+    "native_tool_parser_failed": 0,
+    "native_xml_salvage_events": 0,
+    "downgrade_feedback_occurrences": 0
+  },
+  "assessment": "The fixed-binary rerun is valid evidence for #1021/#1022/#1024. Parser transport failures are no longer the dominant blocker; remaining failures are scenario outcome/check quality issues."
+}
