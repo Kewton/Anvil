@@ -4,6 +4,7 @@ pub const MINIMAL_FEEDBACK_PREFIX: &str = "[minimal-feedback]";
 pub struct FeedbackState {
     empty_response_sent: bool,
     completion_without_write_sent: bool,
+    requested_artifact_sent: bool,
     missing_tool_sent: bool,
     edit_anchor_sent: bool,
 }
@@ -36,6 +37,17 @@ impl FeedbackState {
         self.completion_without_write_sent = true;
         Some(format!(
             "{MINIMAL_FEEDBACK_PREFIX}\nNo file changes have been made in this session. If the task requires creating or modifying files, do that now with Write or Edit. If no file change is needed, say so and finish."
+        ))
+    }
+
+    pub fn requested_artifacts_missing(&mut self, missing_paths: &[String]) -> Option<String> {
+        if self.requested_artifact_sent || missing_paths.is_empty() {
+            return None;
+        }
+        self.requested_artifact_sent = true;
+        let list = missing_paths.join(", ");
+        Some(format!(
+            "{MINIMAL_FEEDBACK_PREFIX}\nThe requested file(s) are still missing: {list}. Create them with Write now, or explain the blocker if they should not be created."
         ))
     }
 
@@ -99,6 +111,16 @@ mod tests {
         assert!(state.empty_response().is_none());
         assert!(state.completion_without_write().is_some());
         assert!(state.completion_without_write().is_none());
+        assert!(
+            state
+                .requested_artifacts_missing(&["src/main.rs".to_string()])
+                .is_some()
+        );
+        assert!(
+            state
+                .requested_artifacts_missing(&["src/main.rs".to_string()])
+                .is_none()
+        );
         assert!(state.missing_tool_call("fix src/lib.rs").is_some());
         assert!(state.missing_tool_call("fix src/lib.rs").is_none());
         assert!(

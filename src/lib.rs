@@ -249,40 +249,56 @@ fn run_minimal_engine(
     mut session: session::store::SessionSnapshot,
     resume_prompt: Option<String>,
 ) -> Result<(), String> {
-    let prompt = match resume_prompt {
-        Some(prompt) => prompt,
-        None => match &config.prompt {
-            Some(prompt) => prompt.clone(),
-            None => stdin_prompt()?.ok_or_else(|| {
-                "minimal engine currently requires --prompt, stdin, or --resume".to_string()
-            })?,
-        },
-    };
+    if let Some(prompt) = resume_prompt {
+        return run_minimal_prompt(
+            &config,
+            &models.main,
+            &mut client,
+            &session_store,
+            &mut session,
+            &prompt,
+        );
+    }
 
-    let work_root = session
-        .active_root
-        .clone()
-        .unwrap_or_else(|| config.cwd.clone());
-    let loop_config = agent::minimal_loop::MinimalLoopConfig {
-        work_root: work_root.clone(),
-        mode: session.mode_state.mode,
-        context_budget: config.context_budget,
-        max_iterations: config.max_iterations,
-        auto_approve: config.yes_mode,
-        offline: config.offline,
-        cancel_flag: None,
-        completion_without_write_feedback:
-            !agent::minimal_loop::completion_without_write_feedback_disabled_from_env(),
-    };
-    let reply = agent::minimal_loop::run_session(
-        &mut client,
-        &models.main,
-        &mut session,
-        &prompt,
-        &loop_config,
-    )?;
-    session.active_root = (work_root != config.cwd).then_some(work_root);
-    session_store.save(&session)?;
+    if let Some(prompt) = &config.prompt {
+        return run_minimal_prompt(
+            &config,
+            &models.main,
+            &mut client,
+            &session_store,
+            &mut session,
+            prompt,
+        );
+    }
+
+    if let Some(prompt) = stdin_prompt()? {
+        return run_minimal_prompt(
+            &config,
+            &models.main,
+            &mut client,
+            &session_store,
+            &mut session,
+            &prompt,
+        );
+    }
+
+    if io::stdin().is_terminal() {
+        return agent::minimal_repl::run(config, models, client, session_store, session);
+    }
+
+    Err("minimal engine requires --prompt, stdin, --resume, or an interactive TTY".to_string())
+}
+
+fn run_minimal_prompt(
+    config: &Config,
+    model: &str,
+    client: &mut OllamaClient,
+    session_store: &SessionStore,
+    session: &mut session::store::SessionSnapshot,
+    prompt: &str,
+) -> Result<(), String> {
+    let reply =
+        agent::minimal_repl::run_turn(config, model, client, session_store, session, prompt)?;
     if !reply.is_empty() {
         println!("{reply}");
     }

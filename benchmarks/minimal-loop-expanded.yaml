@@ -36,9 +36,29 @@ cases:
     success_check:
       files:
         - path: src/formatTitle.ts
-          min_lines: 8
       commands:
         - grep -R "export function formatTitle" src/formatTitle.ts
+        - |
+          node - <<'NODE'
+          const fs = require("fs");
+
+          let src = fs.readFileSync("src/formatTitle.ts", "utf8");
+          src = src.replace(/export\s+/g, "").replace(/:\s*string/g, "");
+          eval(src);
+
+          const cases = [
+            ["  hello   world  ", "Hello World"],
+            ["multi   word title", "Multi Word Title"],
+            ["already Title", "Already Title"],
+          ];
+
+          for (const [input, expected] of cases) {
+            const actual = formatTitle(input);
+            if (actual !== expected) {
+              throw new Error(input + " => " + actual + ", expected " + expected);
+            }
+          }
+          NODE
 
   - name: new-markdown-release-notes
     task_kind: docs
@@ -67,8 +87,30 @@ cases:
   - name: fix-js-date-helper
     task_kind: coding
     scenario_category: existing_code_fix
+    setup_files:
+      - path: src/dateRange.js
+        content: |
+          // dateRange.js - Utility for calculating inclusive day ranges
+
+          /**
+           * Calculate the number of inclusive days between two date strings.
+           * @param {string} start - Start date in YYYY-MM-DD format
+           * @param {string} end - End date in YYYY-MM-DD format
+           * @returns {number} Number of inclusive days
+           */
+          function inclusiveDays(start, end) {
+            const startDate = new Date(start);
+            const endDate = new Date(end);
+
+            const diffTime = endDate - startDate;
+            const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+
+            return diffDays;
+          }
+
+          module.exports = { inclusiveDays };
     prompt: |
-      Create src/dateRange.js with a buggy inclusiveDays(start, end), then fix it so same-day ranges return 1 and reversed ranges return 0.
+      Fix src/dateRange.js so inclusiveDays(start, end) returns 1 for same-day ranges, 0 for reversed ranges, and counts normal ranges inclusively.
     success_check:
       files:
         - path: src/dateRange.js

@@ -383,7 +383,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
     vec![
         tool(
             "Bash",
-            "Run a shell command in the project directory. Runtime classifies commands as read-only, build-test, or general, and offline mode blocks networked or general shell commands.",
+            "Run read-only inspection, build/test, or local script validation commands in the project directory. Do not use Bash to create files or directories; use Write for file creation because Write creates parent directories automatically. Offline mode blocks networked, mutating, or general shell commands.",
             serde_json::json!({
                 "type": "object",
                 "properties": { "command": { "type": "string" } },
@@ -909,6 +909,24 @@ mod tests {
         assert!(
             description.contains("Parent directories are created automatically"),
             "Write description should tell the model not to call Bash mkdir first: {description}"
+        );
+    }
+
+    #[test]
+    fn bash_tool_description_discourages_file_creation() {
+        let specs = default_tool_specs();
+        let description = specs
+            .iter()
+            .find(|spec| spec.function.name == "Bash")
+            .map(|spec| spec.function.description.as_str())
+            .expect("Bash tool spec");
+        assert!(
+            description.contains("Do not use Bash to create files or directories"),
+            "Bash description should route file creation away from shell mkdir/cat: {description}"
+        );
+        assert!(
+            description.contains("Write creates parent directories automatically"),
+            "Bash description should name Write as the directory-creation affordance: {description}"
         );
     }
 

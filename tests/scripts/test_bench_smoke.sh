@@ -65,6 +65,10 @@ if [[ "$prompt" == *"fail logs only"* ]]; then
   echo "fake anvil: failed before session flush" >&2
   exit 1
 fi
+if [[ "$prompt" == *"use seeded fixture"* && ! -f seeded/input.txt ]]; then
+  echo "fake anvil: setup fixture missing" >&2
+  exit 8
+fi
 printf 'ok\n' > result.txt
 if [[ "$prompt" == *"exit after artifact without session"* ]]; then
   echo "fake anvil: crash after artifact" >&2
@@ -104,6 +108,20 @@ cases:
     prompt: exit after artifact without session
   - name: fail-logs-only
     prompt: fail logs only
+  - name: seeded
+    prompt: use seeded fixture
+    setup_files:
+      - path: seeded/input.txt
+        content: |
+          seeded
+    success_check:
+      files:
+        - path: result.txt
+          min_lines: 1
+        - path: seeded/input.txt
+          min_lines: 1
+      commands:
+        - test -f seeded/input.txt
 EOF
 trap 'rm -rf "$tmp"; rm -f "$bench_yaml"' EXIT
 
@@ -143,8 +161,13 @@ if [[ "$header" != "$expected_header" ]]; then
 fi
 
 rows=$(($(wc -l < "$summary") - 1))
-if [[ "$rows" -ne 16 ]]; then
-  echo "FAIL: expected 16 data rows, got $rows" >&2
+if [[ "$rows" -ne 20 ]]; then
+  echo "FAIL: expected 20 data rows, got $rows" >&2
+  exit 1
+fi
+seeded_fixture="$BENCH_ROOT/smoke-model/legacy/seeded/pam_on/run-1/workdir/seeded/input.txt"
+if [[ "$(cat "$seeded_fixture" 2>/dev/null || true)" != "seeded" ]]; then
+  echo "FAIL: setup_files fixture missing or wrong: $seeded_fixture" >&2
   exit 1
 fi
 
@@ -243,8 +266,8 @@ run_dir="$BENCH_ROOT/smoke-model/legacy/docs/pam_on/run-1"
 
 pam_on_count=$(awk -F'\t' 'NR > 1 && $4 == "pam_on" { n++ } END { print n + 0 }' "$summary")
 pam_off_count=$(awk -F'\t' 'NR > 1 && $4 == "pam_off" { n++ } END { print n + 0 }' "$summary")
-if [[ "$pam_on_count" -ne 8 || "$pam_off_count" -ne 8 ]]; then
-  echo "FAIL: expected 8 pam_on and 8 pam_off rows" >&2
+if [[ "$pam_on_count" -ne 10 || "$pam_off_count" -ne 10 ]]; then
+  echo "FAIL: expected 10 pam_on and 10 pam_off rows" >&2
   cat "$summary" >&2
   exit 1
 fi
@@ -345,8 +368,8 @@ if [[ "$recheck_header" != "$expected_recheck_header" ]]; then
   exit 1
 fi
 recheck_rows=$(($(wc -l < "$recheck_summary") - 1))
-if [[ "$recheck_rows" -ne 16 ]]; then
-  echo "FAIL: expected 16 recheck data rows, got $recheck_rows" >&2
+if [[ "$recheck_rows" -ne 20 ]]; then
+  echo "FAIL: expected 20 recheck data rows, got $recheck_rows" >&2
   exit 1
 fi
 awk -F'\t' '$3 == "docs" && $4 == "pam_on" && $0 ~ "/legacy/" { print $10 "\t" $11 }' "$recheck_summary" \

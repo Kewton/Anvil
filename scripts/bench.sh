@@ -53,6 +53,9 @@ Usage: scripts/bench.sh <benchmark-name> [options]
   --no-minimal-completion-without-write-feedback
                     Minimal の no-write completion feedback を無効化
                     （ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK=1）
+  --no-minimal-requested-artifact-feedback
+                    Minimal の requested-artifact missing feedback を無効化
+                    （ANVIL_NO_MINIMAL_REQUESTED_ARTIFACT_FEEDBACK=1）
   --pam-ab          Same prompt suite with PAM enabled and disabled
   --dry-run         anvil 呼び出しを echo で代替
   --recheck-root <path>
@@ -83,6 +86,7 @@ no_precautions=0
 no_case_memory=0
 no_auto_test=0
 no_minimal_completion_without_write_feedback=0
+no_minimal_requested_artifact_feedback=0
 pam_ab=0
 recheck_root=""
 bench_seed_enabled=1
@@ -164,6 +168,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-minimal-completion-without-write-feedback)
       no_minimal_completion_without_write_feedback=1
+      shift
+      ;;
+    --no-minimal-requested-artifact-feedback)
+      no_minimal_requested_artifact_feedback=1
       shift
       ;;
     --pam-ab)
@@ -567,6 +575,36 @@ evaluate_success_check() {
     joined=$(IFS=','; echo "${reasons[*]}")
     SUCCESS_CHECK_REASON="$joined"
   fi
+}
+
+seed_setup_files() {
+  # $1=case_idx
+  local case_idx="$1"
+  local selector file_count setup_idx rel content path parent
+  if [[ "$case_count" -eq 0 ]]; then
+    selector='(.setup_files // [])'
+  else
+    selector="(.cases[$case_idx].setup_files // .setup_files // [])"
+  fi
+
+  file_count=$(yq -r "$selector | length" "$BENCH_YAML")
+  if ! [[ "$file_count" =~ ^[0-9]+$ ]]; then
+    echo "Error: invalid setup_files for case $case_idx" >&2
+    exit 1
+  fi
+
+  for (( setup_idx=0; setup_idx<file_count; setup_idx++ )); do
+    rel=$(yq -r "$selector[$setup_idx].path // \"\"" "$BENCH_YAML")
+    if [[ -z "$rel" || "$rel" == "null" || "$rel" == /* || "$rel" == *..* ]]; then
+      echo "Error: invalid setup_files path for case $case_idx: $rel" >&2
+      exit 1
+    fi
+    content=$(yq -r "$selector[$setup_idx].content // \"\"" "$BENCH_YAML")
+    path="$WORKDIR/$rel"
+    parent=$(dirname "$path")
+    mkdir -p "$parent"
+    printf '%s' "$content" > "$path"
+  done
 }
 
 case_index_for_name() {
@@ -1064,12 +1102,14 @@ for model in "${cleaned_models[@]}"; do
 
         mkdir -p "$WORKDIR" "$STATE_DIR" "$RUN_DIR/logs"
         cd "$WORKDIR" || { echo "Error: cd $WORKDIR failed" >&2; exit 1; }
+        seed_setup_files "$case_idx"
 
         # -------- caller env isolation --------
         # Unset ANVIL_NO_* from caller env to prevent baseline cell contamination.
         unset ANVIL_NO_REMINDER ANVIL_NO_CASE_RETRIEVAL ANVIL_NO_CASE_RECORD \
               ANVIL_NO_AUTO_TEST ANVIL_NO_TESTER ANVIL_NO_REPO_GRAPH \
               ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK \
+              ANVIL_NO_MINIMAL_REQUESTED_ARTIFACT_FEEDBACK \
               ANVIL_CASE_RECORD_DRY_RUN ANVIL_CASE_RETRIEVAL_DRY_RUN \
               ANVIL_PAM_ADVISORY_ENABLED ANVIL_BENCH_SEED
 
@@ -1086,6 +1126,9 @@ for model in "${cleaned_models[@]}"; do
         fi
         if [[ "$no_minimal_completion_without_write_feedback" -eq 1 ]]; then
           env_kv+=("ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK=1")
+        fi
+        if [[ "$no_minimal_requested_artifact_feedback" -eq 1 ]]; then
+          env_kv+=("ANVIL_NO_MINIMAL_REQUESTED_ARTIFACT_FEEDBACK=1")
         fi
         if [[ "$pam_variant" == "pam_on" ]]; then
           env_kv+=("ANVIL_PAM_ADVISORY_ENABLED=true")

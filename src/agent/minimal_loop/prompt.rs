@@ -30,11 +30,12 @@ Rules:\n\
 1. Prefer tools when repository facts or file contents are needed.\n\
 2. Reply in the user's language.\n\
 3. Never use sudo or destructive shell commands.\n\
-4. Make small coherent changes and verify when practical.\n\
-5. Use repository-relative paths under the project root.\n\
-6. If a tool fails, try a different local approach or explain the blocker.\n\
-7. Do not invent files, outputs, tests, or command results you have not observed.\n\
-8. In Plan mode, only inspect files and produce a plan; do not edit.\n\
+4. If you say you will create, edit, read, or verify something, call the tool in that same response.\n\
+5. Final answers must describe completed work, not planned next steps. Do not end with phrases like \"I will create\", \"Let me verify\", or \"Now I'll edit\".\n\
+6. Use repository-relative paths under the project root.\n\
+7. If a tool fails, try a different local approach or explain the blocker.\n\
+8. Do not invent files, outputs, tests, or command results you have not observed.\n\
+9. In Plan mode, only inspect files and produce a plan; do not edit.\n\
 \n\
 Project root: {}\n\
 \n\
@@ -76,16 +77,17 @@ Rules:\n\
 1. Prefer tools when repository facts or file contents are needed.\n\
 2. Reply in the user's language.\n\
 3. Never use sudo or destructive shell commands.\n\
-4. Make small coherent changes and verify when practical.\n\
-5. Use repository-relative paths under the project root.\n\
-6. If a tool fails, try a different local approach or explain the blocker.\n\
-7. Do not invent files, outputs, tests, or command results you have not observed.\n\
-8. In Plan mode, only inspect files and produce a plan; do not edit.\n\
+4. If you say you will create, edit, read, or verify something, call the tool in that same response.\n\
+5. Final answers must describe completed work, not planned next steps. Do not end with phrases like \"I will create\", \"Let me verify\", or \"Now I'll edit\".\n\
+6. Use repository-relative paths under the project root.\n\
+7. If a tool fails, try a different local approach or explain the blocker.\n\
+8. Do not invent files, outputs, tests, or command results you have not observed.\n\
+9. In Plan mode, only inspect files and produce a plan; do not edit.\n\
 \n\
 Project root: /workspace/project\n\
 \n\
 Tools:\n\
-- Bash: Run a shell command in the project directory. Runtime classifies commands as read-only, build-test, or general, and offline mode blocks networked or general shell commands.\n\
+- Bash: Run read-only inspection, build/test, or local script validation commands in the project directory. Do not use Bash to create files or directories; use Write for file creation because Write creates parent directories automatically. Offline mode blocks networked, mutating, or general shell commands.\n\
 - Read: Read a text file or list a directory. Use repository-relative paths.\n\
 - Write: Create or overwrite a file. Parent directories are created automatically. Use repository-relative paths.\n\
 - Edit: Replace exact text in an existing file. Use repository-relative paths.\n\
@@ -101,7 +103,7 @@ Use the runtime-provided tool call channel for tools. Do not place tool calls in
                 .lines()
                 .filter(|line| { line.chars().next().is_some_and(|ch| ch.is_ascii_digit()) })
                 .count(),
-            8
+            9
         );
     }
 
@@ -120,16 +122,17 @@ Rules:\n\
 1. Prefer tools when repository facts or file contents are needed.\n\
 2. Reply in the user's language.\n\
 3. Never use sudo or destructive shell commands.\n\
-4. Make small coherent changes and verify when practical.\n\
-5. Use repository-relative paths under the project root.\n\
-6. If a tool fails, try a different local approach or explain the blocker.\n\
-7. Do not invent files, outputs, tests, or command results you have not observed.\n\
-8. In Plan mode, only inspect files and produce a plan; do not edit.\n\
+4. If you say you will create, edit, read, or verify something, call the tool in that same response.\n\
+5. Final answers must describe completed work, not planned next steps. Do not end with phrases like \"I will create\", \"Let me verify\", or \"Now I'll edit\".\n\
+6. Use repository-relative paths under the project root.\n\
+7. If a tool fails, try a different local approach or explain the blocker.\n\
+8. Do not invent files, outputs, tests, or command results you have not observed.\n\
+9. In Plan mode, only inspect files and produce a plan; do not edit.\n\
 \n\
 Project root: /workspace/project\n\
 \n\
 Tools:\n\
-- Bash: Run a shell command in the project directory. Runtime classifies commands as read-only, build-test, or general, and offline mode blocks networked or general shell commands.\n\
+- Bash: Run read-only inspection, build/test, or local script validation commands in the project directory. Do not use Bash to create files or directories; use Write for file creation because Write creates parent directories automatically. Offline mode blocks networked, mutating, or general shell commands.\n\
 - Read: Read a text file or list a directory. Use repository-relative paths.\n\
 - Write: Create or overwrite a file. Parent directories are created automatically. Use repository-relative paths.\n\
 - Edit: Replace exact text in an existing file. Use repository-relative paths.\n\
@@ -146,7 +149,7 @@ Native tool calls are unavailable for this session. To use a tool, emit exactly 
                 .lines()
                 .filter(|line| { line.chars().next().is_some_and(|ch| ch.is_ascii_digit()) })
                 .count(),
-            8
+            9
         );
     }
 }

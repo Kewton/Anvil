@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -14,6 +15,8 @@ use super::prompt::{PromptToolMode, build_system_prompt};
 
 pub const NO_COMPLETION_WITHOUT_WRITE_FEEDBACK_FLAG: &str =
     "ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK";
+pub const NO_REQUESTED_ARTIFACT_FEEDBACK_FLAG: &str =
+    "ANVIL_NO_MINIMAL_REQUESTED_ARTIFACT_FEEDBACK";
 
 pub trait MinimalChatClient {
     fn chat(
@@ -47,6 +50,7 @@ pub struct MinimalLoopConfig {
     pub offline: bool,
     pub cancel_flag: Option<Arc<AtomicBool>>,
     pub completion_without_write_feedback: bool,
+    pub requested_artifact_feedback: bool,
 }
 
 pub fn run_session<C: MinimalChatClient>(
@@ -65,6 +69,7 @@ pub fn run_session<C: MinimalChatClient>(
     let mut tool_calls_seen = false;
     let mut write_or_edit_calls_seen = false;
     let mut completion_without_write_feedback_sent = false;
+    let requested_artifact_paths = extract_requested_artifact_paths(user_prompt);
 
     session
         .messages
@@ -133,6 +138,15 @@ pub fn run_session<C: MinimalChatClient>(
                 pending_feedback = Some(feedback);
                 continue;
             }
+            let missing_requested_artifacts =
+                missing_requested_artifact_paths(&config.work_root, &requested_artifact_paths);
+            if should_send_requested_artifact_feedback(config, &missing_requested_artifacts)
+                && let Some(feedback) =
+                    feedback_state.requested_artifacts_missing(&missing_requested_artifacts)
+            {
+                pending_feedback = Some(feedback);
+                continue;
+            }
             if config.mode == ExecutionMode::Act
                 && !tool_calls_seen
                 && !completion_without_write_feedback_sent
@@ -191,6 +205,10 @@ pub fn completion_without_write_feedback_disabled_from_env() -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
+pub fn requested_artifact_feedback_disabled_from_env() -> bool {
+    std::env::var_os(NO_REQUESTED_ARTIFACT_FEEDBACK_FLAG).is_some_and(|value| !value.is_empty())
+}
+
 fn should_send_completion_without_write_feedback(
     config: &MinimalLoopConfig,
     write_or_edit_calls_seen: bool,
@@ -200,6 +218,87 @@ fn should_send_completion_without_write_feedback(
         && config.completion_without_write_feedback
         && !write_or_edit_calls_seen
         && !completion_without_write_feedback_sent
+}
+
+fn should_send_requested_artifact_feedback(
+    config: &MinimalLoopConfig,
+    missing_requested_artifacts: &[String],
+) -> bool {
+    config.mode == ExecutionMode::Act
+        && config.requested_artifact_feedback
+        && !missing_requested_artifacts.is_empty()
+}
+
+fn missing_requested_artifact_paths(work_root: &Path, paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| !work_root.join(path).is_file())
+        .cloned()
+        .collect()
+}
+
+fn extract_requested_artifact_paths(prompt: &str) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for raw in prompt.split_whitespace() {
+        if let Some(path) = normalize_requested_path_token(raw)
+            && is_safe_requested_artifact_path(&path)
+        {
+            paths.insert(path);
+        }
+    }
+    paths.into_iter().collect()
+}
+
+fn normalize_requested_path_token(raw: &str) -> Option<String> {
+    let mut token = raw.trim_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+            )
+    });
+    while token.ends_with('.') {
+        token = &token[..token.len() - 1];
+    }
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+fn is_safe_requested_artifact_path(path: &str) -> bool {
+    if path.starts_with('/')
+        || path.starts_with('-')
+        || path.contains('\\')
+        || path.contains("://")
+        || path.ends_with('/')
+        || path.len() > 240
+        || !path.contains('.')
+    {
+        return false;
+    }
+
+    let candidate = Path::new(path);
+    if candidate.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) {
+        return false;
+    }
+
+    candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('.'))
+        .is_some_and(|(_, ext)| {
+            (1..=12).contains(&ext.len())
+                && ext
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        })
 }
 
 fn is_write_or_edit_tool(name: &str) -> bool {
@@ -368,6 +467,7 @@ mod tests {
             offline: false,
             cancel_flag: None,
             completion_without_write_feedback: true,
+            requested_artifact_feedback: true,
         }
     }
 
@@ -587,7 +687,7 @@ mod tests {
             &mut client,
             "qwen3:8b",
             &mut session,
-            "create README.md",
+            "create a README file",
             &config(temp.path().to_path_buf(), 4),
         )
         .unwrap();
@@ -609,6 +709,156 @@ mod tests {
     }
 
     #[test]
+    fn requested_artifact_feedback_then_missing_write_then_complete() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "data/sample-sales.csv", "content": "product,total\nA,10\n"}),
+            )],
+        );
+        client.push_reply("Now I'll create the sales analysis report.", Vec::new());
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "reports/sales-analysis.md", "content": "# Sales Analysis\n\n## Top Products\nA\n"}),
+            )],
+        );
+        client.push_reply("done", Vec::new());
+        let mut session = SessionSnapshot::default();
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "Create data/sample-sales.csv and reports/sales-analysis.md.",
+            &config(temp.path().to_path_buf(), 5),
+        )
+        .unwrap();
+
+        assert_eq!(reply, "done");
+        assert!(temp.path().join("data/sample-sales.csv").is_file());
+        assert!(temp.path().join("reports/sales-analysis.md").is_file());
+        assert_eq!(client.feedback_messages.len(), 1);
+        assert!(
+            client.feedback_messages[0].contains("reports/sales-analysis.md"),
+            "got: {}",
+            client.feedback_messages[0]
+        );
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|m| m.content.starts_with(MINIMAL_FEEDBACK_PREFIX)),
+            "ephemeral feedback must not be persisted to the session"
+        );
+    }
+
+    #[test]
+    fn requested_artifact_feedback_accepts_second_no_tool_response() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "data/sample-sales.csv", "content": "product,total\nA,10\n"}),
+            )],
+        );
+        client.push_reply("Now I'll create the sales analysis report.", Vec::new());
+        client.push_reply("Now I'll create the sales analysis report.", Vec::new());
+        let mut session = SessionSnapshot::default();
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "Create data/sample-sales.csv and reports/sales-analysis.md.",
+            &config(temp.path().to_path_buf(), 4),
+        )
+        .unwrap();
+
+        assert_eq!(reply, "Now I'll create the sales analysis report.");
+        assert_eq!(client.feedback_messages.len(), 1);
+        assert!(client.feedback_messages[0].contains("reports/sales-analysis.md"));
+    }
+
+    #[test]
+    fn requested_artifact_feedback_ignores_existing_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/dateRange.js"), "old").unwrap();
+        let mut client = MockClient::default();
+        client.push_reply("done", Vec::new());
+        let mut session = SessionSnapshot::default();
+        let mut cfg = config(temp.path().to_path_buf(), 4);
+        cfg.completion_without_write_feedback = false;
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "Explain src/dateRange.js.",
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(reply, "done");
+        assert!(client.feedback_messages.is_empty());
+    }
+
+    #[test]
+    fn requested_artifact_feedback_can_be_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "data/sample-sales.csv", "content": "product,total\nA,10\n"}),
+            )],
+        );
+        client.push_reply("Now I'll create the sales analysis report.", Vec::new());
+        let mut session = SessionSnapshot::default();
+        let mut cfg = config(temp.path().to_path_buf(), 4);
+        cfg.requested_artifact_feedback = false;
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "Create data/sample-sales.csv and reports/sales-analysis.md.",
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(reply, "Now I'll create the sales analysis report.");
+        assert!(client.feedback_messages.is_empty());
+    }
+
+    #[test]
+    fn requested_artifact_path_extraction_is_safe_and_explicit() {
+        assert_eq!(
+            extract_requested_artifact_paths(
+                "Create data/sample-sales.csv and reports/sales-analysis.md."
+            ),
+            vec![
+                "data/sample-sales.csv".to_string(),
+                "reports/sales-analysis.md".to_string()
+            ]
+        );
+        assert_eq!(
+            extract_requested_artifact_paths("Fix src/dateRange.js and README.md."),
+            vec!["README.md".to_string(), "src/dateRange.js".to_string()]
+        );
+        assert!(extract_requested_artifact_paths("Use http://example.test/a.md").is_empty());
+        assert!(extract_requested_artifact_paths("Create ../outside.md").is_empty());
+    }
+
+    #[test]
     fn completion_without_write_feedback_accepts_second_no_tool_response() {
         let temp = tempfile::tempdir().unwrap();
         let mut client = MockClient::default();
@@ -620,7 +870,7 @@ mod tests {
             &mut client,
             "qwen3:8b",
             &mut session,
-            "create README.md",
+            "create a README file",
             &config(temp.path().to_path_buf(), 4),
         )
         .unwrap();
