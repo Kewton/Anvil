@@ -3,8 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use regex::Regex;
+
 use crate::modes::plan_act::ExecutionMode;
 use crate::ollama::client::{AssistantReply, OllamaClient, should_use_native_tool_calls};
+use crate::ollama::xml_fallback::ToolCall;
 use crate::session::store::{ConversationMessage, SessionSnapshot};
 use crate::tools::registry::{ToolContext, ToolRegistry, ToolSpec};
 use crate::util::workspace_paths::WorkspacePolicy;
@@ -18,6 +21,7 @@ pub const NO_COMPLETION_WITHOUT_WRITE_FEEDBACK_FLAG: &str =
 pub const NO_REQUESTED_ARTIFACT_FEEDBACK_FLAG: &str =
     "ANVIL_NO_MINIMAL_REQUESTED_ARTIFACT_FEEDBACK";
 const MAX_PLANNED_ACTION_WITHOUT_TOOL_FEEDBACKS: usize = 3;
+const MAX_MISSING_RELATIVE_IMPORT_FEEDBACKS: usize = 3;
 
 pub trait MinimalChatClient {
     fn chat(
@@ -71,6 +75,8 @@ pub fn run_session<C: MinimalChatClient>(
     let mut write_or_edit_calls_seen = false;
     let mut completion_without_write_feedback_sent = false;
     let mut planned_action_without_tool_feedbacks = 0usize;
+    let mut missing_relative_import_feedbacks = 0usize;
+    let mut changed_source_paths = BTreeSet::new();
     let requested_artifact_paths = extract_requested_artifact_paths(user_prompt);
 
     session
@@ -152,6 +158,22 @@ pub fn run_session<C: MinimalChatClient>(
                 pending_feedback = Some(feedback);
                 continue;
             }
+            let missing_relative_imports =
+                missing_relative_imports(&config.work_root, &changed_source_paths);
+            if config.mode == ExecutionMode::Act && !missing_relative_imports.is_empty() {
+                if missing_relative_import_feedbacks >= MAX_MISSING_RELATIVE_IMPORT_FEEDBACKS {
+                    discard_last_no_tool_assistant_message(session);
+                    return Err(format!(
+                        "assistant left unresolved relative imports: {}",
+                        missing_relative_imports.join("; ")
+                    ));
+                }
+                missing_relative_import_feedbacks += 1;
+                discard_last_no_tool_assistant_message(session);
+                pending_feedback =
+                    Some(feedback_state.missing_relative_imports(&missing_relative_imports));
+                continue;
+            }
             if config.mode == ExecutionMode::Act
                 && let Some(feedback) = feedback_state.planned_action_without_tool(&reply.content)
             {
@@ -197,11 +219,18 @@ pub fn run_session<C: MinimalChatClient>(
         };
 
         for call in tool_calls {
+            let changed_source_path = changed_source_path(&config.work_root, &call);
             if is_write_or_edit_tool(&call.name) {
                 write_or_edit_calls_seen = true;
             }
-            let result = match registry.execute(&call.name, &call.arguments, &tool_context) {
-                Ok(result) => result,
+            let execution = registry.execute(&call.name, &call.arguments, &tool_context);
+            let result = match execution {
+                Ok(result) => {
+                    if let Some(path) = changed_source_path {
+                        changed_source_paths.insert(path);
+                    }
+                    result
+                }
                 Err(err) => {
                     if call.name == "Edit"
                         && let Some(feedback) = feedback_state.edit_anchor_mismatch(&err)
@@ -258,6 +287,135 @@ fn missing_requested_artifact_paths(work_root: &Path, paths: &[String]) -> Vec<S
         .filter(|path| !work_root.join(path).is_file())
         .cloned()
         .collect()
+}
+
+fn missing_relative_imports(work_root: &Path, source_paths: &BTreeSet<String>) -> Vec<String> {
+    let mut missing = BTreeSet::new();
+    for source_path in source_paths {
+        let source_absolute = work_root.join(source_path);
+        let Ok(content) = std::fs::read_to_string(&source_absolute) else {
+            continue;
+        };
+        for specifier in extract_relative_import_specifiers(&content) {
+            let Some(candidates) = resolve_relative_module_candidates(source_path, &specifier)
+            else {
+                continue;
+            };
+            if candidates
+                .iter()
+                .any(|candidate| work_root.join(candidate).is_file())
+            {
+                continue;
+            }
+            let candidate_list = candidates
+                .iter()
+                .filter_map(|candidate| path_to_slash_string(candidate))
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(", ");
+            missing.insert(format!(
+                "{source_path} imports {specifier} (expected one of: {candidate_list})"
+            ));
+        }
+    }
+    missing.into_iter().collect()
+}
+
+fn changed_source_path(work_root: &Path, call: &ToolCall) -> Option<String> {
+    if !is_write_or_edit_tool(&call.name) {
+        return None;
+    }
+    let raw_path = call.arguments.get("path")?.as_str()?;
+    let normalized = normalize_tool_path(work_root, raw_path)?;
+    if is_frontend_source_path(&normalized) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
+fn normalize_tool_path(work_root: &Path, raw_path: &str) -> Option<String> {
+    let path = Path::new(raw_path);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(work_root).ok()?
+    } else {
+        path
+    };
+    let normalized = normalize_relative_path(relative)?;
+    path_to_slash_string(&normalized)
+}
+
+fn is_frontend_source_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".d.ts") {
+        return false;
+    }
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "jsx" | "ts" | "tsx"))
+}
+
+fn extract_relative_import_specifiers(content: &str) -> BTreeSet<String> {
+    let mut specifiers = BTreeSet::new();
+    let patterns = [
+        r#"\b(?:import|export)\s+(?:[^'"]*?\s+from\s+)?['"]([^'"]+)['"]"#,
+        r#"\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)"#,
+        r#"\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)"#,
+    ];
+    for pattern in patterns {
+        let regex = Regex::new(pattern).expect("valid relative import regex");
+        for captures in regex.captures_iter(content) {
+            let specifier = captures[1].to_string();
+            if specifier.starts_with("./") || specifier.starts_with("../") {
+                specifiers.insert(specifier);
+            }
+        }
+    }
+    specifiers
+}
+
+fn resolve_relative_module_candidates(source_path: &str, specifier: &str) -> Option<Vec<PathBuf>> {
+    let source = Path::new(source_path);
+    let base_dir = source.parent().unwrap_or_else(|| Path::new(""));
+    let base = normalize_relative_path(&base_dir.join(specifier))?;
+    Some(module_candidate_paths(&base))
+}
+
+fn module_candidate_paths(base: &Path) -> Vec<PathBuf> {
+    if base.extension().is_some() {
+        return vec![base.to_path_buf()];
+    }
+
+    let mut candidates = Vec::new();
+    for ext in ["ts", "tsx", "js", "jsx", "mjs", "cjs", "json"] {
+        candidates.push(base.with_extension(ext));
+    }
+    for ext in ["ts", "tsx", "js", "jsx", "mjs", "cjs", "json"] {
+        candidates.push(base.join(format!("index.{ext}")));
+    }
+    candidates
+}
+
+fn normalize_relative_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
+}
+
+fn path_to_slash_string(path: &Path) -> Option<String> {
+    Some(path.to_str()?.replace('\\', "/"))
 }
 
 fn extract_requested_artifact_paths(prompt: &str) -> Vec<String> {
@@ -893,7 +1051,7 @@ mod tests {
             "",
             vec![tool_call(
                 "Write",
-                json!({"path": "app/page.tsx", "content": "import Game from './Game';\nexport default function Home(){ return <Game /> }\n"}),
+                json!({"path": "app/page.tsx", "content": "export default function Home(){ return <main /> }\n"}),
             )],
         );
         client.push_reply(
@@ -932,6 +1090,55 @@ mod tests {
             !session.messages.iter().any(|message| message.content
                 == "Now I'll create the main game component with canvas rendering."),
             "failed no-tool planning replies must not remain in prompt history"
+        );
+    }
+
+    #[test]
+    fn missing_relative_import_gets_repair_prompt_before_final() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "app/page.tsx", "content": "import dynamic from 'next/dynamic';\nconst GameCanvas = dynamic(() => import('../components/GameCanvas'), { ssr: false });\nexport default function Home(){ return <GameCanvas /> }\n"}),
+            )],
+        );
+        client.push_reply("Created the app.", Vec::new());
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "components/GameCanvas.tsx", "content": "export default function GameCanvas(){ return <canvas /> }\n"}),
+            )],
+        );
+        client.push_reply("Created the app and GameCanvas component.", Vec::new());
+        let mut session = SessionSnapshot::default();
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "create a Next.js app",
+            &config(temp.path().to_path_buf(), 6),
+        )
+        .unwrap();
+
+        assert_eq!(reply, "Created the app and GameCanvas component.");
+        assert!(temp.path().join("app/page.tsx").is_file());
+        assert!(temp.path().join("components/GameCanvas.tsx").is_file());
+        assert_eq!(client.feedback_messages.len(), 1);
+        assert!(
+            client.feedback_messages[0].contains("app/page.tsx imports ../components/GameCanvas"),
+            "got: {}",
+            client.feedback_messages[0]
+        );
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|message| message.content == "Created the app."),
+            "failed final response must not remain in prompt history"
         );
     }
 

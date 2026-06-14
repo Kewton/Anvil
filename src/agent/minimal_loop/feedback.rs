@@ -51,6 +51,13 @@ impl FeedbackState {
         ))
     }
 
+    pub fn missing_relative_imports(&self, missing_imports: &[String]) -> String {
+        let list = missing_imports.join("; ");
+        format!(
+            "{MINIMAL_FEEDBACK_PREFIX}\nSome relative imports in edited JS/TS files do not resolve: {list}. Create the missing file(s) with Write or edit the import path before giving a final answer."
+        )
+    }
+
     pub fn planned_action_without_tool(&mut self, assistant_content: &str) -> Option<String> {
         if !looks_like_planned_tool_action(assistant_content) {
             return None;
