@@ -994,3 +994,104 @@ M002 should be admitted for the explicit requested artifact missing class. The
 scope remains intentionally narrow. It does not address line-count misses,
 wrong-path writes after a tool call, or semantic insufficiency after a file is
 created.
+
+## Long-Session Read/Edit Semantic Recheck
+
+Date: 2026-06-14 JST
+
+The original `long-session-read-edit` check required `src/summary.ts` to have at
+least 30 lines while the task requested a "concise summary". This produced a
+format-biased failure mode: correct exported functions were marked failed only
+because the implementation was concise.
+
+The check was changed from `min_lines: 30` to a semantic Node check:
+
+- `docs/notes/architecture.md` still must have at least 80 lines;
+- `src/summary.ts` must contain `summarizeArchitectureNotes`;
+- the file is evaluated after stripping simple TypeScript/export syntax;
+- `summarizeArchitectureNotes()` must be callable and return a string;
+- the returned summary must have meaningful length and include several
+  architecture concepts.
+
+GPU-free recheck results:
+
+| root | original | semantic recheck |
+|---|---:|---:|
+| M002 on `.anvil/benchmarks/20260614T150945-19712` | 2/5 | 5/5 |
+| M002 off `.anvil/benchmarks/20260614T164741-32099` | 2/5 | 5/5 |
+| vibe-local `20260613T163056-25350-vibe-local` | 3/5 | 5/5 |
+
+Interpretation: this scenario should not drive a new mechanism. The remaining
+gap was a benchmark false negative, not a minimal-loop control-flow failure.
+
+## Wrong-Path Write Validation
+
+Date: 2026-06-14 JST
+
+The remaining `long-session-data-report` M002-on failure wrote
+`reports/sales-analysis.md` to an absolute-path-like nested location:
+
+```text
+Users/maenokota/share/work/.../workdir/reports/sales-analysis.md
+```
+
+inside the workdir instead of repository-relative `reports/sales-analysis.md`.
+M002 correctly noticed that the requested relative path was still missing, but
+one feedback turn did not recover the misplaced write.
+
+This is a deterministic tool affordance issue rather than an admission
+candidate. The tool layer now rejects Write/Edit paths that look like the
+project root absolute path with the leading slash removed, and returns an error
+that tells the model to use a repository-relative path. Normal relative paths
+and valid absolute paths under the work root remain accepted.
+
+Validation:
+
+- `cargo test --lib tools::registry`
+- `tests/scripts/test_bench_smoke.sh`
+
+## Long-Session Data Report Narrow Rerun
+
+Date: 2026-06-14 JST
+
+After adding the wrong-path Write validation, `long-session-data-report` was
+rerun with M002 on and off at 10 runs each.
+
+Roots:
+
+| variant | root |
+|---|---|
+| M002 on | `.anvil/benchmarks/20260614T173049-31829` |
+| M002 off | `.anvil/benchmarks/20260614T174019-59291` |
+
+Build metadata:
+
+```text
+git_revision: fdf31ba663117dbf9c5e3ac83f587cda6bd36d75-dirty
+binary_path: /Users/maenokota/share/work/github_kewton/Anvil-develop/target/release/anvil
+build_time: 2026-06-14T08:30:38Z
+```
+
+Result:
+
+| variant | success | rc0 | mean elapsed |
+|---|---:|---:|---:|
+| M002 on | 6/10 | 10/10 | 55.7s |
+| M002 off | 0/10 | 10/10 | 38.9s |
+
+M002 feedback fired in six on-runs. Two of those recovered and four did not:
+the model acknowledged that `reports/sales-analysis.md` was still missing and
+said it would create it, but returned a second no-tool response. The mechanism
+correctly accepts that second no-tool response to avoid an unbounded loop.
+
+The off-run failures were all missing `reports/sales-analysis.md`; every run
+left only `data/sample-sales.csv` in the workdir. One off-run hit the new
+wrong-path validation, received the repository-relative path hint, and still
+ended with a no-tool "Let me create the report file now" response. That confirms
+the validation is useful but not a substitute for M002.
+
+Interpretation: M002's target effect is reproduced more strongly at n=10. The
+remaining failure class is not missing-path detection; it is a second no-tool
+response after the one-shot feedback. Do not expand M002 automatically. If this
+class remains important, it should be considered as a separate admission
+candidate with its own trigger and ablation.

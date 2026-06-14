@@ -325,9 +325,59 @@ cases:
         - path: docs/notes/architecture.md
           min_lines: 80
         - path: src/summary.ts
-          min_lines: 30
       commands:
         - grep -R "summarizeArchitectureNotes" src/summary.ts
+        - |
+          node - <<'NODE'
+          const fs = require("fs");
+
+          const notes = fs.readFileSync("docs/notes/architecture.md", "utf8");
+          if (notes.split(/\r?\n/).length < 80) {
+            throw new Error("architecture notes are too short");
+          }
+
+          let src = fs.readFileSync("src/summary.ts", "utf8");
+          if (!/summarizeArchitectureNotes/.test(src)) {
+            throw new Error("missing summarizeArchitectureNotes");
+          }
+
+          src = src
+            .replace(/export\s+default\s+/g, "")
+            .replace(/export\s+/g, "")
+            .replace(/\bconst\s+summarizeArchitectureNotes\b/g, "var summarizeArchitectureNotes")
+            .replace(/:\s*string\b/g, "");
+
+          eval(src);
+
+          if (typeof summarizeArchitectureNotes !== "function") {
+            throw new Error("summarizeArchitectureNotes is not a function");
+          }
+
+          const summary = String(summarizeArchitectureNotes());
+          if (summary.length < 300) {
+            throw new Error("summary is too short");
+          }
+
+          const terms = [
+            "architecture",
+            "module",
+            "agent",
+            "tool",
+            "context",
+            "testing",
+            "deployment",
+            "security",
+            "data",
+            "error",
+            "scalability",
+            "local",
+          ];
+          const lower = summary.toLowerCase();
+          const hits = terms.filter((term) => lower.includes(term)).length;
+          if (hits < 4) {
+            throw new Error("summary does not cover enough architecture concepts");
+          }
+          NODE
 
   - name: long-session-large-component
     task_kind: coding

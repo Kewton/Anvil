@@ -9,6 +9,7 @@ addition must have a measured reason, an off flag, and a current audit status.
 | id | mechanism | status | admitted by | final audit date |
 |---|---|---|---|---|
 | M001 | completion-without-write feedback | admitted | #1036 | 2026-06-13 |
+| M002 | requested-artifact missing feedback | admitted | `fdf31ba` | 2026-06-14 |
 
 ## M001: Completion-Without-Write Feedback
 
@@ -71,3 +72,50 @@ Audit notes:
   from 50 to 16. Mean elapsed time increased from 28.5s to 39.7s.
 - Future reviews should compare against this ledger before admitting another
   feedback or recovery mechanism.
+
+## M002: Requested-Artifact Missing Feedback
+
+| field | value |
+|---|---|
+| mechanism | requested-artifact missing feedback |
+| PR | local commit `fdf31ba` |
+| status | admitted |
+| trigger | Act-mode no-tool completion while one or more explicit file-like paths from the original user prompt do not exist under the work root |
+| action | Inject one user-role ephemeral feedback message naming the missing requested path(s); accept the second no-tool response |
+| target scenarios | `long-session-data-report` |
+| injection size | dynamic by missing path list; representative `reports/sales-analysis.md` feedback was 168 chars, 23 whitespace words |
+| off flag | `ANVIL_NO_MINIMAL_REQUESTED_ARTIFACT_FEEDBACK=1` |
+| bench option | `--no-minimal-requested-artifact-feedback` |
+| admission model | `qwen3.6:27b-coding-nvfp4` |
+| admission benchmark | `minimal-loop-expanded`, 8-scenario heavy/light slice x 5 runs |
+| admission report | [vibe-local-win-factor-triage.md](triage/vibe-local-win-factor-triage.md#explicit-requested-artifact-gate-ablation) |
+| baseline report | [vibe-local-win-factor-triage.md](triage/vibe-local-win-factor-triage.md#runtime-guard-rollback-rerun) |
+| final audit date | 2026-06-14 |
+
+Admission result:
+
+| metric | M002 off | M002 on | delta |
+|---|---:|---:|---:|
+| 8-scenario slice success | 33/40 | 36/40 | +3 |
+| `long-session-data-report` | 2/5 | 4/5 | +2 |
+| lightweight non-regression set | 25/25 | 25/25 | +0 |
+| `long-session-data-report` narrow rerun after wrong-path validation | 0/10 | 6/10 | +6 |
+
+Audit notes:
+
+- The off-run failures in `long-session-data-report` exactly matched the
+  trigger: the model wrote `data/sample-sales.csv`, then stopped with no-tool
+  prose such as `Now I'll create the sales analysis report`, leaving
+  `reports/sales-analysis.md` missing.
+- With M002 enabled, the same scenario improved to 4/5. One recovered run wrote
+  the missing report immediately after the feedback.
+- The mechanism is intentionally narrow. It does not address line-count misses,
+  semantic insufficiency after a file exists, or writes to an incorrect
+  absolute-path-like nested location.
+- A later narrow rerun after adding wrong-path Write validation strengthened the
+  target evidence: M002 on scored 6/10 while M002 off scored 0/10 on
+  `long-session-data-report`. The remaining on failures were second no-tool
+  responses after the one allowed feedback turn, not missing detection.
+- Future audits should keep M002 separate from verifier or continuation
+  proposals. Its justification is observable requested-path existence, not
+  phrase classification or task-intent inference.

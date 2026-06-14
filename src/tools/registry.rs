@@ -528,7 +528,38 @@ fn resolve_write_path(
     {
         return Ok(path);
     }
+    reject_nested_absolute_like_write_path(root, raw)?;
     resolve_user_path(root, raw)
+}
+
+fn reject_nested_absolute_like_write_path(root: &std::path::Path, raw: &str) -> Result<(), String> {
+    let input = std::path::Path::new(raw);
+    if input.is_absolute() || raw.starts_with("tmp-tests/") {
+        return Ok(());
+    }
+
+    let root_normals = normal_components(root);
+    let input_normals = normal_components(input);
+    if root_normals.is_empty()
+        || input_normals.len() <= root_normals.len()
+        || !input_normals.starts_with(&root_normals)
+    {
+        return Ok(());
+    }
+
+    let relative = input_normals[root_normals.len()..].join("/");
+    Err(format!(
+        "Write/Edit path looks like an absolute project path without a leading slash: {raw}. Use repository-relative paths such as {relative}."
+    ))
+}
+
+fn normal_components(path: &std::path::Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Issue #458: resolve a `tmp-tests/<rel>` request to the session-scoped
@@ -927,6 +958,94 @@ mod tests {
         assert!(
             description.contains("Write creates parent directories automatically"),
             "Bash description should name Write as the directory-creation affordance: {description}"
+        );
+    }
+
+    #[test]
+    fn write_rejects_absolute_path_text_missing_leading_slash() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
+        };
+        let raw_root = root
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        let raw_path = format!("{raw_root}/reports/sales-analysis.md");
+
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path": raw_path, "content": "x"}),
+                &context,
+            )
+            .unwrap_err();
+
+        assert!(err.contains("absolute project path"), "got: {err}");
+        assert!(err.contains("repository-relative paths"), "got: {err}");
+        assert!(err.contains("reports/sales-analysis.md"), "got: {err}");
+        assert!(!root.join(raw_root).exists());
+    }
+
+    #[test]
+    fn write_path_validation_keeps_relative_and_root_absolute_paths() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
+        };
+
+        registry
+            .execute(
+                "Write",
+                &json!({"path": "reports/sales-analysis.md", "content": "relative"}),
+                &context,
+            )
+            .unwrap();
+        registry
+            .execute(
+                "Write",
+                &json!({"path": root.join("reports/absolute.md").to_string_lossy(), "content": "absolute"}),
+                &context,
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("reports/sales-analysis.md")).unwrap(),
+            "relative"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("reports/absolute.md")).unwrap(),
+            "absolute"
         );
     }
 
