@@ -369,12 +369,20 @@ fn build_request_messages(
             .messages
             .iter()
             .filter(|message| message.role != "system")
-            .cloned(),
+            .map(prompt_history_message),
     );
     if let Some(feedback) = ephemeral_feedback {
         messages.push(ConversationMessage::user(feedback.to_string()));
     }
     messages
+}
+
+fn prompt_history_message(message: &ConversationMessage) -> ConversationMessage {
+    let mut message = message.clone();
+    if message.role == "assistant" && !message.tool_calls.is_empty() {
+        message.content.clear();
+    }
+    message
 }
 
 fn prompt_tool_mode(native_tools_enabled: bool) -> PromptToolMode {
@@ -909,6 +917,46 @@ mod tests {
                 .iter()
                 .any(|message| message.content == "Now let me create the Next.js app structure."),
             "failed no-tool planning replies must be discarded before retry"
+        );
+    }
+
+    #[test]
+    fn tool_call_assistant_preamble_is_not_reprompted() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = SessionSnapshot::default();
+        session.messages.push(ConversationMessage::user(
+            "create a Next.js app".to_string(),
+        ));
+        session.messages.push(ConversationMessage::assistant(
+            "I'll create the project step by step.".to_string(),
+            vec![tool_call(
+                "Write",
+                json!({"path": "package.json", "content": "{}\n"}),
+            )],
+        ));
+        session.messages.push(ConversationMessage::tool(
+            "Write".to_string(),
+            "wrote package.json".to_string(),
+        ));
+
+        let messages = build_request_messages(
+            &session,
+            &ToolRegistry::default().specs(),
+            temp.path(),
+            PromptToolMode::Native,
+            None,
+        );
+
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == "assistant" && !message.tool_calls.is_empty())
+            .expect("assistant tool call history");
+        assert_eq!(assistant.content, "");
+        assert_eq!(assistant.tool_calls[0].name, "Write");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.role == "tool" && message.content == "wrote package.json")
         );
     }
 
