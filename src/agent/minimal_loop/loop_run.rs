@@ -70,7 +70,6 @@ pub fn run_session<C: MinimalChatClient>(
     let mut tool_calls_seen = false;
     let mut write_or_edit_calls_seen = false;
     let mut completion_without_write_feedback_sent = false;
-    let mut no_tool_recovery_feedback_sent = false;
     let mut planned_action_without_tool_feedbacks = 0usize;
     let requested_artifact_paths = extract_requested_artifact_paths(user_prompt);
 
@@ -139,7 +138,6 @@ pub fn run_session<C: MinimalChatClient>(
             ) && let Some(feedback) = feedback_state.completion_without_write()
             {
                 completion_without_write_feedback_sent = true;
-                no_tool_recovery_feedback_sent = true;
                 discard_last_no_tool_assistant_message(session);
                 pending_feedback = Some(feedback);
                 continue;
@@ -150,12 +148,11 @@ pub fn run_session<C: MinimalChatClient>(
                 && let Some(feedback) =
                     feedback_state.requested_artifacts_missing(&missing_requested_artifacts)
             {
-                no_tool_recovery_feedback_sent = true;
                 discard_last_no_tool_assistant_message(session);
                 pending_feedback = Some(feedback);
                 continue;
             }
-            if no_tool_recovery_feedback_sent
+            if config.mode == ExecutionMode::Act
                 && let Some(feedback) = feedback_state.planned_action_without_tool(&reply.content)
             {
                 if planned_action_without_tool_feedbacks
@@ -177,7 +174,6 @@ pub fn run_session<C: MinimalChatClient>(
                 && !completion_without_write_feedback_sent
                 && let Some(feedback) = feedback_state.missing_tool_call(user_prompt)
             {
-                no_tool_recovery_feedback_sent = true;
                 discard_last_no_tool_assistant_message(session);
                 pending_feedback = Some(feedback);
                 continue;
@@ -890,6 +886,56 @@ mod tests {
     }
 
     #[test]
+    fn planned_action_after_write_gets_tool_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "app/page.tsx", "content": "import Game from './Game';\nexport default function Home(){ return <Game /> }\n"}),
+            )],
+        );
+        client.push_reply(
+            "Now I'll create the main game component with canvas rendering.",
+            Vec::new(),
+        );
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "app/Game.tsx", "content": "export default function Game(){ return <canvas /> }\n"}),
+            )],
+        );
+        client.push_reply("Created the page and game component.", Vec::new());
+        let mut session = SessionSnapshot::default();
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "create a Next.js app",
+            &config(temp.path().to_path_buf(), 6),
+        )
+        .unwrap();
+
+        assert_eq!(reply, "Created the page and game component.");
+        assert!(temp.path().join("app/page.tsx").is_file());
+        assert!(temp.path().join("app/Game.tsx").is_file());
+        assert_eq!(client.feedback_messages.len(), 1);
+        assert!(
+            client.feedback_messages[0].contains("described a next action"),
+            "got: {}",
+            client.feedback_messages[0]
+        );
+        assert!(
+            !session.messages.iter().any(|message| message.content
+                == "Now I'll create the main game component with canvas rendering."),
+            "failed no-tool planning replies must not remain in prompt history"
+        );
+    }
+
+    #[test]
     fn repeated_planned_action_without_tool_returns_error() {
         let temp = tempfile::tempdir().unwrap();
         let mut client = MockClient::default();
@@ -995,7 +1041,7 @@ mod tests {
                 json!({"path": "data/sample-sales.csv", "content": "product,total\nA,10\n"}),
             )],
         );
-        client.push_reply("Now I'll create the sales analysis report.", Vec::new());
+        client.push_reply("Created data/sample-sales.csv.", Vec::new());
         let mut session = SessionSnapshot::default();
         let mut cfg = config(temp.path().to_path_buf(), 4);
         cfg.requested_artifact_feedback = false;
@@ -1009,7 +1055,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(reply, "Now I'll create the sales analysis report.");
+        assert_eq!(reply, "Created data/sample-sales.csv.");
         assert!(client.feedback_messages.is_empty());
     }
 
