@@ -1095,3 +1095,74 @@ remaining failure class is not missing-path detection; it is a second no-tool
 response after the one-shot feedback. Do not expand M002 automatically. If this
 class remains important, it should be considered as a separate admission
 candidate with its own trigger and ablation.
+
+## Post-M002 No-Tool Watchlist
+
+Date: 2026-06-14 JST
+
+Decision: do not implement a second feedback mechanism now. Keep the remaining
+post-M002 no-tool pattern on the watchlist.
+
+### Does the pattern appear outside `long-session-data-report`?
+
+No, not in the current M002-on evidence:
+
+| root | scenarios searched | M002 feedback hits |
+|---|---:|---|
+| `.anvil/benchmarks/20260614T150945-19712` | 8-scenario slice | `long-session-data-report` run-4, run-5 |
+| `.anvil/benchmarks/20260614T173049-31829` | `long-session-data-report` n=10 | run-2, run-3, run-4, run-5, run-6, run-10 |
+
+No other scenario in the 8-scenario slice triggered requested-artifact feedback.
+
+### Frequency after feedback
+
+| root | feedback hits | recovered | still missing requested path |
+|---|---:|---:|---:|
+| 8-scenario slice | 2 | 1 | 1 |
+| `long-session-data-report` n=10 | 6 | 2 | 4 |
+
+The n=10 residual failures were:
+
+| run | post-feedback behavior |
+|---:|---|
+| 2 | no-tool response: says `reports/sales-analysis.md` is missing and says it will create it |
+| 3 | no-tool response: same shape |
+| 5 | no-tool response: same shape |
+| 6 | tool call exists, but it rewrites `data/sample-sales.csv` instead of creating the report |
+
+### Would a second feedback likely help?
+
+Possibly, but the evidence is too narrow to justify admitting M003.
+
+The three pure no-tool residuals look superficially recoverable because the
+model explicitly acknowledges the missing report. However, a second feedback
+would break the current one-shot feedback invariant and could create a new
+feedback chain. Run-6 is also not a pure no-tool case: the model used a tool but
+repeated the wrong artifact, so another missing-path reminder is not guaranteed
+to fix it.
+
+Treat the potential upside as bounded and scenario-local for now.
+
+### Risk for tasks that do not require file changes
+
+The current benchmark does not directly cover this risk. Its non-coding cases
+still ask for files to be created:
+
+- `non-coding-research-brief`: `Create reports/local-llm-brief.md`
+- `non-coding-runbook`: `Create runbooks/incident-triage.md`
+
+In real use, a user may ask about a missing path without requesting creation,
+for example `Explain docs/foo.md` in an empty workspace. M002 is partly
+mitigated by the wording "Create them with Write now, or explain the blocker if
+they should not be created", but adding a second feedback would make that risk
+stronger by repeatedly pushing on a path that may be informational rather than a
+deliverable.
+
+### Recommendation
+
+No implementation change.
+
+Keep this as a watchlist pattern. Reopen admission only if future full or
+narrow reruns show the same post-feedback no-tool residual across multiple
+scenarios, and only with a separate off flag and ablation. Do not broaden M002
+itself.
