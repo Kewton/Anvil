@@ -6,6 +6,7 @@ pub struct FeedbackState {
     completion_without_write_sent: bool,
     requested_artifact_sent: bool,
     missing_tool_sent: bool,
+    planned_action_without_tool_sent: bool,
     edit_anchor_sent: bool,
 }
 
@@ -48,6 +49,18 @@ impl FeedbackState {
         let list = missing_paths.join(", ");
         Some(format!(
             "{MINIMAL_FEEDBACK_PREFIX}\nThe requested file(s) are still missing: {list}. Create them with Write now, or explain the blocker if they should not be created."
+        ))
+    }
+
+    pub fn planned_action_without_tool(&mut self, assistant_content: &str) -> Option<String> {
+        if self.planned_action_without_tool_sent
+            || !looks_like_planned_tool_action(assistant_content)
+        {
+            return None;
+        }
+        self.planned_action_without_tool_sent = true;
+        Some(format!(
+            "{MINIMAL_FEEDBACK_PREFIX}\nYour previous response described a next action, but no tool call was issued. If that action is needed, call the tool now. If the work is already complete or no tool is needed, answer with completed work only."
         ))
     }
 
@@ -99,6 +112,52 @@ fn looks_like_repo_action(prompt: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+fn looks_like_planned_tool_action(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    let has_future_marker = [
+        "i will ",
+        "i'll ",
+        "let me ",
+        "now let me ",
+        "next, i ",
+        "i am going to ",
+        "i'm going to ",
+        "これから",
+        "今から",
+        "次に",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    if !has_future_marker {
+        return false;
+    }
+
+    [
+        "create",
+        "write",
+        "edit",
+        "modify",
+        "read",
+        "inspect",
+        "check",
+        "verify",
+        "test",
+        "run",
+        "build",
+        "起動",
+        "作成",
+        "書き",
+        "編集",
+        "修正",
+        "確認",
+        "検証",
+        "実行",
+        "ビルド",
+    ]
+    .iter()
+    .any(|verb| lower.contains(verb))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,6 +170,16 @@ mod tests {
         assert!(state.empty_response().is_none());
         assert!(state.completion_without_write().is_some());
         assert!(state.completion_without_write().is_none());
+        assert!(
+            state
+                .planned_action_without_tool("Now let me create the files.")
+                .is_some()
+        );
+        assert!(
+            state
+                .planned_action_without_tool("Now let me create the files.")
+                .is_none()
+        );
         assert!(
             state
                 .requested_artifacts_missing(&["src/main.rs".to_string()])
@@ -150,5 +219,29 @@ mod tests {
                 .is_none()
         );
         assert!(state.missing_tool_call("README を修正して").is_some());
+    }
+
+    #[test]
+    fn planned_action_feedback_requires_future_tool_action() {
+        let mut state = FeedbackState::default();
+        assert!(
+            state
+                .planned_action_without_tool("Now let me create the Next.js app.")
+                .is_some()
+        );
+
+        let mut state = FeedbackState::default();
+        assert!(
+            state
+                .planned_action_without_tool("The files are complete and tests passed.")
+                .is_none()
+        );
+
+        let mut state = FeedbackState::default();
+        assert!(
+            state
+                .planned_action_without_tool("I will explain the design tradeoffs.")
+                .is_none()
+        );
     }
 }

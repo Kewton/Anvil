@@ -69,6 +69,7 @@ pub fn run_session<C: MinimalChatClient>(
     let mut tool_calls_seen = false;
     let mut write_or_edit_calls_seen = false;
     let mut completion_without_write_feedback_sent = false;
+    let mut no_tool_recovery_feedback_sent = false;
     let requested_artifact_paths = extract_requested_artifact_paths(user_prompt);
 
     session
@@ -135,6 +136,7 @@ pub fn run_session<C: MinimalChatClient>(
             ) && let Some(feedback) = feedback_state.completion_without_write()
             {
                 completion_without_write_feedback_sent = true;
+                no_tool_recovery_feedback_sent = true;
                 pending_feedback = Some(feedback);
                 continue;
             }
@@ -144,6 +146,13 @@ pub fn run_session<C: MinimalChatClient>(
                 && let Some(feedback) =
                     feedback_state.requested_artifacts_missing(&missing_requested_artifacts)
             {
+                no_tool_recovery_feedback_sent = true;
+                pending_feedback = Some(feedback);
+                continue;
+            }
+            if no_tool_recovery_feedback_sent
+                && let Some(feedback) = feedback_state.planned_action_without_tool(&reply.content)
+            {
                 pending_feedback = Some(feedback);
                 continue;
             }
@@ -152,6 +161,7 @@ pub fn run_session<C: MinimalChatClient>(
                 && !completion_without_write_feedback_sent
                 && let Some(feedback) = feedback_state.missing_tool_call(user_prompt)
             {
+                no_tool_recovery_feedback_sent = true;
                 pending_feedback = Some(feedback);
                 continue;
             }
@@ -275,6 +285,7 @@ fn is_safe_requested_artifact_path(path: &str) -> bool {
         || path.ends_with('/')
         || path.len() > 240
         || !path.contains('.')
+        || is_framework_name_token(path)
     {
         return false;
     }
@@ -299,6 +310,16 @@ fn is_safe_requested_artifact_path(path: &str) -> bool {
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
         })
+}
+
+fn is_framework_name_token(path: &str) -> bool {
+    if path.contains('/') {
+        return false;
+    }
+    matches!(
+        path.to_ascii_lowercase().as_str(),
+        "next.js" | "node.js" | "react.js" | "vue.js" | "express.js" | "three.js" | "d3.js"
+    )
 }
 
 fn is_write_or_edit_tool(name: &str) -> bool {
@@ -758,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_artifact_feedback_accepts_second_no_tool_response() {
+    fn requested_artifact_feedback_accepts_blocker_response() {
         let temp = tempfile::tempdir().unwrap();
         let mut client = MockClient::default();
         client.push_reply(
@@ -769,7 +790,10 @@ mod tests {
             )],
         );
         client.push_reply("Now I'll create the sales analysis report.", Vec::new());
-        client.push_reply("Now I'll create the sales analysis report.", Vec::new());
+        client.push_reply(
+            "I cannot create reports/sales-analysis.md because the required input is missing.",
+            Vec::new(),
+        );
         let mut session = SessionSnapshot::default();
 
         let reply = run_session(
@@ -781,9 +805,48 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(reply, "Now I'll create the sales analysis report.");
+        assert_eq!(
+            reply,
+            "I cannot create reports/sales-analysis.md because the required input is missing."
+        );
         assert_eq!(client.feedback_messages.len(), 1);
         assert!(client.feedback_messages[0].contains("reports/sales-analysis.md"));
+    }
+
+    #[test]
+    fn planned_action_after_feedback_gets_one_more_tool_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply("Now let me create the Next.js app structure.", Vec::new());
+        client.push_reply("Now let me create the Next.js app structure.", Vec::new());
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "package.json", "content": "{\"scripts\":{\"dev\":\"next dev -p 3011\"}}\n"}),
+            )],
+        );
+        client.push_reply("Created package.json.", Vec::new());
+        let mut session = SessionSnapshot::default();
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "create a Next.js app",
+            &config(temp.path().to_path_buf(), 6),
+        )
+        .unwrap();
+
+        assert_eq!(reply, "Created package.json.");
+        assert!(temp.path().join("package.json").is_file());
+        assert_eq!(client.feedback_messages.len(), 2);
+        assert!(client.feedback_messages[0].contains("No file changes"));
+        assert!(
+            client.feedback_messages[1].contains("described a next action"),
+            "got: {}",
+            client.feedback_messages[1]
+        );
     }
 
     #[test]
@@ -856,6 +919,12 @@ mod tests {
         );
         assert!(extract_requested_artifact_paths("Use http://example.test/a.md").is_empty());
         assert!(extract_requested_artifact_paths("Create ../outside.md").is_empty());
+        assert!(extract_requested_artifact_paths("Create a Next.js app.").is_empty());
+        assert!(extract_requested_artifact_paths("next.jsアプリを作成").is_empty());
+        assert_eq!(
+            extract_requested_artifact_paths("Create package.json."),
+            vec!["package.json".to_string()]
+        );
     }
 
     #[test]

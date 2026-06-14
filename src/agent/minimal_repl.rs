@@ -1,4 +1,10 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::model_registry::RuntimeModels;
@@ -46,14 +52,17 @@ pub fn run(
             ReplInput::Empty => continue,
             ReplInput::Exit => break,
             ReplInput::Prompt(prompt) => {
-                let reply = run_turn(
-                    &config,
-                    &models.main,
-                    &mut client,
-                    &session_store,
-                    &mut session,
-                    &prompt,
-                )?;
+                let reply = {
+                    let _spinner = ReplSpinner::start("minimal running");
+                    run_turn(
+                        &config,
+                        &models.main,
+                        &mut client,
+                        &session_store,
+                        &mut session,
+                        &prompt,
+                    )?
+                };
                 if !reply.is_empty() {
                     println!("{reply}");
                 }
@@ -62,6 +71,59 @@ pub fn run(
     }
 
     Ok(())
+}
+
+struct ReplSpinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ReplSpinner {
+    fn start(label: &'static str) -> Self {
+        let disabled = std::env::var_os("ANVIL_NO_SPINNER").is_some_and(|value| !value.is_empty());
+        if disabled || !io::stderr().is_terminal() {
+            return Self {
+                stop: Arc::new(AtomicBool::new(true)),
+                handle: None,
+            };
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = stop.clone();
+        let handle = thread::Builder::new()
+            .name("anvil-minimal-repl-spinner".into())
+            .spawn(move || {
+                let frames = ["|", "/", "-", "\\"];
+                let start = Instant::now();
+                let mut index = 0usize;
+                while !stop_for_thread.load(Ordering::SeqCst) {
+                    let elapsed = start.elapsed().as_secs();
+                    eprint!(
+                        "\r{} {} ({}s)",
+                        frames[index % frames.len()],
+                        label,
+                        elapsed
+                    );
+                    let _ = io::stderr().flush();
+                    index = index.wrapping_add(1);
+                    thread::sleep(Duration::from_millis(120));
+                }
+                eprint!("\r\x1b[2K");
+                let _ = io::stderr().flush();
+            })
+            .ok();
+
+        Self { stop, handle }
+    }
+}
+
+impl Drop for ReplSpinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 pub(crate) fn run_turn<C: MinimalChatClient>(
