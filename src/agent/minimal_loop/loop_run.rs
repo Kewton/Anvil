@@ -17,6 +17,7 @@ pub const NO_COMPLETION_WITHOUT_WRITE_FEEDBACK_FLAG: &str =
     "ANVIL_NO_MINIMAL_COMPLETION_WITHOUT_WRITE_FEEDBACK";
 pub const NO_REQUESTED_ARTIFACT_FEEDBACK_FLAG: &str =
     "ANVIL_NO_MINIMAL_REQUESTED_ARTIFACT_FEEDBACK";
+const MAX_PLANNED_ACTION_WITHOUT_TOOL_FEEDBACKS: usize = 3;
 
 pub trait MinimalChatClient {
     fn chat(
@@ -70,6 +71,7 @@ pub fn run_session<C: MinimalChatClient>(
     let mut write_or_edit_calls_seen = false;
     let mut completion_without_write_feedback_sent = false;
     let mut no_tool_recovery_feedback_sent = false;
+    let mut planned_action_without_tool_feedbacks = 0usize;
     let requested_artifact_paths = extract_requested_artifact_paths(user_prompt);
 
     session
@@ -126,6 +128,7 @@ pub fn run_session<C: MinimalChatClient>(
             if reply.content.trim().is_empty()
                 && let Some(feedback) = feedback_state.empty_response()
             {
+                discard_last_no_tool_assistant_message(session);
                 pending_feedback = Some(feedback);
                 continue;
             }
@@ -137,6 +140,7 @@ pub fn run_session<C: MinimalChatClient>(
             {
                 completion_without_write_feedback_sent = true;
                 no_tool_recovery_feedback_sent = true;
+                discard_last_no_tool_assistant_message(session);
                 pending_feedback = Some(feedback);
                 continue;
             }
@@ -147,12 +151,24 @@ pub fn run_session<C: MinimalChatClient>(
                     feedback_state.requested_artifacts_missing(&missing_requested_artifacts)
             {
                 no_tool_recovery_feedback_sent = true;
+                discard_last_no_tool_assistant_message(session);
                 pending_feedback = Some(feedback);
                 continue;
             }
             if no_tool_recovery_feedback_sent
                 && let Some(feedback) = feedback_state.planned_action_without_tool(&reply.content)
             {
+                if planned_action_without_tool_feedbacks
+                    >= MAX_PLANNED_ACTION_WITHOUT_TOOL_FEEDBACKS
+                {
+                    discard_last_no_tool_assistant_message(session);
+                    return Err(
+                        "assistant repeatedly described a future tool action without issuing a tool call"
+                            .to_string(),
+                    );
+                }
+                planned_action_without_tool_feedbacks += 1;
+                discard_last_no_tool_assistant_message(session);
                 pending_feedback = Some(feedback);
                 continue;
             }
@@ -162,6 +178,7 @@ pub fn run_session<C: MinimalChatClient>(
                 && let Some(feedback) = feedback_state.missing_tool_call(user_prompt)
             {
                 no_tool_recovery_feedback_sent = true;
+                discard_last_no_tool_assistant_message(session);
                 pending_feedback = Some(feedback);
                 continue;
             }
@@ -320,6 +337,14 @@ fn is_framework_name_token(path: &str) -> bool {
         path.to_ascii_lowercase().as_str(),
         "next.js" | "node.js" | "react.js" | "vue.js" | "express.js" | "three.js" | "d3.js"
     )
+}
+
+fn discard_last_no_tool_assistant_message(session: &mut SessionSnapshot) {
+    if session.messages.last().is_some_and(|message| {
+        message.role == "assistant" && message.tool_calls.is_empty() && message.name.is_none()
+    }) {
+        session.messages.pop();
+    }
 }
 
 fn is_write_or_edit_tool(name: &str) -> bool {
@@ -846,6 +871,44 @@ mod tests {
             client.feedback_messages[1].contains("described a next action"),
             "got: {}",
             client.feedback_messages[1]
+        );
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|message| message.content == "Now let me create the Next.js app structure."),
+            "failed no-tool planning replies must not remain in prompt history"
+        );
+    }
+
+    #[test]
+    fn repeated_planned_action_without_tool_returns_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply("Now let me create the Next.js app structure.", Vec::new());
+        client.push_reply("Now let me create the Next.js app structure.", Vec::new());
+        client.push_reply("Now let me create the Next.js app structure.", Vec::new());
+        client.push_reply("Now let me create the Next.js app structure.", Vec::new());
+        client.push_reply("Now let me create the Next.js app structure.", Vec::new());
+        let mut session = SessionSnapshot::default();
+
+        let err = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "create a Next.js app",
+            &config(temp.path().to_path_buf(), 8),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("future tool action"));
+        assert_eq!(client.feedback_messages.len(), 4);
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|message| message.content == "Now let me create the Next.js app structure."),
+            "failed no-tool planning replies must be discarded before retry"
         );
     }
 

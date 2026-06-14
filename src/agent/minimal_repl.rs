@@ -52,7 +52,7 @@ pub fn run(
             ReplInput::Empty => continue,
             ReplInput::Exit => break,
             ReplInput::Prompt(prompt) => {
-                let reply = {
+                let result = {
                     let _spinner = ReplSpinner::start("minimal running");
                     run_turn(
                         &config,
@@ -61,7 +61,14 @@ pub fn run(
                         &session_store,
                         &mut session,
                         &prompt,
-                    )?
+                    )
+                };
+                let reply = match result {
+                    Ok(reply) => reply,
+                    Err(err) => {
+                        eprintln!("ERROR: {err}");
+                        continue;
+                    }
                 };
                 if !reply.is_empty() {
                     println!("{reply}");

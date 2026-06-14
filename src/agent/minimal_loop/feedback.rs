@@ -6,7 +6,6 @@ pub struct FeedbackState {
     completion_without_write_sent: bool,
     requested_artifact_sent: bool,
     missing_tool_sent: bool,
-    planned_action_without_tool_sent: bool,
     edit_anchor_sent: bool,
 }
 
@@ -53,12 +52,9 @@ impl FeedbackState {
     }
 
     pub fn planned_action_without_tool(&mut self, assistant_content: &str) -> Option<String> {
-        if self.planned_action_without_tool_sent
-            || !looks_like_planned_tool_action(assistant_content)
-        {
+        if !looks_like_planned_tool_action(assistant_content) {
             return None;
         }
-        self.planned_action_without_tool_sent = true;
         Some(format!(
             "{MINIMAL_FEEDBACK_PREFIX}\nYour previous response described a next action, but no tool call was issued. If that action is needed, call the tool now. If the work is already complete or no tool is needed, answer with completed work only."
         ))
@@ -170,16 +166,6 @@ mod tests {
         assert!(state.empty_response().is_none());
         assert!(state.completion_without_write().is_some());
         assert!(state.completion_without_write().is_none());
-        assert!(
-            state
-                .planned_action_without_tool("Now let me create the files.")
-                .is_some()
-        );
-        assert!(
-            state
-                .planned_action_without_tool("Now let me create the files.")
-                .is_none()
-        );
         assert!(
             state
                 .requested_artifacts_missing(&["src/main.rs".to_string()])
