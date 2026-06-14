@@ -43,6 +43,9 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
 
     // CLI-level mutual-exclusion checks that clap cannot express declaratively.
     args.validate()?;
+    let plan_steps = args.plan_steps.clone();
+    let plan_run = args.plan_run.clone();
+    let run_plan_path = args.run_plan.clone();
 
     // Short-circuit for `anvil sessions ...` BEFORE loading Ollama / Agent so
     // session inspection works offline and without an LLM running.
@@ -71,6 +74,11 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     let (mut config, warnings) = Config::load(args)?;
     for warning in &warnings {
         eprintln!("warning: {warning}");
+    }
+    if (plan_steps.is_some() || plan_run.is_some() || run_plan_path.is_some())
+        && config.engine != Engine::Minimal
+    {
+        return Err("--plan-steps / --plan-run / --run-plan require --engine minimal".to_string());
     }
     config.cwd = ensure_workspace_root(&config.cwd)?;
 
@@ -200,6 +208,9 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
             session_store,
             session,
             resume_prompt,
+            plan_steps,
+            plan_run,
+            run_plan_path,
         );
     }
 
@@ -248,6 +259,9 @@ fn run_minimal_engine(
     session_store: SessionStore,
     mut session: session::store::SessionSnapshot,
     resume_prompt: Option<String>,
+    plan_steps: Option<String>,
+    plan_run: Option<String>,
+    run_plan_path: Option<PathBuf>,
 ) -> Result<(), String> {
     if let Some(prompt) = resume_prompt {
         return run_minimal_prompt(
@@ -258,6 +272,50 @@ fn run_minimal_engine(
             &mut session,
             &prompt,
         );
+    }
+
+    if let Some(goal) = &plan_steps {
+        let path = agent::minimal_step_runner::generate_step_plan(
+            &config,
+            &models.main,
+            &mut client,
+            goal,
+        )?;
+        println!("created step plan: {}", path.display());
+        return Ok(());
+    }
+
+    if let Some(goal) = &plan_run {
+        let summary = agent::minimal_step_runner::generate_and_run_step_plan(
+            &config,
+            &models.main,
+            &mut client,
+            &session_store,
+            &mut session,
+            goal,
+        )?;
+        println!("created step plan: {}", summary.plan_path.display());
+        println!(
+            "completed {}/{} plan steps",
+            summary.steps.completed, summary.steps.total
+        );
+        return Ok(());
+    }
+
+    if let Some(plan_path) = run_plan_path {
+        let summary = agent::minimal_step_runner::run_plan(
+            &config,
+            &models.main,
+            &mut client,
+            &session_store,
+            &mut session,
+            &plan_path,
+        )?;
+        println!(
+            "completed {}/{} plan steps",
+            summary.completed, summary.total
+        );
+        return Ok(());
     }
 
     if let Some(prompt) = &config.prompt {

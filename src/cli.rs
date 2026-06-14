@@ -44,6 +44,15 @@ pub struct CliArgs {
     pub oneshot: bool,
     #[arg(long = "auto-plan")]
     pub auto_plan: bool,
+    /// Ask the minimal engine to draft a step plan and save it under .anvil/plans/.
+    #[arg(long = "plan-steps", value_name = "PROMPT")]
+    pub plan_steps: Option<String>,
+    /// Draft a step plan, save it, then run it immediately with the minimal engine.
+    #[arg(long = "plan-run", value_name = "PROMPT")]
+    pub plan_run: Option<String>,
+    /// Run a previously saved minimal step plan.
+    #[arg(long = "run-plan", value_name = "FILE")]
+    pub run_plan: Option<PathBuf>,
     #[arg(long = "offline")]
     pub offline: bool,
     /// Control deterministic recovery. `hint-only` only nudges the model,
@@ -229,6 +238,22 @@ impl CliArgs {
         if resume_on && (self.prompt.is_some() || self.oneshot) {
             return Err("--resume cannot be combined with --prompt / --oneshot".to_string());
         }
+        let step_modes = self.plan_steps.is_some() as u8
+            + self.plan_run.is_some() as u8
+            + self.run_plan.is_some() as u8;
+        if step_modes > 1 {
+            return Err(
+                "--plan-steps, --plan-run, and --run-plan are mutually exclusive".to_string(),
+            );
+        }
+        if (self.plan_steps.is_some() || self.plan_run.is_some() || self.run_plan.is_some())
+            && (self.prompt.is_some() || self.oneshot || resume_on)
+        {
+            return Err(
+                "--plan-steps / --plan-run / --run-plan cannot be combined with --prompt, --oneshot, or --resume"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 }
@@ -291,6 +316,9 @@ mod tests {
             fresh_session: false,
             oneshot: false,
             auto_plan: false,
+            plan_steps: None,
+            plan_run: None,
+            run_plan: None,
             offline: false,
             deterministic_fallback: None,
             engine: None,
@@ -329,6 +357,24 @@ mod tests {
         let mut args = base_args();
         args.resume = Some(String::new());
         args.oneshot = true;
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_step_plan_conflicts() {
+        let mut args = base_args();
+        args.plan_steps = Some("build app".to_string());
+        args.run_plan = Some(PathBuf::from(".anvil/plans/plan.yaml"));
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.plan_run = Some("build app".to_string());
+        args.run_plan = Some(PathBuf::from(".anvil/plans/plan.yaml"));
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.plan_steps = Some("build app".to_string());
+        args.prompt = Some("hello".to_string());
         assert!(args.validate().is_err());
     }
 

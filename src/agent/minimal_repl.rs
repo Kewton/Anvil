@@ -15,11 +15,15 @@ use super::minimal_loop::{
     MinimalChatClient, MinimalLoopConfig, completion_without_write_feedback_disabled_from_env,
     requested_artifact_feedback_disabled_from_env, run_session,
 };
+use super::minimal_step_runner;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReplInput {
     Empty,
     Exit,
+    PlanSteps(String),
+    PlanRun(String),
+    RunPlan(String),
     Prompt(String),
 }
 
@@ -51,6 +55,63 @@ pub fn run(
         match parse_repl_input(&line) {
             ReplInput::Empty => continue,
             ReplInput::Exit => break,
+            ReplInput::PlanSteps(goal) => {
+                let result = {
+                    let _spinner = ReplSpinner::start("minimal planning");
+                    minimal_step_runner::generate_step_plan(
+                        &config,
+                        &models.main,
+                        &mut client,
+                        &goal,
+                    )
+                };
+                match result {
+                    Ok(path) => println!("created step plan: {}", path.display()),
+                    Err(err) => eprintln!("ERROR: {err}"),
+                }
+            }
+            ReplInput::PlanRun(goal) => {
+                let result = {
+                    let _spinner = ReplSpinner::start("minimal plan-run");
+                    minimal_step_runner::generate_and_run_step_plan(
+                        &config,
+                        &models.main,
+                        &mut client,
+                        &session_store,
+                        &mut session,
+                        &goal,
+                    )
+                };
+                match result {
+                    Ok(summary) => {
+                        println!("created step plan: {}", summary.plan_path.display());
+                        println!(
+                            "completed {}/{} plan steps",
+                            summary.steps.completed, summary.steps.total
+                        );
+                    }
+                    Err(err) => eprintln!("ERROR: {err}"),
+                }
+            }
+            ReplInput::RunPlan(path) => {
+                let path = std::path::PathBuf::from(path);
+                match minimal_step_runner::run_plan(
+                    &config,
+                    &models.main,
+                    &mut client,
+                    &session_store,
+                    &mut session,
+                    &path,
+                ) {
+                    Ok(summary) => {
+                        println!(
+                            "completed {}/{} plan steps",
+                            summary.completed, summary.total
+                        )
+                    }
+                    Err(err) => eprintln!("ERROR: {err}"),
+                }
+            }
             ReplInput::Prompt(prompt) => {
                 let result = {
                     let _spinner = ReplSpinner::start("minimal running");
@@ -167,6 +228,15 @@ fn parse_repl_input(input: &str) -> ReplInput {
     match line.trim() {
         "" => ReplInput::Empty,
         "/exit" | "/quit" => ReplInput::Exit,
+        value if value.starts_with("/plan-steps ") => {
+            ReplInput::PlanSteps(value["/plan-steps ".len()..].trim().to_string())
+        }
+        value if value.starts_with("/plan-run ") => {
+            ReplInput::PlanRun(value["/plan-run ".len()..].trim().to_string())
+        }
+        value if value.starts_with("/run-plan ") => {
+            ReplInput::RunPlan(value["/run-plan ".len()..].trim().to_string())
+        }
         _ => ReplInput::Prompt(line.to_string()),
     }
 }
@@ -235,6 +305,22 @@ mod tests {
         assert_eq!(parse_repl_input("   \n"), ReplInput::Empty);
         assert_eq!(parse_repl_input("/exit\n"), ReplInput::Exit);
         assert_eq!(parse_repl_input(" /quit \r\n"), ReplInput::Exit);
+    }
+
+    #[test]
+    fn parse_repl_input_parses_step_runner_commands() {
+        assert_eq!(
+            parse_repl_input("/plan-steps build a game\n"),
+            ReplInput::PlanSteps("build a game".to_string())
+        );
+        assert_eq!(
+            parse_repl_input("/plan-run build a game\n"),
+            ReplInput::PlanRun("build a game".to_string())
+        );
+        assert_eq!(
+            parse_repl_input("/run-plan .anvil/plans/plan.yaml\n"),
+            ReplInput::RunPlan(".anvil/plans/plan.yaml".to_string())
+        );
     }
 
     #[test]
