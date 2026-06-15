@@ -286,6 +286,26 @@ pub(crate) fn run_turn<C: MinimalChatClient>(
     session: &mut SessionSnapshot,
     prompt: &str,
 ) -> Result<String, String> {
+    run_turn_with_early_success_paths(
+        config,
+        model,
+        client,
+        session_store,
+        session,
+        prompt,
+        Vec::new(),
+    )
+}
+
+pub(crate) fn run_turn_with_early_success_paths<C: MinimalChatClient>(
+    config: &Config,
+    model: &str,
+    client: &mut C,
+    session_store: &SessionStore,
+    session: &mut SessionSnapshot,
+    prompt: &str,
+    early_success_paths: Vec<String>,
+) -> Result<String, String> {
     let work_root = session
         .active_root
         .clone()
@@ -300,6 +320,7 @@ pub(crate) fn run_turn<C: MinimalChatClient>(
         cancel_flag: None,
         completion_without_write_feedback: !completion_without_write_feedback_disabled_from_env(),
         requested_artifact_feedback: !requested_artifact_feedback_disabled_from_env(),
+        early_success_paths,
     };
     let reply = run_session(client, model, session, prompt, &loop_config)?;
     session.active_root = (work_root != config.cwd).then_some(work_root);

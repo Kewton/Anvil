@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,14 +11,43 @@ use crate::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
 use crate::tools::registry::ToolSpec;
 
 use super::minimal_loop::MinimalChatClient;
-use super::minimal_repl::run_turn;
+use super::minimal_repl::run_turn_with_early_success_paths;
+
+mod plan_lint;
+mod profile;
+mod repair;
+mod verify;
+
+#[cfg(test)]
+use plan_lint::lint_plan;
+use plan_lint::{lint_plan_with_workspace, lint_ultra_plan};
+#[cfg(test)]
+use profile::ProfileSnapshot;
+use profile::{
+    build_profiled_phase_prompt, profile_generation_rules, profile_snapshot,
+    verify_profile_after_phase,
+};
+use repair::{
+    analyze_step_progress, build_repair_exhausted_report, build_repair_prompt,
+    failed_step_stop_reason, repaired_step_stop_reason, verified_step_stop_reason,
+    write_or_edit_paths_since,
+};
+#[cfg(test)]
+use verify::VerificationReport;
+use verify::{
+    early_success_paths_for_step, missing_expected_paths, normalize_relative_path,
+    validate_verify_command, verify_step,
+};
 
 const MAX_STEPS: usize = 12;
+const MAX_GOAL_CHARS: usize = 4_000;
 const MAX_STRING_CHARS: usize = 1_200;
 const MAX_LIST_ITEMS: usize = 12;
 const PLAN_GENERATION_ATTEMPTS: usize = 3;
 const STEP_TURN_MAX_ITERATIONS: usize = 8;
-const STEP_REPAIR_MAX_ITERATIONS: usize = 4;
+const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
+const STEP_REPAIR_MAX_FILE_CHANGES: usize = 2;
+const STEP_REPAIR_MAX_TURNS: usize = 4;
 const MAX_ULTRA_PHASES: usize = 8;
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
 
@@ -191,6 +219,13 @@ impl FromStr for UltraPlanStyle {
 pub struct StepRunSummary {
     pub total: usize,
     pub completed: usize,
+    pub outcomes: Vec<StepOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepOutcome {
+    pub id: String,
+    pub stop_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,33 +246,6 @@ pub struct UltraPlanRunSummary {
     pub phases: UltraRunSummary,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VerificationReport {
-    success: bool,
-    failures: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StepProgressReport {
-    missing_before: Vec<String>,
-    missing_after: Vec<String>,
-    write_or_edit_paths: Vec<String>,
-    repeated_write_or_edit_paths: Vec<String>,
-    no_expected_path_progress: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProfileSnapshot {
-    lines: Vec<String>,
-    protected_files: Vec<ProtectedFile>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProtectedFile {
-    path: String,
-    len: u64,
-}
-
 pub fn generate_step_plan<C: MinimalChatClient>(
     config: &Config,
     model: &str,
@@ -254,9 +262,10 @@ pub fn generate_step_plan<C: MinimalChatClient>(
         if !reply.tool_calls.is_empty() {
             last_error = "plan generation must not emit tool calls".to_string();
         } else {
-            match parse_plan_json(&reply.content).and_then(|plan| {
+            match parse_plan_json(&reply.content).and_then(|mut plan| {
+                plan.goal = goal.to_string();
                 validate_plan(&plan)?;
-                lint_plan(&plan)?;
+                lint_plan_with_workspace(&plan, Some(&config.cwd))?;
                 Ok(plan)
             }) {
                 Ok(plan) => return save_plan(&config.cwd, &plan),
@@ -265,7 +274,7 @@ pub fn generate_step_plan<C: MinimalChatClient>(
         }
         if attempt + 1 < PLAN_GENERATION_ATTEMPTS {
             messages.push(ConversationMessage::user(format!(
-                "The previous plan was invalid: {last_error}\nReturn corrected JSON only. Step instructions must be natural-language tasks for Write/Edit, not shell commands. All expected_paths must be repository-relative paths with no leading slash and no '..'. The verify array is only for deterministic checks; never put npm install, create-next-app, dev servers, network commands, or setup commands in verify. If setup is needed, describe it in the instruction and use an allowed verify command such as cat <file>, node --check <file>, or npm run build only after the app entry point exists."
+                "The previous plan was invalid: {last_error}\nReturn corrected JSON only. Step instructions must be natural-language tasks for Write/Edit, not shell commands. All expected_paths must be repository-relative paths with no leading slash and no '..'. The verify array is only for deterministic checks; never put npm install, create-next-app, dev servers, network commands, or setup commands in verify. If setup is needed, describe it in the instruction and use an allowed verify command such as cat <file>, node --check <js-file>, or npm run build only after the app entry point exists. Do not use node --check for .ts or .tsx files."
             )));
         }
     }
@@ -282,11 +291,12 @@ pub fn run_plan<C: MinimalChatClient>(
 ) -> Result<StepRunSummary, String> {
     let plan = load_plan(config, plan_path)?;
     validate_plan(&plan)?;
-    lint_plan(&plan)?;
+    lint_plan_with_workspace(&plan, Some(&config.cwd))?;
     let step_config = capped_config(config, STEP_TURN_MAX_ITERATIONS);
     let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
 
     let mut completed = 0usize;
+    let mut outcomes = Vec::new();
     for (index, step) in plan.steps.iter().enumerate() {
         println!(
             "step {}/{} {}: running",
@@ -297,7 +307,16 @@ pub fn run_plan<C: MinimalChatClient>(
         let missing_before = missing_expected_paths(&config.cwd, step);
         let turn_start = session.messages.len();
         let prompt = build_step_prompt(&plan, step);
-        let turn_result = run_turn(&step_config, model, client, session_store, session, &prompt);
+        let early_success_paths = early_success_paths_for_step(&config.cwd, step);
+        let turn_result = run_turn_with_early_success_paths(
+            &step_config,
+            model,
+            client,
+            session_store,
+            session,
+            &prompt,
+            early_success_paths,
+        );
         let turn_error = match turn_result {
             Ok(reply) => {
                 if !reply.is_empty() {
@@ -314,54 +333,117 @@ pub fn run_plan<C: MinimalChatClient>(
         let mut report = verify_step(&config.cwd, step);
         if report.success {
             completed += 1;
+            let stop_reason = verified_step_stop_reason(turn_error.as_deref());
+            println!("step {}: stop_reason={stop_reason}", step.id);
+            outcomes.push(StepOutcome {
+                id: step.id.clone(),
+                stop_reason,
+            });
             println!("step {}: ok", step.id);
             continue;
         }
 
-        println!(
-            "step {}: verification failed; running one repair turn",
-            step.id
-        );
-        let progress = analyze_step_progress(session, turn_start, missing_before, &report);
-        let repair_prompt =
-            build_repair_prompt(&plan, step, &report, &progress, turn_error.as_deref());
-        let repair_result = run_turn(
-            &repair_config,
-            model,
-            client,
-            session_store,
-            session,
-            &repair_prompt,
-        );
-        match repair_result {
-            Ok(reply) => {
-                if !reply.is_empty() {
-                    println!("{reply}");
-                }
+        println!("step {}: verification failed; running repair", step.id);
+        let mut repair_error = None;
+        let mut file_change_repairs = 0usize;
+        for repair_turn in 1..=STEP_REPAIR_MAX_TURNS {
+            if file_change_repairs >= STEP_REPAIR_MAX_FILE_CHANGES {
+                break;
             }
-            Err(err) => {
+            let progress =
+                analyze_step_progress(session, turn_start, missing_before.clone(), &report);
+            let repair_cycle = file_change_repairs + 1;
+            let repair_prompt = build_repair_prompt(
+                &plan,
+                step,
+                &report,
+                &progress,
+                turn_error.as_deref(),
+                repair_cycle,
+                STEP_REPAIR_MAX_FILE_CHANGES,
+            );
+            let repair_start = session.messages.len();
+            let early_success_paths = early_success_paths_for_step(&config.cwd, step);
+            let repair_result = run_turn_with_early_success_paths(
+                &repair_config,
+                model,
+                client,
+                session_store,
+                session,
+                &repair_prompt,
+                early_success_paths,
+            );
+            repair_error = match repair_result {
+                Ok(reply) => {
+                    if !reply.is_empty() {
+                        println!("{reply}");
+                    }
+                    None
+                }
+                Err(err) => {
+                    println!(
+                        "step {}: repair cycle {repair_cycle} stopped before completion: {err}",
+                        step.id
+                    );
+                    Some(err)
+                }
+            };
+            let changed_files = !write_or_edit_paths_since(session, repair_start).is_empty();
+            if changed_files {
+                file_change_repairs += 1;
+            }
+            report = verify_step(&config.cwd, step);
+            if report.success {
+                break;
+            }
+            if repair_turn < STEP_REPAIR_MAX_TURNS
+                && file_change_repairs < STEP_REPAIR_MAX_FILE_CHANGES
+            {
                 println!(
-                    "step {}: repair turn stopped before completion: {err}",
+                    "step {}: verification still failing after repair turn {repair_turn}",
                     step.id
                 );
             }
         }
-        report = verify_step(&config.cwd, step);
 
         if !report.success {
+            let stop_reason =
+                failed_step_stop_reason(turn_error.as_deref(), repair_error.as_deref());
+            println!("step {}: stop_reason={stop_reason}", step.id);
+            let progress =
+                analyze_step_progress(session, turn_start, missing_before.clone(), &report);
+            let exhausted_report = build_repair_exhausted_report(
+                &plan,
+                step,
+                &report,
+                &progress,
+                turn_error.as_deref(),
+                repair_error.as_deref(),
+                file_change_repairs,
+                STEP_REPAIR_MAX_FILE_CHANGES,
+            );
+            println!("{exhausted_report}");
             return Err(format!(
-                "step {} failed verification: {}",
+                "step {} failed verification: {}\n\n{}",
                 step.id,
-                report.failures.join("; ")
+                report.failures.join("; "),
+                exhausted_report
             ));
         }
         completed += 1;
+        let stop_reason = repaired_step_stop_reason(turn_error.as_deref(), repair_error.as_deref());
+        println!("step {}: stop_reason={stop_reason}", step.id);
+        outcomes.push(StepOutcome {
+            id: step.id.clone(),
+            stop_reason,
+        });
         println!("step {}: ok", step.id);
     }
 
     Ok(StepRunSummary {
         total: plan.steps.len(),
         completed,
+        outcomes,
     })
 }
 
@@ -396,7 +478,10 @@ pub fn generate_ultra_plan<C: MinimalChatClient>(
         if !reply.tool_calls.is_empty() {
             last_error = "ultra plan generation must not emit tool calls".to_string();
         } else {
-            match parse_ultra_plan_json(&reply.content).and_then(|plan| {
+            match parse_ultra_plan_json(&reply.content).and_then(|mut plan| {
+                plan.goal = goal.to_string();
+                plan.profile = profile;
+                plan.style = style;
                 validate_ultra_plan(&plan)?;
                 lint_ultra_plan(&plan)?;
                 Ok(plan)
@@ -487,11 +572,12 @@ Rules:\n\
 - Each step must be executable by a minimal local coding agent in one turn.\n\
 - Step instruction must be natural language, not a shell command, and must name the concrete files it will create or edit.\n\
 - If a step has multiple expected_paths, mention those files or component names in the instruction.\n\
+- If the goal contains a Required final artifacts list, keep those exact repository-relative paths and include relevant paths in expected_paths. Do not rename or relocate them.\n\
 - Put deterministic validation in expected_paths and verify.\n\
 - expected_paths must be repository-relative paths with no leading slash and no '..'.\n\
-- Use only safe local verify commands such as npm run build, npm test, cargo check, cargo test, python -m py_compile <file>, pytest, cat <file>, or node --check <file>.\n\
+- Use only safe local verify commands such as npm run build, npm test, cargo check, cargo test, python -m py_compile <file>, pytest, cat <file>, or node --check <js-file>.\n\
 - The verify array is only for checks. Never include npm install, create-next-app, dev servers, package installation, or network/setup commands in verify.\n\
-- Do not put npm run build on early scaffold/config steps. Use cat or node --check early, and place npm run build only after the app entry point exists.\n\
+- Do not put npm run build on early scaffold/config steps. Use cat early, use node --check only for .js/.mjs/.cjs files, and place npm run build only after the app entry point exists.\n\
 - For Next.js apps, include app/page.tsx or pages/index.tsx before the first npm run build. Config-only steps should create package.json, next.config.js, tailwind.config.js, postcss.config.js, and tsconfig.json without build verification.\n\
 - Do not include long-running dev servers in verify.\n\
 - Avoid network scaffolding unless the user explicitly requires it.\n\
@@ -521,6 +607,7 @@ Rules:\n\
 - Return 2 to 6 phases for most tasks, never more than 8.\n\
 - Each phase prompt must be a focused natural-language task that can be handled by one /plan-run.\n\
 - Phase prompts should name the concrete outcome and the verification expectation when practical.\n\
+- If the user goal contains a Required final artifacts list, preserve those exact repository-relative paths across phases. Do not rename or relocate them.\n\
 - Do not make a phase prompt a shell command.\n\
 - Do not include long-running dev servers, network setup, or package installation as a phase unless the user explicitly requires it.\n\
 - Stop at a clean final verification/cleanup phase.\n\
@@ -543,372 +630,21 @@ fn ultra_plan_generation_user_prompt(
     )
 }
 
-fn profile_generation_rules(profile: UltraProfile) -> &'static str {
-    match profile {
-        UltraProfile::Generic => "",
-        UltraProfile::Nextjs => {
-            "- Profile nextjs: preserve the existing Next.js structure when present. Keep package.json as a Next.js package, keep app/ or pages/ entrypoints, and end with a build verification phase.\n"
-        }
-        UltraProfile::Python => {
-            "- Profile python: preserve the package/import layout, prefer pytest or python -m py_compile checks, and add tests for behavioral changes when practical.\n"
-        }
-        UltraProfile::Rust => {
-            "- Profile rust: preserve Cargo.toml and crate entrypoints, prefer cargo check/cargo test checks, and keep changes scoped to the requested crate behavior.\n"
-        }
-        UltraProfile::Investigation => {
-            "- Profile investigation: produce a concrete triage/report artifact, separate facts from hypotheses, and do not modify source code unless the user explicitly asks for fixes.\n"
-        }
-        UltraProfile::Docs => {
-            "- Profile docs: produce or update documentation artifacts, avoid source-code changes unless explicitly requested, and include a final review phase for accuracy.\n"
-        }
-        UltraProfile::DataAnalysis => {
-            "- Profile data-analysis: treat input data as read-only. First inspect local files, schema, headers, row counts, missingness, and samples using scripts or shell. Produce reusable analysis scripts under scripts/ when needed and a human-readable report under reports/ or docs/. Do not require network access. Do not put raw data into prompts except small samples or summaries.\n"
-        }
-        UltraProfile::DataPipeline => {
-            "- Profile data-pipeline: treat raw input data as read-only. Create reusable extraction/cleaning/validation scripts under scripts/ and processed outputs under data/processed/. Include checks for row counts, schema, missing values, and reproducibility. Do not require network access unless the user explicitly asks and grants it.\n"
-        }
-    }
-}
-
-fn profile_snapshot(work_root: &Path, profile: UltraProfile) -> ProfileSnapshot {
-    let mut lines = Vec::new();
-    let mut protected_files = Vec::new();
-    match profile {
-        UltraProfile::DataAnalysis | UltraProfile::DataPipeline => {
-            let data_files = discover_data_files(work_root);
-            if data_files.is_empty() {
-                lines.push("No local data files were detected yet.".to_string());
-            } else {
-                lines.push("Detected local data files:".to_string());
-                for path in data_files.iter().take(12) {
-                    let full_path = work_root.join(path);
-                    let len = std::fs::metadata(&full_path).map(|m| m.len()).unwrap_or(0);
-                    lines.push(format!("- {} ({} bytes)", path.display(), len));
-                    if let Some(header) = data_file_header(&full_path) {
-                        lines.push(format!("  header/sample: {header}"));
-                    }
-                    if is_protected_data_input(path) {
-                        protected_files.push(ProtectedFile {
-                            path: path.to_string_lossy().to_string(),
-                            len,
-                        });
-                    }
-                }
-            }
-            for dir in ["data/raw", "data/processed", "scripts", "reports", "docs"] {
-                if work_root.join(dir).exists() {
-                    lines.push(format!("Existing directory: {dir}"));
-                }
-            }
-        }
-        UltraProfile::Nextjs => {
-            for path in [
-                "package.json",
-                "tsconfig.json",
-                "app/page.tsx",
-                "app/layout.tsx",
-                "pages/index.tsx",
-                "next.config.js",
-            ] {
-                if work_root.join(path).exists() {
-                    lines.push(format!("Existing file: {path}"));
-                }
-            }
-            if let Some(summary) = package_json_summary(&work_root.join("package.json")) {
-                lines.push(summary);
-            }
-        }
-        UltraProfile::Python => {
-            for path in ["pyproject.toml", "requirements.txt", "src", "tests"] {
-                if work_root.join(path).exists() {
-                    lines.push(format!("Existing path: {path}"));
-                }
-            }
-        }
-        UltraProfile::Rust => {
-            for path in ["Cargo.toml", "src/lib.rs", "src/main.rs", "tests"] {
-                if work_root.join(path).exists() {
-                    lines.push(format!("Existing path: {path}"));
-                }
-            }
-        }
-        UltraProfile::Investigation | UltraProfile::Docs | UltraProfile::Generic => {}
-    }
-    ProfileSnapshot {
-        lines,
-        protected_files,
-    }
-}
-
-fn build_profiled_phase_prompt(
-    ultra_plan: &UltraPlan,
-    phase: &UltraPhase,
-    snapshot: &ProfileSnapshot,
-) -> String {
-    let snapshot = if snapshot.lines.is_empty() {
-        "- none detected".to_string()
-    } else {
-        snapshot.lines.join("\n")
-    };
-    format!(
-        "Ultra goal:\n{goal}\n\nUltra profile: {profile}\nUltra style: {style}\n\nCurrent phase id: {id}\nCurrent phase goal:\n{prompt}\n\nExisting workspace snapshot:\n{snapshot}\n\nProfile contract:\n{contract}\n\nRun only this phase. Preserve the profile contract. Prefer Read/Bash inspection before changing existing project structure. Use Write/Edit for file changes. End with deterministic checks when practical.",
-        goal = ultra_plan.goal,
-        profile = ultra_plan.profile,
-        style = ultra_plan.style,
-        id = phase.id,
-        prompt = phase.prompt,
-        snapshot = snapshot,
-        contract = profile_runtime_contract(ultra_plan.profile),
-    )
-}
-
-fn profile_runtime_contract(profile: UltraProfile) -> &'static str {
-    match profile {
-        UltraProfile::Generic => "- Keep changes scoped to the current phase.",
-        UltraProfile::Nextjs => {
-            "- Preserve the workspace as a Next.js app when one exists.\n- Do not convert package.json to a standalone TypeScript/Node project.\n- Keep next/react/react-dom dependencies when already present.\n- Keep scripts.build as next build when already present.\n- If a 3011 port requirement exists, keep the dev script on port 3011.\n- Do not set tsconfig rootDir to ./src in a way that excludes app/."
-        }
-        UltraProfile::Python => {
-            "- Preserve the existing Python package/import layout.\n- Prefer pytest and python -m py_compile for verification.\n- Do not rewrite project metadata unless this phase explicitly requires it."
-        }
-        UltraProfile::Rust => {
-            "- Preserve Cargo.toml and crate entrypoints.\n- Prefer cargo check/cargo test for verification.\n- Keep public behavior scoped to the requested phase."
-        }
-        UltraProfile::Investigation => {
-            "- Produce a concrete report artifact.\n- Separate observed facts, hypotheses, and proposed next steps.\n- Do not modify source code unless the phase explicitly asks for fixes."
-        }
-        UltraProfile::Docs => {
-            "- Produce or update documentation artifacts.\n- Avoid source-code changes unless explicitly requested.\n- Keep claims grounded in files inspected during this phase."
-        }
-        UltraProfile::DataAnalysis => {
-            "- Treat raw/input data files as read-only.\n- Do not paste full datasets into prompts; use schema, samples, counts, and summaries.\n- Put reusable analysis code under scripts/ when needed.\n- Put human-readable findings under reports/ or docs/.\n- Stay local-only unless the user explicitly requested network access."
-        }
-        UltraProfile::DataPipeline => {
-            "- Treat raw/input data files as read-only.\n- Put reusable extraction/cleaning/validation scripts under scripts/.\n- Put processed outputs under data/processed/.\n- Include deterministic checks for row counts, schema, missing values, or reproducibility.\n- Stay local-only unless the user explicitly requested network access."
-        }
-    }
-}
-
-fn verify_profile_after_phase(
-    work_root: &Path,
-    profile: UltraProfile,
-    before: &ProfileSnapshot,
-) -> Result<(), String> {
-    let mut failures = Vec::new();
-    if matches!(
-        profile,
-        UltraProfile::DataAnalysis | UltraProfile::DataPipeline
-    ) {
-        for protected in &before.protected_files {
-            let path = work_root.join(&protected.path);
-            match std::fs::metadata(&path) {
-                Ok(meta) if meta.len() == protected.len => {}
-                Ok(meta) => failures.push(format!(
-                    "protected input data changed: {} ({} -> {} bytes)",
-                    protected.path,
-                    protected.len,
-                    meta.len()
-                )),
-                Err(_) => {
-                    failures.push(format!("protected input data missing: {}", protected.path))
-                }
-            }
-        }
-    }
-    if profile == UltraProfile::Nextjs {
-        verify_nextjs_profile(work_root, &mut failures);
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures.join("; "))
-    }
-}
-
-fn verify_nextjs_profile(work_root: &Path, failures: &mut Vec<String>) {
-    let package_path = work_root.join("package.json");
-    let app_dir_exists = work_root.join("app").is_dir() || work_root.join("pages").is_dir();
-    if package_path.exists() && app_dir_exists {
-        let Ok(raw) = std::fs::read_to_string(&package_path) else {
-            failures.push("package.json exists but could not be read".to_string());
-            return;
-        };
-        if raw.contains("\"next\"") {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
-                let build = json
-                    .pointer("/scripts/build")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if !build.is_empty() && build != "next build" {
-                    failures.push(format!(
-                        "package.json build script is no longer `next build`: {build}"
-                    ));
-                }
-                let dev = json
-                    .pointer("/scripts/dev")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if dev.contains("3011") && !dev.contains("next dev") {
-                    failures.push(format!(
-                        "package.json dev script mentions 3011 but is not next dev: {dev}"
-                    ));
-                }
-            }
-        } else {
-            failures.push("package.json no longer contains next dependency".to_string());
-        }
-    }
-    let tsconfig_path = work_root.join("tsconfig.json");
-    if tsconfig_path.exists()
-        && app_dir_exists
-        && let Ok(raw) = std::fs::read_to_string(tsconfig_path)
-        && raw.contains("\"rootDir\"")
-        && raw.contains("\"./src\"")
-    {
-        failures.push("tsconfig.json rootDir ./src excludes Next.js app/ files".to_string());
-    }
-}
-
-fn discover_data_files(work_root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    discover_data_files_inner(work_root, work_root, 0, &mut out);
-    out.sort();
-    out
-}
-
-fn discover_data_files_inner(root: &Path, current: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 4 || out.len() >= 48 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(current) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') || name == "node_modules" || name == "target" {
-            continue;
-        }
-        if path.is_dir() {
-            discover_data_files_inner(root, &path, depth + 1, out);
-        } else if is_data_file(&path)
-            && let Ok(relative) = path.strip_prefix(root)
-        {
-            out.push(relative.to_path_buf());
-        }
-    }
-}
-
-fn is_data_file(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    matches!(
-        ext.to_ascii_lowercase().as_str(),
-        "csv" | "tsv" | "json" | "jsonl" | "ndjson" | "parquet" | "xlsx" | "xls" | "sqlite" | "db"
-    )
-}
-
-fn is_protected_data_input(path: &Path) -> bool {
-    let first = path
-        .components()
-        .next()
-        .and_then(|component| match component {
-            std::path::Component::Normal(value) => value.to_str(),
-            _ => None,
-        });
-    if first == Some("data") {
-        let second = path
-            .components()
-            .nth(1)
-            .and_then(|component| match component {
-                std::path::Component::Normal(value) => value.to_str(),
-                _ => None,
-            });
-        return second != Some("processed");
-    }
-    is_data_file(path)
-}
-
-fn data_file_header(path: &Path) -> Option<String> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !matches!(ext.as_str(), "csv" | "tsv" | "json" | "jsonl" | "ndjson") {
-        return None;
-    }
-    let raw = std::fs::read_to_string(path).ok()?;
-    raw.lines()
-        .next()
-        .map(|line| line.chars().take(180).collect::<String>())
-}
-
-fn package_json_summary(path: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let json = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
-    let build = json
-        .pointer("/scripts/build")
-        .and_then(|value| value.as_str())
-        .unwrap_or("none");
-    let dev = json
-        .pointer("/scripts/dev")
-        .and_then(|value| value.as_str())
-        .unwrap_or("none");
-    let deps = json
-        .get("dependencies")
-        .and_then(|value| value.as_object())
-        .map(|map| map.keys().take(8).cloned().collect::<Vec<_>>().join(", "))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "none".to_string());
-    Some(format!(
-        "package.json scripts: build=`{build}`, dev=`{dev}`; dependencies: {deps}"
-    ))
-}
-
 fn plan_generation_user_prompt(goal: &str) -> String {
     format!("Create a step plan for this task:\n{goal}")
 }
 
 fn build_step_prompt(plan: &StepPlan, step: &PlanStep) -> String {
+    let required_artifacts = required_artifact_contract_prompt(&plan.goal);
     format!(
-        "Overall goal:\n{goal}\n\nCurrent step id: {id}\nCurrent step instruction:\n{instruction}\n\nExpected paths after this step:\n{paths}\n\nVerification commands for this step:\n{verify}\n\nExpected verification result: {expected_result}\n\nWork only on this step. Use Write/Edit for file changes. Do not rely on network scaffolding unless this step explicitly says so. Create every expected path before revising an already-created file repeatedly. Before giving a final answer, make the expected paths exist and run the verification commands when possible. If expected_result is pass and verification fails, fix only this step's failure. If expected_result is fail, this is a TDD red step: the verification command should fail after the test is written.",
+        "Overall goal:\n{goal}\n\n{required_artifacts}Current step id: {id}\nCurrent step instruction:\n{instruction}\n\nExpected paths after this step:\n{paths}\n\nVerification commands for this step:\n{verify}\n\nExpected verification result: {expected_result}\n\nWork only on this step. Use Write/Edit for file changes. Do not rely on network scaffolding unless this step explicitly says so. Create every expected path before revising an already-created file repeatedly. Before giving a final answer, make the expected paths exist and run the verification commands when possible. If expected_result is pass and verification fails, fix only this step's failure. If expected_result is fail, this is a TDD red step: the verification command should fail after the test is written.",
         goal = plan.goal,
+        required_artifacts = required_artifacts,
         id = step.id,
         instruction = step.instruction,
         paths = bullet_list(&step.expected_paths),
         verify = bullet_list(&step.verify),
         expected_result = step.expected_result,
-    )
-}
-
-fn build_repair_prompt(
-    plan: &StepPlan,
-    step: &PlanStep,
-    report: &VerificationReport,
-    progress: &StepProgressReport,
-    turn_error: Option<&str>,
-) -> String {
-    let turn_error = turn_error
-        .map(|err| format!("\nPrevious turn stop reason:\n- {err}\n"))
-        .unwrap_or_default();
-    let progress_note = if progress.no_expected_path_progress {
-        format!(
-            "\nStep progress warning:\n- Missing expected paths did not decrease.\n- Missing before: {}\n- Missing now: {}\n- Write/Edit paths observed: {}\n- Repeated Write/Edit paths: {}\n\nDo not keep rewriting only the observed existing files. Emit Write/Edit tool calls for the missing expected paths first.\n",
-            inline_list(&progress.missing_before),
-            inline_list(&progress.missing_after),
-            inline_list(&progress.write_or_edit_paths),
-            inline_list(&progress.repeated_write_or_edit_paths),
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        "The previous step did not pass deterministic verification.{turn_error}\nOverall goal:\n{goal}\n\nCurrent step id: {id}\nCurrent step instruction:\n{instruction}\n\nExpected paths for this step:\n{paths}\n\nExpected verification result: {expected_result}\n\nVerification failures:\n{failures}\n{progress_note}\nRepair only this step. Create or edit the missing/incorrect files, then run the verification commands if possible. Do not move to later steps. If expected_result is fail, do not implement the production fix in this step; make the intended red test fail for the right reason.",
-        goal = plan.goal,
-        id = step.id,
-        instruction = step.instruction,
-        paths = bullet_list(&step.expected_paths),
-        expected_result = step.expected_result,
-        failures = bullet_list(&report.failures),
     )
 }
 
@@ -929,6 +665,59 @@ fn inline_list(items: &[String]) -> String {
     } else {
         items.join(", ")
     }
+}
+
+fn required_artifact_contract_prompt(goal: &str) -> String {
+    let artifacts = extract_required_artifacts(goal);
+    if artifacts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Required final artifacts from the overall goal:\n{}\nDo not rename or relocate these repository-relative paths. Carry relevant paths into phase step plans and verify they exist before final completion.\n\n",
+        bullet_list(&artifacts)
+    )
+}
+
+fn extract_required_artifacts(text: &str) -> Vec<String> {
+    let mut artifacts = Vec::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("required final artifacts")
+            || lower.starts_with("required artifact paths")
+        {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if trimmed.is_empty() {
+            if artifacts.is_empty() {
+                continue;
+            }
+            break;
+        }
+        let Some(path) = trimmed.strip_prefix("- ") else {
+            if artifacts.is_empty() {
+                continue;
+            }
+            break;
+        };
+        if is_valid_required_artifact_path(path) {
+            artifacts.push(path.to_string());
+        }
+    }
+    artifacts
+}
+
+fn is_valid_required_artifact_path(path: &str) -> bool {
+    let path = path.trim();
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains("..")
+        && normalize_relative_path(Path::new(path)).is_some()
 }
 
 fn save_plan(work_root: &Path, plan: &StepPlan) -> Result<PathBuf, String> {
@@ -1234,7 +1023,7 @@ fn parse_quoted(value: &str) -> Result<String, String> {
 }
 
 fn validate_plan(plan: &StepPlan) -> Result<(), String> {
-    validate_text("goal", &plan.goal)?;
+    validate_goal(&plan.goal)?;
     if plan.steps.is_empty() {
         return Err("plan must contain at least one step".to_string());
     }
@@ -1271,7 +1060,7 @@ fn validate_plan(plan: &StepPlan) -> Result<(), String> {
 }
 
 fn validate_ultra_plan(plan: &UltraPlan) -> Result<(), String> {
-    validate_text("goal", &plan.goal)?;
+    validate_goal(&plan.goal)?;
     if plan.phases.len() < 2 {
         return Err("ultra plan must contain at least two phases".to_string());
     }
@@ -1298,146 +1087,6 @@ fn validate_ultra_plan(plan: &UltraPlan) -> Result<(), String> {
     Ok(())
 }
 
-fn lint_plan(plan: &StepPlan) -> Result<(), String> {
-    let mut errors = Vec::new();
-    lint_instruction_specificity(plan, &mut errors);
-    lint_nextjs_build_order(plan, &mut errors);
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("plan lint failed: {}", errors.join("; ")))
-    }
-}
-
-fn lint_ultra_plan(plan: &UltraPlan) -> Result<(), String> {
-    let mut errors = Vec::new();
-    if matches!(plan.style, UltraPlanStyle::Tdd) {
-        let combined = plan
-            .phases
-            .iter()
-            .map(|phase| phase.prompt.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !combined.contains("fail") && !combined.contains("red") && !combined.contains("失敗") {
-            errors.push("TDD ultra plan must include a failing/red test phase".to_string());
-        }
-        if !combined.contains("test")
-            && !combined.contains("cargo test")
-            && !combined.contains("pytest")
-            && !combined.contains("npm test")
-            && !combined.contains("テスト")
-        {
-            errors.push("TDD ultra plan must mention tests".to_string());
-        }
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(format!("ultra plan lint failed: {}", errors.join("; ")))
-    }
-}
-
-fn lint_instruction_specificity(plan: &StepPlan, errors: &mut Vec<String>) {
-    for step in &plan.steps {
-        if step.expected_paths.len() < 2 {
-            continue;
-        }
-        let instruction = step.instruction.to_ascii_lowercase();
-        let mentions_expected_path = step
-            .expected_paths
-            .iter()
-            .any(|path| instruction_mentions_path(&instruction, path));
-        if !mentions_expected_path {
-            errors.push(format!(
-                "step {} has multiple expected paths but the instruction does not name any concrete expected file",
-                step.id
-            ));
-        }
-    }
-}
-
-fn lint_nextjs_build_order(plan: &StepPlan, errors: &mut Vec<String>) {
-    if !plan_looks_like_nextjs(plan) {
-        return;
-    }
-
-    let all_expected = plan
-        .steps
-        .iter()
-        .flat_map(|step| step.expected_paths.iter())
-        .collect::<Vec<_>>();
-    if !all_expected.iter().any(|path| is_nextjs_entry_path(path)) {
-        errors.push(
-            "Next.js plan must include app/page.tsx or pages/index.tsx in expected_paths"
-                .to_string(),
-        );
-    }
-
-    let mut package_seen = false;
-    let mut entry_seen = false;
-    for step in &plan.steps {
-        package_seen |= step
-            .expected_paths
-            .iter()
-            .any(|path| path == "package.json");
-        entry_seen |= step
-            .expected_paths
-            .iter()
-            .any(|path| is_nextjs_entry_path(path));
-        if step.verify.iter().any(|command| command == "npm run build")
-            && (!package_seen || !entry_seen)
-        {
-            errors.push(format!(
-                "step {} runs npm run build before package.json and a Next.js entry path are present",
-                step.id
-            ));
-        }
-    }
-}
-
-fn plan_looks_like_nextjs(plan: &StepPlan) -> bool {
-    let goal = plan.goal.to_ascii_lowercase();
-    goal.contains("next.js")
-        || goal.contains("nextjs")
-        || plan.steps.iter().any(|step| {
-            let instruction = step.instruction.to_ascii_lowercase();
-            instruction.contains("next.js")
-                || instruction.contains("nextjs")
-                || step
-                    .expected_paths
-                    .iter()
-                    .any(|path| path == "next.config.js" || is_nextjs_entry_path(path))
-        })
-}
-
-fn is_nextjs_entry_path(path: &str) -> bool {
-    matches!(
-        path,
-        "app/page.tsx" | "app/page.jsx" | "pages/index.tsx" | "pages/index.jsx"
-    )
-}
-
-fn instruction_mentions_path(instruction_lower: &str, path: &str) -> bool {
-    let path_lower = path.to_ascii_lowercase();
-    if instruction_lower.contains(&path_lower) {
-        return true;
-    }
-    let path = Path::new(path);
-    if let Some(file_name) = path.file_name().and_then(|value| value.to_str()) {
-        let file_name = file_name.to_ascii_lowercase();
-        if instruction_lower.contains(&file_name) {
-            return true;
-        }
-    }
-    if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
-        let stem = stem.to_ascii_lowercase();
-        if stem.len() >= 4 && instruction_lower.contains(&stem) {
-            return true;
-        }
-    }
-    false
-}
-
 fn validate_text(label: &str, value: &str) -> Result<(), String> {
     if value.trim().is_empty() {
         return Err(format!("{label} must not be empty"));
@@ -1448,12 +1097,22 @@ fn validate_text(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_goal(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("goal must not be empty".to_string());
+    }
+    if value.chars().count() > MAX_GOAL_CHARS {
+        return Err("goal is too long".to_string());
+    }
+    Ok(())
+}
+
 fn validate_instruction(value: &str) -> Result<(), String> {
     validate_text("instruction", value)?;
     let trimmed = value.trim();
     let lower = trimmed.to_ascii_lowercase();
     let shell_starts = ["echo ", "cat ", "mkdir ", "touch ", "cd "];
-    let shell_syntax = ["&&", "||", ";", "|", ">", "<", "`", "$("];
+    let shell_syntax = ["&&", "||", ";", "|", "`", "$("];
     if shell_starts.iter().any(|prefix| lower.starts_with(prefix))
         || shell_syntax.iter().any(|needle| trimmed.contains(needle))
     {
@@ -1484,205 +1143,6 @@ fn validate_relative_path(path: &str) -> Result<(), String> {
     normalize_relative_path(path)
         .ok_or_else(|| format!("path escapes workspace: {}", path.display()))?;
     Ok(())
-}
-
-fn validate_verify_command(command: &str) -> Result<(), String> {
-    if command.trim().is_empty() {
-        return Err("verify command must not be empty".to_string());
-    }
-    if command.len() > 240 {
-        return Err(format!("verify command is too long: {command}"));
-    }
-    let forbidden = ["&&", "||", ";", "|", ">", "<", "`", "$(", "\n", "\r"];
-    if forbidden.iter().any(|needle| command.contains(needle)) {
-        return Err(format!(
-            "verify command contains shell control syntax: {command}"
-        ));
-    }
-    let parts = command.split_whitespace().collect::<Vec<_>>();
-    let allowed = match parts.as_slice() {
-        ["npm", "run", "build"] | ["npm", "run", "test"] | ["npm", "test"] => true,
-        ["cargo", "check"] | ["cargo", "test"] => true,
-        ["cargo", "check", rest @ ..] | ["cargo", "test", rest @ ..] => rest
-            .iter()
-            .all(|part| safe_command_argument(part) && !part.eq_ignore_ascii_case("--release")),
-        ["python", "-m", "py_compile", rest @ ..] | ["python3", "-m", "py_compile", rest @ ..] => {
-            !rest.is_empty() && rest.iter().all(|part| safe_command_argument(part))
-        }
-        ["python", "-m", "pytest", rest @ ..] | ["python3", "-m", "pytest", rest @ ..] => {
-            rest.iter().all(|part| safe_command_argument(part))
-        }
-        ["python", script, rest @ ..] | ["python3", script, rest @ ..] => {
-            safe_python_script_path(script) && rest.iter().all(|part| safe_command_argument(part))
-        }
-        ["pytest", rest @ ..] => rest.iter().all(|part| safe_command_argument(part)),
-        ["node", "--check", rest @ ..] => {
-            !rest.is_empty() && rest.iter().all(|part| safe_command_argument(part))
-        }
-        ["cat", rest @ ..] => {
-            !rest.is_empty() && rest.iter().all(|part| safe_command_argument(part))
-        }
-        _ => false,
-    };
-    if allowed {
-        Ok(())
-    } else {
-        Err(format!(
-            "verify command is not in the safe allowlist: {command}"
-        ))
-    }
-}
-
-fn safe_python_script_path(value: &str) -> bool {
-    safe_command_argument(value)
-        && value.ends_with(".py")
-        && !value.starts_with('-')
-        && !Path::new(value).is_absolute()
-}
-
-fn safe_command_argument(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '/' | '_' | '-' | '=' | ':'))
-        && !value.contains("..")
-}
-
-fn verify_step(work_root: &Path, step: &PlanStep) -> VerificationReport {
-    let mut failures = Vec::new();
-    for path in missing_expected_paths(work_root, step) {
-        failures.push(format!("missing expected path: {path}"));
-    }
-    for command in &step.verify {
-        match (step.expected_result, run_verify_command(work_root, command)) {
-            (VerifyExpectedResult::Pass, Ok(())) => {}
-            (VerifyExpectedResult::Pass, Err(err)) => {
-                failures.push(format!("verify failed `{command}`: {err}"));
-            }
-            (VerifyExpectedResult::Fail, Ok(())) => {
-                failures.push(format!("verify unexpectedly passed `{command}`"));
-            }
-            (VerifyExpectedResult::Fail, Err(_)) => {}
-        }
-    }
-    VerificationReport {
-        success: failures.is_empty(),
-        failures,
-    }
-}
-
-fn missing_expected_paths(work_root: &Path, step: &PlanStep) -> Vec<String> {
-    let mut missing = Vec::new();
-    for path in &step.expected_paths {
-        let Some(normalized) = normalize_relative_path(Path::new(path)) else {
-            missing.push(path.clone());
-            continue;
-        };
-        if !work_root.join(normalized).exists() {
-            missing.push(path.clone());
-        }
-    }
-    missing
-}
-
-fn analyze_step_progress(
-    session: &SessionSnapshot,
-    turn_start: usize,
-    missing_before: Vec<String>,
-    report: &VerificationReport,
-) -> StepProgressReport {
-    let missing_after = report_missing_paths(report);
-    let write_or_edit_paths = write_or_edit_paths_since(session, turn_start);
-    let repeated_write_or_edit_paths = repeated_items(&write_or_edit_paths);
-    let no_expected_path_progress =
-        !missing_after.is_empty() && missing_after.len() >= missing_before.len();
-    StepProgressReport {
-        missing_before,
-        missing_after,
-        write_or_edit_paths,
-        repeated_write_or_edit_paths,
-        no_expected_path_progress,
-    }
-}
-
-fn report_missing_paths(report: &VerificationReport) -> Vec<String> {
-    report
-        .failures
-        .iter()
-        .filter_map(|failure| failure.strip_prefix("missing expected path: "))
-        .map(str::to_string)
-        .collect()
-}
-
-fn write_or_edit_paths_since(session: &SessionSnapshot, start: usize) -> Vec<String> {
-    session
-        .messages
-        .iter()
-        .skip(start)
-        .filter(|message| message.role == "assistant")
-        .flat_map(|message| message.tool_calls.iter())
-        .filter(|call| call.name == "Write" || call.name == "Edit")
-        .filter_map(|call| {
-            call.arguments
-                .get("path")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        })
-        .collect()
-}
-
-fn repeated_items(items: &[String]) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    let mut repeated = BTreeSet::new();
-    for item in items {
-        if !seen.insert(item.clone()) {
-            repeated.insert(item.clone());
-        }
-    }
-    repeated.into_iter().collect()
-}
-
-fn run_verify_command(work_root: &Path, command: &str) -> Result<(), String> {
-    validate_verify_command(command)?;
-    let output = Command::new("sh")
-        .arg("-lc")
-        .arg(command)
-        .current_dir(work_root)
-        .output()
-        .map_err(|err| format!("failed to run: {err}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
-    Err(first_lines(&combined, 12))
-}
-
-fn first_lines(value: &str, max_lines: usize) -> String {
-    let lines = value.lines().take(max_lines).collect::<Vec<_>>().join("\n");
-    if lines.is_empty() {
-        "command exited non-zero with no output".to_string()
-    } else {
-        lines
-    }
-}
-
-fn normalize_relative_path(path: &Path) -> Option<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => normalized.push(part),
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    return None;
-                }
-            }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
-        }
-    }
-    Some(normalized)
 }
 
 fn capped_config(config: &Config, max_iterations: usize) -> Config {
@@ -1828,10 +1288,45 @@ mod tests {
         .unwrap();
         assert!(path.starts_with(temp.path().join(".anvil").join("plans")));
         let loaded = parse_ultra_plan_yaml(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(loaded.goal, "Build app");
+        assert_eq!(loaded.goal, "Build app with TDD");
         assert_eq!(loaded.profile, UltraProfile::Generic);
         assert_eq!(loaded.style, UltraPlanStyle::Tdd);
         assert_eq!(loaded.phases[0].id, "write-red-test");
+    }
+
+    #[test]
+    fn generated_plans_preserve_original_goal_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        let goal = "Build app\n\nRequired final artifacts:\n- components/SpaceOpsGame.tsx\n";
+
+        let mut step_client = MockClient::default();
+        step_client.push_reply(
+            r#"{"goal":"Summarized goal","steps":[{"id":"create-game","instruction":"Create components/SpaceOpsGame.tsx","expected_paths":["components/SpaceOpsGame.tsx"],"verify":[]}]}"#,
+            Vec::new(),
+        );
+        let step_path =
+            generate_step_plan(&config(&temp), "qwen3:8b", &mut step_client, goal).unwrap();
+        let step_plan = parse_plan_yaml(&std::fs::read_to_string(step_path).unwrap()).unwrap();
+        assert_eq!(step_plan.goal, goal);
+
+        let mut ultra_client = MockClient::default();
+        ultra_client.push_reply(
+            r#"{"goal":"Summarized ultra goal","profile":"generic","style":"default","phases":[{"id":"create-game","prompt":"Create the game component."},{"id":"verify-game","prompt":"Verify the required game component exists."}]}"#,
+            Vec::new(),
+        );
+        let ultra_path = generate_ultra_plan(
+            &config(&temp),
+            "qwen3:8b",
+            &mut ultra_client,
+            goal,
+            UltraProfile::Nextjs,
+            UltraPlanStyle::Default,
+        )
+        .unwrap();
+        let ultra_plan =
+            parse_ultra_plan_yaml(&std::fs::read_to_string(ultra_path).unwrap()).unwrap();
+        assert_eq!(ultra_plan.goal, goal);
+        assert_eq!(ultra_plan.profile, UltraProfile::Nextjs);
     }
 
     #[test]
@@ -1870,6 +1365,16 @@ mod tests {
     }
 
     #[test]
+    fn natural_language_instruction_may_mention_html_tags() {
+        assert!(
+            validate_instruction(
+                "Implement AnalyticsPanel.tsx using semantic HTML like <dl> and <div>."
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn read_only_cat_verify_is_allowed() {
         assert!(validate_verify_command("cat hello.txt").is_ok());
         assert!(validate_verify_command("cat ../secret.txt").is_err());
@@ -1881,6 +1386,14 @@ mod tests {
         assert!(validate_verify_command("python3 scripts/check_data.py --check").is_ok());
         assert!(validate_verify_command("python /tmp/check_data.py").is_err());
         assert!(validate_verify_command("python scripts/check_data.sh").is_err());
+    }
+
+    #[test]
+    fn node_check_verify_is_limited_to_javascript_files() {
+        assert!(validate_verify_command("node --check scripts/check.js").is_ok());
+        assert!(validate_verify_command("node --check scripts/check.mjs").is_ok());
+        assert!(validate_verify_command("node --check components/Panel.tsx").is_err());
+        assert!(validate_verify_command("node --check src/index.ts").is_err());
     }
 
     #[test]
@@ -1953,6 +1466,69 @@ mod tests {
     }
 
     #[test]
+    fn nextjs_profile_verifier_rejects_at_alias_without_base_url() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+        std::fs::create_dir_all(temp.path().join("components")).unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("app/page.tsx"),
+            "import SpaceOpsGame from '@/components/SpaceOpsGame';\nexport default function Page(){ return <SpaceOpsGame/>; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("components/SpaceOpsGame.tsx"),
+            "export default function SpaceOpsGame(){ return null; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*":["./*"]}}}"#,
+        )
+        .unwrap();
+        let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
+
+        let err =
+            verify_profile_after_phase(temp.path(), UltraProfile::Nextjs, &snapshot).unwrap_err();
+
+        assert!(err.contains("baseUrl"), "got: {err}");
+    }
+
+    #[test]
+    fn nextjs_profile_verifier_accepts_at_alias_with_base_url() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+        std::fs::create_dir_all(temp.path().join("components")).unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("app/page.tsx"),
+            "import SpaceOpsGame from '@/components/SpaceOpsGame';\nexport default function Page(){ return <SpaceOpsGame/>; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("components/SpaceOpsGame.tsx"),
+            "export default function SpaceOpsGame(){ return null; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@/*":["./*"]}}}"#,
+        )
+        .unwrap();
+        let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
+
+        verify_profile_after_phase(temp.path(), UltraProfile::Nextjs, &snapshot).unwrap();
+    }
+
+    #[test]
     fn expected_failure_verify_treats_nonzero_as_success() {
         let temp = tempfile::tempdir().unwrap();
         let step = PlanStep {
@@ -2009,6 +1585,58 @@ mod tests {
     }
 
     #[test]
+    fn nextjs_build_lint_accepts_existing_workspace_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("app/page.tsx"),
+            "export default function Page() { return null; }\n",
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Modify an existing Next.js app".into(),
+            steps: vec![PlanStep {
+                id: "integrate-panel".into(),
+                instruction: "Create components/AnalyticsPanel.tsx and integrate it.".into(),
+                expected_paths: vec!["components/AnalyticsPanel.tsx".into()],
+                verify: vec!["npm run build".into()],
+                expected_result: VerifyExpectedResult::Pass,
+            }],
+        };
+
+        assert!(lint_plan_with_workspace(&plan, Some(temp.path())).is_ok());
+    }
+
+    #[test]
+    fn required_artifact_contract_is_preserved_in_phase_prompt() {
+        let ultra = UltraPlan {
+            goal: "Build app\n\nRequired final artifacts:\n- components/SpaceOpsGame.tsx\n- app/page.tsx\n".into(),
+            profile: UltraProfile::Nextjs,
+            style: UltraPlanStyle::Default,
+            phases: vec![UltraPhase {
+                id: "game".into(),
+                prompt: "Implement the game screen.".into(),
+            }],
+        };
+        let prompt = build_profiled_phase_prompt(
+            &ultra,
+            &ultra.phases[0],
+            &ProfileSnapshot {
+                lines: Vec::new(),
+                protected_files: Vec::new(),
+            },
+        );
+
+        assert!(prompt.contains("Required final artifacts from the overall goal"));
+        assert!(prompt.contains("components/SpaceOpsGame.tsx"));
+    }
+
+    #[test]
     fn multi_path_step_instruction_must_name_concrete_files() {
         let plan = StepPlan {
             goal: "Create config".into(),
@@ -2023,6 +1651,35 @@ mod tests {
 
         let err = lint_plan(&plan).unwrap_err();
         assert!(err.contains("does not name any concrete expected file"));
+    }
+
+    #[test]
+    fn verification_step_can_reference_multiple_expected_paths_without_naming_each_one() {
+        let plan = StepPlan {
+            goal: "Create Next.js app".into(),
+            steps: vec![
+                PlanStep {
+                    id: "create-app".into(),
+                    instruction: "Create package.json and app/page.tsx.".into(),
+                    expected_paths: vec!["package.json".into(), "app/page.tsx".into()],
+                    verify: vec!["cat app/page.tsx".into()],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+                PlanStep {
+                    id: "validate-build".into(),
+                    instruction: "Run the build script to verify the app compiles.".into(),
+                    expected_paths: vec![
+                        "package.json".into(),
+                        "app/page.tsx".into(),
+                        "components/SpaceOpsGame.tsx".into(),
+                    ],
+                    verify: vec!["npm run build".into()],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+            ],
+        };
+
+        assert!(lint_plan(&plan).is_ok());
     }
 
     #[test]
@@ -2098,7 +1755,249 @@ mod tests {
         .unwrap();
 
         assert_eq!(summary.completed, 1);
+        assert_eq!(summary.outcomes[0].stop_reason, "completed");
         assert!(temp.path().join("report.md").is_file());
+    }
+
+    #[test]
+    fn run_plan_allows_second_repair_cycle_for_verifier_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(state.path(), "session-1", "workspace-1");
+        let mut session = SessionSnapshot::default();
+        session.id = "session-1".to_string();
+        session.workspace_key = "workspace-1".to_string();
+        session.mode_state.mode = ExecutionMode::Act;
+        let plan = StepPlan {
+            goal: "Create report".into(),
+            steps: vec![PlanStep {
+                id: "report".into(),
+                instruction: "Create report.md".into(),
+                expected_paths: vec!["report.md".into()],
+                verify: vec!["cat report.md".into()],
+                expected_result: VerifyExpectedResult::Pass,
+            }],
+        };
+        let plan_path = temp.path().join("plan.yaml");
+        std::fs::write(&plan_path, render_plan_yaml(&plan)).unwrap();
+
+        let mut client = MockClient::default();
+        client.push_reply("Done.", Vec::new());
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path":"notes.md","content":"wrong file\n"}),
+            )],
+        );
+        client.push_reply("Created notes.md.", Vec::new());
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path":"report.md","content":"done\n"}),
+            )],
+        );
+        client.push_reply("Created report.md.", Vec::new());
+
+        let summary = run_plan(
+            &config(&temp),
+            "qwen3:8b",
+            &mut client,
+            &store,
+            &mut session,
+            &plan_path,
+        )
+        .unwrap();
+
+        assert_eq!(summary.completed, 1);
+        assert!(temp.path().join("notes.md").is_file());
+        assert!(temp.path().join("report.md").is_file());
+    }
+
+    #[test]
+    fn run_plan_does_not_early_stop_repair_when_expected_path_already_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("report.md"), "bad\n").unwrap();
+        std::fs::write(
+            temp.path().join("check.py"),
+            "from pathlib import Path\nimport sys\nsys.exit(0 if 'good' in Path('report.md').read_text() else 1)\n",
+        )
+        .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(state.path(), "session-1", "workspace-1");
+        let mut session = SessionSnapshot::default();
+        session.id = "session-1".to_string();
+        session.workspace_key = "workspace-1".to_string();
+        session.mode_state.mode = ExecutionMode::Act;
+        let plan = StepPlan {
+            goal: "Fix report".into(),
+            steps: vec![PlanStep {
+                id: "report".into(),
+                instruction: "Fix report.md so check.py passes".into(),
+                expected_paths: vec!["report.md".into()],
+                verify: vec!["python3 check.py".into()],
+                expected_result: VerifyExpectedResult::Pass,
+            }],
+        };
+        let plan_path = temp.path().join("plan.yaml");
+        std::fs::write(&plan_path, render_plan_yaml(&plan)).unwrap();
+
+        let mut client = MockClient::default();
+        client.push_reply("No change needed.", Vec::new());
+        client.push_reply("", vec![tool_call("Read", json!({"path":"report.md"}))]);
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Edit",
+                json!({"path":"report.md","old_string":"bad","new_string":"good"}),
+            )],
+        );
+        client.push_reply("Fixed report.md.", Vec::new());
+
+        let summary = run_plan(
+            &config(&temp),
+            "qwen3:8b",
+            &mut client,
+            &store,
+            &mut session,
+            &plan_path,
+        )
+        .unwrap();
+
+        assert_eq!(summary.completed, 1);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("report.md")).unwrap(),
+            "good\n"
+        );
+        assert!(
+            client.replies.is_empty(),
+            "repair should not stop immediately after Read when expected path already exists"
+        );
+    }
+
+    #[test]
+    fn repair_exhaustion_reports_ultra_plan_run_and_ultra_plan_can_fix() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("report.md"), "bad\n").unwrap();
+        std::fs::write(
+            temp.path().join("check.py"),
+            "from pathlib import Path\nimport sys\nsys.exit(0 if Path('report.md').read_text() == 'good\\n' else 1)\n",
+        )
+        .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(state.path(), "session-1", "workspace-1");
+        let mut session = SessionSnapshot::default();
+        session.id = "session-1".to_string();
+        session.workspace_key = "workspace-1".to_string();
+        session.mode_state.mode = ExecutionMode::Act;
+        let plan = StepPlan {
+            goal: "Fix report.md so check.py passes".into(),
+            steps: vec![PlanStep {
+                id: "fix-report".into(),
+                instruction: "Edit report.md so check.py passes".into(),
+                expected_paths: vec!["report.md".into()],
+                verify: vec!["python3 check.py".into()],
+                expected_result: VerifyExpectedResult::Pass,
+            }],
+        };
+        let plan_path = temp.path().join("plan.yaml");
+        std::fs::write(&plan_path, render_plan_yaml(&plan)).unwrap();
+
+        let mut failing_client = MockClient::default();
+        failing_client.push_reply(
+            "",
+            vec![tool_call(
+                "Edit",
+                json!({"path":"report.md","old_string":"bad","new_string":"bad0"}),
+            )],
+        );
+        failing_client.push_reply("Updated report.md.", Vec::new());
+        failing_client.push_reply(
+            "",
+            vec![tool_call(
+                "Edit",
+                json!({"path":"report.md","old_string":"bad0","new_string":"bad1"}),
+            )],
+        );
+        failing_client.push_reply("Updated report.md again.", Vec::new());
+        failing_client.push_reply(
+            "",
+            vec![tool_call(
+                "Edit",
+                json!({"path":"report.md","old_string":"bad1","new_string":"still bad again"}),
+            )],
+        );
+        failing_client.push_reply("Updated report.md a third time.", Vec::new());
+
+        let err = run_plan(
+            &config(&temp),
+            "qwen3:8b",
+            &mut failing_client,
+            &store,
+            &mut session,
+            &plan_path,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("repair attempts exhausted"), "{err}");
+        assert!(
+            err.contains("suggested command: /ultra-plan-run Repair failed step fix-report"),
+            "{err}"
+        );
+        assert!(err.contains("verify failed `python3 check.py`"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("report.md")).unwrap(),
+            "still bad again\n"
+        );
+
+        let mut recovery_client = MockClient::default();
+        recovery_client.push_reply(
+            r#"{"goal":"Fix report.md so check.py passes","profile":"generic","style":"default","phases":[{"id":"repair-report","prompt":"Repair report.md so python3 check.py passes."},{"id":"verify-report","prompt":"Keep report.md valid and verify python3 check.py still passes."}]}"#,
+            Vec::new(),
+        );
+        recovery_client.push_reply(
+            r#"{"goal":"Repair report.md so python3 check.py passes.","steps":[{"id":"fix-report","instruction":"Edit report.md so python3 check.py passes.","expected_paths":["report.md"],"verify":["python3 check.py"]}]}"#,
+            Vec::new(),
+        );
+        recovery_client.push_reply(
+            "",
+            vec![tool_call(
+                "Edit",
+                json!({"path":"report.md","old_string":"still bad again","new_string":"good"}),
+            )],
+        );
+        recovery_client.push_reply("Fixed report.md and check.py passes.", Vec::new());
+        recovery_client.push_reply(
+            r#"{"goal":"Keep report.md valid and verify python3 check.py still passes.","steps":[{"id":"verify-report","instruction":"Rewrite report.md with the verified good content and run python3 check.py.","expected_paths":["report.md"],"verify":["python3 check.py"]}]}"#,
+            Vec::new(),
+        );
+        recovery_client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path":"report.md","content":"good\n"}),
+            )],
+        );
+        recovery_client.push_reply("Verified report.md still passes.", Vec::new());
+
+        let summary = generate_and_run_ultra_plan(
+            &config(&temp),
+            "qwen3:8b",
+            &mut recovery_client,
+            &store,
+            &mut session,
+            "Repair report.md so python3 check.py passes.",
+            UltraProfile::Generic,
+            UltraPlanStyle::Default,
+        )
+        .unwrap();
+
+        assert_eq!(summary.phases.completed, 2);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("report.md")).unwrap(),
+            "good\n"
+        );
     }
 
     #[test]

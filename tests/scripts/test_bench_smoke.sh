@@ -82,7 +82,7 @@ if [[ "$prompt" == *"exit after artifact without session"* ]]; then
   exit 7
 fi
 cat > "$session_dir/session.json" <<JSON
-{"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","engine":"$engine","profile":"$profile","seed":"${ANVIL_BENCH_SEED:-unset}","messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
+{"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","engine":"$engine","profile":"$profile","seed":"${ANVIL_BENCH_SEED:-unset}","prompt":$(printf '%s' "$prompt" | jq -Rs .),"messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
 JSON
 echo '{"ts_ms":1,"event":"ollama.generate.start","payload":{}}' \
   > "$session_dir/logs/llm-io.jsonl"
@@ -242,8 +242,15 @@ jq -e '.profile == "nextjs"' "$ultra_run_dir/session.json" >/dev/null || {
   cat "$ultra_run_dir/session.json" >&2
   exit 1
 }
+jq -e '.prompt | contains("Required final artifacts") and contains("- result.txt")' \
+  "$ultra_run_dir/session.json" >/dev/null || {
+  echo "FAIL: ultra-plan-run prompt missing required artifact contract" >&2
+  cat "$ultra_run_dir/session.json" >&2
+  exit 1
+}
 jq -e '(.active_flags | index("RUN_MODE=ultra-plan-run"))
-       and (.active_flags | index("ULTRA_PROFILE=nextjs"))' \
+       and (.active_flags | index("ULTRA_PROFILE=nextjs"))
+       and (.active_flags | index("ULTRA_ARTIFACT_CONTRACT=success_check.files"))' \
   "$ultra_run_dir/meta.json" >/dev/null || {
   echo "FAIL: ultra-plan-run meta active flags missing" >&2
   cat "$ultra_run_dir/meta.json" >&2

@@ -538,7 +538,7 @@ pub fn run_with_outcome(
             // Issue #608 AP-08: BuildTest output bodies get the
             // pytest/cargo/npm summary + tail trim formatter applied before
             // the byte cap (design §4.6 ordering). Other classes pass through.
-            let body = apply_test_output_formatter_if_build_test(class, &combined);
+            let body = format_bash_tool_body(class, &normalized, &combined);
             return Ok((
                 format!(
                     "exit_code=-1\ninterrupted=true\n{}",
@@ -565,7 +565,7 @@ pub fn run_with_outcome(
                 class,
             };
             // Issue #608 AP-08: BuildTest body formatter (see above).
-            let body = apply_test_output_formatter_if_build_test(class, &combined);
+            let body = format_bash_tool_body(class, &normalized, &combined);
             return Ok((
                 format!(
                     "exit_code=-1\ntimed_out=true\ntimeout_secs={}\n{}",
@@ -599,7 +599,7 @@ pub fn run_with_outcome(
     // Issue #608 AP-08: BuildTest output bodies get the test_output
     // formatter applied before the byte cap (design §4.6 ordering invariant).
     // Bash metadata (`exit_code=`) stays at the head of the tool result.
-    let body = apply_test_output_formatter_if_build_test(class, &combined);
+    let body = format_bash_tool_body(class, &normalized, &combined);
     Ok((
         format!(
             "exit_code={}\n{}",
@@ -608,6 +608,18 @@ pub fn run_with_outcome(
         ),
         outcome,
     ))
+}
+
+const LARGE_CAT_OUTPUT_THRESHOLD_CHARS: usize = 6_000;
+const LARGE_CAT_EXCERPT_LINES: usize = 30;
+
+fn format_bash_tool_body(class: BashCommandClass, command: &str, combined: &str) -> String {
+    let body = apply_test_output_formatter_if_build_test(class, combined);
+    if matches!(class, BashCommandClass::ReadOnly) {
+        summarize_large_cat_output(command, &body)
+    } else {
+        body
+    }
 }
 
 /// Issue #608 AP-08 helper: apply the `test_output` formatter only when the
@@ -624,6 +636,54 @@ fn apply_test_output_formatter_if_build_test(class: BashCommandClass, combined: 
     } else {
         combined.to_string()
     }
+}
+
+fn summarize_large_cat_output(command: &str, combined: &str) -> String {
+    let char_count = combined.chars().count();
+    if char_count <= LARGE_CAT_OUTPUT_THRESHOLD_CHARS || !is_plain_cat_dump_command(command) {
+        return combined.to_string();
+    }
+
+    let lines = combined.lines().collect::<Vec<_>>();
+    let line_count = lines.len();
+    let head = lines
+        .iter()
+        .take(LARGE_CAT_EXCERPT_LINES)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tail_start = line_count.saturating_sub(LARGE_CAT_EXCERPT_LINES);
+    let tail = lines
+        .iter()
+        .skip(tail_start)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "[anvil] Large `cat` output summarized to keep the session context small.\n\
+command: {command}\n\
+chars: {char_count}\n\
+lines: {line_count}\n\
+Use Read with start_line/end_line, rg, sed -n, head, or tail for focused inspection.\n\
+--- head ({}) ---\n{head}\n\
+--- tail ({}) ---\n{tail}",
+        LARGE_CAT_EXCERPT_LINES.min(line_count),
+        line_count.saturating_sub(tail_start)
+    )
+}
+
+fn is_plain_cat_dump_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    trimmed.starts_with("cat ")
+        && !trimmed.contains("&&")
+        && !trimmed.contains("||")
+        && !trimmed.contains('|')
+        && !trimmed.contains(';')
+        && !trimmed.contains('>')
+        && !trimmed.contains('<')
+        && !trimmed.contains("`")
+        && !trimmed.contains("$(")
 }
 
 pub fn classify_command(command: &str) -> BashCommandClass {
@@ -2319,6 +2379,57 @@ mod tests {
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.stdout.contains("hello"));
         assert!(!outcome.timed_out);
+    }
+
+    #[test]
+    fn small_cat_output_passes_through() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("small.txt"), "alpha\nbeta\n").unwrap();
+
+        let (text, outcome) =
+            run_with_outcome("cat small.txt", temp.path(), None, false, None, None)
+                .expect("cat small file");
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(text.contains("alpha"));
+        assert!(text.contains("beta"));
+        assert!(
+            !text.contains("Large `cat` output summarized"),
+            "small cat output should stay raw: {text}"
+        );
+    }
+
+    #[test]
+    fn large_cat_output_is_summarized_for_tool_result() {
+        let temp = tempdir().unwrap();
+        let mut body = String::new();
+        for index in 1..=500 {
+            body.push_str(&format!("line-{index:03}: {}\n", "x".repeat(40)));
+        }
+        std::fs::write(temp.path().join("large.txt"), body).unwrap();
+
+        let (text, outcome) =
+            run_with_outcome("cat large.txt", temp.path(), None, false, None, None)
+                .expect("cat large file");
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(text.contains("Large `cat` output summarized"));
+        assert!(text.contains("lines: 500"));
+        assert!(text.contains("line-001"));
+        assert!(text.contains("line-500"));
+        assert!(
+            !text.contains("line-250"),
+            "middle of large cat output should not be copied into context"
+        );
+        assert!(
+            text.chars().count() < 5_000,
+            "summarized output should stay compact, got {} chars",
+            text.chars().count()
+        );
+        assert!(
+            outcome.stdout.contains("line-250"),
+            "structured outcome keeps raw stdout for diagnostics"
+        );
     }
 
     /// Issue #606 U-17: `BashExecutionOutcome::default()` yields the catch-all

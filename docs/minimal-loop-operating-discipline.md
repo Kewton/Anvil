@@ -2,7 +2,8 @@
 
 This document records the operating discipline used for the minimal-loop
 strangler work. It complements `docs/minimal-loop-plan.md`; the plan defines
-the phases and principles, while this document defines the repeatable review
+the phases and principles, `docs/minimal-loop-architecture.md` describes the
+current implementation shape, while this document defines the repeatable review
 skills that keep Phase 3 and Phase 4 from drifting.
 
 ## Scope

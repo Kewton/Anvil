@@ -56,6 +56,7 @@ pub struct MinimalLoopConfig {
     pub cancel_flag: Option<Arc<AtomicBool>>,
     pub completion_without_write_feedback: bool,
     pub requested_artifact_feedback: bool,
+    pub early_success_paths: Vec<String>,
 }
 
 pub fn run_session<C: MinimalChatClient>(
@@ -244,12 +245,19 @@ pub fn run_session<C: MinimalChatClient>(
                 .messages
                 .push(ConversationMessage::tool(call.name, result));
         }
+        if early_success_paths_satisfied(&config.work_root, &config.early_success_paths) {
+            return Ok("expected paths satisfied".to_string());
+        }
     }
 
     Err(format!(
         "minimal loop reached max_iterations ({})",
         config.max_iterations
     ))
+}
+
+fn early_success_paths_satisfied(work_root: &Path, paths: &[String]) -> bool {
+    !paths.is_empty() && paths.iter().all(|path| work_root.join(path).exists())
 }
 
 pub fn completion_without_write_feedback_disabled_from_env() -> bool {
@@ -676,6 +684,7 @@ mod tests {
             cancel_flag: None,
             completion_without_write_feedback: true,
             requested_artifact_feedback: true,
+            early_success_paths: Vec::new(),
         }
     }
 
@@ -708,6 +717,35 @@ mod tests {
             "hello"
         );
         assert!(session.messages.iter().any(|m| m.role == "tool"));
+    }
+
+    #[test]
+    fn early_success_paths_stop_after_tool_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "package.json", "content": "{}\n"}),
+            )],
+        );
+        let mut session = SessionSnapshot::default();
+        let mut config = config(temp.path().to_path_buf(), 8);
+        config.early_success_paths = vec!["package.json".to_string()];
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "create package.json",
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(reply, "expected paths satisfied");
+        assert_eq!(client.tool_counts.len(), 1);
+        assert!(temp.path().join("package.json").is_file());
     }
 
     #[test]

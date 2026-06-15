@@ -4,6 +4,7 @@
 人間のレビュアーとエージェントの共通の参照点であり、リポジトリの `docs/minimal-loop-plan.md` に置く。
 Phase 3/4 の triage・admission・ablation・eval report の運用規律は
 `docs/minimal-loop-operating-discipline.md` を参照する。
+現行実装の責務分割と思想は `docs/minimal-loop-architecture.md` を参照する。
 
 ---
 

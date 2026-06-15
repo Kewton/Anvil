@@ -577,6 +577,38 @@ evaluate_success_check() {
   fi
 }
 
+required_artifact_contract_for_case() {
+  # $1=case_idx
+  local case_idx="$1"
+  local selector file_count check_idx rel
+  if [[ "$case_count" -eq 0 ]]; then
+    selector='(.success_check // {})'
+  else
+    selector="(.cases[$case_idx].success_check // .success_check // {})"
+  fi
+
+  file_count=$(yq -r "$selector | (.files // []) | length" "$BENCH_YAML")
+  if ! [[ "$file_count" =~ ^[0-9]+$ ]] || [[ "$file_count" -eq 0 ]]; then
+    return 0
+  fi
+
+  local lines=()
+  for (( check_idx=0; check_idx<file_count; check_idx++ )); do
+    rel=$(yq -r "$selector | .files[$check_idx].path // .files[$check_idx] // \"\"" "$BENCH_YAML")
+    if [[ -z "$rel" || "$rel" == "null" || "$rel" == /* || "$rel" == *..* ]]; then
+      continue
+    fi
+    lines+=("- $rel")
+  done
+
+  if [[ "${#lines[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  printf '\n\nRequired final artifacts (repository-relative paths; create these exact paths if the task succeeds):\n'
+  printf '%s\n' "${lines[@]}"
+}
+
 seed_setup_files() {
   # $1=case_idx
   local case_idx="$1"
@@ -1070,6 +1102,13 @@ for model in "${cleaned_models[@]}"; do
       echo "Error: run_mode=ultra-plan-run requires --engine minimal for case $case_name" >&2
       exit 1
     fi
+    artifact_contract=""
+    if [[ "$run_mode" == "ultra-plan-run" ]]; then
+      artifact_contract=$(required_artifact_contract_for_case "$case_idx")
+      if [[ -n "$artifact_contract" ]]; then
+        prompt="${prompt}${artifact_contract}"
+      fi
+    fi
 
     for pam_variant in "${pam_variants[@]}"; do
       for (( run=1; run<=runs; run++ )); do
@@ -1166,6 +1205,7 @@ for model in "${cleaned_models[@]}"; do
             printf 'RUN_MODE=%s\n' "$run_mode"
             [[ -n "$ultra_profile" && "$ultra_profile" != "null" ]] && printf 'ULTRA_PROFILE=%s\n' "$ultra_profile"
             [[ -n "$ultra_style" && "$ultra_style" != "null" ]] && printf 'ULTRA_STYLE=%s\n' "$ultra_style"
+            [[ -n "$artifact_contract" ]] && printf 'ULTRA_ARTIFACT_CONTRACT=success_check.files\n'
             [[ -n "$cases_arg" ]] && printf 'CASES=%s\n' "$cases_arg"
             printf '%s\n' "${env_kv[@]+"${env_kv[@]}"}"
           } | jq -R -s 'split("\n") | map(select(length > 0))'
