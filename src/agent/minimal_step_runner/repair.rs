@@ -10,6 +10,12 @@ use super::{
     slug,
 };
 
+const REPAIR_PROMPT_MAX_CHARS: usize = 3_600;
+const REPAIR_GOAL_MAX_CHARS: usize = 800;
+const REPAIR_INSTRUCTION_MAX_CHARS: usize = 700;
+const REPAIR_FAILURE_MAX_CHARS: usize = 300;
+const REPAIR_MAX_FAILURES: usize = 6;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StepProgressReport {
     pub(super) missing_before: Vec<String>,
@@ -240,10 +246,10 @@ fn build_ultra_repair_prompt(
         format!("Repair failed step {}.", step.id),
         String::new(),
         "Original goal:".to_string(),
-        plan.goal.clone(),
+        truncate_chars(&plan.goal, REPAIR_GOAL_MAX_CHARS),
         String::new(),
         "Step instruction:".to_string(),
-        step.instruction.clone(),
+        truncate_chars(&step.instruction, REPAIR_INSTRUCTION_MAX_CHARS),
     ];
     let missing = report_missing_paths(report);
     if !missing.is_empty() {
@@ -259,7 +265,19 @@ fn build_ultra_repair_prompt(
     if !report.failures.is_empty() {
         lines.push(String::new());
         lines.push("Current failures:".to_string());
-        lines.extend(report.failures.iter().map(|failure| format!("- {failure}")));
+        lines.extend(
+            report
+                .failures
+                .iter()
+                .take(REPAIR_MAX_FAILURES)
+                .map(|failure| format!("- {}", truncate_chars(failure, REPAIR_FAILURE_MAX_CHARS))),
+        );
+        if report.failures.len() > REPAIR_MAX_FAILURES {
+            lines.push(format!(
+                "- ... {} more failures omitted; rerun the verifier after focused fixes.",
+                report.failures.len() - REPAIR_MAX_FAILURES
+            ));
+        }
     }
     lines.extend([
         String::new(),
@@ -269,7 +287,7 @@ fn build_ultra_repair_prompt(
         "- Inspect relevant files before editing.".to_string(),
         "- Use Write/Edit for concrete fixes and rerun the verifier when possible.".to_string(),
     ]);
-    lines.join("\n")
+    truncate_chars(&lines.join("\n"), REPAIR_PROMPT_MAX_CHARS)
 }
 
 fn save_repair_prompt(
@@ -338,4 +356,15 @@ fn explicit_ultra_profile(goal: &str) -> Option<UltraProfile> {
     goal.lines()
         .find_map(|line| line.trim().strip_prefix("Ultra profile: "))
         .and_then(|value| value.parse().ok())
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let suffix = "\n[truncated]";
+    let keep = max_chars.saturating_sub(suffix.chars().count());
+    let mut out = value.chars().take(keep).collect::<String>();
+    out.push_str(suffix);
+    out
 }

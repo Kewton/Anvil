@@ -168,11 +168,16 @@ fn openai_input(messages: &[ConversationMessage]) -> Vec<Value> {
 }
 
 fn openai_message(role: &str, text: &str) -> Value {
+    let content_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
     json!({
         "role": role,
         "content": [
             {
-                "type": "input_text",
+                "type": content_type,
                 "text": text,
             }
         ],
@@ -299,7 +304,25 @@ fn detect_malformed_tool_call(content: &str, tool_calls: &[ToolCall]) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::parse_openai_response;
+    use super::{build_response_request, parse_openai_response};
+    use crate::session::store::ConversationMessage;
+
+    #[test]
+    fn response_request_uses_output_text_for_assistant_history() {
+        let body = build_response_request(
+            "gpt-test",
+            &[
+                ConversationMessage::system("system".to_string()),
+                ConversationMessage::user("user".to_string()),
+                ConversationMessage::assistant("assistant".to_string(), Vec::new()),
+            ],
+            128,
+        );
+
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][2]["content"][0]["type"], "output_text");
+    }
 
     #[test]
     fn parses_xml_tool_call_from_output_text() {
