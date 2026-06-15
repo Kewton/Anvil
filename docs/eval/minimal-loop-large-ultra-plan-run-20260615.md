@@ -12,9 +12,11 @@ It adds six cases outside the existing small/medium 25-case matrix:
 - Rust CLI development
 - Rust CLI modification
 
-Result: `success_check` passed `1/6`. Execution return code was `rc=0` for
-`3/6`. The headline success number is intentionally not a stable benchmark yet:
-this was `runs=1` because the slice took about 92 minutes for six runs.
+Initial result: `success_check` passed `1/6`. Execution return code was `rc=0`
+for `3/6`. After replacing line-count-heavy checks with semantic checks and
+rechecking the same artifacts, the result is `4/6`. The headline success number
+is intentionally not a stable benchmark yet: this was `runs=1` because the slice
+took about 92 minutes for six runs.
 
 The more important finding is structural: `/ultra-plan-run` can decompose and
 execute large tasks, but the new benchmark needs semantic checks and stronger
@@ -30,6 +32,8 @@ task.
 - Recorded `RUN_MODE=ultra-plan-run`, `ULTRA_PROFILE=...`, and the deterministic
   bench seed in `active_flags`.
 - Added a smoke test covering benchmark-driven `/ultra-plan-run` execution.
+- Replaced the large slice's primary `min_lines` checks with semantic checks
+  using existing generic `success_check.commands`.
 
 ## Run
 
@@ -60,14 +64,14 @@ suite for release-grade comparisons.
 
 ## Results
 
-| Case | rc | success_check | elapsed | Direct reason |
-| --- | ---: | --- | ---: | --- |
-| `large-nextjs-app-development` | 1 | fail | 782s | Path mismatch and incomplete game phase: created `app/components/SpaceOpsGame.tsx` while check expected `components/SpaceOpsGame.tsx`; app shell was short; phase failed during generated plan lint. |
-| `large-nextjs-app-modification` | 1 | fail | 168s | Failed in the first generated phase due plan lint around build verification; no substantial modification happened. |
-| `large-fastapi-app-development` | 0 | fail | 995s | Built service, routes, catalog, and tests; 18 tests passed. Failed only `min_lines` for `app/main.py` and `app/models.py`. |
-| `large-fastapi-app-modification` | 1 | fail | 1575s | Implemented service/routes/tests, but generated pytest step failed. Postcheck only failed `app/routes/orders.py` line threshold (`40<50`). |
-| `large-rust-cli-development` | 0 | fail | 1126s | Built project and passed `cargo test`; failed only `src/args.rs` line threshold (`36<65`). |
-| `large-rust-cli-modification` | 0 | pass | 884s | Passed. Implemented parsing, summary, CLI wiring, and tests; 26 tests passed. |
+| Case | rc | initial check | semantic recheck | elapsed | Direct reason |
+| --- | ---: | --- | --- | ---: | --- |
+| `large-nextjs-app-development` | 1 | fail | fail | 782s | Path mismatch and incomplete game phase: created `app/components/SpaceOpsGame.tsx` while check expected `components/SpaceOpsGame.tsx`; phase failed during generated plan lint. |
+| `large-nextjs-app-modification` | 1 | fail | fail | 168s | Failed in the first generated phase due plan lint around build verification; no substantial modification happened. |
+| `large-fastapi-app-development` | 0 | fail | pass | 995s | Built service, routes, catalog, and tests; semantic checks pass. Initial failure was line-count false negative. |
+| `large-fastapi-app-modification` | 1 | fail | pass | 1575s | Implemented service/routes/tests. Semantic checks pass despite a failed generated pytest step; initial postcheck was line-count false negative. |
+| `large-rust-cli-development` | 0 | fail | pass | 1126s | Built project and passed `cargo test`; semantic CLI/file checks pass. Initial failure was line-count false negative. |
+| `large-rust-cli-modification` | 0 | pass | pass | 884s | Passed. Implemented parsing, summary, CLI wiring, and tests; 26 tests passed. |
 
 ## Findings
 
@@ -77,9 +81,9 @@ suite for release-grade comparisons.
    improvement over a single-turn minimal loop for large tasks.
 
 2. The new benchmark cannot rely on `min_lines` as the main signal.
-   `large-fastapi-app-development` and `large-rust-cli-development` both passed
-   meaningful tests but failed because one file was shorter than expected. These
-   should be converted to semantic checks.
+   Semantic recheck changed the saved-artifact result from `1/6` to `4/6`
+   without rerunning the model. That confirms the initial line-count checks were
+   measuring implementation shape more than user-visible behavior.
 
 3. Artifact-path contracts need to be stricter.
    The Next.js new-app case requested `components/SpaceOpsGame.tsx`, but the
@@ -100,14 +104,11 @@ suite for release-grade comparisons.
 
 ## Recommended Next Work
 
-1. Convert the new large cases from line-count checks to semantic checks:
-   framework build/test commands, expected exports/routes, executable behavior,
-   and small local verification scripts.
+1. Re-run this slice with the semantic checks now in `minimal-loop-large.yaml`.
 2. Tighten `/ultra-plan-run` artifact contracts so required paths are carried
    into each generated phase and step.
 3. Fix benchmark `meta.json` build fields for this run mode.
-4. Re-run this slice with `runs=3` after the check fixes. `runs=5` is probably
-   too expensive until the suite is stable.
+4. Use `runs=3` for the next measurement. `runs=5` is probably too expensive
+   until the suite is stable.
 5. Keep the six cases separate from the existing 25-case Phase 3/4 matrix until
    the checks are stable. They measure a different operating regime.
-
