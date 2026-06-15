@@ -24,7 +24,7 @@ pub fn build_system_prompt(
         }
     };
     format!(
-        "You are Anvil, a local-first coding agent running against a local Ollama model.\n\
+        "You are Anvil, a local-first coding agent running against a configured LLM model.\n\
 \n\
 Rules:\n\
 1. Prefer tools when repository facts or file contents are needed.\n\
@@ -71,7 +71,7 @@ mod tests {
             PromptToolMode::Native,
         );
 
-        let expected = "You are Anvil, a local-first coding agent running against a local Ollama model.\n\
+        let expected = "You are Anvil, a local-first coding agent running against a configured LLM model.\n\
 \n\
 Rules:\n\
 1. Prefer tools when repository facts or file contents are needed.\n\
@@ -116,7 +116,7 @@ Use the runtime-provided tool call channel for tools. Do not place tool calls in
             PromptToolMode::XmlFallback,
         );
 
-        let expected = "You are Anvil, a local-first coding agent running against a local Ollama model.\n\
+        let expected = "You are Anvil, a local-first coding agent running against a configured LLM model.\n\
 \n\
 Rules:\n\
 1. Prefer tools when repository facts or file contents are needed.\n\

@@ -1,11 +1,14 @@
 pub mod agent;
+pub(crate) mod api_keys;
 pub mod cli;
 pub mod config;
+pub mod gemini;
 pub mod logging;
 pub(crate) mod model_capabilities;
 pub mod model_registry;
 pub mod modes;
 pub mod ollama;
+pub mod openai;
 pub mod photon;
 pub mod repo_graph;
 pub mod safety;
@@ -24,10 +27,14 @@ use agent::loop_run::FooterLease;
 use agent::loop_run::commands::{
     print_startup_banner, print_startup_banner_stderr_oneshot, short_id,
 };
+use agent::minimal_llm::MinimalLlmClient;
+use agent::planner_llm::{PlannerProvider, build_planner_llm};
 use cli::{CliArgs, Command};
 use config::{Config, Engine};
+use gemini::GeminiClient;
 use model_registry::{RuntimeModels, select_models};
 use ollama::client::OllamaClient;
+use openai::OpenAiClient;
 use session::compact::find_last_user_prompt;
 use session::sessions_cli;
 use session::store::{SessionStore, reconcile_resume_state};
@@ -51,6 +58,9 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     let run_ultra_plan_path = args.run_ultra_plan.clone();
     let ultra_style = args.ultra_style.clone();
     let ultra_profile = args.ultra_profile.clone();
+    let planner_model = args.planner_model.clone();
+    let execution_provider = args.provider.unwrap_or(PlannerProvider::Ollama);
+    let planner_provider = args.planner_provider.unwrap_or(execution_provider);
 
     // Short-circuit for `anvil sessions ...` BEFORE loading Ollama / Agent so
     // session inspection works offline and without an LLM running.
@@ -94,6 +104,15 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         );
     }
     config.cwd = ensure_workspace_root(&config.cwd)?;
+    if execution_provider != PlannerProvider::Ollama && config.engine != Engine::Minimal {
+        return Err("--provider gemini/openai currently requires --engine minimal".to_string());
+    }
+    if planner_provider != execution_provider && planner_model.is_none() {
+        return Err(
+            "--planner-provider differs from --provider; specify --planner-model explicitly"
+                .to_string(),
+        );
+    }
 
     let state_root = resolve_state_root(&config)?;
     let workspace_key = compute_workspace_key(&config.cwd);
@@ -129,19 +148,75 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
 
     let _ = symlink_anvil_dirs(&config.cwd, &state_root, &session_id);
 
-    let client = OllamaClient::new_with_timeout_and_options(
-        config.ollama_host.clone(),
-        config.chat_timeout_secs,
-        config.context_budget,
-        config.num_predict,
-    )?;
-    let available_models = client.list_models()?;
-    let models = select_models(
-        config.requested_model.clone(),
-        config.requested_sidecar_model.clone(),
-        &available_models,
-        model_registry::detect_total_memory_gib(),
-    );
+    let needs_ollama = config.engine != Engine::Minimal
+        || execution_provider == PlannerProvider::Ollama
+        || planner_provider == PlannerProvider::Ollama;
+    let ollama_client = if needs_ollama {
+        Some(OllamaClient::new_with_timeout_and_options(
+            config.ollama_host.clone(),
+            config.chat_timeout_secs,
+            config.context_budget,
+            config.num_predict,
+        )?)
+    } else {
+        None
+    };
+    let needs_gemini = execution_provider == PlannerProvider::Gemini
+        || planner_provider == PlannerProvider::Gemini;
+    let gemini_client = if needs_gemini {
+        Some(GeminiClient::from_env(
+            &config.cwd,
+            config.chat_timeout_secs,
+            config.num_predict,
+        )?)
+    } else {
+        None
+    };
+    let needs_openai = execution_provider == PlannerProvider::Openai
+        || planner_provider == PlannerProvider::Openai;
+    let openai_client = if needs_openai {
+        Some(OpenAiClient::from_env(
+            &config.cwd,
+            config.chat_timeout_secs,
+            config.num_predict,
+        )?)
+    } else {
+        None
+    };
+    let models = match execution_provider {
+        PlannerProvider::Ollama => {
+            let client = ollama_client
+                .as_ref()
+                .ok_or_else(|| "Ollama client was not initialized".to_string())?;
+            let available_models = client.list_models()?;
+            select_models(
+                config.requested_model.clone(),
+                config.requested_sidecar_model.clone(),
+                &available_models,
+                model_registry::detect_total_memory_gib(),
+            )
+        }
+        PlannerProvider::Gemini => {
+            let main = config
+                .requested_model
+                .clone()
+                .ok_or_else(|| "--provider gemini requires --model".to_string())?;
+            RuntimeModels {
+                main,
+                sidecar: config.requested_sidecar_model.clone(),
+            }
+        }
+        PlannerProvider::Openai => {
+            let main = config
+                .requested_model
+                .clone()
+                .ok_or_else(|| "--provider openai requires --model".to_string())?;
+            RuntimeModels {
+                main,
+                sidecar: config.requested_sidecar_model.clone(),
+            }
+        }
+    };
 
     let session_store = SessionStore::new(&state_root, &session_id, &workspace_key);
     let mut session = session_store.load_or_new(config.fresh_session)?;
@@ -214,10 +289,33 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     }
 
     if config.engine == Engine::Minimal {
+        let minimal_client = match execution_provider {
+            PlannerProvider::Ollama => MinimalLlmClient::Ollama(
+                ollama_client
+                    .as_ref()
+                    .ok_or_else(|| "Ollama client was not initialized".to_string())?
+                    .clone(),
+            ),
+            PlannerProvider::Gemini => MinimalLlmClient::Gemini(
+                gemini_client
+                    .as_ref()
+                    .ok_or_else(|| "Gemini client was not initialized".to_string())?
+                    .clone(),
+            ),
+            PlannerProvider::Openai => MinimalLlmClient::Openai(
+                openai_client
+                    .as_ref()
+                    .ok_or_else(|| "OpenAI client was not initialized".to_string())?
+                    .clone(),
+            ),
+        };
         return run_minimal_engine(
             config,
             models,
-            client,
+            minimal_client,
+            ollama_client.clone(),
+            gemini_client.clone(),
+            openai_client.clone(),
             session_store,
             session,
             resume_prompt,
@@ -229,6 +327,8 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
             run_ultra_plan_path,
             ultra_style,
             ultra_profile,
+            planner_provider,
+            planner_model,
         );
     }
 
@@ -243,6 +343,8 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     // alive for the full `run_cli` scope; bare `_` would drop immediately.
     let _footer_lease = FooterLease::acquire(&config);
     let footer_handle = _footer_lease.handle_clone();
+    let client =
+        ollama_client.ok_or_else(|| "legacy engine requires --provider ollama".to_string())?;
 
     let mut agent = Agent::new(
         config,
@@ -273,7 +375,10 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
 fn run_minimal_engine(
     config: Config,
     models: RuntimeModels,
-    mut client: OllamaClient,
+    mut client: MinimalLlmClient,
+    planner_ollama_client: Option<OllamaClient>,
+    planner_gemini_client: Option<GeminiClient>,
+    planner_openai_client: Option<OpenAiClient>,
     session_store: SessionStore,
     mut session: session::store::SessionSnapshot,
     resume_prompt: Option<String>,
@@ -285,7 +390,10 @@ fn run_minimal_engine(
     run_ultra_plan_path: Option<PathBuf>,
     ultra_style: Option<String>,
     ultra_profile: Option<String>,
+    planner_provider: PlannerProvider,
+    planner_model: Option<String>,
 ) -> Result<(), String> {
+    let selected_planner_model = planner_model.unwrap_or_else(|| models.main.clone());
     if let Some(prompt) = resume_prompt {
         return run_minimal_prompt(
             &config,
@@ -298,19 +406,29 @@ fn run_minimal_engine(
     }
 
     if let Some(goal) = &plan_steps {
-        let path = agent::minimal_step_runner::generate_step_plan(
-            &config,
-            &models.main,
-            &mut client,
-            goal,
+        let mut planner = build_planner_llm(
+            planner_provider,
+            planner_ollama_client.as_ref(),
+            planner_gemini_client.as_ref(),
+            planner_openai_client.as_ref(),
+            selected_planner_model.clone(),
         )?;
+        let path = agent::minimal_step_runner::generate_step_plan(&config, planner.as_mut(), goal)?;
         println!("created step plan: {}", path.display());
         return Ok(());
     }
 
     if let Some(goal) = &plan_run {
+        let mut planner = build_planner_llm(
+            planner_provider,
+            planner_ollama_client.as_ref(),
+            planner_gemini_client.as_ref(),
+            planner_openai_client.as_ref(),
+            selected_planner_model.clone(),
+        )?;
         let summary = agent::minimal_step_runner::generate_and_run_step_plan(
             &config,
+            planner.as_mut(),
             &models.main,
             &mut client,
             &session_store,
@@ -351,10 +469,16 @@ fn run_minimal_engine(
     };
 
     if let Some(goal) = &ultra_plan {
+        let mut planner = build_planner_llm(
+            planner_provider,
+            planner_ollama_client.as_ref(),
+            planner_gemini_client.as_ref(),
+            planner_openai_client.as_ref(),
+            selected_planner_model.clone(),
+        )?;
         let path = agent::minimal_step_runner::generate_ultra_plan(
             &config,
-            &models.main,
-            &mut client,
+            planner.as_mut(),
             goal,
             ultra_profile,
             ultra_style,
@@ -364,8 +488,16 @@ fn run_minimal_engine(
     }
 
     if let Some(goal) = &ultra_plan_run {
+        let mut planner = build_planner_llm(
+            planner_provider,
+            planner_ollama_client.as_ref(),
+            planner_gemini_client.as_ref(),
+            planner_openai_client.as_ref(),
+            selected_planner_model.clone(),
+        )?;
         let summary = agent::minimal_step_runner::generate_and_run_ultra_plan(
             &config,
+            planner.as_mut(),
             &models.main,
             &mut client,
             &session_store,
@@ -383,8 +515,16 @@ fn run_minimal_engine(
     }
 
     if let Some(plan_path) = run_ultra_plan_path {
+        let mut planner = build_planner_llm(
+            planner_provider,
+            planner_ollama_client.as_ref(),
+            planner_gemini_client.as_ref(),
+            planner_openai_client.as_ref(),
+            selected_planner_model.clone(),
+        )?;
         let summary = agent::minimal_step_runner::run_ultra_plan(
             &config,
+            planner.as_mut(),
             &models.main,
             &mut client,
             &session_store,
@@ -421,7 +561,14 @@ fn run_minimal_engine(
     }
 
     if io::stdin().is_terminal() {
-        return agent::minimal_repl::run(config, models, client, session_store, session);
+        let planner = build_planner_llm(
+            planner_provider,
+            planner_ollama_client.as_ref(),
+            planner_gemini_client.as_ref(),
+            planner_openai_client.as_ref(),
+            selected_planner_model,
+        )?;
+        return agent::minimal_repl::run(config, models, client, planner, session_store, session);
     }
 
     Err("minimal engine requires --prompt, stdin, --resume, or an interactive TTY".to_string())
@@ -430,7 +577,7 @@ fn run_minimal_engine(
 fn run_minimal_prompt(
     config: &Config,
     model: &str,
-    client: &mut OllamaClient,
+    client: &mut MinimalLlmClient,
     session_store: &SessionStore,
     session: &mut session::store::SessionSnapshot,
     prompt: &str,

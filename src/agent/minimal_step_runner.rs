@@ -8,10 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
+#[cfg(test)]
 use crate::tools::registry::ToolSpec;
 
 use super::minimal_loop::MinimalChatClient;
 use super::minimal_repl::run_turn_with_early_success_paths;
+use super::planner_llm::PlannerLlm;
 
 mod plan_lint;
 mod profile;
@@ -246,10 +248,9 @@ pub struct UltraPlanRunSummary {
     pub phases: UltraRunSummary,
 }
 
-pub fn generate_step_plan<C: MinimalChatClient>(
+pub fn generate_step_plan<P: PlannerLlm + ?Sized>(
     config: &Config,
-    model: &str,
-    client: &mut C,
+    planner: &mut P,
     goal: &str,
 ) -> Result<PathBuf, String> {
     let mut messages = vec![
@@ -258,7 +259,7 @@ pub fn generate_step_plan<C: MinimalChatClient>(
     ];
     let mut last_error = String::new();
     for attempt in 0..PLAN_GENERATION_ATTEMPTS {
-        let reply = client.chat(model, &messages, &[] as &[ToolSpec], false)?;
+        let reply = planner.chat_plan(&messages)?;
         if !reply.tool_calls.is_empty() {
             last_error = "plan generation must not emit tool calls".to_string();
         } else {
@@ -413,6 +414,7 @@ pub fn run_plan<C: MinimalChatClient>(
             let progress =
                 analyze_step_progress(session, turn_start, missing_before.clone(), &report);
             let exhausted_report = build_repair_exhausted_report(
+                &config.cwd,
                 &plan,
                 step,
                 &report,
@@ -447,23 +449,23 @@ pub fn run_plan<C: MinimalChatClient>(
     })
 }
 
-pub fn generate_and_run_step_plan<C: MinimalChatClient>(
+pub fn generate_and_run_step_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
     config: &Config,
+    planner: &mut P,
     model: &str,
     client: &mut C,
     session_store: &SessionStore,
     session: &mut SessionSnapshot,
     goal: &str,
 ) -> Result<PlanRunSummary, String> {
-    let plan_path = generate_step_plan(config, model, client, goal)?;
+    let plan_path = generate_step_plan(config, planner, goal)?;
     let steps = run_plan(config, model, client, session_store, session, &plan_path)?;
     Ok(PlanRunSummary { plan_path, steps })
 }
 
-pub fn generate_ultra_plan<C: MinimalChatClient>(
+pub fn generate_ultra_plan<P: PlannerLlm + ?Sized>(
     config: &Config,
-    model: &str,
-    client: &mut C,
+    planner: &mut P,
     goal: &str,
     profile: UltraProfile,
     style: UltraPlanStyle,
@@ -474,7 +476,7 @@ pub fn generate_ultra_plan<C: MinimalChatClient>(
     ];
     let mut last_error = String::new();
     for attempt in 0..ULTRA_PLAN_GENERATION_ATTEMPTS {
-        let reply = client.chat(model, &messages, &[] as &[ToolSpec], false)?;
+        let reply = planner.chat_plan(&messages)?;
         if !reply.tool_calls.is_empty() {
             last_error = "ultra plan generation must not emit tool calls".to_string();
         } else {
@@ -499,8 +501,9 @@ pub fn generate_ultra_plan<C: MinimalChatClient>(
     Err(format!("invalid generated ultra plan: {last_error}"))
 }
 
-pub fn run_ultra_plan<C: MinimalChatClient>(
+pub fn run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
     config: &Config,
+    planner: &mut P,
     model: &str,
     client: &mut C,
     session_store: &SessionStore,
@@ -523,6 +526,7 @@ pub fn run_ultra_plan<C: MinimalChatClient>(
         let phase_prompt = build_profiled_phase_prompt(&ultra_plan, phase, &snapshot);
         let summary = generate_and_run_step_plan(
             config,
+            planner,
             model,
             client,
             session_store,
@@ -548,8 +552,9 @@ pub fn run_ultra_plan<C: MinimalChatClient>(
     })
 }
 
-pub fn generate_and_run_ultra_plan<C: MinimalChatClient>(
+pub fn generate_and_run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
     config: &Config,
+    planner: &mut P,
     model: &str,
     client: &mut C,
     session_store: &SessionStore,
@@ -558,8 +563,16 @@ pub fn generate_and_run_ultra_plan<C: MinimalChatClient>(
     profile: UltraProfile,
     style: UltraPlanStyle,
 ) -> Result<UltraPlanRunSummary, String> {
-    let plan_path = generate_ultra_plan(config, model, client, goal, profile, style)?;
-    let phases = run_ultra_plan(config, model, client, session_store, session, &plan_path)?;
+    let plan_path = generate_ultra_plan(config, planner, goal, profile, style)?;
+    let phases = run_ultra_plan(
+        config,
+        planner,
+        model,
+        client,
+        session_store,
+        session,
+        &plan_path,
+    )?;
     Ok(UltraPlanRunSummary { plan_path, phases })
 }
 
@@ -1234,6 +1247,21 @@ mod tests {
         }
     }
 
+    impl PlannerLlm for MockClient {
+        fn chat_plan(
+            &mut self,
+            _messages: &[ConversationMessage],
+        ) -> Result<AssistantReply, String> {
+            self.replies
+                .pop_front()
+                .ok_or_else(|| "no planner reply".to_string())
+        }
+
+        fn label(&self) -> String {
+            "mock-planner".to_string()
+        }
+    }
+
     fn config(root: &TempDir) -> Config {
         let mut config = Config::default();
         config.cwd = root.path().to_path_buf();
@@ -1260,8 +1288,7 @@ mod tests {
             Vec::new(),
         );
 
-        let path =
-            generate_step_plan(&config(&temp), "qwen3:8b", &mut client, "Build app").unwrap();
+        let path = generate_step_plan(&config(&temp), &mut client, "Build app").unwrap();
         assert!(path.starts_with(temp.path().join(".anvil").join("plans")));
         let loaded = parse_plan_yaml(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(loaded.goal, "Build app");
@@ -1279,7 +1306,6 @@ mod tests {
 
         let path = generate_ultra_plan(
             &config(&temp),
-            "qwen3:8b",
             &mut client,
             "Build app with TDD",
             UltraProfile::Generic,
@@ -1304,8 +1330,7 @@ mod tests {
             r#"{"goal":"Summarized goal","steps":[{"id":"create-game","instruction":"Create components/SpaceOpsGame.tsx","expected_paths":["components/SpaceOpsGame.tsx"],"verify":[]}]}"#,
             Vec::new(),
         );
-        let step_path =
-            generate_step_plan(&config(&temp), "qwen3:8b", &mut step_client, goal).unwrap();
+        let step_path = generate_step_plan(&config(&temp), &mut step_client, goal).unwrap();
         let step_plan = parse_plan_yaml(&std::fs::read_to_string(step_path).unwrap()).unwrap();
         assert_eq!(step_plan.goal, goal);
 
@@ -1316,7 +1341,6 @@ mod tests {
         );
         let ultra_path = generate_ultra_plan(
             &config(&temp),
-            "qwen3:8b",
             &mut ultra_client,
             goal,
             UltraProfile::Nextjs,
@@ -1942,24 +1966,46 @@ mod tests {
 
         assert!(err.contains("repair attempts exhausted"), "{err}");
         assert!(
-            err.contains("suggested command: /ultra-plan-run Repair failed step fix-report"),
+            err.contains("repair prompt saved: .anvil/repairs/repair-fix-report-"),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                r#"suggested command: /ultra-plan-run --profile python "$(cat .anvil/repairs/repair-fix-report-"#
+            ),
             "{err}"
         );
         assert!(err.contains("verify failed `python3 check.py`"), "{err}");
+        let repair_files = std::fs::read_dir(temp.path().join(".anvil").join("repairs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(repair_files.len(), 1);
+        let repair_prompt = std::fs::read_to_string(&repair_files[0]).unwrap();
+        assert!(repair_prompt.contains("Repair failed step fix-report."));
+        assert!(repair_prompt.contains("Original goal:"));
+        assert!(repair_prompt.contains("Verification commands:"));
+        assert!(repair_prompt.contains("- python3 check.py"));
         assert_eq!(
             std::fs::read_to_string(temp.path().join("report.md")).unwrap(),
             "still bad again\n"
         );
 
-        let mut recovery_client = MockClient::default();
-        recovery_client.push_reply(
+        let mut recovery_planner = MockClient::default();
+        recovery_planner.push_reply(
             r#"{"goal":"Fix report.md so check.py passes","profile":"generic","style":"default","phases":[{"id":"repair-report","prompt":"Repair report.md so python3 check.py passes."},{"id":"verify-report","prompt":"Keep report.md valid and verify python3 check.py still passes."}]}"#,
             Vec::new(),
         );
-        recovery_client.push_reply(
+        recovery_planner.push_reply(
             r#"{"goal":"Repair report.md so python3 check.py passes.","steps":[{"id":"fix-report","instruction":"Edit report.md so python3 check.py passes.","expected_paths":["report.md"],"verify":["python3 check.py"]}]}"#,
             Vec::new(),
         );
+        recovery_planner.push_reply(
+            r#"{"goal":"Keep report.md valid and verify python3 check.py still passes.","steps":[{"id":"verify-report","instruction":"Rewrite report.md with the verified good content and run python3 check.py.","expected_paths":["report.md"],"verify":["python3 check.py"]}]}"#,
+            Vec::new(),
+        );
+
+        let mut recovery_client = MockClient::default();
         recovery_client.push_reply(
             "",
             vec![tool_call(
@@ -1968,10 +2014,6 @@ mod tests {
             )],
         );
         recovery_client.push_reply("Fixed report.md and check.py passes.", Vec::new());
-        recovery_client.push_reply(
-            r#"{"goal":"Keep report.md valid and verify python3 check.py still passes.","steps":[{"id":"verify-report","instruction":"Rewrite report.md with the verified good content and run python3 check.py.","expected_paths":["report.md"],"verify":["python3 check.py"]}]}"#,
-            Vec::new(),
-        );
         recovery_client.push_reply(
             "",
             vec![tool_call(
@@ -1983,6 +2025,7 @@ mod tests {
 
         let summary = generate_and_run_ultra_plan(
             &config(&temp),
+            &mut recovery_planner,
             "qwen3:8b",
             &mut recovery_client,
             &store,
@@ -2027,20 +2070,22 @@ mod tests {
         let ultra_path = temp.path().join("ultra.yaml");
         std::fs::write(&ultra_path, render_ultra_plan_yaml(&ultra)).unwrap();
 
-        let mut client = MockClient::default();
-        client.push_reply(
+        let mut planner = MockClient::default();
+        planner.push_reply(
             r#"{"goal":"Create a.txt","steps":[{"id":"create-a","instruction":"Create a.txt","expected_paths":["a.txt"],"verify":[]}]}"#,
             Vec::new(),
         );
+        planner.push_reply(
+            r#"{"goal":"Create b.txt","steps":[{"id":"create-b","instruction":"Create b.txt","expected_paths":["b.txt"],"verify":[]}]}"#,
+            Vec::new(),
+        );
+
+        let mut client = MockClient::default();
         client.push_reply(
             "",
             vec![tool_call("Write", json!({"path":"a.txt","content":"a\n"}))],
         );
         client.push_reply("Created a.txt.", Vec::new());
-        client.push_reply(
-            r#"{"goal":"Create b.txt","steps":[{"id":"create-b","instruction":"Create b.txt","expected_paths":["b.txt"],"verify":[]}]}"#,
-            Vec::new(),
-        );
         client.push_reply(
             "",
             vec![tool_call("Write", json!({"path":"b.txt","content":"b\n"}))],
@@ -2049,6 +2094,7 @@ mod tests {
 
         let summary = run_ultra_plan(
             &config(&temp),
+            &mut planner,
             "qwen3:8b",
             &mut client,
             &store,

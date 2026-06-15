@@ -1,9 +1,14 @@
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::session::store::SessionSnapshot;
 
 use super::verify::VerificationReport;
-use super::{PlanStep, StepPlan, bullet_list, inline_list, required_artifact_contract_prompt};
+use super::{
+    PlanStep, StepPlan, UltraProfile, bullet_list, inline_list, required_artifact_contract_prompt,
+    slug,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StepProgressReport {
@@ -136,6 +141,7 @@ pub(super) fn failed_step_stop_reason(
 }
 
 pub(super) fn build_repair_exhausted_report(
+    work_root: &Path,
     plan: &StepPlan,
     step: &PlanStep,
     report: &VerificationReport,
@@ -145,7 +151,9 @@ pub(super) fn build_repair_exhausted_report(
     file_change_repairs: usize,
     max_file_change_repairs: usize,
 ) -> String {
-    let next_command = suggested_ultra_plan_run_command(plan, step, report);
+    let repair_prompt = build_ultra_repair_prompt(plan, step, report);
+    let repair_prompt_save = save_repair_prompt(work_root, step, &repair_prompt);
+    let suggested_profile = suggested_repair_profile(plan, step, report);
     let mut lines = vec![
         "repair attempts exhausted".to_string(),
         format!("step: {}", step.id),
@@ -177,7 +185,21 @@ pub(super) fn build_repair_exhausted_report(
         "next step: switch from local repair to explicit replanning with /ultra-plan-run"
             .to_string(),
     );
-    lines.push(format!("suggested command: {next_command}"));
+    match repair_prompt_save {
+        Ok(path) => {
+            let relative = path.to_string_lossy();
+            lines.push(format!("repair prompt saved: {relative}"));
+            lines.push(format!(
+                "suggested command: /ultra-plan-run --profile {suggested_profile} \"$(cat {relative})\""
+            ));
+        }
+        Err(err) => {
+            lines.push(format!("repair prompt save failed: {err}"));
+            lines.push(format!(
+                "suggested command: /ultra-plan-run --profile {suggested_profile} <repair prompt unavailable>"
+            ));
+        }
+    }
     lines.join("\n")
 }
 
@@ -209,37 +231,111 @@ fn turn_error_kind(err: &str) -> &'static str {
     }
 }
 
-fn suggested_ultra_plan_run_command(
+fn build_ultra_repair_prompt(
     plan: &StepPlan,
     step: &PlanStep,
     report: &VerificationReport,
 ) -> String {
-    let mut goal = format!(
-        "Repair failed step {}. Original goal: {}. Step instruction: {}.",
-        step.id, plan.goal, step.instruction
-    );
+    let mut lines = vec![
+        format!("Repair failed step {}.", step.id),
+        String::new(),
+        "Original goal:".to_string(),
+        plan.goal.clone(),
+        String::new(),
+        "Step instruction:".to_string(),
+        step.instruction.clone(),
+    ];
     let missing = report_missing_paths(report);
     if !missing.is_empty() {
-        goal.push_str(" Missing expected paths: ");
-        goal.push_str(&missing.join(", "));
-        goal.push('.');
+        lines.push(String::new());
+        lines.push("Missing expected paths:".to_string());
+        lines.extend(missing.iter().map(|path| format!("- {path}")));
     }
     if !step.verify.is_empty() {
-        goal.push_str(" Verification commands: ");
-        goal.push_str(&step.verify.join(", "));
-        goal.push('.');
+        lines.push(String::new());
+        lines.push("Verification commands:".to_string());
+        lines.extend(step.verify.iter().map(|command| format!("- {command}")));
     }
     if !report.failures.is_empty() {
-        goal.push_str(" Current failures: ");
-        goal.push_str(&report.failures.join("; "));
-        goal.push('.');
+        lines.push(String::new());
+        lines.push("Current failures:".to_string());
+        lines.extend(report.failures.iter().map(|failure| format!("- {failure}")));
     }
-    let goal = goal
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(900)
-        .collect::<String>();
-    format!("/ultra-plan-run {goal}")
+    lines.extend([
+        String::new(),
+        "Repair constraints:".to_string(),
+        "- Preserve the existing workspace and current project structure.".to_string(),
+        "- Focus on the failed step and its verifier output.".to_string(),
+        "- Inspect relevant files before editing.".to_string(),
+        "- Use Write/Edit for concrete fixes and rerun the verifier when possible.".to_string(),
+    ]);
+    lines.join("\n")
+}
+
+fn save_repair_prompt(
+    work_root: &Path,
+    step: &PlanStep,
+    repair_prompt: &str,
+) -> Result<PathBuf, String> {
+    let repair_dir = work_root.join(".anvil").join("repairs");
+    std::fs::create_dir_all(&repair_dir)
+        .map_err(|err| format!("failed to create {}: {err}", repair_dir.display()))?;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("system time before unix epoch: {err}"))?
+        .as_secs();
+    let file_name = format!("repair-{}-{ts}.md", slug(&step.id));
+    let absolute = repair_dir.join(file_name);
+    std::fs::write(&absolute, repair_prompt)
+        .map_err(|err| format!("failed to write {}: {err}", absolute.display()))?;
+    absolute
+        .strip_prefix(work_root)
+        .map(PathBuf::from)
+        .map_err(|err| format!("failed to relativize repair prompt path: {err}"))
+}
+
+fn suggested_repair_profile(
+    plan: &StepPlan,
+    step: &PlanStep,
+    report: &VerificationReport,
+) -> UltraProfile {
+    if let Some(profile) = explicit_ultra_profile(&plan.goal)
+        && profile != UltraProfile::Generic
+    {
+        return profile;
+    }
+
+    let evidence = format!(
+        "{}\n{}\n{}\n{}",
+        plan.goal,
+        step.instruction,
+        step.verify.join("\n"),
+        report.failures.join("\n")
+    )
+    .to_ascii_lowercase();
+
+    if evidence.contains("next.js")
+        || evidence.contains("nextjs")
+        || evidence.contains("next build")
+        || evidence.contains("npm run build")
+        || evidence.contains("app/page.tsx")
+    {
+        UltraProfile::Nextjs
+    } else if evidence.contains("cargo ") || evidence.contains(".rs") || evidence.contains("rust") {
+        UltraProfile::Rust
+    } else if evidence.contains("pytest")
+        || evidence.contains("python")
+        || evidence.contains(".py")
+        || evidence.contains("fastapi")
+    {
+        UltraProfile::Python
+    } else {
+        explicit_ultra_profile(&plan.goal).unwrap_or(UltraProfile::Generic)
+    }
+}
+
+fn explicit_ultra_profile(goal: &str) -> Option<UltraProfile> {
+    goal.lines()
+        .find_map(|line| line.trim().strip_prefix("Ultra profile: "))
+        .and_then(|value| value.parse().ok())
 }

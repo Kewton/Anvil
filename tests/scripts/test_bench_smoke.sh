@@ -9,6 +9,7 @@
 #   * meta.json "rc" and "elapsed_s" are numeric
 #   * meta.json records build provenance and active flags
 #   * meta.json records deterministic bench seed fields
+#   * provider / planner provider flags are passed through for minimal runs
 #   * failed runs still copy logs even when session.json was not flushed
 
 set -euo pipefail
@@ -38,6 +39,9 @@ state_dir=""
 engine="legacy"
 prompt=""
 profile=""
+provider=""
+planner_model=""
+planner_provider=""
 prev=""
 for arg in "$@"; do
   if [[ "$prev" == "--state-dir" ]]; then
@@ -54,6 +58,15 @@ for arg in "$@"; do
   fi
   if [[ "$prev" == "--profile" ]]; then
     profile="$arg"
+  fi
+  if [[ "$prev" == "--provider" ]]; then
+    provider="$arg"
+  fi
+  if [[ "$prev" == "--planner-model" ]]; then
+    planner_model="$arg"
+  fi
+  if [[ "$prev" == "--planner-provider" ]]; then
+    planner_provider="$arg"
   fi
   prev="$arg"
 done
@@ -82,7 +95,7 @@ if [[ "$prompt" == *"exit after artifact without session"* ]]; then
   exit 7
 fi
 cat > "$session_dir/session.json" <<JSON
-{"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","engine":"$engine","profile":"$profile","seed":"${ANVIL_BENCH_SEED:-unset}","prompt":$(printf '%s' "$prompt" | jq -Rs .),"messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
+{"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","engine":"$engine","profile":"$profile","provider":"$provider","planner_model":"$planner_model","planner_provider":"$planner_provider","seed":"${ANVIL_BENCH_SEED:-unset}","prompt":$(printf '%s' "$prompt" | jq -Rs .),"messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
 JSON
 echo '{"ts_ms":1,"event":"ollama.generate.start","payload":{}}' \
   > "$session_dir/logs/llm-io.jsonl"
@@ -227,7 +240,9 @@ jq -e '(.active_flags | index("CASES=docs,crash"))
   exit 1
 }
 
-bash scripts/bench.sh bench-ultra-smoke-fixture --model "smoke-ultra" --runs 1 --engine minimal \
+bash scripts/bench.sh bench-ultra-smoke-fixture --model "smoke-ultra" \
+  --provider "gemini" --planner-model "smoke-planner" --planner-provider "openai" \
+  --runs 1 --engine minimal \
   --bench-no-debug --no-bench-seed \
   > "$tmp/bench-ultra.stdout" 2> "$tmp/bench-ultra.stderr" || {
   echo "FAIL: bench.sh ultra-plan-run run failed" >&2
@@ -242,6 +257,14 @@ jq -e '.profile == "nextjs"' "$ultra_run_dir/session.json" >/dev/null || {
   cat "$ultra_run_dir/session.json" >&2
   exit 1
 }
+jq -e '.provider == "gemini"
+       and .planner_model == "smoke-planner"
+       and .planner_provider == "openai"' \
+  "$ultra_run_dir/session.json" >/dev/null || {
+  echo "FAIL: provider/planner flags were not passed to fake ultra-plan-run" >&2
+  cat "$ultra_run_dir/session.json" >&2
+  exit 1
+}
 jq -e '.prompt | contains("Required final artifacts") and contains("- result.txt")' \
   "$ultra_run_dir/session.json" >/dev/null || {
   echo "FAIL: ultra-plan-run prompt missing required artifact contract" >&2
@@ -249,7 +272,10 @@ jq -e '.prompt | contains("Required final artifacts") and contains("- result.txt
   exit 1
 }
 jq -e '(.active_flags | index("RUN_MODE=ultra-plan-run"))
+       and (.active_flags | index("PROVIDER=gemini"))
        and (.active_flags | index("ULTRA_PROFILE=nextjs"))
+       and (.active_flags | index("PLANNER_MODEL=smoke-planner"))
+       and (.active_flags | index("PLANNER_PROVIDER=openai"))
        and (.active_flags | index("ULTRA_ARTIFACT_CONTRACT=success_check.files"))' \
   "$ultra_run_dir/meta.json" >/dev/null || {
   echo "FAIL: ultra-plan-run meta active flags missing" >&2

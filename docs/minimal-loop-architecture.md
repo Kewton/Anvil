@@ -50,6 +50,11 @@ CLI / REPL
         profile.rs     ultra profile contracts and workspace snapshots
         plan_lint.rs   plan sanity checks
 
+  -> planner_llm.rs
+      planner-only LLM adapter boundary
+      current implementation: Ollama
+      planned extension point: non-tool planner providers such as Gemini
+
   -> shared infrastructure
       src/ollama/      Ollama client and parser/xml fallback
       src/tools/       Bash/Read/Write/Edit/Glob/Grep
@@ -116,6 +121,58 @@ instead of teaching the model to work around them.
 
 `/plan-run` and `/ultra-plan-run` exist for tasks that are too large for a
 single local-model turn.
+
+Plan generation and plan execution may use different models. `--model` remains
+the execution model for the minimal loop and tool use. `--planner-model` selects
+the model used only to generate `/plan-steps`, `/plan-run`, `/ultra-plan`, and
+`/ultra-plan-run` plans; when omitted, it defaults to `--model`.
+
+The provider boundary is intentionally narrow. `minimal_llm.rs` abstracts only
+the minimal chat call, and `planner_llm.rs` abstracts only planner chat. Tool
+execution, XML fallback parsing, runtime guards, sessions, and verifier/repair
+logic remain shared Anvil code. Ollama may use native tool calls for allowlisted
+models; Gemini and OpenAI use the XML fallback contract only. This keeps
+provider support small without rebuilding the legacy multi-provider control
+layer.
+
+Current CLI shape:
+
+```sh
+anvil --engine minimal \
+  --provider ollama \
+  --model qwen3.6:27b-coding-nvfp4 \
+  --planner-model qwen3.5:122b \
+  --ultra-plan-run "Build the app"
+```
+
+For Gemini:
+
+```sh
+anvil --engine minimal \
+  --provider gemini \
+  --model gemini-3.1-flash-lite \
+  --planner-provider gemini \
+  --planner-model gemini-3.5-flash \
+  --ultra-plan-run "Build the app"
+```
+
+`GEMINI_API_KEY` is read from the environment or a `.env` file near the
+workspace/current directory.
+
+For OpenAI/GPT planning with Gemini execution:
+
+```sh
+anvil --engine minimal \
+  --provider gemini \
+  --model gemini-3.1-flash-lite \
+  --planner-provider openai \
+  --planner-model gpt-5.4-mini \
+  --ultra-plan-run "Build the app"
+```
+
+`OPENAI_API_KEY` is read from the environment or a `.env` file near the
+workspace/current directory. When `--planner-provider` is omitted, it defaults
+to `--provider`.
 
 `/plan-run`:
 
@@ -206,4 +263,3 @@ The rule of thumb is:
 - make escalation explicit;
 - measure every new mechanism against both target improvement and non-target
   non-regression.
-

@@ -4,6 +4,11 @@
 # Usage: scripts/bench.sh <benchmark-name> [options]
 #   benchmark-name    benchmarks/ 配下の yaml ファイル名（拡張子なし）
 #   --model <name>    使用モデル
+#   --provider <name> 実行モデル provider（ollama|gemini|openai、デフォルト: ollama）
+#   --planner-model <name>
+#                    ultra-plan-run の計画生成で使うモデル（省略時は --model）
+#   --planner-provider <name>
+#                    ultra-plan-run の計画生成 provider（省略時は --provider）
 #   --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
 #   --engine <name>   legacy|minimal（デフォルト: legacy）
 #   --engines <list>  カンマ区切りで複数 engine（例: legacy,minimal）
@@ -40,6 +45,11 @@ Usage: scripts/bench.sh <benchmark-name> [options]
                     例: heavy-space-invaders
                     ※ first-write: planned for future, not yet supported
   --model <name>    使用モデル
+  --provider <name> 実行モデル provider（ollama|gemini|openai、デフォルト: ollama）
+  --planner-model <name>
+                    ultra-plan-run の計画生成で使うモデル（省略時は --model）
+  --planner-provider <name>
+                    ultra-plan-run の計画生成 provider（省略時は --provider）
   --models <list>   カンマ区切りで複数モデル（matrix 実行、逐次）
   --engine <name>   legacy|minimal（デフォルト: legacy）
   --engines <list>  カンマ区切りで複数 engine（例: legacy,minimal）
@@ -75,6 +85,9 @@ EOF
 # -------- arg parse --------
 benchmark_name=""
 model_arg=""
+provider_arg=""
+planner_model_arg=""
+planner_provider_arg=""
 models_arg=""
 engine_arg=""
 engines_arg=""
@@ -122,6 +135,21 @@ while [[ $# -gt 0 ]]; do
     --model)
       [[ $# -ge 2 ]] || { echo "Error: --model requires a value" >&2; exit 1; }
       model_arg="$2"
+      shift 2
+      ;;
+    --provider)
+      [[ $# -ge 2 ]] || { echo "Error: --provider requires a value" >&2; exit 1; }
+      provider_arg="$2"
+      shift 2
+      ;;
+    --planner-model)
+      [[ $# -ge 2 ]] || { echo "Error: --planner-model requires a value" >&2; exit 1; }
+      planner_model_arg="$2"
+      shift 2
+      ;;
+    --planner-provider)
+      [[ $# -ge 2 ]] || { echo "Error: --planner-provider requires a value" >&2; exit 1; }
+      planner_provider_arg="$2"
       shift 2
       ;;
     --models)
@@ -1203,6 +1231,9 @@ for model in "${cleaned_models[@]}"; do
             [[ -n "$chat_retries" ]] && printf 'CHAT_RETRIES=%s\n' "$chat_retries"
             [[ -n "$sidecar_model" ]] && printf 'SIDECAR_MODEL=%s\n' "$sidecar_model"
             printf 'RUN_MODE=%s\n' "$run_mode"
+            [[ -n "$provider_arg" ]] && printf 'PROVIDER=%s\n' "$provider_arg"
+            [[ -n "$planner_model_arg" ]] && printf 'PLANNER_MODEL=%s\n' "$planner_model_arg"
+            [[ -n "$planner_provider_arg" ]] && printf 'PLANNER_PROVIDER=%s\n' "$planner_provider_arg"
             [[ -n "$ultra_profile" && "$ultra_profile" != "null" ]] && printf 'ULTRA_PROFILE=%s\n' "$ultra_profile"
             [[ -n "$ultra_style" && "$ultra_style" != "null" ]] && printf 'ULTRA_STYLE=%s\n' "$ultra_style"
             [[ -n "$artifact_contract" ]] && printf 'ULTRA_ARTIFACT_CONTRACT=success_check.files\n'
@@ -1220,6 +1251,15 @@ for model in "${cleaned_models[@]}"; do
         else
           if [[ "$run_mode" == "ultra-plan-run" ]]; then
             anvil_args=(--offline --yes --ultra-plan-run "$prompt" --state-dir "$STATE_DIR" --model "$model" --engine minimal)
+            if [[ -n "$provider_arg" ]]; then
+              anvil_args+=(--provider "$provider_arg")
+            fi
+            if [[ -n "$planner_model_arg" ]]; then
+              anvil_args+=(--planner-model "$planner_model_arg")
+            fi
+            if [[ -n "$planner_provider_arg" ]]; then
+              anvil_args+=(--planner-provider "$planner_provider_arg")
+            fi
             if [[ -n "$ultra_profile" && "$ultra_profile" != "null" ]]; then
               anvil_args+=(--profile "$ultra_profile")
             fi
@@ -1228,6 +1268,9 @@ for model in "${cleaned_models[@]}"; do
             fi
           else
             anvil_args=(--oneshot --offline --yes --prompt "$prompt" --state-dir "$STATE_DIR" --model "$model")
+            if [[ -n "$provider_arg" ]]; then
+              anvil_args+=(--provider "$provider_arg")
+            fi
           fi
           if [[ "$engine_cli_explicit" -eq 1 ]]; then
             if [[ "$run_mode" == "prompt" ]]; then
@@ -1255,6 +1298,8 @@ for model in "${cleaned_models[@]}"; do
             PATH="$PATH" \
             TERM="${TERM:-xterm}" \
             TMPDIR="${TMPDIR:-/tmp}" \
+            GEMINI_API_KEY="${GEMINI_API_KEY:-}" \
+            OPENAI_API_KEY="${OPENAI_API_KEY:-}" \
             "${env_kv[@]+"${env_kv[@]}"}" \
             "$ANVIL_BIN" "${anvil_args[@]}" > ../stdout.log 2>&1
           rc=$?

@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -8,14 +9,15 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::model_registry::RuntimeModels;
-use crate::ollama::client::OllamaClient;
 use crate::session::store::{SessionSnapshot, SessionStore};
 
+use super::minimal_llm::MinimalLlmClient;
 use super::minimal_loop::{
     MinimalChatClient, MinimalLoopConfig, completion_without_write_feedback_disabled_from_env,
     requested_artifact_feedback_disabled_from_env, run_session,
 };
 use super::minimal_step_runner;
+use super::planner_llm::PlannerLlm;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReplInput {
@@ -42,7 +44,8 @@ enum ReplInput {
 pub fn run(
     config: Config,
     models: RuntimeModels,
-    mut client: OllamaClient,
+    mut client: MinimalLlmClient,
+    mut planner: Box<dyn PlannerLlm>,
     session_store: SessionStore,
     mut session: SessionSnapshot,
 ) -> Result<(), String> {
@@ -73,12 +76,7 @@ pub fn run(
             ReplInput::PlanSteps(goal) => {
                 let result = {
                     let _spinner = ReplSpinner::start("minimal planning");
-                    minimal_step_runner::generate_step_plan(
-                        &config,
-                        &models.main,
-                        &mut client,
-                        &goal,
-                    )
+                    minimal_step_runner::generate_step_plan(&config, planner.as_mut(), &goal)
                 };
                 match result {
                     Ok(path) => println!("created step plan: {}", path.display()),
@@ -90,6 +88,7 @@ pub fn run(
                     let _spinner = ReplSpinner::start("minimal plan-run");
                     minimal_step_runner::generate_and_run_step_plan(
                         &config,
+                        planner.as_mut(),
                         &models.main,
                         &mut client,
                         &session_store,
@@ -113,12 +112,18 @@ pub fn run(
                 style,
                 goal,
             } => {
+                let goal = match resolve_repl_goal_file_reference(&config, &goal) {
+                    Ok(goal) => goal,
+                    Err(err) => {
+                        eprintln!("ERROR: {err}");
+                        continue;
+                    }
+                };
                 let result = {
                     let _spinner = ReplSpinner::start("minimal ultra planning");
                     minimal_step_runner::generate_ultra_plan(
                         &config,
-                        &models.main,
-                        &mut client,
+                        planner.as_mut(),
                         &goal,
                         profile,
                         style,
@@ -134,10 +139,18 @@ pub fn run(
                 style,
                 goal,
             } => {
+                let goal = match resolve_repl_goal_file_reference(&config, &goal) {
+                    Ok(goal) => goal,
+                    Err(err) => {
+                        eprintln!("ERROR: {err}");
+                        continue;
+                    }
+                };
                 let result = {
                     let _spinner = ReplSpinner::start("minimal ultra plan-run");
                     minimal_step_runner::generate_and_run_ultra_plan(
                         &config,
+                        planner.as_mut(),
                         &models.main,
                         &mut client,
                         &session_store,
@@ -162,6 +175,7 @@ pub fn run(
                 let path = std::path::PathBuf::from(path);
                 match minimal_step_runner::run_ultra_plan(
                     &config,
+                    planner.as_mut(),
                     &models.main,
                     &mut client,
                     &session_store,
@@ -404,6 +418,50 @@ fn parse_ultra_goal_command(raw: &str, run: bool) -> ReplInput {
     }
 }
 
+fn resolve_repl_goal_file_reference(config: &Config, goal: &str) -> Result<String, String> {
+    let trimmed = goal.trim();
+    let unquoted = strip_matching_quotes(trimmed);
+    let Some(inner) = unquoted
+        .strip_prefix("$(cat ")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return Ok(goal.to_string());
+    };
+    let path = inner.trim();
+    if path.is_empty() || path.contains(char::is_whitespace) {
+        return Err("$(cat ...) goal reference requires one workspace-relative path".to_string());
+    }
+    let relative = PathBuf::from(path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err("$(cat ...) goal reference must stay inside the workspace".to_string());
+    }
+    let full_path = config.cwd.join(&relative);
+    let canonical_root = std::fs::canonicalize(&config.cwd)
+        .map_err(|err| format!("failed to canonicalize workspace root: {err}"))?;
+    let canonical_file = std::fs::canonicalize(&full_path)
+        .map_err(|err| format!("failed to read goal file {}: {err}", relative.display()))?;
+    if !canonical_file.starts_with(&canonical_root) {
+        return Err("$(cat ...) goal reference escaped the workspace".to_string());
+    }
+    std::fs::read_to_string(&canonical_file)
+        .map_err(|err| format!("failed to read goal file {}: {err}", relative.display()))
+}
+
+fn strip_matching_quotes(value: &str) -> &str {
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -520,6 +578,32 @@ mod tests {
             parse_repl_input("  write hello  \n"),
             ReplInput::Prompt("  write hello  ".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_goal_file_reference_reads_workspace_relative_cat_form() {
+        let temp = tempfile::tempdir().unwrap();
+        let repair_dir = temp.path().join(".anvil").join("repairs");
+        std::fs::create_dir_all(&repair_dir).unwrap();
+        std::fs::write(repair_dir.join("repair.md"), "repair this step").unwrap();
+        let config = config(temp.path().to_path_buf());
+
+        let resolved =
+            resolve_repl_goal_file_reference(&config, r#""$(cat .anvil/repairs/repair.md)""#)
+                .unwrap();
+
+        assert_eq!(resolved, "repair this step");
+    }
+
+    #[test]
+    fn resolve_goal_file_reference_rejects_workspace_escape() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = config(temp.path().to_path_buf());
+
+        let err =
+            resolve_repl_goal_file_reference(&config, r#""$(cat ../repair.md)""#).unwrap_err();
+
+        assert!(err.contains("inside the workspace"), "{err}");
     }
 
     #[test]

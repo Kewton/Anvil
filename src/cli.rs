@@ -2,16 +2,26 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::agent::planner_llm::PlannerProvider;
 use crate::config::{DeterministicFallbackMode, Engine};
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "anvil")]
-#[command(about = "local-first coding agent for Ollama")]
+#[command(about = "local-first coding agent for local and API LLMs")]
 pub struct CliArgs {
     #[arg(short = 'p', long = "prompt")]
     pub prompt: Option<String>,
     #[arg(short = 'm', long = "model")]
     pub model: Option<String>,
+    /// Provider used for the main execution model.
+    #[arg(long = "provider", value_enum)]
+    pub provider: Option<PlannerProvider>,
+    /// LLM model used only for plan generation. Defaults to --model.
+    #[arg(long = "planner-model")]
+    pub planner_model: Option<String>,
+    /// Provider used only for plan generation. Defaults to --provider.
+    #[arg(long = "planner-provider", value_enum)]
+    pub planner_provider: Option<PlannerProvider>,
     #[arg(long = "sidecar-model")]
     pub sidecar_model: Option<String>,
     #[arg(long = "ollama-host")]
@@ -333,6 +343,9 @@ mod tests {
         CliArgs {
             prompt: None,
             model: None,
+            provider: None,
+            planner_model: None,
+            planner_provider: None,
             sidecar_model: None,
             ollama_host: None,
             context_budget: None,
@@ -371,6 +384,40 @@ mod tests {
     #[test]
     fn validate_accepts_default() {
         assert!(base_args().validate().is_ok());
+    }
+
+    #[test]
+    fn planner_flags_parse_and_default_to_none() {
+        let default_args = CliArgs::parse_from(["anvil"]);
+        assert_eq!(default_args.provider, None);
+        assert_eq!(default_args.planner_model, None);
+        assert_eq!(default_args.planner_provider, None);
+
+        let args = CliArgs::parse_from([
+            "anvil",
+            "--provider",
+            "gemini",
+            "--planner-model",
+            "gemini-3.5-flash",
+            "--planner-provider",
+            "gemini",
+        ]);
+        assert_eq!(args.provider, Some(PlannerProvider::Gemini));
+        assert_eq!(args.planner_model.as_deref(), Some("gemini-3.5-flash"));
+        assert_eq!(args.planner_provider, Some(PlannerProvider::Gemini));
+
+        let args = CliArgs::parse_from([
+            "anvil",
+            "--provider",
+            "gpt",
+            "--planner-provider",
+            "openai",
+            "--planner-model",
+            "gpt-5.4-mini",
+        ]);
+        assert_eq!(args.provider, Some(PlannerProvider::Openai));
+        assert_eq!(args.planner_provider, Some(PlannerProvider::Openai));
+        assert_eq!(args.planner_model.as_deref(), Some("gpt-5.4-mini"));
     }
 
     #[test]

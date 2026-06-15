@@ -1,4 +1,4 @@
-local-first coding agent for Ollama
+local-first coding agent for local and API LLMs
 
 Usage: anvil [OPTIONS] [COMMAND]
 
@@ -11,6 +11,12 @@ Options:
           
   -m, --model <MODEL>
           
+      --provider <PROVIDER>
+          Provider used for the main execution model [possible values: ollama, gemini, openai]
+      --planner-model <PLANNER_MODEL>
+          LLM model used only for plan generation. Defaults to --model
+      --planner-provider <PLANNER_PROVIDER>
+          Provider used only for plan generation. Defaults to --provider [possible values: ollama, gemini, openai]
       --sidecar-model <SIDECAR_MODEL>
           
       --ollama-host <OLLAMA_HOST>
@@ -39,6 +45,22 @@ Options:
           
       --auto-plan
           
+      --plan-steps <PROMPT>
+          Ask the minimal engine to draft a step plan and save it under .anvil/plans/
+      --plan-run <PROMPT>
+          Draft a step plan, save it, then run it immediately with the minimal engine
+      --run-plan <FILE>
+          Run a previously saved minimal step plan
+      --ultra-plan <PROMPT>
+          Draft a top-level phase plan for repeated minimal plan-runs
+      --ultra-plan-run <PROMPT>
+          Draft a top-level phase plan, save it, then run each phase with /plan-run
+      --run-ultra-plan <FILE>
+          Run a previously saved minimal ultra phase plan
+      --ultra-style <STYLE>
+          Planning style for --ultra-plan / --ultra-plan-run: default, tdd, or test-hardening
+      --profile <PROFILE>
+          Contract/verifier profile for --ultra-plan / --ultra-plan-run
       --offline
           
       --deterministic-fallback <DETERMINISTIC_FALLBACK>

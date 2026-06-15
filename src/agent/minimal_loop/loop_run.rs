@@ -24,6 +24,10 @@ const MAX_PLANNED_ACTION_WITHOUT_TOOL_FEEDBACKS: usize = 3;
 const MAX_MISSING_RELATIVE_IMPORT_FEEDBACKS: usize = 3;
 
 pub trait MinimalChatClient {
+    fn supports_native_tools(&self, _model: &str) -> bool {
+        false
+    }
+
     fn chat(
         &mut self,
         model: &str,
@@ -34,6 +38,10 @@ pub trait MinimalChatClient {
 }
 
 impl MinimalChatClient for OllamaClient {
+    fn supports_native_tools(&self, model: &str) -> bool {
+        should_use_native_tool_calls(model)
+    }
+
     fn chat(
         &mut self,
         model: &str,
@@ -68,7 +76,7 @@ pub fn run_session<C: MinimalChatClient>(
 ) -> Result<String, String> {
     let registry = ToolRegistry::default();
     let mut native_tools_enabled =
-        should_use_native_tool_calls(model) && !session.native_tools_disabled;
+        client.supports_native_tools(model) && !session.native_tools_disabled;
     let workspace_policy = WorkspacePolicy::for_task_request(user_prompt);
     let mut feedback_state = FeedbackState::default();
     let mut pending_feedback: Option<String> = None;
@@ -625,6 +633,10 @@ mod tests {
     }
 
     impl MinimalChatClient for MockClient {
+        fn supports_native_tools(&self, model: &str) -> bool {
+            crate::ollama::client::should_use_native_tool_calls(model)
+        }
+
         fn chat(
             &mut self,
             _model: &str,
