@@ -1637,6 +1637,23 @@ mod tests {
     }
 
     #[test]
+    fn nextjs_non_build_phase_can_omit_entry_path() {
+        let plan = StepPlan {
+            goal: "Create a Next.js app architecture plan".into(),
+            steps: vec![PlanStep {
+                id: "scope-and-architecture".into(),
+                instruction: "Create docs/architecture.md describing the Next.js app structure."
+                    .into(),
+                expected_paths: vec!["docs/architecture.md".into()],
+                verify: vec!["cat docs/architecture.md".into()],
+                expected_result: VerifyExpectedResult::Pass,
+            }],
+        };
+
+        assert!(lint_plan(&plan).is_ok());
+    }
+
+    #[test]
     fn required_artifact_contract_is_preserved_in_phase_prompt() {
         let ultra = UltraPlan {
             goal: "Build app\n\nRequired final artifacts:\n- components/SpaceOpsGame.tsx\n- app/page.tsx\n".into(),

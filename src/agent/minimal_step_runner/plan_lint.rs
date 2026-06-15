@@ -96,22 +96,10 @@ fn lint_nextjs_build_order(plan: &StepPlan, work_root: Option<&Path>, errors: &m
         return;
     }
 
-    let all_expected = plan
-        .steps
-        .iter()
-        .flat_map(|step| step.expected_paths.iter())
-        .collect::<Vec<_>>();
     let workspace_has_package = work_root
         .map(|root| root.join("package.json").is_file())
         .unwrap_or(false);
     let workspace_has_entry = work_root.map(workspace_has_nextjs_entry).unwrap_or(false);
-
-    if !workspace_has_entry && !all_expected.iter().any(|path| is_nextjs_entry_path(path)) {
-        errors.push(
-            "Next.js plan must include app/page.tsx or pages/index.tsx in expected_paths"
-                .to_string(),
-        );
-    }
 
     let mut package_seen = workspace_has_package;
     let mut entry_seen = workspace_has_entry;
