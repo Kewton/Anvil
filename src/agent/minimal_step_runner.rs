@@ -1490,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn nextjs_profile_verifier_rejects_at_alias_without_base_url() {
+    fn nextjs_profile_verifier_accepts_at_alias_paths_without_base_url() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("app")).unwrap();
         std::fs::create_dir_all(temp.path().join("components")).unwrap();
@@ -1516,10 +1516,40 @@ mod tests {
         .unwrap();
         let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
 
+        verify_profile_after_phase(temp.path(), UltraProfile::Nextjs, &snapshot).unwrap();
+    }
+
+    #[test]
+    fn nextjs_profile_verifier_rejects_at_alias_without_paths_mapping() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+        std::fs::create_dir_all(temp.path().join("components")).unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("app/page.tsx"),
+            "import SpaceOpsGame from '@/components/SpaceOpsGame';\nexport default function Page(){ return <SpaceOpsGame/>; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("components/SpaceOpsGame.tsx"),
+            "export default function SpaceOpsGame(){ return null; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"jsx":"preserve"}}"#,
+        )
+        .unwrap();
+        let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
+
         let err =
             verify_profile_after_phase(temp.path(), UltraProfile::Nextjs, &snapshot).unwrap_err();
 
-        assert!(err.contains("baseUrl"), "got: {err}");
+        assert!(err.contains("paths mapping"), "got: {err}");
     }
 
     #[test]

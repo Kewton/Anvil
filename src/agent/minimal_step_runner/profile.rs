@@ -175,7 +175,7 @@ fn profile_runtime_contract(profile: UltraProfile) -> &'static str {
     match profile {
         UltraProfile::Generic => "- Keep changes scoped to the current phase.",
         UltraProfile::Nextjs => {
-            "- Preserve the workspace as a Next.js app when one exists.\n- Do not convert package.json to a standalone TypeScript/Node project.\n- Keep next/react/react-dom dependencies when already present.\n- Keep scripts.build as next build when already present.\n- If a 3011 port requirement exists, keep the dev script on port 3011.\n- Do not set tsconfig rootDir to ./src in a way that excludes app/.\n- If source imports use @/* aliases, tsconfig.json must set compilerOptions.baseUrl to \".\" and map @/* under compilerOptions.paths; otherwise use relative imports."
+            "- Preserve the workspace as a Next.js app when one exists.\n- Do not convert package.json to a standalone TypeScript/Node project.\n- Keep next/react/react-dom dependencies when already present.\n- Keep scripts.build as next build when already present.\n- If a 3011 port requirement exists, keep the dev script on port 3011.\n- Do not set tsconfig rootDir to ./src in a way that excludes app/.\n- If source imports use @/* aliases, tsconfig.json must map @/* under compilerOptions.paths; otherwise use relative imports."
         }
         UltraProfile::Python => {
             "- Preserve the existing Python package/import layout.\n- Prefer pytest and python -m py_compile for verification.\n- Do not rewrite project metadata unless this phase explicitly requires it."
@@ -239,27 +239,22 @@ fn verify_nextjs_profile(work_root: &Path, failures: &mut Vec<String>) {
         if raw.contains("\"rootDir\"") && raw.contains("\"./src\"") {
             failures.push("tsconfig.json rootDir ./src excludes Next.js app/ files".to_string());
         }
-        if nextjs_source_uses_at_alias(work_root) && nextjs_tsconfig_missing_at_alias_base_url(&raw)
-        {
+        if nextjs_source_uses_at_alias(work_root) && nextjs_tsconfig_missing_at_alias_paths(&raw) {
             failures.push(
-                "Next.js source imports @/* aliases but tsconfig.json lacks compilerOptions.baseUrl \".\""
+                "Next.js source imports @/* aliases but tsconfig.json lacks compilerOptions.paths mapping for @/*"
                     .to_string(),
             );
         }
     }
 }
 
-fn nextjs_tsconfig_missing_at_alias_base_url(raw: &str) -> bool {
+fn nextjs_tsconfig_missing_at_alias_paths(raw: &str) -> bool {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(raw) else {
         return true;
     };
     let compiler = json
         .get("compilerOptions")
         .and_then(|value| value.as_object());
-    let has_base_url = compiler
-        .and_then(|map| map.get("baseUrl"))
-        .and_then(|value| value.as_str())
-        == Some(".");
     let has_alias = compiler
         .and_then(|map| map.get("paths"))
         .and_then(|value| value.get("@/*"))
@@ -270,7 +265,7 @@ fn nextjs_tsconfig_missing_at_alias_base_url(raw: &str) -> bool {
                 .filter_map(|item| item.as_str())
                 .any(|item| item == "./*" || item == "*")
         });
-    !(has_base_url && has_alias)
+    !has_alias
 }
 
 fn nextjs_source_uses_at_alias(work_root: &Path) -> bool {
