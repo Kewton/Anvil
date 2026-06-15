@@ -1020,6 +1020,9 @@ for model in "${cleaned_models[@]}"; do
       max_iterations=$(yq -r '.args.max_iterations // ""' "$BENCH_YAML")
       chat_retries=$(yq -r '.args.chat_retries // ""' "$BENCH_YAML")
       sidecar_model=$(yq -r '.args.sidecar_model // ""' "$BENCH_YAML")
+      run_mode=$(yq -r '.run_mode // "prompt"' "$BENCH_YAML")
+      ultra_profile=$(yq -r '.ultra_profile // .profile // ""' "$BENCH_YAML")
+      ultra_style=$(yq -r '.ultra_style // ""' "$BENCH_YAML")
     else
       case_name=$(yq -r ".cases[$case_idx].name // \"case-$((case_idx + 1))\"" "$BENCH_YAML")
       task_kind=$(yq -r ".cases[$case_idx].task_kind // .cases[$case_idx].category // \"coding\"" "$BENCH_YAML")
@@ -1027,6 +1030,9 @@ for model in "${cleaned_models[@]}"; do
       max_iterations=$(yq -r ".cases[$case_idx].args.max_iterations // .args.max_iterations // \"\"" "$BENCH_YAML")
       chat_retries=$(yq -r ".cases[$case_idx].args.chat_retries // .args.chat_retries // \"\"" "$BENCH_YAML")
       sidecar_model=$(yq -r ".cases[$case_idx].args.sidecar_model // .args.sidecar_model // \"\"" "$BENCH_YAML")
+      run_mode=$(yq -r ".cases[$case_idx].run_mode // .run_mode // \"prompt\"" "$BENCH_YAML")
+      ultra_profile=$(yq -r ".cases[$case_idx].ultra_profile // .cases[$case_idx].profile // .ultra_profile // .profile // \"\"" "$BENCH_YAML")
+      ultra_style=$(yq -r ".cases[$case_idx].ultra_style // .ultra_style // \"\"" "$BENCH_YAML")
     fi
     if [[ -n "$max_iterations_override" ]]; then
       max_iterations="$max_iterations_override"
@@ -1051,6 +1057,17 @@ for model in "${cleaned_models[@]}"; do
     fi
     if ! { [[ -z "$chat_retries" ]] || [[ "$chat_retries" =~ ^[0-9]+$ ]]; }; then
       echo "Error: invalid chat_retries for case $case_name: $chat_retries" >&2
+      exit 1
+    fi
+    case "$run_mode" in
+      prompt|ultra-plan-run) ;;
+      *)
+        echo "Error: invalid run_mode for case $case_name: $run_mode" >&2
+        exit 1
+        ;;
+    esac
+    if [[ "$run_mode" == "ultra-plan-run" && "$engine" != "minimal" ]]; then
+      echo "Error: run_mode=ultra-plan-run requires --engine minimal for case $case_name" >&2
       exit 1
     fi
 
@@ -1146,6 +1163,9 @@ for model in "${cleaned_models[@]}"; do
             [[ -n "$max_iterations" ]] && printf 'MAX_ITERATIONS=%s\n' "$max_iterations"
             [[ -n "$chat_retries" ]] && printf 'CHAT_RETRIES=%s\n' "$chat_retries"
             [[ -n "$sidecar_model" ]] && printf 'SIDECAR_MODEL=%s\n' "$sidecar_model"
+            printf 'RUN_MODE=%s\n' "$run_mode"
+            [[ -n "$ultra_profile" && "$ultra_profile" != "null" ]] && printf 'ULTRA_PROFILE=%s\n' "$ultra_profile"
+            [[ -n "$ultra_style" && "$ultra_style" != "null" ]] && printf 'ULTRA_STYLE=%s\n' "$ultra_style"
             [[ -n "$cases_arg" ]] && printf 'CASES=%s\n' "$cases_arg"
             printf '%s\n' "${env_kv[@]+"${env_kv[@]}"}"
           } | jq -R -s 'split("\n") | map(select(length > 0))'
@@ -1154,13 +1174,25 @@ for model in "${cleaned_models[@]}"; do
 
         start=$SECONDS
         if [[ "$DRY_RUN" -eq 1 ]]; then
-          echo "(dry-run) anvil --oneshot --offline --yes --prompt ... --state-dir $STATE_DIR --model $model --engine $engine --case $case_name --pam-variant $pam_variant" \
+          echo "(dry-run) anvil --${run_mode} ... --state-dir $STATE_DIR --model $model --engine $engine --case $case_name --pam-variant $pam_variant" \
             > ../stdout.log
           rc=0
         else
-          anvil_args=(--oneshot --offline --yes --prompt "$prompt" --state-dir "$STATE_DIR" --model "$model")
+          if [[ "$run_mode" == "ultra-plan-run" ]]; then
+            anvil_args=(--offline --yes --ultra-plan-run "$prompt" --state-dir "$STATE_DIR" --model "$model" --engine minimal)
+            if [[ -n "$ultra_profile" && "$ultra_profile" != "null" ]]; then
+              anvil_args+=(--profile "$ultra_profile")
+            fi
+            if [[ -n "$ultra_style" && "$ultra_style" != "null" ]]; then
+              anvil_args+=(--ultra-style "$ultra_style")
+            fi
+          else
+            anvil_args=(--oneshot --offline --yes --prompt "$prompt" --state-dir "$STATE_DIR" --model "$model")
+          fi
           if [[ "$engine_cli_explicit" -eq 1 ]]; then
-            anvil_args+=(--engine "$engine")
+            if [[ "$run_mode" == "prompt" ]]; then
+              anvil_args+=(--engine "$engine")
+            fi
           fi
           if [[ -n "$max_iterations" ]]; then
             anvil_args+=(--max-iterations "$max_iterations")

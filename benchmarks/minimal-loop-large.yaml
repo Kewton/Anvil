@@ -1,0 +1,290 @@
+name: minimal-loop-large
+description: Large-task benchmark suite for minimal /ultra-plan-run execution.
+args:
+  max_iterations: 60
+  chat_retries: 2
+cases:
+  - name: large-nextjs-app-development
+    task_kind: coding
+    scenario_category: large_app_new
+    run_mode: ultra-plan-run
+    ultra_profile: nextjs
+    prompt: |
+      Build a polished Next.js TypeScript app that can be started on port 3011.
+      Create package.json, app/layout.tsx, app/page.tsx, app/globals.css, and components/SpaceOpsGame.tsx.
+      The app should be a rich browser game inspired by Space Invaders with a canvas or interactive React rendering, score, lives, levels, keyboard controls, pause/restart, and responsive styling.
+      Keep it offline-friendly and avoid external scaffolding commands. The dev script must run Next.js on port 3011 and the build script must use next build.
+    success_check:
+      files:
+        - path: package.json
+        - path: app/layout.tsx
+          min_lines: 12
+        - path: app/page.tsx
+          min_lines: 20
+        - path: app/globals.css
+          min_lines: 45
+        - path: components/SpaceOpsGame.tsx
+          min_lines: 180
+      commands:
+        - grep -R "SpaceOpsGame" app/page.tsx
+        - grep -R "requestAnimationFrame\|keydown\|score" components/SpaceOpsGame.tsx
+        - >
+          node -e "const p=require('./package.json'); if(!String(p.scripts?.dev||'').includes('3011')) process.exit(1); if(!String(p.scripts?.build||'').includes('next build')) process.exit(1);"
+
+  - name: large-nextjs-app-modification
+    task_kind: coding
+    scenario_category: large_app_modification
+    run_mode: ultra-plan-run
+    ultra_profile: nextjs
+    setup_files:
+      - path: package.json
+        content: |
+          {"scripts":{"dev":"next dev -p 3011","build":"next build"},"dependencies":{"next":"14.2.0","react":"18.2.0","react-dom":"18.2.0"},"devDependencies":{"typescript":"5.4.0","@types/react":"18.2.0","@types/node":"20.0.0"}}
+      - path: app/layout.tsx
+        content: |
+          import './globals.css';
+
+          export default function RootLayout({ children }: { children: React.ReactNode }) {
+            return <html lang="en"><body>{children}</body></html>;
+          }
+      - path: app/page.tsx
+        content: |
+          import TaskBoard from '../components/TaskBoard';
+
+          export default function Page() {
+            return <main><TaskBoard /></main>;
+          }
+      - path: app/globals.css
+        content: |
+          body { margin: 0; font-family: system-ui, sans-serif; background: #f6f7fb; color: #111827; }
+          main { padding: 24px; }
+      - path: components/TaskBoard.tsx
+        content: |
+          'use client';
+
+          import { useState } from 'react';
+
+          type Task = { id: number; title: string; status: 'todo' | 'doing' | 'done' };
+
+          const initialTasks: Task[] = [
+            { id: 1, title: 'Triage alerts', status: 'todo' },
+            { id: 2, title: 'Draft release notes', status: 'doing' },
+            { id: 3, title: 'Verify backup', status: 'done' },
+          ];
+
+          export default function TaskBoard() {
+            const [tasks, setTasks] = useState(initialTasks);
+            return (
+              <section>
+                <h1>Operations Board</h1>
+                <ul>{tasks.map((task) => <li key={task.id}>{task.title}: {task.status}</li>)}</ul>
+              </section>
+            );
+          }
+    prompt: |
+      Upgrade the existing Next.js operations board without changing it into a non-Next project.
+      Add filtering by task status, a search field, localStorage persistence, keyboard-friendly controls, and an AnalyticsPanel showing total/open/done counts.
+      Keep package.json as a Next.js package with dev on port 3011 and build as next build.
+      Modify components/TaskBoard.tsx and app/globals.css, add components/AnalyticsPanel.tsx, and wire the panel into app/page.tsx.
+    success_check:
+      files:
+        - path: components/TaskBoard.tsx
+          min_lines: 110
+        - path: components/AnalyticsPanel.tsx
+          min_lines: 35
+        - path: app/page.tsx
+          min_lines: 8
+        - path: app/globals.css
+          min_lines: 55
+      commands:
+        - grep -R "localStorage" components/TaskBoard.tsx
+        - grep -R "AnalyticsPanel" app/page.tsx
+        - >
+          node -e "const p=require('./package.json'); if(!String(p.scripts?.dev||'').includes('3011')) process.exit(1); if(!String(p.scripts?.build||'').includes('next build')) process.exit(1);"
+
+  - name: large-fastapi-app-development
+    task_kind: coding
+    scenario_category: large_app_new
+    run_mode: ultra-plan-run
+    ultra_profile: python
+    prompt: |
+      Build an offline-friendly FastAPI-style inventory service.
+      Create pyproject.toml, app/main.py, app/models.py, app/routes/items.py, app/services/catalog.py, and tests/test_items.py.
+      The service should expose health, list items, get item by SKU, create item validation, stock adjustment, and clear error responses.
+      Keep business logic testable without requiring a running server or network access.
+    success_check:
+      files:
+        - path: pyproject.toml
+        - path: app/main.py
+          min_lines: 18
+        - path: app/models.py
+          min_lines: 45
+        - path: app/routes/items.py
+          min_lines: 60
+        - path: app/services/catalog.py
+          min_lines: 70
+        - path: tests/test_items.py
+          min_lines: 55
+      commands:
+        - grep -R "FastAPI" app/main.py
+        - grep -R "adjust_stock\|create_item" app/services/catalog.py
+        - python3 -m py_compile app/main.py app/models.py app/routes/items.py app/services/catalog.py
+
+  - name: large-fastapi-app-modification
+    task_kind: coding
+    scenario_category: large_app_modification
+    run_mode: ultra-plan-run
+    ultra_profile: python
+    setup_files:
+      - path: pyproject.toml
+        content: |
+          [project]
+          name = "orders-api"
+          version = "0.1.0"
+          dependencies = ["fastapi"]
+      - path: app/main.py
+        content: |
+          from fastapi import FastAPI
+          from app.routes.orders import router as orders_router
+
+          app = FastAPI(title="Orders API")
+          app.include_router(orders_router)
+      - path: app/routes/orders.py
+        content: |
+          from fastapi import APIRouter
+          from app.services.orders import ORDERS, create_order
+
+          router = APIRouter(prefix="/orders")
+
+          @router.get("/")
+          def list_orders():
+              return list(ORDERS.values())
+
+          @router.post("/")
+          def post_order(payload: dict):
+              return create_order(payload)
+      - path: app/services/orders.py
+        content: |
+          ORDERS = {}
+
+          def create_order(payload):
+              order_id = str(len(ORDERS) + 1)
+              order = {"id": order_id, "status": "new", **payload}
+              ORDERS[order_id] = order
+              return order
+    prompt: |
+      Improve the existing FastAPI orders service.
+      Add order validation, deterministic order IDs, status transitions, a not-found path, pagination helpers, and tests that exercise the service layer without a running server.
+      Modify app/routes/orders.py and app/services/orders.py, and create tests/test_orders.py.
+      Preserve the FastAPI app structure.
+    success_check:
+      files:
+        - path: app/routes/orders.py
+          min_lines: 50
+        - path: app/services/orders.py
+          min_lines: 95
+        - path: tests/test_orders.py
+          min_lines: 70
+      commands:
+        - grep -R "update_status\|paginate" app/services/orders.py
+        - grep -R "not_found\|NotFound\|KeyError" app/services/orders.py tests/test_orders.py
+        - python3 -m py_compile app/main.py app/routes/orders.py app/services/orders.py tests/test_orders.py
+
+  - name: large-rust-cli-development
+    task_kind: coding
+    scenario_category: large_app_new
+    run_mode: ultra-plan-run
+    ultra_profile: rust
+    prompt: |
+      Build a Rust CLI project with no external crates.
+      Create Cargo.toml, src/main.rs, src/args.rs, src/report.rs, and tests/cli_report_tests.rs.
+      The CLI should parse --input, --format text|json, and --min-score, read a simple newline-delimited score file, filter rows, and print text or JSON summaries.
+      Include unit tests and integration tests that can run with cargo test without network access.
+    success_check:
+      files:
+        - path: Cargo.toml
+        - path: src/main.rs
+          min_lines: 45
+        - path: src/args.rs
+          min_lines: 65
+        - path: src/report.rs
+          min_lines: 90
+        - path: tests/cli_report_tests.rs
+          min_lines: 45
+      commands:
+        - grep -R "min-score\|format" src/args.rs
+        - grep -R "to_json\|json" src/report.rs
+        - cargo test --quiet
+
+  - name: large-rust-cli-modification
+    task_kind: coding
+    scenario_category: large_app_modification
+    run_mode: ultra-plan-run
+    ultra_profile: rust
+    setup_files:
+      - path: Cargo.toml
+        content: |
+          [package]
+          name = "range-report"
+          version = "0.1.0"
+          edition = "2021"
+      - path: src/main.rs
+        content: |
+          use range_report::{parse_range, summarize};
+
+          fn main() {
+              let input = std::env::args().nth(1).unwrap_or_else(|| "1..3".to_string());
+              let Some((start, end)) = parse_range(&input) else {
+                  eprintln!("invalid range");
+                  std::process::exit(2);
+              };
+              println!("{}", summarize(start, end));
+          }
+      - path: src/lib.rs
+        content: |
+          pub fn parse_range(input: &str) -> Option<(i64, i64)> {
+              let parts: Vec<&str> = input.split("..").collect();
+              if parts.len() != 2 {
+                  return None;
+              }
+              let start = parts[0].parse().ok()?;
+              let end = parts[1].parse().ok()?;
+              Some((start, end))
+          }
+
+          pub fn summarize(start: i64, end: i64) -> String {
+              format!("range={start}..{end}")
+          }
+      - path: tests/range_tests.rs
+        content: |
+          use range_report::{parse_range, summarize};
+
+          #[test]
+          fn parse_range_trims_and_normalizes_reversed_ranges() {
+              assert_eq!(parse_range(" 10 .. 7 "), Some((7, 10)));
+          }
+
+          #[test]
+          fn summarize_reports_count_min_max_and_average() {
+              let summary = summarize(2, 6);
+              assert!(summary.contains("count=5"));
+              assert!(summary.contains("min=2"));
+              assert!(summary.contains("max=6"));
+              assert!(summary.contains("avg=4"));
+          }
+    prompt: |
+      Fix and extend the existing Rust range-report CLI library.
+      parse_range should trim whitespace, accept "start..end", normalize reversed ranges, and reject malformed input.
+      summarize should report count, min, max, sum, and average for the inclusive range.
+      Keep the project dependency-free, update src/lib.rs and src/main.rs if needed, and add any focused tests you need.
+    success_check:
+      files:
+        - path: src/lib.rs
+          min_lines: 45
+        - path: src/main.rs
+          min_lines: 12
+        - path: tests/range_tests.rs
+          min_lines: 16
+      commands:
+        - grep -R "avg\|average" src/lib.rs
+        - cargo test --quiet

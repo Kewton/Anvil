@@ -37,6 +37,7 @@ set -euo pipefail
 state_dir=""
 engine="legacy"
 prompt=""
+profile=""
 prev=""
 for arg in "$@"; do
   if [[ "$prev" == "--state-dir" ]]; then
@@ -47,6 +48,12 @@ for arg in "$@"; do
   fi
   if [[ "$prev" == "--prompt" ]]; then
     prompt="$arg"
+  fi
+  if [[ "$prev" == "--ultra-plan-run" ]]; then
+    prompt="$arg"
+  fi
+  if [[ "$prev" == "--profile" ]]; then
+    profile="$arg"
   fi
   prev="$arg"
 done
@@ -75,7 +82,7 @@ if [[ "$prompt" == *"exit after artifact without session"* ]]; then
   exit 7
 fi
 cat > "$session_dir/session.json" <<JSON
-{"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","engine":"$engine","seed":"${ANVIL_BENCH_SEED:-unset}","messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
+{"id":"$uuid","pam":"${ANVIL_PAM_ADVISORY_ENABLED:-unset}","engine":"$engine","profile":"$profile","seed":"${ANVIL_BENCH_SEED:-unset}","messages":[{"role":"assistant","content":"ok","tool_calls":[]}]}
 JSON
 echo '{"ts_ms":1,"event":"ollama.generate.start","payload":{}}' \
   > "$session_dir/logs/llm-io.jsonl"
@@ -89,6 +96,7 @@ fake_anvil_real=$(realpath "$fake_anvil" 2>/dev/null || printf '%s' "$fake_anvil
 # --- fake benchmark yaml ---
 bench_yaml_dir="$REPO_ROOT/benchmarks"
 bench_yaml="$bench_yaml_dir/bench-smoke-fixture.yaml"
+bench_ultra_yaml="$bench_yaml_dir/bench-ultra-smoke-fixture.yaml"
 mkdir -p "$bench_yaml_dir"
 cat > "$bench_yaml" <<'EOF'
 args:
@@ -123,7 +131,22 @@ cases:
       commands:
         - test -f seeded/input.txt
 EOF
-trap 'rm -rf "$tmp"; rm -f "$bench_yaml"' EXIT
+cat > "$bench_ultra_yaml" <<'EOF'
+args:
+  max_iterations: 1
+cases:
+  - name: ultra-next
+    prompt: build a next app
+    run_mode: ultra-plan-run
+    ultra_profile: nextjs
+    success_check:
+      files:
+        - path: result.txt
+          min_lines: 1
+      commands:
+        - test -f result.txt
+EOF
+trap 'rm -rf "$tmp"; rm -f "$bench_yaml" "$bench_ultra_yaml"' EXIT
 
 # --- invoke bench.sh ---
 export ANVIL_BIN="$fake_anvil"
@@ -201,6 +224,29 @@ jq -e '(.active_flags | index("CASES=docs,crash"))
   "$run_dir_filter/meta.json" >/dev/null || {
   echo "FAIL: --cases/--no-bench-seed meta mismatch in $run_dir_filter/meta.json" >&2
   cat "$run_dir_filter/meta.json" >&2
+  exit 1
+}
+
+bash scripts/bench.sh bench-ultra-smoke-fixture --model "smoke-ultra" --runs 1 --engine minimal \
+  --bench-no-debug --no-bench-seed \
+  > "$tmp/bench-ultra.stdout" 2> "$tmp/bench-ultra.stderr" || {
+  echo "FAIL: bench.sh ultra-plan-run run failed" >&2
+  cat "$tmp/bench-ultra.stderr" >&2
+  exit 1
+}
+BENCH_ROOT_ULTRA=$(awk '/^Done\. Results: / { sub(/^Done\. Results: /, ""); sub(/\/summary\.tsv$/, ""); print }' \
+  "$tmp/bench-ultra.stdout")
+ultra_run_dir="$BENCH_ROOT_ULTRA/smoke-ultra/minimal/ultra-next/default/run-1"
+jq -e '.profile == "nextjs"' "$ultra_run_dir/session.json" >/dev/null || {
+  echo "FAIL: --profile was not passed to fake ultra-plan-run" >&2
+  cat "$ultra_run_dir/session.json" >&2
+  exit 1
+}
+jq -e '(.active_flags | index("RUN_MODE=ultra-plan-run"))
+       and (.active_flags | index("ULTRA_PROFILE=nextjs"))' \
+  "$ultra_run_dir/meta.json" >/dev/null || {
+  echo "FAIL: ultra-plan-run meta active flags missing" >&2
+  cat "$ultra_run_dir/meta.json" >&2
   exit 1
 }
 

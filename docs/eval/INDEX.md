@@ -26,6 +26,8 @@
   Task26 seeded 27B M001 on/off ablation and 8B frontier run.
 - [Cycle 3 Task29 rebaseline and vibe-local comparison](cycle3-task29-vibe-local-comparison-20260613.md):
   Task29-inclusive full matrix, same-model vibe-local comparison, and focused 4-scenario rerun.
+- [Large-task `/ultra-plan-run` initial evaluation](minimal-loop-large-ultra-plan-run-20260615.md):
+  first six-case large-task slice for Next.js, FastAPI, and Rust development/modification.
 - [fix-js-date-helper vibe-local branchpoint triage](triage/fix-js-date-helper-vibe-local-branchpoint.md):
   scenario-level branchpoint analysis and fixture-backed rerun showing no new M002 is justified.
 - [vibe-local win factor triage](triage/vibe-local-win-factor-triage.md):
@@ -47,6 +49,7 @@
 - [Cycle 3 narrow seeded rerun](cycle3-narrow-seeded-rerun.md)
 - [Cycle 3 full matrix](cycle3-full-matrix-20260613.md)
 - [Cycle 3 Task29 rebaseline and vibe-local comparison](cycle3-task29-vibe-local-comparison-20260613.md)
+- [Large-task `/ultra-plan-run` initial evaluation](minimal-loop-large-ultra-plan-run-20260615.md)
 - [Capability frontier](frontier.md)
 
 ## Triage
