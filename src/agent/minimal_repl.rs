@@ -21,9 +21,21 @@ use super::minimal_step_runner;
 enum ReplInput {
     Empty,
     Exit,
+    Invalid(String),
     PlanSteps(String),
     PlanRun(String),
     RunPlan(String),
+    UltraPlan {
+        profile: minimal_step_runner::UltraProfile,
+        style: minimal_step_runner::UltraPlanStyle,
+        goal: String,
+    },
+    UltraPlanRun {
+        profile: minimal_step_runner::UltraProfile,
+        style: minimal_step_runner::UltraPlanStyle,
+        goal: String,
+    },
+    RunUltraPlan(String),
     Prompt(String),
 }
 
@@ -55,6 +67,9 @@ pub fn run(
         match parse_repl_input(&line) {
             ReplInput::Empty => continue,
             ReplInput::Exit => break,
+            ReplInput::Invalid(err) => {
+                eprintln!("ERROR: {err}");
+            }
             ReplInput::PlanSteps(goal) => {
                 let result = {
                     let _spinner = ReplSpinner::start("minimal planning");
@@ -89,6 +104,75 @@ pub fn run(
                             "completed {}/{} plan steps",
                             summary.steps.completed, summary.steps.total
                         );
+                    }
+                    Err(err) => eprintln!("ERROR: {err}"),
+                }
+            }
+            ReplInput::UltraPlan {
+                profile,
+                style,
+                goal,
+            } => {
+                let result = {
+                    let _spinner = ReplSpinner::start("minimal ultra planning");
+                    minimal_step_runner::generate_ultra_plan(
+                        &config,
+                        &models.main,
+                        &mut client,
+                        &goal,
+                        profile,
+                        style,
+                    )
+                };
+                match result {
+                    Ok(path) => println!("created ultra plan: {}", path.display()),
+                    Err(err) => eprintln!("ERROR: {err}"),
+                }
+            }
+            ReplInput::UltraPlanRun {
+                profile,
+                style,
+                goal,
+            } => {
+                let result = {
+                    let _spinner = ReplSpinner::start("minimal ultra plan-run");
+                    minimal_step_runner::generate_and_run_ultra_plan(
+                        &config,
+                        &models.main,
+                        &mut client,
+                        &session_store,
+                        &mut session,
+                        &goal,
+                        profile,
+                        style,
+                    )
+                };
+                match result {
+                    Ok(summary) => {
+                        println!("created ultra plan: {}", summary.plan_path.display());
+                        println!(
+                            "completed {}/{} ultra phases",
+                            summary.phases.completed, summary.phases.total
+                        );
+                    }
+                    Err(err) => eprintln!("ERROR: {err}"),
+                }
+            }
+            ReplInput::RunUltraPlan(path) => {
+                let path = std::path::PathBuf::from(path);
+                match minimal_step_runner::run_ultra_plan(
+                    &config,
+                    &models.main,
+                    &mut client,
+                    &session_store,
+                    &mut session,
+                    &path,
+                ) {
+                    Ok(summary) => {
+                        println!(
+                            "completed {}/{} ultra phases",
+                            summary.completed, summary.total
+                        )
                     }
                     Err(err) => eprintln!("ERROR: {err}"),
                 }
@@ -237,7 +321,65 @@ fn parse_repl_input(input: &str) -> ReplInput {
         value if value.starts_with("/run-plan ") => {
             ReplInput::RunPlan(value["/run-plan ".len()..].trim().to_string())
         }
+        value if value.starts_with("/ultra-plan ") => {
+            parse_ultra_goal_command(&value["/ultra-plan ".len()..], false)
+        }
+        value if value.starts_with("/ultra-plan-run ") => {
+            parse_ultra_goal_command(&value["/ultra-plan-run ".len()..], true)
+        }
+        value if value.starts_with("/run-ultra-plan ") => {
+            ReplInput::RunUltraPlan(value["/run-ultra-plan ".len()..].trim().to_string())
+        }
         _ => ReplInput::Prompt(line.to_string()),
+    }
+}
+
+fn parse_ultra_goal_command(raw: &str, run: bool) -> ReplInput {
+    let mut rest = raw.trim();
+    let mut style = minimal_step_runner::UltraPlanStyle::Default;
+    let mut profile = minimal_step_runner::UltraProfile::Generic;
+    loop {
+        if let Some(after_flag) = rest.strip_prefix("--style ") {
+            let mut parts = after_flag.splitn(2, char::is_whitespace);
+            let Some(style_value) = parts.next() else {
+                return ReplInput::Invalid("--style requires a value".to_string());
+            };
+            style = match style_value.parse() {
+                Ok(style) => style,
+                Err(err) => return ReplInput::Invalid(err),
+            };
+            rest = parts.next().unwrap_or("").trim();
+            continue;
+        }
+        if let Some(after_flag) = rest.strip_prefix("--profile ") {
+            let mut parts = after_flag.splitn(2, char::is_whitespace);
+            let Some(profile_value) = parts.next() else {
+                return ReplInput::Invalid("--profile requires a value".to_string());
+            };
+            profile = match profile_value.parse() {
+                Ok(profile) => profile,
+                Err(err) => return ReplInput::Invalid(err),
+            };
+            rest = parts.next().unwrap_or("").trim();
+            continue;
+        }
+        break;
+    }
+    if rest.is_empty() {
+        return ReplInput::Invalid("/ultra-plan requires a goal".to_string());
+    }
+    if run {
+        ReplInput::UltraPlanRun {
+            profile,
+            style,
+            goal: rest.to_string(),
+        }
+    } else {
+        ReplInput::UltraPlan {
+            profile,
+            style,
+            goal: rest.to_string(),
+        }
     }
 }
 
@@ -320,6 +462,34 @@ mod tests {
         assert_eq!(
             parse_repl_input("/run-plan .anvil/plans/plan.yaml\n"),
             ReplInput::RunPlan(".anvil/plans/plan.yaml".to_string())
+        );
+        assert_eq!(
+            parse_repl_input("/ultra-plan build a game\n"),
+            ReplInput::UltraPlan {
+                profile: minimal_step_runner::UltraProfile::Generic,
+                style: minimal_step_runner::UltraPlanStyle::Default,
+                goal: "build a game".to_string()
+            }
+        );
+        assert_eq!(
+            parse_repl_input("/ultra-plan-run --profile data-analysis --style tdd build a game\n"),
+            ReplInput::UltraPlanRun {
+                profile: minimal_step_runner::UltraProfile::DataAnalysis,
+                style: minimal_step_runner::UltraPlanStyle::Tdd,
+                goal: "build a game".to_string()
+            }
+        );
+        assert_eq!(
+            parse_repl_input("/ultra-plan-run --style test-hardening --profile python add tests\n"),
+            ReplInput::UltraPlanRun {
+                profile: minimal_step_runner::UltraProfile::Python,
+                style: minimal_step_runner::UltraPlanStyle::TestHardening,
+                goal: "add tests".to_string()
+            }
+        );
+        assert_eq!(
+            parse_repl_input("/run-ultra-plan .anvil/plans/ultra.yaml\n"),
+            ReplInput::RunUltraPlan(".anvil/plans/ultra.yaml".to_string())
         );
     }
 

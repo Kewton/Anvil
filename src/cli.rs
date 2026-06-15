@@ -53,6 +53,21 @@ pub struct CliArgs {
     /// Run a previously saved minimal step plan.
     #[arg(long = "run-plan", value_name = "FILE")]
     pub run_plan: Option<PathBuf>,
+    /// Draft a top-level phase plan for repeated minimal plan-runs.
+    #[arg(long = "ultra-plan", value_name = "PROMPT")]
+    pub ultra_plan: Option<String>,
+    /// Draft a top-level phase plan, save it, then run each phase with /plan-run.
+    #[arg(long = "ultra-plan-run", value_name = "PROMPT")]
+    pub ultra_plan_run: Option<String>,
+    /// Run a previously saved minimal ultra phase plan.
+    #[arg(long = "run-ultra-plan", value_name = "FILE")]
+    pub run_ultra_plan: Option<PathBuf>,
+    /// Planning style for --ultra-plan / --ultra-plan-run: default, tdd, or test-hardening.
+    #[arg(long = "ultra-style", value_name = "STYLE")]
+    pub ultra_style: Option<String>,
+    /// Contract/verifier profile for --ultra-plan / --ultra-plan-run.
+    #[arg(long = "profile", alias = "ultra-profile", value_name = "PROFILE")]
+    pub ultra_profile: Option<String>,
     #[arg(long = "offline")]
     pub offline: bool,
     /// Control deterministic recovery. `hint-only` only nudges the model,
@@ -240,19 +255,36 @@ impl CliArgs {
         }
         let step_modes = self.plan_steps.is_some() as u8
             + self.plan_run.is_some() as u8
-            + self.run_plan.is_some() as u8;
+            + self.run_plan.is_some() as u8
+            + self.ultra_plan.is_some() as u8
+            + self.ultra_plan_run.is_some() as u8
+            + self.run_ultra_plan.is_some() as u8;
         if step_modes > 1 {
             return Err(
-                "--plan-steps, --plan-run, and --run-plan are mutually exclusive".to_string(),
+                "--plan-steps, --plan-run, --run-plan, --ultra-plan, --ultra-plan-run, and --run-ultra-plan are mutually exclusive".to_string(),
             );
         }
-        if (self.plan_steps.is_some() || self.plan_run.is_some() || self.run_plan.is_some())
-            && (self.prompt.is_some() || self.oneshot || resume_on)
-        {
+        let planning_mode = self.plan_steps.is_some()
+            || self.plan_run.is_some()
+            || self.run_plan.is_some()
+            || self.ultra_plan.is_some()
+            || self.ultra_plan_run.is_some()
+            || self.run_ultra_plan.is_some();
+        if planning_mode && (self.prompt.is_some() || self.oneshot || resume_on) {
             return Err(
-                "--plan-steps / --plan-run / --run-plan cannot be combined with --prompt, --oneshot, or --resume"
+                "--plan-steps / --plan-run / --run-plan / --ultra-plan / --ultra-plan-run / --run-ultra-plan cannot be combined with --prompt, --oneshot, or --resume"
                     .to_string(),
             );
+        }
+        if self.ultra_style.is_some() && self.ultra_plan.is_none() && self.ultra_plan_run.is_none()
+        {
+            return Err("--ultra-style requires --ultra-plan or --ultra-plan-run".to_string());
+        }
+        if self.ultra_profile.is_some()
+            && self.ultra_plan.is_none()
+            && self.ultra_plan_run.is_none()
+        {
+            return Err("--profile requires --ultra-plan or --ultra-plan-run".to_string());
         }
         Ok(())
     }
@@ -319,6 +351,11 @@ mod tests {
             plan_steps: None,
             plan_run: None,
             run_plan: None,
+            ultra_plan: None,
+            ultra_plan_run: None,
+            run_ultra_plan: None,
+            ultra_style: None,
+            ultra_profile: None,
             offline: false,
             deterministic_fallback: None,
             engine: None,
@@ -373,9 +410,32 @@ mod tests {
         assert!(args.validate().is_err());
 
         let mut args = base_args();
+        args.ultra_plan_run = Some("build app".to_string());
+        args.plan_run = Some("build app".to_string());
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
         args.plan_steps = Some("build app".to_string());
         args.prompt = Some("hello".to_string());
         assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.ultra_style = Some("tdd".to_string());
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.ultra_style = Some("tdd".to_string());
+        args.ultra_plan_run = Some("build app".to_string());
+        assert!(args.validate().is_ok());
+
+        let mut args = base_args();
+        args.ultra_profile = Some("data-analysis".to_string());
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.ultra_profile = Some("data-analysis".to_string());
+        args.ultra_plan_run = Some("analyze data".to_string());
+        assert!(args.validate().is_ok());
     }
 
     #[test]

@@ -46,6 +46,11 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     let plan_steps = args.plan_steps.clone();
     let plan_run = args.plan_run.clone();
     let run_plan_path = args.run_plan.clone();
+    let ultra_plan = args.ultra_plan.clone();
+    let ultra_plan_run = args.ultra_plan_run.clone();
+    let run_ultra_plan_path = args.run_ultra_plan.clone();
+    let ultra_style = args.ultra_style.clone();
+    let ultra_profile = args.ultra_profile.clone();
 
     // Short-circuit for `anvil sessions ...` BEFORE loading Ollama / Agent so
     // session inspection works offline and without an LLM running.
@@ -75,10 +80,18 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     for warning in &warnings {
         eprintln!("warning: {warning}");
     }
-    if (plan_steps.is_some() || plan_run.is_some() || run_plan_path.is_some())
+    if (plan_steps.is_some()
+        || plan_run.is_some()
+        || run_plan_path.is_some()
+        || ultra_plan.is_some()
+        || ultra_plan_run.is_some()
+        || run_ultra_plan_path.is_some())
         && config.engine != Engine::Minimal
     {
-        return Err("--plan-steps / --plan-run / --run-plan require --engine minimal".to_string());
+        return Err(
+            "--plan-steps / --plan-run / --run-plan / --ultra-plan / --ultra-plan-run / --run-ultra-plan require --engine minimal"
+                .to_string(),
+        );
     }
     config.cwd = ensure_workspace_root(&config.cwd)?;
 
@@ -211,6 +224,11 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
             plan_steps,
             plan_run,
             run_plan_path,
+            ultra_plan,
+            ultra_plan_run,
+            run_ultra_plan_path,
+            ultra_style,
+            ultra_profile,
         );
     }
 
@@ -262,6 +280,11 @@ fn run_minimal_engine(
     plan_steps: Option<String>,
     plan_run: Option<String>,
     run_plan_path: Option<PathBuf>,
+    ultra_plan: Option<String>,
+    ultra_plan_run: Option<String>,
+    run_ultra_plan_path: Option<PathBuf>,
+    ultra_style: Option<String>,
+    ultra_profile: Option<String>,
 ) -> Result<(), String> {
     if let Some(prompt) = resume_prompt {
         return run_minimal_prompt(
@@ -313,6 +336,63 @@ fn run_minimal_engine(
         )?;
         println!(
             "completed {}/{} plan steps",
+            summary.completed, summary.total
+        );
+        return Ok(());
+    }
+
+    let ultra_style = match ultra_style {
+        Some(value) => value.parse()?,
+        None => agent::minimal_step_runner::UltraPlanStyle::Default,
+    };
+    let ultra_profile = match ultra_profile {
+        Some(value) => value.parse()?,
+        None => agent::minimal_step_runner::UltraProfile::Generic,
+    };
+
+    if let Some(goal) = &ultra_plan {
+        let path = agent::minimal_step_runner::generate_ultra_plan(
+            &config,
+            &models.main,
+            &mut client,
+            goal,
+            ultra_profile,
+            ultra_style,
+        )?;
+        println!("created ultra plan: {}", path.display());
+        return Ok(());
+    }
+
+    if let Some(goal) = &ultra_plan_run {
+        let summary = agent::minimal_step_runner::generate_and_run_ultra_plan(
+            &config,
+            &models.main,
+            &mut client,
+            &session_store,
+            &mut session,
+            goal,
+            ultra_profile,
+            ultra_style,
+        )?;
+        println!("created ultra plan: {}", summary.plan_path.display());
+        println!(
+            "completed {}/{} ultra phases",
+            summary.phases.completed, summary.phases.total
+        );
+        return Ok(());
+    }
+
+    if let Some(plan_path) = run_ultra_plan_path {
+        let summary = agent::minimal_step_runner::run_ultra_plan(
+            &config,
+            &models.main,
+            &mut client,
+            &session_store,
+            &mut session,
+            &plan_path,
+        )?;
+        println!(
+            "completed {}/{} ultra phases",
             summary.completed, summary.total
         );
         return Ok(());
