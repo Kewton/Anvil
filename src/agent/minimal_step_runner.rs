@@ -32,6 +32,8 @@ use profile::{
     build_profiled_phase_prompt, profile_generation_rules, profile_snapshot,
     verify_profile_after_phase,
 };
+#[cfg(test)]
+use repair::REPAIR_REPLAN_PROMPT_MAX_CHARS;
 use repair::{
     analyze_step_progress, build_repair_exhausted_report, build_repair_prompt,
     failed_step_stop_reason, repaired_step_stop_reason, verified_step_stop_reason,
@@ -2663,11 +2665,11 @@ raise SystemExit(1)
             .collect::<Vec<_>>();
         assert_eq!(repair_files.len(), 1);
         let repair_prompt = std::fs::read_to_string(&repair_files[0]).unwrap();
-        assert!(repair_prompt.contains("Repair failed step fix-report."));
-        assert!(repair_prompt.contains("Original goal:"));
+        assert!(repair_prompt.contains("Repair failed step: fix-report"));
+        assert!(repair_prompt.contains("Original goal excerpt:"));
         assert!(repair_prompt.contains("Verification commands:"));
         assert!(repair_prompt.contains("- python3 check.py"));
-        assert!(repair_prompt.chars().count() <= MAX_GOAL_CHARS);
+        assert!(repair_prompt.chars().count() <= REPAIR_REPLAN_PROMPT_MAX_CHARS);
         assert_eq!(
             std::fs::read_to_string(temp.path().join("report.md")).unwrap(),
             "still bad again\n"
@@ -2783,11 +2785,40 @@ raise SystemExit(1)
         assert_eq!(repair_files.len(), 1);
         let repair_prompt = std::fs::read_to_string(&repair_files[0]).unwrap();
         assert!(
-            repair_prompt.chars().count() <= MAX_GOAL_CHARS,
+            repair_prompt.chars().count() <= REPAIR_REPLAN_PROMPT_MAX_CHARS,
             "repair prompt was {} chars",
             repair_prompt.chars().count()
         );
         assert!(repair_prompt.contains("[truncated]"));
+
+        let ultra = UltraPlan {
+            goal: repair_prompt.clone(),
+            profile: UltraProfile::Nextjs,
+            style: UltraPlanStyle::Default,
+            intent: WorkIntent::Fix,
+            phases: vec![UltraPhase {
+                id: "repair-build".into(),
+                prompt: "Repair only the current build failure, then run npm run build.".into(),
+            }],
+        };
+        let phase_prompt = build_profiled_phase_prompt(
+            &ultra,
+            &ultra.phases[0],
+            &ProfileSnapshot {
+                lines: vec![
+                    "- package.json exists".into(),
+                    "- app/page.tsx exists".into(),
+                    "- components/SpaceInvaders.tsx exists".into(),
+                ],
+                protected_files: Vec::new(),
+            },
+            WorkIntent::Fix,
+        );
+        assert!(
+            phase_prompt.chars().count() <= MAX_GOAL_CHARS,
+            "expanded phase prompt was {} chars",
+            phase_prompt.chars().count()
+        );
     }
 
     #[test]

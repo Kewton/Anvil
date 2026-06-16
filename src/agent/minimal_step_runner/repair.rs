@@ -10,11 +10,11 @@ use super::{
     slug,
 };
 
-const REPAIR_PROMPT_MAX_CHARS: usize = 3_600;
-const REPAIR_GOAL_MAX_CHARS: usize = 800;
-const REPAIR_INSTRUCTION_MAX_CHARS: usize = 700;
-const REPAIR_FAILURE_MAX_CHARS: usize = 1_800;
-const REPAIR_MAX_FAILURES: usize = 6;
+pub(super) const REPAIR_REPLAN_PROMPT_MAX_CHARS: usize = 1_600;
+const REPAIR_GOAL_MAX_CHARS: usize = 300;
+const REPAIR_INSTRUCTION_MAX_CHARS: usize = 320;
+const REPAIR_FAILURE_MAX_CHARS: usize = 900;
+const REPAIR_MAX_FAILURES: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct StepProgressReport {
@@ -243,9 +243,11 @@ fn build_ultra_repair_prompt(
     report: &VerificationReport,
 ) -> String {
     let mut lines = vec![
-        format!("Repair failed step {}.", step.id),
+        format!("Repair failed step: {}", step.id),
         String::new(),
-        "Original goal:".to_string(),
+        "Task: Repair the current workspace so deterministic verification passes.".to_string(),
+        String::new(),
+        "Original goal excerpt:".to_string(),
         truncate_chars(&plan.goal, REPAIR_GOAL_MAX_CHARS),
         String::new(),
         "Step instruction:".to_string(),
@@ -264,7 +266,7 @@ fn build_ultra_repair_prompt(
     }
     if !report.failures.is_empty() {
         lines.push(String::new());
-        lines.push("Current failures:".to_string());
+        lines.push("Current failure evidence:".to_string());
         lines.extend(
             report
                 .failures
@@ -295,13 +297,13 @@ fn build_ultra_repair_prompt(
     }
     lines.extend([
         String::new(),
-        "Repair constraints:".to_string(),
+        "Required action:".to_string(),
         "- Preserve the existing workspace and current project structure.".to_string(),
-        "- Focus on the failed step and its verifier output.".to_string(),
+        "- Focus on the failed step and verifier evidence above.".to_string(),
         "- Inspect relevant files before editing.".to_string(),
         "- Use Write/Edit for concrete fixes and rerun the verifier when possible.".to_string(),
     ]);
-    truncate_chars(&lines.join("\n"), REPAIR_PROMPT_MAX_CHARS)
+    truncate_chars(&lines.join("\n"), REPAIR_REPLAN_PROMPT_MAX_CHARS)
 }
 
 fn save_repair_prompt(
