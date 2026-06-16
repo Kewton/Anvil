@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::{PlanStep, StepPlan, UltraPlan, UltraPlanStyle};
+use super::{PlanStep, StepKind, StepPlan, UltraPlan, UltraPlanStyle};
 
 #[cfg(test)]
 pub(super) fn lint_plan(plan: &StepPlan) -> Result<(), String> {
@@ -12,7 +12,8 @@ pub(super) fn lint_plan_with_workspace(
     work_root: Option<&Path>,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
-    lint_instruction_specificity(plan, &mut errors);
+    lint_instruction_specificity(plan, work_root, &mut errors);
+    lint_dependency_setup_before_verify(plan, work_root, &mut errors);
     lint_nextjs_build_order(plan, work_root, &mut errors);
     if errors.is_empty() {
         Ok(())
@@ -49,12 +50,21 @@ pub(super) fn lint_ultra_plan(plan: &UltraPlan) -> Result<(), String> {
     }
 }
 
-fn lint_instruction_specificity(plan: &StepPlan, errors: &mut Vec<String>) {
+fn lint_instruction_specificity(
+    plan: &StepPlan,
+    work_root: Option<&Path>,
+    errors: &mut Vec<String>,
+) {
+    let mut introduced_paths = Vec::new();
     for step in &plan.steps {
         if step.expected_paths.len() < 2 {
+            introduced_paths.extend(step.expected_paths.iter().cloned());
             continue;
         }
-        if is_verification_only_step(step) {
+        if is_verification_only_step(step)
+            && expected_paths_are_known(step, &introduced_paths, work_root)
+        {
+            introduced_paths.extend(step.expected_paths.iter().cloned());
             continue;
         }
         let instruction = step.instruction.to_ascii_lowercase();
@@ -68,6 +78,7 @@ fn lint_instruction_specificity(plan: &StepPlan, errors: &mut Vec<String>) {
                 step.id
             ));
         }
+        introduced_paths.extend(step.expected_paths.iter().cloned());
     }
 }
 
@@ -75,20 +86,83 @@ fn is_verification_only_step(step: &PlanStep) -> bool {
     if step.verify.is_empty() {
         return false;
     }
+    if step.kind == StepKind::Verify {
+        return true;
+    }
     let instruction = step.instruction.to_ascii_lowercase();
-    let verification_language = instruction.contains("verify")
-        || instruction.contains("validate")
-        || instruction.contains("check")
-        || instruction.contains("run the build")
-        || instruction.contains("run build");
-    let change_language = instruction.contains("create")
-        || instruction.contains("add ")
-        || instruction.contains("modify")
-        || instruction.contains("update")
-        || instruction.contains("edit")
-        || instruction.contains("write")
-        || instruction.contains("implement");
+    let id = step.id.replace('-', " ").to_ascii_lowercase();
+    let combined = format!("{id}\n{instruction}");
+    let verification_language = combined.contains("verify")
+        || combined.contains("validate")
+        || combined.contains("check")
+        || combined.contains("test")
+        || combined.contains("build")
+        || combined.contains("compile");
+    let change_language = combined.contains("create")
+        || combined.contains("add ")
+        || combined.contains("modify")
+        || combined.contains("update")
+        || combined.contains("edit")
+        || combined.contains("write")
+        || combined.contains("implement")
+        || combined.contains("scaffold")
+        || combined.contains("generate");
     verification_language && !change_language
+}
+
+fn lint_dependency_setup_before_verify(
+    plan: &StepPlan,
+    work_root: Option<&Path>,
+    errors: &mut Vec<String>,
+) {
+    let mut dependency_setup_seen = work_root
+        .map(|root| root.join("node_modules").is_dir())
+        .unwrap_or(false);
+    for step in &plan.steps {
+        if step.kind == StepKind::Setup
+            || instruction_has_dependency_setup_language(&step.instruction)
+        {
+            dependency_setup_seen = true;
+        }
+        if step.verify.iter().any(|command| {
+            matches!(
+                command.as_str(),
+                "npm run build" | "npm test" | "npm run test"
+            )
+        }) && !dependency_setup_seen
+        {
+            errors.push(format!(
+                "step {} runs npm verification before a dependency setup step or existing node_modules",
+                step.id
+            ));
+        }
+    }
+}
+
+fn instruction_has_dependency_setup_language(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("npm install")
+        || lower.contains("npm ci")
+        || lower.contains("pnpm install")
+        || lower.contains("yarn install")
+        || lower.contains("pip install")
+        || lower.contains("poetry install")
+        || lower.contains("uv sync")
+        || lower.contains("bundle install")
+        || lower.contains("composer install")
+}
+
+fn expected_paths_are_known(
+    step: &PlanStep,
+    introduced_paths: &[String],
+    work_root: Option<&Path>,
+) -> bool {
+    step.expected_paths.iter().all(|path| {
+        introduced_paths.iter().any(|known| known == path)
+            || work_root
+                .map(|root| root.join(path).exists())
+                .unwrap_or(false)
+    })
 }
 
 fn lint_nextjs_build_order(plan: &StepPlan, work_root: Option<&Path>, errors: &mut Vec<String>) {

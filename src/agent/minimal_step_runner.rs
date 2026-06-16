@@ -15,11 +15,14 @@ use super::minimal_loop::MinimalChatClient;
 use super::minimal_repl::run_turn_with_early_success_paths;
 use super::planner_llm::PlannerLlm;
 
+mod intent;
 mod plan_lint;
 mod profile;
+mod profiles;
 mod repair;
 mod verify;
 
+use intent::{WorkIntent, detect_work_intent};
 #[cfg(test)]
 use plan_lint::lint_plan;
 use plan_lint::{lint_plan_with_workspace, lint_ultra_plan};
@@ -62,6 +65,8 @@ pub struct StepPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanStep {
     pub id: String,
+    #[serde(default)]
+    pub kind: StepKind,
     pub instruction: String,
     #[serde(default)]
     pub expected_paths: Vec<String>,
@@ -69,6 +74,59 @@ pub struct PlanStep {
     pub verify: Vec<String>,
     #[serde(default)]
     pub expected_result: VerifyExpectedResult,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StepKind {
+    #[default]
+    Work,
+    Inspect,
+    Create,
+    Edit,
+    Setup,
+    Verify,
+    Repair,
+    Report,
+}
+
+impl StepKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Inspect => "inspect",
+            Self::Create => "create",
+            Self::Edit => "edit",
+            Self::Setup => "setup",
+            Self::Verify => "verify",
+            Self::Repair => "repair",
+            Self::Report => "report",
+        }
+    }
+}
+
+impl fmt::Display for StepKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for StepKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "work" | "task" => Ok(Self::Work),
+            "inspect" | "investigate" | "read" => Ok(Self::Inspect),
+            "create" | "scaffold" | "generate" => Ok(Self::Create),
+            "edit" | "modify" | "update" => Ok(Self::Edit),
+            "setup" | "install" | "prepare" => Ok(Self::Setup),
+            "verify" | "validate" | "check" | "test" => Ok(Self::Verify),
+            "repair" | "fix" => Ok(Self::Repair),
+            "report" | "summarize" => Ok(Self::Report),
+            other => Err(format!("unknown step kind: {other}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +171,8 @@ pub struct UltraPlan {
     pub profile: UltraProfile,
     #[serde(default)]
     pub style: UltraPlanStyle,
+    #[serde(default)]
+    pub intent: WorkIntent,
     pub phases: Vec<UltraPhase>,
 }
 
@@ -217,6 +277,16 @@ impl FromStr for UltraPlanStyle {
     }
 }
 
+impl UltraPlan {
+    fn effective_intent(&self) -> WorkIntent {
+        if self.intent == WorkIntent::Unknown {
+            detect_work_intent(&self.goal)
+        } else {
+            self.intent
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepRunSummary {
     pub total: usize,
@@ -275,7 +345,7 @@ pub fn generate_step_plan<P: PlannerLlm + ?Sized>(
         }
         if attempt + 1 < PLAN_GENERATION_ATTEMPTS {
             messages.push(ConversationMessage::user(format!(
-                "The previous plan was invalid: {last_error}\nReturn corrected JSON only. Step instructions must be natural-language tasks for Write/Edit, not shell commands. All expected_paths must be repository-relative paths with no leading slash and no '..'. The verify array is only for deterministic checks; never put npm install, create-next-app, dev servers, network commands, or setup commands in verify. If setup is needed, describe it in the instruction and use an allowed verify command such as cat <file>, node --check <js-file>, or npm run build only after the app entry point exists. Do not use node --check for .ts or .tsx files."
+                "The previous plan was invalid: {last_error}\nReturn corrected JSON only. Use kind to keep responsibilities separate: inspect reads, create/edit writes artifacts, setup prepares dependencies or local environment, verify runs deterministic checks, repair fixes verifier failures, report records an unfixable blocker. Step instructions must be natural-language tasks, not shell commands. expected_paths are artifacts that should exist after the step, not files to inspect. Inspection-only steps should usually have empty expected_paths. If a creation/edit step has multiple expected_paths, name concrete files or component names in the instruction. A validation-only step may list multiple expected_paths only when those paths were created by earlier steps in this plan or already exist in the workspace. All expected_paths must be repository-relative paths with no leading slash and no '..'. The verify array is only for deterministic checks; never put npm install, create-next-app, dev servers, network commands, or setup commands in verify. If dependency setup is required before verification, create a separate kind:\"setup\" step before the kind:\"verify\" step. If setup is not allowed or cannot run, use kind:\"report\" and do not claim success. Do not use node --check for .ts or .tsx files."
             )));
         }
     }
@@ -470,9 +540,12 @@ pub fn generate_ultra_plan<P: PlannerLlm + ?Sized>(
     profile: UltraProfile,
     style: UltraPlanStyle,
 ) -> Result<PathBuf, String> {
+    let intent = detect_work_intent(goal);
     let mut messages = vec![
-        ConversationMessage::system(ultra_plan_generation_system_prompt(profile, style)),
-        ConversationMessage::user(ultra_plan_generation_user_prompt(goal, profile, style)),
+        ConversationMessage::system(ultra_plan_generation_system_prompt(profile, style, intent)),
+        ConversationMessage::user(ultra_plan_generation_user_prompt(
+            goal, profile, style, intent,
+        )),
     ];
     let mut last_error = String::new();
     for attempt in 0..ULTRA_PLAN_GENERATION_ATTEMPTS {
@@ -484,6 +557,7 @@ pub fn generate_ultra_plan<P: PlannerLlm + ?Sized>(
                 plan.goal = goal.to_string();
                 plan.profile = profile;
                 plan.style = style;
+                plan.intent = detect_work_intent(goal);
                 validate_ultra_plan(&plan)?;
                 lint_ultra_plan(&plan)?;
                 Ok(plan)
@@ -513,6 +587,7 @@ pub fn run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
     let ultra_plan = load_ultra_plan(config, ultra_plan_path)?;
     validate_ultra_plan(&ultra_plan)?;
     lint_ultra_plan(&ultra_plan)?;
+    let intent = ultra_plan.effective_intent();
 
     let mut completed = 0usize;
     for (index, phase) in ultra_plan.phases.iter().enumerate() {
@@ -523,7 +598,7 @@ pub fn run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
             phase.id
         );
         let snapshot = profile_snapshot(&config.cwd, ultra_plan.profile);
-        let phase_prompt = build_profiled_phase_prompt(&ultra_plan, phase, &snapshot);
+        let phase_prompt = build_profiled_phase_prompt(&ultra_plan, phase, &snapshot, intent);
         let summary = generate_and_run_step_plan(
             config,
             planner,
@@ -534,7 +609,7 @@ pub fn run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
             &phase_prompt,
         )
         .map_err(|err| format!("phase {} failed: {err}", phase.id))?;
-        verify_profile_after_phase(&config.cwd, ultra_plan.profile, &snapshot)
+        verify_profile_after_phase(&config.cwd, ultra_plan.profile, intent, &snapshot)
             .map_err(|err| format!("phase {} failed profile verification: {err}", phase.id))?;
         completed += 1;
         println!(
@@ -579,17 +654,25 @@ pub fn generate_and_run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>
 fn plan_generation_system_prompt() -> String {
     "You are Anvil in Plan mode. You do not execute tools. Produce a step plan for a local coding agent.\n\
 Output JSON only, with this exact shape:\n\
-{\"goal\":\"...\",\"steps\":[{\"id\":\"kebab-id\",\"instruction\":\"...\",\"expected_paths\":[\"relative/path\"],\"verify\":[\"npm run build\"],\"expected_result\":\"pass\"}]}\n\
+{\"goal\":\"...\",\"steps\":[{\"id\":\"kebab-id\",\"kind\":\"create\",\"instruction\":\"...\",\"expected_paths\":[\"relative/path\"],\"verify\":[\"npm run build\"],\"expected_result\":\"pass\"}]}\n\
 Rules:\n\
 - Split large tasks into small sequential steps.\n\
 - Each step must be executable by a minimal local coding agent in one turn.\n\
+- Use kind to separate responsibility: inspect, create, edit, setup, verify, repair, or report.\n\
+- setup steps prepare dependencies or local environment. Put setup commands in the setup instruction, never in verify.\n\
+- verify steps only run deterministic checks. They should not create, edit, install, scaffold, or repair.\n\
+- report steps are for explicit blockers such as dependency_missing when setup is not allowed or cannot run; report is not success.\n\
 - Step instruction must be natural language, not a shell command, and must name the concrete files it will create or edit.\n\
+- expected_paths are artifacts that should exist after the step. They are not a list of files to inspect.\n\
+- Inspection-only steps should usually have empty expected_paths unless they verify files that already exist.\n\
 - If a step has multiple expected_paths, mention those files or component names in the instruction.\n\
+- Validation-only steps may list multiple expected_paths without naming each one only when those paths were created by earlier steps or already exist in the workspace.\n\
 - If the goal contains a Required final artifacts list, keep those exact repository-relative paths and include relevant paths in expected_paths. Do not rename or relocate them.\n\
 - Put deterministic validation in expected_paths and verify.\n\
 - expected_paths must be repository-relative paths with no leading slash and no '..'.\n\
 - Use only safe local verify commands such as npm run build, npm test, cargo check, cargo test, python -m py_compile <file>, pytest, cat <file>, or node --check <js-file>.\n\
 - The verify array is only for checks. Never include npm install, create-next-app, dev servers, package installation, or network/setup commands in verify.\n\
+- If a later verify step needs dependencies installed, add a prior setup step that explicitly installs or prepares them.\n\
 - Do not put npm run build on early scaffold/config steps. Use cat early, use node --check only for .js/.mjs/.cjs files, and place npm run build only after the app entry point exists.\n\
 - For Next.js apps, include app/page.tsx or pages/index.tsx before the first npm run build. Config-only steps should create package.json, next.config.js, tailwind.config.js, postcss.config.js, and tsconfig.json without build verification.\n\
 - Do not include long-running dev servers in verify.\n\
@@ -599,7 +682,11 @@ Rules:\n\
         .to_string()
 }
 
-fn ultra_plan_generation_system_prompt(profile: UltraProfile, style: UltraPlanStyle) -> String {
+fn ultra_plan_generation_system_prompt(
+    profile: UltraProfile,
+    style: UltraPlanStyle,
+    intent: WorkIntent,
+) -> String {
     let style_rules = match style {
         UltraPlanStyle::Default => {
             "- Use ordinary phased delivery unless the user explicitly asks for TDD or test hardening.\n"
@@ -611,11 +698,11 @@ fn ultra_plan_generation_system_prompt(profile: UltraProfile, style: UltraPlanSt
             "- Use test-hardening phases: inspect existing tests, identify uncovered behavior, add focused tests, make only necessary fixes, then run broader tests.\n"
         }
     };
-    let profile_rules = profile_generation_rules(profile);
+    let profile_rules = profile_generation_rules(profile, intent);
     format!(
         "You are Anvil's ultra planner. You do not execute tools. Produce a top-level phase plan whose phases will each be executed by /plan-run.\n\
 Output JSON only, with this exact shape:\n\
-{{\"goal\":\"...\",\"profile\":\"{}\",\"style\":\"{}\",\"phases\":[{{\"id\":\"kebab-id\",\"prompt\":\"focused /plan-run goal\"}}]}}\n\
+{{\"goal\":\"...\",\"profile\":\"{}\",\"style\":\"{}\",\"intent\":\"{}\",\"phases\":[{{\"id\":\"kebab-id\",\"prompt\":\"focused /plan-run goal\"}}]}}\n\
 Rules:\n\
 - Return 2 to 6 phases for most tasks, never more than 8.\n\
 - Each phase prompt must be a focused natural-language task that can be handled by one /plan-run.\n\
@@ -627,7 +714,8 @@ Rules:\n\
 {profile_rules}\
 {style_rules}",
         profile.as_str(),
-        style.as_str()
+        style.as_str(),
+        intent.as_str()
     )
 }
 
@@ -635,11 +723,13 @@ fn ultra_plan_generation_user_prompt(
     goal: &str,
     profile: UltraProfile,
     style: UltraPlanStyle,
+    intent: WorkIntent,
 ) -> String {
     format!(
-        "Create an ultra phase plan for this task using profile `{}` and style `{}`:\n{goal}",
+        "Create an ultra phase plan for this task using profile `{}`, style `{}`, and work intent `{}`:\n{goal}",
         profile.as_str(),
-        style.as_str()
+        style.as_str(),
+        intent.as_str()
     )
 }
 
@@ -840,6 +930,9 @@ fn render_plan_yaml(plan: &StepPlan) -> String {
         out.push_str("  - id: ");
         out.push_str(&quote_yaml(&step.id));
         out.push('\n');
+        out.push_str("    kind: ");
+        out.push_str(&quote_yaml(step.kind.as_str()));
+        out.push('\n');
         out.push_str("    instruction: ");
         out.push_str(&quote_yaml(&step.instruction));
         out.push('\n');
@@ -875,6 +968,9 @@ fn render_ultra_plan_yaml(plan: &UltraPlan) -> String {
     out.push('\n');
     out.push_str("style: ");
     out.push_str(&quote_yaml(plan.style.as_str()));
+    out.push('\n');
+    out.push_str("intent: ");
+    out.push_str(&quote_yaml(plan.effective_intent().as_str()));
     out.push('\n');
     out.push_str("phases:\n");
     for phase in &plan.phases {
@@ -914,11 +1010,20 @@ fn parse_plan_yaml(raw: &str) -> Result<StepPlan, String> {
             }
             current = Some(PlanStep {
                 id: parse_quoted(rest)?,
+                kind: StepKind::Work,
                 instruction: String::new(),
                 expected_paths: Vec::new(),
                 verify: Vec::new(),
                 expected_result: VerifyExpectedResult::Pass,
             });
+            list_kind = ListKind::None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("    kind: ") {
+            let step = current
+                .as_mut()
+                .ok_or_else(|| "kind before step id".to_string())?;
+            step.kind = parse_quoted(rest)?.parse()?;
             list_kind = ListKind::None;
             continue;
         }
@@ -974,6 +1079,7 @@ fn parse_ultra_plan_yaml(raw: &str) -> Result<UltraPlan, String> {
     let mut goal: Option<String> = None;
     let mut profile = UltraProfile::Generic;
     let mut style = UltraPlanStyle::Default;
+    let mut intent = WorkIntent::Unknown;
     let mut phases: Vec<UltraPhase> = Vec::new();
     let mut current: Option<UltraPhase> = None;
 
@@ -992,6 +1098,10 @@ fn parse_ultra_plan_yaml(raw: &str) -> Result<UltraPlan, String> {
         }
         if let Some(rest) = line.strip_prefix("style: ") {
             style = parse_quoted(rest)?.parse()?;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("intent: ") {
+            intent = parse_quoted(rest)?.parse()?;
             continue;
         }
         if let Some(rest) = line.strip_prefix("  - id: ") {
@@ -1020,6 +1130,7 @@ fn parse_ultra_plan_yaml(raw: &str) -> Result<UltraPlan, String> {
         goal: goal.ok_or_else(|| "missing goal".to_string())?,
         profile,
         style,
+        intent,
         phases,
     };
     validate_ultra_plan(&plan)?;
@@ -1062,6 +1173,7 @@ fn validate_plan(plan: &StepPlan) -> Result<(), String> {
         for command in &step.verify {
             validate_verify_command(command)?;
         }
+        validate_step_kind_contract(step)?;
         if step.expected_result == VerifyExpectedResult::Fail && step.verify.is_empty() {
             return Err(format!(
                 "step {} expected_result fail requires at least one verify command",
@@ -1070,6 +1182,79 @@ fn validate_plan(plan: &StepPlan) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_step_kind_contract(step: &PlanStep) -> Result<(), String> {
+    match step.kind {
+        StepKind::Inspect => {
+            if !step.expected_paths.is_empty() && step.verify.is_empty() {
+                return Err(format!(
+                    "inspect step {} must not use expected_paths as files to inspect",
+                    step.id
+                ));
+            }
+        }
+        StepKind::Setup => {
+            if step
+                .verify
+                .iter()
+                .any(|command| is_build_or_test_verify(command))
+            {
+                return Err(format!(
+                    "setup step {} must not run build/test verification; add a later verify step",
+                    step.id
+                ));
+            }
+        }
+        StepKind::Verify => {
+            if step.verify.is_empty() {
+                return Err(format!("verify step {} requires verify commands", step.id));
+            }
+            if instruction_has_setup_language(&step.instruction) {
+                return Err(format!(
+                    "verify step {} must not install or prepare dependencies; add a prior setup step",
+                    step.id
+                ));
+            }
+        }
+        StepKind::Report => {
+            if !step.verify.is_empty() {
+                return Err(format!(
+                    "report step {} must not run verification commands",
+                    step.id
+                ));
+            }
+        }
+        StepKind::Work | StepKind::Create | StepKind::Edit | StepKind::Repair => {}
+    }
+    Ok(())
+}
+
+fn is_build_or_test_verify(command: &str) -> bool {
+    matches!(
+        command.split_whitespace().collect::<Vec<_>>().as_slice(),
+        ["npm", "run", "build"]
+            | ["npm", "run", "test"]
+            | ["npm", "test"]
+            | ["cargo", "check", ..]
+            | ["cargo", "test", ..]
+            | ["pytest", ..]
+            | ["python", "-m", "pytest", ..]
+            | ["python3", "-m", "pytest", ..]
+    )
+}
+
+fn instruction_has_setup_language(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("npm install")
+        || lower.contains("npm ci")
+        || lower.contains("pnpm install")
+        || lower.contains("yarn install")
+        || lower.contains("pip install")
+        || lower.contains("poetry install")
+        || lower.contains("uv sync")
+        || lower.contains("bundle install")
+        || lower.contains("composer install")
 }
 
 fn validate_ultra_plan(plan: &UltraPlan) -> Result<(), String> {
@@ -1125,7 +1310,7 @@ fn validate_instruction(value: &str) -> Result<(), String> {
     let trimmed = value.trim();
     let lower = trimmed.to_ascii_lowercase();
     let shell_starts = ["echo ", "cat ", "mkdir ", "touch ", "cd "];
-    let shell_syntax = ["&&", "||", ";", "|", "`", "$("];
+    let shell_syntax = ["&&", "||", "|", "`", "$("];
     if shell_starts.iter().any(|prefix| lower.starts_with(prefix))
         || shell_syntax.iter().any(|needle| trimmed.contains(needle))
     {
@@ -1317,6 +1502,7 @@ mod tests {
         assert_eq!(loaded.goal, "Build app with TDD");
         assert_eq!(loaded.profile, UltraProfile::Generic);
         assert_eq!(loaded.style, UltraPlanStyle::Tdd);
+        assert_eq!(loaded.intent, WorkIntent::Create);
         assert_eq!(loaded.phases[0].id, "write-red-test");
     }
 
@@ -1351,6 +1537,7 @@ mod tests {
             parse_ultra_plan_yaml(&std::fs::read_to_string(ultra_path).unwrap()).unwrap();
         assert_eq!(ultra_plan.goal, goal);
         assert_eq!(ultra_plan.profile, UltraProfile::Nextjs);
+        assert_eq!(ultra_plan.intent, WorkIntent::Create);
     }
 
     #[test]
@@ -1359,6 +1546,7 @@ mod tests {
             goal: "x".into(),
             steps: vec![PlanStep {
                 id: "bad".into(),
+                kind: StepKind::Verify,
                 instruction: "x".into(),
                 expected_paths: vec![],
                 verify: vec!["npm install left-pad".into()],
@@ -1374,6 +1562,7 @@ mod tests {
             goal: "x".into(),
             steps: vec![PlanStep {
                 id: "bad".into(),
+                kind: StepKind::Create,
                 instruction: "echo 'hello' > hello.txt".into(),
                 expected_paths: vec!["hello.txt".into()],
                 verify: vec![],
@@ -1389,12 +1578,42 @@ mod tests {
     }
 
     #[test]
+    fn natural_language_instruction_may_use_semicolon() {
+        assert!(
+            validate_instruction(
+                "Inspect the current workspace; verify whether package.json already exists."
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn natural_language_instruction_may_mention_html_tags() {
         assert!(
             validate_instruction(
                 "Implement AnalyticsPanel.tsx using semantic HTML like <dl> and <div>."
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn work_intent_is_detected_from_goal_language() {
+        assert_eq!(
+            detect_work_intent("Next.js アプリを新規開発してください"),
+            WorkIntent::Create
+        );
+        assert_eq!(
+            detect_work_intent("原因調査してレポートにまとめる"),
+            WorkIntent::Investigate
+        );
+        assert_eq!(
+            detect_work_intent("既存のバグを修正してください"),
+            WorkIntent::Fix
+        );
+        assert_eq!(
+            detect_work_intent("README ドキュメントを更新する"),
+            WorkIntent::Document
         );
     }
 
@@ -1448,6 +1667,144 @@ mod tests {
     }
 
     #[test]
+    fn step_kind_is_saved_and_loaded_in_plan_yaml() {
+        let plan = StepPlan {
+            goal: "Create app".into(),
+            steps: vec![PlanStep {
+                id: "setup-dependencies".into(),
+                kind: StepKind::Setup,
+                instruction: "Install or prepare dependencies for package.json.".into(),
+                expected_paths: vec![],
+                verify: vec![],
+                expected_result: VerifyExpectedResult::Pass,
+            }],
+        };
+
+        let rendered = render_plan_yaml(&plan);
+        assert!(rendered.contains(r#"kind: "setup""#), "{rendered}");
+        let parsed = parse_plan_yaml(&rendered).unwrap();
+        assert_eq!(parsed.steps[0].kind, StepKind::Setup);
+    }
+
+    #[test]
+    fn legacy_plan_yaml_without_kind_defaults_to_work() {
+        let raw = r#"
+goal: "Create report"
+steps:
+  - id: "create-report"
+    instruction: "Create report.md"
+    expected_paths:
+      - "report.md"
+    verify:
+"#;
+
+        let plan = parse_plan_yaml(raw).unwrap();
+        assert_eq!(plan.steps[0].kind, StepKind::Work);
+    }
+
+    #[test]
+    fn setup_step_must_not_run_build_verification() {
+        let plan = StepPlan {
+            goal: "Prepare project".into(),
+            steps: vec![PlanStep {
+                id: "setup-dependencies".into(),
+                kind: StepKind::Setup,
+                instruction: "Install dependencies for package.json.".into(),
+                expected_paths: vec![],
+                verify: vec!["npm run build".into()],
+                expected_result: VerifyExpectedResult::Pass,
+            }],
+        };
+
+        let err = validate_plan(&plan).unwrap_err();
+        assert!(err.contains("setup step setup-dependencies must not run build/test"));
+    }
+
+    #[test]
+    fn verify_step_must_not_prepare_dependencies() {
+        let plan = StepPlan {
+            goal: "Verify project".into(),
+            steps: vec![PlanStep {
+                id: "verify-build".into(),
+                kind: StepKind::Verify,
+                instruction: "Run npm install and then verify the build.".into(),
+                expected_paths: vec![],
+                verify: vec!["npm run build".into()],
+                expected_result: VerifyExpectedResult::Pass,
+            }],
+        };
+
+        let err = validate_plan(&plan).unwrap_err();
+        assert!(err.contains("verify step verify-build must not install"));
+    }
+
+    #[test]
+    fn npm_verify_before_dependency_setup_is_rejected_by_lint() {
+        let plan = StepPlan {
+            goal: "Create app".into(),
+            steps: vec![
+                PlanStep {
+                    id: "create-package".into(),
+                    kind: StepKind::Create,
+                    instruction: "Create package.json and app/page.tsx.".into(),
+                    expected_paths: vec!["package.json".into(), "app/page.tsx".into()],
+                    verify: vec![],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+                PlanStep {
+                    id: "verify-build".into(),
+                    kind: StepKind::Verify,
+                    instruction: "Verify the build.".into(),
+                    expected_paths: vec!["package.json".into(), "app/page.tsx".into()],
+                    verify: vec!["npm run build".into()],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+            ],
+        };
+
+        let err = lint_plan(&plan).unwrap_err();
+        assert!(
+            err.contains("runs npm verification before a dependency setup step"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn npm_verify_after_dependency_setup_is_allowed_by_lint() {
+        let plan = StepPlan {
+            goal: "Create app".into(),
+            steps: vec![
+                PlanStep {
+                    id: "create-package".into(),
+                    kind: StepKind::Create,
+                    instruction: "Create package.json and app/page.tsx.".into(),
+                    expected_paths: vec!["package.json".into(), "app/page.tsx".into()],
+                    verify: vec![],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+                PlanStep {
+                    id: "setup-dependencies".into(),
+                    kind: StepKind::Setup,
+                    instruction: "Install or prepare dependencies for package.json.".into(),
+                    expected_paths: vec![],
+                    verify: vec![],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+                PlanStep {
+                    id: "verify-build".into(),
+                    kind: StepKind::Verify,
+                    instruction: "Verify the build.".into(),
+                    expected_paths: vec!["package.json".into(), "app/page.tsx".into()],
+                    verify: vec!["npm run build".into()],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+            ],
+        };
+
+        assert!(lint_plan(&plan).is_ok());
+    }
+
+    #[test]
     fn data_profile_verifier_rejects_raw_input_changes() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("data/raw")).unwrap();
@@ -1457,8 +1814,13 @@ mod tests {
 
         std::fs::write(&raw, "date,total\n2026-01-01,99\nextra,row\n").unwrap();
 
-        let err = verify_profile_after_phase(temp.path(), UltraProfile::DataPipeline, &snapshot)
-            .unwrap_err();
+        let err = verify_profile_after_phase(
+            temp.path(),
+            UltraProfile::DataPipeline,
+            WorkIntent::Create,
+            &snapshot,
+        )
+        .unwrap_err();
         assert!(err.contains("protected input data changed"));
     }
 
@@ -1483,8 +1845,13 @@ mod tests {
         .unwrap();
         let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
 
-        let err =
-            verify_profile_after_phase(temp.path(), UltraProfile::Nextjs, &snapshot).unwrap_err();
+        let err = verify_profile_after_phase(
+            temp.path(),
+            UltraProfile::Nextjs,
+            WorkIntent::Create,
+            &snapshot,
+        )
+        .unwrap_err();
         assert!(err.contains("build script"));
         assert!(err.contains("rootDir"));
     }
@@ -1516,7 +1883,85 @@ mod tests {
         .unwrap();
         let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
 
-        verify_profile_after_phase(temp.path(), UltraProfile::Nextjs, &snapshot).unwrap();
+        verify_profile_after_phase(
+            temp.path(),
+            UltraProfile::Nextjs,
+            WorkIntent::Create,
+            &snapshot,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nextjs_profile_verifier_rejects_incomplete_tailwind_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"},"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("app/page.tsx"), "export default function Page() { return <main className=\"min-h-screen text-white\" />; }\n").unwrap();
+        std::fs::write(
+            temp.path().join("app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
+
+        let err = verify_profile_after_phase(
+            temp.path(),
+            UltraProfile::Nextjs,
+            WorkIntent::Create,
+            &snapshot,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("tailwindcss dependency"), "got: {err}");
+        assert!(err.contains("postcss dependency"), "got: {err}");
+        assert!(err.contains("autoprefixer dependency"), "got: {err}");
+        assert!(err.contains("tailwind.config"), "got: {err}");
+        assert!(err.contains("postcss.config"), "got: {err}");
+    }
+
+    #[test]
+    fn nextjs_profile_verifier_accepts_complete_tailwind_contract() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"},"devDependencies":{"tailwindcss":"3.4.0","postcss":"8.4.0","autoprefixer":"10.4.0"},"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("app/page.tsx"),
+            "export default function Page() { return <main className=\"min-h-screen text-white\" />; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("tailwind.config.js"),
+            "module.exports = { content: ['./app/**/*.{ts,tsx}'] };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("postcss.config.js"),
+            "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n",
+        )
+        .unwrap();
+        let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
+
+        verify_profile_after_phase(
+            temp.path(),
+            UltraProfile::Nextjs,
+            WorkIntent::Create,
+            &snapshot,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1546,8 +1991,13 @@ mod tests {
         .unwrap();
         let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
 
-        let err =
-            verify_profile_after_phase(temp.path(), UltraProfile::Nextjs, &snapshot).unwrap_err();
+        let err = verify_profile_after_phase(
+            temp.path(),
+            UltraProfile::Nextjs,
+            WorkIntent::Create,
+            &snapshot,
+        )
+        .unwrap_err();
 
         assert!(err.contains("paths mapping"), "got: {err}");
     }
@@ -1579,7 +2029,13 @@ mod tests {
         .unwrap();
         let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
 
-        verify_profile_after_phase(temp.path(), UltraProfile::Nextjs, &snapshot).unwrap();
+        verify_profile_after_phase(
+            temp.path(),
+            UltraProfile::Nextjs,
+            WorkIntent::Create,
+            &snapshot,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1587,6 +2043,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let step = PlanStep {
             id: "red-test".into(),
+            kind: StepKind::Verify,
             instruction: "Add a failing test".into(),
             expected_paths: vec![],
             verify: vec!["cat missing.txt".into()],
@@ -1597,6 +2054,7 @@ mod tests {
         std::fs::write(temp.path().join("present.txt"), "ok\n").unwrap();
         let step = PlanStep {
             id: "red-test".into(),
+            kind: StepKind::Verify,
             instruction: "Add a failing test".into(),
             expected_paths: vec![],
             verify: vec!["cat present.txt".into()],
@@ -1608,12 +2066,50 @@ mod tests {
     }
 
     #[test]
+    fn nextjs_build_verify_reports_dependency_missing_before_shell_error() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"},"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        let step = PlanStep {
+            id: "verify-build".into(),
+            kind: StepKind::Verify,
+            instruction: "Verify the Next.js app build.".into(),
+            expected_paths: vec!["package.json".into()],
+            verify: vec!["npm run build".into()],
+            expected_result: VerifyExpectedResult::Pass,
+        };
+
+        let report = verify_step(temp.path(), &step);
+
+        assert!(!report.success);
+        assert!(
+            report.failures[0].contains("dependency_missing"),
+            "{:?}",
+            report.failures
+        );
+        assert!(
+            report.failures[0].contains("node_modules/.bin/next"),
+            "{:?}",
+            report.failures
+        );
+        assert!(
+            report.failures[0].contains("do not change scripts.build"),
+            "{:?}",
+            report.failures
+        );
+    }
+
+    #[test]
     fn nextjs_build_before_entry_path_is_rejected_by_lint() {
         let plan = StepPlan {
             goal: "Create a Next.js app".into(),
             steps: vec![
                 PlanStep {
                     id: "init-next-project".into(),
+                    kind: StepKind::Create,
                     instruction: "Create package.json, next.config.js, and tailwind.config.js"
                         .into(),
                     expected_paths: vec![
@@ -1626,6 +2122,7 @@ mod tests {
                 },
                 PlanStep {
                     id: "create-app-entry".into(),
+                    kind: StepKind::Create,
                     instruction: "Create app/page.tsx".into(),
                     expected_paths: vec!["app/page.tsx".into()],
                     verify: vec![],
@@ -1652,10 +2149,12 @@ mod tests {
             "export default function Page() { return null; }\n",
         )
         .unwrap();
+        std::fs::create_dir_all(temp.path().join("node_modules")).unwrap();
         let plan = StepPlan {
             goal: "Modify an existing Next.js app".into(),
             steps: vec![PlanStep {
                 id: "integrate-panel".into(),
+                kind: StepKind::Edit,
                 instruction: "Create components/AnalyticsPanel.tsx and integrate it.".into(),
                 expected_paths: vec!["components/AnalyticsPanel.tsx".into()],
                 verify: vec!["npm run build".into()],
@@ -1672,6 +2171,7 @@ mod tests {
             goal: "Create a Next.js app architecture plan".into(),
             steps: vec![PlanStep {
                 id: "scope-and-architecture".into(),
+                kind: StepKind::Create,
                 instruction: "Create docs/architecture.md describing the Next.js app structure."
                     .into(),
                 expected_paths: vec!["docs/architecture.md".into()],
@@ -1689,6 +2189,7 @@ mod tests {
             goal: "Build app\n\nRequired final artifacts:\n- components/SpaceOpsGame.tsx\n- app/page.tsx\n".into(),
             profile: UltraProfile::Nextjs,
             style: UltraPlanStyle::Default,
+            intent: WorkIntent::Create,
             phases: vec![UltraPhase {
                 id: "game".into(),
                 prompt: "Implement the game screen.".into(),
@@ -1701,10 +2202,12 @@ mod tests {
                 lines: Vec::new(),
                 protected_files: Vec::new(),
             },
+            WorkIntent::Create,
         );
 
         assert!(prompt.contains("Required final artifacts from the overall goal"));
         assert!(prompt.contains("components/SpaceOpsGame.tsx"));
+        assert!(prompt.contains("Detected intent: create"));
     }
 
     #[test]
@@ -1713,6 +2216,7 @@ mod tests {
             goal: "Create config".into(),
             steps: vec![PlanStep {
                 id: "setup-config".into(),
+                kind: StepKind::Create,
                 instruction: "Initialize the project configuration".into(),
                 expected_paths: vec!["package.json".into(), "tsconfig.json".into()],
                 verify: vec![],
@@ -1731,13 +2235,33 @@ mod tests {
             steps: vec![
                 PlanStep {
                     id: "create-app".into(),
+                    kind: StepKind::Create,
                     instruction: "Create package.json and app/page.tsx.".into(),
                     expected_paths: vec!["package.json".into(), "app/page.tsx".into()],
                     verify: vec!["cat app/page.tsx".into()],
                     expected_result: VerifyExpectedResult::Pass,
                 },
                 PlanStep {
+                    id: "create-game-component".into(),
+                    kind: StepKind::Create,
+                    instruction: "Create components/SpaceOpsGame.tsx.".into(),
+                    expected_paths: vec!["components/SpaceOpsGame.tsx".into()],
+                    verify: vec!["cat components/SpaceOpsGame.tsx".into()],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+                PlanStep {
+                    id: "setup-dependencies".into(),
+                    kind: StepKind::Setup,
+                    instruction:
+                        "Install or prepare project dependencies for the existing package.json."
+                            .into(),
+                    expected_paths: vec![],
+                    verify: vec![],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+                PlanStep {
                     id: "validate-build".into(),
+                    kind: StepKind::Verify,
                     instruction: "Run the build script to verify the app compiles.".into(),
                     expected_paths: vec![
                         "package.json".into(),
@@ -1751,6 +2275,59 @@ mod tests {
         };
 
         assert!(lint_plan(&plan).is_ok());
+    }
+
+    #[test]
+    fn final_build_check_id_allows_multiple_known_paths_without_instruction_names() {
+        let plan = StepPlan {
+            goal: "Create Next.js app".into(),
+            steps: vec![
+                PlanStep {
+                    id: "scaffold-app".into(),
+                    kind: StepKind::Create,
+                    instruction: "Create package.json and app/page.tsx.".into(),
+                    expected_paths: vec!["package.json".into(), "app/page.tsx".into()],
+                    verify: vec![],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+                PlanStep {
+                    id: "setup-dependencies".into(),
+                    kind: StepKind::Setup,
+                    instruction: "Install or prepare project dependencies for package.json.".into(),
+                    expected_paths: vec![],
+                    verify: vec![],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+                PlanStep {
+                    id: "final-build-check".into(),
+                    kind: StepKind::Verify,
+                    instruction: "Confirm production readiness.".into(),
+                    expected_paths: vec!["package.json".into(), "app/page.tsx".into()],
+                    verify: vec!["npm run build".into()],
+                    expected_result: VerifyExpectedResult::Pass,
+                },
+            ],
+        };
+
+        assert!(lint_plan(&plan).is_ok());
+    }
+
+    #[test]
+    fn verification_step_still_rejects_unknown_multiple_paths_without_names() {
+        let plan = StepPlan {
+            goal: "Create reports".into(),
+            steps: vec![PlanStep {
+                id: "final-check".into(),
+                kind: StepKind::Verify,
+                instruction: "Run final validation.".into(),
+                expected_paths: vec!["report.md".into(), "summary.md".into()],
+                verify: vec!["cat report.md".into()],
+                expected_result: VerifyExpectedResult::Pass,
+            }],
+        };
+
+        let err = lint_plan(&plan).unwrap_err();
+        assert!(err.contains("does not name any concrete expected file"));
     }
 
     #[test]
@@ -1795,6 +2372,7 @@ mod tests {
             goal: "Create report".into(),
             steps: vec![PlanStep {
                 id: "report".into(),
+                kind: StepKind::Create,
                 instruction: "Create report.md".into(),
                 expected_paths: vec!["report.md".into()],
                 verify: vec![],
@@ -1843,6 +2421,7 @@ mod tests {
             goal: "Create report".into(),
             steps: vec![PlanStep {
                 id: "report".into(),
+                kind: StepKind::Create,
                 instruction: "Create report.md".into(),
                 expected_paths: vec!["report.md".into()],
                 verify: vec!["cat report.md".into()],
@@ -1905,6 +2484,7 @@ mod tests {
             goal: "Fix report".into(),
             steps: vec![PlanStep {
                 id: "report".into(),
+                kind: StepKind::Edit,
                 instruction: "Fix report.md so check.py passes".into(),
                 expected_paths: vec!["report.md".into()],
                 verify: vec!["python3 check.py".into()],
@@ -1966,6 +2546,7 @@ mod tests {
             goal: "Fix report.md so check.py passes".into(),
             steps: vec![PlanStep {
                 id: "fix-report".into(),
+                kind: StepKind::Edit,
                 instruction: "Edit report.md so check.py passes".into(),
                 expected_paths: vec!["report.md".into()],
                 verify: vec!["python3 check.py".into()],
@@ -2098,6 +2679,7 @@ mod tests {
             goal: "Ultra goal: ".to_string() + &"large context ".repeat(800),
             steps: vec![PlanStep {
                 id: "verify-build".into(),
+                kind: StepKind::Verify,
                 instruction: "Run npm run build and repair the failed Next.js project.".repeat(80),
                 expected_paths: vec!["package.json".into(), "app/page.tsx".into()],
                 verify: vec!["npm run build".into()],
@@ -2168,6 +2750,7 @@ mod tests {
             goal: "Create two files".into(),
             profile: UltraProfile::Generic,
             style: UltraPlanStyle::Default,
+            intent: WorkIntent::Create,
             phases: vec![
                 UltraPhase {
                     id: "create-a".into(),

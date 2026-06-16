@@ -279,6 +279,20 @@ fn build_ultra_repair_prompt(
             ));
         }
     }
+    if report
+        .failures
+        .iter()
+        .any(|failure| failure.contains("dependency_missing"))
+    {
+        lines.extend([
+            String::new(),
+            "Dependency setup note:".to_string(),
+            "- This failure is a missing dependency/tooling precondition, not an ordinary source-code verifier failure.".to_string(),
+            "- Do not keep rewriting existing source or config files if they already satisfy the contract.".to_string(),
+            "- Replan with an explicit setup step before the verify step when setup is allowed.".to_string(),
+            "- If setup is not allowed or cannot run, stop with dependency_missing; do not claim the verifier passed.".to_string(),
+        ]);
+    }
     lines.extend([
         String::new(),
         "Repair constraints:".to_string(),

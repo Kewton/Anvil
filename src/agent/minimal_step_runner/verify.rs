@@ -3,6 +3,21 @@ use std::process::Command;
 
 use super::{PlanStep, VerifyExpectedResult};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailureKind {
+    DependencyMissing,
+    VerifierUnavailable,
+}
+
+impl FailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DependencyMissing => "dependency_missing",
+            Self::VerifierUnavailable => "verifier_unavailable",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct VerificationReport {
     pub(super) success: bool,
@@ -15,6 +30,10 @@ pub(super) fn verify_step(work_root: &Path, step: &PlanStep) -> VerificationRepo
         failures.push(format!("missing expected path: {path}"));
     }
     for command in &step.verify {
+        if let Some(precondition_failure) = verifier_precondition_failure(work_root, command) {
+            failures.push(precondition_failure);
+            continue;
+        }
         match (step.expected_result, run_verify_command(work_root, command)) {
             (VerifyExpectedResult::Pass, Ok(())) => {}
             (VerifyExpectedResult::Pass, Err(err)) => {
@@ -30,6 +49,40 @@ pub(super) fn verify_step(work_root: &Path, step: &PlanStep) -> VerificationRepo
         success: failures.is_empty(),
         failures,
     }
+}
+
+fn verifier_precondition_failure(work_root: &Path, command: &str) -> Option<String> {
+    if command == "npm run build" && nextjs_build_requires_missing_next_binary(work_root) {
+        return Some(format!(
+            "{}: {}: npm run build requires node_modules/.bin/next, but it is missing. Install dependencies with npm install/npm ci when allowed, or stop as dependency_missing; do not change scripts.build away from next build to fake success.",
+            FailureKind::DependencyMissing.as_str(),
+            FailureKind::VerifierUnavailable.as_str()
+        ));
+    }
+    None
+}
+
+fn nextjs_build_requires_missing_next_binary(work_root: &Path) -> bool {
+    let package_path = work_root.join("package.json");
+    let Ok(raw) = std::fs::read_to_string(package_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let build = json
+        .pointer("/scripts/build")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if build != "next build" {
+        return false;
+    }
+    let has_next_dependency = ["dependencies", "devDependencies"].iter().any(|section| {
+        json.get(section)
+            .and_then(|value| value.get("next"))
+            .is_some()
+    });
+    has_next_dependency && !work_root.join("node_modules/.bin/next").is_file()
 }
 
 pub(super) fn missing_expected_paths(work_root: &Path, step: &PlanStep) -> Vec<String> {
