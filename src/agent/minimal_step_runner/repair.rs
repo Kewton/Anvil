@@ -13,7 +13,7 @@ use super::{
 const REPAIR_PROMPT_MAX_CHARS: usize = 3_600;
 const REPAIR_GOAL_MAX_CHARS: usize = 800;
 const REPAIR_INSTRUCTION_MAX_CHARS: usize = 700;
-const REPAIR_FAILURE_MAX_CHARS: usize = 300;
+const REPAIR_FAILURE_MAX_CHARS: usize = 1_800;
 const REPAIR_MAX_FAILURES: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

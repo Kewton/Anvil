@@ -2103,6 +2103,59 @@ steps:
     }
 
     #[test]
+    fn verifier_failure_excerpt_preserves_diagnostic_and_source_context() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+        std::fs::create_dir_all(temp.path().join("scripts")).unwrap();
+        let mut page_lines = (1..=60)
+            .map(|index| format!("// filler line {index}"))
+            .collect::<Vec<_>>();
+        page_lines[42] =
+            "  const { score, lives, level, gameOver } = game.renderState;".to_string();
+        std::fs::write(temp.path().join("app/page.tsx"), page_lines.join("\n")).unwrap();
+        std::fs::write(
+            temp.path().join("scripts/fail.py"),
+            r#"for i in range(14):
+    print(f"build prelude {i}")
+print("Failed to compile.")
+print("./app/page.tsx:43:18")
+print("Type error: Property 'lives' does not exist on type 'GameInternalState'.")
+print("")
+print("  41 |   }, [game]);")
+print("  42 |")
+print("> 43 |   const { score, lives, level, gameOver } = game.renderState;")
+print("     |                  ^")
+raise SystemExit(1)
+"#,
+        )
+        .unwrap();
+        let step = PlanStep {
+            id: "verify-build".into(),
+            kind: StepKind::Verify,
+            instruction: "Verify build output.".into(),
+            expected_paths: vec!["app/page.tsx".into()],
+            verify: vec!["python3 scripts/fail.py".into()],
+            expected_result: VerifyExpectedResult::Pass,
+        };
+
+        let report = verify_step(temp.path(), &step);
+
+        assert!(!report.success);
+        let failure = &report.failures[0];
+        assert!(
+            failure.contains("Type error: Property 'lives' does not exist"),
+            "{failure}"
+        );
+        assert!(failure.contains("related source excerpt"), "{failure}");
+        assert!(failure.contains("app/page.tsx:40-46"), "{failure}");
+        assert!(
+            failure
+                .contains(">   43 |   const { score, lives, level, gameOver } = game.renderState;"),
+            "{failure}"
+        );
+    }
+
+    #[test]
     fn nextjs_build_before_entry_path_is_rejected_by_lint() {
         let plan = StepPlan {
             goal: "Create a Next.js app".into(),
@@ -2735,6 +2788,67 @@ steps:
             repair_prompt.chars().count()
         );
         assert!(repair_prompt.contains("[truncated]"));
+    }
+
+    #[test]
+    fn saved_repair_prompt_preserves_verifier_diagnostic_excerpt() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = StepPlan {
+            goal: "Fix the Next.js page".into(),
+            steps: vec![PlanStep {
+                id: "verify-build".into(),
+                kind: StepKind::Verify,
+                instruction: "Run npm run build and fix TypeScript errors.".into(),
+                expected_paths: vec!["app/page.tsx".into()],
+                verify: vec!["npm run build".into()],
+                expected_result: VerifyExpectedResult::Pass,
+            }],
+        };
+        let report = VerificationReport {
+            success: false,
+            failures: vec![format!(
+                "verify failed `npm run build`: diagnostic excerpt:\n{}\n./app/page.tsx:43:18\nType error: Property 'lives' does not exist on type 'GameInternalState'.\n\nrelated source excerpt:\napp/page.tsx:40-46\n>   43 |   const {{ score, lives }} = game.renderState;",
+                "build prelude\n".repeat(30)
+            )],
+        };
+        let progress = super::repair::StepProgressReport {
+            missing_before: Vec::new(),
+            missing_after: Vec::new(),
+            write_or_edit_paths: Vec::new(),
+            repeated_write_or_edit_paths: Vec::new(),
+            no_expected_path_progress: false,
+        };
+
+        let report_text = build_repair_exhausted_report(
+            temp.path(),
+            &plan,
+            &plan.steps[0],
+            &report,
+            &progress,
+            None,
+            None,
+            2,
+            2,
+        );
+
+        assert!(
+            report_text.contains("repair prompt saved: .anvil/repairs/repair-verify-build-"),
+            "{report_text}"
+        );
+        let repair_files = std::fs::read_dir(temp.path().join(".anvil").join("repairs"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(repair_files.len(), 1);
+        let repair_prompt = std::fs::read_to_string(&repair_files[0]).unwrap();
+        assert!(
+            repair_prompt.contains("Type error: Property 'lives' does not exist"),
+            "{repair_prompt}"
+        );
+        assert!(
+            repair_prompt.contains("related source excerpt"),
+            "{repair_prompt}"
+        );
     }
 
     #[test]
