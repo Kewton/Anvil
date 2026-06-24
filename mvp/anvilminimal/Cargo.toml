@@ -1,0 +1,25 @@
+[package]
+name = "anvilminimal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Copyable minimal loop + YAML plan runner MVP"
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+globset = "0.4"
+ignore = "0.4"
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"], default-features = false }
+rustyline = { version = "14", default-features = false, features = ["with-file-history"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+uuid = { version = "1", default-features = false, features = ["v7", "std", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"

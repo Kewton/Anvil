@@ -1,0 +1,52 @@
+name: minimal-loop-expanded
+scenarios:
+  - id: new-rust-cli-small
+    prompt: Create a small Rust CLI.
+  - id: new-python-csv-small
+    prompt: Create a small CSV utility.
+  - id: fix-rust-parser-error
+    prompt: Fix a Rust parser error.
+  - id: fix-readme-command
+    prompt: Fix README command documentation.
+  - id: fix-python-slugify
+    prompt: Fix a Python slugify helper.
+  - id: fix-js-date-helper
+    prompt: Fix a JavaScript date helper.
+  - id: new-typescript-formatter
+    prompt: Create a TypeScript formatter.
+  - id: fix-json-normalizer
+    prompt: Fix a JSON normalizer.
+  - id: multi-file-rust-library
+    prompt: Create a multi-file Rust library.
+  - id: scaffold-nextjs-app
+    prompt: Scaffold a Next.js app.
+  - id: non-coding-research-brief
+    prompt: Write a research brief.
+  - id: long-session-data-report
+    prompt: Create a data report.
+  - id: docs-heading-update
+    prompt: Update required docs heading.
+  - id: data-schema-check
+    prompt: Validate data schema.
+  - id: node-zero-tests
+    prompt: Avoid Node zero-test false success.
+  - id: rust-manifest-binding
+    prompt: Bind Rust tests to manifest path.
+  - id: requested-artifact-hard-gate
+    prompt: Create exact requested artifact.
+  - id: no-tool-progress-stop
+    prompt: Prevent no-tool progress final.
+  - id: parser-feedback-loop
+    prompt: Recover from malformed tool call.
+  - id: blocked-mkdir-script
+    prompt: Avoid unnecessary mkdir script block.
+  - id: nextjs-port-3011
+    prompt: Preserve Next.js dev port 3011.
+  - id: nextjs-alias
+    prompt: Preserve Next.js @ alias config.
+  - id: data-raw-file-protection
+    prompt: Do not mutate raw data.
+  - id: repair-exhausted-report
+    prompt: Emit repair exhausted report.
+  - id: copy-artifact-smoke
+    prompt: Validate copy artifact.
