@@ -1,0 +1,56 @@
+[
+  {
+    "run_id": "mvp-smoke__python-markdown-linter-medium__minimal-loop__openai-gpt-5.4-mini__gemini-gemini-3.5-flash__r1",
+    "expected_failure_kind_before_fix": "postcheck_failure",
+    "expected_failure_kind_after_fix": "verify_repair_exhausted",
+    "process": {
+      "rc": 0,
+      "stderr": ""
+    },
+    "events": [
+      {
+        "event": "loop_stop",
+        "reason": "required_artifacts_satisfied_after_tool",
+        "required_paths": [
+          "markdown_lint.py",
+          "test_markdown_lint.py"
+        ]
+      },
+      {
+        "event": "postcheck_summary",
+        "ok": false,
+        "missing_artifacts": []
+      }
+    ],
+    "root_cause": "postcheck command was outside the loop, so the model could not receive deterministic unittest failure feedback before success."
+  },
+  {
+    "run_id": "mvp-smoke__nextjs-space-invaders-large__minimal-loop__openai-gpt-5.4-mini__gemini-gemini-3.5-flash__r1",
+    "expected_failure_kind_before_fix": "provider_http_status",
+    "expected_failure_kind_after_fix": "provider_transient_exhausted",
+    "process": {
+      "rc": 1,
+      "stderr": "error: minimal loop reached max_iterations (12)"
+    },
+    "events": [
+      {
+        "event": "provider_error",
+        "provider": "openai",
+        "model": "gpt-5.4-mini",
+        "status": 500,
+        "error_kind": "http_status",
+        "attempt": 2,
+        "retry_exhausted": true,
+        "body_snippet": "<REDACTED>"
+      },
+      {
+        "event": "fallback_decision",
+        "from": "native_tools",
+        "to": "xml_fallback",
+        "allowed": false,
+        "reason": "OpenAI Responses API failed: 500 Internal Server Error"
+      }
+    ],
+    "root_cause": "HTTP transient provider errors were not clearly separated from tool-call parse fallback, so provider failure could be hidden by later max_iterations."
+  }
+]

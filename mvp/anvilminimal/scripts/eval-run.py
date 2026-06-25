@@ -17,7 +17,8 @@ from eval_lib.failure_classification import classify_failure, read_jsonl
 from eval_lib.matrix import expand_matrix, parse_modes
 from eval_lib.models import ModelRef, load_model_profiles
 from eval_lib.plan_scoring import score_plan_file
-from eval_lib.postcheck import run_postcheck
+from eval_lib.postcheck import is_dependency_command, run_postcheck
+from eval_lib.redaction import redact_json
 from eval_lib.process import run_capture
 from eval_lib.run_summary import calculate_overall, empty_summary_row, write_summary
 from eval_lib.suites import load_suite
@@ -78,6 +79,11 @@ def main() -> int:
         run_dir.mkdir(parents=True, exist_ok=True)
         workdir.mkdir(parents=True, exist_ok=True)
         command = actual_command(spec, workdir)
+        contract = completion_contract_for_spec(spec)
+        if contract:
+            contract_path = run_dir / "completion-contract.json"
+            write_json(contract_path, redact_json(contract))
+            command = inject_completion_contract_arg(command, contract_path)
         (run_dir / "command.txt").write_text(" ".join(json.dumps(part) for part in command) + "\n", encoding="utf-8")
         write_json(run_dir / "meta.json", scrub_spec(spec))
         if args.dry_run:
@@ -153,6 +159,62 @@ def actual_command(spec: dict, workdir: Path) -> list[str]:
     return [str(workdir) if part == "workdir" else part for part in command]
 
 
+def completion_contract_for_spec(spec: dict) -> dict | None:
+    if spec.get("mode") != "minimal-loop":
+        return None
+    scenario = spec.get("scenario", {}) or {}
+    required_paths = list(dict.fromkeys(scenario.get("expected_artifacts", []) or []))
+    commands = list(scenario.get("postcheck", {}).get("commands", []) or [])
+    has_dependency_setup = any(is_dependency_command(command) for command in commands)
+    verify_commands = [
+        command
+        for command in commands
+        if deterministic_verify_command(command, has_dependency_setup)
+    ]
+    if not required_paths and not verify_commands:
+        return None
+    return {
+        "required_paths": required_paths,
+        "verify_commands": verify_commands,
+        "verify_repair_cap": 2,
+        "source": "eval_scenario",
+    }
+
+
+def deterministic_verify_command(command: str, has_dependency_setup: bool) -> bool:
+    lowered = command.lower().strip()
+    if not lowered or is_dependency_command(command):
+        return False
+    if "&&" in lowered or "||" in lowered or "|" in lowered or ";" in lowered:
+        return False
+    if "next dev" in lowered or "vite --host" in lowered:
+        return False
+    if has_dependency_setup and (
+        lowered.startswith("npm ")
+        or lowered.startswith("pnpm ")
+        or lowered.startswith("yarn ")
+    ):
+        return False
+    return True
+
+
+def inject_completion_contract_arg(command: list[str], contract_path: Path) -> list[str]:
+    injected = ["--completion-contract-json", str(contract_path)]
+    action_flags = {
+        "--prompt",
+        "--plan-steps",
+        "--plan-run",
+        "--run-plan",
+        "--ultra-plan",
+        "--ultra-plan-run",
+        "--run-ultra-plan",
+    }
+    for index, part in enumerate(command):
+        if part in action_flags:
+            return [*command[:index], *injected, *command[index:]]
+    return [*command, *injected]
+
+
 def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeout_sec: int | None) -> tuple[dict, list[dict]]:
     row = empty_summary_row(spec)
     row["workdir"] = str(workdir)
@@ -204,6 +266,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         post = run_postcheck(spec["scenario"], workdir, run_dir / "postcheck", timeout_sec=scenario_timeout)
         events.append({"event": "postcheck_summary", "run_id": spec["run_id"], **post})
     success = result.rc == 0 and bool(post["ok"])
+    diagnostics = summarize_run_events(events, post)
     execution_score = 100.0 if success else 0.0
     time_score = 100.0
     extras = {
@@ -240,6 +303,14 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "iterations": "",
             "tool_calls": "",
             "files_changed": count_files(workdir),
+            "stop_reason": diagnostics["stop_reason"],
+            "last_blocking_reason": diagnostics["last_blocking_reason"],
+            "missing_artifacts": diagnostics["missing_artifacts"],
+            "verify_attempts": diagnostics["verify_attempts"],
+            "last_provider_error_kind": diagnostics["last_provider_error_kind"],
+            "last_provider_http_status": diagnostics["last_provider_http_status"],
+            "provider_attempts": diagnostics["provider_attempts"],
+            "fallback_decision": diagnostics["fallback_decision"],
             "plan_quality_score": plan_score if plan_score is not None else "",
             "ultra_phase_quality_score": ultra_score if ultra_score is not None else "",
             "execution_score": execution_score,
@@ -250,6 +321,73 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         }
     )
     return row, events
+
+
+def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
+    loop_stop = next((event for event in reversed(events) if event.get("event") == "loop_stop"), {})
+    completion_verify = [
+        event for event in events if event.get("event") == "completion_verify"
+    ]
+    provider_error = next(
+        (event for event in reversed(events) if event.get("event") == "provider_error"),
+        {},
+    )
+    provider_response = next(
+        (event for event in reversed(events) if event.get("event") == "provider_response"),
+        {},
+    )
+    fallback = next(
+        (event for event in reversed(events) if event.get("event") == "fallback_decision"),
+        {},
+    )
+    tool_error = next(
+        (
+            event
+            for event in reversed(events)
+            if event.get("event") == "tool_execute" and event.get("status") == "error"
+        ),
+        {},
+    )
+    missing = post.get("missing_artifacts") or loop_stop.get("missing_paths") or []
+    return {
+        "stop_reason": str(loop_stop.get("reason", "")),
+        "last_blocking_reason": str(
+            loop_stop.get(
+                "primary_reason",
+                loop_stop.get(
+                    "last_blocking_reason",
+                    tool_error_reason(tool_error),
+                ),
+            )
+        ),
+        "missing_artifacts": ",".join(str(item) for item in missing),
+        "verify_attempts": str(len(completion_verify)) if completion_verify else "",
+        "last_provider_error_kind": str(provider_error.get("error_kind", "")),
+        "last_provider_http_status": str(provider_error.get("status", "")),
+        "provider_attempts": str(
+            provider_error.get("attempt", provider_response.get("attempt", ""))
+        ),
+        "fallback_decision": fallback_decision_cell(fallback),
+    }
+
+
+def fallback_decision_cell(event: dict) -> str:
+    if not event:
+        return ""
+    allowed = event.get("allowed")
+    if allowed is True:
+        return "allowed"
+    if allowed is False:
+        return "blocked"
+    return str(allowed)
+
+
+def tool_error_reason(event: dict) -> str:
+    if not event:
+        return ""
+    name = event.get("name", "")
+    kind = event.get("error_kind", "")
+    return f"{name} {kind}".strip()
 
 
 def collect_plans(workdir: Path, run_dir: Path) -> list[Path]:

@@ -95,6 +95,7 @@ impl ChatClient for OpenAiClient {
                                     "event": "provider_response",
                                     "provider": "openai",
                                     "model": model,
+                                    "attempt": attempt + 1,
                                     "tool_calls": reply.tool_calls.len(),
                                 }),
                             );
@@ -115,7 +116,10 @@ impl ChatClient for OpenAiClient {
                         }
                     }
                 }
-                Ok(response) if attempt == self.retries => {
+                Ok(response)
+                    if attempt == self.retries
+                        || !is_retryable_status(response.status().as_u16()) =>
+                {
                     let status = response.status();
                     let body = response.text().unwrap_or_default();
                     eval_events::emit(
@@ -126,12 +130,29 @@ impl ChatClient for OpenAiClient {
                             "model": model,
                             "status": status.as_u16(),
                             "error_kind": "http_status",
+                            "attempt": attempt + 1,
+                            "retry_exhausted": attempt == self.retries,
+                            "retryable": is_retryable_status(status.as_u16()),
                             "body_snippet": eval_events::body_snippet(&body),
                         }),
                     );
                     anyhow::bail!("OpenAI Responses API failed: {}", status);
                 }
-                Ok(_) => {}
+                Ok(response) => {
+                    let status = response.status();
+                    eval_events::emit(
+                        self.eval_events_path.as_deref(),
+                        json!({
+                            "event": "provider_retry",
+                            "provider": "openai",
+                            "model": model,
+                            "status": status.as_u16(),
+                            "error_kind": "http_status",
+                            "attempt": attempt + 1,
+                            "retryable": is_retryable_status(status.as_u16()),
+                        }),
+                    );
+                }
                 Err(err) if attempt == self.retries => {
                     eval_events::emit(
                         self.eval_events_path.as_deref(),
@@ -140,16 +161,34 @@ impl ChatClient for OpenAiClient {
                             "provider": "openai",
                             "model": model,
                             "error_kind": "network",
+                            "attempt": attempt + 1,
+                            "retry_exhausted": true,
                             "message": eval_events::body_snippet(&err.to_string()),
                         }),
                     );
                     return Err(err.into());
                 }
-                Err(_) => {}
+                Err(err) => {
+                    eval_events::emit(
+                        self.eval_events_path.as_deref(),
+                        json!({
+                            "event": "provider_retry",
+                            "provider": "openai",
+                            "model": model,
+                            "error_kind": "network",
+                            "attempt": attempt + 1,
+                            "message": eval_events::body_snippet(&err.to_string()),
+                        }),
+                    );
+                }
             }
         }
         unreachable!("retry loop always returns or bails")
     }
+}
+
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
 }
 
 pub fn build_response_request(

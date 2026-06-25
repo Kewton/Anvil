@@ -18,6 +18,7 @@ fn config(root: PathBuf) -> Config {
         workspace_root: root.clone(),
         state_dir: root.join("state"),
         eval_events_path: None,
+        completion_contract_path: None,
         yes: true,
         offline: false,
         context_budget: 1000,

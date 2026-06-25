@@ -19,6 +19,7 @@ use crate::tui::status::UiStatus;
 use crate::tui::{InteractionUi, NOOP_UI};
 
 use super::compact::compact_if_needed;
+use super::completion::{CompletionContract, format_verify_feedback};
 use super::import_scan::{format_missing_import_feedback, scan_relative_imports};
 use super::prompt::{ToolPromptMode, build_request_messages};
 
@@ -26,6 +27,7 @@ use super::prompt::{ToolPromptMode, build_request_messages};
 pub enum RunStopReason {
     AssistantFinal,
     RequiredArtifactsSatisfiedAfterTool,
+    CompletionContractSatisfied,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +37,10 @@ pub struct RunSessionOutcome {
     pub changed_paths: Vec<String>,
     pub iterations: usize,
     pub tool_calls: usize,
+    pub missing_required_paths: Vec<String>,
+    pub verify_attempts: usize,
+    pub last_blocking_reason: Option<String>,
+    pub last_provider_error: Option<String>,
 }
 
 pub fn run_session(
@@ -88,10 +94,21 @@ pub fn run_session_with_outcome_with_ui(
     let registry = ToolRegistry::default();
     let mut native_tools_enabled =
         client.supports_native_tools(&config.model) && !session.native_tools_disabled;
-    let required_paths =
-        effective_required_paths(&config.workspace_root, required_paths, user_prompt);
+    let completion_contract = CompletionContract::load_for_config(config)?;
+    let required_paths = effective_required_paths(
+        &config.workspace_root,
+        required_paths,
+        user_prompt,
+        completion_contract
+            .as_ref()
+            .map(|contract| contract.required_paths.as_slice())
+            .unwrap_or(&[]),
+    );
     let initially_missing_paths = missing_paths(&config.workspace_root, &required_paths);
     let mut pending_feedback: Option<String> = None;
+    let mut verify_attempts = 0usize;
+    let mut last_blocking_reason: Option<String> = None;
+    let last_provider_error: Option<String> = None;
     let mut write_or_edit_seen = false;
     let mut no_tool_feedbacks = 0usize;
     let mut empty_feedbacks = 0usize;
@@ -138,13 +155,42 @@ pub fn run_session_with_outcome_with_ui(
                 pending_feedback = None;
                 reply
             }
-            Err(err) if native_tools_enabled && client.allows_xml_fallback() => {
+            Err(err)
+                if native_tools_enabled
+                    && client.allows_xml_fallback()
+                    && provider_error_allows_xml_fallback(&err) =>
+            {
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "fallback_decision",
+                        "from": "native_tools",
+                        "to": "xml_fallback",
+                        "allowed": true,
+                        "reason": eval_events::body_snippet(&err.to_string()),
+                    }),
+                );
                 native_tools_enabled = false;
                 session.native_tools_disabled = true;
                 pending_feedback = Some(super::feedback::malformed_tool_call(&err.to_string()));
                 continue;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                let message = err.to_string();
+                if native_tools_enabled && client.allows_xml_fallback() {
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "fallback_decision",
+                            "from": "native_tools",
+                            "to": "xml_fallback",
+                            "allowed": false,
+                            "reason": eval_events::body_snippet(&message),
+                        }),
+                    );
+                }
+                return Err(err);
+            }
         };
         ui.publish_status(UiStatus::for_model_reply(
             config,
@@ -166,12 +212,15 @@ pub fn run_session_with_outcome_with_ui(
             let missing = missing_paths(&config.workspace_root, &required_paths);
             if !missing.is_empty() {
                 session.messages.pop();
+                last_blocking_reason =
+                    Some(format!("missing required paths: {}", missing.join(", ")));
                 pending_feedback = Some(super::feedback::missing_artifacts(&missing));
                 continue;
             }
             if reply.content.trim().is_empty() && empty_feedbacks < 1 {
                 empty_feedbacks += 1;
                 session.messages.pop();
+                last_blocking_reason = Some("empty assistant response".to_string());
                 pending_feedback = Some(super::feedback::empty_response());
                 continue;
             }
@@ -179,6 +228,7 @@ pub fn run_session_with_outcome_with_ui(
                 if no_tool_feedbacks < 1 {
                     no_tool_feedbacks += 1;
                     session.messages.pop();
+                    last_blocking_reason = Some("completion without write".to_string());
                     pending_feedback = Some(super::feedback::completion_without_write());
                     continue;
                 }
@@ -191,6 +241,7 @@ pub fn run_session_with_outcome_with_ui(
             {
                 no_tool_feedbacks += 1;
                 session.messages.pop();
+                last_blocking_reason = Some("progress text without tool call".to_string());
                 pending_feedback = Some(super::feedback::no_tool_progress());
                 continue;
             }
@@ -200,8 +251,52 @@ pub fn run_session_with_outcome_with_ui(
                 scan_relative_imports(&config.workspace_root, &import_scan_paths)?;
             if !missing_imports.is_empty() {
                 session.messages.pop();
+                last_blocking_reason = Some("missing relative imports".to_string());
                 pending_feedback = Some(format_missing_import_feedback(&missing_imports));
                 continue;
+            }
+            if let Some(contract) = completion_contract
+                .as_ref()
+                .filter(|contract| contract.has_verify())
+            {
+                match verify_completion_contract(
+                    &config.workspace_root,
+                    config.eval_events_path.as_deref(),
+                    contract,
+                    &mut verify_attempts,
+                ) {
+                    Ok(None) => {
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "loop_stop",
+                                "reason": "completion_contract_satisfied",
+                                "required_paths": required_paths,
+                                "verify_attempts": verify_attempts,
+                            }),
+                        );
+                        return Ok(RunSessionOutcome {
+                            final_text: reply.content,
+                            stop_reason: RunStopReason::CompletionContractSatisfied,
+                            changed_paths,
+                            iterations: iteration + 1,
+                            tool_calls: tool_call_count,
+                            missing_required_paths: Vec::new(),
+                            verify_attempts,
+                            last_blocking_reason,
+                            last_provider_error,
+                        });
+                    }
+                    Ok(Some(feedback)) => {
+                        session.messages.pop();
+                        last_blocking_reason = Some("completion verify failed".to_string());
+                        pending_feedback = Some(feedback);
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err);
+                    }
+                }
             }
             return Ok(RunSessionOutcome {
                 final_text: reply.content,
@@ -209,6 +304,10 @@ pub fn run_session_with_outcome_with_ui(
                 changed_paths,
                 iterations: iteration + 1,
                 tool_calls: tool_call_count,
+                missing_required_paths: Vec::new(),
+                verify_attempts,
+                last_blocking_reason,
+                last_provider_error,
             });
         }
 
@@ -300,6 +399,51 @@ pub fn run_session_with_outcome_with_ui(
             &initially_missing_paths,
             write_or_edit_seen,
         ) {
+            if let Some(contract) = completion_contract
+                .as_ref()
+                .filter(|contract| contract.has_verify())
+            {
+                match verify_completion_contract(
+                    &config.workspace_root,
+                    config.eval_events_path.as_deref(),
+                    contract,
+                    &mut verify_attempts,
+                ) {
+                    Ok(None) => {
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "loop_stop",
+                                "reason": "completion_contract_satisfied",
+                                "required_paths": required_paths,
+                                "verify_attempts": verify_attempts,
+                            }),
+                        );
+                        return Ok(RunSessionOutcome {
+                            final_text: format!(
+                                "completion contract satisfied: {}",
+                                required_paths.join(", ")
+                            ),
+                            stop_reason: RunStopReason::CompletionContractSatisfied,
+                            changed_paths,
+                            iterations: iteration + 1,
+                            tool_calls: tool_call_count,
+                            missing_required_paths: Vec::new(),
+                            verify_attempts,
+                            last_blocking_reason,
+                            last_provider_error,
+                        });
+                    }
+                    Ok(Some(feedback)) => {
+                        last_blocking_reason = Some("completion verify failed".to_string());
+                        pending_feedback = Some(feedback);
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err);
+                    }
+                }
+            }
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
@@ -317,9 +461,30 @@ pub fn run_session_with_outcome_with_ui(
                 changed_paths,
                 iterations: iteration + 1,
                 tool_calls: tool_call_count,
+                missing_required_paths: Vec::new(),
+                verify_attempts,
+                last_blocking_reason,
+                last_provider_error,
             });
         }
     }
+    let missing = missing_paths(&config.workspace_root, &required_paths);
+    let reason = if missing.is_empty() {
+        "max_iterations"
+    } else {
+        "required_artifacts_missing"
+    };
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "loop_stop",
+            "reason": reason,
+            "missing_paths": missing,
+            "verify_attempts": verify_attempts,
+            "last_blocking_reason": last_blocking_reason,
+            "last_provider_error": last_provider_error.as_deref().map(eval_events::body_snippet),
+        }),
+    );
     bail!(
         "minimal loop reached max_iterations ({})",
         config.max_iterations
@@ -334,19 +499,86 @@ fn missing_paths(root: &std::path::Path, required_paths: &[String]) -> Vec<Strin
         .collect()
 }
 
-fn effective_required_paths(root: &Path, explicit: &[String], prompt: &str) -> Vec<String> {
+fn effective_required_paths(
+    root: &Path,
+    explicit: &[String],
+    prompt: &str,
+    contract_paths: &[String],
+) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for path in explicit
         .iter()
         .cloned()
         .chain(extract_requested_artifact_paths(root, prompt))
+        .chain(contract_paths.iter().cloned())
     {
         if seen.insert(path.clone()) {
             out.push(path);
         }
     }
     out
+}
+
+fn verify_completion_contract(
+    root: &Path,
+    eval_events_path: Option<&Path>,
+    contract: &CompletionContract,
+    verify_attempts: &mut usize,
+) -> anyhow::Result<Option<String>> {
+    *verify_attempts += 1;
+    let report = contract.verify(root);
+    let ok = report.is_pass();
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "completion_verify",
+            "ok": ok,
+            "attempt": *verify_attempts,
+            "repair_cap": contract.verify_repair_cap,
+            "missing_paths": report.missing_paths.clone(),
+            "command_failures": report.command_failures.len(),
+            "dependency_missing": report.dependency_missing.clone(),
+            "primary_reason": eval_events::body_snippet(&report.primary_reason()),
+        }),
+    );
+    if ok {
+        return Ok(None);
+    }
+    if *verify_attempts >= contract.verify_repair_cap {
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "loop_stop",
+                "reason": "verify_repair_exhausted",
+                "verify_attempts": *verify_attempts,
+                "primary_reason": eval_events::body_snippet(&report.primary_reason()),
+            }),
+        );
+        bail!(
+            "completion contract verify failed after {} attempts: {}",
+            *verify_attempts,
+            report.primary_reason()
+        );
+    }
+    Ok(Some(format_verify_feedback(&report)))
+}
+
+fn provider_error_allows_xml_fallback(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    if lower.contains(" api failed:")
+        || lower.contains("http")
+        || lower.contains("status")
+        || lower.contains("network")
+        || lower.contains("timeout")
+    {
+        return false;
+    }
+    lower.contains("function_call")
+        || lower.contains("tool call")
+        || lower.contains("tool_call")
+        || lower.contains("provider parse")
+        || lower.contains("parse")
 }
 
 pub(crate) fn extract_requested_artifact_paths(root: &Path, prompt: &str) -> Vec<String> {
@@ -588,6 +820,7 @@ mod tests {
             chat_timeout_secs: 1,
             chat_retries: 1,
             eval_events_path: None,
+            completion_contract_path: None,
             resume: None,
             fresh_session: false,
             no_footer: false,
@@ -628,6 +861,139 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "ok"
         );
+    }
+
+    #[test]
+    fn completion_contract_without_verify_preserves_early_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.txt"],"verify_commands":[]}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create the file",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+    }
+
+    #[test]
+    fn minimal_loop_repairs_after_completion_verify_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.py"],"verify_commands":["python3 -m py_compile a.py"],"verify_repair_cap":2}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.py","content":"def fixed():\n    return 1\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a.py",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::CompletionContractSatisfied
+        );
+        assert_eq!(outcome.verify_attempts, 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.py")).unwrap(),
+            "def fixed():\n    return 1\n"
+        );
+        assert!(!session.messages.iter().any(|message| {
+            message
+                .content
+                .contains("Deterministic completion verification failed")
+        }));
+    }
+
+    #[test]
+    fn minimal_loop_stops_with_verify_repair_exhausted_after_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.py"],"verify_commands":["python3 -m py_compile a.py"],"verify_repair_cap":1}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a.py",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("completion contract verify failed"));
     }
 
     #[test]
@@ -872,6 +1238,16 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("missing tool call for action prompt"));
+    }
+
+    #[test]
+    fn provider_http_error_does_not_enable_xml_fallback() {
+        assert!(!provider_error_allows_xml_fallback(&anyhow::anyhow!(
+            "OpenAI Responses API failed: 500 Internal Server Error"
+        )));
+        assert!(provider_error_allows_xml_fallback(&anyhow::anyhow!(
+            "OpenAI function_call arguments are not valid JSON"
+        )));
     }
 
     #[test]

@@ -30,6 +30,14 @@ SUMMARY_HEADER = [
     "iterations",
     "tool_calls",
     "files_changed",
+    "stop_reason",
+    "last_blocking_reason",
+    "missing_artifacts",
+    "verify_attempts",
+    "last_provider_error_kind",
+    "last_provider_http_status",
+    "provider_attempts",
+    "fallback_decision",
     "plan_quality_score",
     "ultra_phase_quality_score",
     "execution_score",
@@ -67,6 +75,14 @@ def empty_summary_row(spec: dict[str, Any]) -> dict[str, Any]:
         "iterations": "",
         "tool_calls": "",
         "files_changed": "",
+        "stop_reason": "",
+        "last_blocking_reason": "",
+        "missing_artifacts": "",
+        "verify_attempts": "",
+        "last_provider_error_kind": "",
+        "last_provider_http_status": "",
+        "provider_attempts": "",
+        "fallback_decision": "",
         "plan_quality_score": "",
         "ultra_phase_quality_score": "",
         "execution_score": "",
@@ -117,4 +133,3 @@ def calculate_overall(mode: str, plan_score: float | None, ultra_score: float | 
     if mode == "ultra-step-run":
         return round(0.45 * (plan_score or 0) + 0.45 * execution_score + 0.10 * time_score, 1)
     return execution_score
-

@@ -112,6 +112,7 @@ mod tests {
             workspace_root: std::path::PathBuf::from("/tmp/anvilminimal"),
             state_dir: std::path::PathBuf::from("state"),
             eval_events_path: None,
+            completion_contract_path: None,
             yes: true,
             offline: false,
             context_budget: 65536,

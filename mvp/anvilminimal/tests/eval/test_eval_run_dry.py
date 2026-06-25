@@ -56,6 +56,50 @@ class EvalRunDryTest(unittest.TestCase):
         self.assertIn("- package.json", prompt)
         self.assertIn("- src/app/page.tsx", prompt)
 
+    def test_completion_contract_for_minimal_loop_splits_verify_from_setup(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import importlib.util
+
+        module_path = ROOT / "scripts/eval-run.py"
+        spec = importlib.util.spec_from_file_location("eval_run", module_path)
+        eval_run = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(eval_run)
+
+        contract = eval_run.completion_contract_for_spec(
+            {
+                "mode": "minimal-loop",
+                "scenario": {
+                    "expected_artifacts": ["package.json", "src/app/page.tsx"],
+                    "postcheck": {
+                        "commands": [
+                            "npm install --ignore-scripts",
+                            "npm run build",
+                            "python3 -m unittest test_app.py",
+                        ]
+                    },
+                },
+            }
+        )
+        self.assertEqual(contract["required_paths"], ["package.json", "src/app/page.tsx"])
+        self.assertEqual(contract["verify_commands"], ["python3 -m unittest test_app.py"])
+
+    def test_completion_contract_arg_is_inserted_before_prompt(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import importlib.util
+
+        module_path = ROOT / "scripts/eval-run.py"
+        spec = importlib.util.spec_from_file_location("eval_run", module_path)
+        eval_run = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(eval_run)
+
+        command = eval_run.inject_completion_contract_arg(
+            ["anvilminimal", "--yes", "--prompt", "do it"],
+            Path("/tmp/contract.json"),
+        )
+        self.assertLess(command.index("--completion-contract-json"), command.index("--prompt"))
+
 
 if __name__ == "__main__":
     unittest.main()

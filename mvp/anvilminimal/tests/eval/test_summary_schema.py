@@ -44,6 +44,8 @@ class SummarySchemaTest(unittest.TestCase):
                     "main_provider": "openai",
                     "success": "false",
                     "rc": "1",
+                    "stop_reason": "verify_repair_exhausted",
+                    "last_blocking_reason": "command failed",
                     "extras_json": {"failure_kind": "tool_validation_error"},
                 }
             )
@@ -51,6 +53,8 @@ class SummarySchemaTest(unittest.TestCase):
             report = generate_report(run_root)
             self.assertIn("blocking: all required runs failed", report)
             self.assertIn("| tool_validation_error | 1 |", report)
+            self.assertIn("verify_repair_exhausted", report)
+            self.assertIn("command failed", report)
 
 
 if __name__ == "__main__":

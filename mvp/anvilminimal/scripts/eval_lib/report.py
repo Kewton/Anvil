@@ -17,6 +17,7 @@ def generate_report(run_root: Path) -> str:
     lines.extend(section_table("Model Profile Summary", aggregate(rows, "main_provider")))
     lines.extend(plan_rankings(rows))
     lines.extend(blocking_summary(rows))
+    lines.extend(stop_reason_summary(rows))
     lines.extend(failure_summary(rows))
     return "\n".join(lines) + "\n"
 
@@ -97,11 +98,45 @@ def failure_summary(rows: list[dict[str, str]]) -> list[str]:
     return lines
 
 
+def stop_reason_summary(rows: list[dict[str, str]]) -> list[str]:
+    detail_rows = []
+    for row in rows:
+        if row.get("success") == "true":
+            continue
+        extras = parse_extras(row)
+        detail_rows.append(
+            {
+                "scenario": row.get("scenario", ""),
+                "mode": row.get("mode", ""),
+                "failure_kind": str(extras.get("failure_kind", "")),
+                "stop_reason": row.get("stop_reason", ""),
+                "blocking": row.get("last_blocking_reason", ""),
+                "provider": row.get("last_provider_error_kind", ""),
+                "status": row.get("last_provider_http_status", ""),
+            }
+        )
+    lines = ["## Stop Reasons", ""]
+    if not detail_rows:
+        return lines + ["No failed rows.", ""]
+    return lines + table_rows(
+        detail_rows,
+        ["scenario", "mode", "failure_kind", "stop_reason", "blocking", "provider", "status"],
+    )
+
+
 def blocking_summary(rows: list[dict[str, str]]) -> list[str]:
     required = [row for row in rows if row.get("success") != "diagnostic_skipped"]
     if required and all(row.get("success") != "true" for row in required):
         return ["## Blocking", "", "blocking: all required runs failed", ""]
     return []
+
+
+def table_rows(rows: list[dict[str, str]], headers: list[str]) -> list[str]:
+    lines = ["| " + " | ".join(headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
+    for row in rows:
+        lines.append("| " + " | ".join(str(row.get(header, "")) for header in headers) + " |")
+    lines.append("")
+    return lines
 
 
 def parse_extras(row: dict[str, str]) -> dict[str, object]:

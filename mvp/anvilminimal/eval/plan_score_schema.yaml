@@ -22,6 +22,14 @@ summary_eval_tsv_header:
   - iterations
   - tool_calls
   - files_changed
+  - stop_reason
+  - last_blocking_reason
+  - missing_artifacts
+  - verify_attempts
+  - last_provider_error_kind
+  - last_provider_http_status
+  - provider_attempts
+  - fallback_decision
   - plan_quality_score
   - ultra_phase_quality_score
   - execution_score
