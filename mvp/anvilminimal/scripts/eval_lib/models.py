@@ -91,6 +91,7 @@ def load_model_profiles(path: str | Path) -> tuple[dict[str, Any], list[dict[str
             "serial": bool(profile.get("serial")),
             "parallel": bool(profile.get("parallel", not profile.get("serial"))),
             "provider_limit": int(profile.get("provider_limit", 2)),
+            "chat_retries": int(profile.get("chat_retries", 1)),
             "runs": runs,
         }
     return normalized, warnings

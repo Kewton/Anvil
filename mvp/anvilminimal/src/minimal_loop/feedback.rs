@@ -24,3 +24,20 @@ pub fn completion_without_write() -> String {
 pub fn malformed_tool_call(error: &str) -> String {
     format!("The previous tool call was malformed: {error}. Retry with a valid tool call.")
 }
+
+pub fn artifact_stagnation(paths: &[String], attempt: usize, attempt_limit: usize) -> String {
+    format!(
+        "Required artifact creation is stalled. Missing required artifact(s): {}.\nEmit exactly one Write or Edit tool call now for one of those paths. Do not inspect the workspace again and do not answer in prose until a required artifact is created. artifact_recovery_attempt={attempt}/{attempt_limit}",
+        paths.join(", ")
+    )
+}
+
+pub fn verify_repair_edit_required(
+    signature: &str,
+    attempt: usize,
+    attempt_limit: usize,
+) -> String {
+    format!(
+        "Deterministic verification is still failing with the same signature: {signature}. Do not rerun verification and do not answer in prose. Make a concrete Write or Edit change to the failing implementation, test, or setup file before verification is retried. verify_repair_edit_attempt={attempt}/{attempt_limit}"
+    )
+}

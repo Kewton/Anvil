@@ -41,6 +41,7 @@ class EvalRunDryTest(unittest.TestCase):
             self.assertIn("--prompt", commands)
             self.assertIn("--plan-steps", commands)
             self.assertIn("Required final artifacts:", commands)
+            self.assertIn('"--chat-retries" "2"', commands)
 
     def test_expected_artifacts_can_be_rendered_as_required_final_artifacts(self):
         sys.path.insert(0, str(ROOT / "scripts"))
@@ -99,6 +100,42 @@ class EvalRunDryTest(unittest.TestCase):
             Path("/tmp/contract.json"),
         )
         self.assertLess(command.index("--completion-contract-json"), command.index("--prompt"))
+
+    def test_speed_cloud_profile_sets_chat_retries_without_cli_default_change(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from eval_lib.models import load_model_profiles
+        from eval_lib.matrix import render_command
+
+        profiles, _ = load_model_profiles(ROOT / "eval/model_profiles.yaml")
+        self.assertEqual(profiles["speed-cloud"]["chat_retries"], 2)
+        command = render_command(
+            binary="anvilminimal",
+            mode="minimal-loop",
+            scenario={"prompt": "do it"},
+            main=profiles["speed-cloud"]["runs"][0]["main"],
+            planner=profiles["speed-cloud"]["runs"][0]["planner"],
+            context_budget=65536,
+            workdir=Path("workdir"),
+            chat_retries=profiles["speed-cloud"]["chat_retries"],
+        )
+        self.assertIn("--chat-retries", command)
+        self.assertEqual(command[command.index("--chat-retries") + 1], "2")
+
+    def test_postcheck_oracle_defaults_to_fixed(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from eval_lib.postcheck import run_postcheck
+
+        with tempfile.TemporaryDirectory() as td:
+            workdir = Path(td) / "work"
+            out = Path(td) / "out"
+            workdir.mkdir()
+            result = run_postcheck(
+                {"expected_artifacts": [], "postcheck": {"commands": []}},
+                workdir,
+                out,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["oracle_kind"], "fixed")
 
 
 if __name__ == "__main__":

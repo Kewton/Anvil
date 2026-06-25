@@ -61,6 +61,7 @@ def expand_matrix(
                         "local_llm_used": bool(model_pair["local_llm_used"]),
                         "port_mutex": scenario_port_mutex(scenario),
                         "provider_limits": profile.get("provider_limit", 2),
+                        "chat_retries": int(profile.get("chat_retries", 1)),
                     }
                     row["command"] = render_command(
                         binary=binary,
@@ -70,6 +71,7 @@ def expand_matrix(
                         planner=planner,
                         context_budget=context_budget,
                         workdir=Path("workdir"),
+                        chat_retries=row["chat_retries"],
                     )
                     row["command_text"] = shlex.join(row["command"])
                     rows.append(row)
@@ -93,12 +95,15 @@ def render_command(
     planner: ModelRef,
     context_budget: int,
     workdir: Path,
+    chat_retries: int = 1,
 ) -> list[str]:
     base = [
         binary,
         "--yes",
         "--context-budget",
         str(context_budget),
+        "--chat-retries",
+        str(chat_retries),
         *cli_model_args(main, planner),
         "--cwd",
         str(workdir),

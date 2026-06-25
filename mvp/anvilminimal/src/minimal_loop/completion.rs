@@ -67,6 +67,12 @@ impl CompletionContract {
         !self.verify_commands.is_empty()
     }
 
+    pub fn dependency_precondition_active(&self, root: &Path) -> bool {
+        self.verify_commands.iter().any(|command| {
+            requires_next_binary(command) && !root.join("node_modules/.bin/next").is_file()
+        })
+    }
+
     pub fn verify(&self, root: &Path) -> VerificationReport {
         let mut report = VerificationReport::pass();
         for path in &self.required_paths {
@@ -87,6 +93,8 @@ impl CompletionContract {
                 Ok(output) => {
                     if command.contains("npm") && output.contains("0 tests") {
                         report.push_command_failure(command.clone(), "Node 0 tests rejected");
+                    } else if let Some(reason) = classify_python_test_discovery_failure(&output) {
+                        report.push_command_failure(command.clone(), reason);
                     }
                 }
                 Err(err)
@@ -95,7 +103,14 @@ impl CompletionContract {
                 {
                     report.push_dependency_missing(command.clone());
                 }
-                Err(err) => report.push_command_failure(command.clone(), err.to_string()),
+                Err(err) => {
+                    let reason = err.to_string();
+                    if let Some(reason) = classify_python_test_discovery_failure(&reason) {
+                        report.push_command_failure(command.clone(), reason);
+                    } else {
+                        report.push_command_failure(command.clone(), reason);
+                    }
+                }
             }
         }
         report
@@ -200,6 +215,15 @@ fn requires_next_binary(command: &str) -> bool {
         || lower.starts_with("yarn build ")
 }
 
+fn classify_python_test_discovery_failure(output: &str) -> Option<String> {
+    let lower = output.to_ascii_lowercase();
+    if lower.contains("no tests ran") || lower.contains("ran 0 tests") {
+        Some("test_discovery_failure:no_tests_ran".to_string())
+    } else {
+        None
+    }
+}
+
 fn default_verify_repair_cap() -> usize {
     2
 }
@@ -289,5 +313,41 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains(".env"));
+    }
+
+    #[test]
+    fn python_no_tests_ran_is_test_discovery_failure() {
+        assert_eq!(
+            classify_python_test_discovery_failure("Ran 0 tests in 0.000s\n\nOK").as_deref(),
+            Some("test_discovery_failure:no_tests_ran")
+        );
+        assert_eq!(
+            classify_python_test_discovery_failure("NO TESTS RAN").as_deref(),
+            Some("test_discovery_failure:no_tests_ran")
+        );
+    }
+
+    #[test]
+    fn unittest_zero_tests_is_not_verify_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("test_repair_report.py"),
+            "def test_free():\n    pass\n",
+        )
+        .unwrap();
+        let report = CompletionContract {
+            required_paths: vec!["test_repair_report.py".to_string()],
+            verify_commands: vec!["python3 -m unittest test_repair_report.py".to_string()],
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap()
+        .verify(dir.path());
+        assert!(!report.is_pass());
+        assert!(
+            report
+                .primary_reason()
+                .contains("test_discovery_failure:no_tests_ran")
+        );
     }
 }

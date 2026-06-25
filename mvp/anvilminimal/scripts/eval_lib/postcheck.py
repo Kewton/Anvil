@@ -46,6 +46,7 @@ def run_postcheck(
             ok = False
             missing.append(artifact)
     postcheck = scenario.get("postcheck", {}) or {}
+    oracle_kind = postcheck.get("oracle_kind", "fixed")
     for index, command in enumerate(postcheck.get("commands", []) or []):
         is_dependency = is_dependency_command(command)
         result = run_capture(
@@ -83,6 +84,7 @@ def run_postcheck(
         "postcheck_elapsed_sec": round(postcheck_elapsed, 3),
         "dependency_elapsed_sec": round(dependency_elapsed, 3),
         "events_path": str(events_path),
+        "oracle_kind": oracle_kind,
     }
 
 
@@ -152,4 +154,3 @@ def load_postcheck_events(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-

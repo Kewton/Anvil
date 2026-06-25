@@ -25,7 +25,13 @@ KNOWN_FAILURE_KINDS = {
     "tool_execution_error",
     "tool_validation_error",
     "unclassified_process_failure",
+    "artifact_recovery_exhausted",
+    "test_discovery_failure",
+    "verify_repair_no_change",
     "verify_repair_exhausted",
+    "verify_repair_progress_invalid",
+    "verify_repair_progress_regressed",
+    "verify_repair_progress_unchanged",
     "verify_command_policy_error",
 }
 
@@ -63,6 +69,27 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "planner_provider": event.get("planner_provider", ""),
                 "planner_model": event.get("planner_model", ""),
                 "planner_repair_attempts": event.get("repair_attempt", ""),
+            }
+        if name == "loop_stop" and event.get("reason") == "artifact_recovery_exhausted":
+            return {
+                "failure_kind": "artifact_recovery_exhausted",
+                "last_loop_stop": "artifact_recovery_exhausted",
+            }
+        if name == "loop_stop" and event.get("reason") == "verify_repair_no_change":
+            return {
+                "failure_kind": "verify_repair_no_change",
+                "last_loop_stop": "verify_repair_no_change",
+            }
+        if name == "loop_stop" and event.get("reason") == "test_discovery_failure":
+            return {
+                "failure_kind": "test_discovery_failure",
+                "last_loop_stop": "test_discovery_failure",
+            }
+        if name == "loop_stop" and str(event.get("reason", "")).startswith("verify_repair_progress_"):
+            return {
+                "failure_kind": event.get("reason", "verify_repair_exhausted"),
+                "last_loop_stop": event.get("reason", ""),
+                "repair_progress": event.get("repair_progress", ""),
             }
         if name == "loop_stop" and event.get("reason") == "verify_repair_exhausted":
             return {
@@ -135,6 +162,12 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
         return {"failure_kind": "path_confinement_error"}
     if "minimal loop reached max_iterations" in lower:
         return {"failure_kind": "max_iterations"}
+    if "artifact recovery exhausted" in lower:
+        return {"failure_kind": "artifact_recovery_exhausted"}
+    if "verify repair made no file changes" in lower:
+        return {"failure_kind": "verify_repair_no_change"}
+    if "test_discovery_failure" in lower or "no tests ran" in lower or "ran 0 tests" in lower:
+        return {"failure_kind": "test_discovery_failure"}
     if "completion contract verify failed" in lower:
         return {"failure_kind": "verify_repair_exhausted"}
     if "missing tool call for action prompt" in lower:

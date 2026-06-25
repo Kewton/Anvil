@@ -51,6 +51,16 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
                 self.assertEqual(classified["failure_kind"], entry["expected_failure_kind"])
                 self.assertTrue(known_failure_kind(classified["failure_kind"]))
 
+    def test_minimal_loop_004_fixture_is_classified(self):
+        fixture = ROOT / "tests/eval/fixtures/minimal_loop_004/failure_events.json"
+        entries = json.loads(fixture.read_text(encoding="utf-8"))
+        self.assertEqual(len(entries), 5)
+        for entry in entries:
+            with self.subTest(entry["id"]):
+                classified = classify_events(entry["events"])
+                self.assertEqual(classified["failure_kind"], entry["expected_failure_kind"])
+                self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
     def test_planner_error_event_wins_over_stderr(self):
         classified = classify_events(
             [
@@ -140,6 +150,62 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
         )
         self.assertEqual(classified["failure_kind"], "verify_repair_exhausted")
         self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+    def test_classifies_artifact_recovery_exhausted_from_events(self):
+        classified = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "artifact_recovery_exhausted",
+                    "missing_paths": ["date-helper.js"],
+                }
+            ]
+        )
+        self.assertEqual(classified["failure_kind"], "artifact_recovery_exhausted")
+        self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+    def test_classifies_verify_repair_no_change_from_events(self):
+        classified = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "verify_repair_no_change",
+                    "failure_signature": "commands=assertion_failure",
+                }
+            ]
+        )
+        self.assertEqual(classified["failure_kind"], "verify_repair_no_change")
+        self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+    def test_classifies_repair_progress_from_events(self):
+        classified = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "verify_repair_progress_unchanged",
+                    "repair_progress": "unchanged",
+                }
+            ]
+        )
+        self.assertEqual(classified["failure_kind"], "verify_repair_progress_unchanged")
+        self.assertEqual(classified["repair_progress"], "unchanged")
+        self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+    def test_classifies_test_discovery_failure(self):
+        classified = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "test_discovery_failure",
+                    "primary_reason": "test_discovery_failure:no_tests_ran",
+                }
+            ]
+        )
+        self.assertEqual(classified["failure_kind"], "test_discovery_failure")
+        self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+        stderr = classify_stderr("error: completion contract verify failed: NO TESTS RAN", rc=1)
+        self.assertEqual(stderr["failure_kind"], "test_discovery_failure")
 
     def test_classifies_provider_transient_exhausted(self):
         classified = classify_events(

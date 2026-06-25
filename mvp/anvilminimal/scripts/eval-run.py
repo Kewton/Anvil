@@ -273,22 +273,32 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         "timeout": result.timeout,
         "metric_source": "events+process" if child_events else "process",
         "elapsed_total_sec": round(time.monotonic() - start, 3),
+        "oracle_kind": post.get("oracle_kind", ""),
     }
     if not success:
         stderr = (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace")
-        extras.update(
-            {
-                key: value
-                for key, value in classify_failure(
-                    events=events,
-                    stderr=stderr,
-                    rc=result.rc,
-                    timeout=result.timeout,
-                    post_ok=bool(post["ok"]),
-                ).items()
-                if value not in {"", None}
-            }
-        )
+        failure = {
+            key: value
+            for key, value in classify_failure(
+                events=events,
+                stderr=stderr,
+                rc=result.rc,
+                timeout=result.timeout,
+                post_ok=bool(post["ok"]),
+            ).items()
+            if value not in {"", None}
+        }
+        if failure.get("failure_kind") == "provider_transient_exhausted":
+            failure["agent_capability_failure"] = False
+        elif failure.get("failure_kind"):
+            failure["agent_capability_failure"] = True
+        extras.update(failure)
+    if diagnostics["repair_progress"]:
+        extras["repair_progress"] = diagnostics["repair_progress"]
+    if diagnostics["provider_transient_excluded_from_agent_capability"]:
+        extras["provider_transient_excluded_from_agent_capability"] = diagnostics[
+            "provider_transient_excluded_from_agent_capability"
+        ]
     row.update(
         {
             "rc": result.rc,
@@ -336,6 +346,10 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
     completion_verify = [
         event for event in events if event.get("event") == "completion_verify"
     ]
+    repair_progress = next(
+        (event for event in reversed(events) if event.get("event") == "verify_repair_progress"),
+        {},
+    )
     provider_error = next(
         (event for event in reversed(events) if event.get("event") == "provider_error"),
         {},
@@ -364,6 +378,10 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
         {},
     )
     missing = post.get("missing_artifacts") or loop_stop.get("missing_paths") or []
+    provider_transient = (
+        provider_error.get("status") in {429, 500, 502, 503, 504}
+        or provider_error.get("error_kind") in {"network", "timeout"}
+    )
     return {
         "stop_reason": str(loop_stop.get("reason", "")),
         "last_blocking_reason": str(
@@ -383,6 +401,10 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
             provider_error.get("attempt", provider_response.get("attempt", ""))
         ),
         "fallback_decision": fallback_decision_cell(fallback),
+        "repair_progress": str(repair_progress.get("verdict", "")),
+        "provider_transient_excluded_from_agent_capability": str(provider_transient).lower()
+        if provider_transient
+        else "",
         "planner_stage": str(planner_error.get("planner_stage", "")),
         "planner_error_kind": str(planner_error.get("planner_error_kind", "")),
         "planner_error_count": str(len(planner_errors)) if planner_errors else "",
