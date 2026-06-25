@@ -82,6 +82,15 @@ def normalize_scenario(raw: dict[str, Any]) -> dict[str, Any]:
     return scenario
 
 
+def prompt_with_required_final_artifacts(scenario: dict[str, Any]) -> str:
+    prompt = scenario["prompt"]
+    artifacts = [str(path) for path in scenario.get("expected_artifacts", []) or []]
+    if not artifacts or "Required final artifacts:" in prompt:
+        return prompt
+    block = "\n".join(f"- {path}" for path in artifacts)
+    return f"{prompt}\n\nRequired final artifacts:\n{block}"
+
+
 def infer_size(sid: str) -> str:
     sid = sid.lower()
     if "large" in sid or "multi" in sid or "long" in sid or "nextjs" in sid:
@@ -102,4 +111,3 @@ def infer_category(sid: str) -> str:
     if sid.startswith("new") or "scaffold" in sid or "copy" in sid:
         return "new-code"
     return "fix-code"
-

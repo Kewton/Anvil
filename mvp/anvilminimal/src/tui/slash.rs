@@ -194,4 +194,19 @@ mod tests {
         assert_eq!(parsed.style, "default");
         assert_eq!(parsed.goal, "goal");
     }
+
+    #[test]
+    fn parses_user_ultra_plan_run_nextjs_command() {
+        let parsed = parse_slash(
+            "/ultra-plan-run --profile nextjs あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。",
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(parsed.command, "/ultra-plan-run");
+        assert_eq!(parsed.profile, "nextjs");
+        assert_eq!(
+            parsed.goal,
+            "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。"
+        );
+    }
 }

@@ -11,7 +11,7 @@ use crate::planner::profile::{
 use crate::planner::repair::{build_repair_prompt, save_repair_report};
 use crate::planner::step_plan::{PlanStep, StepPlan, parse_step_plan, render_step_plan};
 use crate::planner::ultra_plan::{UltraPlan, parse_ultra_plan, render_ultra_plan};
-use crate::planner::verify::{VerificationReport, VerifyStatus, verify_step};
+use crate::planner::verify::{VerificationReport, verify_step};
 use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
 use crate::tui::status::UiStatus;
@@ -44,22 +44,41 @@ pub fn generate_step_plan_with_ui(
             "\nInclude expected_paths on the final step so deterministic verification can catch missing artifacts.",
         );
     }
-    let messages = vec![crate::state::ConversationMessage::user(prompt)];
     let model = model_for(config, true);
-    let reply = {
-        let _guard = ui.before_model_call(&format!("planner {} {model}", client.label()));
-        client.chat(model, &messages, &[], false)?
-    };
-    ui.publish_status(UiStatus::for_model_reply(
-        config,
-        model,
-        client.label(),
-        reply.prompt_tokens,
-        reply.completion_tokens,
-    ));
-    let mut plan = parse_step_plan(&reply.content).unwrap_or_else(|_| StepPlan::single(goal));
-    strengthen_step_plan_for_profile(&mut plan, config);
-    Ok(plan)
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        let messages = vec![crate::state::ConversationMessage::user(prompt.clone())];
+        let reply = {
+            let _guard = ui.before_model_call(&format!("planner {} {model}", client.label()));
+            client.chat(model, &messages, &[], false)?
+        };
+        ui.publish_status(UiStatus::for_model_reply(
+            config,
+            model,
+            client.label(),
+            reply.prompt_tokens,
+            reply.completion_tokens,
+        ));
+        match parse_step_plan(&reply.content) {
+            Ok(mut plan) => {
+                strengthen_step_plan_for_profile(&mut plan, config);
+                return Ok(plan);
+            }
+            Err(err) => {
+                last_error = Some(err.to_string());
+                prompt = format!(
+                    "Your previous StepPlan output was invalid on attempt {attempt}/3: {}.\n\
+Return only YAML with this exact shape:\n\
+goal: \"...\"\nsteps:\n  - id: \"step-1\"\n    kind: \"work\"\n    instruction: \"...\"\n    expected_paths:\n      - \"relative/path\"\n    verify:\n      - \"command\"\n\nGoal: {goal}",
+                    last_error.as_deref().unwrap_or("invalid YAML")
+                );
+            }
+        }
+    }
+    anyhow::bail!(
+        "invalid StepPlan after corrective retries: {}",
+        last_error.unwrap_or_else(|| "unknown parse error".to_string())
+    )
 }
 
 pub fn save_step_plan(root: &Path, plan: &StepPlan) -> anyhow::Result<PathBuf> {
@@ -143,10 +162,11 @@ fn run_step(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<()> {
+    let instruction = prompt_with_required_paths(&step.instruction, &step.expected_paths);
     run_session_with_required_paths_with_ui(
         client,
         session,
-        &step.instruction,
+        &instruction,
         &step.expected_paths,
         config,
         ui,
@@ -156,6 +176,7 @@ fn run_step(
         return Ok(());
     }
     let repair_prompt = build_repair_prompt(&step.id, &report);
+    let repair_prompt = prompt_with_required_paths(&repair_prompt, &step.expected_paths);
     run_session_with_required_paths_with_ui(
         client,
         session,
@@ -287,19 +308,14 @@ pub fn run_ultra_plan_with_ui(
         if ui.interrupted() {
             anyhow::bail!("interrupted by user");
         }
-        let step_plan = generate_step_plan_with_ui(planner, &phase.prompt, config, ui)?;
+        let phase_prompt = ultra_phase_prompt(plan, &phase.prompt, config);
+        let step_plan = generate_step_plan_with_ui(planner, &phase_prompt, config, ui)?;
         save_step_plan(&config.workspace_root, &step_plan)?;
         run_step_plan_with_ui(execution, &step_plan, config, ui)
             .map_err(|err| anyhow::anyhow!("phase {} failed: {err}", phase.id))?;
         let profile_report = verify_profile(&config.workspace_root, &plan.profile, &plan.goal);
         let final_phase = index + 1 == plan.phases.len();
-        if !profile_report.is_pass()
-            && (final_phase
-                || !matches!(
-                    profile_report.status,
-                    VerifyStatus::ProfileContractFailed(_)
-                ))
-        {
+        if !profile_report.is_pass() {
             if final_phase
                 && profile_auto_repair(
                     &config.workspace_root,
@@ -374,6 +390,41 @@ fn strengthen_step_plan_for_profile(plan: &mut StepPlan, config: &Config) {
     }
 }
 
+fn prompt_with_required_paths(instruction: &str, paths: &[String]) -> String {
+    if paths.is_empty() || instruction.contains("Required final artifacts:") {
+        return instruction.to_string();
+    }
+    format!(
+        "{}\n\nRequired final artifacts:\n{}",
+        instruction,
+        paths
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn ultra_phase_prompt(plan: &UltraPlan, phase_prompt: &str, config: &Config) -> String {
+    let expected_paths = profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+    let required = if expected_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nRequired final artifacts:\n{}",
+            expected_paths
+                .iter()
+                .map(|path| format!("- {path}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    format!(
+        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase task: {}{}",
+        plan.goal, plan.profile, plan.style, plan.intent, phase_prompt, required
+    )
+}
+
 #[allow(dead_code)]
 fn _format_report(report: &VerificationReport) -> String {
     format!("{:?}", report.status)
@@ -434,6 +485,58 @@ mod tests {
     }
 
     #[test]
+    fn invalid_planner_output_gets_corrective_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = render_step_plan(&StepPlan::single("goal"));
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text("not yaml"),
+            AssistantReply::text(valid),
+        ]);
+        let plan =
+            generate_step_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
+        assert_eq!(plan.goal, "goal");
+        assert_eq!(plan.steps.len(), 1);
+    }
+
+    #[test]
+    fn required_final_artifacts_are_preserved_in_step_prompt() {
+        let prompt = prompt_with_required_paths(
+            "Create the app",
+            &["package.json".to_string(), "src/app/page.tsx".to_string()],
+        );
+        assert!(prompt.contains("Required final artifacts:"));
+        assert!(prompt.contains("- package.json"));
+        assert!(prompt.contains("- src/app/page.tsx"));
+    }
+
+    #[test]
+    fn required_final_artifacts_are_preserved_in_ultra_phase_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = UltraPlan {
+            goal: "3011 port app".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "scaffold".to_string(),
+                    prompt: "Scaffold project".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "finish".to_string(),
+                    prompt: "Finish project".to_string(),
+                },
+            ],
+        };
+        let prompt = ultra_phase_prompt(&plan, "Finish project", &config(dir.path().to_path_buf()));
+        assert!(prompt.contains("Original ultra goal: 3011 port app"));
+        assert!(prompt.contains("Profile: nextjs"));
+        assert!(prompt.contains("Required final artifacts:"));
+        assert!(prompt.contains("- package.json"));
+        assert!(prompt.contains("- src/app/page.tsx"));
+    }
+
+    #[test]
     fn ultra_plan_final_profile_failure_runs_repair() {
         let dir = tempfile::tempdir().unwrap();
         let step_yaml = render_step_plan(&StepPlan::single("Scaffold project"));
@@ -441,22 +544,17 @@ mod tests {
             AssistantReply::text(step_yaml.clone()),
             AssistantReply::text(step_yaml),
         ]);
-        let package = r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let good_package = r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let bad_package =
+            r#"{"dependencies":{},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
         let mut execution = FakeClient::new(vec![
             AssistantReply {
                 content: String::new(),
-                tool_calls: vec![crate::state::ToolCall::new(
-                    "Write",
-                    serde_json::json!({"path":"package.json","content":package}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            },
-            AssistantReply::text("done"),
-            AssistantReply::text("done"),
-            AssistantReply {
-                content: String::new(),
                 tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"package.json","content":good_package}),
+                    ),
                     crate::state::ToolCall::new(
                         "Write",
                         serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main>Space Invaders</main>;}"}),
@@ -469,7 +567,17 @@ mod tests {
                 prompt_tokens: None,
                 completion_tokens: None,
             },
-            AssistantReply::text("repaired"),
+            AssistantReply::text("done"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"package.json","content":bad_package}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("done"),
         ]);
         let plan = UltraPlan {
             goal: "3011 port app".to_string(),
@@ -496,6 +604,51 @@ mod tests {
         .unwrap();
         assert_eq!(result, "ultra-plan-run complete: 2 phases");
         assert!(dir.path().join("src/app/page.tsx").is_file());
+    }
+
+    #[test]
+    fn ultra_plan_non_final_profile_failure_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let step_yaml = render_step_plan(&StepPlan::single("Scaffold project"));
+        let mut planner = FakeClient::new(vec![AssistantReply::text(step_yaml)]);
+        let package = r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"package.json","content":package}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("done"),
+        ]);
+        let plan = UltraPlan {
+            goal: "3011 port app".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "scaffold".to_string(),
+                    prompt: "Scaffold project".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "finish".to_string(),
+                    prompt: "Finish project".to_string(),
+                },
+            ],
+        };
+        let err = run_ultra_plan(
+            &mut planner,
+            &mut execution,
+            &plan,
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("phase scaffold profile verification failed"));
     }
 
     struct FakeClient {

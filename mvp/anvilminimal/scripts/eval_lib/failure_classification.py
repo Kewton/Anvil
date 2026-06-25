@@ -7,6 +7,8 @@ from typing import Any
 
 KNOWN_FAILURE_KINDS = {
     "diagnostic_skipped",
+    "max_iterations",
+    "missing_tool_call",
     "path_confinement_error",
     "postcheck_failure",
     "provider_http_status",
@@ -74,6 +76,10 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
         return {"failure_kind": "provider_parse_error"}
     if "path escapes workspace" in lower:
         return {"failure_kind": "path_confinement_error"}
+    if "minimal loop reached max_iterations" in lower:
+        return {"failure_kind": "max_iterations"}
+    if "missing tool call for action prompt" in lower:
+        return {"failure_kind": "missing_tool_call"}
     http = re.search(r"(OpenAI Responses API|Gemini interactions API) failed: (\d{3})", stderr)
     if http:
         status = int(http.group(2))

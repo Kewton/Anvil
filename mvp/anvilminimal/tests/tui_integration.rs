@@ -134,7 +134,7 @@ fn tui_integration_records_model_and_tool_boundaries() {
         &ui,
     )
     .unwrap();
-    assert_eq!(result, "done");
+    assert_eq!(result, "required artifacts satisfied: a.txt");
     let events = ui.events();
     assert!(events.iter().any(|event| event == "model:fake m"));
     assert!(events.iter().any(|event| event == "tool:Write"));
@@ -204,9 +204,11 @@ fn planner_uses_ui_for_planner_model_call() {
 #[test]
 fn tui_ultra_plan_run_smoke_fake_clients() {
     let dir = tempfile::tempdir().unwrap();
-    let step_yaml = anvilminimal::planner::step_plan::render_step_plan(
-        &anvilminimal::planner::step_plan::StepPlan::single("write app"),
-    );
+    let mut step_plan = anvilminimal::planner::step_plan::StepPlan::single("write app");
+    step_plan.steps[0]
+        .expected_paths
+        .push("app.txt".to_string());
+    let step_yaml = anvilminimal::planner::step_plan::render_step_plan(&step_plan);
     let plan = anvilminimal::planner::ultra_plan::UltraPlan {
         goal: "build app".to_string(),
         profile: "generic".to_string(),
@@ -232,7 +234,26 @@ fn tui_ultra_plan_run_smoke_fake_clients() {
     );
     let mut execution = FakeClient::new(
         "exec",
-        vec![AssistantReply::text("done"), AssistantReply::text("done")],
+        vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"app.txt","content":"phase1"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"app.txt","content":"phase2"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ],
     );
     let ui = FakeUi::default();
     let result = run_ultra_plan_with_ui(

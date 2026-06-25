@@ -40,6 +40,21 @@ class EvalRunDryTest(unittest.TestCase):
             commands = "\n".join(path.read_text() for path in command_files)
             self.assertIn("--prompt", commands)
             self.assertIn("--plan-steps", commands)
+            self.assertIn("Required final artifacts:", commands)
+
+    def test_expected_artifacts_can_be_rendered_as_required_final_artifacts(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from eval_lib.suites import prompt_with_required_final_artifacts
+
+        prompt = prompt_with_required_final_artifacts(
+            {
+                "prompt": "Create the app",
+                "expected_artifacts": ["package.json", "src/app/page.tsx"],
+            }
+        )
+        self.assertIn("Required final artifacts:", prompt)
+        self.assertIn("- package.json", prompt)
+        self.assertIn("- src/app/page.tsx", prompt)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,22 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
         classified = classify_stderr("error: something opaque", rc=1, timeout=False)
         self.assertEqual(classified["failure_kind"], "unclassified_process_failure")
 
+    def test_failure_kind_max_iterations_snapshot(self):
+        classified = classify_stderr(
+            "error: minimal loop reached max_iterations (12)", rc=1, timeout=False
+        )
+        self.assertEqual(classified["failure_kind"], "max_iterations")
+        self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+    def test_failure_kind_missing_tool_call_snapshot(self):
+        classified = classify_stderr(
+            "error: missing tool call for action prompt after feedback",
+            rc=1,
+            timeout=False,
+        )
+        self.assertEqual(classified["failure_kind"], "missing_tool_call")
+        self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
     def test_events_take_provider_and_tool_failure_shapes(self):
         provider = classify_events(
             [

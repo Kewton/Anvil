@@ -43,6 +43,13 @@ pub fn verify_step(root: &Path, step: &PlanStep) -> VerificationReport {
                 status: VerifyStatus::CommandFailed(err.to_string()),
             };
         }
+        if is_nextjs_build_command(command) && !root.join("node_modules/.bin/next").is_file() {
+            return VerificationReport {
+                status: VerifyStatus::DependencyMissing(
+                    "node_modules/.bin/next missing for Next.js build".to_string(),
+                ),
+            };
+        }
         match crate::tools::bash::run_checked(command, root, false) {
             Ok(output) if command.contains("npm") && output.contains("0 tests") => {
                 return VerificationReport {
@@ -76,10 +83,42 @@ pub fn validate_verify_command(command: &str) -> anyhow::Result<()> {
     if crate::tools::bash::blocked_reason(trimmed, false).is_some() {
         anyhow::bail!("verify command is blocked");
     }
+    if contains_shell_control_syntax(trimmed) {
+        anyhow::bail!("verify command may not use shell control syntax");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("npm install")
+        || lower.contains("pnpm install")
+        || lower.contains("yarn install")
+        || lower.contains("cargo install")
+        || lower.contains("next dev")
+        || lower.contains("vite --host")
+    {
+        anyhow::bail!("verify command may not perform setup or start a dev server");
+    }
     if let Some(path) = manifest_path_arg(trimmed) {
         validate_workspace_relative(path)?;
     }
     Ok(())
+}
+
+fn contains_shell_control_syntax(command: &str) -> bool {
+    command.contains("&&")
+        || command.contains("||")
+        || command.contains('|')
+        || command.contains(';')
+        || command.contains("`")
+        || command.contains("$(")
+}
+
+fn is_nextjs_build_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower == "npm run build"
+        || lower.starts_with("npm run build ")
+        || lower == "pnpm build"
+        || lower.starts_with("pnpm build ")
+        || lower == "yarn build"
+        || lower.starts_with("yarn build ")
 }
 
 fn manifest_path_arg(command: &str) -> Option<&str> {
@@ -117,6 +156,24 @@ mod tests {
     }
 
     #[test]
+    fn verify_command_rejects_shell_control_syntax() {
+        for command in [
+            "npm test && npm run build",
+            "cargo test | cat",
+            "npm test; echo ok",
+        ] {
+            assert!(validate_verify_command(command).is_err(), "{command}");
+        }
+    }
+
+    #[test]
+    fn verify_command_rejects_install_or_dev_server() {
+        for command in ["npm install", "pnpm install", "next dev -p 3011"] {
+            assert!(validate_verify_command(command).is_err(), "{command}");
+        }
+    }
+
+    #[test]
     fn verify_command_nonzero_fails() {
         let dir = tempfile::tempdir().unwrap();
         let step = PlanStep {
@@ -129,6 +186,27 @@ mod tests {
         assert!(matches!(
             verify_step(dir.path(), &step).status,
             VerifyStatus::CommandFailed(_)
+        ));
+    }
+
+    #[test]
+    fn nextjs_build_missing_next_binary_is_dependency_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"x","react":"x","react-dom":"x"}}"#,
+        )
+        .unwrap();
+        let step = PlanStep {
+            id: "s".to_string(),
+            kind: "verify".to_string(),
+            instruction: "x".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["npm run build".to_string()],
+        };
+        assert!(matches!(
+            verify_step(dir.path(), &step).status,
+            VerifyStatus::DependencyMissing(_)
         ));
     }
 }

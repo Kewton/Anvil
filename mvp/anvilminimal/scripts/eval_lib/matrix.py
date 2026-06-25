@@ -6,6 +6,7 @@ from typing import Any
 
 from .artifacts import run_id
 from .models import ModelRef, cli_model_args
+from .suites import prompt_with_required_final_artifacts
 
 VALID_MODES = {"minimal-loop", "step-plan", "plan-run", "ultra-plan-run", "ultra-step-run"}
 
@@ -102,7 +103,7 @@ def render_command(
         "--cwd",
         str(workdir),
     ]
-    prompt = scenario["prompt"]
+    prompt = prompt_with_required_final_artifacts(scenario)
     if mode == "minimal-loop":
         return [*base, "--prompt", prompt]
     if mode == "step-plan":
@@ -114,4 +115,3 @@ def render_command(
     if mode == "ultra-step-run":
         return [*base, "--run-plan", "<phase-step-plan.yaml>"]
     raise ValueError(f"unknown mode: {mode}")
-
