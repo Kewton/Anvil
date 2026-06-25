@@ -1,0 +1,19 @@
+goal: "Create a Next.js app on port 3011"
+steps:
+  - id: "scaffold"
+    kind: "scaffold"
+    instruction: "Create package.json and src/app files for the requested Next.js app. Keep all files workspace-relative."
+    expected_paths:
+      - "package.json"
+      - "src/app/page.tsx"
+      - "src/app/layout.tsx"
+    verify:
+      - "npm run build"
+  - id: "verify"
+    kind: "verify"
+    instruction: "Verify the app builds and document how it runs on port 3011."
+    expected_paths:
+      - "package.json"
+    verify:
+      - "npm run build"
+      - "curl http://127.0.0.1:3011/"

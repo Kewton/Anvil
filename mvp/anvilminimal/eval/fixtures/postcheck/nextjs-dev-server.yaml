@@ -1,0 +1,13 @@
+id: nextjs-fixture
+expected_artifacts:
+  - package.json
+postcheck:
+  commands: []
+  dev_server:
+    command: python3 -m http.server 3011
+    port: 3011
+    readiness:
+      url: http://127.0.0.1:3011/
+      expect_status: 200
+      timeout_sec: 10
+    shutdown: signal

@@ -8,6 +8,8 @@ use crate::providers::ChatClient;
 use crate::state::{ConversationMessage, SessionSnapshot};
 use crate::tools::path_guard::resolve_existing;
 use crate::tools::registry::{ToolContext, ToolRegistry};
+use crate::tui::status::UiStatus;
+use crate::tui::{InteractionUi, NOOP_UI};
 
 use super::compact::compact_if_needed;
 use super::prompt::build_request_messages;
@@ -28,6 +30,24 @@ pub fn run_session_with_required_paths(
     required_paths: &[String],
     config: &Config,
 ) -> anyhow::Result<String> {
+    run_session_with_required_paths_with_ui(
+        client,
+        session,
+        user_prompt,
+        required_paths,
+        config,
+        &NOOP_UI,
+    )
+}
+
+pub fn run_session_with_required_paths_with_ui(
+    client: &mut dyn ChatClient,
+    session: &mut SessionSnapshot,
+    user_prompt: &str,
+    required_paths: &[String],
+    config: &Config,
+    ui: &dyn InteractionUi,
+) -> anyhow::Result<String> {
     let registry = ToolRegistry::default();
     let mut native_tools_enabled =
         client.supports_native_tools(&config.model) && !session.native_tools_disabled;
@@ -39,6 +59,9 @@ pub fn run_session_with_required_paths(
         .push(ConversationMessage::user(user_prompt.to_string()));
 
     for _ in 0..config.max_iterations {
+        if ui.interrupted() {
+            bail!("interrupted by user");
+        }
         compact_if_needed(&mut session.messages, config.context_budget);
         let specs = registry.specs().to_vec();
         let request_tools = if native_tools_enabled {
@@ -52,12 +75,17 @@ pub fn run_session_with_required_paths(
             &config.workspace_root,
             pending_feedback.as_deref(),
         );
-        let reply = match client.chat(
-            &config.model,
-            &request_messages,
-            &request_tools,
-            native_tools_enabled,
-        ) {
+        let label = format!("{} {}", client.label(), config.model);
+        let chat_result = {
+            let _guard = ui.before_model_call(&label);
+            client.chat(
+                &config.model,
+                &request_messages,
+                &request_tools,
+                native_tools_enabled,
+            )
+        };
+        let reply = match chat_result {
             Ok(reply) => {
                 pending_feedback = None;
                 reply
@@ -70,6 +98,16 @@ pub fn run_session_with_required_paths(
             }
             Err(err) => return Err(err),
         };
+        ui.publish_status(UiStatus::for_model_reply(
+            config,
+            &config.model,
+            client.label(),
+            reply.prompt_tokens,
+            reply.completion_tokens,
+        ));
+        if ui.interrupted() {
+            bail!("interrupted by user");
+        }
         let tool_calls = reply.tool_calls.clone();
         session.messages.push(ConversationMessage::assistant(
             reply.content.clone(),
@@ -103,13 +141,19 @@ pub fn run_session_with_required_paths(
         };
         let mut names_seen = BTreeSet::new();
         for call in tool_calls {
+            if ui.interrupted() {
+                bail!("interrupted by user");
+            }
             if !names_seen.insert(call.name.clone()) {
                 // Multiple same-tool calls are fine; this keeps clippy from seeing unused state.
             }
             if matches!(call.name.as_str(), "Write" | "Edit") {
                 write_or_edit_seen = true;
             }
-            let result = registry.execute(&call.name, &call.arguments, &context)?;
+            let result = {
+                let _guard = ui.before_tool_call(&call.name);
+                registry.execute(&call.name, &call.arguments, &context)?
+            };
             session.messages.push(ConversationMessage::tool_result(
                 call.name,
                 Some(call.id),
@@ -187,6 +231,7 @@ mod tests {
             chat_retries: 1,
             resume: None,
             fresh_session: false,
+            no_footer: false,
             profile: "generic".to_string(),
             style: "default".to_string(),
             action: crate::config::Action::Repl,

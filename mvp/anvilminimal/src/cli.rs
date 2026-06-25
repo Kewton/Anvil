@@ -64,6 +64,8 @@ pub struct Cli {
     pub cwd: Option<PathBuf>,
     #[arg(long, action = ArgAction::SetTrue)]
     pub fresh_session: bool,
+    #[arg(long, action = ArgAction::SetTrue, help = "Disable the fixed TUI footer")]
+    pub no_footer: bool,
     #[arg(trailing_var_arg = true)]
     pub goal: Vec<String>,
 }
@@ -85,6 +87,12 @@ mod tests {
     fn help_does_not_include_engine() {
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--engine"));
+    }
+
+    #[test]
+    fn help_includes_no_footer() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--no-footer"));
     }
 
     #[test]

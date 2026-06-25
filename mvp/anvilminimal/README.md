@@ -32,6 +32,29 @@ anvilminimal --provider ollama --model qwen3.6:27b-coding-nvfp4 \
   "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。"
 ```
 
+## TUI
+
+Interactive TTY mode uses the same `anvil>` prompt and slash commands, plus
+terminal-only markdown rendering, spinner, ESC boundary interrupt, and a fixed
+footer. Disable paths:
+
+```bash
+ANVIL_NO_SPINNER=1 anvilminimal --yes
+ANVIL_NO_FOOTER=1 anvilminimal --yes
+ANVIL_NO_INTERRUPT=1 anvilminimal --yes
+ANVIL_NO_MARKDOWN=1 anvilminimal --yes
+NO_COLOR=1 anvilminimal --yes
+anvilminimal --yes --no-footer
+```
+
+Release/manual TTY smoke:
+
+```bash
+ANVIL_PTY_TESTS=1 cargo test tui_pty_smoke -- --ignored
+anvilminimal --help
+anvilminimal --yes --context-budget 65536 --model qwen3.6:27b-coding-nvfp4 --planner-model gemini-3.5-flash --planner-provider gemini --provider ollama
+```
+
 ## API Keys
 
 `OPENAI_API_KEY` and `GEMINI_API_KEY` are read from process env first, then

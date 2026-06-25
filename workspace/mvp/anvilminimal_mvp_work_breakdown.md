@@ -384,6 +384,9 @@ cargo test data_profile
 
 目的: engine 指定なしで TUI/REPL を起動し、slash command から plan/ultra run を使えるようにする。
 
+詳細計画: `workspace/mvp/anvilminimal_tui_migration_plan.md`
+詳細作業分解: `workspace/mvp/anvilminimal_tui_work_breakdown.md`
+
 | ID | 作業 | 作成/変更 | テスト |
 |---|---|---|---|
 | P7-T01 | REPL loop を実装する | `src/repl.rs` | non-tty behavior |
@@ -394,6 +397,13 @@ cargo test data_profile
 | P7-T06 | goal reference expansion を実装する | `repl.rs` + `path_guard.rs` | `$(cat relative/path)` confinement |
 | P7-T07 | approval prompt と raw mode の干渉を避ける | `repl.rs` | approval prompt fixture |
 | P7-T08 | CLI/REPL action parity を固定する | `cli.rs`, `repl.rs` | profile/style/path interpretation parity |
+| P7-T09 | TUI module 境界を作る | `src/tui/{mod,terminal,repl,slash,status}.rs` | TTY/non-TTY behavior |
+| P7-T10 | markdown renderer を移植する | `src/tui/markdown.rs` | SGR-only / `<think>` strip |
+| P7-T11 | spinner を移植する | `src/tui/spinner.rs` | env disable / sanitize / prompt cleanup |
+| P7-T12 | ESC interrupt を移植する | `src/tui/interrupt.rs` | boundary stop / raw mode pause-resume |
+| P7-T13 | fixed footer を移植する | `src/tui/footer.rs` | DECSTBM reset / `--no-footer` / env disable |
+| P7-T14 | Runtime UI hook を minimal loop / planner に接続する | `src/tui/status.rs`, loop/runner | fake UI integration |
+| P7-T15 | PTY smoke を追加する | integration test/helper | prompt/spinner/footer/markdown disable env |
 
 slash command fixture。
 
@@ -404,12 +414,18 @@ slash command fixture。
 - `/ultra-plan-run --profile nextjs "3011 port app"`
 - `/run-ultra-plan .anvil/plans/ultra-plan-001.yaml`
 - CLI の `--profile` / `--style` と REPL slash command の `--profile` / `--style` が同じ `Config` へ反映される
+- spinner / footer / markdown / interrupt は TTY で有効、non-TTY と disable env で no-op になる
 
 Phase 7 の targeted test。
 
 ```bash
 cargo test repl
 cargo test slash_command
+cargo test markdown
+cargo test spinner
+cargo test footer
+cargo test interrupt
+cargo test tui_integration
 ```
 
 ## Phase 8: E2E / copy validation / harness

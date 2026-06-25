@@ -703,9 +703,18 @@ Phase 1 以降は、実装と同じ PR/commit 内で対応するテストコー�
 
 ### Phase 7: REPL/TUI
 
+詳細な TUI terminal primitives の移植計画は `workspace/mvp/anvilminimal_tui_migration_plan.md`、具体作業分解は `workspace/mvp/anvilminimal_tui_work_breakdown.md` を参照する。この Phase 7 は単なる line REPL ではなく、spinner / footer / ESC interrupt / markdown rendering / raw mode 境界を含む。
+
 移植。
 
 - `repl.rs`
+- `tui/terminal.rs`
+- `tui/slash.rs`
+- `tui/spinner.rs`
+- `tui/footer.rs`
+- `tui/interrupt.rs`
+- `tui/markdown.rs`
+- `tui/status.rs`
 
 対応 command。
 
@@ -725,6 +734,9 @@ Phase 1 以降は、実装と同じ PR/commit 内で対応するテストコー�
 - 指定コマンドで `anvil>` prompt が出る
 - REPL spinner が TTY で表示される
 - `ANVIL_NO_SPINNER` で spinner を無効化できる
+- fixed footer が TTY で表示され、`--no-footer` / `ANVIL_NO_FOOTER` で無効化できる
+- assistant 応答は terminal markdown renderer を通り、`<think>` を表示しない
+- ESC interrupt が provider/tool/phase 境界停止として働き、prompt 入力中の raw mode と干渉しない
 - `$(cat relative/path)` goal reference が workspace 外へ出られない
 - `/plan-run`, `/run-plan`, `/ultra-plan-run`, `/run-ultra-plan` は CLI action と同じ path/profile/style 解釈をする
 - engine 指定なしで TUI 起動できる

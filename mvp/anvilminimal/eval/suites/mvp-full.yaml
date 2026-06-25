@@ -1,0 +1,7 @@
+name: mvp-full
+description: Release-oriented suite. Includes balanced scenarios and the existing 25 regression seeds.
+include_suites:
+  - mvp-balanced.yaml
+include_benchmarks:
+  - ../../benchmarks/minimal-loop-expanded.yaml
+scenarios: []

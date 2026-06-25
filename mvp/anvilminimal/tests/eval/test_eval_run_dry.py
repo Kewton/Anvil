@@ -1,0 +1,46 @@
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+class EvalRunDryTest(unittest.TestCase):
+    def test_dry_run_writes_matrix_and_commands(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td) / "run"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-run.py",
+                    "--suite",
+                    "eval/suites/mvp-smoke.yaml",
+                    "--model-profile",
+                    "speed-cloud",
+                    "--modes",
+                    "minimal-loop,step-plan",
+                    "--runs",
+                    "1",
+                    "--run-root",
+                    str(run_root),
+                    "--dry-run",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            matrix = json.loads((run_root / "matrix.json").read_text())
+            self.assertEqual(len(matrix), 24)
+            command_files = list((run_root / "runs").glob("*/command.txt"))
+            self.assertEqual(len(command_files), 24)
+            commands = "\n".join(path.read_text() for path in command_files)
+            self.assertIn("--prompt", commands)
+            self.assertIn("--plan-steps", commands)
+
+
+if __name__ == "__main__":
+    unittest.main()

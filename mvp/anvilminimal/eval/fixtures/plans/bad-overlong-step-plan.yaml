@@ -1,0 +1,23 @@
+goal: "Create a Next.js app on port 3011"
+steps:
+  - id: "one"
+    kind: "work"
+    instruction: "Do everything in one broad step without clear verification boundaries, including design, implementation, dependency installation, server startup, visual polish, repair, documentation, and all validation."
+    expected_paths:
+      - "package.json"
+      - "src/app/page.tsx"
+      - "src/app/layout.tsx"
+      - "README.md"
+      - "docs/notes.md"
+      - "scripts/run.sh"
+    verify:
+      - "npm run build"
+      - "npm run build"
+      - "npm run build"
+      - "npm run build"
+      - "npm run build"
+      - "npm run build"
+      - "npm run build"
+      - "npm run build"
+      - "npm run build"
+      - "npm run build"

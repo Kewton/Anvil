@@ -1,0 +1,125 @@
+name: mvp-smoke
+description: Short eval suite for PR and local smoke checks.
+scenarios:
+  - id: fix-js-date-helper-small
+    size: small
+    category: fix-code
+    profile: generic
+    prompt: Fix a JavaScript date helper and add a deterministic node smoke check.
+    expected_artifacts:
+      - date-helper.js
+    postcheck:
+      commands:
+        - node date-helper.js
+    timeouts:
+      total_sec: 600
+      model_call_sec: 180
+    plan_constraints:
+      min_steps: 2
+      max_steps: 5
+      required_verify_keywords:
+        - node
+  - id: docs-heading-update-small
+    size: small
+    category: data-docs
+    profile: generic
+    prompt: Create README.md with a clear usage heading and one command example.
+    expected_artifacts:
+      - README.md
+    postcheck:
+      commands: []
+    timeouts:
+      total_sec: 600
+      model_call_sec: 180
+    plan_constraints:
+      min_steps: 1
+      max_steps: 4
+      required_verify_keywords:
+        - README.md
+  - id: python-markdown-linter-medium
+    size: medium
+    category: fix-code
+    profile: generic
+    prompt: Build a Python markdown heading linter with unittest coverage.
+    expected_artifacts:
+      - markdown_lint.py
+      - test_markdown_lint.py
+    postcheck:
+      commands:
+        - python3 -m unittest test_markdown_lint.py
+    timeouts:
+      total_sec: 1200
+      model_call_sec: 240
+    plan_constraints:
+      min_steps: 3
+      max_steps: 7
+      required_verify_keywords:
+        - python3 -m unittest
+  - id: rust-cli-medium
+    size: medium
+    category: new-code
+    profile: generic
+    prompt: Create a small Rust CLI with one unit test and cargo test verification.
+    expected_artifacts:
+      - Cargo.toml
+      - src/main.rs
+    postcheck:
+      commands:
+        - cargo test
+    timeouts:
+      total_sec: 1200
+      model_call_sec: 240
+    plan_constraints:
+      min_steps: 3
+      max_steps: 8
+      required_verify_keywords:
+        - cargo test
+  - id: nextjs-space-invaders-large
+    size: large
+    category: new-code
+    profile: nextjs
+    prompt: Create a Next.js Space Invaders game that can run on port 3011.
+    expected_artifacts:
+      - package.json
+      - src/app/page.tsx
+      - src/app/layout.tsx
+    postcheck:
+      commands:
+        - npm install --ignore-scripts
+        - npm run build
+      dev_server:
+        command: env -u NODE_ENV npm run dev
+        port: 3011
+        readiness:
+          url: http://127.0.0.1:3011/
+          expect_status: 200
+          timeout_sec: 60
+        shutdown: signal
+    timeouts:
+      total_sec: 3600
+      model_call_sec: 300
+    plan_constraints:
+      min_steps: 3
+      max_steps: 8
+      required_verify_keywords:
+        - npm run build
+        - 3011
+  - id: repair-exhausted-report-large
+    size: large
+    category: recovery
+    profile: generic
+    prompt: Create a multi-file tool that reports repair exhaustion with deterministic tests.
+    expected_artifacts:
+      - repair_report.py
+      - test_repair_report.py
+    postcheck:
+      commands:
+        - python3 -m unittest test_repair_report.py
+    timeouts:
+      total_sec: 2400
+      model_call_sec: 300
+    plan_constraints:
+      min_steps: 4
+      max_steps: 9
+      required_verify_keywords:
+        - python3 -m unittest

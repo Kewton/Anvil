@@ -1,0 +1,11 @@
+goal: "Create a Next.js app on port 3011"
+steps:
+  - id: "escape"
+    kind: "work"
+    instruction: "Write the requested app outside the workspace and verify it from an absolute path."
+    expected_paths:
+      - "../package.json"
+      - "/tmp/outside/src/app/page.tsx"
+      - "~/workspace/escape"
+    verify:
+      - "npm run build"

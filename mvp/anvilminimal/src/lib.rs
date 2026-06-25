@@ -7,10 +7,13 @@ pub mod providers;
 pub mod repl;
 pub mod state;
 pub mod tools;
+pub mod tui;
 
 use anyhow::Context;
 use cli::Cli;
 use config::{Action, Config};
+use tui::OutputRenderer;
+use tui::markdown::PlainRenderer;
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     let config = Config::from_cli(cli)?;
@@ -27,7 +30,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 state::SessionStore::new(config.state_dir.clone()).load_or_create(resume)?;
             let reply = minimal_loop::run_session(&mut *client, &mut session, &prompt, &config)?;
             state::SessionStore::new(config.state_dir.clone()).save(&session)?;
-            println!("{reply}");
+            PlainRenderer.render_assistant(&reply)?;
             Ok(())
         }
         Action::PlanSteps(goal) => {
