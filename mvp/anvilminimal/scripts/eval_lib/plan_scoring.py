@@ -145,6 +145,9 @@ def score_expected_paths(steps: list[dict[str, Any]], expected: set[str]) -> tup
     for path in paths:
         if invalid_path(path):
             penalties.append({"kind": "path_escape", "path": path})
+    duplicates = len(paths) - len(set(paths))
+    if duplicates:
+        penalties.append({"kind": "duplicate_expected_path_ownership", "count": duplicates})
     if not paths:
         return (0, penalties)
     if expected:
@@ -166,6 +169,8 @@ def score_verify(steps: list[dict[str, Any]], required: list[str]) -> tuple[int,
     if duplicates:
         penalties.append({"kind": "duplicate_verify", "count": duplicates})
     text = "\n".join(commands).lower()
+    if any(("&&" in cmd or "||" in cmd or "|" in cmd or ";" in cmd) for cmd in commands):
+        penalties.append({"kind": "verify_command_policy_error"})
     if required:
         hits = sum(1 for keyword in required if str(keyword).lower() in text)
         return (int(10 * hits / max(1, len(required))), penalties)
@@ -213,7 +218,10 @@ def penalty_points(penalties: list[dict[str, Any]]) -> int:
             points += 20
         elif penalty["kind"] == "duplicate_verify":
             points += min(18, int(penalty.get("count", 1)) * 3)
+        elif penalty["kind"] == "duplicate_expected_path_ownership":
+            points += min(20, int(penalty.get("count", 1)) * 5)
+        elif penalty["kind"] == "verify_command_policy_error":
+            points += 15
         elif penalty["kind"] == "step_count_out_of_range":
             points += 5
     return points
-

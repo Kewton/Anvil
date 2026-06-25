@@ -156,6 +156,22 @@ pub fn parse_step_plan(text: &str) -> anyhow::Result<StepPlan> {
     Ok(StepPlan { goal, steps })
 }
 
+pub fn parse_step_plan_with_default_goal(
+    text: &str,
+    fallback_goal: &str,
+) -> anyhow::Result<(StepPlan, bool)> {
+    match parse_step_plan(text) {
+        Ok(plan) => Ok((plan, false)),
+        Err(err) if err.to_string().contains("StepPlan missing goal") => {
+            let repaired = format!("goal: {:?}\n{}", fallback_goal, extract_yaml(text));
+            parse_step_plan(&repaired)
+                .map(|plan| (plan, true))
+                .map_err(|_| err)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn normalize_legacy_step(mut step: PlanStep) -> PlanStep {
     if step.kind == "report" && (!step.expected_paths.is_empty() || !step.verify.is_empty()) {
         step.kind = "implement".to_string();
@@ -231,5 +247,28 @@ steps:
         assert_eq!(parsed.steps[0].expected_result_kind(), ExpectedResult::Fail);
         let rendered = render_step_plan(&parsed);
         assert!(rendered.contains("expected_result"));
+    }
+
+    #[test]
+    fn missing_goal_can_be_repaired_from_user_goal_when_steps_exist() {
+        let (parsed, repaired) = parse_step_plan_with_default_goal(
+            r#"steps:
+  - id: "s1"
+    instruction: "write code"
+"#,
+            "fallback goal",
+        )
+        .unwrap();
+        assert!(repaired);
+        assert_eq!(parsed.goal, "fallback goal");
+        assert_eq!(parsed.steps.len(), 1);
+    }
+
+    #[test]
+    fn missing_steps_is_not_auto_repaired() {
+        let err = parse_step_plan_with_default_goal("goal: x", "fallback")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("StepPlan has no steps"));
     }
 }

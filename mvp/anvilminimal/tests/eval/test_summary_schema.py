@@ -46,6 +46,9 @@ class SummarySchemaTest(unittest.TestCase):
                     "rc": "1",
                     "stop_reason": "verify_repair_exhausted",
                     "last_blocking_reason": "command failed",
+                    "planner_stage": "lint",
+                    "planner_error_kind": "planner_lint_error",
+                    "planner_schema_repaired": "true",
                     "extras_json": {"failure_kind": "tool_validation_error"},
                 }
             )
@@ -55,6 +58,10 @@ class SummarySchemaTest(unittest.TestCase):
             self.assertIn("| tool_validation_error | 1 |", report)
             self.assertIn("verify_repair_exhausted", report)
             self.assertIn("command failed", report)
+            self.assertIn("## Planner Failures", report)
+            self.assertIn("planner_lint_error", report)
+            self.assertIn("## Planner Repairs", report)
+            self.assertIn("schema_repaired", report)
 
 
 if __name__ == "__main__":

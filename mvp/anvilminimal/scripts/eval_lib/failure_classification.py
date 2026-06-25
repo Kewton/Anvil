@@ -11,6 +11,9 @@ KNOWN_FAILURE_KINDS = {
     "max_iterations_after_provider_error",
     "missing_tool_call",
     "path_confinement_error",
+    "phase_scaffold_error",
+    "planner_lint_error",
+    "planner_schema_error",
     "postcheck_failure",
     "provider_http_status",
     "provider_model_unavailable",
@@ -23,6 +26,7 @@ KNOWN_FAILURE_KINDS = {
     "tool_validation_error",
     "unclassified_process_failure",
     "verify_repair_exhausted",
+    "verify_command_policy_error",
 }
 
 
@@ -50,6 +54,16 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     )
     for event in reversed(events):
         name = event.get("event")
+        if name == "planner_error":
+            return {
+                "failure_kind": event.get("planner_error_kind", "planner_schema_error"),
+                "planner_stage": event.get("planner_stage", ""),
+                "planner_error_kind": event.get("planner_error_kind", ""),
+                "planner_error_message": event.get("planner_error_message", ""),
+                "planner_provider": event.get("planner_provider", ""),
+                "planner_model": event.get("planner_model", ""),
+                "planner_repair_attempts": event.get("repair_attempt", ""),
+            }
         if name == "loop_stop" and event.get("reason") == "verify_repair_exhausted":
             return {
                 "failure_kind": "verify_repair_exhausted",
@@ -110,6 +124,9 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
     lower = stderr.lower()
     if "missing string argument `" in stderr or "unknown tool:" in stderr:
         return {"failure_kind": "tool_validation_error"}
+    planner = classify_planner_stderr(stderr)
+    if planner:
+        return planner
     if "path does not exist:" in lower or "no such file or directory" in lower:
         return {"failure_kind": "tool_execution_error", "tool_error_kind": "path_missing"}
     if "function_call arguments" in stderr or "provider parse" in lower:
@@ -145,6 +162,46 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
     if str(rc) not in {"", "0", "None"}:
         return {"failure_kind": "unclassified_process_failure"}
     return {"failure_kind": "postcheck_failure"}
+
+
+def classify_planner_stderr(stderr: str) -> dict[str, Any]:
+    lower = stderr.lower()
+    if "stepplan missing goal" in lower or "stepplan has no steps" in lower:
+        return {
+            "failure_kind": "planner_schema_error",
+            "planner_stage": "schema",
+            "planner_error_kind": "planner_schema_error",
+        }
+    if "ultra phase must have id and prompt" in lower:
+        return {
+            "failure_kind": "planner_schema_error",
+            "planner_stage": "schema",
+            "planner_error_kind": "planner_schema_error",
+        }
+    if "verify command may not use shell control syntax" in lower or "verify command is blocked" in lower:
+        return {
+            "failure_kind": "verify_command_policy_error",
+            "planner_stage": "verify_policy",
+            "planner_error_kind": "verify_command_policy_error",
+        }
+    if (
+        "duplicate expected path ownership" in lower
+        or "implement step must declare concrete expected paths" in lower
+        or "verify command requires dependency setup or package manifest first" in lower
+        or "next.js build verify requires an entrypoint expected path first" in lower
+    ):
+        return {
+            "failure_kind": "planner_lint_error",
+            "planner_stage": "lint",
+            "planner_error_kind": "planner_lint_error",
+        }
+    if "phase scaffold failed" in lower:
+        return {
+            "failure_kind": "phase_scaffold_error",
+            "planner_stage": "scaffold",
+            "planner_error_kind": "phase_scaffold_error",
+        }
+    return {}
 
 
 def classify_failure(

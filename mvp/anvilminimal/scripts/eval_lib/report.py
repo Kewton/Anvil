@@ -18,6 +18,8 @@ def generate_report(run_root: Path) -> str:
     lines.extend(plan_rankings(rows))
     lines.extend(blocking_summary(rows))
     lines.extend(stop_reason_summary(rows))
+    lines.extend(planner_failure_summary(rows))
+    lines.extend(planner_repair_summary(rows))
     lines.extend(failure_summary(rows))
     return "\n".join(lines) + "\n"
 
@@ -96,6 +98,45 @@ def failure_summary(rows: list[dict[str, str]]) -> list[str]:
             lines.append(f"| {key} | {count} |")
     lines.append("")
     return lines
+
+
+def planner_failure_summary(rows: list[dict[str, str]]) -> list[str]:
+    counter = Counter()
+    for row in rows:
+        extras = parse_extras(row)
+        kind = row.get("planner_error_kind") or str(extras.get("planner_error_kind", ""))
+        if not kind:
+            continue
+        key = (
+            row.get("planner_provider", ""),
+            row.get("planner_model", ""),
+            row.get("planner_stage") or str(extras.get("planner_stage", "")),
+            kind,
+        )
+        counter[key] += 1
+    lines = ["## Planner Failures", "", "| provider | model | stage | kind | count |", "|---|---|---|---|---:|"]
+    if not counter:
+        lines.append("| none |  |  |  | 0 |")
+    else:
+        for (provider, model, stage, kind), count in sorted(counter.items()):
+            lines.append(f"| {provider} | {model} | {stage} | {kind} | {count} |")
+    lines.append("")
+    return lines
+
+
+def planner_repair_summary(rows: list[dict[str, str]]) -> list[str]:
+    repaired = [row for row in rows if row.get("planner_schema_repaired") == "true"]
+    raw_violations = [row for row in rows if row.get("planner_raw_schema_violation") == "true"]
+    parser_limitations = [row for row in rows if row.get("planner_parser_limitation") == "true"]
+    prompt_issues = [row for row in rows if row.get("planner_prompt_issue") == "true"]
+    rows_out = [
+        {"metric": "schema_repaired", "count": str(len(repaired))},
+        {"metric": "raw_schema_violation", "count": str(len(raw_violations))},
+        {"metric": "parser_limitation", "count": str(len(parser_limitations))},
+        {"metric": "prompt_issue", "count": str(len(prompt_issues))},
+    ]
+    lines = ["## Planner Repairs", ""]
+    return lines + table_rows(rows_out, ["metric", "count"])
 
 
 def stop_reason_summary(rows: list[dict[str, str]]) -> list[str]:

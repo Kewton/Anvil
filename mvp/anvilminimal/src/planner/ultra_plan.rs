@@ -53,6 +53,7 @@ pub fn render_ultra_plan(plan: &UltraPlan) -> String {
 }
 
 pub fn parse_ultra_plan(text: &str) -> anyhow::Result<UltraPlan> {
+    let text = extract_yaml(text);
     let mut goal = String::new();
     let mut profile = "generic".to_string();
     let mut style = "default".to_string();
@@ -104,6 +105,17 @@ pub fn parse_ultra_plan(text: &str) -> anyhow::Result<UltraPlan> {
     })
 }
 
+fn extract_yaml(text: &str) -> &str {
+    if let Some(start) = text.find("```") {
+        let after = &text[start + 3..];
+        let after = after.strip_prefix("yaml").unwrap_or(after);
+        if let Some(end) = after.find("```") {
+            return &after[..end];
+        }
+    }
+    text
+}
+
 fn unquote(value: &str) -> String {
     let value = value.trim();
     if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
@@ -121,5 +133,12 @@ mod tests {
     fn ultra_yaml_round_trip() {
         let plan = UltraPlan::deterministic("goal", "nextjs", "default", "create");
         assert_eq!(parse_ultra_plan(&render_ultra_plan(&plan)).unwrap(), plan);
+    }
+
+    #[test]
+    fn fenced_yaml_is_supported() {
+        let plan = UltraPlan::deterministic("goal", "nextjs", "default", "create");
+        let text = format!("```yaml\n{}\n```", render_ultra_plan(&plan));
+        assert_eq!(parse_ultra_plan(&text).unwrap(), plan);
     }
 }

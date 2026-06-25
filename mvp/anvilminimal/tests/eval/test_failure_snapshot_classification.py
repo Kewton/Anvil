@@ -41,6 +41,34 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
         self.assertEqual(classified["failure_kind"], "provider_transient_exhausted")
         self.assertEqual(provider["expected_failure_kind_after_fix"], "provider_transient_exhausted")
 
+    def test_planner_20260625_unclassified_fixture_is_classified(self):
+        fixture = ROOT / "eval/fixtures/planner_failures/20260625_speed_cloud_unclassified.json"
+        entries = json.loads(fixture.read_text(encoding="utf-8"))
+        self.assertEqual(len(entries), 28)
+        for entry in entries:
+            with self.subTest(entry["id"]):
+                classified = classify_stderr(entry["stderr"], rc=1, timeout=False)
+                self.assertEqual(classified["failure_kind"], entry["expected_failure_kind"])
+                self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+    def test_planner_error_event_wins_over_stderr(self):
+        classified = classify_events(
+            [
+                {
+                    "event": "planner_error",
+                    "planner_stage": "lint",
+                    "planner_error_kind": "planner_lint_error",
+                    "planner_error_message": "implement step must declare concrete expected paths",
+                    "planner_provider": "openai",
+                    "planner_model": "gpt-5.4-mini",
+                    "repair_attempt": 2,
+                }
+            ]
+        )
+        self.assertEqual(classified["failure_kind"], "planner_lint_error")
+        self.assertEqual(classified["planner_stage"], "lint")
+        self.assertEqual(classified["planner_repair_attempts"], 2)
+
     def test_unknown_process_failure_is_explicitly_unclassified(self):
         classified = classify_stderr("error: something opaque", rc=1, timeout=False)
         self.assertEqual(classified["failure_kind"], "unclassified_process_failure")

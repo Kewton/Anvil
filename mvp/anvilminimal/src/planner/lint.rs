@@ -2,9 +2,64 @@ use crate::planner::step_plan::{ExpectedResult, StepKind, StepPlan};
 use crate::planner::ultra_plan::UltraPlan;
 use crate::tools::path_guard::validate_workspace_relative;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanLintReport {
+    pub errors: Vec<PlanLintError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanLintError {
+    pub category: String,
+    pub message: String,
+}
+
+impl PlanLintReport {
+    pub fn pass() -> Self {
+        Self { errors: Vec::new() }
+    }
+
+    pub fn is_pass(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    pub fn push(&mut self, category: impl Into<String>, message: impl Into<String>) {
+        self.errors.push(PlanLintError {
+            category: category.into(),
+            message: message.into(),
+        });
+    }
+
+    pub fn primary_message(&self) -> String {
+        self.errors
+            .first()
+            .map(|err| err.message.clone())
+            .unwrap_or_else(|| "pass".to_string())
+    }
+
+    pub fn primary_category(&self) -> String {
+        self.errors
+            .first()
+            .map(|err| err.category.clone())
+            .unwrap_or_else(|| "pass".to_string())
+    }
+
+    pub fn has_category(&self, category: &str) -> bool {
+        self.errors.iter().any(|err| err.category == category)
+    }
+}
+
 pub fn lint_step_plan(plan: &StepPlan) -> anyhow::Result<()> {
+    let report = lint_step_plan_report(plan);
+    if report.is_pass() {
+        return Ok(());
+    }
+    anyhow::bail!("{}", report.primary_message())
+}
+
+pub fn lint_step_plan_report(plan: &StepPlan) -> PlanLintReport {
+    let mut report = PlanLintReport::pass();
     if plan.steps.len() > 12 {
-        anyhow::bail!("StepPlan has too many steps");
+        report.push("contract", "StepPlan has too many steps");
     }
     let mut ids = std::collections::BTreeSet::new();
     let mut path_owners = std::collections::BTreeMap::new();
@@ -12,31 +67,51 @@ pub fn lint_step_plan(plan: &StepPlan) -> anyhow::Result<()> {
     let mut setup_seen = false;
     for step in &plan.steps {
         if step.id.trim().is_empty() {
-            anyhow::bail!("step id is empty");
+            report.push("contract", "step id is empty");
         }
         if !ids.insert(step.id.as_str()) {
-            anyhow::bail!("duplicate step id: {}", step.id);
+            report.push("contract", format!("duplicate step id: {}", step.id));
         }
         if looks_like_shell_command(&step.instruction) {
-            anyhow::bail!("step instruction must be natural language, not a shell command");
+            report.push(
+                "contract",
+                "step instruction must be natural language, not a shell command",
+            );
         }
-        validate_step_kind_contract(step)?;
+        if let Err(err) = validate_step_kind_contract(step) {
+            report.push("contract", err.to_string());
+        }
         for path in &step.expected_paths {
-            validate_workspace_relative(path)?;
+            if let Err(err) = validate_workspace_relative(path) {
+                report.push("contract", err.to_string());
+                continue;
+            }
             if let Some(owner) = path_owners.insert(path.as_str(), step.id.as_str()) {
-                anyhow::bail!(
-                    "duplicate expected path ownership: {path} in {owner} and {}",
-                    step.id
+                report.push(
+                    "path_ownership",
+                    format!(
+                        "duplicate expected path ownership: {path} in {owner} and {}",
+                        step.id
+                    ),
                 );
             }
         }
         for command in &step.verify {
-            crate::planner::verify::validate_verify_command(command)?;
+            if let Err(err) = crate::planner::verify::validate_verify_command(command) {
+                report.push("verify_policy", err.to_string());
+                continue;
+            }
             if is_build_verify(command) && !setup_seen && !step_creates_dependency_manifest(step) {
-                anyhow::bail!("verify command requires dependency setup or package manifest first");
+                report.push(
+                    "dependency_order",
+                    "verify command requires dependency setup or package manifest first",
+                );
             }
             if is_nextjs_build(command) && !has_nextjs_entrypoint(&seen_paths, step) {
-                anyhow::bail!("Next.js build verify requires an entrypoint expected path first");
+                report.push(
+                    "dependency_order",
+                    "Next.js build verify requires an entrypoint expected path first",
+                );
             }
         }
         if step.step_kind() == StepKind::Setup || step_creates_dependency_manifest(step) {
@@ -46,7 +121,7 @@ pub fn lint_step_plan(plan: &StepPlan) -> anyhow::Result<()> {
             seen_paths.insert(path.as_str());
         }
     }
-    Ok(())
+    report
 }
 
 fn validate_step_kind_contract(step: &crate::planner::step_plan::PlanStep) -> anyhow::Result<()> {
@@ -145,22 +220,34 @@ fn looks_like_file_change_instruction(instruction: &str) -> bool {
 }
 
 pub fn lint_ultra_plan(plan: &UltraPlan) -> anyhow::Result<()> {
+    let report = lint_ultra_plan_report(plan);
+    if report.is_pass() {
+        return Ok(());
+    }
+    anyhow::bail!("{}", report.primary_message())
+}
+
+pub fn lint_ultra_plan_report(plan: &UltraPlan) -> PlanLintReport {
+    let mut report = PlanLintReport::pass();
     if !(2..=8).contains(&plan.phases.len()) {
-        anyhow::bail!("UltraPlan must have 2-8 phases");
+        report.push("scaffold", "UltraPlan must have 2-8 phases");
     }
     let mut ids = std::collections::BTreeSet::new();
     for phase in &plan.phases {
         if phase.id.trim().is_empty() || phase.prompt.trim().is_empty() {
-            anyhow::bail!("ultra phase must have id and prompt");
+            report.push("scaffold", "ultra phase must have id and prompt");
         }
         if !ids.insert(phase.id.as_str()) {
-            anyhow::bail!("duplicate ultra phase id: {}", phase.id);
+            report.push(
+                "scaffold",
+                format!("duplicate ultra phase id: {}", phase.id),
+            );
         }
         if phase.prompt.trim_start().starts_with('/') {
-            anyhow::bail!("ultra phase prompt must not be a REPL command");
+            report.push("scaffold", "ultra phase prompt must not be a REPL command");
         }
     }
-    Ok(())
+    report
 }
 
 fn looks_like_shell_command(value: &str) -> bool {
@@ -318,11 +405,89 @@ mod tests {
     }
 
     #[test]
+    fn plan_lint_report_aggregates_multiple_errors() {
+        let plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "s1".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create first".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: vec!["npm test && npm run build".to_string()],
+                },
+                PlanStep {
+                    id: "s2".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create second".to_string(),
+                    expected_paths: vec!["out.txt".to_string()],
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "s3".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create duplicate".to_string(),
+                    expected_paths: vec!["out.txt".to_string()],
+                    verify: Vec::new(),
+                },
+            ],
+        };
+        let report = lint_step_plan_report(&plan);
+        assert!(report.has_category("contract"));
+        assert!(report.has_category("verify_policy"));
+        assert!(report.has_category("path_ownership"));
+        assert!(report.errors.len() >= 3);
+    }
+
+    #[test]
+    fn lint_step_plan_wrapper_preserves_existing_first_error() {
+        let plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![PlanStep {
+                id: "s1".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create result".to_string(),
+                expected_paths: Vec::new(),
+                verify: Vec::new(),
+            }],
+        };
+        let err = lint_step_plan(&plan).unwrap_err().to_string();
+        assert!(err.contains("implement step must declare concrete expected paths"));
+    }
+
+    #[test]
     fn duplicate_expected_path_ownership_is_rejected() {
         let plan = StepPlan {
             goal: "goal".to_string(),
             steps: vec![step("s1", "Create file"), step("s2", "Update file")],
         };
         assert!(lint_step_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn ultra_plan_lint_report_uses_same_category_vocabulary() {
+        let plan = UltraPlan {
+            goal: "goal".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "".to_string(),
+                    prompt: "".to_string(),
+                },
+                UltraPhase {
+                    id: "x".to_string(),
+                    prompt: "/plan-run do it".to_string(),
+                },
+            ],
+        };
+        let report = lint_ultra_plan_report(&plan);
+        assert!(report.has_category("scaffold"));
+        assert!(report.errors.len() >= 2);
     }
 }

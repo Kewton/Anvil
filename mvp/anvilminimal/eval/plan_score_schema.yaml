@@ -30,6 +30,14 @@ summary_eval_tsv_header:
   - last_provider_http_status
   - provider_attempts
   - fallback_decision
+  - planner_stage
+  - planner_error_kind
+  - planner_error_count
+  - planner_repair_attempts
+  - planner_schema_repaired
+  - planner_raw_schema_violation
+  - planner_parser_limitation
+  - planner_prompt_issue
   - plan_quality_score
   - ultra_phase_quality_score
   - execution_score

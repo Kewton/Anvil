@@ -311,6 +311,14 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "last_provider_http_status": diagnostics["last_provider_http_status"],
             "provider_attempts": diagnostics["provider_attempts"],
             "fallback_decision": diagnostics["fallback_decision"],
+            "planner_stage": diagnostics["planner_stage"],
+            "planner_error_kind": diagnostics["planner_error_kind"],
+            "planner_error_count": diagnostics["planner_error_count"],
+            "planner_repair_attempts": diagnostics["planner_repair_attempts"],
+            "planner_schema_repaired": diagnostics["planner_schema_repaired"],
+            "planner_raw_schema_violation": diagnostics["planner_raw_schema_violation"],
+            "planner_parser_limitation": diagnostics["planner_parser_limitation"],
+            "planner_prompt_issue": diagnostics["planner_prompt_issue"],
             "plan_quality_score": plan_score if plan_score is not None else "",
             "ultra_phase_quality_score": ultra_score if ultra_score is not None else "",
             "execution_score": execution_score,
@@ -340,6 +348,13 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
         (event for event in reversed(events) if event.get("event") == "fallback_decision"),
         {},
     )
+    planner_errors = [
+        event for event in events if event.get("event") == "planner_error"
+    ]
+    planner_schema_repairs = [
+        event for event in events if event.get("event") == "planner_schema_repaired"
+    ]
+    planner_error = planner_errors[-1] if planner_errors else {}
     tool_error = next(
         (
             event
@@ -368,6 +383,29 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
             provider_error.get("attempt", provider_response.get("attempt", ""))
         ),
         "fallback_decision": fallback_decision_cell(fallback),
+        "planner_stage": str(planner_error.get("planner_stage", "")),
+        "planner_error_kind": str(planner_error.get("planner_error_kind", "")),
+        "planner_error_count": str(len(planner_errors)) if planner_errors else "",
+        "planner_repair_attempts": str(planner_error.get("repair_attempt", "")),
+        "planner_schema_repaired": str(bool(planner_schema_repairs)).lower()
+        if planner_schema_repairs
+        else "",
+        "planner_raw_schema_violation": str(any(
+            event.get("planner_stage") == "schema" for event in planner_errors
+        )).lower()
+        if planner_errors
+        else "",
+        "planner_parser_limitation": str(any(
+            "parser" in str(event.get("planner_error_message", "")).lower()
+            for event in planner_errors
+        )).lower()
+        if planner_errors
+        else "",
+        "planner_prompt_issue": str(any(
+            event.get("planner_stage") == "lint" for event in planner_errors
+        )).lower()
+        if planner_errors
+        else "",
     }
 
 

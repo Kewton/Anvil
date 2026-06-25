@@ -188,7 +188,7 @@ fn interrupt_boundaries_stop_before_model_call() {
 #[test]
 fn planner_uses_ui_for_planner_model_call() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = "goal: test\nsteps:\n  - id: s1\n    instruction: say done\n";
+    let yaml = "goal: test\nsteps:\n  - id: s1\n    kind: report\n    instruction: say done\n";
     let mut planner = FakeClient::new("planner", vec![AssistantReply::text(yaml)]);
     let ui = FakeUi::default();
     let plan =

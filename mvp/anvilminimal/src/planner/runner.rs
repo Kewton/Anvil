@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::eval_events;
 use crate::minimal_loop::loop_run::run_session_with_outcome_with_ui;
 use crate::planner::intent::detect_intent;
-use crate::planner::lint::{lint_step_plan, lint_ultra_plan};
+use crate::planner::lint::{PlanLintReport, lint_step_plan_report, lint_ultra_plan_report};
 use crate::planner::profile::{
     profile_after_phase, profile_auto_repair, profile_before_phase, profile_expected_paths,
     profile_guidance, profile_repair_prompt, verify_profile,
@@ -11,13 +12,16 @@ use crate::planner::profile::{
 use crate::planner::repair::{
     RepairContext, build_repair_prompt_with_context, save_repair_report_with_context,
 };
-use crate::planner::step_plan::{PlanStep, StepPlan, parse_step_plan, render_step_plan};
+use crate::planner::step_plan::{
+    PlanStep, StepPlan, parse_step_plan, parse_step_plan_with_default_goal, render_step_plan,
+};
 use crate::planner::ultra_plan::{UltraPlan, parse_ultra_plan, render_ultra_plan};
 use crate::planner::verify::{VerificationReport, verify_step};
 use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
 use crate::tui::status::UiStatus;
 use crate::tui::{InteractionUi, NOOP_UI};
+use serde_json::json;
 
 const STEP_TURN_MAX_ITERATIONS: usize = 8;
 const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
@@ -66,19 +70,40 @@ pub fn generate_step_plan_with_ui(
             reply.prompt_tokens,
             reply.completion_tokens,
         ));
-        match parse_step_plan(&reply.content) {
-            Ok(mut plan) => {
+        match parse_step_plan_with_default_goal(&reply.content, goal) {
+            Ok((mut plan, repaired)) => {
+                if repaired {
+                    emit_planner_schema_repaired(
+                        config,
+                        client.label(),
+                        model,
+                        "schema",
+                        "StepPlan missing goal",
+                        attempt,
+                    );
+                }
                 strengthen_step_plan_for_profile(&mut plan, config);
-                return Ok(plan);
+                let lint_report = lint_step_plan_report(&plan);
+                if lint_report.is_pass() {
+                    return Ok(plan);
+                }
+                let message = lint_report.primary_message();
+                emit_planner_error_for_lint(config, client.label(), model, &lint_report, attempt);
+                last_error = Some(message.clone());
+                prompt = build_lint_retry_prompt(goal, &lint_report, attempt);
             }
             Err(err) => {
                 last_error = Some(err.to_string());
-                prompt = format!(
-                    "Your previous StepPlan output was invalid on attempt {attempt}/3: {}.\n\
-Return only YAML with this exact shape:\n\
-goal: \"...\"\nsteps:\n  - id: \"step-1\"\n    kind: \"work\"\n    instruction: \"...\"\n    expected_paths:\n      - \"relative/path\"\n    verify:\n      - \"command\"\n\nGoal: {goal}",
-                    last_error.as_deref().unwrap_or("invalid YAML")
+                emit_planner_error(
+                    config,
+                    client.label(),
+                    model,
+                    "schema",
+                    "planner_schema_error",
+                    &err.to_string(),
+                    attempt,
                 );
+                prompt = build_schema_retry_prompt(goal, &err.to_string(), attempt);
             }
         }
     }
@@ -151,7 +176,11 @@ pub fn run_step_plan_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<String> {
-    lint_step_plan(plan)?;
+    let report = lint_step_plan_report(plan);
+    if !report.is_pass() {
+        emit_planner_error_for_lint(config, "plan-file", &config.planner_model, &report, 0);
+        anyhow::bail!("{}", report.primary_message());
+    }
     let mut session = SessionSnapshot::new();
     for step in &plan.steps {
         if ui.interrupted() {
@@ -291,14 +320,55 @@ pub fn generate_ultra_plan_with_ui(
         reply.prompt_tokens,
         reply.completion_tokens,
     ));
-    parse_ultra_plan(&reply.content).or_else(|_| {
-        Ok(UltraPlan::deterministic(
-            goal,
-            &config.profile,
-            &config.style,
-            detect_intent(goal),
-        ))
-    })
+    match parse_ultra_plan(&reply.content) {
+        Ok(plan) => {
+            let report = lint_ultra_plan_report(&plan);
+            if report.is_pass() {
+                Ok(plan)
+            } else {
+                emit_planner_error_for_lint(config, client.label(), model, &report, 1);
+                emit_planner_schema_repaired(
+                    config,
+                    client.label(),
+                    model,
+                    "scaffold",
+                    &report.primary_message(),
+                    1,
+                );
+                Ok(UltraPlan::deterministic(
+                    goal,
+                    &config.profile,
+                    &config.style,
+                    detect_intent(goal),
+                ))
+            }
+        }
+        Err(err) => {
+            emit_planner_error(
+                config,
+                client.label(),
+                model,
+                "schema",
+                "planner_schema_error",
+                &err.to_string(),
+                1,
+            );
+            emit_planner_schema_repaired(
+                config,
+                client.label(),
+                model,
+                "schema",
+                &err.to_string(),
+                1,
+            );
+            Ok(UltraPlan::deterministic(
+                goal,
+                &config.profile,
+                &config.style,
+                detect_intent(goal),
+            ))
+        }
+    }
 }
 
 pub fn save_ultra_plan(root: &Path, plan: &UltraPlan) -> anyhow::Result<PathBuf> {
@@ -368,14 +438,30 @@ pub fn run_ultra_plan_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<String> {
-    lint_ultra_plan(plan)?;
+    let report = lint_ultra_plan_report(plan);
+    if !report.is_pass() {
+        emit_planner_error_for_lint(config, "ultra-plan-file", &config.planner_model, &report, 0);
+        anyhow::bail!("{}", report.primary_message());
+    }
     for (index, phase) in plan.phases.iter().enumerate() {
         if ui.interrupted() {
             anyhow::bail!("interrupted by user");
         }
         let profile_snapshot = profile_before_phase(&config.workspace_root, &plan.profile)?;
         let phase_prompt = ultra_phase_prompt(plan, &phase.prompt, config);
-        let step_plan = generate_step_plan_with_ui(planner, &phase_prompt, config, ui)?;
+        let step_plan =
+            generate_step_plan_with_ui(planner, &phase_prompt, config, ui).map_err(|err| {
+                emit_planner_error(
+                    config,
+                    planner.label(),
+                    &config.planner_model,
+                    "scaffold",
+                    "phase_scaffold_error",
+                    &format!("phase scaffold failed: {}", err),
+                    index + 1,
+                );
+                anyhow::anyhow!("phase scaffold failed: {}", err)
+            })?;
         save_step_plan(&config.workspace_root, &step_plan)?;
         run_step_plan_with_ui(execution, &step_plan, config, ui)
             .map_err(|err| anyhow::anyhow!("phase {} failed: {err}", phase.id))?;
@@ -448,6 +534,112 @@ pub fn run_ultra_plan_with_ui(
         "ultra-plan-run complete: {} phases",
         plan.phases.len()
     ))
+}
+
+fn emit_planner_error_for_lint(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    report: &PlanLintReport,
+    attempt: usize,
+) {
+    let (stage, kind) = planner_stage_and_kind_for_lint(report);
+    emit_planner_error(
+        config,
+        provider,
+        model,
+        stage,
+        kind,
+        &report.primary_message(),
+        attempt,
+    );
+}
+
+fn emit_planner_error(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    stage: &str,
+    kind: &str,
+    message: &str,
+    attempt: usize,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "planner_error",
+            "planner_stage": stage,
+            "planner_error_kind": kind,
+            "planner_error_message": eval_events::body_snippet(message),
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+        }),
+    );
+}
+
+fn emit_planner_schema_repaired(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    stage: &str,
+    message: &str,
+    attempt: usize,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "planner_schema_repaired",
+            "planner_stage": stage,
+            "planner_error_kind": "planner_schema_repaired",
+            "planner_error_message": eval_events::body_snippet(message),
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+        }),
+    );
+}
+
+fn planner_stage_and_kind_for_lint(report: &PlanLintReport) -> (&'static str, &'static str) {
+    if report.has_category("verify_policy") {
+        ("verify_policy", "verify_command_policy_error")
+    } else if report.has_category("scaffold") {
+        ("scaffold", "phase_scaffold_error")
+    } else {
+        ("lint", "planner_lint_error")
+    }
+}
+
+fn build_schema_retry_prompt(goal: &str, error: &str, attempt: usize) -> String {
+    format!(
+        "Your previous StepPlan output failed schema validation on attempt {attempt}/3: {error}.\n\
+Return only YAML. Include top-level `goal` and non-empty `steps` exactly like this:\n\
+goal: \"{goal}\"\nsteps:\n  - id: \"step-1\"\n    kind: \"implement\"\n    expected_result: \"pass\"\n    instruction: \"Create the required files for the goal.\"\n    expected_paths:\n      - \"relative/path\"\n    verify:\n      - \"command\"\n\nGoal: {goal}"
+    )
+}
+
+fn build_lint_retry_prompt(goal: &str, report: &PlanLintReport, attempt: usize) -> String {
+    let guidance = if report.has_category("verify_policy") {
+        "Do not use shell control syntax such as &&, ||, |, or ; in verify commands. Split each verify command into a separate YAML list item."
+    } else if report.has_category("path_ownership") {
+        "Do not assign the same expected path to multiple steps. Each output path must have exactly one owning implement step."
+    } else if report.has_category("dependency_order") {
+        "Put package manifest and dependency setup before build/test verify steps. Do not verify before the files needed by that command exist."
+    } else {
+        "Implement steps must declare concrete workspace-relative expected_paths. Inspect/report steps must not declare expected paths or verify commands."
+    };
+    let errors = report
+        .errors
+        .iter()
+        .map(|err| format!("- [{}] {}", err.category, err.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Your previous StepPlan failed deterministic lint on attempt {attempt}/3.\n\
+Fix these issues without weakening safety rules:\n{errors}\n\n\
+{guidance}\n\n\
+Return only YAML with goal and steps. Goal: {goal}"
+    )
 }
 
 fn strengthen_step_plan_for_profile(plan: &mut StepPlan, config: &Config) {
@@ -575,6 +767,66 @@ mod tests {
             generate_step_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
         assert_eq!(plan.goal, "goal");
         assert_eq!(plan.steps.len(), 1);
+    }
+
+    #[test]
+    fn missing_goal_is_repaired_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut planner = FakeClient::new(vec![AssistantReply::text(
+            r#"steps:
+  - id: "s1"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create file"
+    expected_paths:
+      - "out.txt"
+"#,
+        )]);
+        let plan = generate_step_plan(&mut planner, "goal", &cfg).unwrap();
+        assert_eq!(plan.goal, "goal");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("planner_schema_repaired"));
+    }
+
+    #[test]
+    fn verify_policy_error_gets_corrective_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid = r#"goal: "goal"
+steps:
+  - id: "s1"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create app"
+    expected_paths:
+      - "package.json"
+    verify:
+      - "node check.js && node check2.js"
+"#;
+        let valid = r#"goal: "goal"
+steps:
+  - id: "s1"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create app"
+    expected_paths:
+      - "package.json"
+    verify:
+      - "node check.js"
+      - "node check2.js"
+"#;
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(invalid),
+            AssistantReply::text(valid),
+        ]);
+        let plan =
+            generate_step_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
+        assert_eq!(
+            plan.steps[0].verify,
+            vec!["node check.js".to_string(), "node check2.js".to_string()]
+        );
     }
 
     #[test]
