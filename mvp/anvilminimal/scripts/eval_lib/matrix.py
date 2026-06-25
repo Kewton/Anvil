@@ -9,6 +9,7 @@ from .models import ModelRef, cli_model_args
 from .suites import prompt_with_required_final_artifacts
 
 VALID_MODES = {"minimal-loop", "step-plan", "plan-run", "ultra-plan-run", "ultra-step-run"}
+VALID_BINARY_KINDS = {"anvilminimal", "anvildev"}
 
 
 def parse_modes(value: str) -> list[str]:
@@ -26,9 +27,11 @@ def expand_matrix(
     runs: int,
     context_budget: int,
     binary: str = "anvilminimal",
+    binary_kind: str = "auto",
     scenario_filter: str | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    resolved_binary_kind = resolve_binary_kind(binary, binary_kind)
     scenarios = suite["scenarios"]
     if scenario_filter:
         scenarios = [s for s in scenarios if s["id"] == scenario_filter]
@@ -62,9 +65,12 @@ def expand_matrix(
                         "port_mutex": scenario_port_mutex(scenario),
                         "provider_limits": profile.get("provider_limit", 2),
                         "chat_retries": int(profile.get("chat_retries", 1)),
+                        "binary": binary,
+                        "binary_kind": resolved_binary_kind,
                     }
                     row["command"] = render_command(
                         binary=binary,
+                        binary_kind=resolved_binary_kind,
                         mode=mode,
                         scenario=scenario,
                         main=main,
@@ -78,6 +84,17 @@ def expand_matrix(
     return rows
 
 
+def resolve_binary_kind(binary: str, binary_kind: str = "auto") -> str:
+    if binary_kind != "auto":
+        if binary_kind not in VALID_BINARY_KINDS:
+            raise ValueError(f"unknown binary kind: {binary_kind}")
+        return binary_kind
+    name = Path(binary).name
+    if name in {"anvildev", "anvil"}:
+        return "anvildev"
+    return "anvilminimal"
+
+
 def scenario_port_mutex(scenario: dict[str, Any]) -> int | None:
     dev = scenario.get("postcheck", {}).get("dev_server")
     if dev and dev.get("port"):
@@ -89,6 +106,7 @@ def scenario_port_mutex(scenario: dict[str, Any]) -> int | None:
 
 def render_command(
     binary: str,
+    binary_kind: str,
     mode: str,
     scenario: dict[str, Any],
     main: ModelRef,
@@ -97,26 +115,57 @@ def render_command(
     workdir: Path,
     chat_retries: int = 1,
 ) -> list[str]:
-    base = [
-        binary,
-        "--yes",
-        "--context-budget",
-        str(context_budget),
-        "--chat-retries",
-        str(chat_retries),
-        *cli_model_args(main, planner),
-        "--cwd",
-        str(workdir),
-    ]
+    if binary_kind == "anvilminimal":
+        base = [
+            binary,
+            "--yes",
+            "--context-budget",
+            str(context_budget),
+            "--chat-retries",
+            str(chat_retries),
+            *cli_model_args(main, planner),
+            "--profile",
+            scenario.get("profile", "generic"),
+            "--cwd",
+            str(workdir),
+        ]
+    elif binary_kind == "anvildev":
+        base = [
+            binary,
+            "--engine",
+            "minimal",
+            "--yes",
+            "--context-budget",
+            str(context_budget),
+            "--chat-retries",
+            str(chat_retries),
+            *cli_model_args(main, planner),
+            "--cwd",
+            str(workdir),
+        ]
+    else:
+        raise ValueError(f"unknown binary kind: {binary_kind}")
     prompt = prompt_with_required_final_artifacts(scenario)
-    if mode == "minimal-loop":
-        return [*base, "--prompt", prompt]
-    if mode == "step-plan":
-        return [*base, "--plan-steps", prompt]
-    if mode == "plan-run":
-        return [*base, "--plan-run", prompt]
-    if mode == "ultra-plan-run":
-        return [*base, "--ultra-plan-run", "--profile", scenario.get("profile", "generic"), prompt]
-    if mode == "ultra-step-run":
-        return [*base, "--run-plan", "<phase-step-plan.yaml>"]
+    if binary_kind == "anvilminimal":
+        if mode == "minimal-loop":
+            return [*base, "--prompt", prompt]
+        if mode == "step-plan":
+            return [*base, "--plan-steps", prompt]
+        if mode == "plan-run":
+            return [*base, "--plan-run", prompt]
+        if mode == "ultra-plan-run":
+            return [*base, "--ultra-plan-run", prompt]
+        if mode == "ultra-step-run":
+            return [*base, "--run-plan", "<phase-step-plan.yaml>"]
+    if binary_kind == "anvildev":
+        if mode == "minimal-loop":
+            return [*base, "--prompt", prompt]
+        if mode == "step-plan":
+            return [*base, "--plan-steps", prompt]
+        if mode == "plan-run":
+            return [*base, "--plan-run", prompt]
+        if mode == "ultra-plan-run":
+            return [*base, "--ultra-plan-run", prompt, "--profile", scenario.get("profile", "generic")]
+        if mode == "ultra-step-run":
+            return [*base, "--run-plan", "<phase-step-plan.yaml>"]
     raise ValueError(f"unknown mode: {mode}")

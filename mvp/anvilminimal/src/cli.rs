@@ -50,7 +50,7 @@ pub struct Cli {
     pub offline: bool,
     #[arg(long, default_value = "http://localhost:11434")]
     pub ollama_host: String,
-    #[arg(long, default_value_t = 2_048)]
+    #[arg(long, default_value_t = 8_192)]
     pub num_predict: usize,
     #[arg(long, default_value_t = 12)]
     pub max_iterations: usize,
@@ -107,6 +107,12 @@ mod tests {
     fn sidecar_model_is_rejected_by_default() {
         let err = Cli::try_parse_from(["anvilminimal", "--sidecar-model", "x"]).unwrap_err();
         assert!(err.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn num_predict_defaults_to_source_minimal_budget() {
+        let cli = Cli::parse_from(["anvilminimal"]);
+        assert_eq!(cli.num_predict, 8_192);
     }
 
     #[test]

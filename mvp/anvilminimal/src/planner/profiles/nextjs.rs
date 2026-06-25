@@ -72,6 +72,9 @@ pub fn verify(root: &Path, goal: &str) -> VerificationReport {
     if let Some(reason) = tsconfig_contract_failure(&project.path) {
         return profile_failure(reason);
     }
+    if let Some(reason) = css_side_effect_import_contract_failure(&project.path) {
+        return profile_failure(reason);
+    }
     if let Some(reason) = tailwind_contract_failure(&project.path, &package) {
         return profile_failure(reason);
     }
@@ -87,8 +90,13 @@ pub fn guidance(goal: &str) -> String {
     format!(
         "For the nextjs profile, create a runnable Next.js app, not only package metadata. \
          Keep the project in the workspace root unless a project subdirectory already exists. \
-         Required artifacts by completion: package.json, src/app/page.tsx, src/app/layout.tsx. \
-         package.json must include next, react, react-dom and scripts.build = `next build`.{port}"
+         Required artifacts by completion: package.json, src/app/page.tsx, src/app/layout.tsx, src/app/global.d.ts. \
+         If those files are absent, write package.json, src/app/layout.tsx, src/app/page.tsx, and src/app/global.d.ts before further inspection. \
+         If any layout imports CSS such as ./globals.css, src/app/global.d.ts must declare module \"*.css\". \
+         package.json must include next, react, react-dom and scripts.build = `next build`. \
+         For TypeScript/TSX apps, create tsconfig.json before treating the app as complete. \
+         Do not use deprecated moduleResolution=node10; use bundler or node16, \
+         or set ignoreDeprecations to 6.0 when needed.{port}"
     )
 }
 
@@ -98,6 +106,7 @@ pub fn expected_paths(root: &Path, goal: &str) -> Vec<String> {
     if !goal.to_ascii_lowercase().contains("scaffold") {
         paths.push(format!("{prefix}src/app/page.tsx"));
         paths.push(format!("{prefix}src/app/layout.tsx"));
+        paths.push(format!("{prefix}src/app/global.d.ts"));
     }
     paths
 }
@@ -141,6 +150,10 @@ pub fn auto_repair(root: &Path, goal: &str, report: &VerificationReport) -> anyh
     ensure_file(
         &project.path.join("src/app/globals.css"),
         "* { box-sizing: border-box; }\nhtml, body { margin: 0; min-height: 100%; background: #05070d; color: #eef7ff; }\nbutton { font: inherit; }\n",
+    )?;
+    ensure_file(
+        &project.path.join("src/app/global.d.ts"),
+        "declare module \"*.css\";\n",
     )?;
     ensure_file(
         &project.path.join("src/app/layout.tsx"),
@@ -577,12 +590,64 @@ fn tsconfig_contract_failure(root: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&content).ok()?;
     let compiler = value.get("compilerOptions").and_then(Value::as_object)?;
+    if compiler
+        .get("moduleResolution")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.eq_ignore_ascii_case("node10"))
+    {
+        return Some(
+            "tsconfig.moduleResolution=node10 is deprecated for Next.js builds; use bundler or node16"
+                .to_string(),
+        );
+    }
     let root_dir = compiler.get("rootDir").and_then(Value::as_str)?;
-    if matches!(root_dir, "." | "./") {
+    if !matches!(root_dir, "." | "./") {
+        Some("tsconfig.rootDir must not constrain Next.js generated files".to_string())
+    } else {
+        None
+    }
+}
+
+fn css_side_effect_import_contract_failure(root: &Path) -> Option<String> {
+    let imports_css = [
+        "src/app/layout.tsx",
+        "src/app/layout.ts",
+        "app/layout.tsx",
+        "app/layout.ts",
+    ]
+    .iter()
+    .any(|rel| {
+        std::fs::read_to_string(root.join(rel))
+            .is_ok_and(|content| content.contains(".css\"") || content.contains(".css'"))
+    });
+    if !imports_css {
+        return None;
+    }
+    if css_module_declaration_exists(root) {
         None
     } else {
-        Some("tsconfig.rootDir must not constrain Next.js generated files".to_string())
+        Some(
+            "CSS side-effect imports require a declaration file such as src/app/global.d.ts with declare module \"*.css\""
+                .to_string(),
+        )
     }
+}
+
+fn css_module_declaration_exists(root: &Path) -> bool {
+    for rel in [
+        "src/app/global.d.ts",
+        "src/global.d.ts",
+        "global.d.ts",
+        "app/global.d.ts",
+    ] {
+        if std::fs::read_to_string(root.join(rel)).is_ok_and(|content| {
+            content.contains("declare module \"*.css\"")
+                || content.contains("declare module '*.css'")
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 fn alias_configured(tsconfig: &Value) -> bool {
@@ -708,9 +773,45 @@ mod tests {
             vec![
                 "space-invaders/package.json",
                 "space-invaders/src/app/page.tsx",
-                "space-invaders/src/app/layout.tsx"
+                "space-invaders/src/app/layout.tsx",
+                "space-invaders/src/app/global.d.ts"
             ]
         );
+    }
+
+    #[test]
+    fn nextjs_rejects_missing_css_declaration_for_global_import() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("package.json"), package_json()).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){return null;}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/layout.tsx"),
+            "import './globals.css';\nexport default function Layout({children}:{children:React.ReactNode}){return children;}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "body { margin: 0; }",
+        )
+        .unwrap();
+
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("declare module")
+        ));
+
+        std::fs::write(
+            dir.path().join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        assert!(verify(dir.path(), "3011").is_pass());
     }
 
     #[test]
@@ -751,6 +852,21 @@ mod tests {
         assert!(matches!(
             report.status,
             VerifyStatus::ProfileContractFailed(reason) if reason.contains("rootDir")
+        ));
+    }
+
+    #[test]
+    fn nextjs_rejects_deprecated_module_resolution_build_risk() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"moduleResolution":"node10"}}"#,
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("moduleResolution=node10")
         ));
     }
 

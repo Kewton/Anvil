@@ -58,6 +58,12 @@ impl VerificationSignature {
             .iter()
             .any(|failure| failure.contains("test_discovery_failure"))
     }
+
+    pub fn has_test_framework_mismatch(&self) -> bool {
+        self.command_failures
+            .iter()
+            .any(|failure| failure.contains("test_framework_mismatch"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +114,8 @@ pub fn classify_repair_progress(
         RepairProgressVerdict::Improved
     } else if current.total_failures() > previous.total_failures() {
         RepairProgressVerdict::Regressed
+    } else if had_edit {
+        RepairProgressVerdict::Improved
     } else {
         RepairProgressVerdict::Unchanged
     };
@@ -118,6 +126,9 @@ fn normalize_failure_reason(reason: &str) -> String {
     let lower = reason.to_ascii_lowercase();
     if lower.contains("no tests ran") || lower.contains("ran 0 tests") {
         return "test_discovery_failure:no_tests_ran".to_string();
+    }
+    if lower.contains("test_framework_mismatch") || lower.contains("pytest_style_under_unittest") {
+        return "test_framework_mismatch:pytest_style_under_unittest".to_string();
     }
     if lower.contains("module not found") || lower.contains("no module named") {
         return "dependency_missing:module_not_found".to_string();
@@ -163,6 +174,20 @@ mod tests {
     }
 
     #[test]
+    fn repair_progress_improved_when_signature_changes_after_edit() {
+        let mut previous = VerificationReport::pass();
+        previous.push_command_failure(
+            "python3 -m unittest test_a.py",
+            "ImportError: cannot import name 'x'",
+        );
+        let previous = VerificationSignature::from_report(&previous);
+        let mut current = VerificationReport::pass();
+        current.push_command_failure("python3 -m unittest test_a.py", "AssertionError: bad");
+        let (_, verdict) = classify_repair_progress(Some(&previous), &current, true);
+        assert_eq!(verdict, RepairProgressVerdict::Improved);
+    }
+
+    #[test]
     fn repair_progress_invalid_without_edit() {
         let mut previous = VerificationReport::pass();
         previous.push_command_failure("python3 -m unittest test_a.py", "AssertionError: bad");
@@ -178,5 +203,16 @@ mod tests {
         report.push_command_failure("python3 -m unittest test_a.py", "NO TESTS RAN");
         let signature = VerificationSignature::from_report(&report);
         assert!(signature.has_test_discovery_failure());
+    }
+
+    #[test]
+    fn signature_detects_test_framework_mismatch() {
+        let mut report = VerificationReport::pass();
+        report.push_command_failure(
+            "python3 -m unittest test_a.py",
+            "test_framework_mismatch:pytest_style_under_unittest",
+        );
+        let signature = VerificationSignature::from_report(&report);
+        assert!(signature.has_test_framework_mismatch());
     }
 }

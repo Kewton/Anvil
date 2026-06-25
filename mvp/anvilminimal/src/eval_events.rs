@@ -40,14 +40,22 @@ pub fn argument_shape(arguments: &Value) -> Value {
         Value::Object(map) => {
             let mut keys = map.keys().cloned().collect::<Vec<_>>();
             keys.sort();
+            let mut summaries = serde_json::Map::new();
+            for key in &keys {
+                if let Some(value) = map.get(key) {
+                    summaries.insert(key.clone(), argument_value_summary(key, value));
+                }
+            }
             json!({
                 "arguments_type": "object",
                 "argument_keys": keys,
+                "argument_summaries": summaries,
             })
         }
         Value::String(value) => json!({
             "arguments_type": "string",
             "argument_len": value.chars().count(),
+            "argument_preview": safe_preview(value),
         }),
         Value::Array(values) => json!({
             "arguments_type": "array",
@@ -69,7 +77,45 @@ pub fn body_snippet(body: &str) -> String {
     let mut clean = body.replace('\n', " ");
     clean = clean.replace('\r', " ");
     clean = redact_secret_like(&clean);
+    clean = redact_home_paths(&clean);
     clean.chars().take(SNIPPET_LIMIT).collect()
+}
+
+fn argument_value_summary(key: &str, value: &Value) -> Value {
+    match value {
+        Value::String(text) => {
+            if key == "content" {
+                json!({
+                    "type": "string",
+                    "string_len": text.chars().count(),
+                    "preview": "<omitted>",
+                })
+            } else if matches!(key, "path" | "pattern" | "glob" | "command") {
+                json!({
+                    "type": "string",
+                    "string_len": text.chars().count(),
+                    "preview": safe_preview(text),
+                })
+            } else {
+                json!({
+                    "type": "string",
+                    "string_len": text.chars().count(),
+                })
+            }
+        }
+        Value::Array(values) => json!({"type": "array", "len": values.len()}),
+        Value::Object(map) => json!({"type": "object", "keys": map.len()}),
+        Value::Bool(_) => json!({"type": "bool"}),
+        Value::Number(_) => json!({"type": "number"}),
+        Value::Null => json!({"type": "null"}),
+    }
+}
+
+fn safe_preview(value: &str) -> String {
+    let mut clean = value.replace('\n', "\\n").replace('\r', "\\r");
+    clean = redact_secret_like(&clean);
+    clean = redact_home_paths(&clean);
+    clean.chars().take(120).collect()
 }
 
 fn redact_secret_like(value: &str) -> String {
@@ -89,6 +135,31 @@ fn redact_secret_like(value: &str) -> String {
         .join(" ")
 }
 
+fn redact_home_paths(value: &str) -> String {
+    let mut out = value.to_string();
+    for prefix in ["/Users/", "/home/"] {
+        let mut search_from = 0usize;
+        loop {
+            let Some(relative_start) = out[search_from..].find(prefix) else {
+                break;
+            };
+            let start = search_from + relative_start;
+            let name_start = start + prefix.len();
+            let Some(rest_end) = out[name_start..].find('/') else {
+                break;
+            };
+            let name_end = name_start + rest_end;
+            if &out[name_start..name_end] == "<user>" {
+                search_from = name_end;
+                continue;
+            }
+            out.replace_range(name_start..name_end, "<user>");
+            search_from = name_start + "<user>".len();
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,18 +170,23 @@ mod tests {
         let path = dir.path().join("events.jsonl");
         emit(
             Some(&path),
-            json!({"event":"tool_call_raw","name":"Grep","arguments": argument_shape(&json!({"pattern":"secret"}))}),
+            json!({"event":"tool_call_raw","name":"Grep","arguments": argument_shape(&json!({"pattern":"sk-test","content":"do not persist"}))}),
         );
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("\"event\":\"tool_call_raw\""));
-        assert!(text.contains("\"argument_keys\":[\"pattern\"]"));
-        assert!(!text.contains("secret"));
+        assert!(text.contains("\"argument_keys\":[\"content\",\"pattern\"]"));
+        assert!(text.contains("<redacted>"));
+        assert!(!text.contains("do not persist"));
     }
 
     #[test]
     fn body_snippet_truncates_and_redacts_secret_like_values() {
-        let snippet = body_snippet(&format!("api_key sk-test {}", "x".repeat(700)));
+        let snippet = body_snippet(&format!(
+            "api_key sk-test /Users/example/project {}",
+            "x".repeat(700)
+        ));
         assert!(snippet.contains("<redacted>"));
+        assert!(snippet.contains("/Users/<user>/project"));
         assert!(snippet.chars().count() <= SNIPPET_LIMIT);
     }
 }

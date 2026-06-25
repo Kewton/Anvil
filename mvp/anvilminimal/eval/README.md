@@ -9,8 +9,9 @@ This directory contains the MVP eval harness for:
 - ultra-step-run diagnostic replay
 
 The harness is intentionally outside the Rust runtime. Python scripts under
-`scripts/` read YAML suites, expand model matrices, run `anvilminimal`, execute
-deterministic postchecks, score plans, and write comparable artifacts.
+`scripts/` read YAML suites, expand model matrices, run `anvilminimal` or the
+source `anvildev` binary, execute deterministic postchecks, score plans, and
+write comparable artifacts.
 
 ## Output
 
@@ -69,6 +70,24 @@ python3 scripts/eval-run.py \
   --dry-run
 ```
 
+To render commands for the source binary instead of the MVP binary:
+
+```bash
+python3 scripts/eval-run.py \
+  --suite eval/suites/mvp-smoke.yaml \
+  --model-profile speed-cloud \
+  --modes minimal-loop,step-plan,plan-run,ultra-plan-run \
+  --binary anvildev \
+  --dry-run
+```
+
+`--binary anvildev` is auto-detected as the source CLI dialect. You can also
+pass `--binary-kind anvildev` explicitly. The harness adds `--engine minimal`
+and renders `--plan-run <PROMPT>` / `--ultra-plan-run <PROMPT>` as source
+Anvil expects. MVP-only `--completion-contract-json` is not inserted for
+`anvildev`; postchecks still run from the same suite after the child process
+returns.
+
 ## Speed Cloud Eval
 
 This excludes local LLMs and runs cloud-only rows with provider limits.
@@ -97,6 +116,19 @@ python3 scripts/eval-run.py \
   --runs 1 \
   --parallel 4 \
   --provider-smoke-summary workspace/eval-artifacts/anvilminimal-mvp/<provider-smoke>/summary.eval.tsv \
+  --timeout-sec 1800
+```
+
+Source-binary comparison run:
+
+```bash
+python3 scripts/eval-run.py \
+  --suite eval/suites/mvp-smoke.yaml \
+  --model-profile speed-cloud \
+  --modes minimal-loop,step-plan,plan-run,ultra-plan-run \
+  --binary anvildev \
+  --runs 1 \
+  --parallel 4 \
   --timeout-sec 1800
 ```
 

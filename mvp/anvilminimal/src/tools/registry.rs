@@ -75,6 +75,7 @@ impl ToolRegistry {
                     &path,
                     optional_usize(arguments, "start_line"),
                     optional_usize(arguments, "end_line"),
+                    context.workspace_policy,
                 )
             }
             "Write" => {
@@ -144,8 +145,14 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
         "unknown_tool"
     } else if message.contains("path escapes workspace") {
         "path_confinement_error"
+    } else if message.contains("path_not_found_recoverable") {
+        "path_not_found_recoverable"
     } else if message.contains("workspace_policy_blocked") {
         "workspace_policy_blocked"
+    } else if message.contains("invalid glob pattern") {
+        "invalid_glob"
+    } else if message.contains("Is a directory") || message.contains("is a directory") {
+        "read_directory"
     } else if message.contains("dangerous command blocked") {
         "dangerous_command"
     } else if message.contains("edit_anchor_not_found") {
@@ -168,7 +175,10 @@ pub fn recoverable_tool_error(err: &anyhow::Error) -> bool {
         tool_error_kind(err),
         "missing_arg"
             | "unknown_tool"
+            | "path_not_found_recoverable"
             | "workspace_policy_blocked"
+            | "invalid_glob"
+            | "read_directory"
             | "edit_anchor_not_found"
             | "edit_noop"
             | "edit_ambiguous_anchor"
@@ -330,5 +340,35 @@ mod tests {
             .unwrap();
         assert!(!output.contains("node_modules/pkg/index.js"));
         assert!(output.contains("my-node_modules-note.md"));
+    }
+
+    #[test]
+    fn workdir_prefix_path_miss_is_recoverable_with_hint() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "ok").unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+        };
+        let err = registry
+            .execute("Read", &json!({"path":"workdir/a.txt"}), &context)
+            .unwrap_err();
+        assert_eq!(tool_error_kind(&err), "path_not_found_recoverable");
+        assert!(recoverable_tool_error(&err));
+    }
+
+    #[test]
+    fn absolute_path_escape_remains_hard_failure() {
+        let err = crate::tools::path_guard::resolve_existing(
+            tempfile::tempdir().unwrap().path(),
+            "/etc/passwd",
+        )
+        .unwrap_err();
+        assert!(!recoverable_tool_error(&err));
     }
 }

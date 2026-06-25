@@ -1,0 +1,22 @@
+[
+  {
+    "id": "artifact-target-exhausted",
+    "expected_failure_kind": "artifact_recovery_exhausted",
+    "events": [
+      {
+        "event": "artifact_stagnation_feedback",
+        "missing_paths": ["a.txt", "b.txt"],
+        "target_path": "a.txt",
+        "target_attempt": 2,
+        "last_model_action": "non_edit_tool"
+      },
+      {
+        "event": "loop_stop",
+        "reason": "artifact_recovery_exhausted",
+        "missing_paths": ["a.txt", "b.txt"],
+        "last_target_path": "a.txt",
+        "last_model_action": "non_edit_tool"
+      }
+    ]
+  }
+]

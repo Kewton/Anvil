@@ -51,6 +51,23 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
                 self.assertEqual(classified["failure_kind"], entry["expected_failure_kind"])
                 self.assertTrue(known_failure_kind(classified["failure_kind"]))
 
+    def test_step_plan_json_and_path_errors_are_classified(self):
+        invalid_json = classify_stderr(
+            "error: invalid StepPlan after corrective retries: StepPlan invalid JSON: expected value",
+            rc=1,
+            timeout=False,
+        )
+        self.assertEqual(invalid_json["failure_kind"], "planner_schema_error")
+        self.assertTrue(known_failure_kind(invalid_json["failure_kind"]))
+
+        unsafe_path = classify_stderr(
+            "error: invalid StepPlan after corrective retries: StepPlan unsafe expected path: path escapes workspace",
+            rc=1,
+            timeout=False,
+        )
+        self.assertEqual(unsafe_path["failure_kind"], "path_confinement_error")
+        self.assertTrue(known_failure_kind(unsafe_path["failure_kind"]))
+
     def test_minimal_loop_004_fixture_is_classified(self):
         fixture = ROOT / "tests/eval/fixtures/minimal_loop_004/failure_events.json"
         entries = json.loads(fixture.read_text(encoding="utf-8"))
@@ -58,6 +75,21 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
         for entry in entries:
             with self.subTest(entry["id"]):
                 classified = classify_events(entry["events"])
+                self.assertEqual(classified["failure_kind"], entry["expected_failure_kind"])
+                self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+    def test_minimal_loop_005_fixtures_are_classified(self):
+        fixture_dir = ROOT / "tests/eval/fixtures/minimal_loop_005"
+        entries = []
+        for fixture in sorted(fixture_dir.glob("*.json")):
+            entries.extend(json.loads(fixture.read_text(encoding="utf-8")))
+        self.assertEqual(len(entries), 4)
+        for entry in entries:
+            with self.subTest(entry["id"]):
+                classified = classify_events(entry["events"])
+                if entry["expected_failure_kind"] == "diagnostic_skipped":
+                    self.assertEqual(classified, {})
+                    continue
                 self.assertEqual(classified["failure_kind"], entry["expected_failure_kind"])
                 self.assertTrue(known_failure_kind(classified["failure_kind"]))
 
@@ -158,10 +190,14 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
                     "event": "loop_stop",
                     "reason": "artifact_recovery_exhausted",
                     "missing_paths": ["date-helper.js"],
+                    "last_target_path": "date-helper.js",
+                    "last_model_action": "non_edit_tool",
                 }
             ]
         )
         self.assertEqual(classified["failure_kind"], "artifact_recovery_exhausted")
+        self.assertEqual(classified["artifact_target_path"], "date-helper.js")
+        self.assertEqual(classified["artifact_last_model_action"], "non_edit_tool")
         self.assertTrue(known_failure_kind(classified["failure_kind"]))
 
     def test_classifies_verify_repair_no_change_from_events(self):
@@ -176,6 +212,37 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
         )
         self.assertEqual(classified["failure_kind"], "verify_repair_no_change")
         self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+    def test_classifies_profile_and_deferred_completion_failures(self):
+        deferred = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "deferred_verify_requirement_pending",
+                    "primary_reason": "deferred verify requirement pending: command `npm run build`",
+                }
+            ]
+        )
+        self.assertEqual(deferred["failure_kind"], "deferred_verify_requirement_pending")
+        self.assertTrue(known_failure_kind(deferred["failure_kind"]))
+
+        profile = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "profile_contract_failure",
+                    "primary_reason": "scripts.build must be next build",
+                }
+            ]
+        )
+        self.assertEqual(profile["failure_kind"], "profile_contract_failure")
+        self.assertTrue(known_failure_kind(profile["failure_kind"]))
+
+        stderr = classify_stderr(
+            "error: completion contract verify failed after 1 attempts: deferred verify requirement pending: command `npm run build`",
+            rc=1,
+        )
+        self.assertEqual(stderr["failure_kind"], "deferred_verify_requirement_pending")
 
     def test_classifies_repair_progress_from_events(self):
         classified = classify_events(
@@ -206,6 +273,40 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
 
         stderr = classify_stderr("error: completion contract verify failed: NO TESTS RAN", rc=1)
         self.assertEqual(stderr["failure_kind"], "test_discovery_failure")
+
+    def test_classifies_test_framework_mismatch(self):
+        classified = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "test_framework_mismatch",
+                    "primary_reason": "test_framework_mismatch:pytest_style_under_unittest",
+                }
+            ]
+        )
+        self.assertEqual(classified["failure_kind"], "test_framework_mismatch")
+        self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+        stderr = classify_stderr(
+            "error: completion contract verify failed: test_framework_mismatch:pytest_style_under_unittest",
+            rc=1,
+        )
+        self.assertEqual(stderr["failure_kind"], "test_framework_mismatch")
+
+    def test_classifies_recoverable_tool_error_repeated(self):
+        classified = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "recoverable_tool_error_repeated",
+                    "name": "Read",
+                    "error_kind": "path_not_found_recoverable",
+                }
+            ]
+        )
+        self.assertEqual(classified["failure_kind"], "recoverable_tool_error_repeated")
+        self.assertEqual(classified["tool_error_kind"], "path_not_found_recoverable")
+        self.assertTrue(known_failure_kind(classified["failure_kind"]))
 
     def test_classifies_provider_transient_exhausted(self):
         classified = classify_events(

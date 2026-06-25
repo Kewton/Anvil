@@ -1,0 +1,24 @@
+{
+  "provider": "ollama",
+  "endpoint": "/api/chat",
+  "model": "qwen3.6:27b-coding-nvfp4",
+  "stream": false,
+  "tools": [],
+  "messages": [
+    {
+      "role": "system",
+      "content_contains": [
+        "Return only one JSON object",
+        "Allowed step kinds",
+        "Expected paths must be workspace-relative"
+      ]
+    },
+    {
+      "role": "user",
+      "content_contains": [
+        "Create a step plan",
+        "Required final artifacts"
+      ]
+    }
+  ]
+}

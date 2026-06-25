@@ -31,10 +31,11 @@ pub fn resolve_existing(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
     let root = root
         .canonicalize()
         .context("workspace root is not accessible")?;
-    let candidate = root.join(raw);
+    let normalized = strip_redundant_root_prefix(&root, raw);
+    let candidate = root.join(&normalized);
     let canonical = candidate
         .canonicalize()
-        .with_context(|| format!("path does not exist: {raw}"))?;
+        .with_context(|| missing_path_message(&root, raw))?;
     ensure_inside(&root, &canonical)?;
     Ok(canonical)
 }
@@ -44,7 +45,8 @@ pub fn resolve_for_create(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
     let root = root
         .canonicalize()
         .context("workspace root is not accessible")?;
-    let candidate = root.join(raw);
+    let normalized = strip_redundant_root_prefix(&root, raw);
+    let candidate = root.join(normalized);
     let existing_parent = nearest_existing_parent(&candidate)?;
     let parent_canonical = existing_parent
         .canonicalize()
@@ -55,11 +57,12 @@ pub fn resolve_for_create(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
 
 pub fn resolve_optional_existing(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
     validate_workspace_relative(raw)?;
-    let candidate = root.join(raw);
+    let normalized = strip_redundant_root_prefix(root, raw);
+    let candidate = root.join(&normalized);
     if candidate.exists() {
-        resolve_existing(root, raw)
+        resolve_existing(root, normalized.to_string_lossy().as_ref())
     } else {
-        resolve_for_create(root, raw)
+        resolve_for_create(root, normalized.to_string_lossy().as_ref())
     }
 }
 
@@ -87,6 +90,56 @@ fn ensure_inside(root: &Path, candidate: &Path) -> anyhow::Result<()> {
         bail!("path escapes workspace");
     }
     Ok(())
+}
+
+fn strip_redundant_root_prefix(root: &Path, raw: &str) -> PathBuf {
+    let path = Path::new(raw);
+    let Some(root_name) = root.file_name() else {
+        return path.to_path_buf();
+    };
+    let mut components = path.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return path.to_path_buf();
+    };
+    if first != root_name {
+        return path.to_path_buf();
+    }
+    let stripped = components.as_path();
+    if stripped.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        stripped.to_path_buf()
+    }
+}
+
+fn missing_path_message(root: &Path, raw: &str) -> String {
+    if let Some(candidate) = missing_path_candidate(root, raw) {
+        format!(
+            "path_not_found_recoverable: path does not exist: {raw}; did you mean `{candidate}`?"
+        )
+    } else {
+        format!("path does not exist: {raw}")
+    }
+}
+
+fn missing_path_candidate(root: &Path, raw: &str) -> Option<String> {
+    let path = Path::new(raw);
+    let mut components = path.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return None;
+    };
+    if first != "workdir" {
+        return None;
+    }
+    let tail = components.as_path();
+    if tail.as_os_str().is_empty() {
+        return None;
+    }
+    let candidate = root.join(tail);
+    if !candidate.exists() {
+        return None;
+    }
+    Some(tail.to_string_lossy().replace('\\', "/"))
 }
 
 fn looks_like_windows_absolute(raw: &str) -> bool {
@@ -120,6 +173,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = resolve_for_create(dir.path(), "notes/new.md").unwrap();
         assert!(path.ends_with("notes/new.md"));
+    }
+
+    #[test]
+    fn strips_redundant_workspace_root_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "ok").unwrap();
+        let raw = format!(
+            "{}/a.txt",
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+        let path = resolve_existing(dir.path(), &raw).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "ok");
+    }
+
+    #[test]
+    fn suggests_workdir_prefix_without_silent_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "ok").unwrap();
+        let err = resolve_existing(dir.path(), "workdir/a.txt").unwrap_err();
+        assert!(err.to_string().contains("path_not_found_recoverable"));
+        assert!(err.to_string().contains("did you mean `a.txt`"));
     }
 
     #[test]

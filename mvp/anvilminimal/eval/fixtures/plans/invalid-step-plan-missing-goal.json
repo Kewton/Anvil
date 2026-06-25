@@ -1,0 +1,11 @@
+{
+  "steps": [
+    {
+      "id": "implement",
+      "kind": "create",
+      "instruction": "Create app.py.",
+      "expected_paths": ["app.py"],
+      "verify": []
+    }
+  ]
+}

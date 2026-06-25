@@ -1,0 +1,13 @@
+[
+  {
+    "id": "pytest-style-under-unittest",
+    "expected_failure_kind": "test_framework_mismatch",
+    "events": [
+      {
+        "event": "loop_stop",
+        "reason": "test_framework_mismatch",
+        "primary_reason": "test_framework_mismatch:pytest_style_under_unittest"
+      }
+    ]
+  }
+]

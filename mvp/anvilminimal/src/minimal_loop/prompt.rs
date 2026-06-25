@@ -14,11 +14,15 @@ pub fn build_request_messages(
     tools: &[ToolSpec],
     root: &Path,
     pending_feedback: Option<&str>,
+    profile_guidance: Option<&str>,
     mode: ToolPromptMode,
 ) -> Vec<ConversationMessage> {
     let mut messages = Vec::new();
     messages.push(ConversationMessage::system(system_prompt(
-        tools, root, mode,
+        tools,
+        root,
+        profile_guidance,
+        mode,
     )));
     messages.extend(history.iter().map(sanitize_history_message_for_request));
     if let Some(feedback) = pending_feedback {
@@ -27,7 +31,12 @@ pub fn build_request_messages(
     messages
 }
 
-fn system_prompt(tools: &[ToolSpec], root: &Path, mode: ToolPromptMode) -> String {
+fn system_prompt(
+    tools: &[ToolSpec],
+    root: &Path,
+    profile_guidance: Option<&str>,
+    mode: ToolPromptMode,
+) -> String {
     let tools = tools
         .iter()
         .map(|tool| format!("- {}: {}", tool.function.name, tool.function.description))
@@ -43,6 +52,10 @@ Tools:\n{}",
         root.display(),
         tools
     );
+    if let Some(guidance) = profile_guidance {
+        prompt.push_str("\n\nProfile guidance:\n");
+        prompt.push_str(guidance);
+    }
     if mode == ToolPromptMode::XmlFallback {
         prompt.push_str(
             "\n\nNative tool calls are unavailable for this provider turn. Use XML fallback tool calls exactly like:\n\
@@ -76,6 +89,7 @@ mod tests {
             ToolRegistry::default().specs(),
             Path::new("/tmp/work"),
             None,
+            None,
             ToolPromptMode::Native,
         );
         let prompt = &messages[0].content;
@@ -90,6 +104,7 @@ mod tests {
             &[],
             ToolRegistry::default().specs(),
             Path::new("/tmp/work"),
+            None,
             None,
             ToolPromptMode::XmlFallback,
         );
@@ -113,10 +128,14 @@ mod tests {
             ToolRegistry::default().specs(),
             Path::new("/tmp/work"),
             None,
+            Some(
+                "For the nextjs profile, create a runnable Next.js app, not only package metadata.",
+            ),
             ToolPromptMode::Native,
         );
         assert_eq!(messages[1].role, "assistant");
         assert!(messages[1].content.is_empty());
         assert_eq!(history[0].content, "I will create it now.");
+        assert!(messages[0].content.contains("Profile guidance"));
     }
 }

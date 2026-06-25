@@ -47,8 +47,10 @@ pub struct RunSessionOutcome {
 }
 
 const ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD: usize = 3;
-const ARTIFACT_RECOVERY_ATTEMPT_LIMIT: usize = 2;
-const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 2;
+const ARTIFACT_RECOVERY_ATTEMPT_LIMIT: usize = 3;
+const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 3;
+const RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT: usize = 2;
+const MALFORMED_NATIVE_TOOL_RETRY_LIMIT: usize = 2;
 
 #[derive(Debug, Default)]
 struct VerifyRepairState {
@@ -60,6 +62,56 @@ struct VerifyRepairState {
 struct VerifyFailureFeedback {
     feedback: String,
     signature: VerificationSignature,
+}
+
+#[derive(Debug, Default)]
+struct ArtifactRecoveryState {
+    target_path: Option<String>,
+    target_attempts: usize,
+    last_model_action: Option<String>,
+}
+
+impl ArtifactRecoveryState {
+    fn sync_target(&mut self, required_paths: &[String], missing: &[String]) -> Option<String> {
+        let next = required_paths
+            .iter()
+            .find(|path| missing.contains(path))
+            .cloned()
+            .or_else(|| missing.first().cloned());
+        if self.target_path != next {
+            self.target_path = next.clone();
+            self.target_attempts = 0;
+        }
+        next
+    }
+
+    fn record_action(&mut self, action: &str) {
+        self.last_model_action = Some(action.to_string());
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecoverableToolErrorState {
+    key: Option<String>,
+    repeats: usize,
+}
+
+impl RecoverableToolErrorState {
+    fn record(&mut self, tool_name: &str, err: &anyhow::Error) -> usize {
+        let key = format!("{tool_name}:{}:{}", tool_error_kind(err), err);
+        if self.key.as_deref() == Some(key.as_str()) {
+            self.repeats += 1;
+        } else {
+            self.key = Some(key);
+            self.repeats = 1;
+        }
+        self.repeats
+    }
+
+    fn reset(&mut self) {
+        self.key = None;
+        self.repeats = 0;
+    }
 }
 
 pub fn run_session(
@@ -136,13 +188,23 @@ pub fn run_session_with_outcome_with_ui(
     let mut tool_call_count = 0usize;
     let artifact_recovery_enabled = completion_contract.is_some() || explicit_required_paths;
     let mut artifact_non_edit_streak = 0usize;
-    let mut artifact_recovery_attempts = 0usize;
+    let mut artifact_recovery_state = ArtifactRecoveryState::default();
     let mut verify_repair_state = VerifyRepairState::default();
+    let mut recoverable_tool_error_state = RecoverableToolErrorState::default();
+    let mut malformed_native_tool_feedbacks = 0usize;
+    let iteration_limit = if completion_contract.is_some() {
+        config.max_iterations
+            + ARTIFACT_RECOVERY_ATTEMPT_LIMIT.saturating_mul(required_paths.len().max(1))
+            + 1
+    } else {
+        config.max_iterations
+    };
     session
         .messages
         .push(ConversationMessage::user(user_prompt.to_string()));
+    let profile_guidance = crate::planner::profile::profile_guidance(&config.profile, user_prompt);
 
-    for iteration in 0..config.max_iterations {
+    for iteration in 0..iteration_limit {
         if ui.interrupted() {
             bail!("interrupted by user");
         }
@@ -158,6 +220,7 @@ pub fn run_session_with_outcome_with_ui(
             &specs,
             &config.workspace_root,
             pending_feedback.as_deref(),
+            profile_guidance.as_deref(),
             if native_tools_enabled {
                 ToolPromptMode::Native
             } else {
@@ -177,7 +240,26 @@ pub fn run_session_with_outcome_with_ui(
         let reply = match chat_result {
             Ok(reply) => {
                 pending_feedback = None;
+                malformed_native_tool_feedbacks = 0;
                 reply
+            }
+            Err(err)
+                if native_tools_enabled
+                    && provider_error_allows_native_tool_retry(&err)
+                    && malformed_native_tool_feedbacks < MALFORMED_NATIVE_TOOL_RETRY_LIMIT =>
+            {
+                malformed_native_tool_feedbacks += 1;
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "native_tool_parse_retry_feedback",
+                        "attempt": malformed_native_tool_feedbacks,
+                        "attempt_limit": MALFORMED_NATIVE_TOOL_RETRY_LIMIT,
+                        "reason": eval_events::body_snippet(&err.to_string()),
+                    }),
+                );
+                pending_feedback = Some(super::feedback::malformed_tool_call(&err.to_string()));
+                continue;
             }
             Err(err)
                 if native_tools_enabled
@@ -236,6 +318,25 @@ pub fn run_session_with_outcome_with_ui(
             let missing = missing_paths(&config.workspace_root, &required_paths);
             if !missing.is_empty() {
                 session.messages.pop();
+                artifact_non_edit_streak =
+                    artifact_non_edit_streak.saturating_add(ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD);
+                artifact_recovery_state.record_action("no_tool_missing_artifacts");
+                if let Some(feedback) = maybe_artifact_recovery_feedback(
+                    &mut artifact_recovery_state,
+                    &mut artifact_non_edit_streak,
+                    ArtifactRecoveryFeedbackContext {
+                        eval_events_path: config.eval_events_path.as_deref(),
+                        enabled: artifact_recovery_enabled,
+                        missing_paths: &missing,
+                        required_paths: &required_paths,
+                        contract: completion_contract.as_ref(),
+                        root: &config.workspace_root,
+                    },
+                )? {
+                    last_blocking_reason = Some("artifact creation stalled".to_string());
+                    pending_feedback = Some(feedback);
+                    continue;
+                }
                 last_blocking_reason =
                     Some(format!("missing required paths: {}", missing.join(", ")));
                 pending_feedback = Some(super::feedback::missing_artifacts(&missing));
@@ -296,6 +397,7 @@ pub fn run_session_with_outcome_with_ui(
                     &config.workspace_root,
                     config.eval_events_path.as_deref(),
                     contract,
+                    user_prompt,
                     &mut verify_attempts,
                     verify_repair_state.pending_signature.as_ref(),
                     true,
@@ -359,6 +461,7 @@ pub fn run_session_with_outcome_with_ui(
         let mut names_seen = BTreeSet::new();
         let mut batch_had_edit = false;
         let mut batch_non_edit_tools = 0usize;
+        let missing_before_batch = missing_paths(&config.workspace_root, &required_paths);
         for call in tool_calls {
             if ui.interrupted() {
                 bail!("interrupted by user");
@@ -387,6 +490,7 @@ pub fn run_session_with_outcome_with_ui(
             };
             let result = match result {
                 Ok(result) => {
+                    recoverable_tool_error_state.reset();
                     eval_events::emit(
                         config.eval_events_path.as_deref(),
                         json!({
@@ -408,6 +512,7 @@ pub fn run_session_with_outcome_with_ui(
                 }
                 Err(err) if recoverable_tool_error(&err) => {
                     let kind = tool_error_kind(&err);
+                    let repeats = recoverable_tool_error_state.record(&call.name, &err);
                     eval_events::emit(
                         config.eval_events_path.as_deref(),
                         json!({
@@ -415,8 +520,22 @@ pub fn run_session_with_outcome_with_ui(
                             "name": call.name.as_str(),
                             "error_kind": kind,
                             "missing_arg": missing_arg_name(&err),
+                            "repeat_count": repeats,
                         }),
                     );
+                    if repeats > RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT {
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "loop_stop",
+                                "reason": "recoverable_tool_error_repeated",
+                                "name": call.name.as_str(),
+                                "error_kind": kind,
+                                "repeat_count": repeats - 1,
+                            }),
+                        );
+                        bail!("recoverable tool error repeated: {kind}");
+                    }
                     recoverable_tool_feedback(&call.name, &err)
                 }
                 Err(err) => {
@@ -438,10 +557,24 @@ pub fn run_session_with_outcome_with_ui(
                 result,
             ));
         }
-        if batch_had_edit {
+        let missing_after_batch = missing_paths(&config.workspace_root, &required_paths);
+        let batch_reduced_missing_paths = missing_after_batch.len() < missing_before_batch.len();
+        if batch_reduced_missing_paths {
             artifact_non_edit_streak = 0;
+            artifact_recovery_state.record_action("required_artifact_progress");
         } else {
-            artifact_non_edit_streak += batch_non_edit_tools;
+            artifact_non_edit_streak += if batch_non_edit_tools > 0 {
+                batch_non_edit_tools
+            } else if batch_had_edit {
+                1
+            } else {
+                0
+            };
+            if batch_had_edit {
+                artifact_recovery_state.record_action("edit_without_required_artifact_progress");
+            } else if batch_non_edit_tools > 0 {
+                artifact_recovery_state.record_action("non_edit_tool");
+            }
         }
         if required_paths_satisfied_after_tool(
             &config.workspace_root,
@@ -449,6 +582,15 @@ pub fn run_session_with_outcome_with_ui(
             &initially_missing_paths,
             write_or_edit_seen,
         ) {
+            let mut import_scan_paths = changed_paths.clone();
+            import_scan_paths.extend(required_paths.iter().cloned());
+            let missing_imports =
+                scan_relative_imports(&config.workspace_root, &import_scan_paths)?;
+            if !missing_imports.is_empty() {
+                last_blocking_reason = Some("missing relative imports".to_string());
+                pending_feedback = Some(format_missing_import_feedback(&missing_imports));
+                continue;
+            }
             if let Some(contract) = completion_contract
                 .as_ref()
                 .filter(|contract| contract.has_verify())
@@ -467,6 +609,7 @@ pub fn run_session_with_outcome_with_ui(
                     &config.workspace_root,
                     config.eval_events_path.as_deref(),
                     contract,
+                    user_prompt,
                     &mut verify_attempts,
                     verify_repair_state.pending_signature.as_ref(),
                     batch_had_edit,
@@ -531,45 +674,21 @@ pub fn run_session_with_outcome_with_ui(
                 last_provider_error,
             });
         }
-        let missing = missing_paths(&config.workspace_root, &required_paths);
-        if should_emit_artifact_recovery(
-            artifact_recovery_enabled,
-            artifact_non_edit_streak,
-            &missing,
-            completion_contract.as_ref(),
-            &config.workspace_root,
-        ) {
-            artifact_recovery_attempts += 1;
-            if artifact_recovery_attempts > ARTIFACT_RECOVERY_ATTEMPT_LIMIT {
-                eval_events::emit(
-                    config.eval_events_path.as_deref(),
-                    json!({
-                        "event": "loop_stop",
-                        "reason": "artifact_recovery_exhausted",
-                        "missing_paths": missing,
-                        "non_edit_streak": artifact_non_edit_streak,
-                        "attempts": artifact_recovery_attempts - 1,
-                    }),
-                );
-                bail!("artifact recovery exhausted");
-            }
-            eval_events::emit(
-                config.eval_events_path.as_deref(),
-                json!({
-                    "event": "artifact_stagnation_feedback",
-                    "missing_paths": missing,
-                    "attempt": artifact_recovery_attempts,
-                    "attempt_limit": ARTIFACT_RECOVERY_ATTEMPT_LIMIT,
-                    "non_edit_streak": artifact_non_edit_streak,
-                }),
-            );
+        let missing = missing_after_batch;
+        if let Some(feedback) = maybe_artifact_recovery_feedback(
+            &mut artifact_recovery_state,
+            &mut artifact_non_edit_streak,
+            ArtifactRecoveryFeedbackContext {
+                eval_events_path: config.eval_events_path.as_deref(),
+                enabled: artifact_recovery_enabled,
+                missing_paths: &missing,
+                required_paths: &required_paths,
+                contract: completion_contract.as_ref(),
+                root: &config.workspace_root,
+            },
+        )? {
             last_blocking_reason = Some("artifact creation stalled".to_string());
-            pending_feedback = Some(super::feedback::artifact_stagnation(
-                &missing,
-                artifact_recovery_attempts,
-                ARTIFACT_RECOVERY_ATTEMPT_LIMIT,
-            ));
-            artifact_non_edit_streak = 0;
+            pending_feedback = Some(feedback);
             continue;
         }
     }
@@ -629,12 +748,13 @@ fn verify_completion_contract(
     root: &Path,
     eval_events_path: Option<&Path>,
     contract: &CompletionContract,
+    goal: &str,
     verify_attempts: &mut usize,
     previous_signature: Option<&VerificationSignature>,
     had_edit: bool,
 ) -> anyhow::Result<Option<VerifyFailureFeedback>> {
     *verify_attempts += 1;
-    let report = contract.verify(root);
+    let report = contract.verify_with_goal(root, goal);
     let ok = report.is_pass();
     let (signature, verdict) = classify_repair_progress(previous_signature, &report, had_edit);
     eval_events::emit(
@@ -647,6 +767,9 @@ fn verify_completion_contract(
             "missing_paths": report.missing_paths.clone(),
             "command_failures": report.command_failures.len(),
             "dependency_missing": report.dependency_missing.clone(),
+            "profile": contract.profile.as_deref().unwrap_or(""),
+            "profile_failures": report.profile_failures.clone(),
+            "deferred_verify_requirements": contract.deferred_status_summary(root, goal),
             "primary_reason": eval_events::body_snippet(&report.primary_reason()),
             "failure_signature": signature.label(),
             "repair_progress": verdict.as_str(),
@@ -667,8 +790,15 @@ fn verify_completion_contract(
             }),
         );
     }
-    if *verify_attempts >= contract.verify_repair_cap {
-        let stop_reason = terminal_verify_stop_reason(&signature, previous_signature, verdict);
+    let effective_repair_cap =
+        if previous_signature.is_some() && matches!(verdict, RepairProgressVerdict::Improved) {
+            contract.verify_repair_cap.saturating_add(1)
+        } else {
+            contract.verify_repair_cap
+        };
+    if *verify_attempts >= effective_repair_cap {
+        let stop_reason =
+            terminal_verify_stop_reason(&report, &signature, previous_signature, verdict);
         eval_events::emit(
             eval_events_path,
             json!({
@@ -730,12 +860,30 @@ fn handle_verify_repair_no_edit(
 }
 
 fn terminal_verify_stop_reason(
+    report: &crate::planner::verify::VerificationReport,
     signature: &VerificationSignature,
     previous_signature: Option<&VerificationSignature>,
     verdict: RepairProgressVerdict,
 ) -> String {
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| !reason.contains("deferred verify requirement pending"))
+    {
+        return "profile_contract_failure".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("deferred verify requirement pending"))
+    {
+        return "deferred_verify_requirement_pending".to_string();
+    }
     if signature.has_test_discovery_failure() {
         return "test_discovery_failure".to_string();
+    }
+    if signature.has_test_framework_mismatch() {
+        return "test_framework_mismatch".to_string();
     }
     if previous_signature.is_some() {
         match verdict {
@@ -763,6 +911,70 @@ fn should_emit_artifact_recovery(
         && !contract.is_some_and(|contract| contract.dependency_precondition_active(root))
 }
 
+struct ArtifactRecoveryFeedbackContext<'a> {
+    eval_events_path: Option<&'a Path>,
+    enabled: bool,
+    missing_paths: &'a [String],
+    required_paths: &'a [String],
+    contract: Option<&'a CompletionContract>,
+    root: &'a Path,
+}
+
+fn maybe_artifact_recovery_feedback(
+    state: &mut ArtifactRecoveryState,
+    non_edit_streak: &mut usize,
+    context: ArtifactRecoveryFeedbackContext<'_>,
+) -> anyhow::Result<Option<String>> {
+    if !should_emit_artifact_recovery(
+        context.enabled,
+        *non_edit_streak,
+        context.missing_paths,
+        context.contract,
+        context.root,
+    ) {
+        return Ok(None);
+    }
+    let target_path = state
+        .sync_target(context.required_paths, context.missing_paths)
+        .unwrap_or_default();
+    state.target_attempts += 1;
+    if state.target_attempts > ARTIFACT_RECOVERY_ATTEMPT_LIMIT {
+        eval_events::emit(
+            context.eval_events_path,
+            json!({
+                "event": "loop_stop",
+                "reason": "artifact_recovery_exhausted",
+                "missing_paths": context.missing_paths,
+                "non_edit_streak": *non_edit_streak,
+                "attempts": state.target_attempts - 1,
+                "last_target_path": target_path,
+                "last_model_action": state.last_model_action,
+            }),
+        );
+        bail!("artifact recovery exhausted");
+    }
+    eval_events::emit(
+        context.eval_events_path,
+        json!({
+            "event": "artifact_stagnation_feedback",
+            "missing_paths": context.missing_paths,
+            "attempt": state.target_attempts,
+            "attempt_limit": ARTIFACT_RECOVERY_ATTEMPT_LIMIT,
+            "non_edit_streak": *non_edit_streak,
+            "target_path": target_path,
+            "target_attempt": state.target_attempts,
+            "last_model_action": state.last_model_action,
+        }),
+    );
+    *non_edit_streak = 0;
+    Ok(Some(super::feedback::artifact_stagnation_for_target(
+        context.missing_paths,
+        &target_path,
+        state.target_attempts,
+        ARTIFACT_RECOVERY_ATTEMPT_LIMIT,
+    )))
+}
+
 fn provider_error_allows_xml_fallback(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_ascii_lowercase();
     if lower.contains(" api failed:")
@@ -778,6 +990,22 @@ fn provider_error_allows_xml_fallback(err: &anyhow::Error) -> bool {
         || lower.contains("tool_call")
         || lower.contains("provider parse")
         || lower.contains("parse")
+}
+
+fn provider_error_allows_native_tool_retry(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    if lower.contains(" api failed:")
+        || lower.contains("http")
+        || lower.contains("status")
+        || lower.contains("network")
+        || lower.contains("timeout")
+    {
+        return false;
+    }
+    lower.contains("function_call")
+        || lower.contains("tool call")
+        || lower.contains("tool_call")
+        || lower.contains("provider parse")
 }
 
 pub(crate) fn extract_requested_artifact_paths(root: &Path, prompt: &str) -> Vec<String> {
@@ -1101,6 +1329,54 @@ mod tests {
     }
 
     #[test]
+    fn minimal_loop_nextjs_required_paths_only_does_not_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["package.json","src/app/page.tsx","src/app/layout.tsx","src/app/global.d.ts"],"verify_commands":[],"profile":"nextjs","goal":"Create a Next.js app","deferred_verify_requirements":[{"command":"npm run build","reason":"requires dependency setup","authority":"postcheck","profile":"nextjs","status":"blocked_by_dependency_setup"}],"verify_repair_cap":1}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![
+                    ToolCall::new("Write", json!({"path":"package.json","content":"{}"})),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main/>;}\n"}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/layout.tsx","content":"export default function RootLayout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>}\n"}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";\n"}),
+                    ),
+                ],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a Next.js app",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("completion contract verify failed"), "{err}");
+        assert!(dir.path().join("package.json").is_file());
+    }
+
+    #[test]
     fn minimal_loop_repairs_after_completion_verify_failure() {
         let dir = tempfile::tempdir().unwrap();
         let contract = dir.path().join("contract.json");
@@ -1265,9 +1541,9 @@ mod tests {
         .unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
-        cfg.max_iterations = 10;
+        cfg.max_iterations = 13;
         let mut replies = Vec::new();
-        for _ in 0..9 {
+        for _ in 0..12 {
             replies.push(Ok(AssistantReply {
                 content: String::new(),
                 tool_calls: vec![ToolCall::new("Glob", json!({"pattern":"**/*"}))],
@@ -1325,6 +1601,12 @@ mod tests {
                         "Bash",
                         json!({"command":"python3 -m py_compile a.py"}),
                     )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Read", json!({"path":"a.py"}))],
                     prompt_tokens: None,
                     completion_tokens: None,
                 }),
@@ -1645,6 +1927,103 @@ mod tests {
         )));
     }
 
+    struct ParseRetryFake {
+        replies: Vec<anyhow::Result<AssistantReply>>,
+        native_flags: Vec<bool>,
+    }
+
+    impl ChatClient for ParseRetryFake {
+        fn label(&self) -> &str {
+            "parse-retry-fake"
+        }
+
+        fn supports_native_tools(&self, _model: &str) -> bool {
+            true
+        }
+
+        fn allows_xml_fallback(&self) -> bool {
+            true
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            _messages: &[ConversationMessage],
+            _tools: &[crate::tools::registry::ToolSpec],
+            native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            self.native_flags.push(native_tools_enabled);
+            self.replies.remove(0)
+        }
+    }
+
+    #[test]
+    fn malformed_native_tool_call_retries_with_native_tools_before_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = ParseRetryFake {
+            replies: vec![
+                Err(anyhow::anyhow!(
+                    "OpenAI function_call arguments are not valid JSON"
+                )),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+            native_flags: Vec::new(),
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session_with_required_paths(
+            &mut fake,
+            &mut session,
+            "create a.txt",
+            &["a.txt".to_string()],
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(result, "required artifacts satisfied: a.txt");
+        assert_eq!(fake.native_flags, vec![true, true]);
+        assert!(!session.native_tools_disabled);
+    }
+
+    #[test]
+    fn repeated_malformed_native_tool_call_eventually_uses_xml_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = ParseRetryFake {
+            replies: vec![
+                Err(anyhow::anyhow!(
+                    "OpenAI function_call arguments are not valid JSON"
+                )),
+                Err(anyhow::anyhow!(
+                    "OpenAI function_call arguments are not valid JSON"
+                )),
+                Err(anyhow::anyhow!(
+                    "OpenAI function_call arguments are not valid JSON"
+                )),
+                Ok(AssistantReply::text("final")),
+            ],
+            native_flags: Vec::new(),
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "Summarize this workspace.",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(result, "final");
+        assert_eq!(fake.native_flags, vec![true, true, true, false]);
+        assert!(session.native_tools_disabled);
+    }
+
     #[test]
     fn requested_artifact_path_extraction_rejects_escape_and_metadata_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -1729,6 +2108,193 @@ Required final artifacts:
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn required_artifact_success_waits_for_missing_relative_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":"import './layout.css';\nexport default function Page(){return <main/>;}"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/layout.css","content":"main { color: white; }\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a page",
+            &["src/app/page.tsx".to_string()],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert!(dir.path().join("src/app/layout.css").is_file());
+        assert_eq!(outcome.changed_paths.len(), 2);
+    }
+
+    #[test]
+    fn repeated_recoverable_tool_error_stops_before_max_iterations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "ok").unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.max_iterations = 8;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session(&mut fake, &mut session, "read a.txt", &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("recoverable tool error repeated"));
+    }
+
+    #[test]
+    fn unrelated_edits_do_not_reset_artifact_recovery_targeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.txt"],"verify_commands":[]}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        cfg.max_iterations = 6;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"scratch1.txt","content":"x"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"scratch2.txt","content":"x"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"scratch3.txt","content":"x"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a.txt",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+    }
+
+    #[test]
+    fn artifact_recovery_event_records_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.txt","b.txt"],"verify_commands":[]}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 13;
+        let mut replies = Vec::new();
+        for _ in 0..12 {
+            replies.push(Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Glob", json!({"pattern":"**/*"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }));
+        }
+        let mut fake = Fake { replies };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create required files",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("artifact recovery exhausted"));
+        let text = std::fs::read_to_string(events).unwrap();
+        assert!(text.contains("\"target_path\":\"a.txt\""));
+        assert!(text.contains("\"last_target_path\":\"a.txt\""));
     }
 
     #[test]

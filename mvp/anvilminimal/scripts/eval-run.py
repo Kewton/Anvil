@@ -35,6 +35,12 @@ def main() -> int:
     parser.add_argument("--parallel", type=int, default=4)
     parser.add_argument("--context-budget", type=int, default=65536)
     parser.add_argument("--binary", default="anvilminimal")
+    parser.add_argument(
+        "--binary-kind",
+        choices=["auto", "anvilminimal", "anvildev"],
+        default="auto",
+        help="CLI dialect for --binary. auto treats anvildev/anvil as source anvildev and otherwise anvilminimal.",
+    )
     parser.add_argument("--run-root")
     parser.add_argument("--timeout-sec", type=int)
     parser.add_argument("--dry-run", action="store_true")
@@ -63,6 +69,7 @@ def main() -> int:
         args.runs,
         args.context_budget,
         args.binary,
+        binary_kind=args.binary_kind,
         scenario_filter=args.scenario,
     )
     write_jsonl(run_root / "warnings.jsonl", warnings)
@@ -160,6 +167,8 @@ def actual_command(spec: dict, workdir: Path) -> list[str]:
 
 
 def completion_contract_for_spec(spec: dict) -> dict | None:
+    if spec.get("binary_kind", "anvilminimal") != "anvilminimal":
+        return None
     if spec.get("mode") != "minimal-loop":
         return None
     scenario = spec.get("scenario", {}) or {}
@@ -171,14 +180,33 @@ def completion_contract_for_spec(spec: dict) -> dict | None:
         for command in commands
         if deterministic_verify_command(command, has_dependency_setup)
     ]
-    if not required_paths and not verify_commands:
+    deferred_requirements = [
+        {
+            "command": command,
+            "reason": "requires dependency setup",
+            "authority": "postcheck",
+            "profile": scenario.get("profile", "generic"),
+            "status": "blocked_by_dependency_setup",
+        }
+        for command in commands
+        if deferred_verify_requirement(command, has_dependency_setup)
+    ]
+    profile = scenario.get("profile", "generic")
+    profile_value = profile if profile not in {"", "generic", "default", "none"} else None
+    if not required_paths and not verify_commands and not deferred_requirements and not profile_value:
         return None
-    return {
+    contract = {
         "required_paths": required_paths,
         "verify_commands": verify_commands,
         "verify_repair_cap": 2,
         "source": "eval_scenario",
     }
+    if profile_value:
+        contract["profile"] = profile_value
+        contract["goal"] = scenario.get("prompt", "")
+    if deferred_requirements:
+        contract["deferred_verify_requirements"] = deferred_requirements
+    return contract
 
 
 def deterministic_verify_command(command: str, has_dependency_setup: bool) -> bool:
@@ -196,6 +224,25 @@ def deterministic_verify_command(command: str, has_dependency_setup: bool) -> bo
     ):
         return False
     return True
+
+
+def deferred_verify_requirement(command: str, has_dependency_setup: bool) -> bool:
+    lowered = command.lower().strip()
+    if not has_dependency_setup:
+        return False
+    if is_dependency_command(command):
+        return False
+    if "&&" in lowered or "||" in lowered or "|" in lowered or ";" in lowered:
+        return False
+    return lowered in {
+        "npm run build",
+        "npm test",
+        "npm run test",
+        "pnpm build",
+        "pnpm test",
+        "yarn build",
+        "yarn test",
+    }
 
 
 def inject_completion_contract_arg(command: list[str], contract_path: Path) -> list[str]:
@@ -299,6 +346,12 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         extras["provider_transient_excluded_from_agent_capability"] = diagnostics[
             "provider_transient_excluded_from_agent_capability"
         ]
+    planner_observability = summarize_planner_observability(events)
+    if planner_observability:
+        extras.update(planner_observability)
+    completion_observability = summarize_completion_observability(events)
+    if completion_observability:
+        extras.update(completion_observability)
     row.update(
         {
             "rc": result.rc,
@@ -339,6 +392,59 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         }
     )
     return row, events
+
+
+def summarize_planner_observability(events: list[dict]) -> dict[str, object]:
+    raw_shapes = [
+        {
+            "planner_provider": event.get("planner_provider", ""),
+            "planner_model": event.get("planner_model", ""),
+            "attempt": event.get("attempt", ""),
+            "content_len": event.get("content_len", ""),
+            "has_json_object": event.get("has_json_object", ""),
+            "contains_goal_key": event.get("contains_goal_key", ""),
+            "contains_steps_key": event.get("contains_steps_key", ""),
+            "json_extract_status": event.get("json_extract_status", ""),
+        }
+        for event in events
+        if event.get("event") == "planner_raw_output_shape"
+    ]
+    quality_warnings = [
+        {
+            "planner_provider": event.get("planner_provider", ""),
+            "planner_model": event.get("planner_model", ""),
+            "message": event.get("planner_error_message", ""),
+        }
+        for event in events
+        if event.get("event") == "planner_quality_warning"
+    ]
+    out: dict[str, object] = {}
+    if raw_shapes:
+        out["planner_raw_output_shape_count"] = len(raw_shapes)
+        out["planner_raw_output_shapes"] = raw_shapes
+    if quality_warnings:
+        out["planner_quality_warning_count"] = len(quality_warnings)
+        out["planner_quality_warnings"] = quality_warnings
+    return out
+
+
+def summarize_completion_observability(events: list[dict]) -> dict[str, object]:
+    completion = [
+        event for event in events if event.get("event") == "completion_verify"
+    ]
+    if not completion:
+        return {}
+    last = completion[-1]
+    out: dict[str, object] = {
+        "completion_verify_count": len(completion),
+    }
+    if last.get("profile"):
+        out["completion_profile"] = last.get("profile", "")
+    if last.get("deferred_verify_requirements"):
+        out["deferred_verify_requirements"] = last.get("deferred_verify_requirements", [])
+    if last.get("profile_failures"):
+        out["profile_failures"] = last.get("profile_failures", [])
+    return out
 
 
 def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:

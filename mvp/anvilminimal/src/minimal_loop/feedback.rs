@@ -32,6 +32,21 @@ pub fn artifact_stagnation(paths: &[String], attempt: usize, attempt_limit: usiz
     )
 }
 
+pub fn artifact_stagnation_for_target(
+    paths: &[String],
+    target_path: &str,
+    attempt: usize,
+    attempt_limit: usize,
+) -> String {
+    if target_path.is_empty() {
+        return artifact_stagnation(paths, attempt, attempt_limit);
+    }
+    format!(
+        "Required artifact creation is stalled. Missing required artifact(s): {}.\nCreate this exact workspace-relative path now: `{target_path}`.\nYour next response for this turn must be exactly one Write or Edit tool call for `{target_path}`. Plain text without a tool call is invalid and will be discarded. Do not inspect the workspace again and do not answer in prose until this required artifact is created. artifact_recovery_target_attempt={attempt}/{attempt_limit}",
+        paths.join(", ")
+    )
+}
+
 pub fn verify_repair_edit_required(
     signature: &str,
     attempt: usize,

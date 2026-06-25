@@ -101,7 +101,10 @@ pub fn lint_step_plan_report(plan: &StepPlan) -> PlanLintReport {
                 report.push("verify_policy", err.to_string());
                 continue;
             }
-            if is_build_verify(command) && !setup_seen && !step_creates_dependency_manifest(step) {
+            if requires_dependency_setup_before_verify(command)
+                && !setup_seen
+                && !step_creates_dependency_manifest(step)
+            {
                 report.push(
                     "dependency_order",
                     "verify command requires dependency setup or package manifest first",
@@ -124,6 +127,56 @@ pub fn lint_step_plan_report(plan: &StepPlan) -> PlanLintReport {
     report
 }
 
+pub fn step_plan_quality_warnings(plan: &StepPlan) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let expected_path_count: usize = plan
+        .steps
+        .iter()
+        .map(|step| step.expected_paths.len())
+        .sum();
+    let has_verify = plan.steps.iter().any(|step| !step.verify.is_empty());
+    let has_setup = plan
+        .steps
+        .iter()
+        .any(|step| step.step_kind() == StepKind::Setup || step_creates_dependency_manifest(step));
+    let lower_goal = plan.goal.to_ascii_lowercase();
+    let looks_medium_or_large = expected_path_count > 1
+        || lower_goal.contains("app")
+        || lower_goal.contains("next.js")
+        || lower_goal.contains("nextjs")
+        || lower_goal.contains("game")
+        || lower_goal.contains("project")
+        || lower_goal.contains("テスト")
+        || lower_goal.contains("アプリ");
+    if plan.steps.len() == 1 && looks_medium_or_large {
+        warnings.push("single-step plan for medium/large task".to_string());
+    }
+    if expected_path_count > 1 {
+        let owners = plan
+            .steps
+            .iter()
+            .filter(|step| !step.expected_paths.is_empty())
+            .count();
+        if owners <= 1 {
+            warnings.push("multiple expected paths owned by one step".to_string());
+        }
+    }
+    if !has_verify
+        && (lower_goal.contains("test")
+            || lower_goal.contains("build")
+            || lower_goal.contains("verify")
+            || lower_goal.contains("検証"))
+    {
+        warnings.push(
+            "task likely needs deterministic verify but plan has no verify command".to_string(),
+        );
+    }
+    if has_verify && !has_setup && lower_goal.contains("next") {
+        warnings.push("verify appears without setup for framework task".to_string());
+    }
+    warnings
+}
+
 fn validate_step_kind_contract(step: &crate::planner::step_plan::PlanStep) -> anyhow::Result<()> {
     match step.step_kind() {
         StepKind::Inspect => {
@@ -132,7 +185,11 @@ fn validate_step_kind_contract(step: &crate::planner::step_plan::PlanStep) -> an
             }
         }
         StepKind::Setup => {
-            if step.verify.iter().any(|command| is_build_verify(command)) {
+            if step
+                .verify
+                .iter()
+                .any(|command| is_verify_like_command(command))
+            {
                 anyhow::bail!("setup step may not run build/test verification");
             }
         }
@@ -165,9 +222,40 @@ fn validate_step_kind_contract(step: &crate::planner::step_plan::PlanStep) -> an
     Ok(())
 }
 
-fn is_build_verify(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    lower.contains("test") || lower.contains("build")
+fn is_verify_like_command(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower == "cargo test"
+        || lower.starts_with("cargo test ")
+        || lower == "npm test"
+        || lower == "npm run test"
+        || lower == "npm run build"
+        || lower == "pnpm test"
+        || lower == "pnpm build"
+        || lower == "yarn test"
+        || lower == "yarn build"
+        || lower.starts_with("python -m unittest")
+        || lower.starts_with("python3 -m unittest")
+        || lower == "pytest"
+        || lower.starts_with("pytest ")
+        || lower.contains(" build")
+}
+
+fn requires_dependency_setup_before_verify(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower == "npm test"
+        || lower == "npm run test"
+        || lower == "npm run build"
+        || lower == "pnpm test"
+        || lower == "pnpm build"
+        || lower == "yarn test"
+        || lower == "yarn build"
+        || lower.starts_with("npm run build ")
+        || lower.starts_with("npm run test ")
+        || lower.starts_with("npm test ")
+        || lower.starts_with("pnpm build ")
+        || lower.starts_with("pnpm test ")
+        || lower.starts_with("yarn build ")
+        || lower.starts_with("yarn test ")
 }
 
 fn is_nextjs_build(command: &str) -> bool {
@@ -278,6 +366,23 @@ mod tests {
     }
 
     #[test]
+    fn step_plan_rejects_duplicate_step_ids() {
+        duplicate_step_ids_are_rejected();
+    }
+
+    #[test]
+    fn step_kind_source_aliases() {
+        for kind in ["work", "create", "edit", "repair"] {
+            let mut plan = StepPlan {
+                goal: "goal".to_string(),
+                steps: vec![step("s1", "Create the file")],
+            };
+            plan.steps[0].kind = kind.to_string();
+            assert!(lint_step_plan(&plan).is_ok(), "{kind}");
+        }
+    }
+
+    #[test]
     fn shell_command_instruction_is_rejected() {
         let plan = StepPlan {
             goal: "goal".to_string(),
@@ -331,6 +436,17 @@ mod tests {
     }
 
     #[test]
+    fn shell_test_file_check_does_not_require_dependency_setup() {
+        let mut plan = StepPlan {
+            goal: "Create README".to_string(),
+            steps: vec![step("s1", "Create README.md")],
+        };
+        plan.steps[0].expected_paths = vec!["README.md".to_string()];
+        plan.steps[0].verify = vec!["test -f README.md".to_string()];
+        assert!(lint_step_plan(&plan).is_ok());
+    }
+
+    #[test]
     fn inspect_step_rejects_expected_paths() {
         let mut plan = StepPlan {
             goal: "goal".to_string(),
@@ -354,6 +470,23 @@ mod tests {
             }],
         };
         assert!(lint_step_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn expected_result_fail_requires_verify() {
+        let plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![PlanStep {
+                id: "s1".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "fail".to_string(),
+                instruction: "Create result".to_string(),
+                expected_paths: vec!["out.txt".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let err = lint_step_plan(&plan).unwrap_err().to_string();
+        assert!(err.contains("expected_result fail requires a verify command"));
     }
 
     #[test]
@@ -402,6 +535,90 @@ mod tests {
             }],
         };
         assert!(lint_step_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn planner_lint_python_unittest_without_setup_passes() {
+        let plan = StepPlan {
+            goal: "Create Python linter".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "s1".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Implement the linter".to_string(),
+                    expected_paths: vec!["markdown_lint.py".to_string()],
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "s2".to_string(),
+                    kind: "verify".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Run deterministic unit tests".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: vec!["python3 -m unittest test_markdown_lint.py".to_string()],
+                },
+            ],
+        };
+        assert!(lint_step_plan(&plan).is_ok());
+    }
+
+    #[test]
+    fn planner_lint_python_unittest_alias_without_setup_passes() {
+        let plan = StepPlan {
+            goal: "Create Python module".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "s1".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Implement the module".to_string(),
+                    expected_paths: vec!["app.py".to_string()],
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "s2".to_string(),
+                    kind: "verify".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Run stdlib unittest".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: vec!["python -m unittest test_app.py".to_string()],
+                },
+            ],
+        };
+        assert!(lint_step_plan(&plan).is_ok());
+    }
+
+    #[test]
+    fn planner_lint_pytest_and_cargo_test_are_not_dependency_order_failures() {
+        for command in ["pytest", "pytest tests", "cargo test"] {
+            let plan = StepPlan {
+                goal: "Run verifier".to_string(),
+                steps: vec![
+                    PlanStep {
+                        id: "s1".to_string(),
+                        kind: "implement".to_string(),
+                        expected_result: "pass".to_string(),
+                        instruction: "Create source".to_string(),
+                        expected_paths: vec!["src/lib.rs".to_string()],
+                        verify: Vec::new(),
+                    },
+                    PlanStep {
+                        id: "s2".to_string(),
+                        kind: "verify".to_string(),
+                        expected_result: "pass".to_string(),
+                        instruction: "Run verifier".to_string(),
+                        expected_paths: Vec::new(),
+                        verify: vec![command.to_string()],
+                    },
+                ],
+            };
+            let report = lint_step_plan_report(&plan);
+            assert!(
+                !report.has_category("dependency_order"),
+                "{command}: {report:?}"
+            );
+        }
     }
 
     #[test]
@@ -466,6 +683,45 @@ mod tests {
             steps: vec![step("s1", "Create file"), step("s2", "Update file")],
         };
         assert!(lint_step_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn step_plan_rejects_duplicate_expected_path_ownership() {
+        duplicate_expected_path_ownership_is_rejected();
+    }
+
+    #[test]
+    fn step_plan_quality_diagnostic() {
+        let plan = StepPlan {
+            goal: "Build a Next.js game app".to_string(),
+            steps: vec![PlanStep {
+                id: "s1".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create app".to_string(),
+                expected_paths: vec!["package.json".to_string(), "src/app/page.tsx".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let warnings = step_plan_quality_warnings(&plan);
+        assert!(!warnings.is_empty());
+    }
+
+    #[test]
+    fn step_plan_quality_diagnostic_does_not_reject_small_task() {
+        let plan = StepPlan {
+            goal: "Update README heading".to_string(),
+            steps: vec![PlanStep {
+                id: "s1".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Update README".to_string(),
+                expected_paths: vec!["README.md".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        assert!(lint_step_plan(&plan).is_ok());
+        assert!(step_plan_quality_warnings(&plan).is_empty());
     }
 
     #[test]

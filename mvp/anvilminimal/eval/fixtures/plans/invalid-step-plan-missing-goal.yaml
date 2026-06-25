@@ -1,0 +1,7 @@
+steps:
+  - id: "implement"
+    kind: "implement"
+    instruction: "Create the file."
+    expected_paths:
+      - "app.py"
+    verify:

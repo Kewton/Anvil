@@ -188,8 +188,8 @@ fn interrupt_boundaries_stop_before_model_call() {
 #[test]
 fn planner_uses_ui_for_planner_model_call() {
     let dir = tempfile::tempdir().unwrap();
-    let yaml = "goal: test\nsteps:\n  - id: s1\n    kind: report\n    instruction: say done\n";
-    let mut planner = FakeClient::new("planner", vec![AssistantReply::text(yaml)]);
+    let json = r#"{"goal":"test","steps":[{"id":"s1","kind":"report","instruction":"say done","expected_paths":[],"verify":[],"expected_result":"pass"}]}"#;
+    let mut planner = FakeClient::new("planner", vec![AssistantReply::text(json)]);
     let ui = FakeUi::default();
     let plan =
         generate_step_plan_with_ui(&mut planner, "test", &config(dir.path().to_path_buf()), &ui)
@@ -206,10 +206,11 @@ fn planner_uses_ui_for_planner_model_call() {
 fn tui_ultra_plan_run_smoke_fake_clients() {
     let dir = tempfile::tempdir().unwrap();
     let mut step_plan = anvilminimal::planner::step_plan::StepPlan::single("write app");
+    step_plan.steps[0].kind = "implement".to_string();
     step_plan.steps[0]
         .expected_paths
         .push("app.txt".to_string());
-    let step_yaml = anvilminimal::planner::step_plan::render_step_plan(&step_plan);
+    let step_json = serde_json::to_string(&step_plan).unwrap();
     let plan = anvilminimal::planner::ultra_plan::UltraPlan {
         goal: "build app".to_string(),
         profile: "generic".to_string(),
@@ -229,8 +230,8 @@ fn tui_ultra_plan_run_smoke_fake_clients() {
     let mut planner = FakeClient::new(
         "planner",
         vec![
-            AssistantReply::text(step_yaml.clone()),
-            AssistantReply::text(step_yaml),
+            AssistantReply::text(step_json.clone()),
+            AssistantReply::text(step_json),
         ],
     );
     let mut execution = FakeClient::new(

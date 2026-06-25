@@ -1,0 +1,14 @@
+[
+  {
+    "id": "read-workdir-prefix-recoverable",
+    "expected_failure_kind": "tool_validation_error",
+    "events": [
+      {
+        "event": "tool_validation_error",
+        "name": "Read",
+        "error_kind": "path_not_found_recoverable",
+        "repeat_count": 1
+      }
+    ]
+  }
+]

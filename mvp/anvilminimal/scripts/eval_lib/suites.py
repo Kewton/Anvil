@@ -88,7 +88,13 @@ def prompt_with_required_final_artifacts(scenario: dict[str, Any]) -> str:
     if not artifacts or "Required final artifacts:" in prompt:
         return prompt
     block = "\n".join(f"- {path}" for path in artifacts)
-    return f"{prompt}\n\nRequired final artifacts:\n{block}"
+    return (
+        f"{prompt}\n\n"
+        "Required final artifacts:\n"
+        f"{block}\n\n"
+        "Create every required final artifact as an exact workspace-relative path before any final response. "
+        "If implementation is needed, prefer Write/Edit tool calls for the missing files over additional inspection."
+    )
 
 
 def infer_size(sid: str) -> str:

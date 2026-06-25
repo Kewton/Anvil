@@ -15,18 +15,22 @@ KNOWN_FAILURE_KINDS = {
     "planner_lint_error",
     "planner_schema_error",
     "postcheck_failure",
+    "profile_contract_failure",
     "provider_http_status",
     "provider_model_unavailable",
     "provider_parse_error",
     "provider_transient_exhausted",
     "required_artifacts_missing",
+    "recoverable_tool_error_repeated",
     "timeout",
     "tool_argument_decode_error",
     "tool_execution_error",
     "tool_validation_error",
     "unclassified_process_failure",
     "artifact_recovery_exhausted",
+    "deferred_verify_requirement_pending",
     "test_discovery_failure",
+    "test_framework_mismatch",
     "verify_repair_no_change",
     "verify_repair_exhausted",
     "verify_repair_progress_invalid",
@@ -74,6 +78,9 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             return {
                 "failure_kind": "artifact_recovery_exhausted",
                 "last_loop_stop": "artifact_recovery_exhausted",
+                "artifact_target_path": event.get("last_target_path", ""),
+                "artifact_last_model_action": event.get("last_model_action", ""),
+                "artifact_recovery_attempts": event.get("attempts", ""),
             }
         if name == "loop_stop" and event.get("reason") == "verify_repair_no_change":
             return {
@@ -85,11 +92,33 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "failure_kind": "test_discovery_failure",
                 "last_loop_stop": "test_discovery_failure",
             }
+        if name == "loop_stop" and event.get("reason") == "test_framework_mismatch":
+            return {
+                "failure_kind": "test_framework_mismatch",
+                "last_loop_stop": "test_framework_mismatch",
+            }
+        if name == "loop_stop" and event.get("reason") == "recoverable_tool_error_repeated":
+            return {
+                "failure_kind": "recoverable_tool_error_repeated",
+                "last_loop_stop": "recoverable_tool_error_repeated",
+                "tool_error_kind": event.get("error_kind", ""),
+                "tool_name": event.get("name", ""),
+            }
         if name == "loop_stop" and str(event.get("reason", "")).startswith("verify_repair_progress_"):
             return {
                 "failure_kind": event.get("reason", "verify_repair_exhausted"),
                 "last_loop_stop": event.get("reason", ""),
                 "repair_progress": event.get("repair_progress", ""),
+            }
+        if name == "loop_stop" and event.get("reason") == "deferred_verify_requirement_pending":
+            return {
+                "failure_kind": "deferred_verify_requirement_pending",
+                "last_loop_stop": "deferred_verify_requirement_pending",
+            }
+        if name == "loop_stop" and event.get("reason") == "profile_contract_failure":
+            return {
+                "failure_kind": "profile_contract_failure",
+                "last_loop_stop": "profile_contract_failure",
             }
         if name == "loop_stop" and event.get("reason") == "verify_repair_exhausted":
             return {
@@ -105,6 +134,7 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             return {
                 "failure_kind": "tool_validation_error",
                 "tool_error_kind": event.get("error_kind", ""),
+                "tool_name": event.get("name", ""),
             }
         if name == "tool_execute" and event.get("status") == "error":
             return {
@@ -154,6 +184,10 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
     planner = classify_planner_stderr(stderr)
     if planner:
         return planner
+    if "recoverable tool error repeated" in lower:
+        return {"failure_kind": "recoverable_tool_error_repeated"}
+    if "path_not_found_recoverable" in lower:
+        return {"failure_kind": "tool_validation_error", "tool_error_kind": "path_not_found_recoverable"}
     if "path does not exist:" in lower or "no such file or directory" in lower:
         return {"failure_kind": "tool_execution_error", "tool_error_kind": "path_missing"}
     if "function_call arguments" in stderr or "provider parse" in lower:
@@ -166,9 +200,15 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
         return {"failure_kind": "artifact_recovery_exhausted"}
     if "verify repair made no file changes" in lower:
         return {"failure_kind": "verify_repair_no_change"}
+    if "test_framework_mismatch" in lower or "pytest_style_under_unittest" in lower:
+        return {"failure_kind": "test_framework_mismatch"}
     if "test_discovery_failure" in lower or "no tests ran" in lower or "ran 0 tests" in lower:
         return {"failure_kind": "test_discovery_failure"}
     if "completion contract verify failed" in lower:
+        if "deferred verify requirement pending" in lower:
+            return {"failure_kind": "deferred_verify_requirement_pending"}
+        if "profile contract" in lower or "scripts.build must be next build" in lower:
+            return {"failure_kind": "profile_contract_failure"}
         return {"failure_kind": "verify_repair_exhausted"}
     if "missing tool call for action prompt" in lower:
         return {"failure_kind": "missing_tool_call"}
@@ -199,11 +239,21 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
 
 def classify_planner_stderr(stderr: str) -> dict[str, Any]:
     lower = stderr.lower()
-    if "stepplan missing goal" in lower or "stepplan has no steps" in lower:
+    if (
+        "stepplan missing goal" in lower
+        or "stepplan has no steps" in lower
+        or "stepplan invalid json" in lower
+    ):
         return {
             "failure_kind": "planner_schema_error",
             "planner_stage": "schema",
             "planner_error_kind": "planner_schema_error",
+        }
+    if "stepplan unsafe expected path" in lower:
+        return {
+            "failure_kind": "path_confinement_error",
+            "planner_stage": "schema",
+            "planner_error_kind": "path_confinement_error",
         }
     if "ultra phase must have id and prompt" in lower:
         return {

@@ -69,8 +69,11 @@ class EvalRunDryTest(unittest.TestCase):
 
         contract = eval_run.completion_contract_for_spec(
             {
+                "binary_kind": "anvilminimal",
                 "mode": "minimal-loop",
                 "scenario": {
+                    "profile": "nextjs",
+                    "prompt": "Create a Next.js app",
                     "expected_artifacts": ["package.json", "src/app/page.tsx"],
                     "postcheck": {
                         "commands": [
@@ -84,6 +87,46 @@ class EvalRunDryTest(unittest.TestCase):
         )
         self.assertEqual(contract["required_paths"], ["package.json", "src/app/page.tsx"])
         self.assertEqual(contract["verify_commands"], ["python3 -m unittest test_app.py"])
+        self.assertEqual(contract["profile"], "nextjs")
+        self.assertEqual(
+            contract["deferred_verify_requirements"],
+            [
+                {
+                    "command": "npm run build",
+                    "reason": "requires dependency setup",
+                    "authority": "postcheck",
+                    "profile": "nextjs",
+                    "status": "blocked_by_dependency_setup",
+                }
+            ],
+        )
+
+    def test_completion_contract_for_docs_only_does_not_force_profile_or_verify(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import importlib.util
+
+        module_path = ROOT / "scripts/eval-run.py"
+        spec = importlib.util.spec_from_file_location("eval_run_docs", module_path)
+        eval_run = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(eval_run)
+
+        contract = eval_run.completion_contract_for_spec(
+            {
+                "binary_kind": "anvilminimal",
+                "mode": "minimal-loop",
+                "scenario": {
+                    "profile": "generic",
+                    "prompt": "Update docs",
+                    "expected_artifacts": ["README.md"],
+                    "postcheck": {"commands": []},
+                },
+            }
+        )
+        self.assertEqual(contract["required_paths"], ["README.md"])
+        self.assertEqual(contract["verify_commands"], [])
+        self.assertNotIn("profile", contract)
+        self.assertNotIn("deferred_verify_requirements", contract)
 
     def test_completion_contract_arg_is_inserted_before_prompt(self):
         sys.path.insert(0, str(ROOT / "scripts"))
@@ -110,6 +153,7 @@ class EvalRunDryTest(unittest.TestCase):
         self.assertEqual(profiles["speed-cloud"]["chat_retries"], 2)
         command = render_command(
             binary="anvilminimal",
+            binary_kind="anvilminimal",
             mode="minimal-loop",
             scenario={"prompt": "do it"},
             main=profiles["speed-cloud"]["runs"][0]["main"],
@@ -120,6 +164,121 @@ class EvalRunDryTest(unittest.TestCase):
         )
         self.assertIn("--chat-retries", command)
         self.assertEqual(command[command.index("--chat-retries") + 1], "2")
+
+    def test_anvilminimal_ultra_plan_run_does_not_duplicate_profile(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from eval_lib.models import load_model_profiles
+        from eval_lib.matrix import render_command
+
+        profiles, _ = load_model_profiles(ROOT / "eval/model_profiles.yaml")
+        command = render_command(
+            binary="anvilminimal",
+            binary_kind="anvilminimal",
+            mode="ultra-plan-run",
+            scenario={"prompt": "do it", "profile": "nextjs"},
+            main=profiles["speed-cloud"]["runs"][0]["main"],
+            planner=profiles["speed-cloud"]["runs"][0]["planner"],
+            context_budget=65536,
+            workdir=Path("workdir"),
+            chat_retries=profiles["speed-cloud"]["chat_retries"],
+        )
+        self.assertEqual(command.count("--profile"), 1, command)
+        self.assertLess(command.index("--profile"), command.index("--ultra-plan-run"))
+
+    def test_anvildev_dry_run_uses_source_cli_dialect(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td) / "run"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-run.py",
+                    "--suite",
+                    "eval/suites/mvp-smoke.yaml",
+                    "--model-profile",
+                    "speed-cloud",
+                    "--modes",
+                    "minimal-loop,step-plan,plan-run,ultra-plan-run,ultra-step-run",
+                    "--scenario",
+                    "nextjs-space-invaders-large",
+                    "--runs",
+                    "1",
+                    "--binary",
+                    "anvildev",
+                    "--run-root",
+                    str(run_root),
+                    "--dry-run",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            matrix = json.loads((run_root / "matrix.json").read_text())
+            self.assertEqual({row["binary_kind"] for row in matrix}, {"anvildev"})
+            command_files = list((run_root / "runs").glob("*/command.txt"))
+            commands = "\n".join(path.read_text() for path in command_files)
+            self.assertIn('"--engine" "minimal"', commands)
+            self.assertIn('"--plan-run"', commands)
+            self.assertIn('"--ultra-plan-run"', commands)
+            self.assertIn('"--run-plan" "<phase-step-plan.yaml>"', commands)
+            self.assertNotIn("--completion-contract-json", commands)
+
+            ultra = next(row["command"] for row in matrix if row["mode"] == "ultra-plan-run")
+            self.assertTrue(
+                ultra[ultra.index("--ultra-plan-run") + 1].startswith("Create a Next.js"),
+                ultra,
+            )
+            self.assertGreater(ultra.index("--profile"), ultra.index("--ultra-plan-run"))
+
+    def test_scenario_filter_is_single_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td) / "run"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-run.py",
+                    "--suite",
+                    "eval/suites/mvp-smoke.yaml",
+                    "--model-profile",
+                    "speed-cloud",
+                    "--modes",
+                    "step-plan",
+                    "--scenario",
+                    "docs-heading-update-small,python-markdown-linter-medium",
+                    "--runs",
+                    "1",
+                    "--run-root",
+                    str(run_root),
+                    "--dry-run",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("scenario not found", result.stderr + result.stdout)
+
+    def test_completion_contract_is_anvilminimal_only(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import importlib.util
+
+        module_path = ROOT / "scripts/eval-run.py"
+        spec = importlib.util.spec_from_file_location("eval_run", module_path)
+        eval_run = importlib.util.module_from_spec(spec)
+        self.assertIsNotNone(spec.loader)
+        spec.loader.exec_module(eval_run)
+
+        contract = eval_run.completion_contract_for_spec(
+            {
+                "binary_kind": "anvildev",
+                "mode": "minimal-loop",
+                "scenario": {
+                    "expected_artifacts": ["app.py"],
+                    "postcheck": {"commands": ["python3 -m unittest test_app.py"]},
+                },
+            }
+        )
+        self.assertIsNone(contract)
 
     def test_postcheck_oracle_defaults_to_fixed(self):
         sys.path.insert(0, str(ROOT / "scripts"))

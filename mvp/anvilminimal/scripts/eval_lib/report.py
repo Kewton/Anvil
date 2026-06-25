@@ -20,6 +20,8 @@ def generate_report(run_root: Path) -> str:
     lines.extend(stop_reason_summary(rows))
     lines.extend(planner_failure_summary(rows))
     lines.extend(planner_repair_summary(rows))
+    lines.extend(planner_raw_shape_summary(rows))
+    lines.extend(planner_quality_warning_summary(rows))
     lines.extend(failure_summary(rows))
     return "\n".join(lines) + "\n"
 
@@ -137,6 +139,71 @@ def planner_repair_summary(rows: list[dict[str, str]]) -> list[str]:
     ]
     lines = ["## Planner Repairs", ""]
     return lines + table_rows(rows_out, ["metric", "count"])
+
+
+def planner_raw_shape_summary(rows: list[dict[str, str]]) -> list[str]:
+    counter = Counter()
+    for row in rows:
+        extras = parse_extras(row)
+        shapes = extras.get("planner_raw_output_shapes", [])
+        if not isinstance(shapes, list):
+            continue
+        for shape in shapes:
+            if not isinstance(shape, dict):
+                continue
+            key = (
+                str(shape.get("planner_provider", "")),
+                str(shape.get("planner_model", "")),
+                str(shape.get("json_extract_status", "")),
+                str(shape.get("has_json_object", "")),
+                str(shape.get("contains_goal_key", "")),
+                str(shape.get("contains_steps_key", "")),
+            )
+            counter[key] += 1
+    lines = [
+        "## Planner Raw Output Shapes",
+        "",
+        "| provider | model | json_extract_status | has_json_object | contains_goal_key | contains_steps_key | count |",
+        "|---|---|---|---|---|---|---:|",
+    ]
+    if not counter:
+        lines.append("| none |  |  |  |  |  | 0 |")
+    else:
+        for (provider, model, status, has_json, has_goal, has_steps), count in sorted(counter.items()):
+            lines.append(f"| {provider} | {model} | {status} | {has_json} | {has_goal} | {has_steps} | {count} |")
+    lines.append("")
+    return lines
+
+
+def planner_quality_warning_summary(rows: list[dict[str, str]]) -> list[str]:
+    counter = Counter()
+    for row in rows:
+        extras = parse_extras(row)
+        warnings = extras.get("planner_quality_warnings", [])
+        if not isinstance(warnings, list):
+            continue
+        for warning in warnings:
+            if not isinstance(warning, dict):
+                continue
+            key = (
+                str(warning.get("planner_provider", "")),
+                str(warning.get("planner_model", "")),
+                str(warning.get("message", "")),
+            )
+            counter[key] += 1
+    lines = [
+        "## Planner Quality Warnings",
+        "",
+        "| provider | model | warning | count |",
+        "|---|---|---|---:|",
+    ]
+    if not counter:
+        lines.append("| none |  |  | 0 |")
+    else:
+        for (provider, model, message), count in sorted(counter.items()):
+            lines.append(f"| {provider} | {model} | {message} | {count} |")
+    lines.append("")
+    return lines
 
 
 def stop_reason_summary(rows: list[dict[str, str]]) -> list[str]:

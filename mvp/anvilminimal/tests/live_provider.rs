@@ -10,6 +10,47 @@ use anvilminimal::state::ConversationMessage;
 use anvilminimal::tools::registry::ToolRegistry;
 
 #[test]
+fn planner_live_provider_smoke_skips_without_keys() {
+    if std::env::var("ANVIL_LIVE_PROVIDER_TESTS").ok().as_deref() == Some("1") {
+        let _ = find_workspace_with_key("OPENAI_API_KEY");
+        let _ = find_workspace_with_key("GEMINI_API_KEY");
+    }
+}
+
+#[test]
+fn planner_live_openai_gemini_json_contract() {
+    if std::env::var("ANVIL_LIVE_PROVIDER_TESTS").ok().as_deref() != Some("1") {
+        return;
+    }
+    let Some(openai_root) = find_workspace_with_key("OPENAI_API_KEY") else {
+        return;
+    };
+    let Some(gemini_root) = find_workspace_with_key("GEMINI_API_KEY") else {
+        return;
+    };
+    let goal = "Build a Python markdown heading linter with unit tests.";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut openai_config = smoke_config(tmp.path(), openai_root, Provider::Openai);
+    openai_config.planner_model =
+        std::env::var("ANVIL_OPENAI_SMOKE_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".to_string());
+    openai_config.planner_provider = Provider::Openai;
+    let mut openai = OpenAiClient::from_env(&openai_config).expect("openai client");
+    let openai_plan = anvilminimal::planner::generate_step_plan(&mut openai, goal, &openai_config)
+        .expect("OpenAI planner JSON contract");
+    assert!(!openai_plan.steps.is_empty());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut gemini_config = smoke_config(tmp.path(), gemini_root, Provider::Gemini);
+    gemini_config.planner_model = std::env::var("ANVIL_GEMINI_SMOKE_MODEL")
+        .unwrap_or_else(|_| "gemini-3.5-flash".to_string());
+    gemini_config.planner_provider = Provider::Gemini;
+    let mut gemini = GeminiClient::from_env(&gemini_config).expect("gemini client");
+    let gemini_plan = anvilminimal::planner::generate_step_plan(&mut gemini, goal, &gemini_config)
+        .expect("Gemini planner JSON contract");
+    assert!(!gemini_plan.steps.is_empty());
+}
+
+#[test]
 #[ignore]
 fn live_openai_request_shape_uses_smoke_model() {
     if std::env::var("ANVIL_LIVE_PROVIDER_TESTS").ok().as_deref() != Some("1") {
@@ -177,5 +218,32 @@ fn find_workspace_with_key(name: &str) -> Option<PathBuf> {
         Some(PathBuf::from("."))
     } else {
         None
+    }
+}
+
+fn smoke_config(tmp_root: &Path, key_root: PathBuf, provider: Provider) -> Config {
+    Config {
+        workspace_root: key_root,
+        state_dir: tmp_root.join("state"),
+        eval_events_path: None,
+        completion_contract_path: None,
+        yes: true,
+        offline: false,
+        context_budget: 4096,
+        model: "unused".to_string(),
+        provider,
+        planner_model: "unused".to_string(),
+        planner_provider: provider,
+        ollama_host: "http://127.0.0.1:11434".to_string(),
+        num_predict: 512,
+        max_iterations: 1,
+        chat_timeout_secs: 60,
+        chat_retries: 0,
+        resume: None,
+        fresh_session: true,
+        no_footer: false,
+        profile: "generic".to_string(),
+        style: "default".to_string(),
+        action: Action::Prompt(String::new()),
     }
 }

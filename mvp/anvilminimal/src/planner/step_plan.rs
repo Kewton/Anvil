@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepPlan {
@@ -33,12 +34,32 @@ pub enum ExpectedResult {
     Unknown(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct GeneratedStepPlan {
+    goal: String,
+    steps: Vec<GeneratedPlanStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct GeneratedPlanStep {
+    id: Value,
+    #[serde(default = "default_step_kind")]
+    kind: String,
+    #[serde(default = "default_expected_result")]
+    expected_result: String,
+    instruction: String,
+    #[serde(default)]
+    expected_paths: Value,
+    #[serde(default)]
+    verify: Value,
+}
+
 impl PlanStep {
     pub fn step_kind(&self) -> StepKind {
         match self.kind.trim().to_ascii_lowercase().as_str() {
             "inspect" => StepKind::Inspect,
             "setup" => StepKind::Setup,
-            "implement" | "work" => StepKind::Implement,
+            "implement" | "work" | "create" | "edit" | "repair" => StepKind::Implement,
             "verify" => StepKind::Verify,
             "report" => StepKind::Report,
             other => StepKind::Unknown(other.to_string()),
@@ -52,6 +73,14 @@ impl PlanStep {
             other => ExpectedResult::Unknown(other.to_string()),
         }
     }
+}
+
+fn default_step_kind() -> String {
+    "implement".to_string()
+}
+
+fn default_expected_result() -> String {
+    "pass".to_string()
 }
 
 impl StepPlan {
@@ -68,6 +97,220 @@ impl StepPlan {
             }],
         }
     }
+}
+
+pub fn parse_generated_step_plan_json(raw: &str, original_goal: &str) -> anyhow::Result<StepPlan> {
+    let json_text = extract_json_object(raw)?;
+    let value: Value = serde_json::from_str(json_text)
+        .map_err(|err| anyhow::anyhow!("StepPlan invalid JSON: {}", err))?;
+    let goal = value
+        .get("goal")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if goal.is_empty() {
+        anyhow::bail!("StepPlan missing goal");
+    }
+    let steps = value.get("steps").and_then(Value::as_array);
+    if steps.is_none_or(|steps| steps.is_empty()) {
+        anyhow::bail!("StepPlan has no steps");
+    }
+    let generated: GeneratedStepPlan = serde_json::from_value(value)
+        .map_err(|err| anyhow::anyhow!("StepPlan invalid JSON: {}", err))?;
+    normalize_generated_step_plan(generated, original_goal)
+}
+
+pub fn repair_generated_step_plan_contract(plan: &mut StepPlan) {
+    normalize_verify_steps(plan);
+    normalize_duplicate_expected_path_ownership(plan);
+}
+
+pub fn extract_json_object(raw: &str) -> anyhow::Result<&str> {
+    let bytes = raw.as_bytes();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        if start.is_none() {
+            if *byte == b'{' {
+                start = Some(index);
+                depth = 1;
+            }
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let begin = start.unwrap_or(0);
+                    return Ok(&raw[begin..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("StepPlan invalid JSON: no JSON object found")
+}
+
+fn normalize_generated_step_plan(
+    generated: GeneratedStepPlan,
+    original_goal: &str,
+) -> anyhow::Result<StepPlan> {
+    let _provider_goal = generated.goal;
+    let mut steps = Vec::new();
+    for (index, step) in generated.steps.into_iter().enumerate() {
+        let mut expected_paths = Vec::new();
+        for path in normalize_string_list(&step.expected_paths, "expected_paths")? {
+            crate::tools::path_guard::validate_workspace_relative(&path)
+                .map_err(|err| anyhow::anyhow!("StepPlan unsafe expected path: {err}"))?;
+            expected_paths.push(path);
+        }
+        let verify = normalize_string_list(&step.verify, "verify")?;
+        let normalized = PlanStep {
+            id: normalize_step_id(&step.id, index),
+            kind: normalize_step_kind(&step.kind),
+            expected_result: normalize_expected_result(&step.expected_result),
+            instruction: step.instruction,
+            expected_paths,
+            verify,
+        };
+        steps.push(normalized);
+    }
+    if steps.is_empty() {
+        anyhow::bail!("StepPlan has no steps");
+    }
+    Ok(StepPlan {
+        goal: original_goal.to_string(),
+        steps,
+    })
+}
+
+fn normalize_string_list(value: &Value, field: &str) -> anyhow::Result<Vec<String>> {
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![trimmed.to_string()])
+            }
+        }
+        Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                let Some(text) = item.as_str() else {
+                    anyhow::bail!("StepPlan invalid JSON: {field} must contain only strings");
+                };
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+            Ok(out)
+        }
+        _ => anyhow::bail!("StepPlan invalid JSON: {field} must be a string or string array"),
+    }
+}
+
+fn normalize_step_id(value: &Value, index: usize) -> String {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => text.trim().to_string(),
+        Value::Number(number) => format!("step-{number}"),
+        _ => format!("step-{}", index + 1),
+    }
+}
+
+fn normalize_step_kind(kind: &str) -> String {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "work" | "create" | "edit" | "repair" => "implement".to_string(),
+        "inspect" | "setup" | "implement" | "verify" | "report" => kind.trim().to_ascii_lowercase(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_expected_result(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "pass" | "passed" | "success" | "succeed" | "succeeds" => "pass".to_string(),
+        "fail" | "failed" | "failure" | "expected-failure" => "fail".to_string(),
+        other if other.contains("fail") || other.contains("red") => "fail".to_string(),
+        _ => "pass".to_string(),
+    }
+}
+
+fn normalize_verify_steps(plan: &mut StepPlan) {
+    for step in &mut plan.steps {
+        if step.step_kind() == StepKind::Verify {
+            step.expected_paths.clear();
+            if !step.verify.is_empty() && looks_like_file_change_instruction(&step.instruction) {
+                step.instruction =
+                    "Run the listed deterministic verification commands without changing files."
+                        .to_string();
+            }
+        }
+    }
+}
+
+fn normalize_duplicate_expected_path_ownership(plan: &mut StepPlan) {
+    use std::collections::BTreeMap;
+
+    let mut owners: BTreeMap<String, usize> = BTreeMap::new();
+    for (index, step) in plan.steps.iter().enumerate() {
+        for path in &step.expected_paths {
+            let replace = owners.get(path).is_none_or(|current| {
+                ownership_priority(step, path) > ownership_priority(&plan.steps[*current], path)
+            });
+            if replace {
+                owners.insert(path.clone(), index);
+            }
+        }
+    }
+    for (index, step) in plan.steps.iter_mut().enumerate() {
+        let mut seen_in_step = std::collections::BTreeSet::new();
+        step.expected_paths.retain(|path| {
+            seen_in_step.insert(path.clone())
+                && owners.get(path).is_some_and(|owner| *owner == index)
+        });
+    }
+}
+
+fn ownership_priority(step: &PlanStep, path: &str) -> u8 {
+    let manifest_or_config = matches!(
+        path,
+        "package.json" | "Cargo.toml" | "pyproject.toml" | "tsconfig.json" | "next.config.js"
+    );
+    match step.step_kind() {
+        StepKind::Setup if manifest_or_config => 5,
+        StepKind::Implement => 4,
+        StepKind::Setup => 3,
+        StepKind::Verify => 2,
+        StepKind::Inspect | StepKind::Report | StepKind::Unknown(_) => 1,
+    }
+}
+
+fn looks_like_file_change_instruction(instruction: &str) -> bool {
+    let lower = instruction.to_ascii_lowercase();
+    lower.contains("write")
+        || lower.contains("edit")
+        || lower.contains("create")
+        || lower.contains("modify")
+        || lower.contains("fix")
+        || lower.contains("実装")
+        || lower.contains("作成")
+        || lower.contains("修正")
 }
 
 pub fn render_step_plan(plan: &StepPlan) -> String {
@@ -250,6 +493,58 @@ steps:
     }
 
     #[test]
+    fn generated_plan_repair_normalizes_verify_instruction_without_paths() {
+        let mut plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![PlanStep {
+                id: "verify".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Fix the implementation and run tests".to_string(),
+                expected_paths: vec!["src/lib.rs".to_string()],
+                verify: vec!["cargo test".to_string()],
+            }],
+        };
+        repair_generated_step_plan_contract(&mut plan);
+        assert!(plan.steps[0].expected_paths.is_empty());
+        assert_eq!(
+            plan.steps[0].instruction,
+            "Run the listed deterministic verification commands without changing files."
+        );
+    }
+
+    #[test]
+    fn generated_plan_repair_prefers_implement_owner_for_source_paths() {
+        let mut plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "setup".to_string(),
+                    kind: "setup".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create scaffolding".to_string(),
+                    expected_paths: vec![
+                        "markdown_lint.py".to_string(),
+                        "package.json".to_string(),
+                    ],
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "implement".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Implement linter".to_string(),
+                    expected_paths: vec!["markdown_lint.py".to_string()],
+                    verify: Vec::new(),
+                },
+            ],
+        };
+        repair_generated_step_plan_contract(&mut plan);
+        assert_eq!(plan.steps[0].expected_paths, vec!["package.json"]);
+        assert_eq!(plan.steps[1].expected_paths, vec!["markdown_lint.py"]);
+    }
+
+    #[test]
     fn missing_goal_can_be_repaired_from_user_goal_when_steps_exist() {
         let (parsed, repaired) = parse_step_plan_with_default_goal(
             r#"steps:
@@ -270,5 +565,92 @@ steps:
             .unwrap_err()
             .to_string();
         assert!(err.contains("StepPlan has no steps"));
+    }
+
+    #[test]
+    fn parse_step_plan_json() {
+        let plan = parse_generated_step_plan_json(
+            r#"{"goal":"short","steps":[{"id":"create-file","kind":"create","instruction":"Create the file","expected_paths":["src/lib.rs"],"verify":["cargo test"],"expected_result":"pass"}]}"#,
+            "original goal",
+        )
+        .unwrap();
+        assert_eq!(plan.goal, "original goal");
+        assert_eq!(plan.steps[0].kind, "implement");
+        assert_eq!(plan.steps[0].expected_paths, vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn extract_step_plan_json_from_fenced_or_prefixed_text() {
+        let raw = "Here is the plan:\n```json\n{\"goal\":\"g\",\"steps\":[{\"id\":\"s1\",\"instruction\":\"do it\"}]}\n```";
+        let extracted = extract_json_object(raw).unwrap();
+        assert!(extracted.starts_with('{'));
+        let plan = parse_generated_step_plan_json(raw, "goal").unwrap();
+        assert_eq!(plan.steps[0].kind, "implement");
+    }
+
+    #[test]
+    fn generated_step_plan_preserves_original_goal() {
+        let plan = parse_generated_step_plan_json(
+            r#"{"goal":"short","steps":[{"id":"s1","instruction":"do it"}]}"#,
+            "long original goal",
+        )
+        .unwrap();
+        assert_eq!(plan.goal, "long original goal");
+    }
+
+    #[test]
+    fn generated_step_plan_rejects_missing_goal_or_steps() {
+        let missing_goal =
+            parse_generated_step_plan_json(r#"{"steps":[{"id":"s1","instruction":"do it"}]}"#, "g")
+                .unwrap_err()
+                .to_string();
+        assert!(missing_goal.contains("StepPlan missing goal"));
+        let empty_steps = parse_generated_step_plan_json(r#"{"goal":"g","steps":[]}"#, "g")
+            .unwrap_err()
+            .to_string();
+        assert!(empty_steps.contains("StepPlan has no steps"));
+    }
+
+    #[test]
+    fn generated_step_plan_rejects_unsafe_expected_paths() {
+        let err = parse_generated_step_plan_json(
+            r#"{"goal":"g","steps":[{"id":"s1","instruction":"do it","expected_paths":["../secret"]}]}"#,
+            "g",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("StepPlan unsafe expected path"));
+    }
+
+    #[test]
+    fn generated_step_plan_normalizes_numeric_id_and_prose_expected_result() {
+        let plan = parse_generated_step_plan_json(
+            r#"{"goal":"g","steps":[{"id":1,"kind":"setup","instruction":"Assess workspace","expected_result":"Workspace state assessed."},{"id":2,"kind":"verify","instruction":"Add red test","expected_result":"The focused test should fail before implementation.","verify":["cargo test"]}]}"#,
+            "g",
+        )
+        .unwrap();
+        assert_eq!(plan.steps[0].id, "step-1");
+        assert_eq!(plan.steps[0].expected_result, "pass");
+        assert_eq!(plan.steps[1].id, "step-2");
+        assert_eq!(plan.steps[1].expected_result, "fail");
+    }
+
+    #[test]
+    fn generated_step_plan_normalizes_string_lists() {
+        let plan = parse_generated_step_plan_json(
+            r#"{"goal":"g","steps":[{"id":"s1","kind":"implement","instruction":"Create README","expected_paths":"README.md","verify":"test -f README.md"}]}"#,
+            "g",
+        )
+        .unwrap();
+        assert_eq!(plan.steps[0].expected_paths, vec!["README.md"]);
+        assert_eq!(plan.steps[0].verify, vec!["test -f README.md"]);
+
+        let empty = parse_generated_step_plan_json(
+            r#"{"goal":"g","steps":[{"id":"s1","kind":"inspect","instruction":"Inspect","expected_paths":"","verify":""}]}"#,
+            "g",
+        )
+        .unwrap();
+        assert!(empty.steps[0].expected_paths.is_empty());
+        assert!(empty.steps[0].verify.is_empty());
     }
 }

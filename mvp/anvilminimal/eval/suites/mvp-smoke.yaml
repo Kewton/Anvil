@@ -40,7 +40,7 @@ scenarios:
     size: medium
     category: fix-code
     profile: generic
-    prompt: Build a Python markdown heading linter with unittest coverage.
+    prompt: Build a Python markdown heading linter with Python unittest.TestCase coverage.
     expected_artifacts:
       - markdown_lint.py
       - test_markdown_lint.py
@@ -83,6 +83,7 @@ scenarios:
       - package.json
       - src/app/page.tsx
       - src/app/layout.tsx
+      - src/app/global.d.ts
     postcheck:
       commands:
         - npm install --ignore-scripts
@@ -108,7 +109,7 @@ scenarios:
     size: large
     category: recovery
     profile: generic
-    prompt: Create a multi-file tool that reports repair exhaustion with deterministic tests.
+    prompt: Create a multi-file tool that reports repair exhaustion with deterministic Python unittest.TestCase tests.
     expected_artifacts:
       - repair_report.py
       - test_repair_report.py

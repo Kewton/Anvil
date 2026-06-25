@@ -190,6 +190,15 @@ fn parse_step(step: &Value, content: &mut String, calls: &mut Vec<ToolCall>) -> 
                 content.push_str(text);
             }
         }
+        "model_output" => {
+            if let Some(items) = step.get("content").and_then(Value::as_array) {
+                for item in items {
+                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                        content.push_str(text);
+                    }
+                }
+            }
+        }
         "function_call" => {
             let name = step
                 .get("name")
@@ -355,6 +364,15 @@ mod tests {
     fn handles_missing_thought() {
         let reply = parse_interactions_response(r#"{"output_text":"done"}"#).unwrap();
         assert_eq!(reply.content, "done");
+    }
+
+    #[test]
+    fn parses_model_output_content_text() {
+        let reply = parse_interactions_response(
+            r#"{"steps":[{"type":"thought","signature":"sig"},{"type":"model_output","content":[{"type":"text","text":"{\"goal\":\"g\",\"steps\":[]}"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.content, r#"{"goal":"g","steps":[]}"#);
     }
 
     #[test]
