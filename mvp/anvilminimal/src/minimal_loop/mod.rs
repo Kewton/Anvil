@@ -1,5 +1,6 @@
 pub mod compact;
 pub mod feedback;
+pub mod import_scan;
 pub mod loop_run;
 pub mod prompt;
 

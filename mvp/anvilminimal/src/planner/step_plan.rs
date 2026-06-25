@@ -10,9 +10,48 @@ pub struct StepPlan {
 pub struct PlanStep {
     pub id: String,
     pub kind: String,
+    pub expected_result: String,
     pub instruction: String,
     pub expected_paths: Vec<String>,
     pub verify: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepKind {
+    Inspect,
+    Setup,
+    Implement,
+    Verify,
+    Report,
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpectedResult {
+    Pass,
+    Fail,
+    Unknown(String),
+}
+
+impl PlanStep {
+    pub fn step_kind(&self) -> StepKind {
+        match self.kind.trim().to_ascii_lowercase().as_str() {
+            "inspect" => StepKind::Inspect,
+            "setup" => StepKind::Setup,
+            "implement" | "work" => StepKind::Implement,
+            "verify" => StepKind::Verify,
+            "report" => StepKind::Report,
+            other => StepKind::Unknown(other.to_string()),
+        }
+    }
+
+    pub fn expected_result_kind(&self) -> ExpectedResult {
+        match self.expected_result.trim().to_ascii_lowercase().as_str() {
+            "" | "pass" => ExpectedResult::Pass,
+            "fail" => ExpectedResult::Fail,
+            other => ExpectedResult::Unknown(other.to_string()),
+        }
+    }
 }
 
 impl StepPlan {
@@ -21,7 +60,8 @@ impl StepPlan {
             goal: goal.to_string(),
             steps: vec![PlanStep {
                 id: "step-1".to_string(),
-                kind: "work".to_string(),
+                kind: "report".to_string(),
+                expected_result: "pass".to_string(),
                 instruction: goal.to_string(),
                 expected_paths: Vec::new(),
                 verify: Vec::new(),
@@ -35,6 +75,10 @@ pub fn render_step_plan(plan: &StepPlan) -> String {
     for step in &plan.steps {
         out.push_str(&format!("  - id: {:?}\n", step.id));
         out.push_str(&format!("    kind: {:?}\n", step.kind));
+        out.push_str(&format!(
+            "    expected_result: {:?}\n",
+            step.expected_result
+        ));
         out.push_str(&format!("    instruction: {:?}\n", step.instruction));
         out.push_str("    expected_paths:\n");
         for path in &step.expected_paths {
@@ -66,11 +110,12 @@ pub fn parse_step_plan(text: &str) -> anyhow::Result<StepPlan> {
         }
         if let Some(value) = trimmed.strip_prefix("- id:") {
             if let Some(step) = current.take() {
-                steps.push(step);
+                steps.push(normalize_legacy_step(step));
             }
             current = Some(PlanStep {
                 id: unquote(value.trim()),
                 kind: "work".to_string(),
+                expected_result: "pass".to_string(),
                 instruction: String::new(),
                 expected_paths: Vec::new(),
                 verify: Vec::new(),
@@ -83,6 +128,8 @@ pub fn parse_step_plan(text: &str) -> anyhow::Result<StepPlan> {
         };
         if let Some(value) = trimmed.strip_prefix("kind:") {
             step.kind = unquote(value.trim());
+        } else if let Some(value) = trimmed.strip_prefix("expected_result:") {
+            step.expected_result = unquote(value.trim());
         } else if let Some(value) = trimmed.strip_prefix("instruction:") {
             step.instruction = unquote(value.trim());
         } else if trimmed == "expected_paths:" {
@@ -98,7 +145,7 @@ pub fn parse_step_plan(text: &str) -> anyhow::Result<StepPlan> {
         }
     }
     if let Some(step) = current {
-        steps.push(step);
+        steps.push(normalize_legacy_step(step));
     }
     if goal.is_empty() {
         anyhow::bail!("StepPlan missing goal");
@@ -107,6 +154,13 @@ pub fn parse_step_plan(text: &str) -> anyhow::Result<StepPlan> {
         anyhow::bail!("StepPlan has no steps");
     }
     Ok(StepPlan { goal, steps })
+}
+
+fn normalize_legacy_step(mut step: PlanStep) -> PlanStep {
+    if step.kind == "report" && (!step.expected_paths.is_empty() || !step.verify.is_empty()) {
+        step.kind = "implement".to_string();
+    }
+    step
 }
 
 fn extract_yaml(text: &str) -> &str {
@@ -136,10 +190,46 @@ mod tests {
     #[test]
     fn yaml_round_trip() {
         let mut plan = StepPlan::single("make thing");
+        plan.steps[0].kind = "implement".to_string();
         plan.steps[0]
             .expected_paths
             .push("package.json".to_string());
         let parsed = parse_step_plan(&render_step_plan(&plan)).unwrap();
         assert_eq!(parsed, plan);
+    }
+
+    #[test]
+    fn legacy_step_plan_defaults_kind_and_expected_result() {
+        let parsed = parse_step_plan(
+            r#"goal: "goal"
+steps:
+  - id: "s1"
+    instruction: "write code"
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.steps[0].kind, "work");
+        assert_eq!(parsed.steps[0].step_kind(), StepKind::Implement);
+        assert_eq!(parsed.steps[0].expected_result_kind(), ExpectedResult::Pass);
+    }
+
+    #[test]
+    fn step_plan_parses_typed_kind_and_expected_result() {
+        let parsed = parse_step_plan(
+            r#"goal: "goal"
+steps:
+  - id: "s1"
+    kind: "verify"
+    expected_result: "fail"
+    instruction: "run failing test"
+    verify:
+      - "cargo test"
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.steps[0].step_kind(), StepKind::Verify);
+        assert_eq!(parsed.steps[0].expected_result_kind(), ExpectedResult::Fail);
+        let rendered = render_step_plan(&parsed);
+        assert!(rendered.contains("expected_result"));
     }
 }

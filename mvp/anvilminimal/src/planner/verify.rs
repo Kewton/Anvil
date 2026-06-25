@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::planner::step_plan::PlanStep;
+use crate::planner::step_plan::{ExpectedResult, PlanStep};
 use crate::tools::path_guard::{resolve_existing, validate_workspace_relative};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,64 +15,154 @@ pub enum VerifyStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationReport {
     pub status: VerifyStatus,
+    pub missing_paths: Vec<String>,
+    pub command_failures: Vec<CommandFailure>,
+    pub dependency_missing: Vec<String>,
+    pub profile_failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandFailure {
+    pub command: String,
+    pub reason: String,
 }
 
 impl VerificationReport {
     pub fn pass() -> Self {
         Self {
             status: VerifyStatus::Pass,
+            missing_paths: Vec::new(),
+            command_failures: Vec::new(),
+            dependency_missing: Vec::new(),
+            profile_failures: Vec::new(),
         }
     }
 
     pub fn is_pass(&self) -> bool {
         self.status == VerifyStatus::Pass
+            && self.missing_paths.is_empty()
+            && self.command_failures.is_empty()
+            && self.dependency_missing.is_empty()
+            && self.profile_failures.is_empty()
+    }
+
+    pub fn missing_path(path: impl Into<String>) -> Self {
+        let mut report = Self::pass();
+        report.push_missing_path(path);
+        report
+    }
+
+    pub fn command_failed(command: impl Into<String>, reason: impl Into<String>) -> Self {
+        let mut report = Self::pass();
+        report.push_command_failure(command, reason);
+        report
+    }
+
+    pub fn dependency_missing(reason: impl Into<String>) -> Self {
+        let mut report = Self::pass();
+        report.push_dependency_missing(reason);
+        report
+    }
+
+    pub fn profile_failed(reason: impl Into<String>) -> Self {
+        let mut report = Self::pass();
+        report.push_profile_failure(reason);
+        report
+    }
+
+    pub fn push_missing_path(&mut self, path: impl Into<String>) {
+        self.missing_paths.push(path.into());
+        self.refresh_status();
+    }
+
+    pub fn push_command_failure(&mut self, command: impl Into<String>, reason: impl Into<String>) {
+        self.command_failures.push(CommandFailure {
+            command: command.into(),
+            reason: reason.into(),
+        });
+        self.refresh_status();
+    }
+
+    pub fn push_dependency_missing(&mut self, reason: impl Into<String>) {
+        self.dependency_missing.push(reason.into());
+        self.refresh_status();
+    }
+
+    pub fn push_profile_failure(&mut self, reason: impl Into<String>) {
+        self.profile_failures.push(reason.into());
+        self.refresh_status();
+    }
+
+    pub fn primary_reason(&self) -> String {
+        self.missing_paths
+            .first()
+            .cloned()
+            .or_else(|| self.dependency_missing.first().cloned())
+            .or_else(|| {
+                self.command_failures
+                    .first()
+                    .map(|failure| failure.reason.clone())
+            })
+            .or_else(|| self.profile_failures.first().cloned())
+            .unwrap_or_else(|| "pass".to_string())
+    }
+
+    pub fn refresh_status(&mut self) {
+        self.status = if let Some(path) = self.missing_paths.first() {
+            VerifyStatus::MissingPath(path.clone())
+        } else if let Some(reason) = self.dependency_missing.first() {
+            VerifyStatus::DependencyMissing(reason.clone())
+        } else if let Some(failure) = self.command_failures.first() {
+            VerifyStatus::CommandFailed(failure.reason.clone())
+        } else if let Some(reason) = self.profile_failures.first() {
+            VerifyStatus::ProfileContractFailed(reason.clone())
+        } else {
+            VerifyStatus::Pass
+        };
     }
 }
 
 pub fn verify_step(root: &Path, step: &PlanStep) -> VerificationReport {
+    let mut report = VerificationReport::pass();
     for path in &step.expected_paths {
         if resolve_existing(root, path).is_err() {
-            return VerificationReport {
-                status: VerifyStatus::MissingPath(path.clone()),
-            };
+            report.push_missing_path(path.clone());
         }
     }
     for command in &step.verify {
         if let Err(err) = validate_verify_command(command) {
-            return VerificationReport {
-                status: VerifyStatus::CommandFailed(err.to_string()),
-            };
+            report.push_command_failure(command.clone(), err.to_string());
+            continue;
         }
         if is_nextjs_build_command(command) && !root.join("node_modules/.bin/next").is_file() {
-            return VerificationReport {
-                status: VerifyStatus::DependencyMissing(
-                    "node_modules/.bin/next missing for Next.js build".to_string(),
-                ),
-            };
+            report.push_dependency_missing("node_modules/.bin/next missing for Next.js build");
+            continue;
         }
         match crate::tools::bash::run_checked(command, root, false) {
-            Ok(output) if command.contains("npm") && output.contains("0 tests") => {
-                return VerificationReport {
-                    status: VerifyStatus::CommandFailed("Node 0 tests rejected".to_string()),
-                };
+            Ok(output) => {
+                if step.expected_result_kind() == ExpectedResult::Fail {
+                    report.push_command_failure(
+                        command.clone(),
+                        "expected command to fail but it passed",
+                    );
+                } else if command.contains("npm") && output.contains("0 tests") {
+                    report.push_command_failure(command.clone(), "Node 0 tests rejected");
+                }
             }
-            Ok(_) => {}
             Err(err)
                 if err.to_string().contains("not found")
                     || err.to_string().contains("No such file") =>
             {
-                return VerificationReport {
-                    status: VerifyStatus::DependencyMissing(command.clone()),
-                };
+                report.push_dependency_missing(command.clone());
             }
             Err(err) => {
-                return VerificationReport {
-                    status: VerifyStatus::CommandFailed(err.to_string()),
-                };
+                if step.expected_result_kind() != ExpectedResult::Fail {
+                    report.push_command_failure(command.clone(), err.to_string());
+                }
             }
         }
     }
-    VerificationReport::pass()
+    report
 }
 
 pub fn validate_verify_command(command: &str) -> anyhow::Result<()> {
@@ -140,6 +230,7 @@ mod tests {
         let step = PlanStep {
             id: "s".to_string(),
             kind: "work".to_string(),
+            expected_result: "pass".to_string(),
             instruction: "x".to_string(),
             expected_paths: vec!["missing.txt".to_string()],
             verify: vec!["false".to_string()],
@@ -179,6 +270,7 @@ mod tests {
         let step = PlanStep {
             id: "s".to_string(),
             kind: "work".to_string(),
+            expected_result: "pass".to_string(),
             instruction: "x".to_string(),
             expected_paths: Vec::new(),
             verify: vec!["false".to_string()],
@@ -200,6 +292,7 @@ mod tests {
         let step = PlanStep {
             id: "s".to_string(),
             kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
             instruction: "x".to_string(),
             expected_paths: Vec::new(),
             verify: vec!["npm run build".to_string()],
@@ -208,5 +301,65 @@ mod tests {
             verify_step(dir.path(), &step).status,
             VerifyStatus::DependencyMissing(_)
         ));
+    }
+
+    #[test]
+    fn verify_step_aggregates_missing_paths_and_command_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = PlanStep {
+            id: "s".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "verify".to_string(),
+            expected_paths: vec!["missing-a.txt".to_string(), "missing-b.txt".to_string()],
+            verify: vec!["false".to_string()],
+        };
+        let report = verify_step(dir.path(), &step);
+        assert_eq!(report.missing_paths.len(), 2);
+        assert_eq!(report.command_failures.len(), 1);
+        assert!(matches!(report.status, VerifyStatus::MissingPath(_)));
+    }
+
+    #[test]
+    fn verify_expected_result_fail_accepts_nonzero_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = PlanStep {
+            id: "s".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "fail".to_string(),
+            instruction: "red test".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["false".to_string()],
+        };
+        assert!(verify_step(dir.path(), &step).is_pass());
+    }
+
+    #[test]
+    fn verify_expected_result_pass_rejects_nonzero_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = PlanStep {
+            id: "s".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "green test".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["false".to_string()],
+        };
+        assert!(!verify_step(dir.path(), &step).is_pass());
+    }
+
+    #[test]
+    fn verification_report_status_compat_accessor_matches_primary_failure() {
+        let mut report = VerificationReport::pass();
+        report.push_command_failure("cargo test", "failed");
+        assert_eq!(
+            report.status,
+            VerifyStatus::CommandFailed("failed".to_string())
+        );
+        report.push_missing_path("src/main.rs");
+        assert_eq!(
+            report.status,
+            VerifyStatus::MissingPath("src/main.rs".to_string())
+        );
     }
 }

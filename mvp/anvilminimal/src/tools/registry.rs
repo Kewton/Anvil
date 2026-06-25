@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use crate::mode::ExecutionMode;
 
 use super::path_guard::{resolve_existing, resolve_for_create, resolve_optional_existing};
+use super::workspace_policy::{WorkspacePolicy, ensure_tool_path_allowed};
 
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -15,6 +16,7 @@ pub struct ToolContext {
     pub auto_approve: bool,
     pub interactive_approval: bool,
     pub offline: bool,
+    pub workspace_policy: WorkspacePolicy,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +69,7 @@ impl ToolRegistry {
             "Read" => {
                 let raw = required_string(arguments, "path")?;
                 let path = resolve_existing(&context.root, raw)?;
+                ensure_tool_path_allowed(&context.root, &path, context.workspace_policy)?;
                 crate::tools::read::run(
                     &context.root,
                     &path,
@@ -93,7 +96,7 @@ impl ToolRegistry {
             }
             "Glob" => {
                 let pattern = required_string(arguments, "pattern")?;
-                crate::tools::glob::run(&context.root, pattern)
+                crate::tools::glob::run(&context.root, pattern, context.workspace_policy)
             }
             "Grep" => {
                 let pattern = required_string(arguments, "pattern")?;
@@ -102,7 +105,13 @@ impl ToolRegistry {
                     .get("case_sensitive")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                crate::tools::grep::run(&context.root, pattern, glob, case_sensitive)
+                crate::tools::grep::run(
+                    &context.root,
+                    pattern,
+                    glob,
+                    case_sensitive,
+                    context.workspace_policy,
+                )
             }
             other => bail!("unknown tool: {other}"),
         }
@@ -135,8 +144,18 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
         "unknown_tool"
     } else if message.contains("path escapes workspace") {
         "path_confinement_error"
+    } else if message.contains("workspace_policy_blocked") {
+        "workspace_policy_blocked"
     } else if message.contains("dangerous command blocked") {
         "dangerous_command"
+    } else if message.contains("edit_anchor_not_found") {
+        "edit_anchor_not_found"
+    } else if message.contains("edit_noop") {
+        "edit_noop"
+    } else if message.contains("edit_ambiguous_anchor") {
+        "edit_ambiguous_anchor"
+    } else if message.contains("edit_already_applied") {
+        "edit_already_applied"
     } else if message.contains("approval required") {
         "approval_required"
     } else {
@@ -145,7 +164,16 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
 }
 
 pub fn recoverable_tool_error(err: &anyhow::Error) -> bool {
-    matches!(tool_error_kind(err), "missing_arg" | "unknown_tool")
+    matches!(
+        tool_error_kind(err),
+        "missing_arg"
+            | "unknown_tool"
+            | "workspace_policy_blocked"
+            | "edit_anchor_not_found"
+            | "edit_noop"
+            | "edit_ambiguous_anchor"
+            | "edit_already_applied"
+    )
 }
 
 pub fn missing_arg_name(err: &anyhow::Error) -> Option<String> {
@@ -219,6 +247,7 @@ mod tests {
             auto_approve: true,
             interactive_approval: false,
             offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
         };
         assert!(
             registry
@@ -237,6 +266,7 @@ mod tests {
             auto_approve: true,
             interactive_approval: false,
             offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
         };
         registry
             .execute("Write", &json!({"path":"a/b.txt","content":"ok"}), &context)
@@ -258,5 +288,47 @@ mod tests {
         assert_eq!(tool_error_kind(&err), "missing_arg");
         assert!(recoverable_tool_error(&err));
         assert_eq!(missing_arg_name(&err).as_deref(), Some("pattern"));
+    }
+
+    #[test]
+    fn normal_workspace_policy_blocks_anvil_metadata_read() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+        std::fs::write(dir.path().join(".anvil/session.json"), "{}").unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+        };
+        let err = registry
+            .execute("Read", &json!({"path":".anvil/session.json"}), &context)
+            .unwrap_err();
+        assert_eq!(tool_error_kind(&err), "workspace_policy_blocked");
+    }
+
+    #[test]
+    fn glob_uses_ignore_walker() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/index.js"), "").unwrap();
+        std::fs::write(dir.path().join("my-node_modules-note.md"), "").unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Plan,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+        };
+        let output = registry
+            .execute("Glob", &json!({"pattern":"**/*"}), &context)
+            .unwrap();
+        assert!(!output.contains("node_modules/pkg/index.js"));
+        assert!(output.contains("my-node_modules-note.md"));
     }
 }

@@ -19,7 +19,23 @@ use crate::tui::status::UiStatus;
 use crate::tui::{InteractionUi, NOOP_UI};
 
 use super::compact::compact_if_needed;
+use super::import_scan::{format_missing_import_feedback, scan_relative_imports};
 use super::prompt::{ToolPromptMode, build_request_messages};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunStopReason {
+    AssistantFinal,
+    RequiredArtifactsSatisfiedAfterTool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSessionOutcome {
+    pub final_text: String,
+    pub stop_reason: RunStopReason,
+    pub changed_paths: Vec<String>,
+    pub iterations: usize,
+    pub tool_calls: usize,
+}
 
 pub fn run_session(
     client: &mut dyn ChatClient,
@@ -55,6 +71,20 @@ pub fn run_session_with_required_paths_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<String> {
+    Ok(
+        run_session_with_outcome_with_ui(client, session, user_prompt, required_paths, config, ui)?
+            .final_text,
+    )
+}
+
+pub fn run_session_with_outcome_with_ui(
+    client: &mut dyn ChatClient,
+    session: &mut SessionSnapshot,
+    user_prompt: &str,
+    required_paths: &[String],
+    config: &Config,
+    ui: &dyn InteractionUi,
+) -> anyhow::Result<RunSessionOutcome> {
     let registry = ToolRegistry::default();
     let mut native_tools_enabled =
         client.supports_native_tools(&config.model) && !session.native_tools_disabled;
@@ -65,11 +95,13 @@ pub fn run_session_with_required_paths_with_ui(
     let mut write_or_edit_seen = false;
     let mut no_tool_feedbacks = 0usize;
     let mut empty_feedbacks = 0usize;
+    let mut changed_paths: Vec<String> = Vec::new();
+    let mut tool_call_count = 0usize;
     session
         .messages
         .push(ConversationMessage::user(user_prompt.to_string()));
 
-    for _ in 0..config.max_iterations {
+    for iteration in 0..config.max_iterations {
         if ui.interrupted() {
             bail!("interrupted by user");
         }
@@ -125,6 +157,7 @@ pub fn run_session_with_required_paths_with_ui(
             bail!("interrupted by user");
         }
         let tool_calls = reply.tool_calls.clone();
+        tool_call_count += tool_calls.len();
         session.messages.push(ConversationMessage::assistant(
             reply.content.clone(),
             tool_calls.clone(),
@@ -161,7 +194,22 @@ pub fn run_session_with_required_paths_with_ui(
                 pending_feedback = Some(super::feedback::no_tool_progress());
                 continue;
             }
-            return Ok(reply.content);
+            let mut import_scan_paths = changed_paths.clone();
+            import_scan_paths.extend(required_paths.iter().cloned());
+            let missing_imports =
+                scan_relative_imports(&config.workspace_root, &import_scan_paths)?;
+            if !missing_imports.is_empty() {
+                session.messages.pop();
+                pending_feedback = Some(format_missing_import_feedback(&missing_imports));
+                continue;
+            }
+            return Ok(RunSessionOutcome {
+                final_text: reply.content,
+                stop_reason: RunStopReason::AssistantFinal,
+                changed_paths,
+                iterations: iteration + 1,
+                tool_calls: tool_call_count,
+            });
         }
 
         let context = ToolContext {
@@ -170,6 +218,7 @@ pub fn run_session_with_required_paths_with_ui(
             auto_approve: config.yes,
             interactive_approval: false,
             offline: config.offline,
+            workspace_policy: crate::tools::workspace_policy::WorkspacePolicy::for_task_request(),
         };
         let mut names_seen = BTreeSet::new();
         for call in tool_calls {
@@ -204,6 +253,12 @@ pub fn run_session_with_required_paths_with_ui(
                     );
                     if matches!(call.name.as_str(), "Write" | "Edit") {
                         write_or_edit_seen = true;
+                        if let Some(path) =
+                            changed_path_from_call(&config.workspace_root, &call.arguments)
+                            && !changed_paths.contains(&path)
+                        {
+                            changed_paths.push(path);
+                        }
                     }
                     result
                 }
@@ -253,10 +308,16 @@ pub fn run_session_with_required_paths_with_ui(
                     "required_paths": required_paths,
                 }),
             );
-            return Ok(format!(
-                "required artifacts satisfied: {}",
-                required_paths.join(", ")
-            ));
+            return Ok(RunSessionOutcome {
+                final_text: format!(
+                    "required artifacts satisfied: {}",
+                    required_paths.join(", ")
+                ),
+                stop_reason: RunStopReason::RequiredArtifactsSatisfiedAfterTool,
+                changed_paths,
+                iterations: iteration + 1,
+                tool_calls: tool_call_count,
+            });
         }
     }
     bail!(
@@ -474,6 +535,13 @@ fn recoverable_tool_feedback(name: &str, err: &anyhow::Error) -> String {
     )
 }
 
+fn changed_path_from_call(root: &Path, arguments: &serde_json::Value) -> Option<String> {
+    let raw = arguments.get("path")?.as_str()?;
+    let path = resolve_existing(root, raw).ok()?;
+    let root = root.canonicalize().ok()?;
+    Some(crate::tools::path_guard::relative_display(&root, &path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +631,54 @@ mod tests {
     }
 
     #[test]
+    fn run_session_string_wrapper_preserves_existing_cli_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply::text("plain final"))],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "Summarize workspace",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "plain final");
+    }
+
+    #[test]
+    fn changed_paths_are_workspace_relative_after_tool_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":"export default function Page(){return null;}"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create page",
+            &["src/app/page.tsx".to_string()],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(outcome.changed_paths, vec!["src/app/page.tsx"]);
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+    }
+
+    #[test]
     fn missing_tool_argument_feedback_allows_retry() {
         let dir = tempfile::tempdir().unwrap();
         let mut fake = Fake {
@@ -604,6 +720,39 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.content.contains("recoverable validation error"))
+        );
+    }
+
+    #[test]
+    fn edit_anchor_mismatch_returns_recoverable_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "actual content").unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Edit",
+                        json!({"path":"a.txt","old_string":"missing anchor","new_string":"replacement"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("final")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "Summarize workspace",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "final");
+        assert!(
+            session.messages.iter().any(|message| message.role == "tool"
+                && message.content.contains("edit_anchor_not_found"))
         );
     }
 
@@ -762,6 +911,53 @@ Required final artifacts:
 ";
         let paths = extract_requested_artifact_paths(dir.path(), prompt);
         assert_eq!(paths, vec!["safe/file.txt"]);
+    }
+
+    #[test]
+    fn missing_relative_import_gets_repair_prompt_before_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/page.tsx","content":"import Widget from './Widget';\nexport default function Page(){return <Widget/>;}"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/Widget.tsx","content":"export default function Widget(){return <div/>;}"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "create a small Next.js page",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "done");
+        assert!(dir.path().join("src/Widget.tsx").is_file());
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == "assistant" && message.content == "done")
+                .count(),
+            1
+        );
     }
 
     #[test]

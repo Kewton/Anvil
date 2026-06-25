@@ -27,8 +27,15 @@ pub fn verify(root: &Path, goal: &str) -> VerificationReport {
     let build = scripts
         .and_then(|scripts| scripts.get("build"))
         .and_then(Value::as_str);
-    if build != Some("next build") {
+    if build != Some("next build") || build.is_some_and(is_weakened_script) {
         return profile_failure("scripts.build must be next build");
+    }
+    if scripts
+        .and_then(|scripts| scripts.get("dev"))
+        .and_then(Value::as_str)
+        .is_some_and(is_weakened_script)
+    {
+        return profile_failure("scripts.dev must run next dev");
     }
     if goal.contains("3011") {
         let dev = scripts
@@ -55,9 +62,18 @@ pub fn verify(root: &Path, goal: &str) -> VerificationReport {
         let Ok(tsconfig) = std::fs::read_to_string(project.path.join("tsconfig.json")) else {
             return profile_failure(project.rel_path("tsconfig.json missing for @/* alias"));
         };
-        if !tsconfig.contains("\"@/*\"") {
-            return profile_failure("tsconfig paths missing @/*");
+        let Ok(tsconfig): Result<Value, _> = serde_json::from_str(&tsconfig) else {
+            return profile_failure("tsconfig.json invalid");
+        };
+        if !alias_configured(&tsconfig) {
+            return profile_failure("tsconfig baseUrl/paths missing @/* alias");
         }
+    }
+    if let Some(reason) = tsconfig_contract_failure(&project.path) {
+        return profile_failure(reason);
+    }
+    if let Some(reason) = tailwind_contract_failure(&project.path, &package) {
+        return profile_failure(reason);
     }
     VerificationReport::pass()
 }
@@ -120,7 +136,7 @@ pub fn auto_repair(root: &Path, goal: &str, report: &VerificationReport) -> anyh
     )?;
     ensure_file(
         &project.path.join("tsconfig.json"),
-        r#"{"compilerOptions":{"target":"ES2017","lib":["dom","dom.iterable","esnext"],"allowJs":true,"skipLibCheck":true,"strict":true,"noEmit":true,"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler","resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve","incremental":true,"plugins":[{"name":"next"}],"paths":{"@/*":["./src/*"]}},"include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],"exclude":["node_modules"]}"#,
+        r#"{"compilerOptions":{"target":"ES2017","lib":["dom","dom.iterable","esnext"],"allowJs":true,"skipLibCheck":true,"strict":true,"noEmit":true,"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler","resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve","incremental":true,"plugins":[{"name":"next"}],"baseUrl":".","paths":{"@/*":["./src/*"]}},"include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],"exclude":["node_modules"]}"#,
     )?;
     ensure_file(
         &project.path.join("src/app/globals.css"),
@@ -532,6 +548,8 @@ fn contains_in_files(root: &Path, needle: &str) -> bool {
         "pages/index.jsx",
         "src/app/page.tsx",
         "src/app/page.jsx",
+        "src/app/globals.css",
+        "app/globals.css",
         "src/pages/index.tsx",
         "src/pages/index.jsx",
     ] {
@@ -540,6 +558,94 @@ fn contains_in_files(root: &Path, needle: &str) -> bool {
         }
     }
     false
+}
+
+fn is_weakened_script(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    value.is_empty()
+        || value == "true"
+        || value == "echo ok"
+        || value == "echo done"
+        || value.starts_with("echo ")
+}
+
+fn tsconfig_contract_failure(root: &Path) -> Option<String> {
+    let path = root.join("tsconfig.json");
+    if !path.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    let compiler = value.get("compilerOptions").and_then(Value::as_object)?;
+    let root_dir = compiler.get("rootDir").and_then(Value::as_str)?;
+    if matches!(root_dir, "." | "./") {
+        None
+    } else {
+        Some("tsconfig.rootDir must not constrain Next.js generated files".to_string())
+    }
+}
+
+fn alias_configured(tsconfig: &Value) -> bool {
+    let Some(compiler) = tsconfig.get("compilerOptions").and_then(Value::as_object) else {
+        return false;
+    };
+    let Some(base_url) = compiler.get("baseUrl").and_then(Value::as_str) else {
+        return false;
+    };
+    if !matches!(base_url, "." | "./") {
+        return false;
+    }
+    compiler
+        .get("paths")
+        .and_then(Value::as_object)
+        .and_then(|paths| paths.get("@/*"))
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values.iter().any(|value| {
+                matches!(
+                    value.as_str(),
+                    Some("./src/*") | Some("src/*") | Some("./*") | Some("*")
+                )
+            })
+        })
+}
+
+fn tailwind_contract_failure(root: &Path, package: &Value) -> Option<String> {
+    let uses_tailwind = package_has_dependency(package, "tailwindcss")
+        || contains_in_files(root, "@tailwind")
+        || root.join("tailwind.config.js").is_file()
+        || root.join("tailwind.config.ts").is_file();
+    if !uses_tailwind {
+        return None;
+    }
+    for dep in ["tailwindcss", "postcss"] {
+        if !package_has_dependency(package, dep) {
+            return Some(format!("Tailwind toolchain dependency missing: {dep}"));
+        }
+    }
+    if !(root.join("tailwind.config.js").is_file() || root.join("tailwind.config.ts").is_file()) {
+        return Some("Tailwind config file missing".to_string());
+    }
+    if !(root.join("postcss.config.js").is_file()
+        || root.join("postcss.config.mjs").is_file()
+        || root.join("postcss.config.cjs").is_file())
+    {
+        return Some("PostCSS config file missing for Tailwind".to_string());
+    }
+    let layout = std::fs::read_to_string(root.join("src/app/layout.tsx"))
+        .or_else(|_| std::fs::read_to_string(root.join("app/layout.tsx")))
+        .unwrap_or_default();
+    if !layout.contains("globals.css") {
+        return Some("globals.css must be imported by app layout".to_string());
+    }
+    None
+}
+
+fn package_has_dependency(package: &Value, name: &str) -> bool {
+    ["dependencies", "devDependencies"]
+        .iter()
+        .filter_map(|key| package.get(*key).and_then(Value::as_object))
+        .any(|deps| deps.contains_key(name))
 }
 
 #[cfg(test)]
@@ -605,5 +711,94 @@ mod tests {
                 "space-invaders/src/app/layout.tsx"
             ]
         );
+    }
+
+    #[test]
+    fn nextjs_rejects_script_weakening() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"echo ok","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){return null;}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/layout.tsx"),
+            "export default function Layout({children}:{children:React.ReactNode}){return children;}",
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("scripts.build")
+        ));
+    }
+
+    #[test]
+    fn nextjs_rejects_tsconfig_rootdir_that_breaks_next() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"rootDir":"src"}}"#,
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("rootDir")
+        ));
+    }
+
+    #[test]
+    fn nextjs_rejects_alias_without_baseurl_or_paths() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "import Widget from '@/Widget'; export default function Page(){return <Widget/>;}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("baseUrl/paths")
+        ));
+    }
+
+    #[test]
+    fn nextjs_rejects_missing_tailwind_toolchain_when_tailwind_used() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("Tailwind")
+        ));
+    }
+
+    fn complete_app() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("package.json"), package_json()).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){return null;}",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/app/layout.tsx"), "export default function Layout({children}:{children:React.ReactNode}){return children;}").unwrap();
+        dir
     }
 }

@@ -1,14 +1,16 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::minimal_loop::loop_run::run_session_with_required_paths_with_ui;
+use crate::minimal_loop::loop_run::run_session_with_outcome_with_ui;
 use crate::planner::intent::detect_intent;
 use crate::planner::lint::{lint_step_plan, lint_ultra_plan};
 use crate::planner::profile::{
-    profile_auto_repair, profile_expected_paths, profile_guidance, profile_repair_prompt,
-    verify_profile,
+    profile_after_phase, profile_auto_repair, profile_before_phase, profile_expected_paths,
+    profile_guidance, profile_repair_prompt, verify_profile,
 };
-use crate::planner::repair::{build_repair_prompt, save_repair_report};
+use crate::planner::repair::{
+    RepairContext, build_repair_prompt_with_context, save_repair_report_with_context,
+};
 use crate::planner::step_plan::{PlanStep, StepPlan, parse_step_plan, render_step_plan};
 use crate::planner::ultra_plan::{UltraPlan, parse_ultra_plan, render_ultra_plan};
 use crate::planner::verify::{VerificationReport, verify_step};
@@ -16,6 +18,11 @@ use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
 use crate::tui::status::UiStatus;
 use crate::tui::{InteractionUi, NOOP_UI};
+
+const STEP_TURN_MAX_ITERATIONS: usize = 8;
+const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
+const STEP_REPAIR_MAX_TURNS: usize = 4;
+const STEP_REPAIR_MAX_FILE_CHANGING_TURNS: usize = 2;
 
 pub fn generate_step_plan(
     client: &mut dyn ChatClient,
@@ -163,34 +170,92 @@ fn run_step(
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<()> {
     let instruction = prompt_with_required_paths(&step.instruction, &step.expected_paths);
-    run_session_with_required_paths_with_ui(
+    let step_config = capped_config(config, STEP_TURN_MAX_ITERATIONS);
+    let initial = run_session_with_outcome_with_ui(
         client,
         session,
         &instruction,
         &step.expected_paths,
-        config,
+        &step_config,
         ui,
     )?;
     let report = verify_step(&config.workspace_root, step);
     if report.is_pass() {
         return Ok(());
     }
-    let repair_prompt = build_repair_prompt(&step.id, &report);
-    let repair_prompt = prompt_with_required_paths(&repair_prompt, &step.expected_paths);
-    run_session_with_required_paths_with_ui(
-        client,
-        session,
-        &repair_prompt,
-        &step.expected_paths,
-        config,
-        ui,
-    )?;
-    let retry = verify_step(&config.workspace_root, step);
-    if retry.is_pass() {
-        return Ok(());
+    let mut context = RepairContext {
+        missing_paths: report.missing_paths.clone(),
+        changed_files: initial.changed_paths.clone(),
+        initial_stop_reason: Some(format!("{:?}", initial.stop_reason)),
+        ..RepairContext::default()
+    };
+    let mut current_report = report;
+    let mut previous_missing = current_report.missing_paths.len();
+    let mut repair_stop_reason = None;
+    let mut file_changing_repairs = 0usize;
+    let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
+    for _ in 0..STEP_REPAIR_MAX_TURNS {
+        let repair_prompt = build_repair_prompt_with_context(&step.id, &current_report, &context);
+        let repair_prompt = prompt_with_required_paths(&repair_prompt, &step.expected_paths);
+        let repair = run_session_with_outcome_with_ui(
+            client,
+            session,
+            &repair_prompt,
+            &step.expected_paths,
+            &repair_config,
+            ui,
+        )?;
+        repair_stop_reason = Some(format!("{:?}", repair.stop_reason));
+        merge_changed_files(&mut context, &repair.changed_paths);
+        if !repair.changed_paths.is_empty() {
+            file_changing_repairs += 1;
+        }
+        let retry = verify_step(&config.workspace_root, step);
+        if retry.is_pass() {
+            return Ok(());
+        }
+        let next_missing = retry.missing_paths.len();
+        if next_missing >= previous_missing {
+            context.progress_warning = Some(format!(
+                "Missing expected paths did not decrease after repair. Remaining: {}",
+                if retry.missing_paths.is_empty() {
+                    "none".to_string()
+                } else {
+                    retry.missing_paths.join(", ")
+                }
+            ));
+        }
+        previous_missing = next_missing;
+        current_report = retry;
+        if file_changing_repairs >= STEP_REPAIR_MAX_FILE_CHANGING_TURNS {
+            break;
+        }
     }
-    save_repair_report(&config.workspace_root, &step.id, &retry)?;
-    anyhow::bail!("step {} failed verification: {:?}", step.id, retry.status)
+    context.repair_stop_reason = repair_stop_reason;
+    save_repair_report_with_context(&config.workspace_root, &step.id, &current_report, &context)?;
+    anyhow::bail!(
+        "step {} failed verification after bounded repair: {}",
+        step.id,
+        current_report.primary_reason()
+    )
+}
+
+fn capped_config(config: &Config, cap: usize) -> Config {
+    let mut out = config.clone();
+    out.max_iterations = out.max_iterations.min(cap);
+    out
+}
+
+fn merge_changed_files(context: &mut RepairContext, incoming: &[String]) {
+    for path in incoming {
+        if context.changed_files.contains(path) {
+            if !context.repeated_changed_files.contains(path) {
+                context.repeated_changed_files.push(path.clone());
+            }
+        } else {
+            context.changed_files.push(path.clone());
+        }
+    }
 }
 
 pub fn generate_ultra_plan(
@@ -308,11 +373,21 @@ pub fn run_ultra_plan_with_ui(
         if ui.interrupted() {
             anyhow::bail!("interrupted by user");
         }
+        let profile_snapshot = profile_before_phase(&config.workspace_root, &plan.profile)?;
         let phase_prompt = ultra_phase_prompt(plan, &phase.prompt, config);
         let step_plan = generate_step_plan_with_ui(planner, &phase_prompt, config, ui)?;
         save_step_plan(&config.workspace_root, &step_plan)?;
         run_step_plan_with_ui(execution, &step_plan, config, ui)
             .map_err(|err| anyhow::anyhow!("phase {} failed: {err}", phase.id))?;
+        let snapshot_report =
+            profile_after_phase(&config.workspace_root, &plan.profile, &profile_snapshot);
+        if !snapshot_report.is_pass() {
+            return Err(anyhow::anyhow!(
+                "phase {} profile snapshot verification failed: {}",
+                phase.id,
+                snapshot_report.primary_reason()
+            ));
+        }
         let profile_report = verify_profile(&config.workspace_root, &plan.profile, &plan.goal);
         let final_phase = index + 1 == plan.phases.len();
         if !profile_report.is_pass() {
@@ -340,12 +415,13 @@ pub fn run_ultra_plan_with_ui(
                 let expected_paths =
                     profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
                 let mut repair_session = SessionSnapshot::new();
-                run_session_with_required_paths_with_ui(
+                let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
+                run_session_with_outcome_with_ui(
                     execution,
                     &mut repair_session,
                     &repair_prompt,
                     &expected_paths,
-                    config,
+                    &repair_config,
                     ui,
                 )
                 .map_err(|err| {
@@ -383,6 +459,9 @@ fn strengthen_step_plan_for_profile(plan: &mut StepPlan, config: &Config) {
             if path.ends_with("package.json") && !last.expected_paths.contains(&path) {
                 last.expected_paths.push(path);
             }
+        }
+        if !last.expected_paths.is_empty() && last.kind == "report" {
+            last.kind = "implement".to_string();
         }
     }
     if let Some(guidance) = profile_guidance(&config.profile, &plan.goal) {
@@ -649,6 +728,97 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("phase scaffold profile verification failed"));
+    }
+
+    #[test]
+    fn ultra_phase_profile_snapshot_runs_before_and_after_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("input")).unwrap();
+        std::fs::write(dir.path().join("input/source.csv"), "1234").unwrap();
+        let step_yaml = render_step_plan(&StepPlan::single("mutate data"));
+        let mut planner = FakeClient::new(vec![AssistantReply::text(step_yaml)]);
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"printf '5678' > input/source.csv"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("done"),
+        ]);
+        let plan = UltraPlan {
+            goal: "analyze data".to_string(),
+            profile: "data".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "phase-1".to_string(),
+                    prompt: "Mutate data".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "phase-2".to_string(),
+                    prompt: "Report".to_string(),
+                },
+            ],
+        };
+        let err = run_ultra_plan(
+            &mut planner,
+            &mut execution,
+            &plan,
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("profile snapshot verification failed"));
+        assert!(err.contains("content changed"));
+    }
+
+    #[test]
+    fn step_loop_uses_step_iteration_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.max_iterations = 20;
+        let plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![PlanStep {
+                id: "s1".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create missing file".to_string(),
+                expected_paths: vec!["missing.txt".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let replies = (0..10)
+            .map(|_| AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })
+            .collect();
+        let mut fake = FakeClient::new(replies);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_iterations (8)"));
+    }
+
+    #[test]
+    fn repair_loop_uses_repair_iteration_cap() {
+        let mut cfg = config(PathBuf::from("/tmp/work"));
+        cfg.max_iterations = 20;
+        assert_eq!(
+            capped_config(&cfg, STEP_REPAIR_MAX_ITERATIONS).max_iterations,
+            6
+        );
     }
 
     struct FakeClient {

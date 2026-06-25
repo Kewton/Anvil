@@ -31,11 +31,11 @@ const TRACES: &[SafetyTrace] = &[
     },
     SafetyTrace {
         id: "SG-07",
-        test_or_defer: "defer:別計画: frontend relative import scanner is larger than minimal loop convergence fix",
+        test_or_defer: "missing_relative_import_gets_repair_prompt_before_final",
     },
     SafetyTrace {
         id: "SG-08",
-        test_or_defer: "defer:別計画: edit fallback parity needs edit-tool focused implementation",
+        test_or_defer: "edit_anchor_mismatch_returns_recoverable_feedback",
     },
     SafetyTrace {
         id: "SG-09",
@@ -47,7 +47,7 @@ const TRACES: &[SafetyTrace] = &[
     },
     SafetyTrace {
         id: "SG-11",
-        test_or_defer: "defer:別計画: workspace policy wiring needs read/glob/grep rollout",
+        test_or_defer: "normal_workspace_policy_blocks_anvil_metadata_read",
     },
     SafetyTrace {
         id: "SG-12",
@@ -59,15 +59,15 @@ const TRACES: &[SafetyTrace] = &[
     },
     SafetyTrace {
         id: "SG-14",
-        test_or_defer: "defer:別計画: typed StepKind changes YAML compatibility surface",
+        test_or_defer: "step_plan_parses_typed_kind_and_expected_result",
     },
     SafetyTrace {
         id: "SG-15",
-        test_or_defer: "defer:別計画: semantic step kind lint follows typed StepKind",
+        test_or_defer: "step_kind_contract_rejects_setup_with_build_verify",
     },
     SafetyTrace {
         id: "SG-16",
-        test_or_defer: "defer:別計画: workspace semantic plan lint needs profile-specific rollout",
+        test_or_defer: "semantic_lint_rejects_next_build_before_entrypoint",
     },
     SafetyTrace {
         id: "SG-17",
@@ -75,19 +75,19 @@ const TRACES: &[SafetyTrace] = &[
     },
     SafetyTrace {
         id: "SG-18",
-        test_or_defer: "defer:別計画: per-step iteration caps require config plumbing",
+        test_or_defer: "step_loop_uses_step_iteration_cap",
     },
     SafetyTrace {
         id: "SG-19",
-        test_or_defer: "defer:別計画: progress-aware bounded repair requires repair runner redesign",
+        test_or_defer: "repair_loop_uses_repair_iteration_cap",
     },
     SafetyTrace {
         id: "SG-20",
-        test_or_defer: "defer:別計画: repair exhausted report depends on changed-file repair tracking",
+        test_or_defer: "repair_exhausted_report_contains_changed_files",
     },
     SafetyTrace {
         id: "SG-21",
-        test_or_defer: "defer:別計画: verification aggregation changes public report shape",
+        test_or_defer: "verify_step_aggregates_missing_paths_and_command_failures",
     },
     SafetyTrace {
         id: "SG-22",
@@ -103,7 +103,7 @@ const TRACES: &[SafetyTrace] = &[
     },
     SafetyTrace {
         id: "SG-25",
-        test_or_defer: "defer:別計画: nextjs Tailwind/rootDir contract is profile-specific expansion",
+        test_or_defer: "nextjs_rejects_missing_tailwind_toolchain_when_tailwind_used",
     },
     SafetyTrace {
         id: "SG-26",
@@ -127,11 +127,11 @@ const TRACES: &[SafetyTrace] = &[
     },
     SafetyTrace {
         id: "SG-31",
-        test_or_defer: "defer:別計画: compaction evidence protection needs state-level migration",
+        test_or_defer: "compaction_preserves_recent_read_evidence",
     },
     SafetyTrace {
         id: "SG-32",
-        test_or_defer: "defer:別計画: bash timeout/process group requires runner replacement",
+        test_or_defer: "bash_timeout_returns_structured_outcome",
     },
     SafetyTrace {
         id: "SG-33",
@@ -139,15 +139,15 @@ const TRACES: &[SafetyTrace] = &[
     },
     SafetyTrace {
         id: "SG-34",
-        test_or_defer: "defer:別計画: data profile raw-input protection is profile-specific expansion",
+        test_or_defer: "data_profile_rejects_raw_input_hash_change",
     },
     SafetyTrace {
         id: "SG-35",
-        test_or_defer: "defer:別計画: read/glob/grep ignore policy needs tool-wide rollout",
+        test_or_defer: "grep_large_result_is_summarized",
     },
     SafetyTrace {
         id: "SG-36",
-        test_or_defer: "defer:別計画: edit normalized fallback is edit-tool focused work",
+        test_or_defer: "edit_normalized_line_fallback_applies_change",
     },
     SafetyTrace {
         id: "SG-37",
@@ -155,7 +155,7 @@ const TRACES: &[SafetyTrace] = &[
     },
     SafetyTrace {
         id: "SG-38",
-        test_or_defer: "defer:別計画: bash output shaping needs test-output summarizer port",
+        test_or_defer: "bash_test_output_extracts_failure_summary",
     },
 ];
 
@@ -184,4 +184,14 @@ fn safety_traceability_all_sg_have_test_or_defer_note() {
             );
         }
     }
+}
+
+#[test]
+fn safety_traceability_has_no_defer_after_remaining_sg_completion() {
+    let deferred = TRACES
+        .iter()
+        .filter(|trace| trace.test_or_defer.starts_with("defer:"))
+        .map(|trace| trace.id)
+        .collect::<Vec<_>>();
+    assert!(deferred.is_empty(), "deferred SG remain: {deferred:?}");
 }
