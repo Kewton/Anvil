@@ -13,6 +13,7 @@ from pathlib import Path
 
 from eval_lib.artifacts import create_run_root, write_json, write_jsonl
 from eval_lib.config import merge_dotenv_into_env
+from eval_lib.failure_classification import classify_failure, read_jsonl
 from eval_lib.matrix import expand_matrix, parse_modes
 from eval_lib.models import ModelRef, load_model_profiles
 from eval_lib.plan_scoring import score_plan_file
@@ -36,6 +37,15 @@ def main() -> int:
     parser.add_argument("--run-root")
     parser.add_argument("--timeout-sec", type=int)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--provider-smoke-summary",
+        help="Path to mvp-provider-smoke summary.eval.tsv that must be green before this run.",
+    )
+    parser.add_argument(
+        "--allow-provider-smoke-failure",
+        action="store_true",
+        help="Explicitly bypass a failed provider smoke summary.",
+    )
     args = parser.parse_args()
 
     run_root = Path(args.run_root) if args.run_root else create_run_root()
@@ -43,6 +53,8 @@ def main() -> int:
     profiles, warnings = load_model_profiles(args.model_profiles)
     if args.model_profile not in profiles:
         raise SystemExit(f"unknown model profile: {args.model_profile}")
+    if args.provider_smoke_summary and not args.allow_provider_smoke_failure:
+        assert_provider_smoke_green(Path(args.provider_smoke_summary))
     matrix = expand_matrix(
         suite,
         profiles[args.model_profile],
@@ -172,6 +184,10 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         env=env,
     )
     process_elapsed = result.elapsed_sec
+    child_events = read_jsonl(run_dir / "anvil-events.jsonl")
+    for event in child_events:
+        event.setdefault("run_id", spec["run_id"])
+    events.extend(child_events)
     plans = collect_plans(workdir, run_dir)
     plan_score = None
     ultra_score = None
@@ -190,6 +206,26 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
     success = result.rc == 0 and bool(post["ok"])
     execution_score = 100.0 if success else 0.0
     time_score = 100.0
+    extras = {
+        "timeout": result.timeout,
+        "metric_source": "events+process" if child_events else "process",
+        "elapsed_total_sec": round(time.monotonic() - start, 3),
+    }
+    if not success:
+        stderr = (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace")
+        extras.update(
+            {
+                key: value
+                for key, value in classify_failure(
+                    events=events,
+                    stderr=stderr,
+                    rc=result.rc,
+                    timeout=result.timeout,
+                    post_ok=bool(post["ok"]),
+                ).items()
+                if value not in {"", None}
+            }
+        )
     row.update(
         {
             "rc": result.rc,
@@ -210,7 +246,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "time_score": time_score,
             "overall_score": calculate_overall(spec["mode"], plan_score, ultra_score, execution_score, time_score),
             "plan_artifacts": ",".join(str(path.relative_to(run_dir)) for path in plans),
-            "extras_json": {"timeout": result.timeout, "metric_source": "process", "elapsed_total_sec": round(time.monotonic() - start, 3)},
+            "extras_json": extras,
         }
     )
     return row, events
@@ -266,6 +302,19 @@ def apply_time_scores(rows: list[dict]) -> None:
             ultra = float(row["ultra_phase_quality_score"]) if row.get("ultra_phase_quality_score") not in {"", None} else None
             execution = float(row["execution_score"]) if row.get("execution_score") not in {"", None} else 0.0
             row["overall_score"] = calculate_overall(row["mode"], plan, ultra, execution, float(row["time_score"]))
+
+
+def assert_provider_smoke_green(summary_path: Path) -> None:
+    from eval_lib.run_summary import read_summary
+
+    rows = read_summary(summary_path)
+    required = [row for row in rows if row.get("success") != "diagnostic_skipped"]
+    failed = [row for row in required if row.get("success") != "true"]
+    if failed:
+        raise SystemExit(
+            f"provider smoke failed ({len(failed)}/{len(required)}); "
+            "rerun provider smoke or pass --allow-provider-smoke-failure explicitly"
+        )
 
 
 def scrub_matrix(matrix: list[dict]) -> list[dict]:

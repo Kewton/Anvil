@@ -1,8 +1,11 @@
+use std::path::PathBuf;
+
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::{Config, load_api_key};
+use crate::eval_events;
 use crate::state::{ConversationMessage, ToolCall};
 use crate::tools::registry::ToolSpec;
 
@@ -17,6 +20,7 @@ pub struct OpenAiClient {
     http: Client,
     max_predict: usize,
     retries: usize,
+    eval_events_path: Option<PathBuf>,
 }
 
 impl OpenAiClient {
@@ -31,6 +35,7 @@ impl OpenAiClient {
             http,
             max_predict: config.num_predict,
             retries: config.chat_retries,
+            eval_events_path: config.eval_events_path.clone(),
         })
     }
 }
@@ -62,6 +67,15 @@ impl ChatClient for OpenAiClient {
             native_tools_enabled,
             self.max_predict,
         );
+        eval_events::emit(
+            self.eval_events_path.as_deref(),
+            json!({
+                "event": "provider_request",
+                "provider": "openai",
+                "model": model,
+                "tools": if native_tools_enabled { tools.len() } else { 0 },
+            }),
+        );
         for attempt in 0..=self.retries {
             match self
                 .http
@@ -71,13 +85,66 @@ impl ChatClient for OpenAiClient {
                 .send()
             {
                 Ok(response) if response.status().is_success() => {
-                    return parse_openai_response(&response.text()?);
+                    let body = response.text()?;
+                    let parsed = parse_openai_response(&body);
+                    match parsed {
+                        Ok(reply) => {
+                            eval_events::emit(
+                                self.eval_events_path.as_deref(),
+                                json!({
+                                    "event": "provider_response",
+                                    "provider": "openai",
+                                    "model": model,
+                                    "tool_calls": reply.tool_calls.len(),
+                                }),
+                            );
+                            return Ok(reply);
+                        }
+                        Err(err) => {
+                            eval_events::emit(
+                                self.eval_events_path.as_deref(),
+                                json!({
+                                    "event": "provider_parse_error",
+                                    "provider": "openai",
+                                    "model": model,
+                                    "error_kind": "provider_parse_error",
+                                    "message": eval_events::body_snippet(&err.to_string()),
+                                }),
+                            );
+                            return Err(err);
+                        }
+                    }
                 }
                 Ok(response) if attempt == self.retries => {
-                    anyhow::bail!("OpenAI Responses API failed: {}", response.status());
+                    let status = response.status();
+                    let body = response.text().unwrap_or_default();
+                    eval_events::emit(
+                        self.eval_events_path.as_deref(),
+                        json!({
+                            "event": "provider_error",
+                            "provider": "openai",
+                            "model": model,
+                            "status": status.as_u16(),
+                            "error_kind": "http_status",
+                            "body_snippet": eval_events::body_snippet(&body),
+                        }),
+                    );
+                    anyhow::bail!("OpenAI Responses API failed: {}", status);
                 }
                 Ok(_) => {}
-                Err(err) if attempt == self.retries => return Err(err.into()),
+                Err(err) if attempt == self.retries => {
+                    eval_events::emit(
+                        self.eval_events_path.as_deref(),
+                        json!({
+                            "event": "provider_error",
+                            "provider": "openai",
+                            "model": model,
+                            "error_kind": "network",
+                            "message": eval_events::body_snippet(&err.to_string()),
+                        }),
+                    );
+                    return Err(err.into());
+                }
                 Err(_) => {}
             }
         }
@@ -167,7 +234,7 @@ pub fn parse_openai_response(body: &str) -> anyhow::Result<AssistantReply> {
             let name = item
                 .name
                 .ok_or_else(|| anyhow::anyhow!("OpenAI function_call missing name"))?;
-            let arguments = item.arguments.unwrap_or(Value::Null);
+            let arguments = normalize_function_arguments(item.arguments)?;
             tool_calls.push(ToolCall {
                 id: item
                     .call_id
@@ -188,6 +255,40 @@ pub fn parse_openai_response(body: &str) -> anyhow::Result<AssistantReply> {
     })
 }
 
+fn normalize_function_arguments(value: Option<Value>) -> anyhow::Result<Value> {
+    match value {
+        Some(object @ Value::Object(_)) => Ok(object),
+        Some(Value::String(raw)) => {
+            let decoded: Value = serde_json::from_str(&raw).map_err(|err| {
+                anyhow::anyhow!("OpenAI function_call arguments are not valid JSON: {err}")
+            })?;
+            match decoded {
+                Value::Object(_) => Ok(decoded),
+                other => Err(anyhow::anyhow!(
+                    "OpenAI function_call arguments must decode to object, got {}",
+                    json_type(&other)
+                )),
+            }
+        }
+        Some(Value::Null) | None => Err(anyhow::anyhow!("OpenAI function_call missing arguments")),
+        Some(other) => Err(anyhow::anyhow!(
+            "OpenAI function_call arguments must be object or JSON string, got {}",
+            json_type(&other)
+        )),
+    }
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,11 +307,41 @@ mod tests {
     }
 
     #[test]
-    fn parses_function_call() {
+    fn parses_function_call_arguments_object_for_compat() {
         let reply = parse_openai_response(
             r#"{"output":[{"type":"function_call","name":"Read","call_id":"c1","arguments":{"path":"a"}}]}"#,
         )
         .unwrap();
         assert_eq!(reply.tool_calls[0].name, "Read");
+        assert_eq!(reply.tool_calls[0].arguments["path"], "a");
+    }
+
+    #[test]
+    fn parses_function_call_arguments_json_string() {
+        let reply = parse_openai_response(
+            r#"{"output":[{"type":"function_call","name":"Grep","call_id":"c1","arguments":"{\"pattern\":\"TODO\"}"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.tool_calls[0].arguments["pattern"], "TODO");
+    }
+
+    #[test]
+    fn rejects_malformed_function_call_arguments_string() {
+        let err = parse_openai_response(
+            r#"{"output":[{"type":"function_call","name":"Grep","arguments":"{\"pattern\""}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not valid JSON"));
+    }
+
+    #[test]
+    fn rejects_non_object_function_call_arguments() {
+        let err = parse_openai_response(
+            r#"{"output":[{"type":"function_call","name":"Grep","arguments":"[\"TODO\"]"}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must decode to object"));
     }
 }

@@ -127,6 +127,33 @@ pub fn required_string<'a>(value: &'a Value, key: &str) -> anyhow::Result<&'a st
         .ok_or_else(|| anyhow::anyhow!("missing string argument `{key}`"))
 }
 
+pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
+    let message = err.to_string();
+    if message.starts_with("missing string argument `") {
+        "missing_arg"
+    } else if message.starts_with("unknown tool:") {
+        "unknown_tool"
+    } else if message.contains("path escapes workspace") {
+        "path_confinement_error"
+    } else if message.contains("dangerous command blocked") {
+        "dangerous_command"
+    } else if message.contains("approval required") {
+        "approval_required"
+    } else {
+        "tool_execution_error"
+    }
+}
+
+pub fn recoverable_tool_error(err: &anyhow::Error) -> bool {
+    matches!(tool_error_kind(err), "missing_arg" | "unknown_tool")
+}
+
+pub fn missing_arg_name(err: &anyhow::Error) -> Option<String> {
+    let message = err.to_string();
+    let rest = message.strip_prefix("missing string argument `")?;
+    Some(rest.split('`').next()?.to_string())
+}
+
 fn optional_usize(value: &Value, key: &str) -> Option<usize> {
     value.get(key).and_then(Value::as_u64).map(|n| n as usize)
 }
@@ -223,5 +250,13 @@ mod tests {
     #[test]
     fn dangerous_command() {
         assert!(crate::tools::bash::blocked_reason("rm -rf /", false).is_some());
+    }
+
+    #[test]
+    fn classifies_recoverable_validation_errors() {
+        let err = required_string(&json!({}), "pattern").unwrap_err();
+        assert_eq!(tool_error_kind(&err), "missing_arg");
+        assert!(recoverable_tool_error(&err));
+        assert_eq!(missing_arg_name(&err).as_deref(), Some("pattern"));
     }
 }

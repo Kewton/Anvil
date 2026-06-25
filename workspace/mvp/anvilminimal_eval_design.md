@@ -769,3 +769,28 @@ Phase E6: live acceptance。
 8. `ultra-step-run` replay を phase 開始前 snapshot + `--run-plan` で実装する。
 9. `summary.eval.tsv` / `events.jsonl` / `report.md` を固定する。
 10. speed-cloud と local-only の受け入れテストを追加する。
+
+## 2026-06-25 追補: Provider Tool Call Failure 対策
+
+`speed-cloud` の minimal-loop 全敗を受け、eval の完了条件に次を追加する。
+
+- `ANVIL_EVAL_EVENTS` を runtime が読み、provider/tool validation の JSONL evidence を出力する
+- `eval-run.py` は child run の `anvil-events.jsonl` を harness の `events.jsonl` に merge する
+- failed row の `summary.eval.tsv.extras_json` には必ず `failure_kind` を含める
+- OpenAI/Gemini の function call arguments は object と JSON encoded string の両方を parser unit test で検証する
+- `mvp-provider-smoke.yaml` を speed-cloud full/smoke 前の semantic smoke として使用する
+- cloud eval 前に `eval-preflight.py --live-provider-smoke all` で no-tool/tool-declaration の疎通を確認する
+- provider smoke が failed の summary を渡した本体 eval は `--allow-provider-smoke-failure` なしでは実行しない
+
+追加受け入れコマンド。
+
+```bash
+cd mvp/anvilminimal
+python3 scripts/eval-preflight.py --suite eval/suites/mvp-provider-smoke.yaml --model-profile speed-cloud --live-provider-smoke all
+python3 scripts/eval-run.py --suite eval/suites/mvp-provider-smoke.yaml --model-profile speed-cloud --modes minimal-loop,plan-run,ultra-plan-run --runs 1 --parallel 4
+python3 scripts/eval-run.py --suite eval/suites/mvp-smoke.yaml --model-profile speed-cloud --modes minimal-loop,step-plan,plan-run,ultra-plan-run --provider-smoke-summary <provider-smoke-run>/summary.eval.tsv
+```
+
+横展開レビュー成果物。
+
+- `workspace/mvp/eval/001/provider_toolcall_cross_review.md`

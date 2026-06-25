@@ -12,15 +12,31 @@ pub fn build_interactions_request(
     tools: &[ToolSpec],
     _max_predict: usize,
 ) -> Value {
+    build_interactions_request_with_previous(model, messages, tools, _max_predict, None)
+}
+
+pub fn build_interactions_request_with_previous(
+    model: &str,
+    messages: &[ConversationMessage],
+    tools: &[ToolSpec],
+    _max_predict: usize,
+    previous_interaction_id: Option<&str>,
+) -> Value {
     if tools.is_empty() {
         json!({
             "model": normalize_interactions_model(model),
             "input": render_text_input(messages),
         })
+    } else if let Some(previous_interaction_id) = previous_interaction_id {
+        json!({
+            "model": normalize_interactions_model(model),
+            "previous_interaction_id": previous_interaction_id,
+            "input": previous_interaction_input(messages),
+            "tools": tools.iter().map(gemini_tool_declaration).collect::<Vec<_>>(),
+        })
     } else {
         json!({
             "model": normalize_interactions_model(model),
-            "store": false,
             "input": gemini_input(messages),
             "tools": tools.iter().map(gemini_tool_declaration).collect::<Vec<_>>(),
         })
@@ -75,12 +91,7 @@ fn gemini_input(messages: &[ConversationMessage]) -> Vec<Value> {
                     }));
                 }
             }
-            "tool" => input.push(json!({
-                "type": "function_result",
-                "name": message.name.clone().unwrap_or_else(|| "tool".to_string()),
-                "call_id": message.tool_call_id.clone().unwrap_or_else(|| message.name.clone().unwrap_or_else(|| "tool".to_string())),
-                "result": [{"type":"text","text":message.content}],
-            })),
+            "tool" => input.push(gemini_tool_result(message)),
             "user" => input.push(json!({"type":"user_input","content":message.content})),
             "system" | "developer" => input.push(json!({"type":"user_input","content":format!("{}\n{}", message.role, message.content)})),
             _ => input.push(json!({"type":"user_input","content":message.content})),
@@ -90,6 +101,52 @@ fn gemini_input(messages: &[ConversationMessage]) -> Vec<Value> {
         input.push(json!({"type":"user_input","content":""}));
     }
     input
+}
+
+fn trailing_tool_results(messages: &[ConversationMessage]) -> Vec<Value> {
+    let mut tool_messages = messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role == "tool")
+        .collect::<Vec<_>>();
+    tool_messages.reverse();
+    tool_messages
+        .into_iter()
+        .map(gemini_tool_result)
+        .collect::<Vec<_>>()
+}
+
+fn previous_interaction_input(messages: &[ConversationMessage]) -> Vec<Value> {
+    let tool_results = trailing_tool_results(messages);
+    if !tool_results.is_empty() {
+        return tool_results;
+    }
+    if let Some(message) = messages.iter().rev().find(|message| {
+        matches!(
+            message.role.as_str(),
+            "user" | "system" | "developer" | "tool"
+        )
+    }) {
+        return match message.role.as_str() {
+            "tool" => vec![gemini_tool_result(message)],
+            "system" | "developer" => {
+                vec![
+                    json!({"type":"user_input","content":format!("{}\n{}", message.role, message.content)}),
+                ]
+            }
+            _ => vec![json!({"type":"user_input","content":message.content})],
+        };
+    }
+    vec![json!({"type":"user_input","content":""})]
+}
+
+fn gemini_tool_result(message: &ConversationMessage) -> Value {
+    json!({
+        "type": "function_result",
+        "name": message.name.clone().unwrap_or_else(|| "tool".to_string()),
+        "call_id": message.tool_call_id.clone().unwrap_or_else(|| message.name.clone().unwrap_or_else(|| "tool".to_string())),
+        "result": [{"type":"text","text":message.content}],
+    })
 }
 
 pub fn parse_interactions_response(body: &str) -> anyhow::Result<AssistantReply> {
@@ -120,6 +177,11 @@ pub fn parse_interactions_response(body: &str) -> anyhow::Result<AssistantReply>
     })
 }
 
+pub fn interaction_id(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value.get("id").and_then(Value::as_str).map(str::to_string)
+}
+
 fn parse_step(step: &Value, content: &mut String, calls: &mut Vec<ToolCall>) -> anyhow::Result<()> {
     let kind = step.get("type").and_then(Value::as_str).unwrap_or_default();
     match kind {
@@ -139,7 +201,7 @@ fn parse_step(step: &Value, content: &mut String, calls: &mut Vec<ToolCall>) -> 
                 .and_then(Value::as_str)
                 .unwrap_or(name)
                 .to_string();
-            let arguments = step.get("arguments").cloned().unwrap_or(Value::Null);
+            let arguments = normalize_function_arguments(step.get("arguments").cloned())?;
             calls.push(ToolCall {
                 id,
                 name: name.to_string(),
@@ -149,6 +211,40 @@ fn parse_step(step: &Value, content: &mut String, calls: &mut Vec<ToolCall>) -> 
         _ => {}
     }
     Ok(())
+}
+
+fn normalize_function_arguments(value: Option<Value>) -> anyhow::Result<Value> {
+    match value {
+        Some(object @ Value::Object(_)) => Ok(object),
+        Some(Value::String(raw)) => {
+            let decoded: Value = serde_json::from_str(&raw).map_err(|err| {
+                anyhow::anyhow!("Gemini function_call arguments are not valid JSON: {err}")
+            })?;
+            match decoded {
+                Value::Object(_) => Ok(decoded),
+                other => Err(anyhow::anyhow!(
+                    "Gemini function_call arguments must decode to object, got {}",
+                    json_type(&other)
+                )),
+            }
+        }
+        Some(Value::Null) | None => Err(anyhow::anyhow!("Gemini function_call missing arguments")),
+        Some(other) => Err(anyhow::anyhow!(
+            "Gemini function_call arguments must be object or JSON string, got {}",
+            json_type(&other)
+        )),
+    }
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 #[cfg(test)]
@@ -190,6 +286,44 @@ mod tests {
     }
 
     #[test]
+    fn stateful_tool_result_request_uses_previous_interaction_id() {
+        let body = build_interactions_request_with_previous(
+            "gemini-3.1-flash-lite",
+            &[ConversationMessage::tool_result(
+                "Write".to_string(),
+                Some("call-1".to_string()),
+                "ok".to_string(),
+            )],
+            ToolRegistry::default().specs(),
+            100,
+            Some("interaction-1"),
+        );
+        assert_eq!(body["previous_interaction_id"], "interaction-1");
+        assert_eq!(body["input"][0]["type"], "function_result");
+        assert_eq!(body["input"][0]["call_id"], "call-1");
+        assert!(body.get("store").is_none());
+    }
+
+    #[test]
+    fn stateful_next_user_request_sends_latest_user_input_only() {
+        let body = build_interactions_request_with_previous(
+            "gemini-3.1-flash-lite",
+            &[
+                ConversationMessage::user("old"),
+                ConversationMessage::assistant("done", Vec::new()),
+                ConversationMessage::user("new task"),
+            ],
+            ToolRegistry::default().specs(),
+            100,
+            Some("interaction-1"),
+        );
+        assert_eq!(body["previous_interaction_id"], "interaction-1");
+        assert_eq!(body["input"][0]["type"], "user_input");
+        assert_eq!(body["input"][0]["content"], "new task");
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
     fn parses_function_call_round_trip() {
         let reply = parse_interactions_response(
             r#"{"output":[{"type":"function_call","name":"Read","call_id":"c1","arguments":{"path":"a"}}]}"#,
@@ -199,9 +333,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_function_call_arguments_json_string() {
+        let reply = parse_interactions_response(
+            r#"{"output":[{"type":"function_call","name":"Grep","call_id":"c1","arguments":"{\"pattern\":\"TODO\"}"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.tool_calls[0].arguments["pattern"], "TODO");
+    }
+
+    #[test]
+    fn rejects_missing_function_call_arguments() {
+        let err = parse_interactions_response(
+            r#"{"output":[{"type":"function_call","name":"Grep","call_id":"c1"}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing arguments"));
+    }
+
+    #[test]
     fn handles_missing_thought() {
         let reply = parse_interactions_response(r#"{"output_text":"done"}"#).unwrap();
         assert_eq!(reply.content, "done");
+    }
+
+    #[test]
+    fn extracts_interaction_id() {
+        assert_eq!(
+            interaction_id(r#"{"id":"interaction-1","output_text":"done"}"#).as_deref(),
+            Some("interaction-1")
+        );
     }
 
     #[test]

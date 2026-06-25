@@ -1,0 +1,57 @@
+name: mvp-provider-smoke
+description: Provider semantic smoke before running broader cloud eval suites.
+scenarios:
+  - id: write-one-file-small
+    size: small
+    category: provider-smoke
+    profile: generic
+    prompt: Create hello.txt containing exactly provider smoke ok.
+    expected_artifacts:
+      - hello.txt
+    postcheck:
+      commands:
+        - grep -qx "provider smoke ok" hello.txt
+    timeouts:
+      total_sec: 300
+      model_call_sec: 120
+    plan_constraints:
+      min_steps: 1
+      max_steps: 3
+      required_verify_keywords:
+        - hello.txt
+  - id: grep-existing-file-small
+    size: small
+    category: provider-smoke
+    profile: generic
+    prompt: Create notes.txt with two lines. One line must contain the exact token ANVIL_PROVIDER_SMOKE.
+    expected_artifacts:
+      - notes.txt
+    postcheck:
+      commands:
+        - grep -q ANVIL_PROVIDER_SMOKE notes.txt
+    timeouts:
+      total_sec: 300
+      model_call_sec: 120
+    plan_constraints:
+      min_steps: 1
+      max_steps: 3
+      required_verify_keywords:
+        - grep
+  - id: bash-echo-small
+    size: small
+    category: provider-smoke
+    profile: generic
+    prompt: Create echo.txt containing exactly echo smoke ok. You may use Bash or Write.
+    expected_artifacts:
+      - echo.txt
+    postcheck:
+      commands:
+        - grep -qx "echo smoke ok" echo.txt
+    timeouts:
+      total_sec: 300
+      model_call_sec: 120
+    plan_constraints:
+      min_steps: 1
+      max_steps: 3
+      required_verify_keywords:
+        - echo.txt

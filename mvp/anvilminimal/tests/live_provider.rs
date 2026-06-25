@@ -37,6 +37,7 @@ fn live_openai_responses_no_tool_http_smoke() {
     let config = Config {
         workspace_root,
         state_dir: tmp.path().join("state"),
+        eval_events_path: None,
         yes: true,
         offline: false,
         context_budget: 4096,
@@ -97,6 +98,7 @@ fn live_gemini_interactions_no_tool_http_smoke() {
     let config = Config {
         workspace_root,
         state_dir: tmp.path().join("state"),
+        eval_events_path: None,
         yes: true,
         offline: false,
         context_budget: 4096,

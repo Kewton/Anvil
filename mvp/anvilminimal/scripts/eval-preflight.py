@@ -7,9 +7,16 @@ import sys
 from pathlib import Path
 
 from eval_lib.artifacts import create_run_root, write_json, write_jsonl
-from eval_lib.config import credential_status, load_dotenv
+from eval_lib.config import credential_status, env_value, load_dotenv
 from eval_lib.matrix import expand_matrix, parse_modes
-from eval_lib.models import load_model_profiles, ollama_models, required_providers_for_profile
+from eval_lib.models import (
+    gemini_interactions_smoke,
+    load_model_profiles,
+    models_for_provider,
+    ollama_models,
+    openai_responses_smoke,
+    required_providers_for_profile,
+)
 from eval_lib.postcheck import port_available
 from eval_lib.process import command_available
 from eval_lib.suites import load_suite
@@ -28,6 +35,13 @@ def main() -> int:
     parser.add_argument("--run-root")
     parser.add_argument("--offline-ok", action="store_true")
     parser.add_argument("--ollama-host", default="http://localhost:11434")
+    parser.add_argument(
+        "--live-provider-smoke",
+        nargs="?",
+        const="all",
+        default="",
+        help="Run live no-tool and tool-declaration provider smoke checks for all/openai/gemini.",
+    )
     args = parser.parse_args()
 
     run_root = Path(args.run_root) if args.run_root else create_run_root()
@@ -61,6 +75,19 @@ def main() -> int:
             ollama = {model: ("present" if model in available else "missing") for model in sorted(needed)}
         except Exception as err:
             ollama = {"error": str(err)}
+    live_provider_smoke = {}
+    if args.live_provider_smoke:
+        requested = (
+            required_providers_for_profile(profile)
+            if args.live_provider_smoke == "all"
+            else {part.strip() for part in args.live_provider_smoke.split(",") if part.strip()}
+        )
+        if "openai" in requested:
+            key = env_value("OPENAI_API_KEY", dotenv)
+            live_provider_smoke["openai"] = smoke_openai_models(profile, key)
+        if "gemini" in requested:
+            key = env_value("GEMINI_API_KEY", dotenv)
+            live_provider_smoke["gemini"] = smoke_gemini_models(profile, key)
 
     ok = True
     if any(status == "missing" for status in deps.values()):
@@ -73,6 +100,11 @@ def main() -> int:
         ok = False
     if any(status == "missing" for status in ollama.values()) and not args.offline_ok:
         ok = False
+    if live_provider_smoke and not args.offline_ok:
+        for provider in live_provider_smoke.values():
+            for smoke in provider.values():
+                if not smoke.get("ok"):
+                    ok = False
 
     payload = {
         "ok": ok,
@@ -84,6 +116,7 @@ def main() -> int:
         "credentials": credentials,
         "ports": ports,
         "ollama": ollama,
+        "live_provider_smoke": live_provider_smoke,
     }
     write_json(run_root / "preflight.json", payload)
     write_jsonl(run_root / "warnings.jsonl", warnings)
@@ -95,6 +128,28 @@ def main() -> int:
     if any(status == "missing" for status in credentials.values()) or ollama:
         return 3
     return 4
+
+
+def smoke_openai_models(profile: dict, api_key: str | None) -> dict[str, dict]:
+    if not api_key:
+        return {model: {"ok": False, "error_kind": "missing_credential"} for model in sorted(models_for_provider(profile, "openai"))}
+    results = {}
+    for model in sorted(models_for_provider(profile, "openai")):
+        no_tool = openai_responses_smoke(model, api_key, tools=False)
+        tool = openai_responses_smoke(model, api_key, tools=True) if no_tool.get("ok") else {"ok": False, "skipped": "no_tool_failed"}
+        results[model] = {"ok": bool(no_tool.get("ok") and tool.get("ok")), "no_tool": no_tool, "tool_declaration": tool}
+    return results
+
+
+def smoke_gemini_models(profile: dict, api_key: str | None) -> dict[str, dict]:
+    if not api_key:
+        return {model: {"ok": False, "error_kind": "missing_credential"} for model in sorted(models_for_provider(profile, "gemini"))}
+    results = {}
+    for model in sorted(models_for_provider(profile, "gemini")):
+        no_tool = gemini_interactions_smoke(model, api_key, tools=False)
+        tool = gemini_interactions_smoke(model, api_key, tools=True) if no_tool.get("ok") else {"ok": False, "skipped": "no_tool_failed"}
+        results[model] = {"ok": bool(no_tool.get("ok") and tool.get("ok")), "no_tool": no_tool, "tool_declaration": tool}
+    return results
 
 
 def dependency_status(suite: dict, binary: str) -> dict[str, str]:
@@ -122,4 +177,3 @@ def local_binary_exists() -> bool:
 
 if __name__ == "__main__":
     sys.exit(main())
-

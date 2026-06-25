@@ -1,13 +1,17 @@
 use std::collections::BTreeSet;
 
 use anyhow::bail;
+use serde_json::json;
 
 use crate::config::Config;
+use crate::eval_events;
 use crate::mode::ExecutionMode;
 use crate::providers::ChatClient;
 use crate::state::{ConversationMessage, SessionSnapshot};
 use crate::tools::path_guard::resolve_existing;
-use crate::tools::registry::{ToolContext, ToolRegistry};
+use crate::tools::registry::{
+    ToolContext, ToolRegistry, missing_arg_name, recoverable_tool_error, tool_error_kind,
+};
 use crate::tui::status::UiStatus;
 use crate::tui::{InteractionUi, NOOP_UI};
 
@@ -147,12 +151,59 @@ pub fn run_session_with_required_paths_with_ui(
             if !names_seen.insert(call.name.clone()) {
                 // Multiple same-tool calls are fine; this keeps clippy from seeing unused state.
             }
-            if matches!(call.name.as_str(), "Write" | "Edit") {
-                write_or_edit_seen = true;
-            }
+            let shape = eval_events::argument_shape(&call.arguments);
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "tool_call_raw",
+                    "name": call.name.as_str(),
+                    "arguments": shape,
+                }),
+            );
             let result = {
                 let _guard = ui.before_tool_call(&call.name);
-                registry.execute(&call.name, &call.arguments, &context)?
+                registry.execute(&call.name, &call.arguments, &context)
+            };
+            let result = match result {
+                Ok(result) => {
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "tool_execute",
+                            "name": call.name.as_str(),
+                            "status": "ok",
+                        }),
+                    );
+                    if matches!(call.name.as_str(), "Write" | "Edit") {
+                        write_or_edit_seen = true;
+                    }
+                    result
+                }
+                Err(err) if recoverable_tool_error(&err) => {
+                    let kind = tool_error_kind(&err);
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "tool_validation_error",
+                            "name": call.name.as_str(),
+                            "error_kind": kind,
+                            "missing_arg": missing_arg_name(&err),
+                        }),
+                    );
+                    recoverable_tool_feedback(&call.name, &err)
+                }
+                Err(err) => {
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "tool_execute",
+                            "name": call.name.as_str(),
+                            "status": "error",
+                            "error_kind": tool_error_kind(&err),
+                        }),
+                    );
+                    return Err(err);
+                }
             };
             session.messages.push(ConversationMessage::tool_result(
                 call.name,
@@ -182,6 +233,12 @@ fn looks_like_progress_without_tool(content: &str) -> bool {
         || lower.contains("作成します")
         || lower.contains("実装します")
         || lower.contains("進めます")
+}
+
+fn recoverable_tool_feedback(name: &str, err: &anyhow::Error) -> String {
+    format!(
+        "Tool call `{name}` was rejected with a recoverable validation error: {err}. Retry with the same tool or another available tool using a valid JSON object that matches the tool schema."
+    )
 }
 
 #[cfg(test)]
@@ -229,6 +286,7 @@ mod tests {
             max_iterations: 4,
             chat_timeout_secs: 1,
             chat_retries: 1,
+            eval_events_path: None,
             resume: None,
             fresh_session: false,
             no_footer: false,
@@ -265,5 +323,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, "done");
+    }
+
+    #[test]
+    fn missing_tool_argument_feedback_allows_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Grep", json!({}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session_with_required_paths(
+            &mut fake,
+            &mut session,
+            "create a.txt",
+            &["a.txt".to_string()],
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "done");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ok"
+        );
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.content.contains("recoverable validation error"))
+        );
+    }
+
+    #[test]
+    fn dangerous_command_remains_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command":"rm -rf /"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session(
+            &mut fake,
+            &mut session,
+            "run command",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("dangerous command blocked"));
     }
 }

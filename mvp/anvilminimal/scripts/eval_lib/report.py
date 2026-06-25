@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import statistics
+import json
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
@@ -15,6 +16,7 @@ def generate_report(run_root: Path) -> str:
     lines.extend(section_table("Size Summary", aggregate(rows, "size")))
     lines.extend(section_table("Model Profile Summary", aggregate(rows, "main_provider")))
     lines.extend(plan_rankings(rows))
+    lines.extend(blocking_summary(rows))
     lines.extend(failure_summary(rows))
     return "\n".join(lines) + "\n"
 
@@ -74,7 +76,10 @@ def failure_summary(rows: list[dict[str, str]]) -> list[str]:
     for row in rows:
         if row.get("success") == "true":
             continue
-        if row.get("success") == "diagnostic_skipped":
+        extras = parse_extras(row)
+        if extras.get("failure_kind"):
+            counter[str(extras["failure_kind"])] += 1
+        elif row.get("success") == "diagnostic_skipped":
             counter["diagnostic_skipped"] += 1
         elif row.get("rc") == "124":
             counter["timeout"] += 1
@@ -90,6 +95,24 @@ def failure_summary(rows: list[dict[str, str]]) -> list[str]:
             lines.append(f"| {key} | {count} |")
     lines.append("")
     return lines
+
+
+def blocking_summary(rows: list[dict[str, str]]) -> list[str]:
+    required = [row for row in rows if row.get("success") != "diagnostic_skipped"]
+    if required and all(row.get("success") != "true" for row in required):
+        return ["## Blocking", "", "blocking: all required runs failed", ""]
+    return []
+
+
+def parse_extras(row: dict[str, str]) -> dict[str, object]:
+    raw = row.get("extras_json", "")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def compare_summaries(baseline: Path, experiment: Path) -> str:
@@ -141,4 +164,3 @@ def fmt(value: float | None) -> str:
     if value is None:
         return ""
     return f"{value:.1f}"
-

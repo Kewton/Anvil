@@ -24,6 +24,7 @@ mod tests {
         let config = Config {
             workspace_root: std::path::PathBuf::from("."),
             state_dir: std::path::PathBuf::from("state"),
+            eval_events_path: None,
             yes: true,
             offline: false,
             context_budget: 1000,

@@ -6,7 +6,7 @@ profiles:
     runs:
       - main: openai:gpt-5.4-mini
         planner: gemini:gemini-3.5-flash
-      - main: gemini:gemini-3.1-flash
+      - main: gemini:gemini-3.1-flash-lite
         planner: openai:gpt-5.4-mini
   openai-only:
     parallel: true
@@ -18,7 +18,7 @@ profiles:
     parallel: true
     provider_limit: 2
     runs:
-      - main: gemini:gemini-3.1-flash
+      - main: gemini:gemini-3.1-flash-lite
         planner: gemini:gemini-3.5-flash
   openai-main-gemini-plan:
     parallel: true
@@ -30,7 +30,7 @@ profiles:
     parallel: true
     provider_limit: 2
     runs:
-      - main: gemini:gemini-3.1-flash
+      - main: gemini:gemini-3.1-flash-lite
         planner: openai:gpt-5.4-mini
   local-only:
     serial: true
@@ -55,7 +55,7 @@ profiles:
   gemini-main-local-plan:
     serial: true
     runs:
-      - main: gemini:gemini-3.1-flash
+      - main: gemini:gemini-3.1-flash-lite
         planner: ollama:qwen3.6:27b-coding-nvfp4
   full:
     parallel: true
@@ -63,11 +63,11 @@ profiles:
     runs:
       - main: openai:gpt-5.4-mini
         planner: openai:gpt-5.4-mini
-      - main: gemini:gemini-3.1-flash
+      - main: gemini:gemini-3.1-flash-lite
         planner: gemini:gemini-3.5-flash
       - main: openai:gpt-5.4-mini
         planner: gemini:gemini-3.5-flash
-      - main: gemini:gemini-3.1-flash
+      - main: gemini:gemini-3.1-flash-lite
         planner: openai:gpt-5.4-mini
       - main: ollama:qwen3.6:27b-coding-nvfp4
         planner: ollama:qwen3.6:27b-coding-nvfp4

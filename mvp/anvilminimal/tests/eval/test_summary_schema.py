@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from eval_lib.report import compare_summaries
+from eval_lib.report import compare_summaries, generate_report
 from eval_lib.run_summary import SUMMARY_HEADER, read_summary, write_summary
 
 
@@ -29,7 +29,29 @@ class SummarySchemaTest(unittest.TestCase):
         self.assertIn("# Eval Compare", text)
         self.assertIn("success_rate", text)
 
+    def test_report_uses_failure_kind_from_extras(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td)
+            row = {key: "" for key in SUMMARY_HEADER}
+            row.update(
+                {
+                    "run_id": "x",
+                    "suite": "s",
+                    "scenario": "scenario",
+                    "size": "small",
+                    "category": "provider-smoke",
+                    "mode": "minimal-loop",
+                    "main_provider": "openai",
+                    "success": "false",
+                    "rc": "1",
+                    "extras_json": {"failure_kind": "tool_validation_error"},
+                }
+            )
+            write_summary(run_root / "summary.eval.tsv", [row])
+            report = generate_report(run_root)
+            self.assertIn("blocking: all required runs failed", report)
+            self.assertIn("| tool_validation_error | 1 |", report)
+
 
 if __name__ == "__main__":
     unittest.main()
-

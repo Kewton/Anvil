@@ -40,6 +40,7 @@ pub enum Action {
 pub struct Config {
     pub workspace_root: PathBuf,
     pub state_dir: PathBuf,
+    pub eval_events_path: Option<PathBuf>,
     pub yes: bool,
     pub offline: bool,
     pub context_budget: usize,
@@ -82,6 +83,7 @@ impl Config {
         Ok(Self {
             workspace_root,
             state_dir,
+            eval_events_path: crate::eval_events::path_from_env(),
             yes: cli.yes,
             offline: cli.offline,
             context_budget: cli.context_budget,

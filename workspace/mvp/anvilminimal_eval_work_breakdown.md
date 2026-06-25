@@ -468,3 +468,25 @@ python3 scripts/eval-run.py --suite eval/suites/mvp-smoke.yaml --model-profile s
 - local LLM を含む run と cloud-only run の scheduler policy が分かれる
 - speed-cloud smoke と local-only smoke の実行手順が README にある
 - Next.js 3011 scenario は `npm run build` と HTTP 200 まで確認できる
+
+## 2026-06-25 追補作業: Provider Tool Call Failure Response
+
+| ID | 作業 | 作成/変更 | テスト |
+|---|---|---|---|
+| E10-T01 | 2026-06-25 minimal-loop failure snapshot を fixture 化 | `eval/fixtures/provider_failures/minimal_loop_20260625.json` | `test_failure_snapshot_classification.py` |
+| E10-T02 | OpenAI Responses `function_call.arguments` の JSON string decode | `src/providers/openai.rs` | parser unit tests |
+| E10-T03 | Gemini function call arguments の object/string/null 扱いを整理 | `src/providers/gemini_function_calling.rs` | parser unit tests |
+| E10-T04 | recoverable tool validation feedback を minimal loop に追加 | `src/minimal_loop/loop_run.rs`, `src/tools/registry.rs` | missing arg retry / dangerous command hard error |
+| E10-T05 | `ANVIL_EVAL_EVENTS` writer を runtime に追加 | `src/eval_events.rs`, providers, loop | JSONL/redaction unit tests |
+| E10-T06 | eval failure classification を summary/report に反映 | `scripts/eval_lib/failure_classification.py`, `eval-run.py`, `report.py` | Python unittest |
+| E10-T07 | Gemini/OpenAI live provider smoke preflight を追加 | `scripts/eval-preflight.py`, `eval_lib/models.py` | offline unit tests + manual live smoke |
+| E10-T08 | provider semantic smoke suite と gate を追加 | `eval/suites/mvp-provider-smoke.yaml`, `eval/README.md` | dry-run / provider-smoke summary gate |
+| E10-T09 | provider/tool-call 横展開レビューを記録 | `workspace/mvp/eval/001/provider_toolcall_cross_review.md` | review doc present |
+
+追加 Definition of Done。
+
+- `cargo test` と `python3 -m unittest discover -s tests/eval -p 'test_*.py'` が通る
+- `eval-run.py --dry-run` が `mvp-provider-smoke` と `mvp-smoke` の両方で matrix を生成できる
+- `success=false` の eval row は `extras_json.failure_kind` を持つ
+- provider smoke summary が failed の場合、本体 eval は `--allow-provider-smoke-failure` なしで停止する
+- live provider smoke は unit test には混ぜず、`.env` の `OPENAI_API_KEY` / `GEMINI_API_KEY` がある環境で明示実行する

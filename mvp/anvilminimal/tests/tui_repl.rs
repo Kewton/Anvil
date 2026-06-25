@@ -11,6 +11,7 @@ fn config(root: PathBuf) -> Config {
     Config {
         workspace_root: root,
         state_dir: PathBuf::from("state"),
+        eval_events_path: None,
         yes: true,
         offline: false,
         context_budget: 1000,

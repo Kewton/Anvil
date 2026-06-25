@@ -77,14 +77,32 @@ This excludes local LLMs and runs cloud-only rows with provider limits.
 export OPENAI_API_KEY=...
 export GEMINI_API_KEY=...
 
+python3 scripts/eval-preflight.py \
+  --suite eval/suites/mvp-provider-smoke.yaml \
+  --model-profile speed-cloud \
+  --live-provider-smoke all
+
+python3 scripts/eval-run.py \
+  --suite eval/suites/mvp-provider-smoke.yaml \
+  --model-profile speed-cloud \
+  --modes minimal-loop,plan-run,ultra-plan-run \
+  --runs 1 \
+  --parallel 4 \
+  --timeout-sec 600
+
 python3 scripts/eval-run.py \
   --suite eval/suites/mvp-smoke.yaml \
   --model-profile speed-cloud \
   --modes minimal-loop,step-plan,plan-run,ultra-plan-run \
   --runs 1 \
   --parallel 4 \
+  --provider-smoke-summary workspace/eval-artifacts/anvilminimal-mvp/<provider-smoke>/summary.eval.tsv \
   --timeout-sec 1800
 ```
+
+Use `--allow-provider-smoke-failure` only for diagnostic runs where the provider
+smoke failure is the subject of the investigation. Normal acceptance should keep
+the provider smoke gate enabled.
 
 ## Local Eval
 
@@ -166,5 +184,6 @@ cargo test
 python3 -m unittest discover -s tests/eval -p 'test_*.py'
 ```
 
-Live provider/network checks are not part of unit tests.
-
+Live provider/network checks are not part of unit tests. Run
+`eval-preflight.py --live-provider-smoke all` before cloud eval to verify the
+current model/endpoint/tool-declaration contract.

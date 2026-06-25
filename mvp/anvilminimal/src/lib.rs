@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod eval_events;
 pub mod minimal_loop;
 pub mod mode;
 pub mod planner;
