@@ -51,12 +51,20 @@ SUMMARY_HEADER = [
     "planner_advisory_quality_count",
     "planner_quality_retry_count",
     "planner_quality_retry_degraded_count",
+    "valid_plan_generated",
     "plan_quality_score",
     "executable_plan_score",
     "constraint_coverage_score",
     "verify_strength_score",
     "artifact_ownership_score",
     "lint_repair_score",
+    "execution_shape_readiness_score",
+    "plan_run_predictive_score",
+    "runtime_friction_score",
+    "artifact_progress_score",
+    "finalization_score",
+    "tool_policy_compatibility_score",
+    "plan_run_runtime_health_score",
     "stability_score",
     "ultra_phase_quality_score",
     "execution_score",
@@ -115,12 +123,20 @@ def empty_summary_row(spec: dict[str, Any]) -> dict[str, Any]:
         "planner_advisory_quality_count": "",
         "planner_quality_retry_count": "",
         "planner_quality_retry_degraded_count": "",
+        "valid_plan_generated": "",
         "plan_quality_score": "",
         "executable_plan_score": "",
         "constraint_coverage_score": "",
         "verify_strength_score": "",
         "artifact_ownership_score": "",
         "lint_repair_score": "",
+        "execution_shape_readiness_score": "",
+        "plan_run_predictive_score": "",
+        "runtime_friction_score": "",
+        "artifact_progress_score": "",
+        "finalization_score": "",
+        "tool_policy_compatibility_score": "",
+        "plan_run_runtime_health_score": "",
         "stability_score": "",
         "ultra_phase_quality_score": "",
         "execution_score": "",
@@ -216,3 +232,22 @@ def calculate_overall(
             1,
         )
     return execution_score
+
+
+def calculate_plan_run_predictive_score(
+    executable_score: float | None,
+    artifact_ownership_score: float | None,
+    verify_strength_score: float | None,
+    constraint_score: float | None,
+    lint_repair_score: float | None,
+    execution_shape_readiness_score: float | None,
+) -> float:
+    return round(
+        0.30 * (execution_shape_readiness_score or 0)
+        + 0.25 * (executable_score or 0)
+        + 0.15 * (artifact_ownership_score or 0)
+        + 0.15 * (verify_strength_score or 0)
+        + 0.10 * (constraint_score or 0)
+        + 0.05 * (lint_repair_score or 0),
+        1,
+    )

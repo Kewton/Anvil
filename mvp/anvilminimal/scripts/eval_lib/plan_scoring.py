@@ -29,6 +29,15 @@ EXECUTABLE_WEIGHTS = {
     "step_budget_fit": 15,
 }
 
+EXECUTION_SHAPE_WEIGHTS = {
+    "first_artifact_owner": 25,
+    "wrapper_step_minimality": 20,
+    "empty_expected_path_minimality": 15,
+    "verify_owner_coupling": 15,
+    "write_first_bias": 15,
+    "terminal_finalization_risk": 10,
+}
+
 CONSTRAINT_COVERAGE_WEIGHTS = {
     "expected_artifacts": 45,
     "required_verify": 25,
@@ -59,7 +68,16 @@ def score_plan_file(path: str | Path, scenario: dict[str, Any] | None = None) ->
 def parse_failure(error: str) -> dict[str, Any]:
     details = {key: 0 for key in STEP_WEIGHTS}
     details["penalties"] = [{"kind": "parse_failure", "message": error}]
-    return {"kind": "step", "score": 0, "details": details}
+    return {
+        "kind": "step",
+        "score": 0,
+        "executable_score": 0,
+        "constraint_coverage_score": 0,
+        "verify_strength_score": 0,
+        "artifact_ownership_score": 0,
+        "execution_shape_readiness_score": 0,
+        "details": details,
+    }
 
 
 def score_step_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -101,6 +119,7 @@ def score_step_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None
     constraint = score_constraint_coverage(plan, scenario)
     verify_strength = score_verify_strength(steps, scenario)
     artifact_ownership = score_artifact_ownership(steps, scenario)
+    execution_shape = score_execution_shape_readiness(plan, scenario)
     return {
         "kind": "step",
         "score": total,
@@ -108,11 +127,13 @@ def score_step_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None
         "constraint_coverage_score": constraint["score"],
         "verify_strength_score": verify_strength["score"],
         "artifact_ownership_score": artifact_ownership["score"],
+        "execution_shape_readiness_score": execution_shape["score"],
         "details": details,
         "executable_details": executable["details"],
         "constraint_coverage_details": constraint["details"],
         "verify_strength_details": verify_strength["details"],
         "artifact_ownership_details": artifact_ownership["details"],
+        "execution_shape_details": execution_shape["details"],
     }
 
 
@@ -235,6 +256,108 @@ def score_artifact_ownership(steps: list[dict[str, Any]], scenario: dict[str, An
             "penalties": penalties,
         },
     }
+
+
+def score_execution_shape_readiness(plan: dict[str, Any], scenario: dict[str, Any] | None = None) -> dict[str, Any]:
+    scenario = scenario or {}
+    steps = plan.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        return {
+            "score": 0,
+            "details": {
+                **{key: 0 for key in EXECUTION_SHAPE_WEIGHTS},
+                "penalties": [{"kind": "no_steps"}],
+            },
+        }
+
+    expected = [str(path) for path in scenario.get("expected_artifacts", []) or []]
+    fresh_workspace = not scenario_has_seed_inputs(scenario)
+    penalties: list[dict[str, Any]] = []
+    details: dict[str, Any] = {}
+
+    owner_indexes = [index for index, step in enumerate(steps) if step.get("expected_paths")]
+    first_owner = owner_indexes[0] if owner_indexes else None
+    if first_owner is None:
+        details["first_artifact_owner"] = 0 if expected else 15
+        if expected:
+            penalties.append({"kind": "missing_artifact_owner"})
+    elif first_owner == 0:
+        details["first_artifact_owner"] = EXECUTION_SHAPE_WEIGHTS["first_artifact_owner"]
+    elif first_owner == 1:
+        details["first_artifact_owner"] = 20
+        penalties.append({"kind": "artifact_owner_delayed", "first_owner_index": first_owner})
+    elif first_owner == 2:
+        details["first_artifact_owner"] = 12
+        penalties.append({"kind": "artifact_owner_delayed", "first_owner_index": first_owner})
+    else:
+        details["first_artifact_owner"] = 5
+        penalties.append({"kind": "artifact_owner_delayed", "first_owner_index": first_owner})
+
+    wrapper_kinds = {"inspect", "analyze", "review", "report", "summarize"}
+    wrapper_steps = [
+        str(step.get("id", ""))
+        for step in steps
+        if not step.get("expected_paths") and str(step.get("kind", "")).lower() in wrapper_kinds
+    ]
+    wrapper_score = EXECUTION_SHAPE_WEIGHTS["wrapper_step_minimality"] - len(wrapper_steps) * 7
+    if wrapper_steps:
+        penalties.append({"kind": "wrapper_steps_without_artifacts", "steps": wrapper_steps})
+    details["wrapper_step_minimality"] = max(0, wrapper_score)
+
+    empty_expected_path_steps = [
+        str(step.get("id", ""))
+        for step in steps
+        if not step.get("expected_paths") and not step.get("verify")
+    ]
+    empty_score = EXECUTION_SHAPE_WEIGHTS["empty_expected_path_minimality"] - len(empty_expected_path_steps) * 5
+    if empty_expected_path_steps:
+        penalties.append({"kind": "empty_expected_path_steps", "steps": empty_expected_path_steps})
+    details["empty_expected_path_minimality"] = max(0, empty_score)
+
+    verify_steps = [step for step in steps if step.get("verify")]
+    owner_verify_steps = [step for step in verify_steps if step.get("expected_paths")]
+    verify_only_steps = [step for step in verify_steps if not step.get("expected_paths")]
+    if not verify_steps:
+        details["verify_owner_coupling"] = 6
+    elif owner_verify_steps:
+        details["verify_owner_coupling"] = EXECUTION_SHAPE_WEIGHTS["verify_owner_coupling"]
+    elif len(verify_only_steps) == 1 and owner_indexes:
+        details["verify_owner_coupling"] = 10
+    else:
+        details["verify_owner_coupling"] = 5
+        penalties.append({"kind": "verify_detached_from_artifact_owner"})
+
+    read_before_write_risks = []
+    created: set[str] = set()
+    expected_set = set(expected)
+    for index, step in enumerate(steps):
+        instruction = str(step.get("instruction", "")).lower()
+        kind = str(step.get("kind", "")).lower()
+        if (
+            fresh_workspace
+            and expected_set
+            and not created
+            and kind in {"inspect", "analyze", "review"}
+            and looks_like_existing_workspace_assumption(instruction)
+        ):
+            read_before_write_risks.append(str(step.get("id", index)))
+        created.update(str(path) for path in step.get("expected_paths", []) or [])
+    write_bias_score = EXECUTION_SHAPE_WEIGHTS["write_first_bias"] - len(read_before_write_risks) * 8
+    if read_before_write_risks:
+        penalties.append({"kind": "read_before_write_shape_risk", "steps": read_before_write_risks})
+    details["write_first_bias"] = max(0, write_bias_score)
+
+    last = steps[-1]
+    last_kind = str(last.get("kind", "")).lower()
+    if last_kind in {"report", "summarize"} and not last.get("expected_paths") and not last.get("verify"):
+        details["terminal_finalization_risk"] = 2
+        penalties.append({"kind": "terminal_report_step"})
+    else:
+        details["terminal_finalization_risk"] = EXECUTION_SHAPE_WEIGHTS["terminal_finalization_risk"]
+
+    score = sum(int(details[key]) for key in EXECUTION_SHAPE_WEIGHTS)
+    details["penalties"] = penalties
+    return {"score": max(0, min(100, score)), "details": details}
 
 
 def score_ultra_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None) -> dict[str, Any]:

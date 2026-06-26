@@ -15,6 +15,7 @@ def generate_report(run_root: Path) -> str:
     lines.extend(section_table("Mode Summary", aggregate(rows, "mode")))
     lines.extend(section_table("Size Summary", aggregate(rows, "size")))
     lines.extend(section_table("Model Profile Summary", aggregate(rows, "main_provider")))
+    lines.extend(core_metric_summary(rows))
     lines.extend(plan_rankings(rows))
     lines.extend(executable_plan_rankings(rows))
     lines.extend(additional_plan_metric_rankings(rows))
@@ -49,6 +50,51 @@ def aggregate(rows: list[dict[str, str]], key: str) -> list[dict[str, str]]:
             }
         )
     return out
+
+
+def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
+    groups: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        groups[row.get("mode", "")].append(row)
+    out = []
+    for mode, group in sorted(groups.items()):
+        elapsed = [
+            to_float(row.get("exec_elapsed_sec"))
+            for row in group
+            if to_float(row.get("exec_elapsed_sec")) is not None
+        ]
+        out.append(
+            {
+                "mode": mode,
+                "success": success_count_cell(group),
+                "valid_plan": valid_plan_count_cell(group),
+                "plan_quality": fmt(mean([to_float(row.get("plan_quality_score")) for row in group])),
+                "shape_readiness": fmt(
+                    mean([to_float(row.get("execution_shape_readiness_score")) for row in group])
+                ),
+                "predictive": fmt(mean([to_float(row.get("plan_run_predictive_score")) for row in group])),
+                "runtime_health": fmt(
+                    mean([to_float(row.get("plan_run_runtime_health_score")) for row in group])
+                ),
+                "p50_exec_sec": fmt(percentile(elapsed, 50)),
+            }
+        )
+    lines = ["## Core Metrics", ""]
+    if not out:
+        return lines + ["No rows.", ""]
+    return lines + table_rows(
+        out,
+        [
+            "mode",
+            "success",
+            "valid_plan",
+            "plan_quality",
+            "shape_readiness",
+            "predictive",
+            "runtime_health",
+            "p50_exec_sec",
+        ],
+    )
 
 
 def section_table(title: str, rows: list[dict[str, str]]) -> list[str]:
@@ -105,13 +151,17 @@ def additional_plan_metric_rankings(rows: list[dict[str, str]]) -> list[str]:
         "verify_strength_score",
         "artifact_ownership_score",
         "lint_repair_score",
+        "runtime_friction_score",
+        "artifact_progress_score",
+        "finalization_score",
+        "tool_policy_compatibility_score",
     ]
-    lines = ["## Additional Plan Metrics", ""]
+    lines = ["## Detailed Metric Diagnostics", ""]
     ranked_rows = []
     for metric in metrics:
         scored = [(to_float(row.get(metric)), row) for row in rows]
         scored = [(score, row) for score, row in scored if score is not None]
-        for score, row in sorted(scored, key=lambda item: item[0])[:5]:
+        for score, row in sorted(scored, key=lambda item: item[0])[:3]:
             ranked_rows.append(
                 {
                     "metric": metric,
@@ -123,7 +173,7 @@ def additional_plan_metric_rankings(rows: list[dict[str, str]]) -> list[str]:
                 }
             )
     if not ranked_rows:
-        return lines + ["No additional plan metric scores.", ""]
+        return lines + ["No detailed metric scores.", ""]
     return lines + table_rows(ranked_rows, ["metric", "scenario", "mode", "provider", "score", "success"])
 
 
@@ -165,7 +215,9 @@ def plan_run_predictiveness_summary(rows: list[dict[str, str]]) -> list[str]:
     false_positive = 0
     false_negative = 0
     for key in sorted(set(step_groups).intersection(run_groups)):
-        step_score = mean([to_float(row.get("overall_score")) for row in step_groups[key]])
+        step_score = mean([to_float(row.get("plan_run_predictive_score")) for row in step_groups[key]])
+        if step_score is None:
+            step_score = mean([to_float(row.get("overall_score")) for row in step_groups[key]])
         run_success = success_rate(run_groups[key])
         if step_score is None:
             continue
@@ -181,7 +233,7 @@ def plan_run_predictiveness_summary(rows: list[dict[str, str]]) -> list[str]:
                 "scenario": sample.get("scenario", ""),
                 "main": f"{sample.get('main_provider', '')}:{sample.get('main_model', '')}",
                 "planner": f"{sample.get('planner_provider', '')}:{sample.get('planner_model', '')}",
-                "step_overall": fmt(step_score),
+                "step_predictive": fmt(step_score),
                 "plan_run_success": fmt(run_success),
             }
         )
@@ -198,7 +250,7 @@ def plan_run_predictiveness_summary(rows: list[dict[str, str]]) -> list[str]:
             "",
         ]
     )
-    return lines + table_rows(pair_rows, ["scenario", "main", "planner", "step_overall", "plan_run_success"])
+    return lines + table_rows(pair_rows, ["scenario", "main", "planner", "step_predictive", "plan_run_success"])
 
 
 def failure_summary(rows: list[dict[str, str]]) -> list[str]:
@@ -433,10 +485,31 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
     lines = ["# Eval Compare", "", "| metric | baseline | experiment | delta |", "|---|---:|---:|---:|"]
     metrics = [
         ("success_rate", success_rate(base), success_rate(exp)),
+        ("valid_plan_generated_rate", valid_plan_rate(base), valid_plan_rate(exp)),
         (
             "p50_exec_sec",
             percentile([to_float(r.get("exec_elapsed_sec")) for r in base], 50),
             percentile([to_float(r.get("exec_elapsed_sec")) for r in exp], 50),
+        ),
+        (
+            "plan_quality_score_avg",
+            mean([to_float(r.get("plan_quality_score")) for r in base]),
+            mean([to_float(r.get("plan_quality_score")) for r in exp]),
+        ),
+        (
+            "execution_shape_readiness_score_avg",
+            mean([to_float(r.get("execution_shape_readiness_score")) for r in base]),
+            mean([to_float(r.get("execution_shape_readiness_score")) for r in exp]),
+        ),
+        (
+            "plan_run_predictive_score_avg",
+            mean([to_float(r.get("plan_run_predictive_score")) for r in base]),
+            mean([to_float(r.get("plan_run_predictive_score")) for r in exp]),
+        ),
+        (
+            "plan_run_runtime_health_score_avg",
+            mean([to_float(r.get("plan_run_runtime_health_score")) for r in base]),
+            mean([to_float(r.get("plan_run_runtime_health_score")) for r in exp]),
         ),
         (
             "executable_plan_score_avg",
@@ -469,13 +542,34 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             mean([to_float(r.get("stability_score")) for r in exp]),
         ),
         (
+            "runtime_friction_score_avg",
+            mean([to_float(r.get("runtime_friction_score")) for r in base]),
+            mean([to_float(r.get("runtime_friction_score")) for r in exp]),
+        ),
+        (
+            "artifact_progress_score_avg",
+            mean([to_float(r.get("artifact_progress_score")) for r in base]),
+            mean([to_float(r.get("artifact_progress_score")) for r in exp]),
+        ),
+        (
+            "finalization_score_avg",
+            mean([to_float(r.get("finalization_score")) for r in base]),
+            mean([to_float(r.get("finalization_score")) for r in exp]),
+        ),
+        (
+            "tool_policy_compatibility_score_avg",
+            mean([to_float(r.get("tool_policy_compatibility_score")) for r in base]),
+            mean([to_float(r.get("tool_policy_compatibility_score")) for r in exp]),
+        ),
+        (
             "overall_score_avg",
             mean([to_float(r.get("overall_score")) for r in base]),
             mean([to_float(r.get("overall_score")) for r in exp]),
         ),
     ]
     for name, b, e in metrics:
-        lines.append(f"| {name} | {fmt(b)} | {fmt(e)} | {fmt((e or 0) - (b or 0))} |")
+        delta = None if b is None or e is None else e - b
+        lines.append(f"| {name} | {fmt(b)} | {fmt(e)} | {fmt(delta)} |")
     lines.append("")
     return "\n".join(lines)
 
@@ -484,6 +578,24 @@ def success_rate(rows: list[dict[str, str]]) -> float:
     if not rows:
         return 0.0
     return 100.0 * sum(1 for row in rows if row.get("success") == "true") / len(rows)
+
+
+def valid_plan_rate(rows: list[dict[str, str]]) -> float | None:
+    scoped = [row for row in rows if row.get("valid_plan_generated") not in {"", None}]
+    if not scoped:
+        return None
+    return 100.0 * sum(1 for row in scoped if row.get("valid_plan_generated") == "true") / len(scoped)
+
+
+def success_count_cell(rows: list[dict[str, str]]) -> str:
+    return f"{sum(1 for row in rows if row.get('success') == 'true')}/{len(rows)}"
+
+
+def valid_plan_count_cell(rows: list[dict[str, str]]) -> str:
+    scoped = [row for row in rows if row.get("valid_plan_generated") not in {"", None}]
+    if not scoped:
+        return ""
+    return f"{sum(1 for row in scoped if row.get('valid_plan_generated') == 'true')}/{len(scoped)}"
 
 
 def prediction_key(row: dict[str, str]) -> tuple[str, str, str, str, str, str]:

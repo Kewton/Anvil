@@ -248,6 +248,55 @@ steps:
         penalties = {penalty["kind"] for penalty in score["artifact_ownership_details"]["penalties"]}
         self.assertIn("extra_artifact_ownership", penalties)
 
+    def test_execution_shape_readiness_penalizes_wrapper_and_terminal_report(self):
+        risky = """goal: js helper
+steps:
+  - id: inspect
+    kind: inspect
+    instruction: Inspect the current workspace and determine whether date-helper.js already exists.
+  - id: implement
+    kind: implement
+    instruction: Create date-helper.js.
+    expected_paths:
+      - date-helper.js
+  - id: report
+    kind: report
+    instruction: Report completion.
+"""
+        direct = """goal: js helper
+steps:
+  - id: implement
+    kind: implement
+    instruction: Create date-helper.js and smoke-check.js, then verify with node smoke-check.js.
+    expected_paths:
+      - date-helper.js
+      - smoke-check.js
+    verify:
+      - node smoke-check.js
+"""
+        scenario = {
+            "size": "small",
+            "profile": "generic",
+            "prompt": "Fix a JavaScript date helper and add a deterministic node smoke check.",
+            "expected_artifacts": ["date-helper.js"],
+            "plan_constraints": {"min_steps": 1, "max_steps": 4, "required_verify_keywords": ["node"]},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            risky_path = Path(td) / "risky.yaml"
+            direct_path = Path(td) / "direct.yaml"
+            risky_path.write_text(risky, encoding="utf-8")
+            direct_path.write_text(direct, encoding="utf-8")
+            risky_score = score_plan_file(risky_path, scenario)
+            direct_score = score_plan_file(direct_path, scenario)
+        self.assertLess(
+            risky_score["execution_shape_readiness_score"],
+            direct_score["execution_shape_readiness_score"],
+            (risky_score, direct_score),
+        )
+        penalties = {penalty["kind"] for penalty in risky_score["execution_shape_details"]["penalties"]}
+        self.assertIn("wrapper_steps_without_artifacts", penalties)
+        self.assertIn("terminal_report_step", penalties)
+
 
 if __name__ == "__main__":
     unittest.main()

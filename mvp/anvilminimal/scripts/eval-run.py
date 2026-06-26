@@ -21,7 +21,13 @@ from eval_lib.plan_scoring import score_plan_file
 from eval_lib.postcheck import is_dependency_command, run_postcheck
 from eval_lib.redaction import redact_json
 from eval_lib.process import run_capture
-from eval_lib.run_summary import calculate_overall, empty_summary_row, write_summary
+from eval_lib.run_summary import (
+    calculate_overall,
+    calculate_plan_run_predictive_score,
+    empty_summary_row,
+    write_summary,
+)
+from eval_lib.runtime_scoring import score_runtime_health
 from eval_lib.suites import load_suite
 
 
@@ -300,11 +306,17 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         event.setdefault("run_id", spec["run_id"])
     events.extend(child_events)
     plans = collect_plans(workdir, run_dir)
+    valid_plan_generated = (
+        bool(plans)
+        if spec["mode"] in {"step-plan", "plan-run", "ultra-plan-run", "ultra-step-run"}
+        else ""
+    )
     plan_score = None
     executable_plan_score = None
     constraint_coverage_score = None
     verify_strength_score = None
     artifact_ownership_score = None
+    execution_shape_readiness_score = None
     ultra_score = None
     for plan in plans:
         score = score_plan_file(plan, spec["scenario"])
@@ -321,6 +333,8 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
                 verify_strength_score = float(score["verify_strength_score"])
             if score.get("artifact_ownership_score") is not None:
                 artifact_ownership_score = float(score["artifact_ownership_score"])
+            if score.get("execution_shape_readiness_score") is not None:
+                execution_shape_readiness_score = float(score["execution_shape_readiness_score"])
 
     post = {"ok": True, "postcheck_elapsed_sec": 0.0, "dependency_elapsed_sec": 0.0}
     if result.rc == 0 and spec["mode"] != "step-plan":
@@ -367,6 +381,23 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
     completion_observability = summarize_completion_observability(events)
     if completion_observability:
         extras.update(completion_observability)
+    plan_run_predictive_score = ""
+    if executable_plan_score is not None:
+        plan_run_predictive_score = calculate_plan_run_predictive_score(
+            executable_plan_score,
+            artifact_ownership_score,
+            verify_strength_score,
+            constraint_coverage_score,
+            lint_repair_score,
+            execution_shape_readiness_score,
+        )
+    runtime_scores = score_runtime_health(
+        events,
+        mode=spec["mode"],
+        success=success,
+        scenario=spec["scenario"],
+        workdir=workdir,
+    )
     row.update(
         {
             "rc": result.rc,
@@ -404,12 +435,18 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "planner_quality_retry_degraded_count": diagnostics[
                 "planner_quality_retry_degraded_count"
             ],
+            "valid_plan_generated": valid_plan_generated,
             "plan_quality_score": plan_score if plan_score is not None else "",
             "executable_plan_score": executable_plan_score if executable_plan_score is not None else "",
             "constraint_coverage_score": constraint_coverage_score if constraint_coverage_score is not None else "",
             "verify_strength_score": verify_strength_score if verify_strength_score is not None else "",
             "artifact_ownership_score": artifact_ownership_score if artifact_ownership_score is not None else "",
             "lint_repair_score": lint_repair_score,
+            "execution_shape_readiness_score": execution_shape_readiness_score
+            if execution_shape_readiness_score is not None
+            else "",
+            "plan_run_predictive_score": plan_run_predictive_score,
+            **runtime_scores,
             "ultra_phase_quality_score": ultra_score if ultra_score is not None else "",
             "execution_score": execution_score,
             "time_score": time_score,
@@ -727,8 +764,22 @@ def apply_time_scores(rows: list[dict]) -> None:
             verify_strength = float(row["verify_strength_score"]) if row.get("verify_strength_score") not in {"", None} else None
             artifact_ownership = float(row["artifact_ownership_score"]) if row.get("artifact_ownership_score") not in {"", None} else None
             lint_repair = float(row["lint_repair_score"]) if row.get("lint_repair_score") not in {"", None} else None
+            execution_shape = (
+                float(row["execution_shape_readiness_score"])
+                if row.get("execution_shape_readiness_score") not in {"", None}
+                else None
+            )
             ultra = float(row["ultra_phase_quality_score"]) if row.get("ultra_phase_quality_score") not in {"", None} else None
             execution = float(row["execution_score"]) if row.get("execution_score") not in {"", None} else 0.0
+            if executable is not None:
+                row["plan_run_predictive_score"] = calculate_plan_run_predictive_score(
+                    executable,
+                    artifact_ownership,
+                    verify_strength,
+                    constraint,
+                    lint_repair,
+                    execution_shape,
+                )
             row["overall_score"] = calculate_overall(
                 row["mode"],
                 plan,

@@ -1,0 +1,12 @@
+goal: "Fix a JavaScript date helper and add a deterministic node smoke check."
+steps:
+  - id: "implement-date-helper-and-smoke"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create date-helper.js exporting deterministic UTC date helper functions, and create smoke-check.js that imports date-helper.js, asserts fixed-input behavior with node:assert, and exits nonzero on mismatch."
+    expected_paths:
+      - "date-helper.js"
+      - "smoke-check.js"
+    verify:
+      - "node smoke-check.js"
+
