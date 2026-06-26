@@ -88,6 +88,8 @@ MVP は成功率が高いが、`verify_strength_score` が低いケースがあ�
 
 これは step-plan YAML としては妥当でも、plan-run の実装品質を保証する力が不足する。
 
+重要なのは、これは単純な prompt 不足ではないこと。現状の問題は「invalid plan が出ている」ではなく、「valid だが弱い plan が deterministic check を通過している」ことにある。したがって、planner に強い verify を出させるだけでなく、作成済み plan を自己チェックし、明確に弱い場合だけ bounded retry に戻す閉ループが必要。
+
 ### P2. executable_plan_score は平均だけでは差が見えにくい
 
 今回の最新 run では MVP と anvildev の `executable_plan_score avg` がどちらも 78.3 だった。
@@ -99,11 +101,17 @@ MVP は成功率が高いが、`verify_strength_score` が低いケースがあ�
 
 つまり `executable_plan_score avg` は「保存された YAML の実行可能性」は見られるが、「YAML を安定して生成できたか」は十分に表現しない。失敗行を含めた総合判断には `success_rate`, `artifact_ownership_score`, `overall_score`, failure kind を併用する必要がある。
 
-### P3. MVP の lint_repair_score が低いケースがある
+### P3. quality warning が修正ループに十分つながっていない
 
 MVP は最終成功しているが、planner lint retry や prompt issue を経由している行がある。
 
-この場合、最終 YAML は出るが planner 出力の一発安定性は低い。`verify_strength_score` を上げるには、retry 後補正だけでなく初回 prompt 側で強い verify を要求する必要がある。
+この場合、最終 YAML は出るが planner 出力の一発安定性は低い。加えて、現在の quality warning は主に event として残るだけで、valid だが弱い plan を作り直す力は限定的。
+
+`verify_strength_score` を上げる主対策は、初回 prompt 強化ではなく、以下の閉ループを作ること。
+
+1. 作成済み plan を deterministic に quality self-check する
+2. 高信頼な issue だけ `retryable_quality` として corrective retry に戻す
+3. retry が悪化した場合は、既に得られている valid plan を保持する
 
 ### P4. anvildev は verify policy と suite 要求のずれが大きい
 
@@ -123,23 +131,29 @@ anvildev は `node smoke-check.js`, `python -m unittest`, `python -m unittest di
 
 現在の `verify_strength_score` は command の文字列強度を見ている。次の改善が必要。
 
-- docs 系で `grep` / `test -f` だけに寄る plan を低く評価し続ける
+- docs 系で存在確認だけの `test -f` / `cat` / 汎用的な `grep` に寄る plan を低く評価し、要求された見出しや文言を確認する content assertion は評価する
 - Next.js profile では `npm run build` または postcheck delegated build が plan に明確に反映されることを評価する
 - Python/Rust では compile-only より unit test を強く評価する
 - plan-run 実測との相関で、しきい値と重みを校正する
 
-### MVP planner prompt / repair guidance
+### MVP plan self-check / quality retry / prompt guidance
 
 - `mvp/anvilminimal/src/planner/runner.rs`
-  - `step_plan_system_prompt`
+  - `plan_generation_system_prompt`
   - `build_lint_retry_prompt`
   - `lint_retry_hard_constraints`
   - `strengthen_step_plan_for_profile`
+- `mvp/anvilminimal/src/planner/lint.rs`
+  - `step_plan_quality_warnings`
 
-現状、expected paths と lint 通過に関する指示は強いが、verify の強度を具体的に上げる指示が不足している。
+現状、expected paths と lint 通過に関する指示は強いが、valid plan の品質不足を検出して修正ループに戻す仕組みが弱い。
 
 改善候補:
 
+- `fatal` / `retryable_quality` / `advisory` の quality issue 分類を追加する
+- weak verify、verify/artifact coupling、instruction specificity、profile expectation を deterministic に判定する
+- 高信頼な `retryable_quality` だけ既存 retry loop に戻す
+- retry が fatal lint を増やした場合は、既に得られている valid plan を保持する
 - docs: `test -s` だけでなく、要求された見出しや例を `grep` で確認する
 - Python: `python3 -m unittest test_*.py`
 - Rust: `cargo test`
@@ -165,33 +179,48 @@ anvildev は `node smoke-check.js`, `python -m unittest`, `python -m unittest di
 
 ## 優先改善方針
 
-### Phase 1: verify_strength を上げる
+### Phase 1: quality self-check を定義する
 
-1. planner prompt に scenario 種別ごとの強い verify 例を追加する。
-2. `test -f`, `cat`, compile-only に寄る plan を避けるよう retry guidance を強化する。
-3. Next.js は `npm run build` を plan 上に残しつつ、dependency setup/postcheck との衝突を避ける方針を明確化する。
-4. unit test が求められるシナリオでは `python3 -m unittest ...`, `cargo test`, `node ...` を優先させる。
+1. 作成済み plan に対して `fatal` / `retryable_quality` / `advisory` の分類を行う。
+2. `test -f`, `cat`, compile-only に寄る plan を弱い verify として検出する。
+3. verify が expected artifact と結びついているかを判定する。
+4. Next.js など profile がある場合は、profile expectation を自己チェックの根拠にする。
 
 受け入れ目安:
 
-- MVP `verify_strength_score avg` が 62.2 から 70 以上へ改善
 - `success_rate` は 12/12 を維持
-- `planner_lint_error` が増えない
+- quality issue の category / message / retryability が event と summary で追跡できる
+- eval scenario 名に依存した判定を追加していない
 
-### Phase 2: executable_plan を上げる
+### Phase 2: quality issue を bounded retry に戻す
 
-1. `expected_paths` を持つ step の instruction に対象 path を明示させる。
-2. 新規作成タスクの先頭 inspect を減らす、または read-only で止まらない instruction にする。
-3. required artifact exactly once ownership を維持する。
-4. Next.js の setup/implement/verify の責任境界をより明確にする。
+1. 高信頼な `retryable_quality` だけ既存の planner retry loop に戻す。
+2. retry prompt は品質不足と hard constraints のみを短く渡す。
+3. retry が fatal lint を増やした場合は、既存の valid plan を保持する。
+4. 初期実装では quality issue exhausted を新たな失敗扱いにしない。失敗扱いへの昇格は、plan-run predictiveness と blind eval で安定性を確認した後の別判断にする。
 
 受け入れ目安:
 
-- MVP `executable_plan_score avg` が 78.3 から 82 以上へ改善
-- `artifact_ownership_score avg` は 95 以上を維持
-- Next.js の最低 `verify_strength_score` が 23.0 から 60 以上へ改善
+- `planner_lint_error` が増えない
+- `lint_repair_score avg` が悪化しない
+- retry 前後の YAML を目視して、品質改善が自然である
+- valid plan がある場合、quality retry の悪化で YAML 生成成功率が下がらない
 
-### Phase 3: 指標の妥当性確認
+### Phase 3: prompt / profile guidance を最小補強する
+
+1. planner prompt に task/profile 種別ごとの強い verify 例を短く追加する。
+2. file existence verify は fallback と明記する。
+3. Next.js は `npm run build` を plan 上に残しつつ、dependency setup/postcheck との衝突を避ける方針を明確化する。
+4. `expected_paths` を持つ step の instruction に対象 path を明示させる。
+
+受け入れ目安:
+
+- MVP `verify_strength_score avg` が 62.2 から改善
+- MVP `executable_plan_score avg` が 78.3 から改善
+- `artifact_ownership_score avg` は 95 以上を維持
+- provider 別分岐を追加していない
+
+### Phase 4: 指標の妥当性確認
 
 1. `--modes step-plan,plan-run --runs 2` 以上で eval を実行する。
 2. `Plan Run Predictiveness` の false positive / false negative を確認する。
@@ -221,4 +250,4 @@ anvildev failure:
 
 MVP は step-plan 生成安定性と artifact ownership で anvildev より優位。ただし verify の強度はまだ不足している。
 
-まず改善すべきは、MVP planner が生成する verify step の質である。`test -f` / `cat` / compile-only から、scenario が要求する unit test / build / content assertion へ寄せる必要がある。
+まず改善すべきは、MVP planner が生成した valid plan を自己チェックし、弱い verify や曖昧な instruction を限定的に修正ループへ戻す仕組みである。prompt 強化は必要だが主対策ではなく、self-check と bounded retry を支える補助策として扱う。
