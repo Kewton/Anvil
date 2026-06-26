@@ -50,6 +50,11 @@ pub struct PlanQualityContext {
     pub required_artifacts: Vec<String>,
     pub preferred_verify: Vec<String>,
     pub dependency_order_hint: Option<String>,
+    pub task_intent: String,
+    pub workspace_context_known: bool,
+    pub workspace_snapshot_class: String,
+    pub has_user_seed_files: bool,
+    pub has_only_agent_metadata: bool,
 }
 
 impl PlanLintReport {
@@ -143,6 +148,9 @@ pub fn lint_step_plan(plan: &StepPlan) -> anyhow::Result<()> {
 
 pub fn lint_step_plan_report(plan: &StepPlan) -> PlanLintReport {
     let mut report = PlanLintReport::pass();
+    if plan.goal.chars().count() > 4000 {
+        report.push("contract", "StepPlan goal is too long");
+    }
     if plan.steps.len() > 12 {
         report.push("contract", "StepPlan has too many steps");
     }
@@ -154,8 +162,23 @@ pub fn lint_step_plan_report(plan: &StepPlan) -> PlanLintReport {
         if step.id.trim().is_empty() {
             report.push("contract", "step id is empty");
         }
+        if let Err(err) = validate_step_id(&step.id) {
+            report.push("contract", err.to_string());
+        }
         if !ids.insert(step.id.as_str()) {
             report.push("contract", format!("duplicate step id: {}", step.id));
+        }
+        if step.instruction.chars().count() > 2500 {
+            report.push(
+                "contract",
+                format!("step {} instruction is too long", step.id),
+            );
+        }
+        if is_placeholder_instruction(&step.instruction) {
+            report.push(
+                "contract",
+                format!("step {} instruction is placeholder text", step.id),
+            );
         }
         if looks_like_shell_command(&step.instruction) {
             report.push(
@@ -282,6 +305,36 @@ pub fn step_plan_quality_report(
     let has_strong_verify = verify_commands
         .iter()
         .any(|command| is_strong_verify_command(command));
+    let has_later_or_any_strong_verify = has_strong_verify;
+
+    if let Some(last) = plan.steps.last()
+        && last.step_kind() == StepKind::Report
+        && !goal_allows_report_blocker(&lower_goal)
+        && (!all_paths.is_empty() || !context.required_artifacts.is_empty())
+    {
+        report.push(
+            PlanQualitySeverity::RetryableQuality,
+            "terminal_report_step",
+            "normal implementation plans should not end with a final summary report step",
+            Some(last.id.clone()),
+            Some(last.instruction.clone()),
+        );
+    }
+
+    if is_fresh_create_workspace(context)
+        && let Some(first) = plan.steps.first()
+        && matches!(first.step_kind(), StepKind::Inspect | StepKind::Report)
+        && first.expected_paths.is_empty()
+        && first.verify.is_empty()
+    {
+        report.push(
+            PlanQualitySeverity::RetryableQuality,
+            "fresh_workspace_read_before_write",
+            "fresh create/scaffold workspace should start by owning an artifact instead of an empty wrapper step",
+            Some(first.id.clone()),
+            Some(context.workspace_snapshot_class.clone()),
+        );
+    }
 
     if looks_next_profile
         && !context.preferred_verify.is_empty()
@@ -360,6 +413,18 @@ pub fn step_plan_quality_report(
         if step.expected_paths.is_empty() {
             continue;
         }
+        if step.verify.is_empty()
+            && !has_later_or_any_strong_verify
+            && looks_code_task(&lower_goal, &all_paths)
+        {
+            report.push(
+                PlanQualitySeverity::Advisory,
+                "artifact_owner_without_local_verify",
+                "artifact-owning step has no local verify and the plan has no strong project verification",
+                Some(step.id.clone()),
+                Some(step.expected_paths.join(", ")),
+            );
+        }
         if instruction_mentions_expected_path_or_content(&step.instruction, &step.expected_paths) {
             continue;
         }
@@ -372,7 +437,21 @@ pub fn step_plan_quality_report(
         );
     }
 
+    let mut prior_paths: Vec<&str> = Vec::new();
     for step in &plan.steps {
+        if step.step_kind() == StepKind::Verify
+            && !all_paths.is_empty()
+            && prior_paths.is_empty()
+            && !step.verify.is_empty()
+        {
+            report.push(
+                PlanQualitySeverity::RetryableQuality,
+                "detached_verify_without_prior_artifact_context",
+                "verify step appears before any artifact-owning step",
+                Some(step.id.clone()),
+                Some(step.verify.join(", ")),
+            );
+        }
         for command in &step.verify {
             if is_strong_verify_command(command) || is_content_assertion_command(command) {
                 continue;
@@ -388,9 +467,61 @@ pub fn step_plan_quality_report(
                 Some(command.clone()),
             );
         }
+        for path in &step.expected_paths {
+            prior_paths.push(path);
+        }
     }
 
     report
+}
+
+fn validate_step_id(id: &str) -> anyhow::Result<()> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("step id is empty");
+    }
+    if trimmed.chars().count() > 64 {
+        anyhow::bail!("step id is too long: {trimmed}");
+    }
+    if trimmed.starts_with('-') || trimmed.ends_with('-') {
+        anyhow::bail!("step id must not start or end with '-': {trimmed}");
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        anyhow::bail!("step id must use lowercase kebab-case: {trimmed}");
+    }
+    Ok(())
+}
+
+fn is_placeholder_instruction(instruction: &str) -> bool {
+    matches!(
+        instruction.trim().to_ascii_lowercase().as_str(),
+        "" | "todo" | "tbd" | "implement" | "fix" | "do it"
+    )
+}
+
+fn goal_allows_report_blocker(lower_goal: &str) -> bool {
+    lower_goal.contains("blocker")
+        || lower_goal.contains("dependency_missing")
+        || lower_goal.contains("dependency missing")
+        || lower_goal.contains("unavailable")
+        || lower_goal.contains("user input")
+        || lower_goal.contains("cannot")
+        || lower_goal.contains("can't")
+        || lower_goal.contains("blocked")
+}
+
+fn is_fresh_create_workspace(context: &PlanQualityContext) -> bool {
+    context.workspace_context_known
+        && context.has_only_agent_metadata
+        && !context.has_user_seed_files
+        && !context.required_artifacts.is_empty()
+        && matches!(
+            context.task_intent.as_str(),
+            "create" | "scaffold" | "new" | "docs"
+        )
 }
 
 fn validate_step_kind_contract(step: &crate::planner::step_plan::PlanStep) -> anyhow::Result<()> {
@@ -1208,6 +1339,157 @@ mod tests {
     }
 
     #[test]
+    fn terminal_report_step_is_retryable_quality_for_implementation_task() {
+        let plan = StepPlan {
+            goal: "Create a Python script".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "code".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create app.py".to_string(),
+                    expected_paths: vec!["app.py".to_string()],
+                    verify: vec!["python3 -m py_compile app.py".to_string()],
+                },
+                PlanStep {
+                    id: "report-completion".to_string(),
+                    kind: "report".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Summarize completion".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: Vec::new(),
+                },
+            ],
+        };
+        let report = step_plan_quality_report(&plan, &PlanQualityContext::default());
+        assert!(report.has_retryable_quality(), "{report:?}");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "terminal_report_step")
+        );
+    }
+
+    #[test]
+    fn blocker_report_step_is_allowed() {
+        let plan = StepPlan {
+            goal: "Report dependency missing blocker".to_string(),
+            steps: vec![PlanStep {
+                id: "report-blocker".to_string(),
+                kind: "report".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Report dependency_missing blocker".to_string(),
+                expected_paths: Vec::new(),
+                verify: Vec::new(),
+            }],
+        };
+        let report = step_plan_quality_report(&plan, &PlanQualityContext::default());
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "terminal_report_step"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn fresh_workspace_inspect_is_retryable_quality_issue() {
+        let plan = StepPlan {
+            goal: "Create a small app".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "inspect-workspace".to_string(),
+                    kind: "inspect".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Inspect the workspace".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "code".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create app.py".to_string(),
+                    expected_paths: vec!["app.py".to_string()],
+                    verify: vec!["python3 -m py_compile app.py".to_string()],
+                },
+            ],
+        };
+        let context = PlanQualityContext {
+            task_intent: "create".to_string(),
+            workspace_context_known: true,
+            workspace_snapshot_class: "metadata_only".to_string(),
+            has_user_seed_files: false,
+            has_only_agent_metadata: true,
+            required_artifacts: vec!["app.py".to_string()],
+            ..PlanQualityContext::default()
+        };
+        let report = step_plan_quality_report(&plan, &context);
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "fresh_workspace_read_before_write"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn fresh_workspace_unknown_context_does_not_penalize_inspect() {
+        let plan = StepPlan {
+            goal: "Create a small app".to_string(),
+            steps: vec![PlanStep {
+                id: "inspect-workspace".to_string(),
+                kind: "inspect".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Inspect the workspace".to_string(),
+                expected_paths: Vec::new(),
+                verify: Vec::new(),
+            }],
+        };
+        let report = step_plan_quality_report(&plan, &PlanQualityContext::default());
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "fresh_workspace_read_before_write"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_step_id_is_rejected() {
+        let mut plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![step("Bad_ID", "Create file")],
+        };
+        plan.steps[0].id = "Bad_ID".to_string();
+        let report = lint_step_plan_report(&plan);
+        assert!(report.has_category("contract"), "{report:?}");
+        assert!(
+            report.primary_message().contains("kebab-case"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn valid_step_id_examples_are_accepted() {
+        for id in ["setup", "create-file-1", "verify-build"] {
+            let plan = StepPlan {
+                goal: "goal".to_string(),
+                steps: vec![step(id, "Create file")],
+            };
+            let report = lint_step_plan_report(&plan);
+            assert!(
+                !report.primary_message().contains("step id"),
+                "{id}: {report:?}"
+            );
+        }
+    }
+
+    #[test]
     fn ultra_plan_lint_report_uses_same_category_vocabulary() {
         let plan = UltraPlan {
             goal: "goal".to_string(),
@@ -1243,6 +1525,11 @@ mod tests {
             dependency_order_hint: Some(
                 "Create package.json and an app entrypoint before npm run build".to_string(),
             ),
+            task_intent: "create".to_string(),
+            workspace_context_known: false,
+            workspace_snapshot_class: "unknown".to_string(),
+            has_user_seed_files: false,
+            has_only_agent_metadata: false,
         }
     }
 }

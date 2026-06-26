@@ -20,7 +20,7 @@ use crate::planner::step_plan::{
     PlanStep, StepKind, StepPlan, extract_json_object, parse_generated_step_plan_json,
     parse_step_plan, render_step_plan, repair_generated_step_plan_contract,
 };
-use crate::planner::ultra_plan::{UltraPlan, parse_ultra_plan, render_ultra_plan};
+use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
 use crate::planner::verify::{VerificationReport, verify_step};
 use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
@@ -254,23 +254,53 @@ pub fn run_step_plan_with_ui(
         anyhow::bail!("{}", report.primary_message());
     }
     let mut session = SessionSnapshot::new();
+    let required_final_artifacts = required_final_artifacts(plan);
+    let mut prior_expected_paths = Vec::new();
     for step in &plan.steps {
         if ui.interrupted() {
             anyhow::bail!("interrupted by user");
         }
-        run_step(client, &mut session, step, config, ui)?;
+        let prompt_context = StepPromptContext {
+            required_final_artifacts: required_final_artifacts.clone(),
+            prior_expected_paths: prior_expected_paths.clone(),
+        };
+        run_step(
+            client,
+            &mut session,
+            plan,
+            step,
+            &prompt_context,
+            config,
+            ui,
+        )?;
+        merge_unique_strings(&mut prior_expected_paths, &step.expected_paths);
     }
     Ok(format!("plan-run complete: {} steps", plan.steps.len()))
+}
+
+#[derive(Debug, Clone, Default)]
+struct StepPromptContext {
+    required_final_artifacts: Vec<String>,
+    prior_expected_paths: Vec<String>,
 }
 
 fn run_step(
     client: &mut dyn ChatClient,
     session: &mut SessionSnapshot,
+    plan: &StepPlan,
     step: &PlanStep,
+    prompt_context: &StepPromptContext,
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<()> {
-    let instruction = prompt_with_required_paths(&step.instruction, &step.expected_paths);
+    let instruction = build_step_prompt(plan, step, prompt_context);
+    emit_step_prompt_contract(config, step, prompt_context, &instruction);
+    if step.step_kind() == StepKind::Report
+        && step.expected_paths.is_empty()
+        && step.verify.is_empty()
+    {
+        return Ok(());
+    }
     let step_config = capped_config(config, STEP_TURN_MAX_ITERATIONS);
     let initial = run_session_with_outcome_with_ui(
         client,
@@ -285,6 +315,13 @@ fn run_step(
         return Ok(());
     }
     let mut context = RepairContext {
+        overall_goal: Some(plan.goal.clone()),
+        required_final_artifacts: prompt_context.required_final_artifacts.clone(),
+        step_instruction: Some(step.instruction.clone()),
+        expected_paths: step.expected_paths.clone(),
+        verify_commands: step.verify.clone(),
+        expected_result: Some(step_expected_result(step).to_string()),
+        max_repair_turns: Some(STEP_REPAIR_MAX_TURNS),
         missing_paths: report.missing_paths.clone(),
         changed_files: initial.changed_paths.clone(),
         initial_stop_reason: Some(format!("{:?}", initial.stop_reason)),
@@ -295,9 +332,9 @@ fn run_step(
     let mut repair_stop_reason = None;
     let mut file_changing_repairs = 0usize;
     let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
-    for _ in 0..STEP_REPAIR_MAX_TURNS {
+    for attempt in 1..=STEP_REPAIR_MAX_TURNS {
+        context.repair_attempt = Some(attempt);
         let repair_prompt = build_repair_prompt_with_context(&step.id, &current_report, &context);
-        let repair_prompt = prompt_with_required_paths(&repair_prompt, &step.expected_paths);
         let repair = run_session_with_outcome_with_ui(
             client,
             session,
@@ -345,6 +382,22 @@ fn capped_config(config: &Config, cap: usize) -> Config {
     let mut out = config.clone();
     out.max_iterations = out.max_iterations.min(cap);
     out
+}
+
+fn required_final_artifacts(plan: &StepPlan) -> Vec<String> {
+    let mut out = Vec::new();
+    for step in &plan.steps {
+        merge_unique_strings(&mut out, &step.expected_paths);
+    }
+    out
+}
+
+fn merge_unique_strings(out: &mut Vec<String>, incoming: &[String]) {
+    for item in incoming {
+        if !out.contains(item) {
+            out.push(item.clone());
+        }
+    }
 }
 
 fn merge_changed_files(context: &mut RepairContext, incoming: &[String]) {
@@ -520,7 +573,7 @@ pub fn run_ultra_plan_with_ui(
             anyhow::bail!("interrupted by user");
         }
         let profile_snapshot = profile_before_phase(&config.workspace_root, &plan.profile)?;
-        let phase_prompt = ultra_phase_prompt(plan, &phase.prompt, config);
+        let phase_prompt = ultra_phase_prompt(plan, phase, config);
         let step_plan =
             generate_step_plan_with_ui(planner, &phase_prompt, config, ui).map_err(|err| {
                 emit_planner_error(
@@ -893,6 +946,9 @@ Hard constraints:\n\
 - Do not start dev servers or perform dependency installation in verify.\n\
 - Prefer tests, builds, smoke checks, or content assertions over file existence checks.\n\
 - For Next.js, put package.json and app entrypoints before npm run build.\n\n\
+- Do not add a final report step for normal success; report is only for explicit blockers.\n\
+- In a fresh create/scaffold workspace, start with setup/implement work that owns an artifact instead of an empty inspect wrapper.\n\
+- Keep verify-only steps connected to prior artifacts through the verify command or step instruction.\n\n\
 Return only one JSON object with top-level goal and steps. Do not use markdown fences.\n\
 Goal: {goal}"
     )
@@ -957,7 +1013,8 @@ fn plan_generation_system_prompt() -> String {
         "Use setup for dependency manifests or setup files; do not run build/test verification in setup.",
         "Use implement/create/edit/work/repair semantics as implement steps, with concrete expected_paths.",
         "Use verify only for deterministic checks. Do not request file changes in verify steps.",
-        "Use report only for final summary. It must not declare expected_paths or verify commands.",
+        "Use report only for explicit blockers such as dependency_missing, unavailable external service, required user input, or unfixable local blocker. Report is not success.",
+        "Normal success plans must end with a verify step or an artifact-owning setup/implement step, not a final summary report.",
         "Expected paths must be workspace-relative, exact, and owned by one implement/setup step.",
         "Prefer tests, builds, smoke checks, or content assertions over file existence checks.",
         "Use file existence checks only as a fallback when no stronger deterministic verification fits.",
@@ -1018,12 +1075,63 @@ fn build_step_plan_user_prompt(goal: &str, config: &Config) -> String {
 
 fn plan_quality_context(config: &Config, goal: &str) -> PlanQualityContext {
     let expectations = profile_quality_expectations(&config.workspace_root, &config.profile, goal);
+    let workspace = workspace_quality_snapshot(&config.workspace_root);
     PlanQualityContext {
         profile: config.profile.clone(),
         required_artifacts: expectations.required_artifacts,
         preferred_verify: expectations.preferred_verify,
         dependency_order_hint: expectations.dependency_order_hint,
+        task_intent: detect_intent(goal).to_string(),
+        workspace_context_known: workspace.context_known,
+        workspace_snapshot_class: workspace.snapshot_class,
+        has_user_seed_files: workspace.has_user_seed_files,
+        has_only_agent_metadata: workspace.has_only_agent_metadata,
     }
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceQualitySnapshot {
+    context_known: bool,
+    snapshot_class: String,
+    has_user_seed_files: bool,
+    has_only_agent_metadata: bool,
+}
+
+fn workspace_quality_snapshot(root: &Path) -> WorkspaceQualitySnapshot {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return WorkspaceQualitySnapshot {
+            context_known: false,
+            snapshot_class: "unknown".to_string(),
+            has_user_seed_files: false,
+            has_only_agent_metadata: false,
+        };
+    };
+    let mut user_entries = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_agent_metadata_entry(&name) {
+            continue;
+        }
+        user_entries += 1;
+    }
+    let has_only_agent_metadata = user_entries == 0;
+    WorkspaceQualitySnapshot {
+        context_known: true,
+        snapshot_class: if has_only_agent_metadata {
+            "metadata_only".to_string()
+        } else {
+            "user_files".to_string()
+        },
+        has_user_seed_files: user_entries > 0,
+        has_only_agent_metadata,
+    }
+}
+
+fn is_agent_metadata_entry(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | ".anvil" | ".codex" | ".agents" | "target" | ".DS_Store"
+    ) || name.starts_with("anvilminimal-eval-")
 }
 
 fn strengthen_step_plan_for_profile(plan: &mut StepPlan, config: &Config) {
@@ -1058,6 +1166,92 @@ fn strengthen_step_plan_for_profile(plan: &mut StepPlan, config: &Config) {
     }
 }
 
+fn build_step_prompt(plan: &StepPlan, step: &PlanStep, context: &StepPromptContext) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Execute exactly one StepPlan step.\n\n");
+    prompt.push_str("Overall goal:\n");
+    prompt.push_str(&plan.goal);
+    prompt.push_str("\n\nCurrent step id:\n");
+    prompt.push_str(&step.id);
+    prompt.push_str("\n\nCurrent step kind:\n");
+    prompt.push_str(&step.kind);
+    prompt.push_str("\n\nCurrent step instruction:\n");
+    prompt.push_str(&step.instruction);
+
+    prompt.push_str("\n\nRequired final artifacts:\n");
+    append_bullets_or_none(&mut prompt, &context.required_final_artifacts);
+
+    prompt.push_str("\n\nArtifacts available from previous steps:\n");
+    append_bullets_or_none(&mut prompt, &context.prior_expected_paths);
+
+    prompt.push_str("\n\nExpected paths after this step:\n");
+    append_bullets_or_none(&mut prompt, &step.expected_paths);
+
+    prompt.push_str("\n\nVerification commands for this step:\n");
+    append_bullets_or_none(&mut prompt, &step.verify);
+
+    prompt.push_str("\n\nExpected verification result:\n");
+    prompt.push_str(step_expected_result(step));
+
+    prompt.push_str(
+        "\n\nStep execution rules:\n\
+- Work only on the current step unless a prior artifact is required to verify this step.\n\
+- Prefer Write/Edit/MultiEdit for declared expected paths.\n\
+- If this step has verification commands, use them as the deterministic success contract.\n\
+- If verification fails, make a bounded step-local repair and re-check the declared contract.\n\
+- Do not claim the plan is complete until this step's expected paths and verification contract are satisfied.\n\
+- Report an explicit blocker only when the blocker cannot be resolved locally.",
+    );
+    prompt
+}
+
+fn append_bullets_or_none(prompt: &mut String, items: &[String]) {
+    if items.is_empty() {
+        prompt.push_str("- none\n");
+        return;
+    }
+    for item in items {
+        prompt.push_str("- ");
+        prompt.push_str(item);
+        prompt.push('\n');
+    }
+}
+
+fn step_expected_result(step: &PlanStep) -> &str {
+    let trimmed = step.expected_result.trim();
+    if trimmed.is_empty() { "pass" } else { trimmed }
+}
+
+fn emit_step_prompt_contract(
+    config: &Config,
+    step: &PlanStep,
+    context: &StepPromptContext,
+    prompt: &str,
+) {
+    let prior_context_applicable =
+        step.step_kind() == StepKind::Verify && !context.prior_expected_paths.is_empty();
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "step_prompt_contract",
+            "prompt_contract_version": 1,
+            "step_id": step.id,
+            "step_kind": step.kind,
+            "has_overall_goal": prompt.contains("Overall goal:"),
+            "has_required_final_artifacts": prompt.contains("Required final artifacts:"),
+            "has_expected_paths": prompt.contains("Expected paths after this step:"),
+            "has_verify_commands": prompt.contains("Verification commands for this step:"),
+            "has_expected_result": prompt.contains("Expected verification result:"),
+            "has_prior_artifact_context": !context.prior_expected_paths.is_empty()
+                && prompt.contains("Artifacts available from previous steps:"),
+            "prior_artifact_context_applicable": prior_context_applicable,
+            "has_bounded_repair_policy": prompt.contains("bounded step-local repair"),
+            "prompt_body_saved": false,
+        }),
+    );
+}
+
+#[allow(dead_code)]
 fn prompt_with_required_paths(instruction: &str, paths: &[String]) -> String {
     if paths.is_empty() || instruction.contains("Required final artifacts:") {
         return instruction.to_string();
@@ -1073,8 +1267,10 @@ fn prompt_with_required_paths(instruction: &str, paths: &[String]) -> String {
     )
 }
 
-fn ultra_phase_prompt(plan: &UltraPlan, phase_prompt: &str, config: &Config) -> String {
+fn ultra_phase_prompt(plan: &UltraPlan, phase: &UltraPhase, config: &Config) -> String {
     let expected_paths = profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+    let expectations =
+        profile_quality_expectations(&config.workspace_root, &plan.profile, &plan.goal);
     let required = if expected_paths.is_empty() {
         String::new()
     } else {
@@ -1087,10 +1283,51 @@ fn ultra_phase_prompt(plan: &UltraPlan, phase_prompt: &str, config: &Config) -> 
                 .join("\n")
         )
     };
+    let preferred_verify = if expectations.preferred_verify.is_empty() {
+        "- none".to_string()
+    } else {
+        expectations
+            .preferred_verify
+            .iter()
+            .map(|command| format!("- {command}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let workspace_snapshot = compact_workspace_snapshot(&config.workspace_root);
     format!(
-        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase task: {}{}",
-        plan.goal, plan.profile, plan.style, plan.intent, phase_prompt, required
+        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\nProfile runtime contract:\n- keep work inside the workspace\n- satisfy required profile artifacts before final phase completion\n- use deterministic verification; preferred commands:\n{}\n{}",
+        plan.goal,
+        plan.profile,
+        plan.style,
+        plan.intent,
+        phase.id,
+        phase.prompt,
+        workspace_snapshot,
+        preferred_verify,
+        required
     )
+}
+
+fn compact_workspace_snapshot(root: &Path) -> String {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return "- unavailable".to_string();
+    };
+    let mut names = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| !matches!(name.as_str(), ".git" | ".anvil" | "target" | ".DS_Store"))
+        .take(12)
+        .collect::<Vec<_>>();
+    names.sort();
+    if names.is_empty() {
+        "- empty or metadata-only".to_string()
+    } else {
+        names
+            .into_iter()
+            .map(|name| format!("- {name}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[allow(dead_code)]
@@ -1287,6 +1524,80 @@ mod tests {
     }
 
     #[test]
+    fn step_execution_prompt_includes_source_contract() {
+        let plan = StepPlan {
+            goal: "Build a game".to_string(),
+            steps: vec![PlanStep {
+                id: "create-page".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the page".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: vec!["npm run build".to_string()],
+            }],
+        };
+        let context = StepPromptContext {
+            required_final_artifacts: vec!["src/app/page.tsx".to_string()],
+            prior_expected_paths: vec!["package.json".to_string()],
+        };
+        let prompt = build_step_prompt(&plan, &plan.steps[0], &context);
+        assert!(prompt.contains("Overall goal:"));
+        assert!(prompt.contains("Build a game"));
+        assert!(prompt.contains("Current step id:"));
+        assert!(prompt.contains("create-page"));
+        assert!(prompt.contains("Verification commands for this step:"));
+        assert!(prompt.contains("npm run build"));
+        assert!(prompt.contains("Expected verification result:"));
+        assert!(prompt.contains("Artifacts available from previous steps:"));
+        assert!(prompt.contains("bounded step-local repair"));
+    }
+
+    #[test]
+    fn run_plan_passes_step_contract_to_execution_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = StepPlan {
+            goal: "Create app.py".to_string(),
+            steps: vec![PlanStep {
+                id: "code".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create app.py".to_string(),
+                expected_paths: vec!["app.py".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"app.py","content":"print('ok')"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let result = run_step_plan(&mut fake, &plan, &config(dir.path().to_path_buf())).unwrap();
+        assert_eq!(result, "plan-run complete: 1 steps");
+        let messages = fake.messages.first().expect("execution prompt");
+        let prompt = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt.contains("Overall goal:"));
+        assert!(prompt.contains("Current step id:"));
+        assert!(prompt.contains("Expected paths after this step:"));
+        assert!(prompt.contains("Verification commands for this step:"));
+    }
+
+    #[test]
+    fn planner_prompt_report_is_blocker_not_success() {
+        let prompt = plan_generation_system_prompt();
+        assert!(prompt.contains("Report is not success"));
+        assert!(prompt.contains("explicit blockers"));
+        assert!(!prompt.contains("Use report only for final summary"));
+    }
+
+    #[test]
     fn invalid_planner_json_does_not_save_plan_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut planner = FakeClient::new(vec![
@@ -1438,9 +1749,19 @@ mod tests {
                 },
             ],
         };
-        let prompt = ultra_phase_prompt(&plan, "Finish project", &config(dir.path().to_path_buf()));
+        let prompt = ultra_phase_prompt(
+            &plan,
+            &crate::planner::ultra_plan::UltraPhase {
+                id: "finish".to_string(),
+                prompt: "Finish project".to_string(),
+            },
+            &config(dir.path().to_path_buf()),
+        );
         assert!(prompt.contains("Original ultra goal: 3011 port app"));
         assert!(prompt.contains("Profile: nextjs"));
+        assert!(prompt.contains("Phase id: finish"));
+        assert!(prompt.contains("Workspace snapshot:"));
+        assert!(prompt.contains("Profile runtime contract:"));
         assert!(prompt.contains("Required final artifacts:"));
         assert!(prompt.contains("- package.json"));
         assert!(prompt.contains("- src/app/page.tsx"));
@@ -1449,11 +1770,12 @@ mod tests {
     #[test]
     fn ultra_plan_final_profile_failure_runs_repair() {
         let dir = tempfile::tempdir().unwrap();
-        let step_json = generated_step_plan_json("Scaffold project");
-        let mut planner = FakeClient::new(vec![
-            AssistantReply::text(step_json.clone()),
-            AssistantReply::text(step_json),
-        ]);
+        let step_json = generated_nextjs_artifact_plan_json("Scaffold project");
+        let mut planner = FakeClient::new(
+            (0..6)
+                .map(|_| AssistantReply::text(step_json.clone()))
+                .collect(),
+        );
         let good_package = r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
         let bad_package =
             r#"{"dependencies":{},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
@@ -1473,11 +1795,14 @@ mod tests {
                         "Write",
                         serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
                     ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";"}),
+                    ),
                 ],
                 prompt_tokens: None,
                 completion_tokens: None,
             },
-            AssistantReply::text("done"),
             AssistantReply {
                 content: String::new(),
                 tool_calls: vec![crate::state::ToolCall::new(
@@ -1519,21 +1844,41 @@ mod tests {
     #[test]
     fn ultra_plan_non_final_profile_failure_stops() {
         let dir = tempfile::tempdir().unwrap();
-        let step_json = generated_step_plan_json("Scaffold project");
-        let mut planner = FakeClient::new(vec![AssistantReply::text(step_json)]);
+        let step_json = generated_nextjs_artifact_plan_json("Scaffold project");
+        let mut planner = FakeClient::new(
+            (0..3)
+                .map(|_| AssistantReply::text(step_json.clone()))
+                .collect(),
+        );
         let package = r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let bad_package = r#"{"dependencies":{"next":"x"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
         let mut execution = FakeClient::new(vec![
             AssistantReply {
                 content: String::new(),
-                tool_calls: vec![crate::state::ToolCall::new(
-                    "Write",
-                    serde_json::json!({"path":"package.json","content":package}),
-                )],
+                tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"package.json","content":bad_package}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main>App</main>;}"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";"}),
+                    ),
+                ],
                 prompt_tokens: None,
                 completion_tokens: None,
             },
             AssistantReply::text("done"),
         ]);
+        let _ = package;
         let plan = UltraPlan {
             goal: "3011 port app".to_string(),
             profile: "nextjs".to_string(),
@@ -1566,14 +1911,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("input")).unwrap();
         std::fs::write(dir.path().join("input/source.csv"), "1234").unwrap();
-        let step_json = generated_step_plan_json("mutate data");
+        let step_json = generated_data_mutation_plan_json("mutate data");
         let mut planner = FakeClient::new(vec![AssistantReply::text(step_json)]);
         let mut execution = FakeClient::new(vec![
             AssistantReply {
                 content: String::new(),
                 tool_calls: vec![crate::state::ToolCall::new(
-                    "Bash",
-                    serde_json::json!({"command":"printf '5678' > input/source.csv"}),
+                    "Write",
+                    serde_json::json!({"path":"input/source.csv","content":"5678"}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -1688,6 +2033,41 @@ mod tests {
 
     fn generated_step_plan_json(goal: &str) -> String {
         serde_json::to_string(&StepPlan::single(goal)).unwrap()
+    }
+
+    fn generated_nextjs_artifact_plan_json(goal: &str) -> String {
+        serde_json::to_string(&StepPlan {
+            goal: goal.to_string(),
+            steps: vec![PlanStep {
+                id: "create-nextjs-artifacts".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create package.json, src/app/page.tsx, src/app/layout.tsx, and src/app/global.d.ts".to_string(),
+                expected_paths: vec![
+                    "package.json".to_string(),
+                    "src/app/page.tsx".to_string(),
+                    "src/app/layout.tsx".to_string(),
+                    "src/app/global.d.ts".to_string(),
+                ],
+                verify: Vec::new(),
+            }],
+        })
+        .unwrap()
+    }
+
+    fn generated_data_mutation_plan_json(goal: &str) -> String {
+        serde_json::to_string(&StepPlan {
+            goal: goal.to_string(),
+            steps: vec![PlanStep {
+                id: "mutate-input".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Mutate input/source.csv".to_string(),
+                expected_paths: vec!["input/source.csv".to_string()],
+                verify: Vec::new(),
+            }],
+        })
+        .unwrap()
     }
 
     fn config(root: PathBuf) -> Config {

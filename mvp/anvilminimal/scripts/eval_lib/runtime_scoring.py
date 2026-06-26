@@ -34,6 +34,7 @@ def score_runtime_health(
             "finalization_score": "",
             "tool_policy_compatibility_score": "",
             "plan_run_runtime_health_score": "",
+            "prompt_contract_score": score_prompt_contract(events),
         }
 
     names = Counter(
@@ -111,7 +112,31 @@ def score_runtime_health(
         "finalization_score": round(finalization, 1),
         "tool_policy_compatibility_score": round(policy, 1),
         "plan_run_runtime_health_score": runtime_health,
+        "prompt_contract_score": score_prompt_contract(events),
     }
+
+
+def score_prompt_contract(events: list[dict[str, Any]]) -> float | str:
+    contract_events = [
+        event for event in events if event.get("event") == "step_prompt_contract"
+    ]
+    if not contract_events:
+        return ""
+    scores = []
+    for event in contract_events:
+        checks = [
+            bool(event.get("has_overall_goal")),
+            bool(event.get("has_required_final_artifacts")),
+            bool(event.get("has_expected_paths")),
+            bool(event.get("has_verify_commands")),
+            bool(event.get("has_expected_result")),
+            bool(event.get("has_bounded_repair_policy")),
+            event.get("prompt_body_saved") is False,
+        ]
+        if event.get("prior_artifact_context_applicable"):
+            checks.append(bool(event.get("has_prior_artifact_context")))
+        scores.append(100.0 * sum(1 for check in checks if check) / len(checks))
+    return round(sum(scores) / len(scores), 1)
 
 
 def clamp(value: float) -> float:

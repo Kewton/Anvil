@@ -4,6 +4,14 @@ use crate::planner::verify::VerificationReport;
 
 #[derive(Debug, Clone, Default)]
 pub struct RepairContext {
+    pub overall_goal: Option<String>,
+    pub required_final_artifacts: Vec<String>,
+    pub step_instruction: Option<String>,
+    pub expected_paths: Vec<String>,
+    pub verify_commands: Vec<String>,
+    pub expected_result: Option<String>,
+    pub repair_attempt: Option<usize>,
+    pub max_repair_turns: Option<usize>,
     pub missing_paths: Vec<String>,
     pub changed_files: Vec<String>,
     pub repeated_changed_files: Vec<String>,
@@ -26,6 +34,34 @@ pub fn build_repair_prompt_with_context(
 Make the smallest bounded change, then stop.",
         report.primary_reason()
     );
+    if let Some(goal) = &context.overall_goal {
+        prompt.push_str("\n\nOverall goal:\n");
+        prompt.push_str(goal);
+    }
+    if let (Some(attempt), Some(max)) = (context.repair_attempt, context.max_repair_turns) {
+        prompt.push_str("\n\nRepair budget:\n");
+        prompt.push_str(&format!("- attempt {attempt}/{max}\n"));
+    }
+    if !context.required_final_artifacts.is_empty() {
+        prompt.push_str("\n\nRequired final artifacts:\n");
+        prompt.push_str(&bullet_list(&context.required_final_artifacts));
+    }
+    if let Some(instruction) = &context.step_instruction {
+        prompt.push_str("\n\nCurrent step instruction:\n");
+        prompt.push_str(instruction);
+    }
+    if !context.expected_paths.is_empty() {
+        prompt.push_str("\n\nExpected paths after this step:\n");
+        prompt.push_str(&bullet_list(&context.expected_paths));
+    }
+    if !context.verify_commands.is_empty() {
+        prompt.push_str("\n\nVerification commands for this step:\n");
+        prompt.push_str(&bullet_list(&context.verify_commands));
+    }
+    if let Some(expected) = &context.expected_result {
+        prompt.push_str("\n\nExpected verification result:\n");
+        prompt.push_str(expected);
+    }
     if !report.missing_paths.is_empty() {
         prompt.push_str("\n\nMissing expected paths:\n");
         prompt.push_str(&bullet_list(&report.missing_paths));
@@ -47,6 +83,14 @@ Make the smallest bounded change, then stop.",
         prompt.push_str("\n\nProgress warning:\n");
         prompt.push_str(warning);
     }
+    prompt.push_str(
+        "\n\nRepair rules:\n\
+- Work only on this step's missing or failed artifacts.\n\
+- Treat verifier output as actionable feedback.\n\
+- If this is an expected failing red test step, preserve the expected failure instead of implementing the feature.\n\
+- Re-run only the declared deterministic verification mentally or via tools needed for this step.\n\
+- Stop after the smallest bounded repair.",
+    );
     prompt
 }
 
@@ -86,6 +130,11 @@ Primary failure: {}\n\n\
 ## Profile Failures\n{}\n\n\
 ## Changed Files\n{}\n\n\
 ## Repeated Changed Files\n{}\n\n\
+## Step Contract\n\
+- overall goal: {}\n\
+- expected result: {}\n\
+- expected paths: {}\n\
+- verify commands: {}\n\n\
 ## Stop Reasons\n\
 - initial: {}\n\
 - repair: {}\n\n\
@@ -104,6 +153,10 @@ Run `/plan-run` again with the original goal and include the missing paths above
         list_or_none(&report.profile_failures),
         list_or_none(&context.changed_files),
         list_or_none(&context.repeated_changed_files),
+        context.overall_goal.as_deref().unwrap_or("unknown"),
+        context.expected_result.as_deref().unwrap_or("unknown"),
+        list_or_none(&context.expected_paths),
+        list_or_none(&context.verify_commands),
         context.initial_stop_reason.as_deref().unwrap_or("unknown"),
         context.repair_stop_reason.as_deref().unwrap_or("unknown")
     )
@@ -155,5 +208,31 @@ mod tests {
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("src/app/page.tsx"));
         assert!(text.contains("initial: AssistantFinal"));
+    }
+
+    #[test]
+    fn repair_prompt_includes_source_contract() {
+        let report = VerificationReport::missing_path("src/app/page.tsx");
+        let context = RepairContext {
+            overall_goal: Some("Build a game".to_string()),
+            required_final_artifacts: vec![
+                "package.json".to_string(),
+                "src/app/page.tsx".to_string(),
+            ],
+            step_instruction: Some("Create the page".to_string()),
+            expected_paths: vec!["src/app/page.tsx".to_string()],
+            verify_commands: vec!["npm run build".to_string()],
+            expected_result: Some("pass".to_string()),
+            repair_attempt: Some(1),
+            max_repair_turns: Some(4),
+            ..RepairContext::default()
+        };
+        let prompt = build_repair_prompt_with_context("page", &report, &context);
+        assert!(prompt.contains("Overall goal:"));
+        assert!(prompt.contains("Build a game"));
+        assert!(prompt.contains("Current step instruction:"));
+        assert!(prompt.contains("Verification commands for this step:"));
+        assert!(prompt.contains("Expected verification result:"));
+        assert!(prompt.contains("attempt 1/4"));
     }
 }

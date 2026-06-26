@@ -50,6 +50,7 @@ class RuntimeScoringTest(unittest.TestCase):
         self.assertLess(stalled_score["runtime_friction_score"], success_score["runtime_friction_score"])
         self.assertLess(stalled_score["artifact_progress_score"], success_score["artifact_progress_score"])
         self.assertLess(stalled_score["plan_run_runtime_health_score"], success_score["plan_run_runtime_health_score"])
+        self.assertEqual(stalled_score["prompt_contract_score"], "")
 
     def test_runtime_health_is_blank_without_runtime_events(self):
         with tempfile.TemporaryDirectory() as td:
@@ -62,6 +63,37 @@ class RuntimeScoringTest(unittest.TestCase):
             )
         self.assertEqual(score["runtime_friction_score"], "")
         self.assertEqual(score["plan_run_runtime_health_score"], "")
+        self.assertEqual(score["prompt_contract_score"], "")
+
+    def test_prompt_contract_score_uses_boolean_event_without_prompt_body(self):
+        events = [
+            {
+                "event": "provider_response",
+                "tool_calls": 1,
+            },
+            {
+                "event": "step_prompt_contract",
+                "has_overall_goal": True,
+                "has_required_final_artifacts": True,
+                "has_expected_paths": True,
+                "has_verify_commands": True,
+                "has_expected_result": True,
+                "has_bounded_repair_policy": True,
+                "prior_artifact_context_applicable": True,
+                "has_prior_artifact_context": True,
+                "prompt_body_saved": False,
+            },
+            {"event": "loop_stop", "reason": "required_artifacts_satisfied_after_tool"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="plan-run",
+                success=True,
+                scenario={"expected_artifacts": []},
+                workdir=Path(td),
+            )
+        self.assertEqual(score["prompt_contract_score"], 100.0)
 
 
 if __name__ == "__main__":

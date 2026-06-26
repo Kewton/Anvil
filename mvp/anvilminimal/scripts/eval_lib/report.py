@@ -76,6 +76,9 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
                 "runtime_health": fmt(
                     mean([to_float(row.get("plan_run_runtime_health_score")) for row in group])
                 ),
+                "prompt_contract": fmt(
+                    mean([to_float(row.get("prompt_contract_score")) for row in group])
+                ),
                 "p50_exec_sec": fmt(percentile(elapsed, 50)),
             }
         )
@@ -92,6 +95,7 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
             "shape_readiness",
             "predictive",
             "runtime_health",
+            "prompt_contract",
             "p50_exec_sec",
         ],
     )
@@ -510,6 +514,11 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             "plan_run_runtime_health_score_avg",
             mean([to_float(r.get("plan_run_runtime_health_score")) for r in base]),
             mean([to_float(r.get("plan_run_runtime_health_score")) for r in exp]),
+        ),
+        (
+            "prompt_contract_score_avg",
+            mean([to_float(r.get("prompt_contract_score")) for r in base]),
+            mean([to_float(r.get("prompt_contract_score")) for r in exp]),
         ),
         (
             "executable_plan_score_avg",
