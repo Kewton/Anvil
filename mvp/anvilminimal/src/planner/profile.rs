@@ -2,6 +2,14 @@ use std::path::Path;
 
 use crate::planner::verify::VerificationReport;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileQualityExpectations {
+    pub required_artifacts: Vec<String>,
+    pub preferred_verify: Vec<String>,
+    pub forbidden_verify: Vec<String>,
+    pub dependency_order_hint: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProfileSnapshot {
     Data(crate::planner::profiles::data::ProfileSnapshot),
@@ -51,6 +59,19 @@ pub fn profile_expected_paths(root: &Path, profile: &str, goal: &str) -> Vec<Str
             crate::planner::profiles::nextjs::expected_paths(root, goal)
         }
         _ => Vec::new(),
+    }
+}
+
+pub fn profile_quality_expectations(
+    root: &Path,
+    profile: &str,
+    goal: &str,
+) -> ProfileQualityExpectations {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::quality_expectations(root, goal)
+        }
+        _ => ProfileQualityExpectations::default(),
     }
 }
 

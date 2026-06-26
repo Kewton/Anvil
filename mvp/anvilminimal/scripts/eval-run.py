@@ -397,6 +397,13 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "planner_raw_schema_violation": diagnostics["planner_raw_schema_violation"],
             "planner_parser_limitation": diagnostics["planner_parser_limitation"],
             "planner_prompt_issue": diagnostics["planner_prompt_issue"],
+            "planner_quality_issue_count": diagnostics["planner_quality_issue_count"],
+            "planner_retryable_quality_count": diagnostics["planner_retryable_quality_count"],
+            "planner_advisory_quality_count": diagnostics["planner_advisory_quality_count"],
+            "planner_quality_retry_count": diagnostics["planner_quality_retry_count"],
+            "planner_quality_retry_degraded_count": diagnostics[
+                "planner_quality_retry_degraded_count"
+            ],
             "plan_quality_score": plan_score if plan_score is not None else "",
             "executable_plan_score": executable_plan_score if executable_plan_score is not None else "",
             "constraint_coverage_score": constraint_coverage_score if constraint_coverage_score is not None else "",
@@ -449,6 +456,24 @@ def summarize_planner_observability(events: list[dict]) -> dict[str, object]:
         for event in events
         if event.get("event") == "planner_quality_warning"
     ]
+    quality_issues = [
+        {
+            "planner_provider": event.get("planner_provider", ""),
+            "planner_model": event.get("planner_model", ""),
+            "category": event.get("planner_quality_category", ""),
+            "severity": event.get("planner_quality_severity", ""),
+            "step_id": event.get("planner_quality_step_id", ""),
+            "message": event.get("planner_error_message", ""),
+        }
+        for event in events
+        if event.get("event") == "planner_quality_issue"
+    ]
+    quality_retries = [
+        event for event in events if event.get("event") == "planner_quality_retry"
+    ]
+    quality_degraded = [
+        event for event in events if event.get("event") == "planner_quality_retry_degraded"
+    ]
     out: dict[str, object] = {}
     if raw_shapes:
         out["planner_raw_output_shape_count"] = len(raw_shapes)
@@ -456,6 +481,13 @@ def summarize_planner_observability(events: list[dict]) -> dict[str, object]:
     if quality_warnings:
         out["planner_quality_warning_count"] = len(quality_warnings)
         out["planner_quality_warnings"] = quality_warnings
+    if quality_issues:
+        out["planner_quality_issue_count"] = len(quality_issues)
+        out["planner_quality_issues"] = quality_issues
+    if quality_retries:
+        out["planner_quality_retry_count"] = len(quality_retries)
+    if quality_degraded:
+        out["planner_quality_retry_degraded_count"] = len(quality_degraded)
     return out
 
 
@@ -504,6 +536,15 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
     ]
     planner_schema_repairs = [
         event for event in events if event.get("event") == "planner_schema_repaired"
+    ]
+    quality_issues = [
+        event for event in events if event.get("event") == "planner_quality_issue"
+    ]
+    quality_retries = [
+        event for event in events if event.get("event") == "planner_quality_retry"
+    ]
+    quality_degraded = [
+        event for event in events if event.get("event") == "planner_quality_retry_degraded"
     ]
     planner_error = planner_errors[-1] if planner_errors else {}
     tool_error = next(
@@ -564,6 +605,29 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
             event.get("planner_stage") == "lint" for event in planner_errors
         )).lower()
         if planner_errors
+        else "",
+        "planner_quality_issue_count": str(len(quality_issues)) if quality_issues else "",
+        "planner_retryable_quality_count": str(
+            sum(
+                1
+                for event in quality_issues
+                if event.get("planner_quality_severity") == "retryable_quality"
+            )
+        )
+        if quality_issues
+        else "",
+        "planner_advisory_quality_count": str(
+            sum(
+                1
+                for event in quality_issues
+                if event.get("planner_quality_severity") == "advisory"
+            )
+        )
+        if quality_issues
+        else "",
+        "planner_quality_retry_count": str(len(quality_retries)) if quality_retries else "",
+        "planner_quality_retry_degraded_count": str(len(quality_degraded))
+        if quality_degraded
         else "",
     }
 

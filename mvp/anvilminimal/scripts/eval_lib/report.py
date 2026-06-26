@@ -26,6 +26,7 @@ def generate_report(run_root: Path) -> str:
     lines.extend(planner_repair_summary(rows))
     lines.extend(planner_raw_shape_summary(rows))
     lines.extend(planner_quality_warning_summary(rows))
+    lines.extend(planner_quality_issue_summary(rows))
     lines.extend(failure_summary(rows))
     return "\n".join(lines) + "\n"
 
@@ -330,6 +331,50 @@ def planner_quality_warning_summary(rows: list[dict[str, str]]) -> list[str]:
     return lines
 
 
+def planner_quality_issue_summary(rows: list[dict[str, str]]) -> list[str]:
+    counter = Counter()
+    retry_count = 0
+    degraded_count = 0
+    for row in rows:
+        extras = parse_extras(row)
+        retry_count += safe_int(
+            row.get("planner_quality_retry_count")
+            or extras.get("planner_quality_retry_count")
+        )
+        degraded_count += safe_int(
+            row.get("planner_quality_retry_degraded_count")
+            or extras.get("planner_quality_retry_degraded_count")
+        )
+        issues = extras.get("planner_quality_issues", [])
+        if not isinstance(issues, list):
+            continue
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            key = (
+                str(issue.get("severity", "")),
+                str(issue.get("category", "")),
+                str(issue.get("message", "")),
+            )
+            counter[key] += 1
+    lines = [
+        "## Planner Quality Issues",
+        "",
+        f"quality_retry_count: {retry_count}",
+        f"quality_retry_degraded_count: {degraded_count}",
+        "",
+        "| severity | category | message | count |",
+        "|---|---|---|---:|",
+    ]
+    if not counter:
+        lines.append("| none |  |  | 0 |")
+    else:
+        for (severity, category, message), count in sorted(counter.items()):
+            lines.append(f"| {severity} | {category} | {message} | {count} |")
+    lines.append("")
+    return lines
+
+
 def stop_reason_summary(rows: list[dict[str, str]]) -> list[str]:
     detail_rows = []
     for row in rows:
@@ -466,6 +511,15 @@ def to_float(value: str | None) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def safe_int(value: object) -> int:
+    if value is None or value == "":
+        return 0
+    try:
+        return int(str(value))
+    except ValueError:
+        return 0
 
 
 def mean(values: Iterable[float | None]) -> float | None:

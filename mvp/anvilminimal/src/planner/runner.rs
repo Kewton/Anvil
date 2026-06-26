@@ -6,18 +6,19 @@ use crate::eval_events;
 use crate::minimal_loop::loop_run::run_session_with_outcome_with_ui;
 use crate::planner::intent::detect_intent;
 use crate::planner::lint::{
-    PlanLintReport, lint_step_plan_report, lint_ultra_plan_report, step_plan_quality_warnings,
+    PlanLintReport, PlanQualityContext, PlanQualityReport, lint_step_plan_report,
+    lint_ultra_plan_report, step_plan_quality_report, step_plan_quality_warnings,
 };
 use crate::planner::profile::{
     profile_after_phase, profile_auto_repair, profile_before_phase, profile_expected_paths,
-    profile_guidance, profile_repair_prompt, verify_profile,
+    profile_guidance, profile_quality_expectations, profile_repair_prompt, verify_profile,
 };
 use crate::planner::repair::{
     RepairContext, build_repair_prompt_with_context, save_repair_report_with_context,
 };
 use crate::planner::step_plan::{
-    PlanStep, StepPlan, extract_json_object, parse_generated_step_plan_json, parse_step_plan,
-    render_step_plan, repair_generated_step_plan_contract,
+    PlanStep, StepKind, StepPlan, extract_json_object, parse_generated_step_plan_json,
+    parse_step_plan, render_step_plan, repair_generated_step_plan_contract,
 };
 use crate::planner::ultra_plan::{UltraPlan, parse_ultra_plan, render_ultra_plan};
 use crate::planner::verify::{VerificationReport, verify_step};
@@ -59,6 +60,7 @@ pub fn generate_step_plan_with_ui(
     }
     let model = model_for(config, true);
     let mut last_error = None;
+    let mut last_valid_plan: Option<StepPlan> = None;
     let mut lint_categories_seen = BTreeSet::new();
     for attempt in 1..=3 {
         let messages = step_plan_messages(&prompt);
@@ -80,8 +82,59 @@ pub fn generate_step_plan_with_ui(
                 strengthen_step_plan_for_profile(&mut plan, config);
                 let lint_report = lint_step_plan_report(&plan);
                 if lint_report.is_pass() {
+                    let quality_context = plan_quality_context(config, goal);
+                    let quality_report = step_plan_quality_report(&plan, &quality_context);
                     emit_planner_quality_warnings(config, client.label(), model, attempt, &plan);
+                    emit_planner_quality_issues(
+                        config,
+                        client.label(),
+                        model,
+                        attempt,
+                        &quality_report,
+                    );
+                    if quality_report.has_retryable_quality() {
+                        last_valid_plan = Some(plan.clone());
+                        if attempt < 3 {
+                            emit_planner_quality_retry(
+                                config,
+                                client.label(),
+                                model,
+                                attempt,
+                                &quality_report,
+                            );
+                            prompt = build_quality_retry_prompt(goal, &quality_report, attempt);
+                            continue;
+                        }
+                        emit_planner_quality_retry_exhausted(
+                            config,
+                            client.label(),
+                            model,
+                            attempt,
+                            &quality_report,
+                        );
+                    }
                     return Ok(plan);
+                }
+                if let Some(plan) = last_valid_plan.clone() {
+                    emit_planner_quality_retry_degraded(
+                        config,
+                        client.label(),
+                        model,
+                        attempt,
+                        "lint",
+                        &lint_report.primary_message(),
+                    );
+                    if attempt >= 3 {
+                        return Ok(plan);
+                    }
+                    let message = lint_report.primary_message();
+                    last_error = Some(message.clone());
+                    for err in &lint_report.errors {
+                        lint_categories_seen.insert(err.category.clone());
+                    }
+                    prompt =
+                        build_lint_retry_prompt(goal, &lint_report, attempt, &lint_categories_seen);
+                    continue;
                 }
                 let message = lint_report.primary_message();
                 emit_planner_error_for_lint(config, client.label(), model, &lint_report, attempt);
@@ -93,6 +146,22 @@ pub fn generate_step_plan_with_ui(
                     build_lint_retry_prompt(goal, &lint_report, attempt, &lint_categories_seen);
             }
             Err(err) => {
+                if let Some(plan) = last_valid_plan.clone() {
+                    emit_planner_quality_retry_degraded(
+                        config,
+                        client.label(),
+                        model,
+                        attempt,
+                        "schema",
+                        &err.to_string(),
+                    );
+                    if attempt >= 3 {
+                        return Ok(plan);
+                    }
+                    last_error = Some(err.to_string());
+                    prompt = build_schema_retry_prompt(goal, &err.to_string(), attempt);
+                    continue;
+                }
                 last_error = Some(err.to_string());
                 emit_planner_error(
                     config,
@@ -106,6 +175,9 @@ pub fn generate_step_plan_with_ui(
                 prompt = build_schema_retry_prompt(goal, &err.to_string(), attempt);
             }
         }
+    }
+    if let Some(plan) = last_valid_plan {
+        return Ok(plan);
     }
     anyhow::bail!(
         "invalid StepPlan after corrective retries: {}",
@@ -630,6 +702,99 @@ fn emit_planner_quality_warnings(
     }
 }
 
+fn emit_planner_quality_issues(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    report: &PlanQualityReport,
+) {
+    for issue in &report.issues {
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "planner_quality_issue",
+                "planner_stage": "quality",
+                "planner_error_kind": "planner_quality_issue",
+                "planner_quality_category": issue.category,
+                "planner_quality_severity": issue.severity.as_str(),
+                "planner_error_message": eval_events::body_snippet(&issue.message),
+                "planner_quality_step_id": issue.step_id,
+                "planner_quality_evidence": issue.evidence,
+                "planner_provider": provider,
+                "planner_model": model,
+                "repair_attempt": attempt,
+            }),
+        );
+    }
+}
+
+fn emit_planner_quality_retry(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    report: &PlanQualityReport,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "planner_quality_retry",
+            "planner_stage": "quality",
+            "planner_error_kind": "planner_quality_retry",
+            "planner_error_message": eval_events::body_snippet(&report.primary_message()),
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+            "planner_quality_issue_count": report.issues.len(),
+        }),
+    );
+}
+
+fn emit_planner_quality_retry_degraded(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    stage: &str,
+    message: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "planner_quality_retry_degraded",
+            "planner_stage": stage,
+            "planner_error_kind": "planner_quality_retry_degraded",
+            "planner_error_message": eval_events::body_snippet(message),
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+        }),
+    );
+}
+
+fn emit_planner_quality_retry_exhausted(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    report: &PlanQualityReport,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "planner_quality_retry_exhausted",
+            "planner_stage": "quality",
+            "planner_error_kind": "planner_quality_retry_exhausted",
+            "planner_error_message": eval_events::body_snippet(&report.primary_message()),
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+            "planner_quality_issue_count": report.issues.len(),
+        }),
+    );
+}
+
 fn emit_planner_schema_repaired(
     config: &Config,
     provider: &str,
@@ -695,6 +860,44 @@ Goal: {goal}"
     )
 }
 
+fn build_quality_retry_prompt(goal: &str, report: &PlanQualityReport, attempt: usize) -> String {
+    let issues = report
+        .issues
+        .iter()
+        .filter(|issue| issue.severity.as_str() == "retryable_quality")
+        .map(|issue| {
+            let step = issue
+                .step_id
+                .as_ref()
+                .map(|value| format!(" step={value}"))
+                .unwrap_or_default();
+            let evidence = issue
+                .evidence
+                .as_ref()
+                .map(|value| format!(" evidence={value}"))
+                .unwrap_or_default();
+            format!(
+                "- [{}{}] {}{}",
+                issue.category, step, issue.message, evidence
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Your previous StepPlan was schema-valid and passed safety lint, but it had retryable quality issues on attempt {attempt}/3.\n\
+Improve the plan without weakening safety rules:\n{issues}\n\n\
+Hard constraints:\n\
+- Keep the original top-level goal unchanged.\n\
+- Keep expected_paths workspace-relative and owned by one setup/implement step.\n\
+- Keep verify commands deterministic, single commands, and free of shell control syntax.\n\
+- Do not start dev servers or perform dependency installation in verify.\n\
+- Prefer tests, builds, smoke checks, or content assertions over file existence checks.\n\
+- For Next.js, put package.json and app entrypoints before npm run build.\n\n\
+Return only one JSON object with top-level goal and steps. Do not use markdown fences.\n\
+Goal: {goal}"
+    )
+}
+
 fn lint_retry_hard_constraints(
     report: &PlanLintReport,
     categories_seen: &BTreeSet<String>,
@@ -715,6 +918,8 @@ fn lint_retry_hard_constraints(
         out.push(
             "- Split multiple checks into multiple verify steps or multiple verify list items.",
         );
+        out.push("- If a Node smoke check needs multiple statements, create a smoke-check.js artifact in an implement step and verify with a single command such as node smoke-check.js.");
+        out.push("- If documentation needs multiple assertions, prefer separate grep -q commands in the verify list, each checking one phrase in one file.");
     }
     if categories.contains("path_ownership") {
         out.push("- Do not duplicate expected_paths across steps; move shared validation into verify commands instead.");
@@ -754,7 +959,11 @@ fn plan_generation_system_prompt() -> String {
         "Use verify only for deterministic checks. Do not request file changes in verify steps.",
         "Use report only for final summary. It must not declare expected_paths or verify commands.",
         "Expected paths must be workspace-relative, exact, and owned by one implement/setup step.",
+        "Prefer tests, builds, smoke checks, or content assertions over file existence checks.",
+        "Use file existence checks only as a fallback when no stronger deterministic verification fits.",
+        "Implement/setup instructions should say what each expected artifact will contain.",
         "Verify commands must not use shell control syntax such as &&, ||, |, or ;.",
+        "For multi-statement Node checks, create a smoke-check.js artifact and verify with node smoke-check.js.",
         "Do not put dev server startup or network setup in verify.",
         "For Next.js, create package.json and app entrypoints before npm run build.",
         "Do not use node --check for .ts or .tsx files.",
@@ -773,25 +982,79 @@ fn build_step_plan_user_prompt(goal: &str, config: &Config) -> String {
             prompt.push('\n');
         }
     }
+    let expectations = profile_quality_expectations(&config.workspace_root, &config.profile, goal);
+    if !expectations.preferred_verify.is_empty()
+        || !expectations
+            .dependency_order_hint
+            .as_deref()
+            .unwrap_or("")
+            .is_empty()
+    {
+        prompt.push_str("\nProfile verification expectations:\n");
+        if !expectations.preferred_verify.is_empty() {
+            prompt.push_str("- Preferred deterministic verify commands:\n");
+            for command in expectations.preferred_verify {
+                prompt.push_str("  - ");
+                prompt.push_str(&command);
+                prompt.push('\n');
+            }
+        }
+        if let Some(hint) = expectations.dependency_order_hint {
+            prompt.push_str("- Order: ");
+            prompt.push_str(&hint);
+            prompt.push('\n');
+        }
+        if !expectations.forbidden_verify.is_empty() {
+            prompt.push_str("- Do not use these in verify:\n");
+            for command in expectations.forbidden_verify {
+                prompt.push_str("  - ");
+                prompt.push_str(&command);
+                prompt.push('\n');
+            }
+        }
+    }
     prompt
 }
 
+fn plan_quality_context(config: &Config, goal: &str) -> PlanQualityContext {
+    let expectations = profile_quality_expectations(&config.workspace_root, &config.profile, goal);
+    PlanQualityContext {
+        profile: config.profile.clone(),
+        required_artifacts: expectations.required_artifacts,
+        preferred_verify: expectations.preferred_verify,
+        dependency_order_hint: expectations.dependency_order_hint,
+    }
+}
+
 fn strengthen_step_plan_for_profile(plan: &mut StepPlan, config: &Config) {
-    let Some(last) = plan.steps.last_mut() else {
+    let is_scaffold = plan.goal.to_ascii_lowercase().contains("scaffold");
+    let Some(target_index) = plan
+        .steps
+        .iter()
+        .rposition(|step| matches!(step.step_kind(), StepKind::Setup | StepKind::Implement))
+        .or_else(|| {
+            is_scaffold.then(|| {
+                plan.steps
+                    .iter()
+                    .rposition(|step| step.step_kind() == StepKind::Report)
+            })?
+        })
+    else {
         return;
     };
-    if plan.goal.to_ascii_lowercase().contains("scaffold") {
+    let target = &mut plan.steps[target_index];
+    if is_scaffold {
         for path in profile_expected_paths(&config.workspace_root, &config.profile, &plan.goal) {
-            if path.ends_with("package.json") && !last.expected_paths.contains(&path) {
-                last.expected_paths.push(path);
+            if path.ends_with("package.json") && !target.expected_paths.contains(&path) {
+                target.expected_paths.push(path);
             }
         }
-        if !last.expected_paths.is_empty() && last.kind == "report" {
-            last.kind = "implement".to_string();
+        if !target.expected_paths.is_empty() && target.kind == "report" {
+            target.kind = "implement".to_string();
         }
     }
     if let Some(guidance) = profile_guidance(&config.profile, &plan.goal) {
-        last.instruction = format!("{}\n\nProfile contract:\n{}", last.instruction, guidance);
+        target.instruction = format!("{}\n\nProfile contract:\n{}", target.instruction, guidance);
     }
 }
 
@@ -1002,6 +1265,8 @@ mod tests {
         categories.insert("path_ownership".to_string());
         let prompt = build_lint_retry_prompt("goal", &report, 2, &categories);
         assert!(prompt.contains("without &&, ||, |, ;"));
+        assert!(prompt.contains("smoke-check.js"));
+        assert!(prompt.contains("grep -q"));
         assert!(prompt.contains("Do not duplicate expected_paths"));
         assert!(prompt.contains("Python stdlib unittest does not require dependency setup"));
         assert!(prompt.contains("Keep the original top-level goal unchanged"));
@@ -1090,6 +1355,68 @@ mod tests {
         assert_eq!(plan.steps.len(), 1);
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("planner_quality_warning"));
+    }
+
+    #[test]
+    fn retryable_quality_issue_gets_corrective_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let weak = r#"{"goal":"Build a Next.js game app","steps":[{"id":"make-app","kind":"implement","expected_result":"pass","instruction":"Create package.json and src/app/page.tsx for the game app","expected_paths":["package.json","src/app/page.tsx"],"verify":[]}]}"#;
+        let strong = r#"{"goal":"Build a Next.js game app","steps":[{"id":"setup","kind":"setup","expected_result":"pass","instruction":"Create package.json with next, react, and react-dom dependencies","expected_paths":["package.json"],"verify":[]},{"id":"page","kind":"implement","expected_result":"pass","instruction":"Create src/app/page.tsx game page","expected_paths":["src/app/page.tsx"],"verify":[]},{"id":"build","kind":"verify","expected_result":"pass","instruction":"Run deterministic Next.js build","expected_paths":[],"verify":["npm run build"]}]}"#;
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(weak),
+            AssistantReply::text(strong),
+        ]);
+        let plan = generate_step_plan(&mut planner, "Build a Next.js game app", &cfg).unwrap();
+        assert_eq!(planner.messages.len(), 2);
+        assert!(
+            plan.steps
+                .iter()
+                .flat_map(|step| step.verify.iter())
+                .any(|command| command == "npm run build")
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("planner_quality_issue"));
+        assert!(event_text.contains("planner_quality_retry"));
+    }
+
+    #[test]
+    fn quality_retry_degradation_keeps_last_valid_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let weak = r#"{"goal":"Build a Next.js game app","steps":[{"id":"make-app","kind":"implement","expected_result":"pass","instruction":"Create package.json and src/app/page.tsx for the game app","expected_paths":["package.json","src/app/page.tsx"],"verify":[]}]}"#;
+        let degraded = r#"{"goal":"Build a Next.js game app","steps":[{"id":"bad","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js && node check2.js"]}]}"#;
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(weak),
+            AssistantReply::text(degraded),
+            AssistantReply::text(degraded),
+        ]);
+        let plan = generate_step_plan(&mut planner, "Build a Next.js game app", &cfg).unwrap();
+        assert_eq!(planner.messages.len(), 3);
+        assert_eq!(plan.steps[0].id, "make-app");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("planner_quality_retry_degraded"));
+    }
+
+    #[test]
+    fn advisory_quality_issue_does_not_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_json = r#"{"goal":"Update README heading","steps":[{"id":"docs","kind":"implement","expected_result":"pass","instruction":"Update README.md","expected_paths":["README.md"],"verify":["test -f README.md"]}]}"#;
+        let mut planner = FakeClient::new(vec![AssistantReply::text(plan_json)]);
+        let plan = generate_step_plan(
+            &mut planner,
+            "Update README heading",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(planner.messages.len(), 1);
+        assert_eq!(plan.steps[0].id, "docs");
     }
 
     #[test]

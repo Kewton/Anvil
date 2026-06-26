@@ -13,6 +13,45 @@ pub struct PlanLintError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanQualitySeverity {
+    Fatal,
+    RetryableQuality,
+    Advisory,
+}
+
+impl PlanQualitySeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanQualitySeverity::Fatal => "fatal",
+            PlanQualitySeverity::RetryableQuality => "retryable_quality",
+            PlanQualitySeverity::Advisory => "advisory",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanQualityIssue {
+    pub category: String,
+    pub message: String,
+    pub severity: PlanQualitySeverity,
+    pub step_id: Option<String>,
+    pub evidence: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanQualityReport {
+    pub issues: Vec<PlanQualityIssue>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanQualityContext {
+    pub profile: String,
+    pub required_artifacts: Vec<String>,
+    pub preferred_verify: Vec<String>,
+    pub dependency_order_hint: Option<String>,
+}
+
 impl PlanLintReport {
     pub fn pass() -> Self {
         Self { errors: Vec::new() }
@@ -45,6 +84,52 @@ impl PlanLintReport {
 
     pub fn has_category(&self, category: &str) -> bool {
         self.errors.iter().any(|err| err.category == category)
+    }
+}
+
+impl PlanQualityReport {
+    pub fn pass() -> Self {
+        Self { issues: Vec::new() }
+    }
+
+    pub fn is_pass(&self) -> bool {
+        self.issues.is_empty()
+    }
+
+    pub fn has_retryable_quality(&self) -> bool {
+        self.issues
+            .iter()
+            .any(|issue| issue.severity == PlanQualitySeverity::RetryableQuality)
+    }
+
+    pub fn has_fatal(&self) -> bool {
+        self.issues
+            .iter()
+            .any(|issue| issue.severity == PlanQualitySeverity::Fatal)
+    }
+
+    pub fn primary_message(&self) -> String {
+        self.issues
+            .first()
+            .map(|issue| issue.message.clone())
+            .unwrap_or_else(|| "pass".to_string())
+    }
+
+    pub fn push(
+        &mut self,
+        severity: PlanQualitySeverity,
+        category: impl Into<String>,
+        message: impl Into<String>,
+        step_id: Option<String>,
+        evidence: Option<String>,
+    ) {
+        self.issues.push(PlanQualityIssue {
+            severity,
+            category: category.into(),
+            message: message.into(),
+            step_id,
+            evidence,
+        });
     }
 }
 
@@ -175,6 +260,137 @@ pub fn step_plan_quality_warnings(plan: &StepPlan) -> Vec<String> {
         warnings.push("verify appears without setup for framework task".to_string());
     }
     warnings
+}
+
+pub fn step_plan_quality_report(
+    plan: &StepPlan,
+    context: &PlanQualityContext,
+) -> PlanQualityReport {
+    let mut report = PlanQualityReport::pass();
+    let all_paths: Vec<&str> = plan
+        .steps
+        .iter()
+        .flat_map(|step| step.expected_paths.iter().map(String::as_str))
+        .collect();
+    let verify_commands: Vec<&str> = plan
+        .steps
+        .iter()
+        .flat_map(|step| step.verify.iter().map(String::as_str))
+        .collect();
+    let lower_goal = plan.goal.to_ascii_lowercase();
+    let looks_next_profile = matches!(context.profile.as_str(), "nextjs" | "next-js" | "next.js");
+    let has_strong_verify = verify_commands
+        .iter()
+        .any(|command| is_strong_verify_command(command));
+
+    if looks_next_profile
+        && !context.preferred_verify.is_empty()
+        && !has_preferred_verify(&verify_commands, &context.preferred_verify)
+        && has_nextjs_artifact_intent(&all_paths, context)
+    {
+        report.push(
+            PlanQualitySeverity::RetryableQuality,
+            "profile_verify_missing",
+            "profile expects deterministic build/test verification but plan has no preferred verify command",
+            None,
+            Some(context.preferred_verify.join(", ")),
+        );
+    }
+
+    if looks_code_task(&lower_goal, &all_paths) && !has_strong_verify {
+        let severity = if !verify_commands.is_empty()
+            || (looks_next_profile
+                && (lower_goal.contains("test")
+                    || lower_goal.contains("build")
+                    || lower_goal.contains("verify")
+                    || lower_goal.contains("検証")))
+        {
+            PlanQualitySeverity::RetryableQuality
+        } else {
+            PlanQualitySeverity::Advisory
+        };
+        report.push(
+            severity,
+            "weak_code_verify",
+            "code task lacks test, build, smoke, or compile verification",
+            None,
+            Some(
+                verify_commands
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        );
+    }
+
+    if looks_docs_task(&lower_goal, &all_paths) && !has_content_assertion(&verify_commands) {
+        report.push(
+            PlanQualitySeverity::Advisory,
+            "weak_docs_verify",
+            "docs task has no content assertion for requested text or headings",
+            None,
+            Some(
+                verify_commands
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        );
+    }
+
+    if !verify_commands.is_empty()
+        && !all_paths.is_empty()
+        && !has_strong_verify
+        && verify_commands
+            .iter()
+            .all(|command| is_weak_verify_command(command))
+    {
+        report.push(
+            PlanQualitySeverity::Advisory,
+            "weak_verify_only",
+            "verify commands only check existence or print files",
+            None,
+            Some(verify_commands.join(", ")),
+        );
+    }
+
+    for step in &plan.steps {
+        if step.expected_paths.is_empty() {
+            continue;
+        }
+        if instruction_mentions_expected_path_or_content(&step.instruction, &step.expected_paths) {
+            continue;
+        }
+        report.push(
+            PlanQualitySeverity::Advisory,
+            "instruction_path_alignment",
+            "implement/setup instruction does not mention expected paths or concrete artifact content",
+            Some(step.id.clone()),
+            Some(step.expected_paths.join(", ")),
+        );
+    }
+
+    for step in &plan.steps {
+        for command in &step.verify {
+            if is_strong_verify_command(command) || is_content_assertion_command(command) {
+                continue;
+            }
+            if command_mentions_any_expected_path(command, &all_paths) {
+                continue;
+            }
+            report.push(
+                PlanQualitySeverity::RetryableQuality,
+                "verify_artifact_coupling",
+                "verify command does not appear to validate any expected artifact",
+                Some(step.id.clone()),
+                Some(command.clone()),
+            );
+        }
+    }
+
+    report
 }
 
 fn validate_step_kind_contract(step: &crate::planner::step_plan::PlanStep) -> anyhow::Result<()> {
@@ -345,6 +561,167 @@ fn looks_like_shell_command(value: &str) -> bool {
     ]
     .iter()
     .any(|prefix| trimmed.starts_with(prefix))
+}
+
+fn has_preferred_verify(commands: &[&str], preferred: &[String]) -> bool {
+    commands.iter().any(|command| {
+        let lower = command.trim().to_ascii_lowercase();
+        preferred.iter().any(|expected| {
+            let expected = expected.trim().to_ascii_lowercase();
+            lower == expected || lower.starts_with(&(expected + " "))
+        })
+    })
+}
+
+fn has_nextjs_artifact_intent(paths: &[&str], context: &PlanQualityContext) -> bool {
+    let expected = paths
+        .iter()
+        .copied()
+        .chain(context.required_artifacts.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    expected.iter().any(|path| path.ends_with("package.json"))
+        && expected.iter().any(|path| {
+            matches!(
+                *path,
+                "src/app/page.tsx"
+                    | "src/app/page.jsx"
+                    | "app/page.tsx"
+                    | "app/page.jsx"
+                    | "pages/index.tsx"
+                    | "pages/index.jsx"
+                    | "src/pages/index.tsx"
+                    | "src/pages/index.jsx"
+            )
+        })
+}
+
+fn looks_code_task(lower_goal: &str, paths: &[&str]) -> bool {
+    if lower_goal.contains("test")
+        || lower_goal.contains("build")
+        || lower_goal.contains("app")
+        || lower_goal.contains("game")
+        || lower_goal.contains("script")
+        || lower_goal.contains("cli")
+        || lower_goal.contains("code")
+        || lower_goal.contains("unit")
+    {
+        return true;
+    }
+    paths.iter().any(|path| {
+        path.ends_with(".py")
+            || path.ends_with(".rs")
+            || path.ends_with(".js")
+            || path.ends_with(".jsx")
+            || path.ends_with(".ts")
+            || path.ends_with(".tsx")
+            || path.ends_with("Cargo.toml")
+            || path.ends_with("package.json")
+    })
+}
+
+fn looks_docs_task(lower_goal: &str, paths: &[&str]) -> bool {
+    if lower_goal.contains("doc")
+        || lower_goal.contains("readme")
+        || lower_goal.contains("heading")
+        || lower_goal.contains("markdown")
+        || lower_goal.contains("section")
+        || lower_goal.contains("見出し")
+        || lower_goal.contains("ドキュメント")
+    {
+        return true;
+    }
+    paths.iter().any(|path| {
+        path.ends_with(".md")
+            || path.ends_with(".mdx")
+            || path.ends_with(".txt")
+            || path.ends_with("README")
+            || path.ends_with("README.md")
+    })
+}
+
+fn is_strong_verify_command(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower == "cargo test"
+        || lower.starts_with("cargo test ")
+        || lower == "cargo build"
+        || lower.starts_with("cargo build ")
+        || lower == "npm test"
+        || lower == "npm run test"
+        || lower.starts_with("npm run test ")
+        || lower == "npm run build"
+        || lower.starts_with("npm run build ")
+        || lower == "pnpm test"
+        || lower.starts_with("pnpm test ")
+        || lower == "pnpm build"
+        || lower.starts_with("pnpm build ")
+        || lower == "yarn test"
+        || lower.starts_with("yarn test ")
+        || lower == "yarn build"
+        || lower.starts_with("yarn build ")
+        || lower.starts_with("python -m unittest")
+        || lower.starts_with("python3 -m unittest")
+        || lower == "pytest"
+        || lower.starts_with("pytest ")
+        || lower.starts_with("node ")
+        || lower.starts_with("python -m py_compile")
+        || lower.starts_with("python3 -m py_compile")
+        || lower.contains(" tsc")
+        || lower == "tsc"
+}
+
+fn is_content_assertion_command(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    (lower.starts_with("grep ") || lower.starts_with("grep -q ") || lower.contains(" grep "))
+        && (command.contains('"') || command.contains('\''))
+}
+
+fn has_content_assertion(commands: &[&str]) -> bool {
+    commands
+        .iter()
+        .any(|command| is_content_assertion_command(command))
+}
+
+fn is_weak_verify_command(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower.starts_with("test -f ")
+        || lower.starts_with("test -s ")
+        || lower.starts_with("cat ")
+        || lower.starts_with("ls ")
+        || lower.starts_with("grep ")
+        || lower.starts_with("grep -q ")
+        || lower.starts_with("python -m py_compile")
+        || lower.starts_with("python3 -m py_compile")
+}
+
+fn instruction_mentions_expected_path_or_content(instruction: &str, paths: &[String]) -> bool {
+    let lower = instruction.to_ascii_lowercase();
+    if lower.contains("package")
+        || lower.contains("layout")
+        || lower.contains("page")
+        || lower.contains("readme")
+        || lower.contains("test")
+        || lower.contains("build")
+        || lower.contains("content")
+        || lower.contains("heading")
+        || lower.contains("見出し")
+    {
+        return true;
+    }
+    paths.iter().any(|path| {
+        let path_lower = path.to_ascii_lowercase();
+        lower.contains(&path_lower)
+            || path_lower
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| lower.contains(name))
+    })
+}
+
+fn command_mentions_any_expected_path(command: &str, paths: &[&str]) -> bool {
+    let lower = command.to_ascii_lowercase();
+    paths
+        .iter()
+        .any(|path| lower.contains(&path.to_ascii_lowercase()))
 }
 
 #[cfg(test)]
@@ -725,6 +1102,112 @@ mod tests {
     }
 
     #[test]
+    fn quality_report_marks_nextjs_missing_build_retryable() {
+        let plan = StepPlan {
+            goal: "Build a Next.js game app".to_string(),
+            steps: vec![PlanStep {
+                id: "s1".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create package.json and src/app/page.tsx for the app".to_string(),
+                expected_paths: vec!["package.json".to_string(), "src/app/page.tsx".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let report = step_plan_quality_report(&plan, &nextjs_quality_context());
+        assert!(report.has_retryable_quality(), "{report:?}");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "profile_verify_missing")
+        );
+    }
+
+    #[test]
+    fn quality_report_accepts_nextjs_build_verify() {
+        let plan = StepPlan {
+            goal: "Build a Next.js game app".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "setup".to_string(),
+                    kind: "setup".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create package.json with next dependencies".to_string(),
+                    expected_paths: vec!["package.json".to_string()],
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "page".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create src/app/page.tsx game page".to_string(),
+                    expected_paths: vec!["src/app/page.tsx".to_string()],
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "verify".to_string(),
+                    kind: "verify".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Run deterministic build".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: vec!["npm run build".to_string()],
+                },
+            ],
+        };
+        assert!(lint_step_plan(&plan).is_ok());
+        let report = step_plan_quality_report(&plan, &nextjs_quality_context());
+        assert!(!report.has_retryable_quality(), "{report:?}");
+    }
+
+    #[test]
+    fn quality_report_does_not_retry_docs_content_assertion() {
+        let plan = StepPlan {
+            goal: "Update README Usage heading".to_string(),
+            steps: vec![PlanStep {
+                id: "docs".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Update README.md with a Usage heading".to_string(),
+                expected_paths: vec!["README.md".to_string()],
+                verify: vec!["grep -q \"Usage\" README.md".to_string()],
+            }],
+        };
+        let report = step_plan_quality_report(&plan, &PlanQualityContext::default());
+        assert!(!report.has_retryable_quality(), "{report:?}");
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "weak_docs_verify"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn quality_report_marks_unrelated_verify_retryable() {
+        let plan = StepPlan {
+            goal: "Create Python script and verify it".to_string(),
+            steps: vec![PlanStep {
+                id: "code".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create app.py script".to_string(),
+                expected_paths: vec!["app.py".to_string()],
+                verify: vec!["test -f README.md".to_string()],
+            }],
+        };
+        let report = step_plan_quality_report(&plan, &PlanQualityContext::default());
+        assert!(report.has_retryable_quality(), "{report:?}");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "verify_artifact_coupling")
+        );
+    }
+
+    #[test]
     fn ultra_plan_lint_report_uses_same_category_vocabulary() {
         let plan = UltraPlan {
             goal: "goal".to_string(),
@@ -745,5 +1228,21 @@ mod tests {
         let report = lint_ultra_plan_report(&plan);
         assert!(report.has_category("scaffold"));
         assert!(report.errors.len() >= 2);
+    }
+
+    fn nextjs_quality_context() -> PlanQualityContext {
+        PlanQualityContext {
+            profile: "nextjs".to_string(),
+            required_artifacts: vec![
+                "package.json".to_string(),
+                "src/app/page.tsx".to_string(),
+                "src/app/layout.tsx".to_string(),
+                "src/app/global.d.ts".to_string(),
+            ],
+            preferred_verify: vec!["npm run build".to_string()],
+            dependency_order_hint: Some(
+                "Create package.json and an app entrypoint before npm run build".to_string(),
+            ),
+        }
     }
 }

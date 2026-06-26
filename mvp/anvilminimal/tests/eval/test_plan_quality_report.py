@@ -25,6 +25,21 @@ class PlanQualityReportTest(unittest.TestCase):
         )
         self.assertEqual(classified, {})
 
+    def test_quality_issue_does_not_become_failure_classification(self):
+        classified = classify_events(
+            [
+                {
+                    "event": "planner_quality_issue",
+                    "planner_stage": "quality",
+                    "planner_error_kind": "planner_quality_issue",
+                    "planner_quality_category": "weak_code_verify",
+                    "planner_quality_severity": "retryable_quality",
+                    "planner_error_message": "weak verify",
+                }
+            ]
+        )
+        self.assertEqual(classified, {})
+
     def test_report_summarizes_quality_warnings(self):
         with tempfile.TemporaryDirectory() as td:
             run_root = Path(td)
@@ -68,6 +83,46 @@ class PlanQualityReportTest(unittest.TestCase):
         self.assertIn("| bottom | scenario | step-plan | 41.0 | 82 | true |", report)
         self.assertIn("large task is represented as a single step", report)
         self.assertIn("| openai | gpt-5.4-mini |", report)
+
+    def test_report_summarizes_quality_issues(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td)
+            row = {key: "" for key in SUMMARY_HEADER}
+            row.update(
+                {
+                    "run_id": "quality",
+                    "suite": "s",
+                    "scenario": "scenario",
+                    "size": "large",
+                    "category": "planner",
+                    "mode": "step-plan",
+                    "planner_provider": "openai",
+                    "planner_model": "gpt-5.4-mini",
+                    "success": "true",
+                    "rc": "0",
+                    "planner_quality_issue_count": "1",
+                    "planner_retryable_quality_count": "1",
+                    "planner_quality_retry_count": "1",
+                    "extras_json": {
+                        "planner_quality_retry_count": 1,
+                        "planner_quality_issues": [
+                            {
+                                "planner_provider": "openai",
+                                "planner_model": "gpt-5.4-mini",
+                                "severity": "retryable_quality",
+                                "category": "weak_code_verify",
+                                "message": "code task lacks test verification",
+                            }
+                        ],
+                    },
+                }
+            )
+            write_summary(run_root / "summary.eval.tsv", [row])
+            report = generate_report(run_root)
+        self.assertIn("## Planner Quality Issues", report)
+        self.assertIn("quality_retry_count: 1", report)
+        self.assertIn("retryable_quality", report)
+        self.assertIn("weak_code_verify", report)
 
     def test_report_summarizes_predictiveness_pair(self):
         with tempfile.TemporaryDirectory() as td:

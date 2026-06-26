@@ -496,3 +496,36 @@ LLM API を使って仮説検証すべき条件は以下に限定する。
 3. profile verification expectations を self-check と prompt の両方へ出す
 4. planner prompt は self-check を満たしやすくする範囲で最小補強する
 5. plan-run predictiveness と blind eval で過剰適応を防ぐ
+
+## 実施結果と方針更新
+
+実施結果の詳細は以下に記録した。
+
+- `workspace/mvp/eval/008/implementation_results.md`
+
+今回の実装では、上記方針 A〜E を MVP に反映した。
+
+- fatal lint と quality self-check を分離
+- `retryable_quality` / `advisory` を stable event と summary に出力
+- Next.js profile expectation を self-check と prompt に接続
+- retryable quality を既存 planner retry 上限内で corrective retry
+- retry 悪化時に last valid plan を保持
+- attempt が残っている場合は degraded lint/schema retry を継続
+- shell control syntax retry prompt に代替案を追加
+
+この結果、最新 smoke step-plan では以下まで改善した。
+
+- success: 12/12
+- executable_plan avg: `79.5`
+- verify_strength avg: `68.6`
+- artifact_ownership avg: `98.0`
+- lint_repair avg: `95.2`
+
+blind step-plan でも success 12/12 を維持したため、eval scenario 名への直接適応ではないと判断する。
+
+ただし、plan-run predictiveness と ultra smoke は未達。
+
+- plan-run predictiveness: step-plan 24/24 success に対し plan-run 1/24 success
+- ultra smoke: 0/12 success
+
+これらは「作成済み plan を強くする」今回の B/C 対策だけでは解けない。次に扱うべき根本原因は、minimal loop 実行時の tool validation / missing tool call / max_iterations と、ultra phase scaffold / schema の安定性である。

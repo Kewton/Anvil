@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use crate::planner::profile::ProfileQualityExpectations;
 use crate::planner::profile::profile_failure;
 use crate::planner::verify::{VerificationReport, VerifyStatus};
 
@@ -109,6 +110,22 @@ pub fn expected_paths(root: &Path, goal: &str) -> Vec<String> {
         paths.push(format!("{prefix}src/app/global.d.ts"));
     }
     paths
+}
+
+pub fn quality_expectations(root: &Path, goal: &str) -> ProfileQualityExpectations {
+    ProfileQualityExpectations {
+        required_artifacts: expected_paths(root, goal),
+        preferred_verify: vec!["npm run build".to_string()],
+        forbidden_verify: vec![
+            "next dev".to_string(),
+            "npm install".to_string(),
+            "pnpm install".to_string(),
+            "yarn install".to_string(),
+        ],
+        dependency_order_hint: Some(
+            "Create package.json and a Next.js entrypoint before npm run build".to_string(),
+        ),
+    }
 }
 
 pub fn repair_prompt(root: &Path, goal: &str, report: &VerificationReport) -> String {

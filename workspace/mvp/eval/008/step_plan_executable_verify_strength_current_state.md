@@ -251,3 +251,26 @@ anvildev failure:
 MVP は step-plan 生成安定性と artifact ownership で anvildev より優位。ただし verify の強度はまだ不足している。
 
 まず改善すべきは、MVP planner が生成した valid plan を自己チェックし、弱い verify や曖昧な instruction を限定的に修正ループへ戻す仕組みである。prompt 強化は必要だが主対策ではなく、self-check と bounded retry を支える補助策として扱う。
+
+## 実施後の状態
+
+実装・検証結果は以下に記録した。
+
+- `workspace/mvp/eval/008/implementation_results.md`
+
+2026-06-26 実施の最新 smoke step-plan eval では、主目的だった `executable_plan avg` と `verify_strength avg` は改善した。
+
+- success: 12/12 維持
+- executable_plan avg: baseline `78.3` -> `79.5`
+- verify_strength avg: baseline `62.2` -> `68.6`
+- artifact_ownership avg: `98.0`
+- lint_repair avg: `95.2`
+
+blind step-plan でも 12/12 success を維持し、verify_strength avg は `69.8` だったため、今回の改善が smoke 固有に閉じている兆候は限定的。
+
+一方で、plan-run predictiveness は未達。
+
+- step-plan: 24/24 success
+- plan-run: 1/24 success
+
+したがって、現時点の残課題は「step-plan YAML の品質」よりも、plan-run / ultra-run 実行経路の false positive、tool validation、max_iterations、phase scaffold 側に移っている。
