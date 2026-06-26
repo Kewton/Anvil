@@ -47,6 +47,12 @@ SUMMARY_HEADER = [
     "planner_parser_limitation",
     "planner_prompt_issue",
     "plan_quality_score",
+    "executable_plan_score",
+    "constraint_coverage_score",
+    "verify_strength_score",
+    "artifact_ownership_score",
+    "lint_repair_score",
+    "stability_score",
     "ultra_phase_quality_score",
     "execution_score",
     "time_score",
@@ -100,6 +106,12 @@ def empty_summary_row(spec: dict[str, Any]) -> dict[str, Any]:
         "planner_parser_limitation": "",
         "planner_prompt_issue": "",
         "plan_quality_score": "",
+        "executable_plan_score": "",
+        "constraint_coverage_score": "",
+        "verify_strength_score": "",
+        "artifact_ownership_score": "",
+        "lint_repair_score": "",
+        "stability_score": "",
         "ultra_phase_quality_score": "",
         "execution_score": "",
         "time_score": "",
@@ -122,9 +134,15 @@ def write_summary(path: Path, rows: list[dict[str, Any]]) -> None:
 def read_summary(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
-        if reader.fieldnames != SUMMARY_HEADER:
+        fieldnames = reader.fieldnames or []
+        projected_header = [key for key in SUMMARY_HEADER if key in fieldnames]
+        if fieldnames != projected_header:
             raise ValueError(f"unsupported summary header in {path}: {reader.fieldnames}")
-        return list(reader)
+        rows = list(reader)
+        for row in rows:
+            for key in SUMMARY_HEADER:
+                row.setdefault(key, "")
+        return rows
 
 
 def serialize_cell(value: Any) -> str:
@@ -137,15 +155,54 @@ def serialize_cell(value: Any) -> str:
     return str(value)
 
 
-def calculate_overall(mode: str, plan_score: float | None, ultra_score: float | None, execution_score: float, time_score: float) -> float:
+def calculate_overall(
+    mode: str,
+    plan_score: float | None,
+    ultra_score: float | None,
+    execution_score: float,
+    time_score: float,
+    executable_score: float | None = None,
+    constraint_score: float | None = None,
+    verify_strength_score: float | None = None,
+    artifact_ownership_score: float | None = None,
+    lint_repair_score: float | None = None,
+) -> float:
     if mode == "minimal-loop":
         return round(0.80 * execution_score + 0.20 * time_score, 1)
     if mode == "step-plan":
-        return round(plan_score or 0, 1)
+        return round(
+            0.35 * (plan_score or 0)
+            + 0.20 * (executable_score or 0)
+            + 0.15 * (constraint_score or 0)
+            + 0.10 * (verify_strength_score or 0)
+            + 0.10 * (artifact_ownership_score or 0)
+            + 0.10 * (lint_repair_score or 0),
+            1,
+        )
     if mode == "plan-run":
-        return round(0.35 * (plan_score or 0) + 0.55 * execution_score + 0.10 * time_score, 1)
+        return round(
+            0.18 * (plan_score or 0)
+            + 0.12 * (executable_score or 0)
+            + 0.08 * (constraint_score or 0)
+            + 0.05 * (verify_strength_score or 0)
+            + 0.05 * (artifact_ownership_score or 0)
+            + 0.05 * (lint_repair_score or 0)
+            + 0.37 * execution_score
+            + 0.10 * time_score,
+            1,
+        )
     if mode == "ultra-plan-run":
         return round(0.30 * (ultra_score or 0) + 0.35 * execution_score + 0.10 * time_score, 1)
     if mode == "ultra-step-run":
-        return round(0.45 * (plan_score or 0) + 0.45 * execution_score + 0.10 * time_score, 1)
+        return round(
+            0.25 * (plan_score or 0)
+            + 0.10 * (executable_score or 0)
+            + 0.08 * (constraint_score or 0)
+            + 0.05 * (verify_strength_score or 0)
+            + 0.05 * (artifact_ownership_score or 0)
+            + 0.05 * (lint_repair_score or 0)
+            + 0.32 * execution_score
+            + 0.10 * time_score,
+            1,
+        )
     return execution_score

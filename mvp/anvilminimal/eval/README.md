@@ -39,6 +39,39 @@ workspace/eval-artifacts/anvilminimal-mvp/<timestamp>/
 `summary.eval.tsv` is the comparison table. `events.jsonl` is the detailed
 evidence stream. `report.md` is the human-readable aggregate.
 
+For step plans, `summary.eval.tsv` contains two complementary scores:
+
+- `plan_quality_score`: YAML validity, decomposition shape, responsibility
+  boundaries, required paths, verify commands, dependency order, and
+  repairability.
+- `executable_plan_score`: whether the plan is likely to execute cleanly when
+  handed to `plan-run`; this checks actionable write steps, expected path names
+  in instructions, read-before-create risk, deterministic verify commands, and
+  step budget fit.
+- `constraint_coverage_score`: coverage of required final artifacts, required
+  verify keywords, and profile-specific contracts such as the Next.js app
+  layout, dependencies, build command, and port 3011.
+- `verify_strength_score`: strength of verification commands. Build/test/dev
+  readiness checks score higher than file existence, `cat`, or compile-only
+  checks.
+- `artifact_ownership_score`: whether required artifacts are owned exactly once
+  by steps, whether extra artifact ownership is introduced, and whether nested
+  paths are naturally tied to their owning step.
+- `lint_repair_score`: planner stability inside a run, based on schema repair,
+  lint retry, parser limitation, and prompt issue signals.
+- `stability_score`: populated only when the same scenario/model/mode appears
+  multiple times in one run root, such as `--runs 3`.
+
+`overall_score` uses the structural, executable, constraint, verify, artifact,
+and lint-repair scores for `step-plan`, `plan-run`, and `ultra-step-run` rows so
+a plan that looks well structured but is hard to execute is visible before the
+runtime phase fails.
+
+`report.md` also includes `Plan Run Predictiveness` when both `step-plan` and
+`plan-run` rows exist for the same scenario/model pair. It reports correlation,
+false positives, and false negatives for the plan score as a predictor of
+runtime success.
+
 ## Preflight
 
 ```bash
@@ -135,6 +168,46 @@ python3 scripts/eval-run.py \
 Use `--allow-provider-smoke-failure` only for diagnostic runs where the provider
 smoke failure is the subject of the investigation. Normal acceptance should keep
 the provider smoke gate enabled.
+
+## Blind Eval
+
+`mvp-blind.yaml` is an independent holdout suite. It intentionally does not
+include `mvp-smoke.yaml` or `mvp-balanced.yaml`, and its scenario IDs are tested
+to stay disjoint from both. Use it after fixing failures found in the known
+suites, not while tuning runtime logic from the same failure logs.
+
+```bash
+python3 scripts/eval-run.py \
+  --suite eval/suites/mvp-blind.yaml \
+  --model-profile speed-cloud \
+  --modes minimal-loop,step-plan \
+  --runs 1 \
+  --parallel 4 \
+  --timeout-sec 1800
+```
+
+For overfitting checks, compare the known and blind results:
+
+```bash
+python3 scripts/eval-run.py \
+  --suite eval/suites/mvp-smoke.yaml \
+  --model-profile speed-cloud \
+  --modes minimal-loop,step-plan \
+  --runs 1 \
+  --parallel 4 \
+  --timeout-sec 1800
+
+python3 scripts/eval-run.py \
+  --suite eval/suites/mvp-blind.yaml \
+  --model-profile speed-cloud \
+  --modes minimal-loop,step-plan \
+  --runs 1 \
+  --parallel 4 \
+  --timeout-sec 1800
+```
+
+A large success-rate gap between these two runs is evidence that the latest
+runtime changes are too tuned to the known suite.
 
 ## Local Eval
 

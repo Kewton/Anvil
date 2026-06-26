@@ -6,6 +6,7 @@ import concurrent.futures
 import json
 import os
 import shutil
+import statistics
 import sys
 import threading
 import time
@@ -121,6 +122,7 @@ def main() -> int:
         rows.append(row)
         events.extend(run_events)
     apply_time_scores(rows)
+    apply_stability_scores(rows)
     write_summary(run_root / "summary.eval.tsv", rows)
     write_jsonl(run_root / "events.jsonl", events)
     print(f"[write] {run_root / 'summary.eval.tsv'}")
@@ -299,6 +301,10 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
     events.extend(child_events)
     plans = collect_plans(workdir, run_dir)
     plan_score = None
+    executable_plan_score = None
+    constraint_coverage_score = None
+    verify_strength_score = None
+    artifact_ownership_score = None
     ultra_score = None
     for plan in plans:
         score = score_plan_file(plan, spec["scenario"])
@@ -307,6 +313,14 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             ultra_score = float(score["score"])
         else:
             plan_score = float(score["score"])
+            if score.get("executable_score") is not None:
+                executable_plan_score = float(score["executable_score"])
+            if score.get("constraint_coverage_score") is not None:
+                constraint_coverage_score = float(score["constraint_coverage_score"])
+            if score.get("verify_strength_score") is not None:
+                verify_strength_score = float(score["verify_strength_score"])
+            if score.get("artifact_ownership_score") is not None:
+                artifact_ownership_score = float(score["artifact_ownership_score"])
 
     post = {"ok": True, "postcheck_elapsed_sec": 0.0, "dependency_elapsed_sec": 0.0}
     if result.rc == 0 and spec["mode"] != "step-plan":
@@ -314,6 +328,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         events.append({"event": "postcheck_summary", "run_id": spec["run_id"], **post})
     success = result.rc == 0 and bool(post["ok"])
     diagnostics = summarize_run_events(events, post)
+    lint_repair_score = calculate_lint_repair_score(diagnostics)
     execution_score = 100.0 if success else 0.0
     time_score = 100.0
     extras = {
@@ -383,10 +398,26 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "planner_parser_limitation": diagnostics["planner_parser_limitation"],
             "planner_prompt_issue": diagnostics["planner_prompt_issue"],
             "plan_quality_score": plan_score if plan_score is not None else "",
+            "executable_plan_score": executable_plan_score if executable_plan_score is not None else "",
+            "constraint_coverage_score": constraint_coverage_score if constraint_coverage_score is not None else "",
+            "verify_strength_score": verify_strength_score if verify_strength_score is not None else "",
+            "artifact_ownership_score": artifact_ownership_score if artifact_ownership_score is not None else "",
+            "lint_repair_score": lint_repair_score,
             "ultra_phase_quality_score": ultra_score if ultra_score is not None else "",
             "execution_score": execution_score,
             "time_score": time_score,
-            "overall_score": calculate_overall(spec["mode"], plan_score, ultra_score, execution_score, time_score),
+            "overall_score": calculate_overall(
+                spec["mode"],
+                plan_score,
+                ultra_score,
+                execution_score,
+                time_score,
+                executable_plan_score,
+                constraint_coverage_score,
+                verify_strength_score,
+                artifact_ownership_score,
+                lint_repair_score,
+            ),
             "plan_artifacts": ",".join(str(path.relative_to(run_dir)) for path in plans),
             "extras_json": extras,
         }
@@ -537,6 +568,30 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
     }
 
 
+def calculate_lint_repair_score(diagnostics: dict[str, str]) -> float:
+    score = 100.0
+    score -= 12.0 * safe_int(diagnostics.get("planner_error_count"))
+    score -= 8.0 * safe_int(diagnostics.get("planner_repair_attempts"))
+    if diagnostics.get("planner_schema_repaired") == "true":
+        score -= 10.0
+    if diagnostics.get("planner_raw_schema_violation") == "true":
+        score -= 15.0
+    if diagnostics.get("planner_parser_limitation") == "true":
+        score -= 10.0
+    if diagnostics.get("planner_prompt_issue") == "true":
+        score -= 10.0
+    if diagnostics.get("planner_stage") == "lint":
+        score -= 8.0
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+def safe_int(value: object) -> int:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def fallback_decision_cell(event: dict) -> str:
     if not event:
         return ""
@@ -603,9 +658,56 @@ def apply_time_scores(rows: list[dict]) -> None:
         if fastest and elapsed > 0:
             row["time_score"] = round(max(0.0, min(100.0, 100.0 * fastest / elapsed)), 1)
             plan = float(row["plan_quality_score"]) if row.get("plan_quality_score") not in {"", None} else None
+            executable = float(row["executable_plan_score"]) if row.get("executable_plan_score") not in {"", None} else None
+            constraint = float(row["constraint_coverage_score"]) if row.get("constraint_coverage_score") not in {"", None} else None
+            verify_strength = float(row["verify_strength_score"]) if row.get("verify_strength_score") not in {"", None} else None
+            artifact_ownership = float(row["artifact_ownership_score"]) if row.get("artifact_ownership_score") not in {"", None} else None
+            lint_repair = float(row["lint_repair_score"]) if row.get("lint_repair_score") not in {"", None} else None
             ultra = float(row["ultra_phase_quality_score"]) if row.get("ultra_phase_quality_score") not in {"", None} else None
             execution = float(row["execution_score"]) if row.get("execution_score") not in {"", None} else 0.0
-            row["overall_score"] = calculate_overall(row["mode"], plan, ultra, execution, float(row["time_score"]))
+            row["overall_score"] = calculate_overall(
+                row["mode"],
+                plan,
+                ultra,
+                execution,
+                float(row["time_score"]),
+                executable,
+                constraint,
+                verify_strength,
+                artifact_ownership,
+                lint_repair,
+            )
+
+
+def apply_stability_scores(rows: list[dict]) -> None:
+    groups: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = (
+            row.get("scenario", ""),
+            row.get("mode", ""),
+            row.get("main_provider", ""),
+            row.get("main_model", ""),
+            row.get("planner_provider", ""),
+            row.get("planner_model", ""),
+            row.get("local_llm_used", ""),
+        )
+        groups.setdefault(key, []).append(row)
+    for group in groups.values():
+        if len(group) < 2:
+            for row in group:
+                row["stability_score"] = ""
+            continue
+        overall = [float(row["overall_score"]) for row in group if row.get("overall_score") not in {"", None}]
+        elapsed = [float(row["exec_elapsed_sec"]) for row in group if row.get("exec_elapsed_sec") not in {"", None}]
+        success_values = {str(row.get("success", "")).lower() for row in group}
+        overall_stdev = statistics.pstdev(overall) if len(overall) > 1 else 0.0
+        elapsed_cv = 0.0
+        if len(elapsed) > 1 and statistics.fmean(elapsed) > 0:
+            elapsed_cv = 100.0 * statistics.pstdev(elapsed) / statistics.fmean(elapsed)
+        mixed_success_penalty = 20.0 if len(success_values) > 1 else 0.0
+        score = 100.0 - min(60.0, overall_stdev * 1.5) - min(30.0, elapsed_cv * 0.3) - mixed_success_penalty
+        for row in group:
+            row["stability_score"] = round(max(0.0, min(100.0, score)), 1)
 
 
 def assert_provider_smoke_green(summary_path: Path) -> None:

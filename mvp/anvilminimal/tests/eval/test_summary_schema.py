@@ -28,6 +28,12 @@ class SummarySchemaTest(unittest.TestCase):
         )
         self.assertIn("# Eval Compare", text)
         self.assertIn("success_rate", text)
+        self.assertIn("executable_plan_score_avg", text)
+        self.assertIn("constraint_coverage_score_avg", text)
+        self.assertIn("verify_strength_score_avg", text)
+        self.assertIn("artifact_ownership_score_avg", text)
+        self.assertIn("lint_repair_score_avg", text)
+        self.assertIn("stability_score_avg", text)
 
     def test_report_uses_failure_kind_from_extras(self):
         with tempfile.TemporaryDirectory() as td:

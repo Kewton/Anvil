@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,20 @@ STEP_WEIGHTS = {
     "verify_commands": 10,
     "dependency_order": 10,
     "repairability": 5,
+}
+
+EXECUTABLE_WEIGHTS = {
+    "actionability": 25,
+    "path_instruction_alignment": 20,
+    "read_before_create_risk": 20,
+    "verify_executability": 20,
+    "step_budget_fit": 15,
+}
+
+CONSTRAINT_COVERAGE_WEIGHTS = {
+    "expected_artifacts": 45,
+    "required_verify": 25,
+    "profile_contract": 30,
 }
 
 ULTRA_WEIGHTS = {
@@ -82,7 +97,144 @@ def score_step_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None
     total = sum(int(details[key]) for key in STEP_WEIGHTS)
     details["penalties"] = penalties
     total = max(0, min(100, total - penalty_points(penalties)))
-    return {"kind": "step", "score": total, "details": details}
+    executable = score_executable_step_plan(plan, scenario)
+    constraint = score_constraint_coverage(plan, scenario)
+    verify_strength = score_verify_strength(steps, scenario)
+    artifact_ownership = score_artifact_ownership(steps, scenario)
+    return {
+        "kind": "step",
+        "score": total,
+        "executable_score": executable["score"],
+        "constraint_coverage_score": constraint["score"],
+        "verify_strength_score": verify_strength["score"],
+        "artifact_ownership_score": artifact_ownership["score"],
+        "details": details,
+        "executable_details": executable["details"],
+        "constraint_coverage_details": constraint["details"],
+        "verify_strength_details": verify_strength["details"],
+        "artifact_ownership_details": artifact_ownership["details"],
+    }
+
+
+def score_executable_step_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None) -> dict[str, Any]:
+    scenario = scenario or {}
+    steps = plan.get("steps") or []
+    expected_artifacts = [str(path) for path in scenario.get("expected_artifacts", []) or []]
+    penalties: list[dict[str, Any]] = []
+    details: dict[str, Any] = {}
+    if not isinstance(steps, list) or not steps:
+        return {
+            "score": 0,
+            "details": {**{key: 0 for key in EXECUTABLE_WEIGHTS}, "penalties": [{"kind": "no_steps"}]},
+        }
+
+    details["actionability"] = score_actionability(steps, penalties)
+    details["path_instruction_alignment"] = score_path_instruction_alignment(steps, expected_artifacts, penalties)
+    details["read_before_create_risk"] = score_read_before_create_risk(steps, expected_artifacts, scenario, penalties)
+    details["verify_executability"] = score_verify_executability(steps, penalties)
+    details["step_budget_fit"] = score_step_budget_fit(steps, scenario, penalties)
+    total = sum(int(details[key]) for key in EXECUTABLE_WEIGHTS)
+    total = max(0, min(100, total - executable_penalty_points(penalties)))
+    details["penalties"] = penalties
+    return {"score": total, "details": details}
+
+
+def score_constraint_coverage(plan: dict[str, Any], scenario: dict[str, Any] | None = None) -> dict[str, Any]:
+    scenario = scenario or {}
+    text = plan_text(plan)
+    expected = [str(path) for path in scenario.get("expected_artifacts", []) or []]
+    required_verify = [str(keyword) for keyword in scenario.get("plan_constraints", {}).get("required_verify_keywords", []) or []]
+    profile = str(scenario.get("profile", "generic")).lower()
+    prompt = str(scenario.get("prompt", "")).lower()
+    details: dict[str, Any] = {}
+
+    artifact_hits = [path for path in expected if path.lower() in text]
+    details["expected_artifacts"] = ratio_score(len(artifact_hits), len(expected), CONSTRAINT_COVERAGE_WEIGHTS["expected_artifacts"])
+    details["missing_expected_artifacts"] = sorted(set(expected).difference(artifact_hits))
+
+    verify_hits = [keyword for keyword in required_verify if keyword.lower() in text]
+    details["required_verify"] = ratio_score(len(verify_hits), len(required_verify), CONSTRAINT_COVERAGE_WEIGHTS["required_verify"])
+    details["missing_required_verify"] = sorted(set(required_verify).difference(verify_hits))
+
+    profile_checks = profile_contract_checks(profile, prompt)
+    profile_hits = [name for name, patterns in profile_checks.items() if any(pattern in text for pattern in patterns)]
+    details["profile_contract"] = ratio_score(
+        len(profile_hits),
+        len(profile_checks),
+        CONSTRAINT_COVERAGE_WEIGHTS["profile_contract"],
+    )
+    details["missing_profile_contract"] = sorted(set(profile_checks).difference(profile_hits))
+
+    score = int(details["expected_artifacts"] + details["required_verify"] + details["profile_contract"])
+    return {"score": max(0, min(100, score)), "details": details}
+
+
+def score_verify_strength(steps: list[dict[str, Any]], scenario: dict[str, Any] | None = None) -> dict[str, Any]:
+    scenario = scenario or {}
+    commands = collect_verify_commands(steps)
+    required_verify = [str(keyword).lower() for keyword in scenario.get("plan_constraints", {}).get("required_verify_keywords", []) or []]
+    if not commands:
+        return {
+            "score": 0,
+            "details": {"commands": [], "required_verify_coverage": 0, "penalties": [{"kind": "no_verify_commands"}]},
+        }
+    strengths = [{"command": command, "strength": command_strength(command)} for command in commands]
+    average_strength = int(sum(item["strength"] for item in strengths) / len(strengths))
+    text = "\n".join(commands).lower()
+    required_hits = sum(1 for keyword in required_verify if keyword in text)
+    required_coverage = ratio_score(required_hits, len(required_verify), 100)
+    score = int(0.75 * average_strength + 0.25 * required_coverage)
+    penalties = []
+    if any(item["strength"] <= 25 for item in strengths):
+        penalties.append({"kind": "weak_verify_command"})
+    if required_verify and required_hits < len(required_verify):
+        penalties.append({"kind": "missing_required_verify_keyword"})
+    return {
+        "score": max(0, min(100, score)),
+        "details": {
+            "commands": strengths,
+            "average_command_strength": average_strength,
+            "required_verify_coverage": required_coverage,
+            "penalties": penalties,
+        },
+    }
+
+
+def score_artifact_ownership(steps: list[dict[str, Any]], scenario: dict[str, Any] | None = None) -> dict[str, Any]:
+    scenario = scenario or {}
+    expected = [str(path) for path in scenario.get("expected_artifacts", []) or []]
+    expected_set = set(expected)
+    all_paths = [str(path) for step in steps for path in step.get("expected_paths", []) or []]
+    counts = Counter(all_paths)
+    exactly_once = [path for path in expected if counts[path] == 1]
+    missing = [path for path in expected if counts[path] == 0]
+    duplicates = [path for path in expected if counts[path] > 1]
+    extras = [path for path in all_paths if path not in expected_set and not allowed_extra_artifact(path, scenario)]
+
+    ownership_score = ratio_score(len(exactly_once), len(expected), 70)
+    no_extra_score = max(0, 15 - len(set(extras)) * 12)
+    nested_expected = [path for path in expected if "/" in path]
+    nested_ok = [path for path in nested_expected if nested_path_is_naturally_owned(path, steps)]
+    nested_score = ratio_score(len(nested_ok), len(nested_expected), 15)
+    score = int(ownership_score + no_extra_score + nested_score)
+    penalties = []
+    if missing:
+        penalties.append({"kind": "missing_required_artifact_ownership", "paths": missing})
+    if duplicates:
+        penalties.append({"kind": "duplicate_required_artifact_ownership", "paths": duplicates})
+    if extras:
+        penalties.append({"kind": "extra_artifact_ownership", "paths": sorted(set(extras))})
+    return {
+        "score": max(0, min(100, score)),
+        "details": {
+            "exactly_once": exactly_once,
+            "missing": missing,
+            "duplicates": duplicates,
+            "extras": sorted(set(extras)),
+            "nested_owned": nested_ok,
+            "penalties": penalties,
+        },
+    }
 
 
 def score_ultra_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -202,6 +354,277 @@ def score_repairability(steps: list[dict[str, Any]]) -> int:
     return 1
 
 
+def score_actionability(steps: list[dict[str, Any]], penalties: list[dict[str, Any]]) -> int:
+    actionable = 0
+    required = 0
+    for step in steps:
+        paths = [str(path) for path in step.get("expected_paths", []) or []]
+        if not paths:
+            continue
+        required += 1
+        instruction = str(step.get("instruction", "")).lower()
+        if has_write_action(instruction):
+            actionable += 1
+        else:
+            penalties.append({"kind": "expected_path_without_write_action", "step": str(step.get("id", ""))})
+    if required == 0:
+        return 0
+    return int(EXECUTABLE_WEIGHTS["actionability"] * actionable / required)
+
+
+def score_path_instruction_alignment(
+    steps: list[dict[str, Any]],
+    expected_artifacts: list[str],
+    penalties: list[dict[str, Any]],
+) -> int:
+    expected = set(expected_artifacts)
+    owned = []
+    aligned = 0
+    for step in steps:
+        instruction = str(step.get("instruction", ""))
+        for path in [str(path) for path in step.get("expected_paths", []) or []]:
+            owned.append(path)
+            if path_mentions_instruction(path, instruction):
+                aligned += 1
+            else:
+                penalties.append({"kind": "expected_path_not_named_in_instruction", "path": path})
+    if not owned:
+        return 0
+    base = int(EXECUTABLE_WEIGHTS["path_instruction_alignment"] * aligned / len(owned))
+    if expected:
+        missing = sorted(expected.difference(owned))
+        if missing:
+            penalties.append({"kind": "expected_artifact_not_owned", "paths": missing})
+    return base
+
+
+def score_read_before_create_risk(
+    steps: list[dict[str, Any]],
+    expected_artifacts: list[str],
+    scenario: dict[str, Any],
+    penalties: list[dict[str, Any]],
+) -> int:
+    created: set[str] = set()
+    risk = 0
+    expected = set(expected_artifacts)
+    fresh_workspace = not scenario_has_seed_inputs(scenario)
+    for step in steps:
+        instruction = str(step.get("instruction", ""))
+        lower = instruction.lower()
+        kind = str(step.get("kind", "")).lower()
+        if fresh_workspace and expected and not created and kind in {"inspect", "analyze", "review"}:
+            if looks_like_existing_workspace_assumption(lower):
+                risk += 1
+                penalties.append({"kind": "workspace_assumption_before_creation", "step": str(step.get("id", ""))})
+        mentions = [path for path in expected if path_mentions_instruction(path, instruction)]
+        if mentions and looks_like_pre_creation_read(lower):
+            blocked = [path for path in mentions if path not in created]
+            if blocked:
+                risk += len(blocked)
+                penalties.append(
+                    {"kind": "read_before_create_risk", "paths": blocked, "step": str(step.get("id", ""))}
+                )
+        created.update(str(path) for path in step.get("expected_paths", []) or [])
+    if risk == 0:
+        return EXECUTABLE_WEIGHTS["read_before_create_risk"]
+    return max(0, EXECUTABLE_WEIGHTS["read_before_create_risk"] - risk * 10)
+
+
+def score_verify_executability(steps: list[dict[str, Any]], penalties: list[dict[str, Any]]) -> int:
+    commands: list[str] = []
+    bad = 0
+    missing_verify = 0
+    for step in steps:
+        kind = str(step.get("kind", "")).lower()
+        verify = [str(cmd) for cmd in step.get("verify", []) or []]
+        if kind == "verify" and not verify:
+            missing_verify += 1
+            penalties.append({"kind": "verify_step_without_command", "step": str(step.get("id", ""))})
+        commands.extend(verify)
+    if missing_verify:
+        bad += missing_verify
+    for command in commands:
+        if has_shell_control(command):
+            bad += 1
+            penalties.append({"kind": "verify_command_policy_error", "command": command})
+        if looks_like_setup_or_server(command):
+            bad += 1
+            penalties.append({"kind": "verify_command_not_deterministic", "command": command})
+    if not commands:
+        return 5 if not any(str(step.get("kind", "")).lower() == "verify" for step in steps) else 0
+    return max(0, EXECUTABLE_WEIGHTS["verify_executability"] - bad * 10)
+
+
+def score_step_budget_fit(
+    steps: list[dict[str, Any]],
+    scenario: dict[str, Any],
+    penalties: list[dict[str, Any]],
+) -> int:
+    size = str(scenario.get("size", "")).lower()
+    score = EXECUTABLE_WEIGHTS["step_budget_fit"]
+    for step in steps:
+        paths = [str(path) for path in step.get("expected_paths", []) or []]
+        kind = str(step.get("kind", "")).lower()
+        if kind in {"implement", "work", "create", "edit", "repair", "scaffold"}:
+            limit = 3 if size == "large" else 2
+            if len(paths) > limit:
+                score -= (len(paths) - limit) * 4
+                penalties.append(
+                    {"kind": "step_too_broad_for_budget", "step": str(step.get("id", "")), "paths": paths}
+                )
+    return max(0, score)
+
+
+def has_write_action(text: str) -> bool:
+    return any(
+        word in text
+        for word in ["create", "write", "edit", "update", "implement", "add", "fix", "generate", "document", "build"]
+    )
+
+
+def path_mentions_instruction(path: str, instruction: str) -> bool:
+    lower = instruction.lower()
+    candidate = path.lower()
+    name = Path(path).name.lower()
+    stem = Path(path).stem.lower()
+    parent = "/".join(Path(path).parts[:-1]).lower()
+    return candidate in lower or name in lower or (stem and stem in lower) or (parent and parent in lower)
+
+
+def looks_like_pre_creation_read(instruction: str) -> bool:
+    read_words = [
+        "inspect",
+        "check",
+        "read",
+        "review",
+        "look for",
+        "determine whether",
+        "whether",
+        "exists",
+        "already",
+    ]
+    create_words = ["create", "write", "add", "implement", "generate"]
+    return any(word in instruction for word in read_words) and not any(word in instruction for word in create_words)
+
+
+def looks_like_existing_workspace_assumption(instruction: str) -> bool:
+    existing_words = [
+        "already",
+        "current",
+        "existing",
+        "exists",
+        "layout",
+        "nearby",
+        "present",
+        "repository",
+        "whether",
+        "workspace",
+    ]
+    discovery_words = ["identify", "inspect", "review", "understand", "confirm", "determine"]
+    return any(word in instruction for word in existing_words) and any(word in instruction for word in discovery_words)
+
+
+def scenario_has_seed_inputs(scenario: dict[str, Any]) -> bool:
+    return any(scenario.get(key) for key in ["seed_files", "fixtures", "input_files", "workspace_files"])
+
+
+def has_shell_control(command: str) -> bool:
+    return any(token in command for token in ["&&", "||", "|", ";", "`", "$("])
+
+
+def looks_like_setup_or_server(command: str) -> bool:
+    lower = command.lower()
+    return any(
+        token in lower
+        for token in ["npm install", "pnpm install", "yarn install", "cargo install", "next dev", "vite --host"]
+    )
+
+
+def plan_text(plan: dict[str, Any]) -> str:
+    return json.dumps(plan, ensure_ascii=False, sort_keys=True).lower()
+
+
+def ratio_score(hit_count: int, total_count: int, weight: int) -> int:
+    if total_count <= 0:
+        return weight
+    return int(weight * hit_count / total_count)
+
+
+def profile_contract_checks(profile: str, prompt: str) -> dict[str, list[str]]:
+    checks: dict[str, list[str]] = {}
+    if "3011" in prompt:
+        checks["port_3011"] = ["3011"]
+    if profile == "nextjs":
+        checks.update(
+            {
+                "package_json": ["package.json"],
+                "next_dependency": ["next"],
+                "react_dependency": ["react"],
+                "react_dom_dependency": ["react-dom"],
+                "dev_port_3011": ["next dev -p 3011", "next dev --port 3011", "3011"],
+                "build_verify": ["npm run build", "next build"],
+                "page_entry": ["src/app/page.tsx"],
+                "layout_entry": ["src/app/layout.tsx"],
+                "global_types": ["src/app/global.d.ts"],
+            }
+        )
+    return checks
+
+
+def collect_verify_commands(steps: list[dict[str, Any]]) -> list[str]:
+    commands = []
+    for step in steps:
+        commands.extend(str(command) for command in step.get("verify", []) or [])
+    return commands
+
+
+def command_strength(command: str) -> int:
+    lower = command.lower()
+    score = 20
+    if "curl" in lower and "http" in lower:
+        score = 85
+    elif any(token in lower for token in ["npm run build", "next build", "cargo build", "tsc", "next lint"]):
+        score = 85
+    elif any(token in lower for token in ["cargo test", "python3 -m unittest", "python -m unittest", "pytest", "npm test"]):
+        score = 90
+    elif lower.startswith("node ") and "--check" not in lower:
+        score = 70
+    elif any(token in lower for token in ["py_compile", "node --check", "cargo check"]):
+        score = 45
+    elif lower.startswith("grep "):
+        score = 35
+    elif lower.startswith("test -f ") or lower.startswith("test -s "):
+        score = 25
+    elif lower.startswith("cat ") or lower.startswith("ls "):
+        score = 10
+    if has_shell_control(command):
+        score = max(0, score - 20)
+    if looks_like_setup_or_server(command):
+        score = min(score, 25)
+    return score
+
+
+def allowed_extra_artifact(path: str, scenario: dict[str, Any]) -> bool:
+    profile = str(scenario.get("profile", "generic")).lower()
+    allowed = set()
+    if profile == "nextjs":
+        allowed.update({"tsconfig.json", "src/app/globals.css", "next-env.d.ts"})
+    return path in allowed
+
+
+def nested_path_is_naturally_owned(path: str, steps: list[dict[str, Any]]) -> bool:
+    parent = str(Path(path).parent).lower()
+    filename = Path(path).name.lower()
+    for step in steps:
+        paths = [str(item) for item in step.get("expected_paths", []) or []]
+        if path not in paths:
+            continue
+        instruction = str(step.get("instruction", "")).lower()
+        if path.lower() in instruction or parent in instruction or filename in instruction:
+            return True
+    return False
+
+
 def keyword_hits(text: str, keywords: list[str]) -> int:
     lowered = text.lower()
     return sum(1 for keyword in keywords if keyword.lower() in lowered)
@@ -224,4 +647,29 @@ def penalty_points(penalties: list[dict[str, Any]]) -> int:
             points += 15
         elif penalty["kind"] == "step_count_out_of_range":
             points += 5
+    return points
+
+
+def executable_penalty_points(penalties: list[dict[str, Any]]) -> int:
+    points = 0
+    for penalty in penalties:
+        kind = penalty.get("kind")
+        if kind == "read_before_create_risk":
+            points += 12
+        elif kind == "workspace_assumption_before_creation":
+            points += 8
+        elif kind == "verify_command_policy_error":
+            points += 15
+        elif kind == "verify_step_without_command":
+            points += 15
+        elif kind == "expected_path_without_write_action":
+            points += 8
+        elif kind == "expected_path_not_named_in_instruction":
+            points += 4
+        elif kind == "expected_artifact_not_owned":
+            points += 12
+        elif kind == "verify_command_not_deterministic":
+            points += 10
+        elif kind == "step_too_broad_for_budget":
+            points += 6
     return points
