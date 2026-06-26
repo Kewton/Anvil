@@ -52,6 +52,139 @@ const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 3;
 const RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT: usize = 2;
 const MALFORMED_NATIVE_TOOL_RETRY_LIMIT: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptArtifactExtraction {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionContractPathMerge {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionContractVerification {
+    Enabled,
+    DisabledDuringStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActionNoToolPolicy {
+    RequireWriteForActionPrompt,
+    RequireToolOnlyIfNoToolSeen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunSessionScope {
+    MinimalLoop,
+    PlanRunStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunSessionStepKind {
+    Inspect,
+    Setup,
+    Implement,
+    Verify,
+    Report,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunSessionOptions {
+    pub prompt_artifact_extraction: PromptArtifactExtraction,
+    pub completion_contract_path_merge: CompletionContractPathMerge,
+    pub completion_contract_verification: CompletionContractVerification,
+    pub action_no_tool_policy: ActionNoToolPolicy,
+    pub scope: RunSessionScope,
+    pub step_kind: Option<RunSessionStepKind>,
+}
+
+impl Default for RunSessionOptions {
+    fn default() -> Self {
+        Self {
+            prompt_artifact_extraction: PromptArtifactExtraction::Enabled,
+            completion_contract_path_merge: CompletionContractPathMerge::Enabled,
+            completion_contract_verification: CompletionContractVerification::Enabled,
+            action_no_tool_policy: ActionNoToolPolicy::RequireWriteForActionPrompt,
+            scope: RunSessionScope::MinimalLoop,
+            step_kind: None,
+        }
+    }
+}
+
+impl RunSessionOptions {
+    pub(crate) fn plan_step(step_kind: RunSessionStepKind) -> Self {
+        Self {
+            prompt_artifact_extraction: PromptArtifactExtraction::Disabled,
+            completion_contract_path_merge: CompletionContractPathMerge::Disabled,
+            completion_contract_verification: CompletionContractVerification::DisabledDuringStep,
+            action_no_tool_policy: ActionNoToolPolicy::RequireToolOnlyIfNoToolSeen,
+            scope: RunSessionScope::PlanRunStep,
+            step_kind: Some(step_kind),
+        }
+    }
+
+    fn contract_runtime_enabled(self) -> bool {
+        self.completion_contract_verification == CompletionContractVerification::Enabled
+    }
+
+    fn contract_path_merge_enabled(self) -> bool {
+        self.completion_contract_path_merge == CompletionContractPathMerge::Enabled
+    }
+
+    fn prompt_artifact_extraction_enabled(self) -> bool {
+        self.prompt_artifact_extraction == PromptArtifactExtraction::Enabled
+    }
+
+    fn requires_action_tool_feedback(
+        self,
+        write_or_edit_seen: bool,
+        tool_call_count: usize,
+    ) -> bool {
+        match self.action_no_tool_policy {
+            ActionNoToolPolicy::RequireWriteForActionPrompt => !write_or_edit_seen,
+            ActionNoToolPolicy::RequireToolOnlyIfNoToolSeen => tool_call_count == 0,
+        }
+    }
+
+    fn allows_tool_only_step_completion(self) -> bool {
+        self.scope == RunSessionScope::PlanRunStep
+            && matches!(
+                self.step_kind,
+                Some(
+                    RunSessionStepKind::Inspect
+                        | RunSessionStepKind::Setup
+                        | RunSessionStepKind::Verify
+                )
+            )
+    }
+}
+
+impl RunSessionScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            RunSessionScope::MinimalLoop => "minimal-loop",
+            RunSessionScope::PlanRunStep => "plan-run-step",
+        }
+    }
+}
+
+impl RunSessionStepKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            RunSessionStepKind::Inspect => "inspect",
+            RunSessionStepKind::Setup => "setup",
+            RunSessionStepKind::Implement => "implement",
+            RunSessionStepKind::Verify => "verify",
+            RunSessionStepKind::Report => "report",
+            RunSessionStepKind::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct VerifyRepairState {
     pending_signature: Option<VerificationSignature>,
@@ -162,12 +295,37 @@ pub fn run_session_with_outcome_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<RunSessionOutcome> {
+    run_session_with_outcome_with_options(
+        client,
+        session,
+        user_prompt,
+        required_paths,
+        config,
+        ui,
+        RunSessionOptions::default(),
+    )
+}
+
+pub(crate) fn run_session_with_outcome_with_options(
+    client: &mut dyn ChatClient,
+    session: &mut SessionSnapshot,
+    user_prompt: &str,
+    required_paths: &[String],
+    config: &Config,
+    ui: &dyn InteractionUi,
+    options: RunSessionOptions,
+) -> anyhow::Result<RunSessionOutcome> {
     let registry = ToolRegistry::default();
     let mut native_tools_enabled =
         client.supports_native_tools(&config.model) && !session.native_tools_disabled;
-    let completion_contract = CompletionContract::load_for_config(config)?;
+    let completion_contract =
+        if options.contract_runtime_enabled() || options.contract_path_merge_enabled() {
+            CompletionContract::load_for_config(config)?
+        } else {
+            None
+        };
     let explicit_required_paths = !required_paths.is_empty();
-    let required_paths = effective_required_paths(
+    let path_sources = effective_required_path_sources(
         &config.workspace_root,
         required_paths,
         user_prompt,
@@ -175,8 +333,16 @@ pub fn run_session_with_outcome_with_ui(
             .as_ref()
             .map(|contract| contract.required_paths.as_slice())
             .unwrap_or(&[]),
+        options,
     );
+    let required_paths = path_sources.effective_required_paths.clone();
     let initially_missing_paths = missing_paths(&config.workspace_root, &required_paths);
+    emit_step_obligation_scope(
+        config.eval_events_path.as_deref(),
+        options,
+        &path_sources,
+        &initially_missing_paths,
+    );
     let mut pending_feedback: Option<String> = None;
     let mut verify_attempts = 0usize;
     let mut last_blocking_reason: Option<String> = None;
@@ -186,13 +352,15 @@ pub fn run_session_with_outcome_with_ui(
     let mut empty_feedbacks = 0usize;
     let mut changed_paths: Vec<String> = Vec::new();
     let mut tool_call_count = 0usize;
-    let artifact_recovery_enabled = completion_contract.is_some() || explicit_required_paths;
+    let contract_runtime_enabled = options.contract_runtime_enabled();
+    let artifact_recovery_enabled =
+        explicit_required_paths || (contract_runtime_enabled && completion_contract.is_some());
     let mut artifact_non_edit_streak = 0usize;
     let mut artifact_recovery_state = ArtifactRecoveryState::default();
     let mut verify_repair_state = VerifyRepairState::default();
     let mut recoverable_tool_error_state = RecoverableToolErrorState::default();
     let mut malformed_native_tool_feedbacks = 0usize;
-    let iteration_limit = if completion_contract.is_some() {
+    let iteration_limit = if contract_runtime_enabled && completion_contract.is_some() {
         config.max_iterations
             + ARTIFACT_RECOVERY_ATTEMPT_LIMIT.saturating_mul(required_paths.len().max(1))
             + 1
@@ -329,7 +497,9 @@ pub fn run_session_with_outcome_with_ui(
                         enabled: artifact_recovery_enabled,
                         missing_paths: &missing,
                         required_paths: &required_paths,
-                        contract: completion_contract.as_ref(),
+                        contract: completion_contract
+                            .as_ref()
+                            .filter(|_| contract_runtime_enabled),
                         root: &config.workspace_root,
                     },
                 )? {
@@ -349,7 +519,9 @@ pub fn run_session_with_outcome_with_ui(
                 pending_feedback = Some(super::feedback::empty_response());
                 continue;
             }
-            if !write_or_edit_seen && looks_like_action_prompt(user_prompt) {
+            if options.requires_action_tool_feedback(write_or_edit_seen, tool_call_count)
+                && looks_like_action_prompt(user_prompt)
+            {
                 if no_tool_feedbacks < 1 {
                     no_tool_feedbacks += 1;
                     session.messages.pop();
@@ -360,7 +532,7 @@ pub fn run_session_with_outcome_with_ui(
                 session.messages.pop();
                 bail!("missing tool call for action prompt after feedback");
             }
-            if !write_or_edit_seen
+            if options.requires_action_tool_feedback(write_or_edit_seen, tool_call_count)
                 && looks_like_progress_without_tool(&reply.content)
                 && no_tool_feedbacks < 3
             {
@@ -382,6 +554,7 @@ pub fn run_session_with_outcome_with_ui(
             }
             if let Some(contract) = completion_contract
                 .as_ref()
+                .filter(|_| contract_runtime_enabled)
                 .filter(|contract| contract.has_verify())
             {
                 if let Some(feedback) = handle_verify_repair_no_edit(
@@ -576,6 +749,27 @@ pub fn run_session_with_outcome_with_ui(
                 artifact_recovery_state.record_action("non_edit_tool");
             }
         }
+        if required_paths.is_empty() && options.allows_tool_only_step_completion() {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "loop_stop",
+                    "reason": "step_tool_observation_completed",
+                    "tool_calls": tool_call_count,
+                }),
+            );
+            return Ok(RunSessionOutcome {
+                final_text: "step tool observation completed".to_string(),
+                stop_reason: RunStopReason::AssistantFinal,
+                changed_paths,
+                iterations: iteration + 1,
+                tool_calls: tool_call_count,
+                missing_required_paths: Vec::new(),
+                verify_attempts,
+                last_blocking_reason,
+                last_provider_error,
+            });
+        }
         if required_paths_satisfied_after_tool(
             &config.workspace_root,
             &required_paths,
@@ -593,6 +787,7 @@ pub fn run_session_with_outcome_with_ui(
             }
             if let Some(contract) = completion_contract
                 .as_ref()
+                .filter(|_| contract_runtime_enabled)
                 .filter(|contract| contract.has_verify())
             {
                 if !batch_had_edit
@@ -683,7 +878,9 @@ pub fn run_session_with_outcome_with_ui(
                 enabled: artifact_recovery_enabled,
                 missing_paths: &missing,
                 required_paths: &required_paths,
-                contract: completion_contract.as_ref(),
+                contract: completion_contract
+                    .as_ref()
+                    .filter(|_| contract_runtime_enabled),
                 root: &config.workspace_root,
             },
         )? {
@@ -723,25 +920,80 @@ fn missing_paths(root: &std::path::Path, required_paths: &[String]) -> Vec<Strin
         .collect()
 }
 
-fn effective_required_paths(
+#[derive(Debug, Clone)]
+struct RequiredPathSources {
+    explicit_required_paths: Vec<String>,
+    prompt_extracted_paths: Vec<String>,
+    completion_contract_paths: Vec<String>,
+    effective_required_paths: Vec<String>,
+}
+
+fn effective_required_path_sources(
     root: &Path,
     explicit: &[String],
     prompt: &str,
     contract_paths: &[String],
-) -> Vec<String> {
+    options: RunSessionOptions,
+) -> RequiredPathSources {
+    let prompt_extracted_paths = if options.prompt_artifact_extraction_enabled() {
+        extract_requested_artifact_paths(root, prompt)
+    } else {
+        Vec::new()
+    };
+    let completion_contract_paths = if options.contract_path_merge_enabled() {
+        contract_paths.to_vec()
+    } else {
+        Vec::new()
+    };
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
-    for path in explicit
-        .iter()
-        .cloned()
-        .chain(extract_requested_artifact_paths(root, prompt))
-        .chain(contract_paths.iter().cloned())
-    {
+    for path in explicit.iter().cloned() {
         if seen.insert(path.clone()) {
             out.push(path);
         }
     }
-    out
+    for path in prompt_extracted_paths.iter().cloned() {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    for path in completion_contract_paths.iter().cloned() {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    RequiredPathSources {
+        explicit_required_paths: explicit.to_vec(),
+        prompt_extracted_paths,
+        completion_contract_paths,
+        effective_required_paths: out,
+    }
+}
+
+fn emit_step_obligation_scope(
+    eval_events_path: Option<&Path>,
+    options: RunSessionOptions,
+    sources: &RequiredPathSources,
+    initially_missing_paths: &[String],
+) {
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "step_obligation_scope",
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "explicit_required_paths": sources.explicit_required_paths.clone(),
+            "prompt_extracted_paths_enabled": options.prompt_artifact_extraction_enabled(),
+            "prompt_extracted_paths": sources.prompt_extracted_paths.clone(),
+            "completion_contract_path_merge_enabled": options.contract_path_merge_enabled(),
+            "completion_contract_verification_enabled": options.contract_runtime_enabled(),
+            "completion_contract_paths": sources.completion_contract_paths.clone(),
+            "effective_required_paths": sources.effective_required_paths.clone(),
+            "initially_missing_paths": initially_missing_paths,
+            "contract_paths_merged": options.contract_path_merge_enabled()
+                && !sources.completion_contract_paths.is_empty(),
+        }),
+    );
 }
 
 fn verify_completion_contract(
@@ -1288,6 +1540,138 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "ok"
         );
+    }
+
+    #[test]
+    fn default_run_session_options_preserve_prompt_artifact_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "Create the file.\n\nRequired final artifacts:\n- a.txt",
+            &[],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert!(dir.path().join("a.txt").is_file());
+    }
+
+    #[test]
+    fn plan_step_disables_prompt_required_artifact_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply::text("workspace inspected"))],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Inspect workspace.\n\nRequired final artifacts:\n- README.md",
+            &[],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Inspect),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert!(!dir.path().join("README.md").exists());
+    }
+
+    #[test]
+    fn plan_step_disables_completion_contract_verification_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(&contract, "not json").unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply::text("workspace inspected"))],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Inspect workspace",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Inspect),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+    }
+
+    #[test]
+    fn verify_step_with_bash_then_final_text_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Bash", json!({"command":"true"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("verification passed")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create app. Verify the current step.",
+            &[],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert_eq!(outcome.tool_calls, 1);
+    }
+
+    #[test]
+    fn verify_step_with_bash_only_can_delegate_to_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command":"true"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create app. Verify the current step.",
+            &[],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert_eq!(outcome.final_text, "step tool observation completed");
+        assert_eq!(outcome.tool_calls, 1);
     }
 
     #[test]

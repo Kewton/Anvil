@@ -79,6 +79,9 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
                 "prompt_contract": fmt(
                     mean([to_float(row.get("prompt_contract_score")) for row in group])
                 ),
+                "obligation_scope": fmt(
+                    mean([to_float(row.get("step_obligation_scope_score")) for row in group])
+                ),
                 "p50_exec_sec": fmt(percentile(elapsed, 50)),
             }
         )
@@ -96,6 +99,7 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
             "predictive",
             "runtime_health",
             "prompt_contract",
+            "obligation_scope",
             "p50_exec_sec",
         ],
     )
@@ -159,6 +163,7 @@ def additional_plan_metric_rankings(rows: list[dict[str, str]]) -> list[str]:
         "artifact_progress_score",
         "finalization_score",
         "tool_policy_compatibility_score",
+        "step_obligation_scope_score",
     ]
     lines = ["## Detailed Metric Diagnostics", ""]
     ranked_rows = []
@@ -519,6 +524,11 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             "prompt_contract_score_avg",
             mean([to_float(r.get("prompt_contract_score")) for r in base]),
             mean([to_float(r.get("prompt_contract_score")) for r in exp]),
+        ),
+        (
+            "step_obligation_scope_score_avg",
+            mean([to_float(r.get("step_obligation_scope_score")) for r in base]),
+            mean([to_float(r.get("step_obligation_scope_score")) for r in exp]),
         ),
         (
             "executable_plan_score_avg",

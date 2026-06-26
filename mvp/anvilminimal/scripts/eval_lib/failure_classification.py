@@ -11,6 +11,7 @@ KNOWN_FAILURE_KINDS = {
     "max_iterations_after_provider_error",
     "missing_tool_call",
     "path_confinement_error",
+    "plan_final_contract_failure",
     "phase_scaffold_error",
     "planner_lint_error",
     "planner_schema_error",
@@ -27,6 +28,8 @@ KNOWN_FAILURE_KINDS = {
     "tool_execution_error",
     "tool_validation_error",
     "unclassified_process_failure",
+    "step_obligation_scope_violation",
+    "step_verify_failure",
     "artifact_recovery_exhausted",
     "deferred_verify_requirement_pending",
     "test_discovery_failure",
@@ -74,6 +77,29 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "planner_model": event.get("planner_model", ""),
                 "planner_repair_attempts": event.get("repair_attempt", ""),
             }
+        if name == "plan_final_contract" and event.get("ok") is False:
+            return {
+                "failure_kind": "plan_final_contract_failure",
+                "last_loop_stop": "plan_final_contract_failure",
+                "missing_artifacts": ",".join(
+                    str(path) for path in event.get("missing_final_artifacts", []) or []
+                ),
+            }
+        if name == "step_obligation_scope":
+            if (
+                event.get("session_scope") == "plan-run-step"
+                and (
+                    event.get("prompt_extracted_paths_enabled")
+                    or event.get("completion_contract_path_merge_enabled")
+                    or event.get("completion_contract_verification_enabled")
+                    or list(event.get("effective_required_paths", []) or [])
+                    != list(event.get("explicit_required_paths", []) or [])
+                )
+            ):
+                return {
+                    "failure_kind": "step_obligation_scope_violation",
+                    "last_loop_stop": "step_obligation_scope_violation",
+                }
         if name == "loop_stop" and event.get("reason") == "artifact_recovery_exhausted":
             return {
                 "failure_kind": "artifact_recovery_exhausted",
@@ -210,6 +236,12 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
         if "profile contract" in lower or "scripts.build must be next build" in lower:
             return {"failure_kind": "profile_contract_failure"}
         return {"failure_kind": "verify_repair_exhausted"}
+    if "plan final contract failed" in lower:
+        return {"failure_kind": "plan_final_contract_failure"}
+    if "step obligation scope" in lower:
+        return {"failure_kind": "step_obligation_scope_violation"}
+    if "failed verification after bounded repair" in lower:
+        return {"failure_kind": "step_verify_failure"}
     if "missing tool call for action prompt" in lower:
         return {"failure_kind": "missing_tool_call"}
     http = re.search(r"(OpenAI Responses API|Gemini interactions API) failed: (\d{3})", stderr)

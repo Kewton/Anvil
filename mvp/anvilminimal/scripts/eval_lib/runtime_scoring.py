@@ -25,6 +25,8 @@ def score_runtime_health(
         "tool_validation_error",
         "artifact_stagnation_feedback",
         "loop_stop",
+        "step_obligation_scope",
+        "plan_final_contract",
     }
     has_runtime_events = any(event.get("event") in runtime_event_names for event in events)
     if mode not in RUNTIME_EXECUTION_MODES or not has_runtime_events:
@@ -35,6 +37,8 @@ def score_runtime_health(
             "tool_policy_compatibility_score": "",
             "plan_run_runtime_health_score": "",
             "prompt_contract_score": score_prompt_contract(events),
+            "step_obligation_scope_score": "",
+            "step_obligation_scope_violation_count": "",
         }
 
     names = Counter(
@@ -106,6 +110,7 @@ def score_runtime_health(
         + 0.20 * finalization,
         1,
     )
+    obligation_scope_score, obligation_scope_violations = score_step_obligation_scope(events)
     return {
         "runtime_friction_score": round(runtime_friction, 1),
         "artifact_progress_score": round(artifact_progress, 1),
@@ -113,6 +118,8 @@ def score_runtime_health(
         "tool_policy_compatibility_score": round(policy, 1),
         "plan_run_runtime_health_score": runtime_health,
         "prompt_contract_score": score_prompt_contract(events),
+        "step_obligation_scope_score": obligation_scope_score,
+        "step_obligation_scope_violation_count": obligation_scope_violations,
     }
 
 
@@ -137,6 +144,45 @@ def score_prompt_contract(events: list[dict[str, Any]]) -> float | str:
             checks.append(bool(event.get("has_prior_artifact_context")))
         scores.append(100.0 * sum(1 for check in checks if check) / len(checks))
     return round(sum(scores) / len(scores), 1)
+
+
+def score_step_obligation_scope(events: list[dict[str, Any]]) -> tuple[float | str, int | str]:
+    scope_events = [
+        event
+        for event in events
+        if event.get("event") == "step_obligation_scope"
+        and event.get("session_scope") == "plan-run-step"
+    ]
+    if not scope_events:
+        return "", ""
+    scores = []
+    violations = 0
+    for event in scope_events:
+        explicit = [str(path) for path in event.get("explicit_required_paths", []) or []]
+        effective = [str(path) for path in event.get("effective_required_paths", []) or []]
+        prompt_extracted = [
+            str(path) for path in event.get("prompt_extracted_paths", []) or []
+        ]
+        contract_paths = [
+            str(path) for path in event.get("completion_contract_paths", []) or []
+        ]
+        extraction_enabled = bool(event.get("prompt_extracted_paths_enabled"))
+        contract_merge_enabled = bool(event.get("completion_contract_path_merge_enabled"))
+        contract_verify_enabled = bool(event.get("completion_contract_verification_enabled"))
+        score = 100.0
+        if extraction_enabled:
+            score -= 30.0 if prompt_extracted else 15.0
+        if contract_merge_enabled:
+            score -= 30.0 if contract_paths else 15.0
+        if contract_verify_enabled:
+            score -= 20.0
+        if effective != explicit:
+            score -= 30.0
+        score = clamp(score)
+        if score < 100.0:
+            violations += 1
+        scores.append(score)
+    return round(sum(scores) / len(scores), 1), violations
 
 
 def clamp(value: float) -> float:

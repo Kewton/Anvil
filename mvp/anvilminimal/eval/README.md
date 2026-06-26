@@ -67,6 +67,21 @@ and lint-repair scores for `step-plan`, `plan-run`, and `ultra-step-run` rows so
 a plan that looks well structured but is hard to execute is visible before the
 runtime phase fails.
 
+For runtime rows, additional scores explain whether a generated plan can
+actually close through the minimal loop:
+
+- `plan_run_runtime_health_score`: aggregate of runtime friction, artifact
+  progress, tool policy compatibility, and finalization. This is intentionally
+  separate from static YAML quality.
+- `prompt_contract_score`: whether the step execution prompt contains the
+  source-parity context sections, such as overall goal, final artifacts,
+  expected paths, verify commands, expected result, and bounded repair policy.
+- `step_obligation_scope_score`: whether `plan-run` step execution treats only
+  the current step's `expected_paths` as current obligations. It penalizes
+  prompt-extracted final artifacts, completion-contract paths, or completion
+  contract verification leaking into a step turn. Plan-level final contract
+  verification is scored separately by success/failure classification.
+
 `report.md` also includes `Plan Run Predictiveness` when both `step-plan` and
 `plan-run` rows exist for the same scenario/model pair. It reports correlation,
 false positives, and false negatives for the plan score as a predictor of

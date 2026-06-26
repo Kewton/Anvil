@@ -3,7 +3,11 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::eval_events;
-use crate::minimal_loop::loop_run::run_session_with_outcome_with_ui;
+use crate::minimal_loop::completion::CompletionContract;
+use crate::minimal_loop::loop_run::{
+    RunSessionOptions, RunSessionStepKind, extract_requested_artifact_paths,
+    run_session_with_outcome_with_options,
+};
 use crate::planner::intent::detect_intent;
 use crate::planner::lint::{
     PlanLintReport, PlanQualityContext, PlanQualityReport, lint_step_plan_report,
@@ -24,6 +28,7 @@ use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render
 use crate::planner::verify::{VerificationReport, verify_step};
 use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
+use crate::tools::path_guard::resolve_existing;
 use crate::tui::status::UiStatus;
 use crate::tui::{InteractionUi, NOOP_UI};
 use serde_json::json;
@@ -248,13 +253,23 @@ pub fn run_step_plan_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<String> {
+    run_step_plan_with_ui_inner(client, plan, config, ui, true)
+}
+
+fn run_step_plan_with_ui_inner(
+    client: &mut dyn ChatClient,
+    plan: &StepPlan,
+    config: &Config,
+    ui: &dyn InteractionUi,
+    verify_final_contract: bool,
+) -> anyhow::Result<String> {
     let report = lint_step_plan_report(plan);
     if !report.is_pass() {
         emit_planner_error_for_lint(config, "plan-file", &config.planner_model, &report, 0);
         anyhow::bail!("{}", report.primary_message());
     }
     let mut session = SessionSnapshot::new();
-    let required_final_artifacts = required_final_artifacts(plan);
+    let required_final_artifacts = required_final_artifacts(plan, &config.workspace_root);
     let mut prior_expected_paths = Vec::new();
     for step in &plan.steps {
         if ui.interrupted() {
@@ -274,6 +289,9 @@ pub fn run_step_plan_with_ui(
             ui,
         )?;
         merge_unique_strings(&mut prior_expected_paths, &step.expected_paths);
+    }
+    if verify_final_contract {
+        verify_plan_final_contract(plan, &required_final_artifacts, config)?;
     }
     Ok(format!("plan-run complete: {} steps", plan.steps.len()))
 }
@@ -302,13 +320,15 @@ fn run_step(
         return Ok(());
     }
     let step_config = capped_config(config, STEP_TURN_MAX_ITERATIONS);
-    let initial = run_session_with_outcome_with_ui(
+    let step_options = step_run_session_options(step);
+    let initial = run_session_with_outcome_with_options(
         client,
         session,
         &instruction,
         &step.expected_paths,
         &step_config,
         ui,
+        step_options,
     )?;
     let report = verify_step(&config.workspace_root, step);
     if report.is_pass() {
@@ -335,13 +355,14 @@ fn run_step(
     for attempt in 1..=STEP_REPAIR_MAX_TURNS {
         context.repair_attempt = Some(attempt);
         let repair_prompt = build_repair_prompt_with_context(&step.id, &current_report, &context);
-        let repair = run_session_with_outcome_with_ui(
+        let repair = run_session_with_outcome_with_options(
             client,
             session,
             &repair_prompt,
             &step.expected_paths,
             &repair_config,
             ui,
+            step_options,
         )?;
         repair_stop_reason = Some(format!("{:?}", repair.stop_reason));
         merge_changed_files(&mut context, &repair.changed_paths);
@@ -378,18 +399,99 @@ fn run_step(
     )
 }
 
+fn step_run_session_options(step: &PlanStep) -> RunSessionOptions {
+    RunSessionOptions::plan_step(run_session_step_kind(step))
+}
+
+fn run_session_step_kind(step: &PlanStep) -> RunSessionStepKind {
+    match step.step_kind() {
+        StepKind::Inspect => RunSessionStepKind::Inspect,
+        StepKind::Setup => RunSessionStepKind::Setup,
+        StepKind::Implement => RunSessionStepKind::Implement,
+        StepKind::Verify => RunSessionStepKind::Verify,
+        StepKind::Report => RunSessionStepKind::Report,
+        StepKind::Unknown(_) => RunSessionStepKind::Unknown,
+    }
+}
+
 fn capped_config(config: &Config, cap: usize) -> Config {
     let mut out = config.clone();
     out.max_iterations = out.max_iterations.min(cap);
     out
 }
 
-fn required_final_artifacts(plan: &StepPlan) -> Vec<String> {
+fn required_final_artifacts(plan: &StepPlan, root: &Path) -> Vec<String> {
     let mut out = Vec::new();
+    merge_unique_strings(
+        &mut out,
+        &extract_requested_artifact_paths(root, &plan.goal),
+    );
     for step in &plan.steps {
         merge_unique_strings(&mut out, &step.expected_paths);
     }
     out
+}
+
+fn verify_plan_final_contract(
+    plan: &StepPlan,
+    required_final_artifacts: &[String],
+    config: &Config,
+) -> anyhow::Result<()> {
+    let external_contract = CompletionContract::load_for_config(config)?;
+    let mut required_paths = required_final_artifacts.to_vec();
+    if let Some(contract) = external_contract.as_ref() {
+        merge_unique_strings(&mut required_paths, &contract.required_paths);
+    }
+    let missing_final_artifacts = missing_final_artifacts(&config.workspace_root, &required_paths);
+    let external_report = external_contract
+        .as_ref()
+        .map(|contract| contract.verify_with_goal(&config.workspace_root, &plan.goal));
+    let external_ok = external_report
+        .as_ref()
+        .is_none_or(|report| report.is_pass());
+    let ok = missing_final_artifacts.is_empty() && external_ok;
+    let primary_reason = if !missing_final_artifacts.is_empty() {
+        format!(
+            "missing final artifacts: {}",
+            missing_final_artifacts.join(", ")
+        )
+    } else if let Some(report) = external_report.as_ref().filter(|report| !report.is_pass()) {
+        report.primary_reason()
+    } else {
+        "ok".to_string()
+    };
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "plan_final_contract",
+            "required_final_artifacts": required_paths,
+            "missing_final_artifacts": missing_final_artifacts,
+            "external_contract_checked": external_contract.is_some(),
+            "external_contract_ok": external_ok,
+            "ok": ok,
+            "primary_reason": eval_events::body_snippet(&primary_reason),
+        }),
+    );
+    if ok {
+        return Ok(());
+    }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "loop_stop",
+            "reason": "plan_final_contract_failure",
+            "primary_reason": eval_events::body_snippet(&primary_reason),
+        }),
+    );
+    anyhow::bail!("plan final contract failed: {primary_reason}")
+}
+
+fn missing_final_artifacts(root: &Path, required_paths: &[String]) -> Vec<String> {
+    required_paths
+        .iter()
+        .filter(|path| resolve_existing(root, path).is_err())
+        .cloned()
+        .collect()
 }
 
 fn merge_unique_strings(out: &mut Vec<String>, incoming: &[String]) {
@@ -588,7 +690,8 @@ pub fn run_ultra_plan_with_ui(
                 anyhow::anyhow!("phase scaffold failed: {}", err)
             })?;
         save_step_plan(&config.workspace_root, &step_plan)?;
-        run_step_plan_with_ui(execution, &step_plan, config, ui)
+        let final_phase = index + 1 == plan.phases.len();
+        run_step_plan_with_ui_inner(execution, &step_plan, config, ui, final_phase)
             .map_err(|err| anyhow::anyhow!("phase {} failed: {err}", phase.id))?;
         let snapshot_report =
             profile_after_phase(&config.workspace_root, &plan.profile, &profile_snapshot);
@@ -600,7 +703,6 @@ pub fn run_ultra_plan_with_ui(
             ));
         }
         let profile_report = verify_profile(&config.workspace_root, &plan.profile, &plan.goal);
-        let final_phase = index + 1 == plan.phases.len();
         if !profile_report.is_pass() {
             if final_phase
                 && profile_auto_repair(
@@ -627,13 +729,14 @@ pub fn run_ultra_plan_with_ui(
                     profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
                 let mut repair_session = SessionSnapshot::new();
                 let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
-                run_session_with_outcome_with_ui(
+                run_session_with_outcome_with_options(
                     execution,
                     &mut repair_session,
                     &repair_prompt,
                     &expected_paths,
                     &repair_config,
                     ui,
+                    RunSessionOptions::plan_step(RunSessionStepKind::Implement),
                 )
                 .map_err(|err| {
                     anyhow::anyhow!("phase {} profile repair failed: {err}", phase.id)
@@ -1951,6 +2054,105 @@ mod tests {
         .to_string();
         assert!(err.contains("profile snapshot verification failed"));
         assert!(err.contains("content changed"));
+    }
+
+    #[test]
+    fn plan_run_final_contract_fails_when_required_final_artifact_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = StepPlan::single("Update docs\n\nRequired final artifacts:\n- README.md");
+        let mut fake = FakeClient::new(vec![]);
+        let err = run_step_plan(&mut fake, &plan, &config(dir.path().to_path_buf()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plan final contract failed"));
+        assert!(err.contains("README.md"));
+    }
+
+    #[test]
+    fn plan_run_final_contract_passes_after_step_artifacts_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = StepPlan {
+            goal: "Create a.txt\n\nRequired final artifacts:\n- a.txt".to_string(),
+            steps: vec![PlanStep {
+                id: "code".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create a.txt".to_string(),
+                expected_paths: vec!["a.txt".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"a.txt","content":"ok"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let result = run_step_plan(&mut fake, &plan, &config(dir.path().to_path_buf())).unwrap();
+        assert_eq!(result, "plan-run complete: 1 steps");
+        assert!(dir.path().join("a.txt").is_file());
+    }
+
+    #[test]
+    fn plan_run_external_completion_contract_checked_at_plan_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":[],"verify_commands":["test -f missing.txt"]}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let plan = StepPlan::single("Inspect workspace");
+        let mut fake = FakeClient::new(vec![]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plan final contract failed"));
+    }
+
+    #[test]
+    fn run_plan_file_uses_same_step_runtime_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let plan = StepPlan {
+            goal: "Inspect workspace\n\nRequired final artifacts:\n- README.md".to_string(),
+            steps: vec![PlanStep {
+                id: "inspect".to_string(),
+                kind: "inspect".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Inspect workspace".to_string(),
+                expected_paths: Vec::new(),
+                verify: Vec::new(),
+            }],
+        };
+        let path = save_step_plan(dir.path(), &plan).unwrap();
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("inspected"),
+        ]);
+        let err = run_plan_file(&mut fake, &path, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plan final contract failed"));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"session_scope\":\"plan-run-step\""));
+        assert!(event_text.contains("\"prompt_extracted_paths_enabled\":false"));
+        assert!(event_text.contains("\"completion_contract_verification_enabled\":false"));
     }
 
     #[test]

@@ -64,6 +64,7 @@ class RuntimeScoringTest(unittest.TestCase):
         self.assertEqual(score["runtime_friction_score"], "")
         self.assertEqual(score["plan_run_runtime_health_score"], "")
         self.assertEqual(score["prompt_contract_score"], "")
+        self.assertEqual(score["step_obligation_scope_score"], "")
 
     def test_prompt_contract_score_uses_boolean_event_without_prompt_body(self):
         events = [
@@ -94,6 +95,60 @@ class RuntimeScoringTest(unittest.TestCase):
                 workdir=Path(td),
             )
         self.assertEqual(score["prompt_contract_score"], 100.0)
+
+    def test_step_obligation_scope_score_detects_disabled_extraction(self):
+        events = [
+            {"event": "provider_response", "tool_calls": 1},
+            {
+                "event": "step_obligation_scope",
+                "session_scope": "plan-run-step",
+                "explicit_required_paths": ["src/app/page.tsx"],
+                "effective_required_paths": ["src/app/page.tsx"],
+                "prompt_extracted_paths_enabled": False,
+                "prompt_extracted_paths": [],
+                "completion_contract_path_merge_enabled": False,
+                "completion_contract_verification_enabled": False,
+                "completion_contract_paths": [],
+            },
+            {"event": "loop_stop", "reason": "required_artifacts_satisfied_after_tool"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="plan-run",
+                success=True,
+                scenario={"expected_artifacts": []},
+                workdir=Path(td),
+            )
+        self.assertEqual(score["step_obligation_scope_score"], 100.0)
+        self.assertEqual(score["step_obligation_scope_violation_count"], 0)
+
+    def test_step_obligation_scope_score_penalizes_context_artifact_merge(self):
+        events = [
+            {"event": "provider_response", "tool_calls": 1},
+            {
+                "event": "step_obligation_scope",
+                "session_scope": "plan-run-step",
+                "explicit_required_paths": [],
+                "effective_required_paths": ["README.md"],
+                "prompt_extracted_paths_enabled": True,
+                "prompt_extracted_paths": ["README.md"],
+                "completion_contract_path_merge_enabled": False,
+                "completion_contract_verification_enabled": False,
+                "completion_contract_paths": [],
+            },
+            {"event": "loop_stop", "reason": "required_artifacts_missing"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="plan-run",
+                success=False,
+                scenario={"expected_artifacts": ["README.md"]},
+                workdir=Path(td),
+            )
+        self.assertLess(score["step_obligation_scope_score"], 100.0)
+        self.assertEqual(score["step_obligation_scope_violation_count"], 1)
 
 
 if __name__ == "__main__":
