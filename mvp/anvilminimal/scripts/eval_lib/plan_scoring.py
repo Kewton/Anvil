@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .simple_yaml import load_yaml
+from .verify_adequacy import score_verify_adequacy_for_plan
 
 
 STEP_WEIGHTS = {
@@ -74,6 +75,10 @@ def parse_failure(error: str) -> dict[str, Any]:
         "executable_score": 0,
         "constraint_coverage_score": 0,
         "verify_strength_score": 0,
+        "verify_adequacy_score": 0,
+        "semantic_verify_coverage_score": 0,
+        "behavior_oracle_declared_score": 0,
+        "contentless_verify_penalty": 0,
         "artifact_ownership_score": 0,
         "execution_shape_readiness_score": 0,
         "details": details,
@@ -118,6 +123,7 @@ def score_step_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None
     executable = score_executable_step_plan(plan, scenario)
     constraint = score_constraint_coverage(plan, scenario)
     verify_strength = score_verify_strength(steps, scenario)
+    verify_adequacy = score_verify_adequacy_for_plan(plan, scenario)
     artifact_ownership = score_artifact_ownership(steps, scenario)
     execution_shape = score_execution_shape_readiness(plan, scenario)
     return {
@@ -126,12 +132,17 @@ def score_step_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None
         "executable_score": executable["score"],
         "constraint_coverage_score": constraint["score"],
         "verify_strength_score": verify_strength["score"],
+        "verify_adequacy_score": verify_adequacy["verify_adequacy_score"],
+        "semantic_verify_coverage_score": verify_adequacy["semantic_verify_coverage_score"],
+        "behavior_oracle_declared_score": verify_adequacy["behavior_oracle_declared_score"],
+        "contentless_verify_penalty": verify_adequacy["contentless_verify_penalty"],
         "artifact_ownership_score": artifact_ownership["score"],
         "execution_shape_readiness_score": execution_shape["score"],
         "details": details,
         "executable_details": executable["details"],
         "constraint_coverage_details": constraint["details"],
         "verify_strength_details": verify_strength["details"],
+        "verify_adequacy_details": verify_adequacy["verify_adequacy_details"],
         "artifact_ownership_details": artifact_ownership["details"],
         "execution_shape_details": execution_shape["details"],
     }

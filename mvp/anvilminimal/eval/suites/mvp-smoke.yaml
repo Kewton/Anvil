@@ -6,6 +6,11 @@ scenarios:
     category: fix-code
     profile: generic
     prompt: Fix a JavaScript date helper and add a deterministic node smoke check.
+    functional_contract:
+      category: library-with-tests
+      required_capabilities:
+        - implementation
+        - deterministic_test
     expected_artifacts:
       - date-helper.js
     postcheck:
@@ -24,6 +29,10 @@ scenarios:
     category: data-docs
     profile: generic
     prompt: Create README.md with a clear usage heading and one command example.
+    functional_contract:
+      category: docs-content
+      required_capabilities:
+        - requested_content
     expected_artifacts:
       - README.md
     postcheck:
@@ -41,6 +50,11 @@ scenarios:
     category: fix-code
     profile: generic
     prompt: Build a Python markdown heading linter with Python unittest.TestCase coverage.
+    functional_contract:
+      category: library-with-tests
+      required_capabilities:
+        - implementation
+        - deterministic_test
     expected_artifacts:
       - markdown_lint.py
       - test_markdown_lint.py
@@ -60,6 +74,11 @@ scenarios:
     category: new-code
     profile: generic
     prompt: Create a small Rust CLI with one unit test and cargo test verification.
+    functional_contract:
+      category: cli-tool
+      required_capabilities:
+        - entrypoint
+        - deterministic_check
     expected_artifacts:
       - Cargo.toml
       - src/main.rs
@@ -79,6 +98,26 @@ scenarios:
     category: new-code
     profile: nextjs
     prompt: Create a Next.js Space Invaders game that can run on port 3011.
+    functional_contract:
+      category: interactive-game
+      required_capabilities:
+        - stateful_interaction
+        - start_or_restart_flow
+        - player_control
+        - adversary_or_challenge
+        - progression_or_score
+        - failure_or_collision_rule
+      forbidden_minimal_outputs:
+        - static_title_only
+    interaction_contract:
+      keyboard: true
+      pointer: optional
+    quality_contract:
+      minimum_acceptance: playable_core_loop
+    oracle_contract:
+      deterministic_oracles:
+        - source_semantic
+        - browser_interaction
     expected_artifacts:
       - package.json
       - src/app/page.tsx
@@ -110,6 +149,11 @@ scenarios:
     category: recovery
     profile: generic
     prompt: Create a multi-file tool that reports repair exhaustion with deterministic Python unittest.TestCase tests.
+    functional_contract:
+      category: library-with-tests
+      required_capabilities:
+        - implementation
+        - deterministic_test
     expected_artifacts:
       - repair_report.py
       - test_repair_report.py

@@ -17,12 +17,14 @@ def generate_report(run_root: Path) -> str:
     lines.extend(section_table("Size Summary", aggregate(rows, "size")))
     lines.extend(section_table("Model Profile Summary", aggregate(rows, "main_provider")))
     lines.extend(core_metric_summary(rows))
+    lines.extend(acceptance_summary(rows))
     lines.extend(target_metric_summary(rows))
     lines.extend(plan_rankings(rows))
     lines.extend(executable_plan_rankings(rows))
     lines.extend(additional_plan_metric_rankings(rows))
     lines.extend(stability_summary(rows))
     lines.extend(plan_run_predictiveness_summary(rows))
+    lines.extend(plan_run_readiness_summary(rows))
     lines.extend(blocking_summary(rows))
     lines.extend(stop_reason_summary(rows))
     lines.extend(planner_failure_summary(rows))
@@ -71,12 +73,15 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
             {
                 "mode": mode,
                 "success": success_count_cell(group),
+                "acceptance": acceptance_count_cell(group),
+                "false_positive": str(sum(1 for row in group if row.get("acceptance_false_positive") == "true")),
                 "valid_plan": valid_plan_count_cell(group),
                 "plan_quality": fmt(mean([to_float(row.get("plan_quality_score")) for row in group])),
                 "shape_readiness": fmt(
                     mean([to_float(row.get("execution_shape_readiness_score")) for row in group])
                 ),
                 "predictive": fmt(mean([to_float(row.get("plan_run_predictive_score")) for row in group])),
+                "readiness": fmt(mean([to_float(row.get("plan_run_readiness_score")) for row in group])),
                 "runtime_health": fmt(
                     mean([to_float(row.get("plan_run_runtime_health_score")) for row in group])
                 ),
@@ -106,10 +111,13 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
         [
             "mode",
             "success",
+            "acceptance",
+            "false_positive",
             "valid_plan",
             "plan_quality",
             "shape_readiness",
             "predictive",
+            "readiness",
             "runtime_health",
             "postcheck",
             "finalization",
@@ -125,6 +133,10 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
 
 def target_metric_summary(rows: list[dict[str, str]]) -> list[str]:
     metrics = [
+        "verify_adequacy_score",
+        "semantic_verify_coverage_score",
+        "behavior_oracle_declared_score",
+        "contentless_verify_penalty",
         "postcheck_stability_score",
         "phase_completion_score",
         "runtime_friction_score",
@@ -155,6 +167,48 @@ def target_metric_summary(rows: list[dict[str, str]]) -> list[str]:
     if not out:
         return lines + ["No target runtime metrics.", ""]
     return lines + table_rows(out, ["mode", "metric", "success_avg", "failure_avg", "failure_n"])
+
+
+def acceptance_summary(rows: list[dict[str, str]]) -> list[str]:
+    groups = group_rows(rows, "mode")
+    out = []
+    failure_counter = Counter()
+    gap_counter = Counter()
+    for mode, group in sorted(groups.items()):
+        scoped = [row for row in group if row.get("acceptance_success") not in {"", None}]
+        if not scoped:
+            continue
+        false_positive = [row for row in scoped if row.get("acceptance_false_positive") == "true"]
+        out.append(
+            {
+                "mode": mode,
+                "legacy_success": success_count_cell(group),
+                "acceptance_success": acceptance_count_cell(group),
+                "false_positive": str(len(false_positive)),
+                "source_semantic_avg": fmt(mean([to_float(row.get("source_semantic_score")) for row in scoped])),
+                "plan_output_avg": fmt(mean([to_float(row.get("plan_output_adherence_score")) for row in scoped])),
+            }
+        )
+        for row in scoped:
+            if row.get("acceptance_failure_kind"):
+                failure_counter[row["acceptance_failure_kind"]] += 1
+            if row.get("oracle_gap_kind"):
+                gap_counter[row["oracle_gap_kind"]] += 1
+    lines = ["## Acceptance Outcomes", ""]
+    if not out:
+        return lines + ["No acceptance outcome rows.", ""]
+    lines.extend(table_rows(out, ["mode", "legacy_success", "acceptance_success", "false_positive", "source_semantic_avg", "plan_output_avg"]))
+    if failure_counter:
+        lines.extend(table_rows(
+            [{"kind": kind, "count": str(count)} for kind, count in sorted(failure_counter.items())],
+            ["kind", "count"],
+        ))
+    if gap_counter:
+        lines.extend(table_rows(
+            [{"gap": gap, "count": str(count)} for gap, count in sorted(gap_counter.items())],
+            ["gap", "count"],
+        ))
+    return lines
 
 
 def section_table(title: str, rows: list[dict[str, str]]) -> list[str]:
@@ -209,8 +263,22 @@ def additional_plan_metric_rankings(rows: list[dict[str, str]]) -> list[str]:
     metrics = [
         "constraint_coverage_score",
         "verify_strength_score",
+        "verify_adequacy_score",
+        "semantic_verify_coverage_score",
+        "behavior_oracle_declared_score",
+        "contentless_verify_penalty",
         "artifact_ownership_score",
         "lint_repair_score",
+        "plan_run_readiness_score",
+        "verify_policy_readiness_score",
+        "contract_handoff_score",
+        "declared_contract_completeness_score",
+        "runner_handoff_integrity_score",
+        "postcheck_contract_alignment_score",
+        "dependency_ordering_score",
+        "finalization_readiness_score",
+        "ultra_phase_readiness_min_score",
+        "ultra_phase_readiness_avg_score",
         "runtime_friction_score",
         "runtime_friction_raw_score",
         "artifact_progress_score",
@@ -338,6 +406,88 @@ def plan_run_predictiveness_summary(rows: list[dict[str, str]]) -> list[str]:
     return lines + table_rows(pair_rows, ["scenario", "main", "planner", "step_predictive", "plan_run_success"])
 
 
+def plan_run_readiness_summary(rows: list[dict[str, str]]) -> list[str]:
+    step_groups = group_by_prediction_key([row for row in rows if row.get("mode") == "step-plan"])
+    run_groups = group_by_prediction_key([row for row in rows if row.get("mode") == "plan-run"])
+    pair_rows = []
+    readiness_scores = []
+    run_success_rates = []
+    false_positive = 0
+    false_negative = 0
+    missed_signals = Counter()
+    for key in sorted(set(step_groups).intersection(run_groups)):
+        readiness = mean([to_float(row.get("plan_run_readiness_score")) for row in step_groups[key]])
+        run_success = success_rate(run_groups[key])
+        if readiness is None:
+            continue
+        readiness_scores.append(readiness)
+        run_success_rates.append(run_success)
+        if readiness >= 80 and run_success < 100:
+            false_positive += 1
+        if readiness < 70 and run_success >= 80:
+            false_negative += 1
+        sample = step_groups[key][0]
+        cap_reasons = sorted({row.get("readiness_cap_reason", "") for row in step_groups[key] if row.get("readiness_cap_reason")})
+        pair_rows.append(
+            {
+                "scenario": sample.get("scenario", ""),
+                "main": f"{sample.get('main_provider', '')}:{sample.get('main_model', '')}",
+                "planner": f"{sample.get('planner_provider', '')}:{sample.get('planner_model', '')}",
+                "readiness": fmt(readiness),
+                "plan_run_success": fmt(run_success),
+                "cap": ";".join(cap_reasons),
+            }
+        )
+    for row in rows:
+        reason = row.get("missed_predictive_signal_reason", "")
+        if reason:
+            missed_signals[reason] += 1
+    lines = ["## Plan Run Readiness", ""]
+    scored = [row for row in rows if to_float(row.get("plan_run_readiness_score")) is not None]
+    if scored:
+        lines.extend(
+            table_rows(
+                [
+                    {
+                        "metric": metric,
+                        "avg": fmt(mean([to_float(row.get(metric)) for row in scored])),
+                    }
+                    for metric in [
+                        "plan_run_readiness_score",
+                        "verify_policy_readiness_score",
+                        "contract_handoff_score",
+                        "declared_contract_completeness_score",
+                        "runner_handoff_integrity_score",
+                        "postcheck_contract_alignment_score",
+                        "dependency_ordering_score",
+                        "finalization_readiness_score",
+                    ]
+                ],
+                ["metric", "avg"],
+            )
+        )
+    if pair_rows:
+        corr = pearson(readiness_scores, run_success_rates)
+        lines.extend(
+            [
+                f"paired_rows: {len(pair_rows)}",
+                f"correlation: {fmt(corr)}",
+                f"false_positive: {false_positive}",
+                f"false_negative: {false_negative}",
+                "",
+            ]
+        )
+        lines.extend(table_rows(pair_rows, ["scenario", "main", "planner", "readiness", "plan_run_success", "cap"]))
+    else:
+        lines.extend(["No paired step-plan and plan-run readiness rows.", ""])
+    if missed_signals:
+        lines.extend(table_rows(
+            [{"reason": reason, "count": str(count)} for reason, count in sorted(missed_signals.items())],
+            ["reason", "count"],
+        ))
+    return lines
+
+
 def failure_summary(rows: list[dict[str, str]]) -> list[str]:
     counter = Counter()
     for row in rows:
@@ -371,6 +521,8 @@ def metric_reason_summary(rows: list[dict[str, str]]) -> list[str]:
         ("runtime_friction", "runtime_friction_reason"),
         ("finalization", "finalization_reason"),
         ("phase_failure", "phase_failure_stage"),
+        ("readiness_cap", "readiness_cap_reason"),
+        ("missed_signal", "missed_predictive_signal_reason"),
     ]
     out = []
     for label, field in reason_fields:
@@ -627,6 +779,13 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
     lines = ["# Eval Compare", "", "| metric | baseline | experiment | delta |", "|---|---:|---:|---:|"]
     metrics = [
         ("success_rate", success_rate(base), success_rate(exp)),
+        ("acceptance_success_rate", acceptance_rate(base), acceptance_rate(exp)),
+        ("acceptance_false_positive_count", false_positive_count(base), false_positive_count(exp)),
+        (
+            "plan_output_adherence_score_avg",
+            mean([to_float(r.get("plan_output_adherence_score")) for r in base]),
+            mean([to_float(r.get("plan_output_adherence_score")) for r in exp]),
+        ),
         ("valid_plan_generated_rate", valid_plan_rate(base), valid_plan_rate(exp)),
         (
             "p50_exec_sec",
@@ -647,6 +806,51 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             "plan_run_predictive_score_avg",
             mean([to_float(r.get("plan_run_predictive_score")) for r in base]),
             mean([to_float(r.get("plan_run_predictive_score")) for r in exp]),
+        ),
+        (
+            "plan_run_readiness_score_avg",
+            mean([to_float(r.get("plan_run_readiness_score")) for r in base]),
+            mean([to_float(r.get("plan_run_readiness_score")) for r in exp]),
+        ),
+        (
+            "verify_policy_readiness_score_avg",
+            mean([to_float(r.get("verify_policy_readiness_score")) for r in base]),
+            mean([to_float(r.get("verify_policy_readiness_score")) for r in exp]),
+        ),
+        (
+            "contract_handoff_score_avg",
+            mean([to_float(r.get("contract_handoff_score")) for r in base]),
+            mean([to_float(r.get("contract_handoff_score")) for r in exp]),
+        ),
+        (
+            "declared_contract_completeness_score_avg",
+            mean([to_float(r.get("declared_contract_completeness_score")) for r in base]),
+            mean([to_float(r.get("declared_contract_completeness_score")) for r in exp]),
+        ),
+        (
+            "runner_handoff_integrity_score_avg",
+            mean([to_float(r.get("runner_handoff_integrity_score")) for r in base]),
+            mean([to_float(r.get("runner_handoff_integrity_score")) for r in exp]),
+        ),
+        (
+            "postcheck_contract_alignment_score_avg",
+            mean([to_float(r.get("postcheck_contract_alignment_score")) for r in base]),
+            mean([to_float(r.get("postcheck_contract_alignment_score")) for r in exp]),
+        ),
+        (
+            "dependency_ordering_score_avg",
+            mean([to_float(r.get("dependency_ordering_score")) for r in base]),
+            mean([to_float(r.get("dependency_ordering_score")) for r in exp]),
+        ),
+        (
+            "finalization_readiness_score_avg",
+            mean([to_float(r.get("finalization_readiness_score")) for r in base]),
+            mean([to_float(r.get("finalization_readiness_score")) for r in exp]),
+        ),
+        (
+            "ultra_phase_readiness_min_score_avg",
+            mean([to_float(r.get("ultra_phase_readiness_min_score")) for r in base]),
+            mean([to_float(r.get("ultra_phase_readiness_min_score")) for r in exp]),
         ),
         (
             "plan_run_runtime_health_score_avg",
@@ -732,6 +936,26 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             "verify_strength_score_avg",
             mean([to_float(r.get("verify_strength_score")) for r in base]),
             mean([to_float(r.get("verify_strength_score")) for r in exp]),
+        ),
+        (
+            "verify_adequacy_score_avg",
+            mean([to_float(r.get("verify_adequacy_score")) for r in base]),
+            mean([to_float(r.get("verify_adequacy_score")) for r in exp]),
+        ),
+        (
+            "semantic_verify_coverage_score_avg",
+            mean([to_float(r.get("semantic_verify_coverage_score")) for r in base]),
+            mean([to_float(r.get("semantic_verify_coverage_score")) for r in exp]),
+        ),
+        (
+            "behavior_oracle_declared_score_avg",
+            mean([to_float(r.get("behavior_oracle_declared_score")) for r in base]),
+            mean([to_float(r.get("behavior_oracle_declared_score")) for r in exp]),
+        ),
+        (
+            "contentless_verify_penalty_avg",
+            mean([to_float(r.get("contentless_verify_penalty")) for r in base]),
+            mean([to_float(r.get("contentless_verify_penalty")) for r in exp]),
         ),
         (
             "artifact_ownership_score_avg",
@@ -822,6 +1046,17 @@ def success_rate(rows: list[dict[str, str]]) -> float:
     return 100.0 * sum(1 for row in rows if row.get("success") == "true") / len(rows)
 
 
+def acceptance_rate(rows: list[dict[str, str]]) -> float | None:
+    scoped = [row for row in rows if row.get("acceptance_success") not in {"", None}]
+    if not scoped:
+        return None
+    return 100.0 * sum(1 for row in scoped if row.get("acceptance_success") == "true") / len(scoped)
+
+
+def false_positive_count(rows: list[dict[str, str]]) -> float:
+    return float(sum(1 for row in rows if row.get("acceptance_false_positive") == "true"))
+
+
 def valid_plan_rate(rows: list[dict[str, str]]) -> float | None:
     scoped = [row for row in rows if row.get("valid_plan_generated") not in {"", None}]
     if not scoped:
@@ -831,6 +1066,13 @@ def valid_plan_rate(rows: list[dict[str, str]]) -> float | None:
 
 def success_count_cell(rows: list[dict[str, str]]) -> str:
     return f"{sum(1 for row in rows if row.get('success') == 'true')}/{len(rows)}"
+
+
+def acceptance_count_cell(rows: list[dict[str, str]]) -> str:
+    scoped = [row for row in rows if row.get("acceptance_success") not in {"", None}]
+    if not scoped:
+        return "n/a"
+    return f"{sum(1 for row in scoped if row.get('acceptance_success') == 'true')}/{len(scoped)}"
 
 
 def valid_plan_count_cell(rows: list[dict[str, str]]) -> str:

@@ -56,6 +56,17 @@ For step plans, `summary.eval.tsv` contains two complementary scores:
   checks. The score also penalizes commands that look syntactically plausible
   but are not semantically useful in the target environment, such as raw
   `rustc --no-link` checks for a Cargo project.
+- `verify_adequacy_score`: whether verification is adequate for the declared
+  functional contract. This is separate from command strength: a production
+  build can be strong as a compiler check while still inadequate for an
+  interactive-game contract.
+- `semantic_verify_coverage_score`: how much of the required functional
+  contract is represented by declared verification.
+- `behavior_oracle_declared_score`: whether a behavior-level oracle such as a
+  deterministic test or browser interaction check is declared.
+- `contentless_verify_penalty`: penalty for checks that only prove file
+  existence or readability, such as `cat`, `test -f`, or `node -e`
+  `existsSync`/`readFileSync` patterns.
 - `execution_shape_readiness_score`: whether the YAML is shaped for clean
   execution by `plan-run`. In addition to wrapper-step and write-first risks,
   this includes environment compatibility signals that predict postcheck
@@ -69,6 +80,42 @@ For step plans, `summary.eval.tsv` contains two complementary scores:
   lint retry, parser limitation, and prompt issue signals.
 - `stability_score`: populated only when the same scenario/model/mode appears
   multiple times in one run root, such as `--runs 3`.
+
+`plan_run_readiness_score` is a separate pre-run predictor for whether a
+StepPlan is likely to survive the `plan-run` handoff. It is not a replacement
+for YAML quality and it must not use scenario id, suite name, hidden postcheck
+oracle, execution success/failure, run id, or stderr text. It only uses the
+user prompt, StepPlan, profile contract, declared expected paths, declared
+verify commands, and deterministic verify policy.
+
+Readiness is decomposed into:
+
+- `verify_policy_readiness_score`: whether declared verify commands match the
+  runtime verify policy mirrored from Rust `planner/verify.rs`.
+- `declared_contract_completeness_score`: whether the StepPlan declares goal,
+  expected result, expected paths, verify, and profile-level contract evidence.
+- `runner_handoff_integrity_score`: diagnostic score from boolean
+  `step_prompt_contract` events showing whether the runner passed the contract
+  to step execution. It is blank for pure pre-run `step-plan` rows.
+- `contract_handoff_score`: the declared contract score, capped by runner
+  handoff integrity when runtime contract events are available.
+- `postcheck_contract_alignment_score`: whether declared paths, verify, and
+  finalization point at the same declared contract. It does not read hidden
+  postcheck expected artifacts.
+- `dependency_ordering_score`: whether manifest/artifact ownership precedes
+  build/test verify in the abstract project contract.
+- `finalization_readiness_score`: whether the plan has a declared completion
+  contract rather than ending in a report-only step.
+
+Post-run calibration remains separate:
+
+- `plan_run_missed_predictive_signal`
+- `missed_predictive_signal_reason`
+- `readiness_false_positive_kind`
+- `readiness_false_negative_kind`
+
+Those fields explain where a high/low readiness score failed to predict a
+runtime outcome. They are not fed back into the same run's readiness score.
 
 `overall_score` uses the structural, executable, constraint, verify, artifact,
 and lint-repair scores for `step-plan`, `plan-run`, and `ultra-step-run` rows so
@@ -155,6 +202,46 @@ diagnostics into reason/subscore fields. `not_available`, blank cells, and `0`
 mean different things: unavailable values are omitted from averages, blank means
 not applicable or not observed, and `0` is a real score.
 
+## Acceptance outcomes
+
+The legacy `success` column remains the process/postcheck success flag for
+backward compatibility. Acceptance is reported separately:
+
+- `legacy_success`: copy of the legacy process/postcheck success result.
+- `process_success`: whether the CLI process exited successfully.
+- `artifact_success`: whether required artifacts exist.
+- `build_success`: whether declared build postchecks passed.
+- `launch_success`: whether declared dev server readiness passed.
+- `source_semantic_success`: static semantic oracle result for the declared
+  functional contract.
+- `plan_output_adherence_success`: whether the final workspace satisfies the
+  concrete capabilities that the saved YAML plan itself claimed it would build.
+  This is evaluated only from generic plan terms such as canvas/render loop,
+  keyboard control, enemies, bullets, collision/failure rules, score/progression,
+  audio, or visual effects. It does not branch on scenario id.
+- `plan_output_adherence_score`: percentage of plan-claimed capabilities found
+  in the final source corpus.
+- `plan_output_failure_kind`: failure category when the plan-output contract is
+  not satisfied, usually `plan_output_missing_required_capabilities`.
+- `behavior_success`: aggregate behavior oracle result. In smoke suites this is
+  currently driven by the source semantic oracle; browser interaction is an
+  explicit adapter for acceptance-required suites.
+- `prompt_contract_success`: whether prompt-derived required capabilities are
+  satisfied by deterministic oracles.
+- `acceptance_success`: layered acceptance result. This can be false even when
+  legacy `success` is true.
+- `acceptance_false_positive`: true when legacy success passed but acceptance
+  failed.
+- `oracle_gap_kind`: generic reason category for eval-method false positives,
+  such as `postcheck_too_weak_for_semantic_contract` or
+  `postcheck_too_weak_for_plan_contract`.
+- `acceptance_oracle_version`: deterministic oracle version used for the row.
+
+Scenario contracts can declare `functional_contract`, `interaction_contract`,
+`quality_contract`, and `oracle_contract`. If omitted, the harness conservatively
+infers broad categories from prompt/profile text, for example
+`interactive-game` from game prompts. Inference must not branch on scenario id.
+
 Existing run roots can be rescored after metric changes when their
 `runs/<run_id>/anvil-events.jsonl`, postcheck logs, workdir, and plan artifacts
 are still available:
@@ -188,6 +275,11 @@ Metric guardrails:
 `plan-run` rows exist for the same scenario/model pair. It reports correlation,
 false positives, and false negatives for the plan score as a predictor of
 runtime success.
+
+`report.md` also includes `Plan Run Readiness` for the same paired rows. This
+uses `plan_run_readiness_score` as the predictor and reports average subscores,
+correlation, false positives, false negatives, readiness cap reasons, and
+missed predictive signal reasons.
 
 ## Preflight
 

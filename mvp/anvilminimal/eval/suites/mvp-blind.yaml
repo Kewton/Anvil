@@ -8,6 +8,11 @@ scenarios:
     profile: generic
     blind: true
     prompt: Create duration_parser.js with a deterministic node self-test for parsing compact durations such as 2h 15m and 45s.
+    functional_contract:
+      category: data-transform
+      required_capabilities:
+        - input_output_contract
+        - deterministic_check
     expected_artifacts:
       - duration_parser.js
     postcheck:
@@ -28,6 +33,10 @@ scenarios:
     profile: generic
     blind: true
     prompt: Create docs/CLI_USAGE.md documenting a command line tool with an options table and one complete example invocation.
+    functional_contract:
+      category: docs-content
+      required_capabilities:
+        - requested_content
     expected_artifacts:
       - docs/CLI_USAGE.md
     postcheck:
@@ -47,6 +56,11 @@ scenarios:
     profile: generic
     blind: true
     prompt: Build a Python INI merge utility with deterministic unittest.TestCase coverage for override precedence and preserved section order.
+    functional_contract:
+      category: library-with-tests
+      required_capabilities:
+        - implementation
+        - deterministic_test
     expected_artifacts:
       - ini_merge.py
       - test_ini_merge.py
@@ -68,6 +82,11 @@ scenarios:
     profile: generic
     blind: true
     prompt: Create a small Rust range-set library with unit tests for merging overlapping ranges and querying containment.
+    functional_contract:
+      category: library-with-tests
+      required_capabilities:
+        - implementation
+        - deterministic_test
     expected_artifacts:
       - Cargo.toml
       - src/lib.rs
@@ -89,6 +108,26 @@ scenarios:
     profile: nextjs
     blind: true
     prompt: Create a polished Next.js memory grid game that can run on port 3011 with keyboard-friendly controls.
+    functional_contract:
+      category: interactive-game
+      required_capabilities:
+        - stateful_interaction
+        - start_or_restart_flow
+        - player_control
+        - adversary_or_challenge
+        - progression_or_score
+        - failure_or_collision_rule
+      forbidden_minimal_outputs:
+        - static_title_only
+    interaction_contract:
+      keyboard: true
+      pointer: optional
+    quality_contract:
+      minimum_acceptance: playable_core_loop
+    oracle_contract:
+      deterministic_oracles:
+        - source_semantic
+        - browser_interaction
     expected_artifacts:
       - package.json
       - src/app/page.tsx
@@ -122,6 +161,11 @@ scenarios:
     profile: generic
     blind: true
     prompt: Create a Python log analyzer that reads fixtures/events.log, groups events by severity, and verifies the behavior with unittest.TestCase tests.
+    functional_contract:
+      category: data-transform
+      required_capabilities:
+        - input_output_contract
+        - deterministic_check
     expected_artifacts:
       - log_analyzer.py
       - test_log_analyzer.py

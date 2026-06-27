@@ -1,0 +1,4 @@
+name: mvp-acceptance
+description: Acceptance-oriented scenarios that require semantic/product behavior checks in addition to build and launch checks.
+include_suites:
+  - mvp-smoke.yaml

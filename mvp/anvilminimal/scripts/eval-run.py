@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 
+from eval_lib.acceptance_outcome import evaluate_acceptance_outcome
 from eval_lib.artifacts import create_run_root, write_json, write_jsonl
 from eval_lib.config import merge_dotenv_into_env
 from eval_lib.failure_classification import (
@@ -22,6 +23,13 @@ from eval_lib.failure_classification import (
 )
 from eval_lib.matrix import expand_matrix, parse_modes
 from eval_lib.models import ModelRef, load_model_profiles
+from eval_lib.plan_readiness import (
+    READINESS_FIELDS,
+    aggregate_ultra_phase_readiness,
+    classify_readiness_outcome,
+    empty_plan_readiness_scores,
+    score_plan_readiness_file,
+)
 from eval_lib.plan_scoring import score_plan_file
 from eval_lib.postcheck import is_dependency_command, run_postcheck
 from eval_lib.redaction import redact_json
@@ -320,15 +328,43 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
     executable_plan_score = None
     constraint_coverage_score = None
     verify_strength_score = None
+    verify_adequacy_score = None
+    semantic_verify_coverage_score = None
+    behavior_oracle_declared_score = None
+    contentless_verify_penalty = None
     artifact_ownership_score = None
     execution_shape_readiness_score = None
     ultra_score = None
+    plan_run_readiness = empty_plan_readiness_scores()
+    phase_readiness_scores: list[dict] = []
     for plan in plans:
         score = score_plan_file(plan, spec["scenario"])
         events.append({"event": "plan_score", "run_id": spec["run_id"], "plan": plan.name, **score})
         if score["kind"] == "ultra":
             ultra_score = float(score["score"])
         else:
+            readiness = score_plan_readiness_file(
+                plan,
+                profile=str(spec["scenario"].get("profile", "")),
+                prompt=str(spec["scenario"].get("prompt", "")),
+                handoff_events=child_events,
+            )
+            phase_readiness_scores.append(readiness)
+            events.append(
+                {
+                    "event": "plan_run_readiness_evaluated",
+                    "run_id": spec["run_id"],
+                    "plan": plan.name,
+                    **{
+                        key: value
+                        for key, value in readiness.items()
+                        if key in READINESS_FIELDS or key == "details"
+                    },
+                }
+            )
+            plan_run_readiness.update(
+                {key: readiness.get(key, "") for key in READINESS_FIELDS if key in readiness}
+            )
             plan_score = float(score["score"])
             if score.get("executable_score") is not None:
                 executable_plan_score = float(score["executable_score"])
@@ -336,16 +372,44 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
                 constraint_coverage_score = float(score["constraint_coverage_score"])
             if score.get("verify_strength_score") is not None:
                 verify_strength_score = float(score["verify_strength_score"])
+            if score.get("verify_adequacy_score") is not None:
+                verify_adequacy_score = float(score["verify_adequacy_score"])
+            if score.get("semantic_verify_coverage_score") is not None:
+                semantic_verify_coverage_score = float(score["semantic_verify_coverage_score"])
+            if score.get("behavior_oracle_declared_score") is not None:
+                behavior_oracle_declared_score = float(score["behavior_oracle_declared_score"])
+            if score.get("contentless_verify_penalty") is not None:
+                contentless_verify_penalty = float(score["contentless_verify_penalty"])
             if score.get("artifact_ownership_score") is not None:
                 artifact_ownership_score = float(score["artifact_ownership_score"])
             if score.get("execution_shape_readiness_score") is not None:
                 execution_shape_readiness_score = float(score["execution_shape_readiness_score"])
+    ultra_phase_readiness = aggregate_ultra_phase_readiness(phase_readiness_scores)
+    if spec["mode"] == "ultra-plan-run" and ultra_phase_readiness.get("ultra_phase_readiness_min_score") not in {"", None}:
+        plan_run_readiness.update(ultra_phase_readiness)
+        plan_run_readiness["plan_run_readiness_score"] = ultra_phase_readiness[
+            "ultra_phase_readiness_min_score"
+        ]
+        plan_run_readiness["readiness_cap_reason"] = ultra_phase_readiness[
+            "ultra_phase_readiness_cap_reason"
+        ]
 
     post = {"ok": True, "postcheck_elapsed_sec": 0.0, "dependency_elapsed_sec": 0.0}
     if result.rc == 0 and spec["mode"] != "step-plan":
         post = run_postcheck(spec["scenario"], workdir, run_dir / "postcheck", timeout_sec=scenario_timeout)
         events.append({"event": "postcheck_summary", "run_id": spec["run_id"], **post})
     success = result.rc == 0 and bool(post["ok"])
+    acceptance = evaluate_acceptance_outcome(
+        scenario=spec["scenario"],
+        workdir=workdir,
+        run_dir=run_dir,
+        mode=spec["mode"],
+        process_success=result.rc == 0,
+        legacy_success=success,
+        postcheck=post,
+        plan_paths=plans,
+    )
+    events.append({"event": "acceptance_summary", "run_id": spec["run_id"], **acceptance})
     diagnostics = summarize_run_events(events, post)
     lint_repair_score = calculate_lint_repair_score(diagnostics)
     execution_score = 100.0 if success else 0.0
@@ -356,6 +420,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         "elapsed_total_sec": round(time.monotonic() - start, 3),
         "oracle_kind": post.get("oracle_kind", ""),
     }
+    failure_kind = ""
     if not success:
         stderr = (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace")
         failure = {
@@ -374,6 +439,22 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             failure["failure_layer"] = failure_layer_for_kind(failure_kind)
             failure["agent_capability_failure"] = capability_failure_included(failure_kind)
         extras.update(failure)
+    readiness_outcome = classify_readiness_outcome(
+        plan_run_readiness.get("plan_run_readiness_score", ""),
+        success=success,
+        failure_kind=failure_kind,
+    )
+    plan_run_readiness.update(readiness_outcome)
+    if readiness_outcome.get("plan_run_missed_predictive_signal"):
+        extras.update(readiness_outcome)
+        events.append(
+            {
+                "event": "plan_run_missed_predictive_signal",
+                "run_id": spec["run_id"],
+                "readiness_score": plan_run_readiness.get("plan_run_readiness_score", ""),
+                **readiness_outcome,
+            }
+        )
     if diagnostics["repair_progress"]:
         extras["repair_progress"] = diagnostics["repair_progress"]
     if diagnostics["provider_transient_excluded_from_agent_capability"]:
@@ -414,6 +495,23 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         {
             "rc": result.rc,
             "success": success,
+            "legacy_success": acceptance.get("legacy_success", success),
+            "process_success": acceptance.get("process_success", ""),
+            "artifact_success": acceptance.get("artifact_success", ""),
+            "build_success": acceptance.get("build_success", ""),
+            "launch_success": acceptance.get("launch_success", ""),
+            "behavior_success": acceptance.get("behavior_success", ""),
+            "source_semantic_success": acceptance.get("source_semantic_success", ""),
+            "source_semantic_score": acceptance.get("source_semantic_score", ""),
+            "plan_output_adherence_success": acceptance.get("plan_output_adherence_success", ""),
+            "plan_output_adherence_score": acceptance.get("plan_output_adherence_score", ""),
+            "plan_output_failure_kind": acceptance.get("plan_output_failure_kind", ""),
+            "prompt_contract_success": acceptance.get("prompt_contract_success", ""),
+            "acceptance_success": acceptance.get("acceptance_success", ""),
+            "acceptance_failure_kind": acceptance.get("acceptance_failure_kind", ""),
+            "acceptance_false_positive": acceptance.get("acceptance_false_positive", ""),
+            "oracle_gap_kind": acceptance.get("oracle_gap_kind", ""),
+            "acceptance_oracle_version": acceptance.get("acceptance_oracle_version", ""),
             "queue_wait_sec": 0.0,
             "process_elapsed_sec": round(process_elapsed, 3),
             "exec_elapsed_sec": round(process_elapsed + float(post["postcheck_elapsed_sec"]) - float(post["dependency_elapsed_sec"]), 3),
@@ -456,12 +554,23 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "executable_plan_score": executable_plan_score if executable_plan_score is not None else "",
             "constraint_coverage_score": constraint_coverage_score if constraint_coverage_score is not None else "",
             "verify_strength_score": verify_strength_score if verify_strength_score is not None else "",
+            "verify_adequacy_score": verify_adequacy_score if verify_adequacy_score is not None else "",
+            "semantic_verify_coverage_score": semantic_verify_coverage_score
+            if semantic_verify_coverage_score is not None
+            else "",
+            "behavior_oracle_declared_score": behavior_oracle_declared_score
+            if behavior_oracle_declared_score is not None
+            else "",
+            "contentless_verify_penalty": contentless_verify_penalty
+            if contentless_verify_penalty is not None
+            else "",
             "artifact_ownership_score": artifact_ownership_score if artifact_ownership_score is not None else "",
             "lint_repair_score": lint_repair_score,
             "execution_shape_readiness_score": execution_shape_readiness_score
             if execution_shape_readiness_score is not None
             else "",
             "plan_run_predictive_score": plan_run_predictive_score,
+            **{key: plan_run_readiness.get(key, "") for key in READINESS_FIELDS},
             **runtime_scores,
             "ultra_phase_quality_score": ultra_score if ultra_score is not None else "",
             "execution_score": execution_score,
@@ -483,6 +592,8 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "extras_json": extras,
         }
     )
+    if acceptance.get("acceptance_details"):
+        row["extras_json"]["acceptance_details"] = acceptance["acceptance_details"]
     return row, events
 
 

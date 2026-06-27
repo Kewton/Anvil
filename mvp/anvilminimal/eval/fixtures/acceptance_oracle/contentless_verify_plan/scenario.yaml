@@ -1,0 +1,14 @@
+profile: nextjs
+prompt: Create a Next.js Space Invaders game that can run on port 3011.
+expected_artifacts:
+  - package.json
+  - src/app/page.tsx
+functional_contract:
+  category: interactive-game
+  required_capabilities:
+    - stateful_interaction
+    - start_or_restart_flow
+    - player_control
+    - adversary_or_challenge
+    - progression_or_score
+    - failure_or_collision_rule

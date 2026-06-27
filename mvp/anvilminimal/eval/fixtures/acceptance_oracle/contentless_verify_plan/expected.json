@@ -1,0 +1,4 @@
+{
+  "verify_adequacy_max": 60,
+  "contentless_verify_penalty_min": 45
+}

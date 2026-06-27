@@ -1,0 +1,4 @@
+profile: nextjs
+prompt: Create a Next.js Space Invaders game that can run on port 3011.
+expected_artifacts:
+  - src/app/page.tsx

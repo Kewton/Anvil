@@ -104,6 +104,81 @@ class EvalEventReportTest(unittest.TestCase):
         self.assertIn("## Failure Layers", report)
         self.assertIn("| bridge | 1 | 1 | 0 |", report)
 
+    def test_report_summarizes_plan_run_readiness(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td)
+            step = {key: "" for key in SUMMARY_HEADER}
+            step.update(
+                {
+                    "run_id": "ready-step",
+                    "suite": "s",
+                    "scenario": "scenario",
+                    "size": "medium",
+                    "category": "planner",
+                    "mode": "step-plan",
+                    "main_provider": "openai",
+                    "main_model": "gpt-5.4-mini",
+                    "planner_provider": "openai",
+                    "planner_model": "gpt-5.4-mini",
+                    "local_llm_used": "false",
+                    "success": "true",
+                    "rc": "0",
+                    "plan_run_readiness_score": "82",
+                    "verify_policy_readiness_score": "100",
+                    "contract_handoff_score": "85",
+                    "declared_contract_completeness_score": "85",
+                    "postcheck_contract_alignment_score": "80",
+                    "dependency_ordering_score": "90",
+                    "finalization_readiness_score": "75",
+                    "readiness_cap_reason": "",
+                }
+            )
+            run = dict(step)
+            run.update(
+                {
+                    "run_id": "ready-run",
+                    "mode": "plan-run",
+                    "success": "false",
+                    "rc": "1",
+                    "plan_run_readiness_score": "82",
+                    "missed_predictive_signal_reason": "postcheck_contract_not_reflected_in_readiness",
+                    "extras_json": {"failure_kind": "postcheck_failure"},
+                }
+            )
+            write_summary(run_root / "summary.eval.tsv", [step, run])
+            report = generate_report(run_root)
+        self.assertIn("## Plan Run Readiness", report)
+        self.assertIn("postcheck_contract_not_reflected_in_readiness", report)
+        self.assertIn("readiness", report)
+
+    def test_report_summarizes_acceptance_false_positive(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td)
+            row = {key: "" for key in SUMMARY_HEADER}
+            row.update(
+                {
+                    "run_id": "acceptance",
+                    "suite": "s",
+                    "scenario": "nextjs-game",
+                    "size": "large",
+                    "category": "new-code",
+                    "mode": "ultra-plan-run",
+                    "success": "true",
+                    "legacy_success": "true",
+                    "acceptance_success": "false",
+                    "acceptance_false_positive": "true",
+                    "acceptance_failure_kind": "static_title_only",
+                    "oracle_gap_kind": "postcheck_too_weak_for_semantic_contract",
+                    "source_semantic_score": "35",
+                    "rc": "0",
+                }
+            )
+            write_summary(run_root / "summary.eval.tsv", [row])
+            report = generate_report(run_root)
+        self.assertIn("## Acceptance Outcomes", report)
+        self.assertIn("static_title_only", report)
+        self.assertIn("postcheck_too_weak_for_semantic_contract", report)
+
 
 if __name__ == "__main__":
     unittest.main()
