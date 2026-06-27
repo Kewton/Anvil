@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
 
+from .failure_classification import capability_failure_included, failure_layer_for_kind
 from .run_summary import read_summary
 
 
@@ -16,6 +17,7 @@ def generate_report(run_root: Path) -> str:
     lines.extend(section_table("Size Summary", aggregate(rows, "size")))
     lines.extend(section_table("Model Profile Summary", aggregate(rows, "main_provider")))
     lines.extend(core_metric_summary(rows))
+    lines.extend(target_metric_summary(rows))
     lines.extend(plan_rankings(rows))
     lines.extend(executable_plan_rankings(rows))
     lines.extend(additional_plan_metric_rankings(rows))
@@ -28,6 +30,8 @@ def generate_report(run_root: Path) -> str:
     lines.extend(planner_raw_shape_summary(rows))
     lines.extend(planner_quality_warning_summary(rows))
     lines.extend(planner_quality_issue_summary(rows))
+    lines.extend(metric_reason_summary(rows))
+    lines.extend(failure_layer_summary(rows))
     lines.extend(failure_summary(rows))
     return "\n".join(lines) + "\n"
 
@@ -76,6 +80,9 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
                 "runtime_health": fmt(
                     mean([to_float(row.get("plan_run_runtime_health_score")) for row in group])
                 ),
+                "postcheck": fmt(mean([to_float(row.get("postcheck_stability_score")) for row in group])),
+                "finalization": fmt(mean([to_float(row.get("finalization_score")) for row in group])),
+                "eca": fmt(mean([to_float(row.get("execution_contract_adherence_score")) for row in group])),
                 "ultra_runtime": fmt(
                     mean([to_float(row.get("ultra_runtime_health_score")) for row in group])
                 ),
@@ -104,6 +111,9 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
             "shape_readiness",
             "predictive",
             "runtime_health",
+            "postcheck",
+            "finalization",
+            "eca",
             "ultra_runtime",
             "phase_completion",
             "prompt_contract",
@@ -111,6 +121,40 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
             "p50_exec_sec",
         ],
     )
+
+
+def target_metric_summary(rows: list[dict[str, str]]) -> list[str]:
+    metrics = [
+        "postcheck_stability_score",
+        "phase_completion_score",
+        "runtime_friction_score",
+        "finalization_score",
+        "execution_contract_adherence_raw_score",
+        "execution_contract_adherence_score",
+    ]
+    out = []
+    for mode, group in sorted(group_rows(rows, "mode").items()):
+        success_rows = [row for row in group if row.get("success") == "true"]
+        failure_rows = [
+            row
+            for row in group
+            if row.get("success") != "true"
+            and row.get("capability_failure_included", capability_cell(row)) != "false"
+        ]
+        for metric in metrics:
+            out.append(
+                {
+                    "mode": mode,
+                    "metric": metric,
+                    "success_avg": fmt(mean([to_float(row.get(metric)) for row in success_rows])),
+                    "failure_avg": fmt(mean([to_float(row.get(metric)) for row in failure_rows])),
+                    "failure_n": str(len(failure_rows)),
+                }
+            )
+    lines = ["## Target Runtime Metrics", ""]
+    if not out:
+        return lines + ["No target runtime metrics.", ""]
+    return lines + table_rows(out, ["mode", "metric", "success_avg", "failure_avg", "failure_n"])
 
 
 def section_table(title: str, rows: list[dict[str, str]]) -> list[str]:
@@ -168,16 +212,29 @@ def additional_plan_metric_rankings(rows: list[dict[str, str]]) -> list[str]:
         "artifact_ownership_score",
         "lint_repair_score",
         "runtime_friction_score",
+        "runtime_friction_raw_score",
         "artifact_progress_score",
         "finalization_score",
+        "step_finalization_score",
+        "plan_finalization_score",
+        "deferred_verify_finalization_score",
+        "postcheck_finalization_score",
         "tool_policy_compatibility_score",
         "dependency_contract_score",
         "config_contract_score",
         "verify_contract_score",
         "postcheck_stability_score",
+        "execution_contract_adherence_raw_score",
         "execution_contract_adherence_score",
+        "execution_contract_min_subscore",
         "step_obligation_scope_score",
         "phase_completion_score",
+        "phase_plan_validity_score",
+        "phase_scaffold_success_score",
+        "phase_step_execution_score",
+        "phase_verify_success_score",
+        "phase_postcheck_success_score",
+        "phase_finalization_score",
         "build_verify_pass_score",
         "build_repair_effectiveness_score",
         "compile_diagnostic_progress_score",
@@ -305,6 +362,63 @@ def failure_summary(rows: list[dict[str, str]]) -> list[str]:
             lines.append(f"| {key} | {count} |")
     lines.append("")
     return lines
+
+
+def metric_reason_summary(rows: list[dict[str, str]]) -> list[str]:
+    reason_fields = [
+        ("postcheck", "postcheck_stability_reason"),
+        ("eca_cap", "execution_contract_cap_reason"),
+        ("runtime_friction", "runtime_friction_reason"),
+        ("finalization", "finalization_reason"),
+        ("phase_failure", "phase_failure_stage"),
+    ]
+    out = []
+    for label, field in reason_fields:
+        counter = Counter()
+        for row in rows:
+            for reason in split_reasons(row.get(field, "")):
+                counter[reason] += 1
+        if counter:
+            for reason, count in sorted(counter.items()):
+                out.append({"metric": label, "reason": reason, "count": str(count)})
+    lines = ["## Target Metric Reasons", ""]
+    if not out:
+        return lines + ["No target metric reasons.", ""]
+    return lines + table_rows(out, ["metric", "reason", "count"])
+
+
+def failure_layer_summary(rows: list[dict[str, str]]) -> list[str]:
+    counter = Counter()
+    included = Counter()
+    for row in rows:
+        if row.get("success") == "true":
+            continue
+        layer = row.get("failure_layer", "")
+        if not layer:
+            extras = parse_extras(row)
+            layer = failure_layer_for_kind(str(extras.get("failure_kind", "")))
+        if not layer:
+            layer = "unknown"
+        counter[layer] += 1
+        include_value = row.get("capability_failure_included", "")
+        if include_value == "":
+            extras = parse_extras(row)
+            include_value = str(capability_failure_included(str(extras.get("failure_kind", "")))).lower()
+        included[(layer, include_value)] += 1
+    lines = ["## Failure Layers", ""]
+    if not counter:
+        return lines + ["No failed rows.", ""]
+    out = []
+    for layer, count in sorted(counter.items()):
+        out.append(
+            {
+                "layer": layer,
+                "count": str(count),
+                "capability_included": str(included.get((layer, "true"), 0)),
+                "capability_excluded": str(included.get((layer, "false"), 0)),
+            }
+        )
+    return lines + table_rows(out, ["layer", "count", "capability_included", "capability_excluded"])
 
 
 def planner_failure_summary(rows: list[dict[str, str]]) -> list[str]:
@@ -640,6 +754,11 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             mean([to_float(r.get("runtime_friction_score")) for r in exp]),
         ),
         (
+            "runtime_friction_raw_score_avg",
+            mean([to_float(r.get("runtime_friction_raw_score")) for r in base]),
+            mean([to_float(r.get("runtime_friction_raw_score")) for r in exp]),
+        ),
+        (
             "artifact_progress_score_avg",
             mean([to_float(r.get("artifact_progress_score")) for r in base]),
             mean([to_float(r.get("artifact_progress_score")) for r in exp]),
@@ -650,9 +769,39 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             mean([to_float(r.get("finalization_score")) for r in exp]),
         ),
         (
+            "step_finalization_score_avg",
+            mean([to_float(r.get("step_finalization_score")) for r in base]),
+            mean([to_float(r.get("step_finalization_score")) for r in exp]),
+        ),
+        (
+            "plan_finalization_score_avg",
+            mean([to_float(r.get("plan_finalization_score")) for r in base]),
+            mean([to_float(r.get("plan_finalization_score")) for r in exp]),
+        ),
+        (
+            "deferred_verify_finalization_score_avg",
+            mean([to_float(r.get("deferred_verify_finalization_score")) for r in base]),
+            mean([to_float(r.get("deferred_verify_finalization_score")) for r in exp]),
+        ),
+        (
+            "postcheck_finalization_score_avg",
+            mean([to_float(r.get("postcheck_finalization_score")) for r in base]),
+            mean([to_float(r.get("postcheck_finalization_score")) for r in exp]),
+        ),
+        (
             "tool_policy_compatibility_score_avg",
             mean([to_float(r.get("tool_policy_compatibility_score")) for r in base]),
             mean([to_float(r.get("tool_policy_compatibility_score")) for r in exp]),
+        ),
+        (
+            "execution_contract_adherence_raw_score_avg",
+            mean([to_float(r.get("execution_contract_adherence_raw_score")) for r in base]),
+            mean([to_float(r.get("execution_contract_adherence_raw_score")) for r in exp]),
+        ),
+        (
+            "execution_contract_min_subscore_avg",
+            mean([to_float(r.get("execution_contract_min_subscore")) for r in base]),
+            mean([to_float(r.get("execution_contract_min_subscore")) for r in exp]),
         ),
         (
             "overall_score_avg",
@@ -709,8 +858,26 @@ def group_by_prediction_key(rows: list[dict[str, str]]) -> dict[tuple[str, str, 
     return groups
 
 
+def group_rows(rows: list[dict[str, str]], key: str) -> dict[str, list[dict[str, str]]]:
+    groups: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        groups[row.get(key, "")].append(row)
+    return groups
+
+
+def capability_cell(row: dict[str, str]) -> str:
+    extras = parse_extras(row)
+    return str(capability_failure_included(str(extras.get("failure_kind", "")))).lower()
+
+
+def split_reasons(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [part for part in str(raw).split(";") if part]
+
+
 def to_float(value: str | None) -> float | None:
-    if value is None or value == "":
+    if value is None or value in {"", "not_available"}:
         return None
     try:
         return float(value)

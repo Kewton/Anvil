@@ -729,6 +729,17 @@ pub fn run_ultra_plan_with_ui(
             None,
             Some(step_plan.steps.len()),
         );
+        emit_ultra_phase_event(
+            config,
+            "ultra_phase_plan_validated",
+            plan,
+            phase,
+            index,
+            "lint",
+            Some(true),
+            None,
+            Some(step_plan.steps.len()),
+        );
         save_step_plan(&config.workspace_root, &step_plan)?;
         let final_phase = index + 1 == plan.phases.len();
         if let Err(err) =
@@ -1194,13 +1205,46 @@ fn planner_stage_and_kind_for_lint(report: &PlanLintReport) -> (&'static str, &'
 }
 
 fn build_schema_retry_prompt(goal: &str, error: &str, attempt: usize) -> String {
+    let issue_hints = schema_retry_issue_hints(error)
+        .into_iter()
+        .map(|hint| format!("- {hint}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "Your previous StepPlan output failed schema validation on attempt {attempt}/3: {error}.\n\
 Return only one JSON object and no markdown fences.\n\
+Detected schema issues:\n{issue_hints}\n\n\
 Required JSON shape:\n\
 {{\n  \"goal\": \"{goal}\",\n  \"steps\": [\n    {{\n      \"id\": \"kebab-id\",\n      \"kind\": \"implement\",\n      \"expected_result\": \"pass\",\n      \"instruction\": \"Create the required files for the goal.\",\n      \"expected_paths\": [\"relative/path\"],\n      \"verify\": [\"command\"]\n    }}\n  ]\n}}\n\n\
 Rules:\n- Include top-level goal and non-empty steps.\n- Step id must be a quoted string, not a number.\n- expected_result must be exactly \"pass\" or \"fail\", not prose.\n- Keep expected_paths workspace-relative.\n- Use deterministic verify commands only.\n\nGoal: {goal}"
     )
+}
+
+fn schema_retry_issue_hints(error: &str) -> Vec<&'static str> {
+    let lower = error.to_ascii_lowercase();
+    let mut hints = Vec::new();
+    if lower.contains("missing goal") || lower.contains("top-level goal") {
+        hints.push("Add a top-level goal field equal to the original goal.");
+    }
+    if lower.contains("missing steps")
+        || lower.contains("non-empty steps")
+        || lower.contains("at least one step")
+    {
+        hints.push("Add a non-empty steps array.");
+    }
+    if lower.contains("id") && (lower.contains("number") || lower.contains("string")) {
+        hints.push("Use quoted string step ids such as \"setup-project\".");
+    }
+    if lower.contains("expected_result") || lower.contains("expected result") {
+        hints.push("Set expected_result to exactly \"pass\" or \"fail\".");
+    }
+    if lower.contains("expected_paths") || lower.contains("workspace-relative") {
+        hints.push("Use workspace-relative expected_paths and avoid absolute paths.");
+    }
+    if hints.is_empty() {
+        hints.push("Return the canonical StepPlan JSON object with goal and steps.");
+    }
+    hints
 }
 
 fn build_lint_retry_prompt(
@@ -1287,6 +1331,8 @@ fn lint_retry_hard_constraints(
         out.push(
             "- Split multiple checks into multiple verify steps or multiple verify list items.",
         );
+        out.push("- Preserve the verification meaning; do not replace a real check with a weak file-existence check.");
+        out.push("- Move setup, dependency installation, and dev-server readiness into setup/implement instructions or external postcheck, not verify.");
         out.push("- If a Node smoke check needs multiple statements, create a smoke-check.js artifact in an implement step and verify with a single command such as node smoke-check.js.");
         out.push("- If documentation needs multiple assertions, prefer separate grep -q commands in the verify list, each checking one phrase in one file.");
     }
@@ -1860,6 +1906,8 @@ mod tests {
         categories.insert("path_ownership".to_string());
         let prompt = build_lint_retry_prompt("goal", &report, 2, &categories);
         assert!(prompt.contains("without &&, ||, |, ;"));
+        assert!(prompt.contains("Preserve the verification meaning"));
+        assert!(prompt.contains("dependency installation"));
         assert!(prompt.contains("smoke-check.js"));
         assert!(prompt.contains("grep -q"));
         assert!(prompt.contains("Do not duplicate expected_paths"));
@@ -1868,6 +1916,23 @@ mod tests {
         for provider in ["OpenAI", "Gemini", "Ollama"] {
             assert!(!prompt.contains(provider), "{provider}: {prompt}");
         }
+    }
+
+    #[test]
+    fn schema_retry_prompt_reports_missing_goal() {
+        let prompt = build_schema_retry_prompt("Build app", "StepPlan missing goal", 1);
+        assert!(prompt.contains("Detected schema issues:"));
+        assert!(prompt.contains("Add a top-level goal field"));
+        assert!(prompt.contains("\"goal\": \"Build app\""));
+        assert!(prompt.contains("Return only one JSON object"));
+    }
+
+    #[test]
+    fn schema_retry_prompt_reports_invalid_step_id_type() {
+        let prompt =
+            build_schema_retry_prompt("Build app", "step id must be string, not number", 2);
+        assert!(prompt.contains("Use quoted string step ids"));
+        assert!(prompt.contains("Step id must be a quoted string"));
     }
 
     #[test]
@@ -2197,6 +2262,41 @@ mod tests {
         .unwrap();
         assert_eq!(result, "ultra-plan-run complete: 2 phases");
         assert!(dir.path().join("src/app/page.tsx").is_file());
+    }
+
+    #[test]
+    fn ultra_phase_emits_plan_validated_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(generated_step_plan_json("phase one")),
+            AssistantReply::text(generated_step_plan_json("phase two")),
+        ]);
+        let mut execution = FakeClient::new(vec![]);
+        let plan = UltraPlan {
+            goal: "Do two phases".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "phase-one".to_string(),
+                    prompt: "Phase one".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "phase-two".to_string(),
+                    prompt: "Phase two".to_string(),
+                },
+            ],
+        };
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("ultra_phase_plan_validated"));
+        assert!(event_text.contains("\"stage\":\"lint\""));
+        assert!(event_text.contains("\"step_count\":1"));
     }
 
     #[test]

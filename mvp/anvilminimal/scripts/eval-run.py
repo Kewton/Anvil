@@ -14,7 +14,12 @@ from pathlib import Path
 
 from eval_lib.artifacts import create_run_root, write_json, write_jsonl
 from eval_lib.config import merge_dotenv_into_env
-from eval_lib.failure_classification import classify_failure, read_jsonl
+from eval_lib.failure_classification import (
+    capability_failure_included,
+    classify_failure,
+    failure_layer_for_kind,
+    read_jsonl,
+)
 from eval_lib.matrix import expand_matrix, parse_modes
 from eval_lib.models import ModelRef, load_model_profiles
 from eval_lib.plan_scoring import score_plan_file
@@ -364,10 +369,10 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             ).items()
             if value not in {"", None}
         }
-        if failure.get("failure_kind") == "provider_transient_exhausted":
-            failure["agent_capability_failure"] = False
-        elif failure.get("failure_kind"):
-            failure["agent_capability_failure"] = True
+        failure_kind = str(failure.get("failure_kind", ""))
+        if failure_kind:
+            failure["failure_layer"] = failure_layer_for_kind(failure_kind)
+            failure["agent_capability_failure"] = capability_failure_included(failure_kind)
         extras.update(failure)
     if diagnostics["repair_progress"]:
         extras["repair_progress"] = diagnostics["repair_progress"]
@@ -443,6 +448,10 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
                 "planner_quality_retry_degraded_count"
             ],
             "valid_plan_generated": valid_plan_generated,
+            "failure_layer": str(extras.get("failure_layer", "")),
+            "capability_failure_included": str(extras.get("agent_capability_failure", "")).lower()
+            if extras.get("agent_capability_failure") not in {"", None}
+            else "",
             "plan_quality_score": plan_score if plan_score is not None else "",
             "executable_plan_score": executable_plan_score if executable_plan_score is not None else "",
             "constraint_coverage_score": constraint_coverage_score if constraint_coverage_score is not None else "",

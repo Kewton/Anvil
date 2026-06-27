@@ -25,6 +25,52 @@
 - runs: 3
 - modes: `minimal-loop,step-plan,plan-run,ultra-plan-run`
 
+## 多角レビュー結果と反映方針
+
+レビュー観点:
+
+| 観点 | レビュー結果 | 反映 |
+|---|---|---|
+| 目的適合 | 対象指標は成功率そのものではなく、失敗箇所を計画系/実行系/つなぎ系へ分解するための診断指標として扱うべき。 | 指標ごとの責務と non-goal を明記し、単一 overall score 最適化を避ける。 |
+| 層分離 | `postcheck_stability_score` は runtime 後の outcome 指標であり、step-plan の静的品質には混ぜるべきではない。 | postcheck は bridge/runtime 評価に限定し、step-plan score には入れない方針を明記。 |
+| 統計妥当性 | 現状値は `mvp-smoke.yaml` 3-run の観測に基づくため、閾値は暫定。blind suite と再計測で確認が必要。 | cap の数値は候補扱いにし、acceptance に blind / post-hoc rescore / 複数 run 確認を追加。 |
+| 過適応リスク | 個別 scenario、特定成果物名、単発ログ文面を metric 条件に入れると、今後の改善が評価合わせになる。 | reason category は汎用カテゴリだけに限定し、特定 scenario 名を判定条件に使わない制約を追加。 |
+| ソフトウェア複雑性 | 新しい top-level score を増やしすぎると読み手が追えなくなる。 | 既存 score は維持し、まず subscore/detail/reason を追加する。top-level 追加は最小限にする。 |
+| 互換性 | TSV schema/report 更新は既存 eval consumer とテストに影響する。 | 空値許容、schema test、report test、旧 summary の読み込み確認を受け入れ条件に追加。 |
+| anvildev 比較 | anvildev は runtime events が少なく `unclassified_process_failure` が多いため、MVP と同じ粒度で層別できない。 | source 比較は成功率/成果物/静的 plan score 中心とし、runtime subscore は MVP 主軸で扱う。 |
+| provider 変動 | `provider_http_status` や transient network は agent capability と分けないと誤判定になる。 | provider layer は指標改善の母集団から除外し、別枠で集計する方針を追加。 |
+
+## 追加レビュー結果と反映
+
+レビューで確認した修正点:
+
+| 観点 | 指摘 | 反映 |
+|---|---|---|
+| 指標責務 | `execution_contract_adherence_score` の cap に `phase_completion_score` / `runtime_friction_score` / `finalization_score` まで混ぜると、bridge 指標が runtime/ultra 指標を吸収して責務が崩れる。 | ECA の cap 入力は `dependency_contract_score`, `config_contract_score`, `verify_contract_score`, `postcheck_stability_score` に限定する。phase/runtime/finalization は横並びの主指標として扱う。 |
+| reason taxonomy | postcheck reason の名前が文書内で揺れている。 | 汎用カテゴリ一覧を固定し、TSV/report/extras では同じ vocabulary を使う。 |
+| 後付け再計測 | `summary.eval.tsv` だけでは reason や stage を復元できない場合がある。 | post-hoc rescore は run root の events/logs を入力にし、summary だけで復元できない値は `not_available` と明示する。 |
+| anvildev 実行 | anvildev 本体には `--engine minimal` が必要だが、`eval-run.py` は `--binary-kind anvildev` で内部的に付与する。作業手順に `eval-run.py --engine minimal` と書くと無効な引数になる。 | work breakdown の実行コマンドは `--binary anvildev --binary-kind anvildev` に統一し、`--engine minimal` は eval runner 内部付与であると明記する。 |
+| テスト実体 | 候補テスト名に実在しない `test_eval_report.py` が含まれていた。 | 既存の `test_eval_event_report.py`, `test_plan_quality_report.py`, `test_summary_schema.py`, `test_runtime_scoring.py` を中心にする。 |
+
+## 指標責務と non-goal
+
+| 指標 | 主な責務 | 使う layer | non-goal |
+|---|---|---|---|
+| `postcheck_stability_score` | deterministic postcheck が安定して通るか、実行後に依存/設定/lockfile/compile の不安定さが出ていないかを測る。 | bridge/runtime | step-plan の静的美しさや prompt coverage は評価しない。 |
+| `phase_completion_score` | ultra の phase が start/scaffold/execute/profile/finalize のどこまで進んだかを測る。 | planning/bridge/execution | 個別 phase の成果物品質やゲーム品質は直接評価しない。 |
+| `runtime_friction_score` | tool validation、execution error、no-tool response、探索停滞、repair 停滞を測る。 | execution | postcheck failure や provider HTTP failure を直接説明する主指標にはしない。 |
+| `finalization_score` | required artifacts、deferred verify、final response、plan-level contract の完了判断を測る。 | bridge/execution | 実装品質の良し悪しを単独では評価しない。 |
+| `execution_contract_adherence_score` | plan contract と実成果物/postcheck の一致を aggregate する。 | bridge | 低い subscore を平均で隠して高評価にすることはしない。 |
+
+設計上の制約:
+
+- `postcheck_stability_score` は事後 outcome 指標なので、planner prompt の直接最適化には使わない。
+- `phase_completion_score` は ultra 専用の主指標とし、minimal-loop / plan-run の aggregate には混ぜない。
+- `runtime_friction_score` は mode-aware に扱い、ultra-plan-run では phase step の補助情報としてだけ使う。
+- `execution_contract_adherence_score` の cap は、個別ケース対策ではなく「低い契約 subscore を aggregate が隠さない」ための一般ルールとして実装する。
+- `execution_contract_adherence_score` の cap 入力は bridge 契約 subscore に限定し、phase/runtime/finalization の低下は別指標で見せる。
+- provider/API 失敗は capability score から除外し、別の reliability bucket として報告する。
+
 ## 現状サマリ
 
 MVP は全体で `123/144` 成功、anvildev は `96/144` 成功だった。
@@ -89,7 +135,19 @@ MVP の `plan-run` では以下。
 
 - `execution_contract_adherence_score` は weighted average だけでなく low-subscore cap を入れる。
 - `postcheck_stability_score` が低い場合は、aggregate を強く cap する。
-- postcheck の低下理由を `dependency_mutation`, `lockfile_mutation`, `package_manager_mismatch`, `dependency_resolution_failure`, `config_compatibility_failure`, `compile_failure` のカテゴリで残す。
+- postcheck の低下理由を、以下の汎用カテゴリで残す。
+  - `artifact_missing`
+  - `dependency_mutation`
+  - `lockfile_mutation`
+  - `package_manager_mismatch`
+  - `dependency_resolution_failure`
+  - `dependency_manifest_incoherent`
+  - `config_compatibility_failure`
+  - `build_or_test_command_failed`
+  - `compile_or_type_failure`
+  - `dev_server_readiness_failed`
+  - `runtime_output_mismatch`
+  - `postcheck_not_applicable`
 
 cap 案:
 
@@ -98,7 +156,34 @@ cap 案:
 - `postcheck_stability_score < 60` の場合、`execution_contract_adherence_score <= 65`
 - `verify_contract_score < 70` の場合、`execution_contract_adherence_score <= 85`
 
-この cap は個別シナリオではなく「低い契約 subscore を aggregate が隠さない」という汎用ルールである。
+この cap は個別シナリオではなく「低い契約 subscore を aggregate が隠さない」という汎用ルールである。ただし、上記の数値は現時点では暫定値であり、acceptance gate にする前に既存 run の後付け再計算と blind suite で確認する。
+
+cap 適用順序:
+
+1. `dependency_contract_score`, `config_contract_score`, `verify_contract_score`, `postcheck_stability_score` のうち、空でない subscore だけを対象に weighted average を算出する。
+2. 空でない subscore の最小値を `min_contract_subscore` として記録する。
+3. `postcheck_stability_score` が存在し、かつ 60 未満なら postcheck cap を最優先で適用する。
+4. `min_contract_subscore` による cap を適用する。
+5. `verify_contract_score` による cap は、verify command が存在する run のみ適用する。
+6. cap 前後の値を `execution_contract_adherence_raw_score` と `execution_contract_adherence_score` として区別できるようにする。
+
+cap 対象外:
+
+- `phase_completion_score`
+- `runtime_friction_score`
+- `finalization_score`
+- `tool_policy_compatibility_score`
+- `plan_run_runtime_health_score`
+- `ultra_runtime_health_score`
+
+これらは ECA の cap 理由ではなく、ECA と並べて failure layer を説明する主指標または補助指標として扱う。
+
+cap が満たすべき性質:
+
+- monotonic: subscore が改善したのに capped score が下がらない。
+- sparse-safe: anvildev や step-plan のように subscore が空の row では不当に 0 扱いしない。
+- explainable: cap 理由を `execution_contract_cap_reason` として report/TSV/extras のいずれかに出す。
+- non-overfit: scenario id、prompt 固有語、特定成果物名を条件に使わない。
 
 ### 3. `phase_completion_score` は ultra-plan-run の成否を強く分離している
 
@@ -248,22 +333,88 @@ MVP の mode 別差分:
 | M013-06 | `finalization_score` が step/plan/postcheck を混ぜている | 完了判断の失敗原因が潰れる | finalization subscore 分解 |
 | M013-07 | `tool_validation_error` の回復性が独立評価されていない | tool args が荒い provider の弱点を見落とす | tool call validity/recovery score |
 | M013-08 | provider HTTP failure が capability failure と混ざりやすい | API 一時問題と agent 問題を混同する | provider 層として score 集計から分離 |
+| M013-09 | `execution_contract_adherence_score` の raw 値と capped 値が区別されていない | cap 導入後に、平均値の変化が実改善か評価ルール変更か分かりにくい | raw/capped 両方を保存 |
+| M013-10 | cap 理由が出ないと score 低下の説明性が落ちる | report を見ても dependency/config/verify/postcheck のどこが原因か分からない | `execution_contract_cap_reason` を出す |
+| M013-11 | runtime subscore が空の anvildev row と 0 点 row を区別しないと比較が歪む | source 比較で anvildev が不当に低評価または高評価になる | empty-safe 集計を徹底 |
+| M013-12 | `phase_completion_score` と `ultra_runtime_health_score` が mirror になりやすい | 似た指標が複数あり、改善対象が曖昧になる | ultra runtime は phase 以外の repair/profile/build 要素も含める |
+| M013-13 | `postcheck_stability_score` は outcome 指標なので planner 評価へ混ぜるとリークになる | step-plan の評価が実行後情報に依存してしまう | step-plan score からは分離 |
+| M013-14 | 直近の根拠は smoke 3-run だけで統計的に弱い | 閾値が known suite に過適応する | blind 3-run と post-hoc rescore で確認 |
+| M013-15 | provider/API failure が目的指標改善の母集団に混ざる | agent 改善では直らない外部要因で score が揺れる | provider failure は別 bucket とし、cap/平均の主分析から除外 |
+| M013-16 | 指標が増えすぎると運用上読めない | report が複雑化し、どの改善を優先すべきか分からない | top-level は増やしすぎず、subscore/detail を基本にする |
+| M013-17 | 後付け再計測で summary だけを入力にすると、新しい reason/stage 指標を復元できない | 既存 run の比較で `0` と `not_available` を混同する | run root の events/logs を入力にし、復元不能値は `not_available` と明示 |
+| M013-18 | anvildev eval の CLI dialect を誤ると比較自体が失敗する | `eval-run.py --engine minimal` のような無効引数や、anvildev 直接実行時の engine 未指定が起きる | eval runner では `--binary-kind anvildev` を使い、内部で `--engine minimal` を付与することを手順に明記 |
 
 ## 次フェーズで実装すべきこと
 
 1. `execution_contract_adherence_score` に low-subscore cap を実装する。
-2. `postcheck_stability_score` の reason categories を TSV/report/extras に出す。
-3. `phase_completion_score` を stage subscore に分ける。
-4. `runtime_friction_score` の mode-aware aggregation を report 側に反映する。
-5. `finalization_score` を step/plan/deferred verify/postcheck に分ける。
-6. 既存の MVP/anvildev 3-run summary に後付け再計算し、成功/失敗分離が改善するか確認する。
-7. blind suite でも同じ分離傾向が出るか確認し、個別ケースへの過適応を防ぐ。
+2. cap 前後の値と cap 理由を保存する。
+3. `postcheck_stability_score` の reason categories を TSV/report/extras に出す。
+4. `phase_completion_score` を stage subscore に分ける。
+5. `ultra_runtime_health_score` が phase completion の単純 mirror にならないよう、build/profile/repair 要素を明示する。
+6. `runtime_friction_score` の mode-aware aggregation を report 側に反映する。
+7. `finalization_score` を step/plan/deferred verify/postcheck に分ける。
+8. provider/API failure を capability analysis の母集団から除外する。
+9. 既存の MVP/anvildev 3-run summary に後付け再計算し、成功/失敗分離が改善するか確認する。
+10. blind suite でも同じ分離傾向が出るか確認し、個別ケースへの過適応を防ぐ。
 
 ## 受け入れ条件案
 
-- MVP `mvp-smoke.yaml` 3-run の plan-run failure で、`execution_contract_adherence_score` failure avg が success avg より 25pt 以上低い。
-- `postcheck_stability_score < 60` の run が aggregate で 80 以上にならない。
+必須:
+
+- MVP `mvp-smoke.yaml` 3-run の plan-run failure で、capped `execution_contract_adherence_score` failure avg が success avg より 25pt 以上低いことを診断有効性の目標にする。
+- `postcheck_stability_score < 60` の run が capped `execution_contract_adherence_score` で 80 以上にならない。
+- `execution_contract_adherence_raw_score` と capped `execution_contract_adherence_score` の両方が TSV/report から確認できる。
+- cap が発生した row では `execution_contract_cap_reason` が確認できる。
 - ultra-plan-run failure の 90%以上で、phase stage subscore から planning/scaffold/execution/profile/finalization のどこで落ちたか分かる。
-- minimal-loop / plan-run の failure で `runtime_friction_score` または `finalization_score` のどちらかが明確に低下する。
+- minimal-loop / plan-run の failure で `runtime_friction_score` または `finalization_score` のどちらかが成功平均より 20pt 以上低い。
+- provider/API failure は capability failure の成功率・平均 score 改善判定から除外され、別 bucket に集計される。
 - blind suite で、known suite と同じ指標が同方向に機能する。
 - 指標名や判定条件に、特定 scenario 名、特定成果物名、単発ログ文面を直接埋め込まない。
+
+判定補足:
+
+- 25pt 以上の差分は既知 suite に対する目標値であり、実装を smoke suite に過適応させるための絶対条件ではない。
+- 目標未達の場合は失敗扱いで黙って進めず、`target_metric_validation_results.md` に「未達の mode / failure layer / reason / 追加で必要な raw event」を記録する。
+- blind suite でも逆方向に出る場合は、指標定義を採用せず再設計する。
+
+推奨:
+
+- `postcheck_stability_score` の低下理由が少なくとも 1 つの汎用カテゴリとして report に出る。
+- anvildev row の空 runtime subscore は空値として扱われ、0 点として平均に混ざらない。
+- `ultra_runtime_health_score` は `phase_completion_score` と完全一致するだけでなく、build/profile/repair の差も表現できる。
+- 後付け再計測で復元できない値は `not_available` と表示し、0 点として扱わない。
+
+## テスト計画案
+
+Unit:
+
+- low-subscore cap の単体テスト。
+  - postcheck 25 / dependency 100 / config 100 / verify 100 で aggregate が高止まりしない。
+  - min subscore が改善した場合に capped score が下がらない。
+  - subscore が空の row では cap が不当に 0 扱いしない。
+- postcheck reason category の単体テスト。
+  - dependency mutation、lockfile mutation、package manager mismatch、dependency resolution failure、config compatibility failure、compile failure をカテゴリとして検出する。
+  - 特定 scenario 名や成果物名がなくても分類できる。
+- phase stage subscore の単体テスト。
+  - scaffold 失敗、step execution 失敗、profile check 失敗、finalization 失敗を別 score として表現する。
+- finalization subscore の単体テスト。
+  - step finalization、plan finalization、deferred verify、postcheck finalization を分離する。
+
+Contract:
+
+- `summary.eval.tsv` header schema test に新規 column を追加する。
+- `report.md` 生成テストで raw/capped/cap reason/postcheck reason/phase stage が出ることを確認する。
+- 旧 summary fixture を読んでも missing column で落ちないことを確認する。
+- `not_available` と空文字と 0 点が平均計算で混同されないことを確認する。
+
+Post-hoc validation:
+
+- 直近 MVP 3-run summary に後付け再計算し、plan-run の success/failure 分離が改善することを確認する。
+- 直近 anvildev 3-run summary に後付け再計算し、空 runtime subscore が 0 扱いされないことを確認する。
+- `mvp-blind.yaml` でも同じ方向に分離することを確認する。
+
+Regression:
+
+- `python3 -m pytest mvp/anvilminimal/tests/eval`
+- `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`
+- speed-cloud smoke の少なくとも `step-plan,plan-run` を 1-run 実行し、TSV/report が生成されること。

@@ -52,6 +52,17 @@ COMPILE_FAILURE_LOG_PATTERNS = (
     "type error",
     "syntax error",
 )
+POSTCHECK_REASON_DEDUCTIONS = {
+    "artifact_missing": 35.0,
+    "build_or_test_command_failed": 45.0,
+    "dev_server_readiness_failed": 45.0,
+    "dependency_mutation": 25.0,
+    "lockfile_mutation": 15.0,
+    "package_manager_mismatch": 10.0,
+    "dependency_resolution_failure": 30.0,
+    "config_compatibility_failure": 30.0,
+    "compile_or_type_failure": 30.0,
+}
 VERIFY_REPAIR_VERDICT_SCORE = {
     "passed": 100.0,
     "improved": 80.0,
@@ -85,6 +96,7 @@ def score_runtime_health(
         "verify_repair_turn",
         "ultra_phase_start",
         "ultra_phase_scaffold_complete",
+        "ultra_phase_plan_validated",
         "ultra_phase_execute_complete",
         "ultra_phase_profile_check",
         "ultra_phase_complete",
@@ -94,25 +106,8 @@ def score_runtime_health(
     has_runtime_events = any(event.get("event") in runtime_event_names for event in events)
     if mode not in RUNTIME_EXECUTION_MODES or not has_runtime_events:
         return {
-            "runtime_friction_score": "",
-            "artifact_progress_score": "",
-            "finalization_score": "",
-            "tool_policy_compatibility_score": "",
-            "plan_run_runtime_health_score": "",
+            **empty_runtime_scores(),
             "prompt_contract_score": score_prompt_contract(events),
-            "dependency_contract_score": "",
-            "config_contract_score": "",
-            "verify_contract_score": "",
-            "postcheck_stability_score": "",
-            "execution_contract_adherence_score": "",
-            "step_obligation_scope_score": "",
-            "step_obligation_scope_violation_count": "",
-            "phase_completion_score": "",
-            "build_verify_pass_score": "",
-            "build_repair_effectiveness_score": "",
-            "compile_diagnostic_progress_score": "",
-            "verify_repair_edit_score": "",
-            "ultra_runtime_health_score": "",
         }
 
     names = Counter(
@@ -146,6 +141,26 @@ def score_runtime_health(
     runtime_friction -= 6.0 * bash_overuse
     runtime_friction -= 10.0 * stagnation
     runtime_friction = clamp(runtime_friction)
+    runtime_friction_raw = runtime_friction
+    runtime_friction_reasons = runtime_friction_reason_categories(
+        validation_errors=validation_errors,
+        execution_errors=execution_errors,
+        no_tool_responses=no_tool_responses,
+        repeated_inspection=repeated_inspection,
+        bash_overuse=bash_overuse,
+        stagnation=stagnation,
+        stop_reason=stop_reason,
+    )
+    if mode == "ultra-plan-run":
+        ultra_friction = score_ultra_runtime_friction(
+            events,
+            success=success,
+            base_runtime_friction=runtime_friction,
+        )
+        if isinstance(ultra_friction, (int, float)):
+            runtime_friction = ultra_friction
+            if ultra_friction < runtime_friction_raw:
+                runtime_friction_reasons.append("phase_orchestration_friction")
 
     write_calls = sum(names.get(name, 0) for name in WRITE_TOOLS)
     required_paths = [str(path) for path in scenario.get("expected_artifacts", []) or []]
@@ -163,14 +178,15 @@ def score_runtime_health(
         artifact_progress -= 20.0
     artifact_progress = clamp(artifact_progress)
 
-    finalization = 100.0 if success else 20.0
-    if "required_artifacts_satisfied" in stop_reason and not success:
-        finalization = max(finalization, 50.0)
-    if "max_iterations" in stop_reason:
-        finalization = min(finalization, 30.0)
-    if no_tool_responses:
-        finalization = min(finalization, 50.0)
-    finalization = clamp(finalization)
+    finalization_scores = score_finalization_details(
+        events,
+        mode=mode,
+        success=success,
+        stop_reason=stop_reason,
+        no_tool_responses=no_tool_responses,
+        run_dir=run_dir,
+    )
+    finalization = finalization_scores["finalization_score"]
 
     policy = 100.0
     policy -= 35.0 * validation_errors
@@ -195,8 +211,10 @@ def score_runtime_health(
     ultra_scores = score_ultra_runtime_health(events, mode=mode, success=success)
     return {
         "runtime_friction_score": round(runtime_friction, 1),
+        "runtime_friction_raw_score": round(runtime_friction_raw, 1),
+        "runtime_friction_reason": ";".join(dict.fromkeys(runtime_friction_reasons)),
         "artifact_progress_score": round(artifact_progress, 1),
-        "finalization_score": round(finalization, 1),
+        **finalization_scores,
         "tool_policy_compatibility_score": round(policy, 1),
         "plan_run_runtime_health_score": runtime_health,
         "prompt_contract_score": score_prompt_contract(events),
@@ -213,7 +231,33 @@ def empty_bridge_scores() -> dict[str, str]:
         "config_contract_score": "",
         "verify_contract_score": "",
         "postcheck_stability_score": "",
+        "postcheck_stability_reason": "",
+        "execution_contract_adherence_raw_score": "",
         "execution_contract_adherence_score": "",
+        "execution_contract_min_subscore": "",
+        "execution_contract_cap_reason": "",
+    }
+
+
+def empty_runtime_scores() -> dict[str, str]:
+    return {
+        "runtime_friction_score": "",
+        "runtime_friction_raw_score": "",
+        "runtime_friction_reason": "",
+        "artifact_progress_score": "",
+        "finalization_score": "",
+        "finalization_reason": "",
+        "step_finalization_score": "",
+        "plan_finalization_score": "",
+        "deferred_verify_finalization_score": "",
+        "postcheck_finalization_score": "",
+        "tool_policy_compatibility_score": "",
+        "plan_run_runtime_health_score": "",
+        "prompt_contract_score": "",
+        **empty_bridge_scores(),
+        "step_obligation_scope_score": "",
+        "step_obligation_scope_violation_count": "",
+        **empty_ultra_runtime_scores(),
     }
 
 
@@ -233,26 +277,79 @@ def score_execution_contract_adherence(
     dependency = score_dependency_contract(plan_text, scenario=scenario, workdir=workdir)
     config = score_config_contract(plan_text, scenario=scenario, workdir=workdir)
     verify = score_verify_contract(plan_data, scenario=scenario, run_dir=run_dir)
-    postcheck = score_postcheck_stability(run_dir)
+    postcheck, postcheck_reason = score_postcheck_stability_detail(
+        run_dir,
+        scenario=scenario,
+        workdir=workdir,
+    )
     available = [
-        (0.35, dependency),
-        (0.25, config),
-        (0.20, verify),
-        (0.20, postcheck),
+        ("dependency_contract_score", 0.35, dependency),
+        ("config_contract_score", 0.25, config),
+        ("verify_contract_score", 0.20, verify),
+        ("postcheck_stability_score", 0.20, postcheck),
     ]
-    weighted = [(weight, value) for weight, value in available if isinstance(value, (int, float))]
+    weighted = [
+        (name, weight, value)
+        for name, weight, value in available
+        if isinstance(value, (int, float))
+    ]
     if not weighted:
+        raw_adherence: float | str = ""
         adherence: float | str = ""
+        min_subscore: float | str = ""
+        cap_reason = ""
     else:
-        total_weight = sum(weight for weight, _ in weighted)
-        adherence = round(sum(weight * float(value) for weight, value in weighted) / total_weight, 1)
+        total_weight = sum(weight for _, weight, _ in weighted)
+        raw_adherence = round(
+            sum(weight * float(value) for _, weight, value in weighted) / total_weight,
+            1,
+        )
+        min_name, _, min_value = min(weighted, key=lambda item: float(item[2]))
+        min_subscore = round(float(min_value), 1)
+        adherence, cap_reason = cap_execution_contract_adherence(
+            raw_adherence,
+            min_name=min_name,
+            min_subscore=float(min_value),
+            verify=verify,
+            postcheck=postcheck,
+        )
     return {
         "dependency_contract_score": round(dependency, 1) if isinstance(dependency, (int, float)) else "",
         "config_contract_score": round(config, 1) if isinstance(config, (int, float)) else "",
         "verify_contract_score": round(verify, 1) if isinstance(verify, (int, float)) else "",
         "postcheck_stability_score": round(postcheck, 1) if isinstance(postcheck, (int, float)) else "",
+        "postcheck_stability_reason": postcheck_reason,
+        "execution_contract_adherence_raw_score": raw_adherence,
         "execution_contract_adherence_score": adherence,
+        "execution_contract_min_subscore": min_subscore,
+        "execution_contract_cap_reason": cap_reason,
     }
+
+
+def cap_execution_contract_adherence(
+    raw_adherence: float,
+    *,
+    min_name: str,
+    min_subscore: float,
+    verify: float | str,
+    postcheck: float | str,
+) -> tuple[float, str]:
+    cap = 100.0
+    reasons: list[str] = []
+    if isinstance(postcheck, (int, float)) and float(postcheck) < 60.0:
+        cap = min(cap, 65.0)
+        reasons.append("postcheck_stability_below_60")
+    if min_subscore < 40.0:
+        cap = min(cap, 55.0)
+        reasons.append(f"min_subscore_below_40:{min_name}")
+    elif min_subscore < 60.0:
+        cap = min(cap, 70.0)
+        reasons.append(f"min_subscore_below_60:{min_name}")
+    if isinstance(verify, (int, float)) and float(verify) < 70.0:
+        cap = min(cap, 85.0)
+        reasons.append("verify_contract_below_70")
+    capped = round(min(raw_adherence, cap), 1)
+    return capped, ";".join(reasons) if capped < raw_adherence else ""
 
 
 def load_plan_contract(plan_paths: list[Path]) -> tuple[str, dict[str, Any]]:
@@ -348,35 +445,55 @@ def score_verify_contract(
 
 
 def score_postcheck_stability(run_dir: Path | None) -> float | str:
+    score, _ = score_postcheck_stability_detail(run_dir, scenario={}, workdir=None)
+    return score
+
+
+def score_postcheck_stability_detail(
+    run_dir: Path | None,
+    *,
+    scenario: dict[str, Any],
+    workdir: Path | None,
+) -> tuple[float | str, str]:
     if run_dir is None:
-        return ""
+        return "", "postcheck_not_applicable"
     postcheck_dir = run_dir / "postcheck"
     if not postcheck_dir.exists():
-        return ""
+        return "", "postcheck_not_applicable"
     score = 100.0
+    reasons: list[str] = []
     text = "\n".join(
         path.read_text(encoding="utf-8", errors="replace")
         for path in sorted(postcheck_dir.glob("*.log"))
         if path.is_file()
     ).lower()
     events = load_postcheck_events(run_dir)
+    missing = []
+    if workdir is not None:
+        for path in scenario.get("expected_artifacts", []) or []:
+            if not (workdir / str(path)).exists():
+                missing.append(str(path))
+    if missing:
+        reasons.append("artifact_missing")
     if any(event.get("event") == "postcheck" and int(event.get("rc") or 0) != 0 for event in events):
-        score -= 45.0
+        reasons.append("build_or_test_command_failed")
     if any(event.get("event") == "dev_server" and event.get("ready") is False for event in events):
-        score -= 45.0
+        reasons.append("dev_server_readiness_failed")
     if contains_any(text, DEPENDENCY_MUTATION_LOG_PATTERNS):
-        score -= 25.0
+        reasons.append("dependency_mutation")
     if contains_any(text, LOCKFILE_MUTATION_LOG_PATTERNS):
-        score -= 15.0
+        reasons.append("lockfile_mutation")
     if contains_any(text, PACKAGE_MANAGER_MIX_LOG_PATTERNS):
-        score -= 10.0
+        reasons.append("package_manager_mismatch")
     if contains_any(text, DEPENDENCY_RESOLUTION_FAILURE_LOG_PATTERNS):
-        score -= 30.0
+        reasons.append("dependency_resolution_failure")
     if contains_any(text, CONFIG_COMPATIBILITY_FAILURE_LOG_PATTERNS):
-        score -= 30.0
+        reasons.append("config_compatibility_failure")
     if contains_any(text, COMPILE_FAILURE_LOG_PATTERNS):
-        score -= 30.0
-    return clamp(score)
+        reasons.append("compile_or_type_failure")
+    for reason in dict.fromkeys(reasons):
+        score -= POSTCHECK_REASON_DEDUCTIONS.get(reason, 0.0)
+    return clamp(score), ";".join(dict.fromkeys(reasons))
 
 
 def contains_any(text: str, patterns: tuple[str, ...]) -> bool:
@@ -480,19 +597,143 @@ def command_represented(command: str, plan_text: str) -> bool:
     return False
 
 
+def runtime_friction_reason_categories(
+    *,
+    validation_errors: int,
+    execution_errors: int,
+    no_tool_responses: int,
+    repeated_inspection: int,
+    bash_overuse: int,
+    stagnation: int,
+    stop_reason: str,
+) -> list[str]:
+    reasons: list[str] = []
+    if validation_errors:
+        reasons.append("tool_validation_error")
+    if execution_errors:
+        reasons.append("tool_execution_error")
+    if no_tool_responses:
+        reasons.append("no_tool_response")
+    if repeated_inspection:
+        reasons.append("repeated_inspection")
+    if bash_overuse:
+        reasons.append("bash_overuse")
+    if stagnation:
+        reasons.append("artifact_stagnation")
+    if "max_iterations" in stop_reason:
+        reasons.append("max_iterations")
+    if "verify_repair" in stop_reason:
+        reasons.append("verify_repair_stagnation")
+    return reasons
+
+
+def score_finalization_details(
+    events: list[dict[str, Any]],
+    *,
+    mode: str,
+    success: bool,
+    stop_reason: str,
+    no_tool_responses: int,
+    run_dir: Path | None,
+) -> dict[str, float | str]:
+    reasons: list[str] = []
+    step = 100.0 if success else 20.0
+    if "required_artifacts_satisfied" in stop_reason and not success:
+        step = max(step, 50.0)
+        reasons.append("artifacts_satisfied_but_not_finalized")
+    if "required_artifacts_missing" in stop_reason:
+        step = min(step, 20.0)
+        reasons.append("required_artifacts_missing")
+    if "max_iterations" in stop_reason:
+        step = min(step, 30.0)
+        reasons.append("max_iterations")
+    if no_tool_responses:
+        step = min(step, 50.0)
+        reasons.append("missing_tool_call")
+    step = clamp(step)
+
+    plan: float | str = ""
+    deferred: float | str = ""
+    postcheck: float | str = ""
+    if mode in {"plan-run", "ultra-plan-run", "ultra-step-run"}:
+        plan = 100.0 if success else 30.0
+        if "plan_final_contract" in stop_reason:
+            plan = 0.0
+            reasons.append("plan_final_contract_failure")
+        elif "required_artifacts_satisfied" in stop_reason and not success:
+            plan = max(plan, 50.0)
+        deferred = 100.0
+        if "deferred_verify_requirement_pending" in stop_reason:
+            deferred = 20.0
+            reasons.append("deferred_verify_requirement_pending")
+        elif any(event.get("event") == "completion_verify" and event.get("ok") is False for event in events):
+            deferred = 60.0
+            reasons.append("completion_verify_failed")
+        postcheck_score, postcheck_reason = score_postcheck_finalization(run_dir)
+        postcheck = postcheck_score
+        if postcheck_reason:
+            reasons.append(postcheck_reason)
+
+    aggregate_values = [
+        value for value in [step, plan, deferred, postcheck] if isinstance(value, (int, float))
+    ]
+    aggregate = round(sum(float(value) for value in aggregate_values) / len(aggregate_values), 1)
+    return {
+        "finalization_score": aggregate,
+        "finalization_reason": ";".join(dict.fromkeys(reasons)),
+        "step_finalization_score": round(step, 1),
+        "plan_finalization_score": round(plan, 1) if isinstance(plan, (int, float)) else "",
+        "deferred_verify_finalization_score": round(deferred, 1) if isinstance(deferred, (int, float)) else "",
+        "postcheck_finalization_score": round(postcheck, 1) if isinstance(postcheck, (int, float)) else "",
+    }
+
+
+def score_postcheck_finalization(run_dir: Path | None) -> tuple[float | str, str]:
+    if run_dir is None or not (run_dir / "postcheck").exists():
+        return "", ""
+    events = load_postcheck_events(run_dir)
+    if any(event.get("event") == "postcheck" and int(event.get("rc") or 0) != 0 for event in events):
+        return 0.0, "postcheck_failure"
+    if any(event.get("event") == "dev_server" and event.get("ready") is False for event in events):
+        return 0.0, "postcheck_failure"
+    return 100.0, ""
+
+
+def score_ultra_runtime_friction(
+    events: list[dict[str, Any]],
+    *,
+    success: bool,
+    base_runtime_friction: float,
+) -> float | str:
+    phase_completion = score_phase_completion(events, success=success)
+    if not isinstance(phase_completion, (int, float)):
+        return base_runtime_friction
+    failed_phases = sum(1 for event in events if event.get("event") == "ultra_phase_failed")
+    incomplete_penalty = max(0.0, 100.0 - float(phase_completion)) * 0.6
+    score = min(base_runtime_friction, 100.0 - incomplete_penalty)
+    score -= 20.0 * failed_phases
+    if not success and not any(event.get("event") == "ultra_plan_complete" for event in events):
+        score = min(score, 55.0)
+    return round(clamp(score), 1)
+
+
 def score_ultra_runtime_health(
     events: list[dict[str, Any]], *, mode: str, success: bool
 ) -> dict[str, float | str]:
     if mode != "ultra-plan-run":
         return empty_ultra_runtime_scores()
     phase_completion = score_phase_completion(events, success=success)
+    phase_stage_scores = score_phase_stage_scores(events, success=success)
     build_scores = score_build_repair(events)
     available = [
-        (0.35, phase_completion),
-        (0.20, build_scores["build_verify_pass_score"]),
-        (0.20, build_scores["build_repair_effectiveness_score"]),
-        (0.15, build_scores["compile_diagnostic_progress_score"]),
-        (0.10, build_scores["verify_repair_edit_score"]),
+        (0.20, phase_completion),
+        (0.15, phase_stage_scores["phase_step_execution_score"]),
+        (0.10, phase_stage_scores["phase_verify_success_score"]),
+        (0.10, phase_stage_scores["phase_finalization_score"]),
+        (0.15, build_scores["build_verify_pass_score"]),
+        (0.15, build_scores["build_repair_effectiveness_score"]),
+        (0.10, build_scores["compile_diagnostic_progress_score"]),
+        (0.05, build_scores["verify_repair_edit_score"]),
     ]
     weighted = [
         (weight, value)
@@ -509,6 +750,7 @@ def score_ultra_runtime_health(
         ultra_runtime = ""
     return {
         "phase_completion_score": phase_completion,
+        **phase_stage_scores,
         **build_scores,
         "ultra_runtime_health_score": ultra_runtime,
     }
@@ -517,6 +759,13 @@ def score_ultra_runtime_health(
 def empty_ultra_runtime_scores() -> dict[str, str]:
     return {
         "phase_completion_score": "",
+        "phase_plan_validity_score": "",
+        "phase_scaffold_success_score": "",
+        "phase_step_execution_score": "",
+        "phase_verify_success_score": "",
+        "phase_postcheck_success_score": "",
+        "phase_finalization_score": "",
+        "phase_failure_stage": "",
         "build_verify_pass_score": "",
         "build_repair_effectiveness_score": "",
         "compile_diagnostic_progress_score": "",
@@ -570,6 +819,96 @@ def score_phase_completion(events: list[dict[str, Any]], *, success: bool) -> fl
     while len(phase_scores) < total:
         phase_scores.append(0.0)
     return round(sum(phase_scores[:total]) / total, 1)
+
+
+def score_phase_stage_scores(events: list[dict[str, Any]], *, success: bool) -> dict[str, float | str]:
+    phase_events = [
+        event
+        for event in events
+        if str(event.get("event", "")).startswith("ultra_phase_")
+        or event.get("event") == "ultra_plan_complete"
+    ]
+    if not phase_events:
+        return {
+            "phase_plan_validity_score": "",
+            "phase_scaffold_success_score": "",
+            "phase_step_execution_score": "",
+            "phase_verify_success_score": "",
+            "phase_postcheck_success_score": "",
+            "phase_finalization_score": "",
+            "phase_failure_stage": "",
+        }
+    total = 0
+    for event in phase_events:
+        total = max(total, safe_int_event(event.get("total_phases")))
+    phase_ids = sorted(
+        {
+            str(event.get("phase_id", ""))
+            for event in phase_events
+            if event.get("phase_id")
+        }
+    )
+    if total <= 0:
+        total = len(phase_ids)
+    if total <= 0:
+        total = 1
+    per_phase: dict[str, set[str]] = {phase_id: set() for phase_id in phase_ids}
+    failed_stages: list[str] = []
+    for event in phase_events:
+        phase_id = str(event.get("phase_id", ""))
+        if phase_id:
+            per_phase.setdefault(phase_id, set()).add(str(event.get("event", "")))
+        if event.get("event") == "ultra_phase_failed":
+            stage = str(event.get("stage", "") or "unknown")
+            failed_stages.append(stage)
+    while len(per_phase) < total:
+        per_phase[f"missing-{len(per_phase) + 1}"] = set()
+
+    def ratio_for(event_name: str) -> float:
+        count = sum(1 for stages in per_phase.values() if event_name in stages)
+        return round(100.0 * count / total, 1)
+
+    completion_events = [event for event in events if event.get("event") == "completion_verify"]
+    if completion_events:
+        verify_success = 100.0 if any(bool(event.get("ok")) for event in completion_events) else 0.0
+    else:
+        verify_success = ratio_for("ultra_phase_profile_check")
+    postcheck_events = load_postcheck_events_from_phase_events(events)
+    if postcheck_events:
+        postcheck_success = 100.0 if all(bool(event.get("ok", True)) for event in postcheck_events) else 0.0
+    elif success:
+        postcheck_success = 100.0
+    else:
+        postcheck_success = ""
+
+    completed = ratio_for("ultra_phase_complete")
+    if success:
+        completed = 100.0
+    has_explicit_plan_validation = any(
+        "ultra_phase_plan_validated" in stages for stages in per_phase.values()
+    )
+    phase_plan_validity = (
+        ratio_for("ultra_phase_plan_validated")
+        if has_explicit_plan_validation
+        else ratio_for("ultra_phase_scaffold_complete")
+    )
+    return {
+        "phase_plan_validity_score": phase_plan_validity,
+        "phase_scaffold_success_score": ratio_for("ultra_phase_scaffold_complete"),
+        "phase_step_execution_score": ratio_for("ultra_phase_execute_complete"),
+        "phase_verify_success_score": verify_success,
+        "phase_postcheck_success_score": postcheck_success,
+        "phase_finalization_score": completed,
+        "phase_failure_stage": ";".join(dict.fromkeys(failed_stages)),
+    }
+
+
+def load_postcheck_events_from_phase_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        event
+        for event in events
+        if event.get("event") in {"postcheck_summary", "postcheck"}
+    ]
 
 
 def score_build_repair(events: list[dict[str, Any]]) -> dict[str, float | str]:

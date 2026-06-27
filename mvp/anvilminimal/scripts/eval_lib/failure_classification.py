@@ -42,6 +42,53 @@ KNOWN_FAILURE_KINDS = {
     "verify_command_policy_error",
 }
 
+PROVIDER_FAILURE_KINDS = {
+    "provider_http_status",
+    "provider_model_unavailable",
+    "provider_parse_error",
+    "provider_transient_exhausted",
+    "max_iterations_after_provider_error",
+}
+PLANNING_FAILURE_KINDS = {
+    "planner_lint_error",
+    "planner_schema_error",
+    "verify_command_policy_error",
+    "phase_scaffold_error",
+}
+BRIDGE_FAILURE_KINDS = {
+    "plan_final_contract_failure",
+    "profile_contract_failure",
+    "step_obligation_scope_violation",
+    "step_verify_failure",
+    "deferred_verify_requirement_pending",
+}
+POSTCHECK_FAILURE_KINDS = {"postcheck_failure"}
+ENVIRONMENT_FAILURE_KINDS = {"timeout", "diagnostic_skipped"}
+
+
+def failure_layer_for_kind(kind: str | None) -> str:
+    normalized = str(kind or "")
+    if not normalized:
+        return ""
+    if normalized in PROVIDER_FAILURE_KINDS:
+        return "provider"
+    if normalized in PLANNING_FAILURE_KINDS:
+        return "planning"
+    if normalized in BRIDGE_FAILURE_KINDS:
+        return "bridge"
+    if normalized in POSTCHECK_FAILURE_KINDS:
+        return "postcheck"
+    if normalized in ENVIRONMENT_FAILURE_KINDS:
+        return "environment"
+    return "runtime"
+
+
+def capability_failure_included(kind: str | None) -> bool | str:
+    layer = failure_layer_for_kind(kind)
+    if not layer:
+        return ""
+    return layer not in {"provider", "environment"}
+
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():

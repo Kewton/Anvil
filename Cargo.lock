@@ -930,6 +930,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "my_cli"
+version = "0.1.0"
+
+[[package]]
 name = "nix"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1230,6 +1234,10 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rust-cli-demo"
+version = "0.1.0"
 
 [[package]]
 name = "rustc-hash"
@@ -2254,6 +2262,10 @@ dependencies = [
  "unicode-xid",
  "wasmparser",
 ]
+
+[[package]]
+name = "workdir"
+version = "0.1.0"
 
 [[package]]
 name = "writeable"

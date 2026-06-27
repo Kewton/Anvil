@@ -34,6 +34,8 @@ class SummarySchemaTest(unittest.TestCase):
         self.assertIn("plan_run_predictive_score_avg", text)
         self.assertIn("plan_run_runtime_health_score_avg", text)
         self.assertIn("execution_contract_adherence_score_avg", text)
+        self.assertIn("execution_contract_adherence_raw_score_avg", text)
+        self.assertIn("execution_contract_min_subscore_avg", text)
         self.assertIn("postcheck_stability_score_avg", text)
         self.assertIn("ultra_runtime_health_score_avg", text)
         self.assertIn("phase_completion_score_avg", text)
@@ -49,6 +51,8 @@ class SummarySchemaTest(unittest.TestCase):
         self.assertIn("artifact_ownership_score_avg", text)
         self.assertIn("lint_repair_score_avg", text)
         self.assertIn("stability_score_avg", text)
+        self.assertIn("runtime_friction_raw_score_avg", text)
+        self.assertIn("step_finalization_score_avg", text)
 
     def test_report_uses_failure_kind_from_extras(self):
         with tempfile.TemporaryDirectory() as td:
@@ -83,6 +87,8 @@ class SummarySchemaTest(unittest.TestCase):
             self.assertIn("planner_lint_error", report)
             self.assertIn("## Planner Repairs", report)
             self.assertIn("schema_repaired", report)
+            self.assertIn("## Failure Layers", report)
+            self.assertIn("| runtime | 1 | 1 | 0 |", report)
 
 
 if __name__ == "__main__":

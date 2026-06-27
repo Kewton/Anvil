@@ -68,6 +68,8 @@ class RuntimeScoringTest(unittest.TestCase):
         self.assertEqual(score["phase_completion_score"], "")
         self.assertEqual(score["ultra_runtime_health_score"], "")
         self.assertEqual(score["execution_contract_adherence_score"], "")
+        self.assertEqual(score["execution_contract_adherence_raw_score"], "")
+        self.assertEqual(score["postcheck_stability_reason"], "")
 
     def test_prompt_contract_score_uses_boolean_event_without_prompt_body(self):
         events = [
@@ -192,11 +194,38 @@ class RuntimeScoringTest(unittest.TestCase):
                 workdir=Path(td),
             )
         self.assertEqual(score["phase_completion_score"], 82.5)
+        self.assertEqual(score["phase_plan_validity_score"], 100.0)
+        self.assertEqual(score["phase_scaffold_success_score"], 100.0)
+        self.assertEqual(score["phase_step_execution_score"], 100.0)
+        self.assertEqual(score["phase_verify_success_score"], 0.0)
+        self.assertEqual(score["phase_finalization_score"], 50.0)
+        self.assertEqual(score["phase_failure_stage"], "execute")
         self.assertEqual(score["build_verify_pass_score"], 0.0)
         self.assertEqual(score["compile_diagnostic_progress_score"], 35.0)
         self.assertEqual(score["verify_repair_edit_score"], 0.0)
         self.assertEqual(score["build_repair_effectiveness_score"], 21.0)
         self.assertLess(score["ultra_runtime_health_score"], 50.0)
+
+    def test_ultra_phase_plan_validity_uses_explicit_validation_event_when_present(self):
+        events = [
+            {"event": "ultra_phase_start", "phase_id": "one", "total_phases": 2},
+            {"event": "ultra_phase_scaffold_complete", "phase_id": "one", "total_phases": 2},
+            {"event": "ultra_phase_plan_validated", "phase_id": "one", "total_phases": 2},
+            {"event": "ultra_phase_start", "phase_id": "two", "total_phases": 2},
+            {"event": "ultra_phase_scaffold_complete", "phase_id": "two", "total_phases": 2},
+            {"event": "ultra_phase_failed", "phase_id": "two", "total_phases": 2, "stage": "lint"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="ultra-plan-run",
+                success=False,
+                scenario={"expected_artifacts": []},
+                workdir=Path(td),
+            )
+        self.assertEqual(score["phase_plan_validity_score"], 50.0)
+        self.assertEqual(score["phase_scaffold_success_score"], 100.0)
+        self.assertEqual(score["phase_failure_stage"], "lint")
 
     def test_ultra_runtime_scores_successful_build_repair(self):
         events = [
@@ -418,7 +447,76 @@ steps:
         self.assertEqual(score["config_contract_score"], 100.0)
         self.assertEqual(score["verify_contract_score"], 100.0)
         self.assertEqual(score["postcheck_stability_score"], 100.0)
+        self.assertEqual(score["postcheck_stability_reason"], "")
+        self.assertEqual(score["execution_contract_adherence_raw_score"], 100.0)
+        self.assertEqual(score["execution_contract_min_subscore"], 100.0)
+        self.assertEqual(score["execution_contract_cap_reason"], "")
         self.assertEqual(score["execution_contract_adherence_score"], 100.0)
+
+    def test_execution_contract_adherence_caps_low_postcheck_subscore(self):
+        plan = """goal: nextjs app
+steps:
+  - id: setup
+    kind: setup
+    instruction: Create package.json, tsconfig.json, and verify with npm run build.
+    expected_paths:
+      - package.json
+      - tsconfig.json
+    verify:
+      - npm run build
+"""
+        events = [
+            {"event": "provider_response", "tool_calls": 1},
+            {"event": "tool_call_raw", "name": "Write"},
+            {"event": "tool_execute", "name": "Write", "status": "ok"},
+            {"event": "loop_stop", "reason": "required_artifacts_satisfied_after_tool"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            plan_path = root / "plan.yaml"
+            plan_path.write_text(plan, encoding="utf-8")
+            workdir = root / "workdir"
+            workdir.mkdir()
+            (workdir / "package.json").write_text(
+                """{
+  "scripts": {"build": "next build"},
+  "dependencies": {"next": "14.2.14", "react": "18.3.1", "react-dom": "18.3.1"},
+  "devDependencies": {"typescript": "5.5.4", "@types/react": "18.3.1", "@types/react-dom": "18.3.1"}
+}
+""",
+                encoding="utf-8",
+            )
+            (workdir / "tsconfig.json").write_text(
+                """{"compilerOptions":{"moduleResolution":"bundler","target":"ES2017"}}""",
+                encoding="utf-8",
+            )
+            postcheck = root / "postcheck"
+            postcheck.mkdir()
+            (postcheck / "events.jsonl").write_text(
+                '{"event":"postcheck","command":"npm run build","rc":1}\n',
+                encoding="utf-8",
+            )
+            (postcheck / "command-0.stderr.log").write_text(
+                "Failed to compile. Type error in src/app/page.tsx",
+                encoding="utf-8",
+            )
+            score = score_runtime_health(
+                events,
+                mode="plan-run",
+                success=False,
+                scenario={
+                    "profile": "nextjs",
+                    "expected_artifacts": ["package.json", "tsconfig.json"],
+                    "postcheck": {"commands": ["npm run build"]},
+                },
+                workdir=workdir,
+                plan_paths=[plan_path],
+                run_dir=root,
+            )
+        self.assertEqual(score["postcheck_stability_reason"], "build_or_test_command_failed;compile_or_type_failure")
+        self.assertGreater(score["execution_contract_adherence_raw_score"], 70.0)
+        self.assertLessEqual(score["execution_contract_adherence_score"], 55.0)
+        self.assertIn("postcheck_stability_below_60", score["execution_contract_cap_reason"])
 
 
 if __name__ == "__main__":

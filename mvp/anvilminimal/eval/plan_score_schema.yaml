@@ -44,6 +44,8 @@ summary_eval_tsv_header:
   - planner_quality_retry_count
   - planner_quality_retry_degraded_count
   - valid_plan_generated
+  - failure_layer
+  - capability_failure_included
   - plan_quality_score
   - executable_plan_score
   - constraint_coverage_score
@@ -53,8 +55,15 @@ summary_eval_tsv_header:
   - execution_shape_readiness_score
   - plan_run_predictive_score
   - runtime_friction_score
+  - runtime_friction_raw_score
+  - runtime_friction_reason
   - artifact_progress_score
   - finalization_score
+  - finalization_reason
+  - step_finalization_score
+  - plan_finalization_score
+  - deferred_verify_finalization_score
+  - postcheck_finalization_score
   - tool_policy_compatibility_score
   - plan_run_runtime_health_score
   - prompt_contract_score
@@ -62,10 +71,21 @@ summary_eval_tsv_header:
   - config_contract_score
   - verify_contract_score
   - postcheck_stability_score
+  - postcheck_stability_reason
+  - execution_contract_adherence_raw_score
   - execution_contract_adherence_score
+  - execution_contract_min_subscore
+  - execution_contract_cap_reason
   - step_obligation_scope_score
   - step_obligation_scope_violation_count
   - phase_completion_score
+  - phase_plan_validity_score
+  - phase_scaffold_success_score
+  - phase_step_execution_score
+  - phase_verify_success_score
+  - phase_postcheck_success_score
+  - phase_finalization_score
+  - phase_failure_stage
   - build_verify_pass_score
   - build_repair_effectiveness_score
   - compile_diagnostic_progress_score

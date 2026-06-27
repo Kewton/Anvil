@@ -27,6 +27,44 @@ pub struct CommandFailure {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyCommandViolationKind {
+    Empty,
+    Blocked,
+    ShellControlSyntax,
+    SetupOrDevServer,
+    WorkspaceEscape,
+}
+
+impl VerifyCommandViolationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Blocked => "blocked",
+            Self::ShellControlSyntax => "shell_control_syntax",
+            Self::SetupOrDevServer => "setup_or_dev_server",
+            Self::WorkspaceEscape => "workspace_escape",
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "verify command is empty",
+            Self::Blocked => "verify command is blocked",
+            Self::ShellControlSyntax => "verify command may not use shell control syntax",
+            Self::SetupOrDevServer => "verify command may not perform setup or start a dev server",
+            Self::WorkspaceEscape => "verify command manifest path escapes workspace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyCommandDiagnosis {
+    pub normalized: String,
+    pub violation: Option<VerifyCommandViolationKind>,
+    pub reason: Option<String>,
+}
+
 impl VerificationReport {
     pub fn pass() -> Self {
         Self {
@@ -166,17 +204,47 @@ pub fn verify_step(root: &Path, step: &PlanStep) -> VerificationReport {
 }
 
 pub fn validate_verify_command(command: &str) -> anyhow::Result<()> {
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("verify command is empty");
+    let diagnosis = diagnose_verify_command(command);
+    if let Some(violation) = diagnosis.violation {
+        anyhow::bail!(
+            "{}",
+            diagnosis
+                .reason
+                .unwrap_or_else(|| violation.message().to_string())
+        );
     }
-    if crate::tools::bash::blocked_reason(trimmed, false).is_some() {
-        anyhow::bail!("verify command is blocked");
+    Ok(())
+}
+
+pub fn normalize_verify_command(command: &str) -> anyhow::Result<String> {
+    let diagnosis = diagnose_verify_command(command);
+    if let Some(violation) = diagnosis.violation {
+        anyhow::bail!(
+            "{}",
+            diagnosis
+                .reason
+                .unwrap_or_else(|| violation.message().to_string())
+        );
     }
-    if contains_shell_control_syntax(trimmed) {
-        anyhow::bail!("verify command may not use shell control syntax");
+    Ok(diagnosis.normalized)
+}
+
+pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
+    let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return verify_command_violation(normalized, VerifyCommandViolationKind::Empty, None);
     }
-    let lower = trimmed.to_ascii_lowercase();
+    if crate::tools::bash::blocked_reason(&normalized, false).is_some() {
+        return verify_command_violation(normalized, VerifyCommandViolationKind::Blocked, None);
+    }
+    if contains_shell_control_syntax(&normalized) {
+        return verify_command_violation(
+            normalized,
+            VerifyCommandViolationKind::ShellControlSyntax,
+            None,
+        );
+    }
+    let lower = normalized.to_ascii_lowercase();
     if lower.contains("npm install")
         || lower.contains("pnpm install")
         || lower.contains("yarn install")
@@ -184,12 +252,38 @@ pub fn validate_verify_command(command: &str) -> anyhow::Result<()> {
         || lower.contains("next dev")
         || lower.contains("vite --host")
     {
-        anyhow::bail!("verify command may not perform setup or start a dev server");
+        return verify_command_violation(
+            normalized,
+            VerifyCommandViolationKind::SetupOrDevServer,
+            None,
+        );
     }
-    if let Some(path) = manifest_path_arg(trimmed) {
-        validate_workspace_relative(path)?;
+    if let Some(path) = manifest_path_arg(&normalized) {
+        if let Err(err) = validate_workspace_relative(path) {
+            return verify_command_violation(
+                normalized,
+                VerifyCommandViolationKind::WorkspaceEscape,
+                Some(err.to_string()),
+            );
+        }
     }
-    Ok(())
+    VerifyCommandDiagnosis {
+        normalized,
+        violation: None,
+        reason: None,
+    }
+}
+
+fn verify_command_violation(
+    normalized: String,
+    violation: VerifyCommandViolationKind,
+    reason: Option<String>,
+) -> VerifyCommandDiagnosis {
+    VerifyCommandDiagnosis {
+        normalized,
+        violation: Some(violation),
+        reason: Some(reason.unwrap_or_else(|| violation.message().to_string())),
+    }
 }
 
 fn contains_shell_control_syntax(command: &str) -> bool {
@@ -244,6 +338,65 @@ mod tests {
     #[test]
     fn rust_manifest_path_escape_rejected() {
         assert!(validate_verify_command("cargo test --manifest-path ../Cargo.toml").is_err());
+    }
+
+    #[test]
+    fn verify_command_diagnoses_shell_control_syntax() {
+        let diagnosis = diagnose_verify_command("npm test && npm run build");
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::ShellControlSyntax)
+        );
+        assert_eq!(
+            diagnosis.reason.as_deref(),
+            Some("verify command may not use shell control syntax")
+        );
+    }
+
+    #[test]
+    fn verify_command_diagnoses_setup_or_dev_server() {
+        let diagnosis = diagnose_verify_command("next dev -p 3011");
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::SetupOrDevServer)
+        );
+        assert_eq!(
+            diagnosis.reason.as_deref(),
+            Some("verify command may not perform setup or start a dev server")
+        );
+    }
+
+    #[test]
+    fn verify_command_diagnoses_empty_command() {
+        let diagnosis = diagnose_verify_command("   ");
+        assert_eq!(diagnosis.violation, Some(VerifyCommandViolationKind::Empty));
+        assert_eq!(diagnosis.normalized, "");
+    }
+
+    #[test]
+    fn verify_command_normalizes_safe_whitespace_only() {
+        let normalized = normalize_verify_command("  cargo   test   --locked  ").unwrap();
+        assert_eq!(normalized, "cargo test --locked");
+    }
+
+    #[test]
+    fn verify_command_keeps_real_check_instead_of_weak_downgrade() {
+        assert!(normalize_verify_command("npm run build").is_ok());
+        assert!(validate_verify_command("test -f package.json").is_ok());
+        let diagnosis = diagnose_verify_command("npm run build && test -f package.json");
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::ShellControlSyntax)
+        );
+    }
+
+    #[test]
+    fn verify_command_diagnoses_manifest_path_escape() {
+        let diagnosis = diagnose_verify_command("cargo test --manifest-path ../Cargo.toml");
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::WorkspaceEscape)
+        );
     }
 
     #[test]

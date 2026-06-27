@@ -5,7 +5,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from eval_lib.failure_classification import classify_events, classify_stderr
+from eval_lib.failure_classification import (
+    capability_failure_included,
+    classify_events,
+    classify_stderr,
+    failure_layer_for_kind,
+)
 
 
 class FailureClassificationTest(unittest.TestCase):
@@ -48,6 +53,14 @@ class FailureClassificationTest(unittest.TestCase):
             rc=1,
         )
         self.assertEqual(result["failure_kind"], "step_verify_failure")
+
+    def test_failure_layers_separate_provider_from_capability_failures(self):
+        self.assertEqual(failure_layer_for_kind("provider_http_status"), "provider")
+        self.assertEqual(capability_failure_included("provider_http_status"), False)
+        self.assertEqual(failure_layer_for_kind("planner_schema_error"), "planning")
+        self.assertEqual(capability_failure_included("planner_schema_error"), True)
+        self.assertEqual(failure_layer_for_kind("tool_validation_error"), "runtime")
+        self.assertEqual(capability_failure_included("tool_validation_error"), True)
 
 
 if __name__ == "__main__":

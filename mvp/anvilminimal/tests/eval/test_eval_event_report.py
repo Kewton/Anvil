@@ -69,6 +69,41 @@ class EvalEventReportTest(unittest.TestCase):
         self.assertIn("# anvilminimal Eval Report", report)
         self.assertIn("## Planner Raw Output Shapes", report)
 
+    def test_report_summarizes_target_metric_reasons_and_failure_layers(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td)
+            row = {key: "" for key in SUMMARY_HEADER}
+            row.update(
+                {
+                    "run_id": "target",
+                    "suite": "s",
+                    "scenario": "scenario",
+                    "size": "medium",
+                    "category": "runtime",
+                    "mode": "plan-run",
+                    "success": "false",
+                    "rc": "1",
+                    "failure_layer": "bridge",
+                    "capability_failure_included": "true",
+                    "postcheck_stability_score": "25",
+                    "postcheck_stability_reason": "build_or_test_command_failed;compile_or_type_failure",
+                    "execution_contract_adherence_raw_score": "88",
+                    "execution_contract_adherence_score": "55",
+                    "execution_contract_cap_reason": "postcheck_stability_below_60",
+                    "runtime_friction_reason": "verify_repair_stagnation",
+                    "finalization_reason": "deferred_verify_requirement_pending",
+                    "extras_json": {"failure_kind": "deferred_verify_requirement_pending"},
+                }
+            )
+            write_summary(run_root / "summary.eval.tsv", [row])
+            report = generate_report(run_root)
+        self.assertIn("## Target Runtime Metrics", report)
+        self.assertIn("## Target Metric Reasons", report)
+        self.assertIn("build_or_test_command_failed", report)
+        self.assertIn("postcheck_stability_below_60", report)
+        self.assertIn("## Failure Layers", report)
+        self.assertIn("| bridge | 1 | 1 | 0 |", report)
+
 
 if __name__ == "__main__":
     unittest.main()

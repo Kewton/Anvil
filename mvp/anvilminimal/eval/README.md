@@ -81,10 +81,22 @@ actually close through the minimal loop:
 - `plan_run_runtime_health_score`: aggregate of runtime friction, artifact
   progress, tool policy compatibility, and finalization. This is intentionally
   separate from static YAML quality.
+- `runtime_friction_raw_score`: raw tool/runtime friction before mode-specific
+  interpretation. Use this for debugging provider/tool behavior, not as the
+  primary cross-mode score.
+- `runtime_friction_reason`: semicolon-delimited generic reason categories such
+  as `tool_validation_error`, `repeated_inspection`, `max_iterations`, or
+  `verify_repair_stagnation`.
 - `execution_contract_adherence_score`: bridge metric that compares the saved
   plan contract with the actual produced artifacts and postcheck behavior. It
-  is the aggregate of dependency, config, verify, and postcheck stability
-  scores.
+  is the capped aggregate of dependency, config, verify, and postcheck stability
+  scores. The cap prevents a low bridge subscore from being hidden by unrelated
+  high subscores.
+- `execution_contract_adherence_raw_score`: the pre-cap bridge aggregate.
+- `execution_contract_min_subscore`: the lowest numeric dependency/config/
+  verify/postcheck bridge subscore used for the cap.
+- `execution_contract_cap_reason`: generic cap reason, such as
+  `postcheck_stability_below_60` or `min_subscore_below_40:<metric>`.
 - `dependency_contract_score`: whether generated dependency manifests satisfy
   plan/profile constraints such as TypeScript major and React type package
   major compatibility.
@@ -95,6 +107,8 @@ actually close through the minimal loop:
 - `postcheck_stability_score`: whether postcheck passed without unstable
   signals such as auto-installing dependencies during build, lockfile patching,
   mixed package manager warnings, peer resolution conflicts, or compile errors.
+- `postcheck_stability_reason`: semicolon-delimited generic postcheck reason
+  categories. It intentionally avoids scenario-specific names.
 - `prompt_contract_score`: whether the step execution prompt contains the
   source-parity context sections, such as overall goal, final artifacts,
   expected paths, verify commands, expected result, and bounded repair policy.
@@ -105,6 +119,11 @@ actually close through the minimal loop:
   verification is scored separately by success/failure classification.
 - `phase_completion_score`: for `ultra-plan-run`, how far each ultra phase got
   through start, scaffold, step execution, profile check, and phase completion.
+- `phase_*_score`: stage-level ultra phase diagnostics. These explain whether
+  the failure was phase planning, scaffold, step execution, verification,
+  postcheck, or finalization.
+- `phase_failure_stage`: generic phase stage reported by runtime events when a
+  phase fails.
 - `build_verify_pass_score`: whether a strong build verify such as
   `npm run build`, `pnpm build`, `yarn build`, `cargo build`, or `tsc` passed
   in the completion contract.
@@ -118,6 +137,37 @@ actually close through the minimal loop:
   concrete `Write`/`Edit`/`MultiEdit` change rather than only inspecting files.
 - `ultra_runtime_health_score`: aggregate of phase completion, build verify,
   build repair effectiveness, diagnostic progress, and repair edit behavior.
+- `finalization_score`: aggregate completion score. It is decomposed into
+  `step_finalization_score`, `plan_finalization_score`,
+  `deferred_verify_finalization_score`, and `postcheck_finalization_score` so
+  step completion, plan-level contract completion, deferred verify, and
+  postcheck completion do not collapse into one opaque number.
+- `finalization_reason`: semicolon-delimited generic reason categories for
+  completion failures.
+- `failure_layer`: failure layer for failed rows: `planning`, `bridge`,
+  `runtime`, `postcheck`, `provider`, or `environment`.
+- `capability_failure_included`: whether the failed row should be included in
+  agent capability score comparisons. Provider/environment failures are reported
+  separately rather than mixed into capability averages.
+
+Target metric reporting keeps the top-level scores limited and moves detailed
+diagnostics into reason/subscore fields. `not_available`, blank cells, and `0`
+mean different things: unavailable values are omitted from averages, blank means
+not applicable or not observed, and `0` is a real score.
+
+Existing run roots can be rescored after metric changes when their
+`runs/<run_id>/anvil-events.jsonl`, postcheck logs, workdir, and plan artifacts
+are still available:
+
+```bash
+python3 scripts/eval-rescore-runtime.py \
+  --run-root /private/tmp/anvilminimal-eval-run \
+  --suite eval/suites/mvp-smoke.yaml \
+  --out-summary /private/tmp/anvilminimal-eval-run/summary.rescored.eval.tsv
+```
+
+Values that cannot be reconstructed from the stored run root are written as
+`not_available` rather than `0`.
 
 Metric guardrails:
 
