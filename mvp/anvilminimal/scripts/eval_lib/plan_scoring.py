@@ -204,18 +204,22 @@ def score_verify_strength(steps: list[dict[str, Any]], scenario: dict[str, Any] 
     text = "\n".join(commands).lower()
     required_hits = sum(1 for keyword in required_verify if keyword in text)
     required_coverage = ratio_score(required_hits, len(required_verify), 100)
-    score = int(0.75 * average_strength + 0.25 * required_coverage)
+    semantic = score_verify_semantics(commands, scenario)
+    score = int(0.60 * average_strength + 0.25 * required_coverage + 0.15 * semantic["score"])
     penalties = []
     if any(item["strength"] <= 25 for item in strengths):
         penalties.append({"kind": "weak_verify_command"})
     if required_verify and required_hits < len(required_verify):
         penalties.append({"kind": "missing_required_verify_keyword"})
+    penalties.extend(semantic["penalties"])
+    score = max(0, score - semantic["penalty_points"])
     return {
         "score": max(0, min(100, score)),
         "details": {
             "commands": strengths,
             "average_command_strength": average_strength,
             "required_verify_coverage": required_coverage,
+            "semantic_validity": semantic["score"],
             "penalties": penalties,
         },
     }
@@ -355,7 +359,12 @@ def score_execution_shape_readiness(plan: dict[str, Any], scenario: dict[str, An
     else:
         details["terminal_finalization_risk"] = EXECUTION_SHAPE_WEIGHTS["terminal_finalization_risk"]
 
+    environment = score_environment_compatibility(plan, scenario)
+    details["environment_compatibility"] = environment["score"]
+    penalties.extend(environment["penalties"])
+
     score = sum(int(details[key]) for key in EXECUTION_SHAPE_WEIGHTS)
+    score -= environment["penalty_points"]
     details["penalties"] = penalties
     return {"score": max(0, min(100, score)), "details": details}
 
@@ -573,6 +582,9 @@ def score_verify_executability(steps: list[dict[str, Any]], penalties: list[dict
         if looks_like_setup_or_server(command):
             bad += 1
             penalties.append({"kind": "verify_command_not_deterministic", "command": command})
+        for issue in command_semantic_issues(command, {}):
+            bad += 1
+            penalties.append({"kind": issue["kind"], "command": command})
     if not commands:
         return 5 if not any(str(step.get("kind", "")).lower() == "verify" for step in steps) else 0
     return max(0, EXECUTABLE_WEIGHTS["verify_executability"] - bad * 10)
@@ -663,6 +675,133 @@ def looks_like_setup_or_server(command: str) -> bool:
     )
 
 
+def score_verify_semantics(commands: list[str], scenario: dict[str, Any]) -> dict[str, Any]:
+    penalties: list[dict[str, Any]] = []
+    penalty_points = 0
+    for command in commands:
+        for issue in command_semantic_issues(command, scenario):
+            penalties.append({"command": command, **issue})
+            penalty_points += int(issue.get("points", 0))
+    score = max(0, 100 - penalty_points)
+    return {"score": score, "penalties": penalties, "penalty_points": penalty_points}
+
+
+def command_semantic_issues(command: str, scenario: dict[str, Any]) -> list[dict[str, Any]]:
+    lower = command.lower().strip()
+    issues: list[dict[str, Any]] = []
+    expected = {str(path) for path in scenario.get("expected_artifacts", []) or []}
+    if lower.startswith("rustc ") and "--no-link" in lower:
+        issues.append({"kind": "invalid_raw_compile_verify", "toolchain": "rust", "points": 35})
+    if lower.startswith("rustc ") and "Cargo.toml" in expected:
+        issues.append({"kind": "raw_compile_verify_for_manifest_project", "toolchain": "rust", "points": 15})
+    if "node --check" in lower and any(ext in lower for ext in [".ts", ".tsx"]):
+        issues.append({"kind": "syntax_check_cannot_validate_typed_source", "toolchain": "node", "points": 25})
+    if lower.startswith("next lint") or lower == "npm run lint":
+        issues.append({"kind": "lint_command_is_not_build_verification", "toolchain": "javascript", "points": 10})
+    return issues
+
+
+def score_environment_compatibility(plan: dict[str, Any], scenario: dict[str, Any]) -> dict[str, Any]:
+    text = plan_text(plan)
+    steps = plan.get("steps") or []
+    commands = collect_verify_commands(steps)
+    penalties: list[dict[str, Any]] = []
+    penalty_points = 0
+
+    for command in commands:
+        for issue in command_semantic_issues(command, scenario):
+            penalties.append({"kind": issue["kind"], "command": command})
+            penalty_points += int(issue.get("points", 0))
+
+    for command in scenario.get("postcheck", {}).get("commands", []) or []:
+        if not postcheck_command_represented(str(command), commands):
+            penalties.append({"kind": "postcheck_not_represented_in_verify", "command": str(command)})
+            penalty_points += 20
+
+    profile_contract = score_profile_environment_contract(
+        profile=str(scenario.get("profile", "generic")).lower(),
+        text=text,
+    )
+    penalties.extend(profile_contract["penalties"])
+    penalty_points += profile_contract["penalty_points"]
+
+    return {
+        "score": max(0, 100 - penalty_points),
+        "penalties": penalties,
+        "penalty_points": penalty_points,
+    }
+
+
+def postcheck_command_represented(postcheck: str, commands: list[str]) -> bool:
+    wanted = postcheck.lower().strip()
+    text = "\n".join(commands).lower()
+    if not wanted:
+        return True
+    if any(token in wanted for token in ["npm install", "pnpm install", "yarn install"]):
+        return True
+    if wanted in text:
+        return True
+    if wanted == "npm run build":
+        return "next build" in text
+    if wanted.startswith("python3 -m unittest"):
+        return "python3 -m unittest" in text or "python -m unittest" in text or "pytest" in text
+    if wanted == "cargo test":
+        return "cargo test" in text
+    if wanted.startswith("node "):
+        return wanted in text or "npm test" in text
+    return False
+
+
+def score_profile_environment_contract(*, profile: str, text: str) -> dict[str, Any]:
+    if profile != "nextjs":
+        return {"penalties": [], "penalty_points": 0}
+    return score_nextjs_environment_contract(text)
+
+
+def score_nextjs_environment_contract(text: str) -> dict[str, Any]:
+    penalties: list[dict[str, Any]] = []
+    penalty_points = 0
+
+    has_build_verify = "npm run build" in text or "next build" in text
+    if has_build_verify and not any(token in text for token in ["compatible", "matching", "same major", "coherent", "aligned"]):
+        penalties.append({"kind": "dependency_coherence_contract_not_explicit", "profile": "nextjs"})
+        penalty_points += 15
+    if has_build_verify and not ("@types/react" in text and "@types/react-dom" in text):
+        penalties.append({"kind": "type_dependency_contract_not_explicit", "profile": "nextjs"})
+        penalty_points += 10
+    if "ignoredeprecations" in text and re.search(r"ignoredeprecations[^0-9]{0,20}6\\.0", text):
+        penalties.append({"kind": "config_deprecation_suppression_risk", "profile": "nextjs"})
+        penalty_points += 12
+    if "target" in text and re.search(r"target[^a-z0-9]{0,20}es5", text):
+        penalties.append({"kind": "config_deprecated_target_risk", "profile": "nextjs"})
+        penalty_points += 15
+    if package_major_mismatch(text, "@types/react", "@types/react-dom"):
+        penalties.append({"kind": "type_dependency_major_mismatch", "profile": "nextjs"})
+        penalty_points += 30
+    if package_major_mismatch(text, "react", "react-dom"):
+        penalties.append({"kind": "runtime_dependency_major_mismatch", "profile": "nextjs"})
+        penalty_points += 30
+
+    return {"penalties": penalties, "penalty_points": penalty_points}
+
+
+def package_major_mismatch(text: str, left: str, right: str) -> bool:
+    left_major = package_major_mention(text, left)
+    right_major = package_major_mention(text, right)
+    return left_major is not None and right_major is not None and left_major != right_major
+
+
+def package_major_mention(text: str, package: str) -> int | None:
+    pattern = rf"(?<![@\\w/-]){re.escape(package)}(?![-\\w/])[^\\n\\r]{{0,48}}[\\^~>=< ]([0-9]+)"
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
 def plan_text(plan: dict[str, Any]) -> str:
     return json.dumps(plan, ensure_ascii=False, sort_keys=True).lower()
 
@@ -704,7 +843,11 @@ def collect_verify_commands(steps: list[dict[str, Any]]) -> list[str]:
 def command_strength(command: str) -> int:
     lower = command.lower()
     score = 20
-    if "curl" in lower and "http" in lower:
+    if lower.startswith("rustc ") and "--no-link" in lower:
+        score = 0
+    elif lower.startswith("cargo verify-project"):
+        score = 30
+    elif "curl" in lower and "http" in lower:
         score = 85
     elif any(token in lower for token in ["npm run build", "next build", "cargo build", "tsc", "next lint"]):
         score = 85

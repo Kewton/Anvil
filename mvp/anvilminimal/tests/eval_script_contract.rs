@@ -27,6 +27,11 @@ fn eval_summary_schema_mentions_required_columns() {
         "mode",
         "plan_quality_score",
         "ultra_phase_quality_score",
+        "phase_completion_score",
+        "build_repair_effectiveness_score",
+        "ultra_runtime_health_score",
+        "execution_contract_adherence_score",
+        "postcheck_stability_score",
         "overall_score",
     ] {
         assert!(schema.contains(column), "schema missing {column}");

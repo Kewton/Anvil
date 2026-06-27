@@ -397,6 +397,13 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         success=success,
         scenario=spec["scenario"],
         workdir=workdir,
+        plan_paths=plans,
+        run_dir=run_dir,
+    )
+    ultra_runtime_health_score = (
+        float(runtime_scores["ultra_runtime_health_score"])
+        if runtime_scores.get("ultra_runtime_health_score") not in {"", None}
+        else None
     )
     row.update(
         {
@@ -461,6 +468,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
                 verify_strength_score,
                 artifact_ownership_score,
                 lint_repair_score,
+                ultra_runtime_health_score,
             ),
             "plan_artifacts": ",".join(str(path.relative_to(run_dir)) for path in plans),
             "extras_json": extras,
@@ -770,6 +778,11 @@ def apply_time_scores(rows: list[dict]) -> None:
                 else None
             )
             ultra = float(row["ultra_phase_quality_score"]) if row.get("ultra_phase_quality_score") not in {"", None} else None
+            ultra_runtime = (
+                float(row["ultra_runtime_health_score"])
+                if row.get("ultra_runtime_health_score") not in {"", None}
+                else None
+            )
             execution = float(row["execution_score"]) if row.get("execution_score") not in {"", None} else 0.0
             if executable is not None:
                 row["plan_run_predictive_score"] = calculate_plan_run_predictive_score(
@@ -791,6 +804,7 @@ def apply_time_scores(rows: list[dict]) -> None:
                 verify_strength,
                 artifact_ownership,
                 lint_repair,
+                ultra_runtime,
             )
 
 

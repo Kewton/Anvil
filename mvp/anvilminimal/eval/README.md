@@ -53,7 +53,15 @@ For step plans, `summary.eval.tsv` contains two complementary scores:
   layout, dependencies, build command, and port 3011.
 - `verify_strength_score`: strength of verification commands. Build/test/dev
   readiness checks score higher than file existence, `cat`, or compile-only
-  checks.
+  checks. The score also penalizes commands that look syntactically plausible
+  but are not semantically useful in the target environment, such as raw
+  `rustc --no-link` checks for a Cargo project.
+- `execution_shape_readiness_score`: whether the YAML is shaped for clean
+  execution by `plan-run`. In addition to wrapper-step and write-first risks,
+  this includes environment compatibility signals that predict postcheck
+  failures, such as explicit dependency/type coherence and configuration
+  compatibility when a build command is the required deterministic
+  verification.
 - `artifact_ownership_score`: whether required artifacts are owned exactly once
   by steps, whether extra artifact ownership is introduced, and whether nested
   paths are naturally tied to their owning step.
@@ -73,6 +81,20 @@ actually close through the minimal loop:
 - `plan_run_runtime_health_score`: aggregate of runtime friction, artifact
   progress, tool policy compatibility, and finalization. This is intentionally
   separate from static YAML quality.
+- `execution_contract_adherence_score`: bridge metric that compares the saved
+  plan contract with the actual produced artifacts and postcheck behavior. It
+  is the aggregate of dependency, config, verify, and postcheck stability
+  scores.
+- `dependency_contract_score`: whether generated dependency manifests satisfy
+  plan/profile constraints such as TypeScript major and React type package
+  major compatibility.
+- `config_contract_score`: whether generated config files such as
+  `tsconfig.json` satisfy the plan/profile contract.
+- `verify_contract_score`: whether plan verification covers the deterministic
+  postcheck commands and those postchecks pass.
+- `postcheck_stability_score`: whether postcheck passed without unstable
+  signals such as auto-installing dependencies during build, lockfile patching,
+  mixed package manager warnings, peer resolution conflicts, or compile errors.
 - `prompt_contract_score`: whether the step execution prompt contains the
   source-parity context sections, such as overall goal, final artifacts,
   expected paths, verify commands, expected result, and bounded repair policy.
@@ -81,6 +103,36 @@ actually close through the minimal loop:
   prompt-extracted final artifacts, completion-contract paths, or completion
   contract verification leaking into a step turn. Plan-level final contract
   verification is scored separately by success/failure classification.
+- `phase_completion_score`: for `ultra-plan-run`, how far each ultra phase got
+  through start, scaffold, step execution, profile check, and phase completion.
+- `build_verify_pass_score`: whether a strong build verify such as
+  `npm run build`, `pnpm build`, `yarn build`, `cargo build`, or `tsc` passed
+  in the completion contract.
+- `build_repair_effectiveness_score`: whether bounded repair after a build
+  verify failure edited relevant files and improved the deterministic
+  diagnostic before the repair cap was exhausted.
+- `compile_diagnostic_progress_score`: whether repeated verify attempts reduced
+  or changed compiler/build failure signatures instead of repeating the same
+  failure.
+- `verify_repair_edit_score`: whether repair turns after verify failure made a
+  concrete `Write`/`Edit`/`MultiEdit` change rather than only inspecting files.
+- `ultra_runtime_health_score`: aggregate of phase completion, build verify,
+  build repair effectiveness, diagnostic progress, and repair edit behavior.
+
+Metric guardrails:
+
+- Scores should measure reusable contracts, not individual scenario answers.
+  Profile-specific knowledge is allowed only when it is expressed as generic
+  categories such as dependency coherence, config compatibility, verify
+  coverage, artifact ownership, runtime friction, or postcheck stability.
+- Do not add unconditional penalties for time-sensitive package versions or
+  one-off failure messages. Penalize version drift only when the plan or
+  scenario declared that version contract, and group log evidence into stable categories
+  such as dependency mutation, lockfile mutation, package-manager mismatch,
+  dependency resolution failure, config compatibility failure, or compile
+  failure.
+- Any new metric should be validated against at least one blind scenario or
+  source/MVP comparison run before being used as a success gate.
 
 `report.md` also includes `Plan Run Predictiveness` when both `step-plan` and
 `plan-run` rows exist for the same scenario/model pair. It reports correlation,

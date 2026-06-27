@@ -15,7 +15,8 @@ use crate::planner::lint::{
 };
 use crate::planner::profile::{
     profile_after_phase, profile_auto_repair, profile_before_phase, profile_expected_paths,
-    profile_guidance, profile_quality_expectations, profile_repair_prompt, verify_profile,
+    profile_guidance, profile_post_step_repair, profile_quality_expectations,
+    profile_repair_prompt, verify_profile,
 };
 use crate::planner::repair::{
     RepairContext, build_repair_prompt_with_context, save_repair_report_with_context,
@@ -85,6 +86,7 @@ pub fn generate_step_plan_with_ui(
             Ok(mut plan) => {
                 repair_generated_step_plan_contract(&mut plan);
                 strengthen_step_plan_for_profile(&mut plan, config);
+                repair_generated_step_plan_contract(&mut plan);
                 let lint_report = lint_step_plan_report(&plan);
                 if lint_report.is_pass() {
                     let quality_context = plan_quality_context(config, goal);
@@ -330,6 +332,7 @@ fn run_step(
         ui,
         step_options,
     )?;
+    let _ = profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal)?;
     let report = verify_step(&config.workspace_root, step);
     if report.is_pass() {
         return Ok(());
@@ -368,6 +371,10 @@ fn run_step(
         merge_changed_files(&mut context, &repair.changed_paths);
         if !repair.changed_paths.is_empty() {
             file_changing_repairs += 1;
+        }
+        if profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal)? {
+            let package_path = "package.json".to_string();
+            merge_changed_files(&mut context, &[package_path]);
         }
         let retry = verify_step(&config.workspace_root, step);
         if retry.is_pass() {
@@ -674,10 +681,32 @@ pub fn run_ultra_plan_with_ui(
         if ui.interrupted() {
             anyhow::bail!("interrupted by user");
         }
+        emit_ultra_phase_event(
+            config,
+            "ultra_phase_start",
+            plan,
+            phase,
+            index,
+            "start",
+            None,
+            None,
+            None,
+        );
         let profile_snapshot = profile_before_phase(&config.workspace_root, &plan.profile)?;
         let phase_prompt = ultra_phase_prompt(plan, phase, config);
         let step_plan =
             generate_step_plan_with_ui(planner, &phase_prompt, config, ui).map_err(|err| {
+                emit_ultra_phase_event(
+                    config,
+                    "ultra_phase_failed",
+                    plan,
+                    phase,
+                    index,
+                    "scaffold",
+                    Some(false),
+                    Some(&err.to_string()),
+                    None,
+                );
                 emit_planner_error(
                     config,
                     planner.label(),
@@ -689,13 +718,60 @@ pub fn run_ultra_plan_with_ui(
                 );
                 anyhow::anyhow!("phase scaffold failed: {}", err)
             })?;
+        emit_ultra_phase_event(
+            config,
+            "ultra_phase_scaffold_complete",
+            plan,
+            phase,
+            index,
+            "scaffold",
+            Some(true),
+            None,
+            Some(step_plan.steps.len()),
+        );
         save_step_plan(&config.workspace_root, &step_plan)?;
         let final_phase = index + 1 == plan.phases.len();
-        run_step_plan_with_ui_inner(execution, &step_plan, config, ui, final_phase)
-            .map_err(|err| anyhow::anyhow!("phase {} failed: {err}", phase.id))?;
+        if let Err(err) =
+            run_step_plan_with_ui_inner(execution, &step_plan, config, ui, final_phase)
+        {
+            emit_ultra_phase_event(
+                config,
+                "ultra_phase_failed",
+                plan,
+                phase,
+                index,
+                "execute",
+                Some(false),
+                Some(&err.to_string()),
+                None,
+            );
+            return Err(anyhow::anyhow!("phase {} failed: {err}", phase.id));
+        }
+        emit_ultra_phase_event(
+            config,
+            "ultra_phase_execute_complete",
+            plan,
+            phase,
+            index,
+            "execute",
+            Some(true),
+            None,
+            None,
+        );
         let snapshot_report =
             profile_after_phase(&config.workspace_root, &plan.profile, &profile_snapshot);
         if !snapshot_report.is_pass() {
+            emit_ultra_phase_event(
+                config,
+                "ultra_phase_failed",
+                plan,
+                phase,
+                index,
+                "profile_snapshot",
+                Some(false),
+                Some(&snapshot_report.primary_reason()),
+                None,
+            );
             return Err(anyhow::anyhow!(
                 "phase {} profile snapshot verification failed: {}",
                 phase.id,
@@ -704,6 +780,17 @@ pub fn run_ultra_plan_with_ui(
         }
         let profile_report = verify_profile(&config.workspace_root, &plan.profile, &plan.goal);
         if !profile_report.is_pass() {
+            emit_ultra_phase_event(
+                config,
+                "ultra_phase_profile_check",
+                plan,
+                phase,
+                index,
+                "profile",
+                Some(false),
+                Some(&profile_report.primary_reason()),
+                None,
+            );
             if final_phase
                 && profile_auto_repair(
                     &config.workspace_root,
@@ -714,6 +801,28 @@ pub fn run_ultra_plan_with_ui(
             {
                 let retry = verify_profile(&config.workspace_root, &plan.profile, &plan.goal);
                 if retry.is_pass() {
+                    emit_ultra_phase_event(
+                        config,
+                        "ultra_phase_profile_check",
+                        plan,
+                        phase,
+                        index,
+                        "profile_auto_repair",
+                        Some(true),
+                        None,
+                        None,
+                    );
+                    emit_ultra_phase_event(
+                        config,
+                        "ultra_phase_complete",
+                        plan,
+                        phase,
+                        index,
+                        "complete",
+                        Some(true),
+                        None,
+                        None,
+                    );
                     continue;
                 }
             }
@@ -743,25 +852,126 @@ pub fn run_ultra_plan_with_ui(
                 })?;
                 let retry = verify_profile(&config.workspace_root, &plan.profile, &plan.goal);
                 if retry.is_pass() {
+                    emit_ultra_phase_event(
+                        config,
+                        "ultra_phase_profile_check",
+                        plan,
+                        phase,
+                        index,
+                        "profile_repair",
+                        Some(true),
+                        None,
+                        None,
+                    );
+                    emit_ultra_phase_event(
+                        config,
+                        "ultra_phase_complete",
+                        plan,
+                        phase,
+                        index,
+                        "complete",
+                        Some(true),
+                        None,
+                        None,
+                    );
                     continue;
                 }
+                emit_ultra_phase_event(
+                    config,
+                    "ultra_phase_failed",
+                    plan,
+                    phase,
+                    index,
+                    "profile_repair",
+                    Some(false),
+                    Some(&format!("{:?}", retry.status)),
+                    None,
+                );
                 return Err(anyhow::anyhow!(
                     "phase {} profile verification failed after repair: {:?}",
                     phase.id,
                     retry.status
                 ));
             }
+            emit_ultra_phase_event(
+                config,
+                "ultra_phase_failed",
+                plan,
+                phase,
+                index,
+                "profile",
+                Some(false),
+                Some(&format!("{:?}", profile_report.status)),
+                None,
+            );
             return Err(anyhow::anyhow!(
                 "phase {} profile verification failed: {:?}",
                 phase.id,
                 profile_report.status
             ));
         }
+        emit_ultra_phase_event(
+            config,
+            "ultra_phase_profile_check",
+            plan,
+            phase,
+            index,
+            "profile",
+            Some(true),
+            None,
+            None,
+        );
+        emit_ultra_phase_event(
+            config,
+            "ultra_phase_complete",
+            plan,
+            phase,
+            index,
+            "complete",
+            Some(true),
+            None,
+            None,
+        );
     }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_plan_complete",
+            "total_phases": plan.phases.len(),
+            "ok": true,
+        }),
+    );
     Ok(format!(
         "ultra-plan-run complete: {} phases",
         plan.phases.len()
     ))
+}
+
+fn emit_ultra_phase_event(
+    config: &Config,
+    event: &str,
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    index: usize,
+    stage: &str,
+    ok: Option<bool>,
+    reason: Option<&str>,
+    step_count: Option<usize>,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": event,
+            "phase_id": phase.id,
+            "phase_index": index + 1,
+            "total_phases": plan.phases.len(),
+            "final_phase": index + 1 == plan.phases.len(),
+            "stage": stage,
+            "ok": ok,
+            "reason": reason.map(eval_events::body_snippet).unwrap_or_default(),
+            "step_count": step_count,
+        }),
+    );
 }
 
 fn emit_planner_error_for_lint(
@@ -1579,7 +1789,7 @@ mod tests {
     #[test]
     fn verify_policy_error_gets_corrective_retry() {
         let dir = tempfile::tempdir().unwrap();
-        let invalid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js && node check2.js"]}]}"#;
+        let invalid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js || node check2.js"]}]}"#;
         let valid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js","node check2.js"]}]}"#;
         let mut planner = FakeClient::new(vec![
             AssistantReply::text(invalid),
@@ -1591,6 +1801,51 @@ mod tests {
             plan.steps[0].verify,
             vec!["node check.js".to_string(), "node check2.js".to_string()]
         );
+    }
+
+    #[test]
+    fn nextjs_profile_strengthening_does_not_reintroduce_duplicate_package_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        let generated = r#"{
+          "goal":"Scaffold a Next.js app",
+          "steps":[
+            {
+              "id":"setup-manifests",
+              "kind":"setup",
+              "expected_result":"pass",
+              "instruction":"Create package.json and tsconfig.json",
+              "expected_paths":["package.json","tsconfig.json"],
+              "verify":[]
+            },
+            {
+              "id":"implement-game-page",
+              "kind":"implement",
+              "expected_result":"pass",
+              "instruction":"Create package.json and the app entrypoint",
+              "expected_paths":["package.json","src/app/page.tsx"],
+              "verify":[]
+            }
+          ]
+        }"#;
+        let mut plan =
+            parse_generated_step_plan_json(generated, "Scaffold a Next.js Space Invaders app")
+                .unwrap();
+        repair_generated_step_plan_contract(&mut plan);
+        strengthen_step_plan_for_profile(&mut plan, &cfg);
+        repair_generated_step_plan_contract(&mut plan);
+        crate::planner::lint::lint_step_plan(&plan).unwrap();
+        let package_owners = plan
+            .steps
+            .iter()
+            .filter(|step| {
+                step.expected_paths
+                    .iter()
+                    .any(|path| path == "package.json")
+            })
+            .count();
+        assert_eq!(package_owners, 1);
     }
 
     #[test]
@@ -1718,7 +1973,7 @@ mod tests {
     #[test]
     fn invalid_planner_lint_does_not_save_plan_file() {
         let dir = tempfile::tempdir().unwrap();
-        let invalid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js && node check2.js"]}]}"#;
+        let invalid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js || node check2.js"]}]}"#;
         let mut planner = FakeClient::new(vec![
             AssistantReply::text(invalid),
             AssistantReply::text(invalid),
@@ -1805,7 +2060,7 @@ mod tests {
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let weak = r#"{"goal":"Build a Next.js game app","steps":[{"id":"make-app","kind":"implement","expected_result":"pass","instruction":"Create package.json and src/app/page.tsx for the game app","expected_paths":["package.json","src/app/page.tsx"],"verify":[]}]}"#;
-        let degraded = r#"{"goal":"Build a Next.js game app","steps":[{"id":"bad","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js && node check2.js"]}]}"#;
+        let degraded = r#"{"goal":"Build a Next.js game app","steps":[{"id":"bad","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js || node check2.js"]}]}"#;
         let mut planner = FakeClient::new(vec![
             AssistantReply::text(weak),
             AssistantReply::text(degraded),

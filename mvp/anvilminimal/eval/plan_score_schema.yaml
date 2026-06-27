@@ -38,7 +38,40 @@ summary_eval_tsv_header:
   - planner_raw_schema_violation
   - planner_parser_limitation
   - planner_prompt_issue
+  - planner_quality_issue_count
+  - planner_retryable_quality_count
+  - planner_advisory_quality_count
+  - planner_quality_retry_count
+  - planner_quality_retry_degraded_count
+  - valid_plan_generated
   - plan_quality_score
+  - executable_plan_score
+  - constraint_coverage_score
+  - verify_strength_score
+  - artifact_ownership_score
+  - lint_repair_score
+  - execution_shape_readiness_score
+  - plan_run_predictive_score
+  - runtime_friction_score
+  - artifact_progress_score
+  - finalization_score
+  - tool_policy_compatibility_score
+  - plan_run_runtime_health_score
+  - prompt_contract_score
+  - dependency_contract_score
+  - config_contract_score
+  - verify_contract_score
+  - postcheck_stability_score
+  - execution_contract_adherence_score
+  - step_obligation_scope_score
+  - step_obligation_scope_violation_count
+  - phase_completion_score
+  - build_verify_pass_score
+  - build_repair_effectiveness_score
+  - compile_diagnostic_progress_score
+  - verify_repair_edit_score
+  - ultra_runtime_health_score
+  - stability_score
   - ultra_phase_quality_score
   - execution_score
   - time_score

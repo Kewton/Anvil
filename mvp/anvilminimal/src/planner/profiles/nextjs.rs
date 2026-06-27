@@ -94,10 +94,9 @@ pub fn guidance(goal: &str) -> String {
          Required artifacts by completion: package.json, src/app/page.tsx, src/app/layout.tsx, src/app/global.d.ts. \
          If those files are absent, write package.json, src/app/layout.tsx, src/app/page.tsx, and src/app/global.d.ts before further inspection. \
          If any layout imports CSS such as ./globals.css, src/app/global.d.ts must declare module \"*.css\". \
-         package.json must include next, react, react-dom and scripts.build = `next build`. \
+         package.json must include compatible next, react, react-dom, @types/react, @types/react-dom, and TypeScript 5.x dependencies plus scripts.build = `next build`. \
          For TypeScript/TSX apps, create tsconfig.json before treating the app as complete. \
-         Do not use deprecated moduleResolution=node10; use bundler or node16, \
-         or set ignoreDeprecations to 6.0 when needed.{port}"
+         Do not use deprecated moduleResolution=node10 or target=ES5; prefer moduleResolution=bundler and target=ES2017 or newer.{port}"
     )
 }
 
@@ -197,6 +196,20 @@ export default function RootLayout({
     Ok(true)
 }
 
+pub fn repair_manifest_coherence(root: &Path, goal: &str) -> anyhow::Result<bool> {
+    let Ok(project) = locate_project_root(root) else {
+        return Ok(false);
+    };
+    let path = project.path.join("package.json");
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let before = std::fs::read_to_string(&path).unwrap_or_default();
+    ensure_package_json(&project.path, goal)?;
+    let after = std::fs::read_to_string(&path).unwrap_or_default();
+    Ok(before != after)
+}
+
 #[derive(Debug, Clone)]
 struct ProjectRoot {
     path: PathBuf,
@@ -276,29 +289,20 @@ fn ensure_package_json(root: &Path, goal: &str) -> anyhow::Result<()> {
         .entry("private")
         .or_insert_with(|| Value::Bool(true));
     let deps = object_entry(&mut package, "dependencies");
-    deps.insert("next".to_string(), Value::String("^14.2.0".to_string()));
-    deps.insert("react".to_string(), Value::String("^18.3.0".to_string()));
-    deps.insert(
-        "react-dom".to_string(),
-        Value::String("^18.3.0".to_string()),
-    );
+    ensure_dependency(deps, "next", "^14.2.0");
+    ensure_dependency(deps, "react", "^18.3.0");
+    ensure_dependency(deps, "react-dom", "^18.3.0");
+    let tailwind_used = uses_tailwind(root, &Value::Object(package.clone()));
     let dev_deps = object_entry(&mut package, "devDependencies");
-    dev_deps.insert(
-        "typescript".to_string(),
-        Value::String("^5.5.0".to_string()),
-    );
-    dev_deps.insert(
-        "@types/node".to_string(),
-        Value::String("^20.14.0".to_string()),
-    );
-    dev_deps.insert(
-        "@types/react".to_string(),
-        Value::String("^18.3.0".to_string()),
-    );
-    dev_deps.insert(
-        "@types/react-dom".to_string(),
-        Value::String("^18.3.0".to_string()),
-    );
+    ensure_dependency(dev_deps, "typescript", "^5.5.0");
+    ensure_dependency(dev_deps, "@types/node", "^20.14.0");
+    ensure_dependency(dev_deps, "@types/react", "^18.3.0");
+    ensure_dependency(dev_deps, "@types/react-dom", "^18.3.0");
+    if tailwind_used {
+        ensure_dependency(dev_deps, "tailwindcss", "^3.4.19");
+        ensure_dependency(dev_deps, "postcss", "^8.5.15");
+        ensure_dependency(dev_deps, "autoprefixer", "^10.4.20");
+    }
     let scripts = object_entry(&mut package, "scripts");
     let dev = if goal.contains("3011") {
         "next dev -p 3011"
@@ -328,6 +332,11 @@ fn object_entry<'a>(package: &'a mut Map<String, Value>, key: &str) -> &'a mut M
         *value = Value::Object(Map::new());
     }
     value.as_object_mut().expect("value was just made object")
+}
+
+fn ensure_dependency(deps: &mut Map<String, Value>, name: &str, version: &str) {
+    deps.entry(name.to_string())
+        .or_insert_with(|| Value::String(version.to_string()));
 }
 
 fn ensure_file(path: &Path, content: &str) -> anyhow::Result<()> {
@@ -693,11 +702,7 @@ fn alias_configured(tsconfig: &Value) -> bool {
 }
 
 fn tailwind_contract_failure(root: &Path, package: &Value) -> Option<String> {
-    let uses_tailwind = package_has_dependency(package, "tailwindcss")
-        || contains_in_files(root, "@tailwind")
-        || root.join("tailwind.config.js").is_file()
-        || root.join("tailwind.config.ts").is_file();
-    if !uses_tailwind {
+    if !uses_tailwind(root, package) {
         return None;
     }
     for dep in ["tailwindcss", "postcss"] {
@@ -721,6 +726,27 @@ fn tailwind_contract_failure(root: &Path, package: &Value) -> Option<String> {
         return Some("globals.css must be imported by app layout".to_string());
     }
     None
+}
+
+fn uses_tailwind(root: &Path, package: &Value) -> bool {
+    package_has_dependency(package, "tailwindcss")
+        || contains_in_files(root, "@tailwind")
+        || root.join("tailwind.config.js").is_file()
+        || root.join("tailwind.config.ts").is_file()
+        || postcss_config_references_tailwind(root)
+}
+
+fn postcss_config_references_tailwind(root: &Path) -> bool {
+    [
+        "postcss.config.js",
+        "postcss.config.mjs",
+        "postcss.config.cjs",
+    ]
+    .iter()
+    .any(|rel| {
+        std::fs::read_to_string(root.join(rel))
+            .is_ok_and(|content| content.to_ascii_lowercase().contains("tailwind"))
+    })
 }
 
 fn package_has_dependency(package: &Value, name: &str) -> bool {
@@ -920,6 +946,46 @@ mod tests {
             report.status,
             VerifyStatus::ProfileContractFailed(reason) if reason.contains("Tailwind")
         ));
+    }
+
+    #[test]
+    fn nextjs_manifest_coherence_adds_tailwind_toolchain_before_install() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("src/app/layout.tsx"),
+            "import './globals.css';\nexport default function Layout({children}:{children:React.ReactNode}){return children;}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tailwind.config.js"),
+            "module.exports = { content: ['./src/**/*.{ts,tsx}'], theme: { extend: {} }, plugins: [] };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("postcss.config.js"),
+            "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n",
+        )
+        .unwrap();
+
+        assert!(repair_manifest_coherence(dir.path(), "3011").unwrap());
+        let package: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+        for dep in ["tailwindcss", "postcss", "autoprefixer"] {
+            assert!(package_has_dependency(&package, dep), "{dep}");
+        }
+        assert!(verify(dir.path(), "3011").is_pass());
     }
 
     fn complete_app() -> tempfile::TempDir {

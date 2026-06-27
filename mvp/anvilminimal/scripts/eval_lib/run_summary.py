@@ -66,8 +66,19 @@ SUMMARY_HEADER = [
     "tool_policy_compatibility_score",
     "plan_run_runtime_health_score",
     "prompt_contract_score",
+    "dependency_contract_score",
+    "config_contract_score",
+    "verify_contract_score",
+    "postcheck_stability_score",
+    "execution_contract_adherence_score",
     "step_obligation_scope_score",
     "step_obligation_scope_violation_count",
+    "phase_completion_score",
+    "build_verify_pass_score",
+    "build_repair_effectiveness_score",
+    "compile_diagnostic_progress_score",
+    "verify_repair_edit_score",
+    "ultra_runtime_health_score",
     "stability_score",
     "ultra_phase_quality_score",
     "execution_score",
@@ -141,8 +152,19 @@ def empty_summary_row(spec: dict[str, Any]) -> dict[str, Any]:
         "tool_policy_compatibility_score": "",
         "plan_run_runtime_health_score": "",
         "prompt_contract_score": "",
+        "dependency_contract_score": "",
+        "config_contract_score": "",
+        "verify_contract_score": "",
+        "postcheck_stability_score": "",
+        "execution_contract_adherence_score": "",
         "step_obligation_scope_score": "",
         "step_obligation_scope_violation_count": "",
+        "phase_completion_score": "",
+        "build_verify_pass_score": "",
+        "build_repair_effectiveness_score": "",
+        "compile_diagnostic_progress_score": "",
+        "verify_repair_edit_score": "",
+        "ultra_runtime_health_score": "",
         "stability_score": "",
         "ultra_phase_quality_score": "",
         "execution_score": "",
@@ -198,6 +220,7 @@ def calculate_overall(
     verify_strength_score: float | None = None,
     artifact_ownership_score: float | None = None,
     lint_repair_score: float | None = None,
+    ultra_runtime_health_score: float | None = None,
 ) -> float:
     if mode == "minimal-loop":
         return round(0.80 * execution_score + 0.20 * time_score, 1)
@@ -224,7 +247,18 @@ def calculate_overall(
             1,
         )
     if mode == "ultra-plan-run":
-        return round(0.30 * (ultra_score or 0) + 0.35 * execution_score + 0.10 * time_score, 1)
+        if ultra_runtime_health_score is None:
+            return round(
+                0.35 * (ultra_score or 0) + 0.55 * execution_score + 0.10 * time_score,
+                1,
+            )
+        return round(
+            0.20 * (ultra_score or 0)
+            + 0.25 * ultra_runtime_health_score
+            + 0.45 * execution_score
+            + 0.10 * time_score,
+            1,
+        )
     if mode == "ultra-step-run":
         return round(
             0.25 * (plan_score or 0)

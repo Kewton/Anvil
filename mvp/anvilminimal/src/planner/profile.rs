@@ -103,6 +103,15 @@ pub fn profile_auto_repair(
     }
 }
 
+pub fn profile_post_step_repair(root: &Path, profile: &str, goal: &str) -> anyhow::Result<bool> {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::repair_manifest_coherence(root, goal)
+        }
+        _ => Ok(false),
+    }
+}
+
 pub fn profile_failure(reason: impl Into<String>) -> VerificationReport {
     VerificationReport::profile_failed(reason)
 }

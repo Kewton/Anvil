@@ -121,6 +121,7 @@ pub fn parse_generated_step_plan_json(raw: &str, original_goal: &str) -> anyhow:
 }
 
 pub fn repair_generated_step_plan_contract(plan: &mut StepPlan) {
+    normalize_verify_commands(plan);
     normalize_verify_steps(plan);
     normalize_duplicate_expected_path_ownership(plan);
 }
@@ -262,6 +263,70 @@ fn normalize_verify_steps(plan: &mut StepPlan) {
             }
         }
     }
+}
+
+fn normalize_verify_commands(plan: &mut StepPlan) {
+    for step in &mut plan.steps {
+        let mut normalized = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for command in &step.verify {
+            for item in normalize_verify_command(command) {
+                if seen.insert(item.clone()) {
+                    normalized.push(item);
+                }
+            }
+        }
+        step.verify = normalized;
+    }
+}
+
+fn normalize_verify_command(command: &str) -> Vec<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    if let Some(path) = node_exists_sync_path(trimmed) {
+        return vec![format!("test -f {path}")];
+    }
+    if trimmed.contains("&&") {
+        return trimmed
+            .split("&&")
+            .flat_map(normalize_verify_command)
+            .collect();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("npm install")
+        || lower.contains("pnpm install")
+        || lower.contains("yarn install")
+        || lower.contains("cargo install")
+        || lower.contains("next dev")
+        || lower.contains("vite --host")
+    {
+        return Vec::new();
+    }
+    vec![trimmed.to_string()]
+}
+
+fn node_exists_sync_path(command: &str) -> Option<String> {
+    let lower = command.to_ascii_lowercase();
+    if !lower.starts_with("node -e") || !lower.contains("existssync") {
+        return None;
+    }
+    let marker = "existsSync(";
+    let start = command.find(marker)? + marker.len();
+    let rest = command.get(start..)?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let after_quote = rest.get(quote.len_utf8()..)?;
+    let end = after_quote.find(quote)?;
+    let path = after_quote.get(..end)?.trim().trim_start_matches("./");
+    if path.is_empty() {
+        return None;
+    }
+    crate::tools::path_guard::validate_workspace_relative(path).ok()?;
+    Some(path.to_string())
 }
 
 fn normalize_duplicate_expected_path_ownership(plan: &mut StepPlan) {
@@ -510,6 +575,30 @@ steps:
         assert_eq!(
             plan.steps[0].instruction,
             "Run the listed deterministic verification commands without changing files."
+        );
+    }
+
+    #[test]
+    fn generated_plan_repair_sanitizes_common_verify_policy_issues() {
+        let mut plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![PlanStep {
+                id: "verify".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Run checks".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec![
+                    "npm test && npm run build".to_string(),
+                    "npm install".to_string(),
+                    "node -e \"const fs=require('fs'); if (!fs.existsSync('src/app/page.tsx')) process.exit(1)\"".to_string(),
+                ],
+            }],
+        };
+        repair_generated_step_plan_contract(&mut plan);
+        assert_eq!(
+            plan.steps[0].verify,
+            vec!["npm test", "npm run build", "test -f src/app/page.tsx"]
         );
     }
 

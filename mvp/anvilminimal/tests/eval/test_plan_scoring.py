@@ -297,6 +297,136 @@ steps:
         self.assertIn("wrapper_steps_without_artifacts", penalties)
         self.assertIn("terminal_report_step", penalties)
 
+    def test_verify_strength_penalizes_semantically_invalid_rust_verify(self):
+        text = """goal: rust cli
+steps:
+  - id: setup
+    kind: setup
+    instruction: Create Cargo.toml for the CLI crate.
+    expected_paths:
+      - Cargo.toml
+    verify:
+      - cargo verify-project --manifest-path Cargo.toml
+  - id: implement
+    kind: implement
+    instruction: Create src/main.rs with CLI behavior and a unit test.
+    expected_paths:
+      - src/main.rs
+    verify:
+      - rustc src/main.rs --no-link
+      - cargo test
+"""
+        scenario = {
+            "size": "medium",
+            "expected_artifacts": ["Cargo.toml", "src/main.rs"],
+            "postcheck": {"commands": ["cargo test"]},
+            "plan_constraints": {"min_steps": 3, "max_steps": 8, "required_verify_keywords": ["cargo test"]},
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "plan.yaml"
+            path.write_text(text, encoding="utf-8")
+            score = score_plan_file(path, scenario)
+        verify_penalties = {penalty["kind"] for penalty in score["verify_strength_details"]["penalties"]}
+        shape_penalties = {penalty["kind"] for penalty in score["execution_shape_details"]["penalties"]}
+        self.assertIn("invalid_raw_compile_verify", verify_penalties)
+        self.assertIn("invalid_raw_compile_verify", shape_penalties)
+        self.assertLess(score["verify_strength_score"], 45, score)
+        self.assertLess(score["execution_shape_readiness_score"], 80, score)
+
+    def test_nextjs_environment_contract_rewards_explicit_dependency_coherence(self):
+        vague = """goal: nextjs app on port 3011
+steps:
+  - id: setup-package-and-tsconfig
+    kind: setup
+    instruction: Create package.json with next, react, react-dom, and typescript/developer dependencies. Create a modern tsconfig.json optimized for Next.js build compatibility.
+    expected_paths:
+      - package.json
+      - tsconfig.json
+    verify:
+      - test -f package.json
+  - id: implement-app
+    kind: implement
+    instruction: Create src/app/page.tsx, src/app/layout.tsx, and src/app/global.d.ts for the game.
+    expected_paths:
+      - src/app/page.tsx
+      - src/app/layout.tsx
+      - src/app/global.d.ts
+    verify:
+      - test -f src/app/page.tsx
+  - id: verify-build
+    kind: verify
+    instruction: Verify the Next.js production build.
+    verify:
+      - grep -q 3011 package.json
+      - grep -q "next build" package.json
+      - npm run build
+"""
+        explicit = """goal: nextjs app on port 3011
+steps:
+  - id: setup-package-and-tsconfig
+    kind: setup
+    instruction: Create package.json with compatible aligned Next.js, React, React DOM, @types/react, @types/react-dom, and TypeScript 5.x dependencies. Use matching React runtime and type package major versions. Add scripts.build = next build and scripts.dev = next dev -p 3011. Create tsconfig.json with moduleResolution=bundler and target=ES2017 or newer.
+    expected_paths:
+      - package.json
+      - tsconfig.json
+    verify:
+      - test -f package.json
+  - id: implement-app
+    kind: implement
+    instruction: Create src/app/page.tsx, src/app/layout.tsx, and src/app/global.d.ts for the App Router game.
+    expected_paths:
+      - src/app/page.tsx
+      - src/app/layout.tsx
+      - src/app/global.d.ts
+    verify:
+      - test -f src/app/page.tsx
+  - id: verify-build
+    kind: verify
+    instruction: Verify the Next.js production build.
+    verify:
+      - npm run build
+"""
+        with tempfile.TemporaryDirectory() as td:
+            vague_path = Path(td) / "vague.yaml"
+            explicit_path = Path(td) / "explicit.yaml"
+            vague_path.write_text(vague, encoding="utf-8")
+            explicit_path.write_text(explicit, encoding="utf-8")
+            vague_score = score_plan_file(vague_path, self.scenario)
+            explicit_score = score_plan_file(explicit_path, self.scenario)
+        vague_penalties = {penalty["kind"] for penalty in vague_score["execution_shape_details"]["penalties"]}
+        explicit_penalties = {
+            penalty["kind"] for penalty in explicit_score["execution_shape_details"]["penalties"]
+        }
+        self.assertIn("dependency_coherence_contract_not_explicit", vague_penalties)
+        self.assertIn("type_dependency_contract_not_explicit", vague_penalties)
+        self.assertNotIn("dependency_coherence_contract_not_explicit", explicit_penalties)
+        self.assertGreater(
+            explicit_score["execution_shape_readiness_score"],
+            vague_score["execution_shape_readiness_score"],
+            (vague_score, explicit_score),
+        )
+
+    def test_nextjs_environment_contract_detects_known_package_version_risks(self):
+        text = """goal: nextjs app on port 3011
+steps:
+  - id: setup
+    kind: setup
+    instruction: Create package.json with react ^19.0.0, react-dom ^19.0.0, @types/react 19.2.17, @types/react-dom ^18.3.0, and TypeScript 6.0.3. Create tsconfig.json with target ES5 and ignoreDeprecations 6.0.
+    expected_paths:
+      - package.json
+      - tsconfig.json
+    verify:
+      - npm run build
+"""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "plan.yaml"
+            path.write_text(text, encoding="utf-8")
+            score = score_plan_file(path, self.scenario)
+        penalties = {penalty["kind"] for penalty in score["execution_shape_details"]["penalties"]}
+        self.assertIn("type_dependency_major_mismatch", penalties)
+        self.assertIn("config_deprecated_target_risk", penalties)
+        self.assertLess(score["execution_shape_readiness_score"], 60, score)
+
 
 if __name__ == "__main__":
     unittest.main()

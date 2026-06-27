@@ -76,6 +76,12 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
                 "runtime_health": fmt(
                     mean([to_float(row.get("plan_run_runtime_health_score")) for row in group])
                 ),
+                "ultra_runtime": fmt(
+                    mean([to_float(row.get("ultra_runtime_health_score")) for row in group])
+                ),
+                "phase_completion": fmt(
+                    mean([to_float(row.get("phase_completion_score")) for row in group])
+                ),
                 "prompt_contract": fmt(
                     mean([to_float(row.get("prompt_contract_score")) for row in group])
                 ),
@@ -98,6 +104,8 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
             "shape_readiness",
             "predictive",
             "runtime_health",
+            "ultra_runtime",
+            "phase_completion",
             "prompt_contract",
             "obligation_scope",
             "p50_exec_sec",
@@ -163,7 +171,18 @@ def additional_plan_metric_rankings(rows: list[dict[str, str]]) -> list[str]:
         "artifact_progress_score",
         "finalization_score",
         "tool_policy_compatibility_score",
+        "dependency_contract_score",
+        "config_contract_score",
+        "verify_contract_score",
+        "postcheck_stability_score",
+        "execution_contract_adherence_score",
         "step_obligation_scope_score",
+        "phase_completion_score",
+        "build_verify_pass_score",
+        "build_repair_effectiveness_score",
+        "compile_diagnostic_progress_score",
+        "verify_repair_edit_score",
+        "ultra_runtime_health_score",
     ]
     lines = ["## Detailed Metric Diagnostics", ""]
     ranked_rows = []
@@ -521,6 +540,36 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             mean([to_float(r.get("plan_run_runtime_health_score")) for r in exp]),
         ),
         (
+            "ultra_runtime_health_score_avg",
+            mean([to_float(r.get("ultra_runtime_health_score")) for r in base]),
+            mean([to_float(r.get("ultra_runtime_health_score")) for r in exp]),
+        ),
+        (
+            "phase_completion_score_avg",
+            mean([to_float(r.get("phase_completion_score")) for r in base]),
+            mean([to_float(r.get("phase_completion_score")) for r in exp]),
+        ),
+        (
+            "build_verify_pass_score_avg",
+            mean([to_float(r.get("build_verify_pass_score")) for r in base]),
+            mean([to_float(r.get("build_verify_pass_score")) for r in exp]),
+        ),
+        (
+            "build_repair_effectiveness_score_avg",
+            mean([to_float(r.get("build_repair_effectiveness_score")) for r in base]),
+            mean([to_float(r.get("build_repair_effectiveness_score")) for r in exp]),
+        ),
+        (
+            "compile_diagnostic_progress_score_avg",
+            mean([to_float(r.get("compile_diagnostic_progress_score")) for r in base]),
+            mean([to_float(r.get("compile_diagnostic_progress_score")) for r in exp]),
+        ),
+        (
+            "verify_repair_edit_score_avg",
+            mean([to_float(r.get("verify_repair_edit_score")) for r in base]),
+            mean([to_float(r.get("verify_repair_edit_score")) for r in exp]),
+        ),
+        (
             "prompt_contract_score_avg",
             mean([to_float(r.get("prompt_contract_score")) for r in base]),
             mean([to_float(r.get("prompt_contract_score")) for r in exp]),
@@ -529,6 +578,31 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             "step_obligation_scope_score_avg",
             mean([to_float(r.get("step_obligation_scope_score")) for r in base]),
             mean([to_float(r.get("step_obligation_scope_score")) for r in exp]),
+        ),
+        (
+            "dependency_contract_score_avg",
+            mean([to_float(r.get("dependency_contract_score")) for r in base]),
+            mean([to_float(r.get("dependency_contract_score")) for r in exp]),
+        ),
+        (
+            "config_contract_score_avg",
+            mean([to_float(r.get("config_contract_score")) for r in base]),
+            mean([to_float(r.get("config_contract_score")) for r in exp]),
+        ),
+        (
+            "verify_contract_score_avg",
+            mean([to_float(r.get("verify_contract_score")) for r in base]),
+            mean([to_float(r.get("verify_contract_score")) for r in exp]),
+        ),
+        (
+            "postcheck_stability_score_avg",
+            mean([to_float(r.get("postcheck_stability_score")) for r in base]),
+            mean([to_float(r.get("postcheck_stability_score")) for r in exp]),
+        ),
+        (
+            "execution_contract_adherence_score_avg",
+            mean([to_float(r.get("execution_contract_adherence_score")) for r in base]),
+            mean([to_float(r.get("execution_contract_adherence_score")) for r in exp]),
         ),
         (
             "executable_plan_score_avg",
