@@ -77,6 +77,11 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
                 "false_positive": str(sum(1 for row in group if row.get("acceptance_false_positive") == "true")),
                 "valid_plan": valid_plan_count_cell(group),
                 "plan_quality": fmt(mean([to_float(row.get("plan_quality_score")) for row in group])),
+                "prompt_plan": fmt(
+                    mean([to_float(row.get("prompt_plan_capability_coverage_score")) for row in group])
+                ),
+                "plan_verify": fmt(mean([to_float(row.get("plan_verify_coverage_score")) for row in group])),
+                "confidence": fmt(mean([to_float(row.get("acceptance_confidence_score")) for row in group])),
                 "shape_readiness": fmt(
                     mean([to_float(row.get("execution_shape_readiness_score")) for row in group])
                 ),
@@ -115,6 +120,9 @@ def core_metric_summary(rows: list[dict[str, str]]) -> list[str]:
             "false_positive",
             "valid_plan",
             "plan_quality",
+            "prompt_plan",
+            "plan_verify",
+            "confidence",
             "shape_readiness",
             "predictive",
             "readiness",
@@ -187,6 +195,9 @@ def acceptance_summary(rows: list[dict[str, str]]) -> list[str]:
                 "false_positive": str(len(false_positive)),
                 "source_semantic_avg": fmt(mean([to_float(row.get("source_semantic_score")) for row in scoped])),
                 "plan_output_avg": fmt(mean([to_float(row.get("plan_output_adherence_score")) for row in scoped])),
+                "prompt_plan_avg": fmt(mean([to_float(row.get("prompt_plan_capability_coverage_score")) for row in scoped])),
+                "plan_verify_avg": fmt(mean([to_float(row.get("plan_verify_coverage_score")) for row in scoped])),
+                "confidence_avg": fmt(mean([to_float(row.get("acceptance_confidence_score")) for row in scoped])),
             }
         )
         for row in scoped:
@@ -197,7 +208,7 @@ def acceptance_summary(rows: list[dict[str, str]]) -> list[str]:
     lines = ["## Acceptance Outcomes", ""]
     if not out:
         return lines + ["No acceptance outcome rows.", ""]
-    lines.extend(table_rows(out, ["mode", "legacy_success", "acceptance_success", "false_positive", "source_semantic_avg", "plan_output_avg"]))
+    lines.extend(table_rows(out, ["mode", "legacy_success", "acceptance_success", "false_positive", "source_semantic_avg", "plan_output_avg", "prompt_plan_avg", "plan_verify_avg", "confidence_avg"]))
     if failure_counter:
         lines.extend(table_rows(
             [{"kind": kind, "count": str(count)} for kind, count in sorted(failure_counter.items())],
@@ -208,6 +219,71 @@ def acceptance_summary(rows: list[dict[str, str]]) -> list[str]:
             [{"gap": gap, "count": str(count)} for gap, count in sorted(gap_counter.items())],
             ["gap", "count"],
         ))
+    lines.extend(capability_contract_outcomes(rows))
+    return lines
+
+
+def capability_contract_outcomes(rows: list[dict[str, str]]) -> list[str]:
+    out = []
+    for mode, group in sorted(group_rows(rows, "mode").items()):
+        scoped = [
+            row
+            for row in group
+            if any(
+                row.get(field)
+                for field in [
+                    "prompt_plan_capability_coverage_score",
+                    "plan_verify_coverage_score",
+                    "plan_output_adherence_score",
+                ]
+            )
+        ]
+        if not scoped:
+            continue
+        out.append(
+            {
+                "mode": mode,
+                "prompt_plan_avg": fmt(mean([to_float(row.get("prompt_plan_capability_coverage_score")) for row in scoped])),
+                "plan_contract_avg": fmt(mean([to_float(row.get("plan_capability_contract_score")) for row in scoped])),
+                "plan_verify_avg": fmt(mean([to_float(row.get("plan_verify_coverage_score")) for row in scoped])),
+                "declared_verify_avg": fmt(mean([to_float(row.get("plan_verify_declared_coverage_score")) for row in scoped])),
+                "executed_verify_avg": fmt(mean([to_float(row.get("executed_verify_coverage_score")) for row in scoped])),
+                "plan_output_avg": fmt(mean([to_float(row.get("plan_output_adherence_score")) for row in scoped])),
+                "missing_plan": str(sum(safe_int(row.get("prompt_plan_missing_capability_count")) for row in scoped)),
+                "missing_verify": str(sum(safe_int(row.get("plan_unverified_capability_count")) for row in scoped)),
+            }
+        )
+    lines = ["", "## Capability Contract Outcomes", ""]
+    if not out:
+        return lines + ["No capability contract rows.", ""]
+    lines.extend(table_rows(
+        out,
+        [
+            "mode",
+            "prompt_plan_avg",
+            "plan_contract_avg",
+            "plan_verify_avg",
+            "declared_verify_avg",
+            "executed_verify_avg",
+            "plan_output_avg",
+            "missing_plan",
+            "missing_verify",
+        ],
+    ))
+    counters = []
+    for label, field in [
+        ("prompt_plan_gap", "prompt_plan_gap_kind"),
+        ("plan_verify_gap", "plan_verify_gap_kind"),
+        ("confidence_reason", "acceptance_confidence_reason"),
+    ]:
+        counter = Counter()
+        for row in rows:
+            for reason in split_reasons(row.get(field, "")):
+                counter[reason] += 1
+        for reason, count in sorted(counter.items()):
+            counters.append({"kind": label, "reason": reason, "count": str(count)})
+    if counters:
+        lines.extend(table_rows(counters, ["kind", "reason", "count"]))
     return lines
 
 
@@ -263,6 +339,12 @@ def additional_plan_metric_rankings(rows: list[dict[str, str]]) -> list[str]:
     metrics = [
         "constraint_coverage_score",
         "verify_strength_score",
+        "plan_capability_contract_score",
+        "prompt_plan_capability_coverage_score",
+        "plan_verify_declared_coverage_score",
+        "executed_verify_coverage_score",
+        "plan_verify_coverage_score",
+        "acceptance_confidence_score",
         "verify_adequacy_score",
         "semantic_verify_coverage_score",
         "behavior_oracle_declared_score",
@@ -523,6 +605,9 @@ def metric_reason_summary(rows: list[dict[str, str]]) -> list[str]:
         ("phase_failure", "phase_failure_stage"),
         ("readiness_cap", "readiness_cap_reason"),
         ("missed_signal", "missed_predictive_signal_reason"),
+        ("prompt_plan_gap", "prompt_plan_gap_kind"),
+        ("plan_verify_gap", "plan_verify_gap_kind"),
+        ("confidence", "acceptance_confidence_reason"),
     ]
     out = []
     for label, field in reason_fields:
@@ -785,6 +870,36 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             "plan_output_adherence_score_avg",
             mean([to_float(r.get("plan_output_adherence_score")) for r in base]),
             mean([to_float(r.get("plan_output_adherence_score")) for r in exp]),
+        ),
+        (
+            "plan_capability_contract_score_avg",
+            mean([to_float(r.get("plan_capability_contract_score")) for r in base]),
+            mean([to_float(r.get("plan_capability_contract_score")) for r in exp]),
+        ),
+        (
+            "prompt_plan_capability_coverage_score_avg",
+            mean([to_float(r.get("prompt_plan_capability_coverage_score")) for r in base]),
+            mean([to_float(r.get("prompt_plan_capability_coverage_score")) for r in exp]),
+        ),
+        (
+            "plan_verify_coverage_score_avg",
+            mean([to_float(r.get("plan_verify_coverage_score")) for r in base]),
+            mean([to_float(r.get("plan_verify_coverage_score")) for r in exp]),
+        ),
+        (
+            "plan_verify_declared_coverage_score_avg",
+            mean([to_float(r.get("plan_verify_declared_coverage_score")) for r in base]),
+            mean([to_float(r.get("plan_verify_declared_coverage_score")) for r in exp]),
+        ),
+        (
+            "executed_verify_coverage_score_avg",
+            mean([to_float(r.get("executed_verify_coverage_score")) for r in base]),
+            mean([to_float(r.get("executed_verify_coverage_score")) for r in exp]),
+        ),
+        (
+            "acceptance_confidence_score_avg",
+            mean([to_float(r.get("acceptance_confidence_score")) for r in base]),
+            mean([to_float(r.get("acceptance_confidence_score")) for r in exp]),
         ),
         ("valid_plan_generated_rate", valid_plan_rate(base), valid_plan_rate(exp)),
         (

@@ -30,6 +30,8 @@ from eval_lib.plan_readiness import (
     empty_plan_readiness_scores,
     score_plan_readiness_file,
 )
+from eval_lib.plan_capability_contract import score_plan_capability_contract
+from eval_lib.plan_verify_coverage import score_plan_verify_coverage
 from eval_lib.plan_scoring import score_plan_file
 from eval_lib.postcheck import is_dependency_command, run_postcheck
 from eval_lib.redaction import redact_json
@@ -328,6 +330,20 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
     executable_plan_score = None
     constraint_coverage_score = None
     verify_strength_score = None
+    plan_capability_contract_score = None
+    prompt_plan_capability_coverage_score = None
+    prompt_plan_missing_capability_count = None
+    plan_required_capability_count = None
+    plan_verify_declared_coverage_score = None
+    executed_verify_coverage_score = None
+    plan_verify_coverage_score = None
+    plan_verified_capability_count = None
+    plan_unverified_capability_count = None
+    prompt_plan_gap_kind = ""
+    plan_verify_gap_kind = ""
+    plan_capability_oracle_version = ""
+    plan_verify_oracle_version = ""
+    verify_adequacy_cap_reason = ""
     verify_adequacy_score = None
     semantic_verify_coverage_score = None
     behavior_oracle_declared_score = None
@@ -372,8 +388,32 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
                 constraint_coverage_score = float(score["constraint_coverage_score"])
             if score.get("verify_strength_score") is not None:
                 verify_strength_score = float(score["verify_strength_score"])
+            if score.get("plan_capability_contract_score") not in {"", None}:
+                plan_capability_contract_score = float(score["plan_capability_contract_score"])
+            if score.get("prompt_plan_capability_coverage_score") not in {"", None}:
+                prompt_plan_capability_coverage_score = float(score["prompt_plan_capability_coverage_score"])
+            if score.get("prompt_plan_missing_capability_count") not in {"", None}:
+                prompt_plan_missing_capability_count = score["prompt_plan_missing_capability_count"]
+            if score.get("plan_required_capability_count") not in {"", None}:
+                plan_required_capability_count = score["plan_required_capability_count"]
+            if score.get("plan_verify_declared_coverage_score") not in {"", None}:
+                plan_verify_declared_coverage_score = float(score["plan_verify_declared_coverage_score"])
+            if score.get("executed_verify_coverage_score") not in {"", None}:
+                executed_verify_coverage_score = float(score["executed_verify_coverage_score"])
+            if score.get("plan_verify_coverage_score") not in {"", None}:
+                plan_verify_coverage_score = float(score["plan_verify_coverage_score"])
+            if score.get("plan_verified_capability_count") not in {"", None}:
+                plan_verified_capability_count = score["plan_verified_capability_count"]
+            if score.get("plan_unverified_capability_count") not in {"", None}:
+                plan_unverified_capability_count = score["plan_unverified_capability_count"]
+            prompt_plan_gap_kind = str(score.get("prompt_plan_gap_kind", prompt_plan_gap_kind) or prompt_plan_gap_kind)
+            plan_verify_gap_kind = str(score.get("plan_verify_gap_kind", plan_verify_gap_kind) or plan_verify_gap_kind)
+            plan_capability_oracle_version = str(score.get("plan_capability_oracle_version", plan_capability_oracle_version) or plan_capability_oracle_version)
+            plan_verify_oracle_version = str(score.get("plan_verify_oracle_version", plan_verify_oracle_version) or plan_verify_oracle_version)
             if score.get("verify_adequacy_score") is not None:
                 verify_adequacy_score = float(score["verify_adequacy_score"])
+            if score.get("verify_adequacy_details", {}).get("cap_reason"):
+                verify_adequacy_cap_reason = str(score["verify_adequacy_details"]["cap_reason"])
             if score.get("semantic_verify_coverage_score") is not None:
                 semantic_verify_coverage_score = float(score["semantic_verify_coverage_score"])
             if score.get("behavior_oracle_declared_score") is not None:
@@ -399,6 +439,43 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         post = run_postcheck(spec["scenario"], workdir, run_dir / "postcheck", timeout_sec=scenario_timeout)
         events.append({"event": "postcheck_summary", "run_id": spec["run_id"], **post})
     success = result.rc == 0 and bool(post["ok"])
+    post_events = read_jsonl(run_dir / "postcheck" / "events.jsonl")
+    runtime_capability_contract = score_plan_capability_contract(
+        scenario=spec["scenario"],
+        plan_paths=plans,
+    )
+    runtime_verify_coverage = score_plan_verify_coverage(
+        scenario=spec["scenario"],
+        mode=spec["mode"],
+        plan_paths=plans,
+        workdir=workdir,
+        postcheck_events=post_events,
+        plan_capability_result=runtime_capability_contract,
+    )
+    events.append({"event": "plan_capability_contract_evaluated", "run_id": spec["run_id"], **runtime_capability_contract})
+    events.append({"event": "plan_verify_coverage_evaluated", "run_id": spec["run_id"], **runtime_verify_coverage})
+    if runtime_capability_contract.get("plan_capability_contract_score") not in {"", None}:
+        plan_capability_contract_score = float(runtime_capability_contract["plan_capability_contract_score"])
+    if runtime_capability_contract.get("prompt_plan_capability_coverage_score") not in {"", None}:
+        prompt_plan_capability_coverage_score = float(runtime_capability_contract["prompt_plan_capability_coverage_score"])
+    if runtime_capability_contract.get("prompt_plan_missing_capability_count") not in {"", None}:
+        prompt_plan_missing_capability_count = runtime_capability_contract["prompt_plan_missing_capability_count"]
+    if runtime_capability_contract.get("plan_required_capability_count") not in {"", None}:
+        plan_required_capability_count = runtime_capability_contract["plan_required_capability_count"]
+    prompt_plan_gap_kind = str(runtime_capability_contract.get("prompt_plan_gap_kind", prompt_plan_gap_kind) or prompt_plan_gap_kind)
+    plan_capability_oracle_version = str(runtime_capability_contract.get("plan_capability_oracle_version", plan_capability_oracle_version) or plan_capability_oracle_version)
+    if runtime_verify_coverage.get("plan_verify_declared_coverage_score") not in {"", None}:
+        plan_verify_declared_coverage_score = float(runtime_verify_coverage["plan_verify_declared_coverage_score"])
+    if runtime_verify_coverage.get("executed_verify_coverage_score") not in {"", None}:
+        executed_verify_coverage_score = float(runtime_verify_coverage["executed_verify_coverage_score"])
+    if runtime_verify_coverage.get("plan_verify_coverage_score") not in {"", None}:
+        plan_verify_coverage_score = float(runtime_verify_coverage["plan_verify_coverage_score"])
+    if runtime_verify_coverage.get("plan_verified_capability_count") not in {"", None}:
+        plan_verified_capability_count = runtime_verify_coverage["plan_verified_capability_count"]
+    if runtime_verify_coverage.get("plan_unverified_capability_count") not in {"", None}:
+        plan_unverified_capability_count = runtime_verify_coverage["plan_unverified_capability_count"]
+    plan_verify_gap_kind = str(runtime_verify_coverage.get("plan_verify_gap_kind", plan_verify_gap_kind) or plan_verify_gap_kind)
+    plan_verify_oracle_version = str(runtime_verify_coverage.get("plan_verify_oracle_version", plan_verify_oracle_version) or plan_verify_oracle_version)
     acceptance = evaluate_acceptance_outcome(
         scenario=spec["scenario"],
         workdir=workdir,
@@ -408,6 +485,8 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         legacy_success=success,
         postcheck=post,
         plan_paths=plans,
+        plan_capability=runtime_capability_contract,
+        plan_verify_coverage=runtime_verify_coverage,
     )
     events.append({"event": "acceptance_summary", "run_id": spec["run_id"], **acceptance})
     diagnostics = summarize_run_events(events, post)
@@ -506,6 +585,40 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "plan_output_adherence_success": acceptance.get("plan_output_adherence_success", ""),
             "plan_output_adherence_score": acceptance.get("plan_output_adherence_score", ""),
             "plan_output_failure_kind": acceptance.get("plan_output_failure_kind", ""),
+            "plan_capability_contract_score": plan_capability_contract_score
+            if plan_capability_contract_score is not None
+            else "",
+            "plan_capability_oracle_version": plan_capability_oracle_version,
+            "prompt_plan_capability_coverage_score": prompt_plan_capability_coverage_score
+            if prompt_plan_capability_coverage_score is not None
+            else "",
+            "prompt_plan_missing_capability_count": prompt_plan_missing_capability_count
+            if prompt_plan_missing_capability_count is not None
+            else "",
+            "plan_required_capability_count": plan_required_capability_count
+            if plan_required_capability_count is not None
+            else "",
+            "plan_verify_declared_coverage_score": plan_verify_declared_coverage_score
+            if plan_verify_declared_coverage_score is not None
+            else "",
+            "executed_verify_coverage_score": executed_verify_coverage_score
+            if executed_verify_coverage_score is not None
+            else "",
+            "plan_verify_coverage_score": plan_verify_coverage_score
+            if plan_verify_coverage_score is not None
+            else "",
+            "plan_verified_capability_count": plan_verified_capability_count
+            if plan_verified_capability_count is not None
+            else "",
+            "plan_unverified_capability_count": plan_unverified_capability_count
+            if plan_unverified_capability_count is not None
+            else "",
+            "prompt_plan_gap_kind": prompt_plan_gap_kind,
+            "plan_verify_gap_kind": plan_verify_gap_kind,
+            "plan_verify_oracle_version": plan_verify_oracle_version,
+            "verify_adequacy_cap_reason": verify_adequacy_cap_reason,
+            "acceptance_confidence_score": acceptance.get("acceptance_confidence_score", ""),
+            "acceptance_confidence_reason": acceptance.get("acceptance_confidence_reason", ""),
             "prompt_contract_success": acceptance.get("prompt_contract_success", ""),
             "acceptance_success": acceptance.get("acceptance_success", ""),
             "acceptance_failure_kind": acceptance.get("acceptance_failure_kind", ""),

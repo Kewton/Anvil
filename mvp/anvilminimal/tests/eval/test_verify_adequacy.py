@@ -89,6 +89,17 @@ steps:
             score = score_plan_file(path, SCENARIO)
         self.assertIn("verify_adequacy_score", score)
         self.assertLess(score["verify_adequacy_score"], 60, score)
+        self.assertTrue(score.get("verify_adequacy_details", {}).get("cap_reason", ""), score)
+
+    def test_plan_verify_coverage_caps_direct_verify_adequacy(self):
+        score = score_verify_adequacy(
+            [{"verify": ["npm run build"]}],
+            SCENARIO,
+            plan_verify_coverage=10,
+            prompt_plan_coverage=100,
+        )
+        self.assertLessEqual(score["verify_adequacy_score"], 45, score)
+        self.assertIn("plan_verify_coverage_below_20", score["verify_adequacy_cap_reason"])
 
     def test_contentless_verify_fixture_scores_low(self):
         directory = ROOT / "eval/fixtures/acceptance_oracle/contentless_verify_plan"

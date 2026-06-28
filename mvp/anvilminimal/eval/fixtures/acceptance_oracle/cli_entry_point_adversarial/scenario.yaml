@@ -1,0 +1,8 @@
+prompt: Create a CLI entry point with deterministic cargo test verification.
+functional_contract:
+  category: cli-tool
+  required_capabilities:
+    - entrypoint
+    - deterministic_check
+expected_artifacts:
+  - src/main.rs

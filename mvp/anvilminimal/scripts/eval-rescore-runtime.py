@@ -19,6 +19,8 @@ from eval_lib.plan_readiness import (
     empty_plan_readiness_scores,
     score_plan_readiness_file,
 )
+from eval_lib.plan_capability_contract import score_plan_capability_contract
+from eval_lib.plan_verify_coverage import score_plan_verify_coverage
 from eval_lib.run_summary import read_summary, write_summary
 from eval_lib.runtime_scoring import score_runtime_health
 from eval_lib.suites import load_suite
@@ -56,6 +58,20 @@ def main() -> int:
             plan_paths=plan_paths,
         )
         updated.update(readiness)
+        capability = score_plan_capability_contract(
+            scenario=scenario,
+            plan_paths=[path for path in plan_paths if path.exists()],
+        )
+        verify_coverage = score_plan_verify_coverage(
+            scenario=scenario,
+            mode=row.get("mode", ""),
+            plan_paths=[path for path in plan_paths if path.exists()],
+            workdir=workdir,
+            postcheck_events=read_jsonl(run_dir / "postcheck" / "events.jsonl"),
+            plan_capability_result=capability,
+        )
+        updated.update(summary_fields_from_capability(capability))
+        updated.update(summary_fields_from_verify_coverage(verify_coverage))
         if events and scenario:
             runtime_scores = score_runtime_health(
                 events,
@@ -80,6 +96,8 @@ def main() -> int:
                     "events_path": str(postcheck_events) if postcheck_events.exists() else "",
                 },
                 plan_paths=plan_paths,
+                plan_capability=capability,
+                plan_verify_coverage=verify_coverage,
             )
             updated.update(
                 {
@@ -91,6 +109,11 @@ def main() -> int:
             if acceptance.get("acceptance_details"):
                 extras = parse_extras_dict(updated.get("extras_json", ""))
                 extras["acceptance_details"] = acceptance["acceptance_details"]
+                updated["extras_json"] = extras
+            if capability.get("capability_contract_details") or verify_coverage.get("plan_verify_details"):
+                extras = parse_extras_dict(updated.get("extras_json", ""))
+                extras["plan_capability_details"] = capability.get("capability_contract_details", {})
+                extras["plan_verify_details"] = verify_coverage.get("plan_verify_details", {})
                 updated["extras_json"] = extras
             if row.get("mode", "") in {"minimal-loop", "plan-run", "ultra-plan-run", "ultra-step-run"} and not any(
                 runtime_scores.get(key) not in {"", None}
@@ -190,6 +213,29 @@ def mark_unavailable(row: dict[str, str]) -> None:
     ]:
         if not row.get(key):
             row[key] = "not_available"
+
+
+def summary_fields_from_capability(capability: dict[str, object]) -> dict[str, object]:
+    return {
+        "plan_capability_contract_score": capability.get("plan_capability_contract_score", ""),
+        "plan_capability_oracle_version": capability.get("plan_capability_oracle_version", ""),
+        "prompt_plan_capability_coverage_score": capability.get("prompt_plan_capability_coverage_score", ""),
+        "prompt_plan_missing_capability_count": capability.get("prompt_plan_missing_capability_count", ""),
+        "plan_required_capability_count": capability.get("plan_required_capability_count", ""),
+        "prompt_plan_gap_kind": capability.get("prompt_plan_gap_kind", ""),
+    }
+
+
+def summary_fields_from_verify_coverage(verify: dict[str, object]) -> dict[str, object]:
+    return {
+        "plan_verify_declared_coverage_score": verify.get("plan_verify_declared_coverage_score", ""),
+        "executed_verify_coverage_score": verify.get("executed_verify_coverage_score", ""),
+        "plan_verify_coverage_score": verify.get("plan_verify_coverage_score", ""),
+        "plan_verified_capability_count": verify.get("plan_verified_capability_count", ""),
+        "plan_unverified_capability_count": verify.get("plan_unverified_capability_count", ""),
+        "plan_verify_gap_kind": verify.get("plan_verify_gap_kind", ""),
+        "plan_verify_oracle_version": verify.get("plan_verify_oracle_version", ""),
+    }
 
 
 if __name__ == "__main__":

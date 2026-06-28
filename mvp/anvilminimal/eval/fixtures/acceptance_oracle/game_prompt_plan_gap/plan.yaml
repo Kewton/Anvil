@@ -1,0 +1,10 @@
+goal: Create a Next.js application.
+steps:
+  - id: scaffold
+    kind: implement
+    instruction: Create package.json and src/app/page.tsx.
+    expected_paths:
+      - package.json
+      - src/app/page.tsx
+    verify:
+      - npm run build

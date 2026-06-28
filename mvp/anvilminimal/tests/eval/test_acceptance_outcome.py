@@ -57,6 +57,8 @@ class AcceptanceOutcomeTest(unittest.TestCase):
         self.assertTrue(outcome["acceptance_false_positive"], outcome)
         self.assertEqual(outcome["acceptance_failure_kind"], "static_title_only")
         self.assertEqual(outcome["oracle_gap_kind"], "postcheck_too_weak_for_semantic_contract")
+        self.assertLessEqual(outcome["acceptance_confidence_score"], 50, outcome)
+        self.assertIn("acceptance_success_false", outcome["acceptance_confidence_reason"])
 
     def test_plan_output_gap_becomes_acceptance_false_positive(self):
         with tempfile.TemporaryDirectory() as td:
@@ -109,6 +111,8 @@ steps:
         self.assertEqual(outcome["acceptance_failure_kind"], "plan_output_missing_required_capabilities")
         self.assertEqual(outcome["oracle_gap_kind"], "postcheck_too_weak_for_plan_contract")
         self.assertFalse(outcome["plan_output_adherence_success"], outcome)
+        self.assertLessEqual(outcome["acceptance_confidence_score"], 50, outcome)
+        self.assertIn("plan_verify_coverage_below_40", outcome["acceptance_confidence_reason"])
 
 
 if __name__ == "__main__":

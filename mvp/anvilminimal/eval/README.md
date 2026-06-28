@@ -223,6 +223,33 @@ backward compatibility. Acceptance is reported separately:
   in the final source corpus.
 - `plan_output_failure_kind`: failure category when the plan-output contract is
   not satisfied, usually `plan_output_missing_required_capabilities`.
+- `plan_capability_contract_score`: whether the YAML plan turns the prompt and
+  profile into an explicit capability contract with expected artifacts and
+  verification evidence.
+- `prompt_plan_capability_coverage_score`: percentage of prompt/profile-derived
+  capabilities represented in the YAML plan. A low value means the plan itself
+  is too weak even if the implementation follows it.
+- `plan_verify_declared_coverage_score`: pre-run score based only on YAML
+  verify declarations. This is used for `step-plan` and never reads generated
+  files.
+- `executed_verify_coverage_score`: post-run score that may inspect generated
+  verify artifacts such as `smoke-check.js`, with workspace confinement, skip
+  directories, read-size limits, and binary-file skips.
+- `plan_verify_coverage_score`: display score for plan capability verification.
+  It uses declared coverage for `step-plan` and executed coverage for runtime
+  modes when available.
+- `plan_verify_gap_kind`: generic reason for weak plan verification, such as
+  `build_only_verify_for_behavior_contract`,
+  `contentless_verify_for_capability_contract`, or
+  `semantic_capability_unverified`.
+- `verify_adequacy_cap_reason`: reason `verify_adequacy_score` was capped by
+  weak plan verification or weak prompt-plan capability coverage.
+- `acceptance_confidence_score`: confidence in `acceptance_success`. It is a
+  diagnostic score, not an additional hard gate in the initial rollout.
+- `acceptance_confidence_reason`: semicolon-delimited reasons confidence was
+  capped, such as `plan_verify_coverage_below_40`,
+  `prompt_plan_capability_coverage_below_70`, or
+  `semantic_inconclusive_needs_behavior_oracle`.
 - `behavior_success`: aggregate behavior oracle result. In smoke suites this is
   currently driven by the source semantic oracle; browser interaction is an
   explicit adapter for acceptance-required suites.
@@ -236,6 +263,20 @@ backward compatibility. Acceptance is reported separately:
   such as `postcheck_too_weak_for_semantic_contract` or
   `postcheck_too_weak_for_plan_contract`.
 - `acceptance_oracle_version`: deterministic oracle version used for the row.
+
+The capability chain is reported as four separate relationships:
+
+- prompt -> plan: `prompt_plan_capability_coverage_score`
+- plan -> verify: `plan_verify_coverage_score`
+- plan -> output: `plan_output_adherence_score`
+- final acceptance: `acceptance_success` plus `acceptance_confidence_score`
+
+The current hard gates remain deterministic process/artifact/build/launch/source
+semantic/plan-output/postcheck checks. Prompt-plan coverage, plan-verify
+coverage, and confidence are diagnostic until calibrated against false
+positive/false negative rates. A static semantic inconclusive result should be
+reported as an oracle-confidence problem or deterministic browser-oracle need,
+not routed to human review.
 
 Scenario contracts can declare `functional_contract`, `interaction_contract`,
 `quality_contract`, and `oracle_contract`. If omitted, the harness conservatively

@@ -63,8 +63,9 @@ steps:
                 workdir=workdir,
                 scenario={"expected_artifacts": ["src/main.rs"]},
             )
-        self.assertEqual(result["plan_output_adherence_success"], "", result)
-        self.assertEqual(result["plan_output_details"]["reason"], "no_plan_output_capabilities")
+        self.assertFalse(result["plan_output_adherence_success"], result)
+        self.assertIn("cli_entrypoint", result["plan_output_details"]["required_capabilities"])
+        self.assertNotIn("score_or_progression", result["plan_output_details"]["required_capabilities"])
 
     def test_static_title_fails_when_plan_requires_game_mechanics(self):
         with tempfile.TemporaryDirectory() as td:

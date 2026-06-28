@@ -1,0 +1,14 @@
+profile: nextjs
+prompt: Create a Next.js Space Invaders game with keyboard controls, enemies, bullets, collision, score, and restart flow.
+functional_contract:
+  category: interactive-game
+  required_capabilities:
+    - stateful_interaction
+    - start_or_restart_flow
+    - player_control
+    - adversary_or_challenge
+    - progression_or_score
+    - failure_or_collision_rule
+expected_artifacts:
+  - package.json
+  - src/app/page.tsx

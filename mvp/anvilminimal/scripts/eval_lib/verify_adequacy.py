@@ -25,14 +25,23 @@ BEHAVIOR_ORACLE_MARKERS = [
 def score_verify_adequacy_for_plan(
     plan: dict[str, Any],
     scenario: dict[str, Any] | None = None,
+    plan_verify_coverage: object = "",
+    prompt_plan_coverage: object = "",
 ) -> dict[str, Any]:
-    return score_verify_adequacy(plan.get("steps") or [], scenario or {})
+    return score_verify_adequacy(
+        plan.get("steps") or [],
+        scenario or {},
+        plan_verify_coverage=plan_verify_coverage,
+        prompt_plan_coverage=prompt_plan_coverage,
+    )
 
 
 def score_verify_adequacy(
     steps: list[dict[str, Any]],
     scenario: dict[str, Any] | None = None,
     contract: AcceptanceContract | None = None,
+    plan_verify_coverage: object = "",
+    prompt_plan_coverage: object = "",
 ) -> dict[str, Any]:
     scenario = scenario or {}
     contract = contract or contract_from_scenario(scenario)
@@ -57,17 +66,34 @@ def score_verify_adequacy(
         score = min(score, 65.0)
     if required and semantic_score < 50.0:
         score = min(score, 55.0)
+    cap_reason = ""
+    plan_coverage = to_float(plan_verify_coverage)
+    prompt_coverage = to_float(prompt_plan_coverage)
+    behavior_plan = bool(required)
+    if plan_coverage is not None and behavior_plan and plan_coverage < 20.0:
+        score = min(score, 45.0)
+        cap_reason = append_reason(cap_reason, "plan_verify_coverage_below_20")
+    elif plan_coverage is not None and plan_coverage < 40.0:
+        score = min(score, 60.0)
+        cap_reason = append_reason(cap_reason, "plan_verify_coverage_below_40")
+    if prompt_coverage is not None and prompt_coverage < 70.0:
+        score = min(score, 80.0)
+        cap_reason = append_reason(cap_reason, "prompt_plan_coverage_below_70")
     return {
         "verify_adequacy_score": max(0.0, min(100.0, score)),
         "semantic_verify_coverage_score": round(semantic_score, 1),
         "behavior_oracle_declared_score": round(behavior_score, 1),
         "contentless_verify_penalty": round(contentless_penalty + no_verify_penalty, 1),
+        "verify_adequacy_cap_reason": cap_reason,
         "verify_adequacy_details": {
             "commands": commands,
             "required_capabilities": required,
             "missing_semantic_verify_capabilities": missing_semantic,
             "contentless_commands": contentless,
             "contract_category": contract.category,
+            "plan_verify_coverage_score": plan_verify_coverage,
+            "prompt_plan_capability_coverage_score": prompt_plan_coverage,
+            "cap_reason": cap_reason,
         },
     }
 
@@ -148,3 +174,20 @@ def capability_keywords(capability: str) -> list[str]:
         "input_output_contract": ["input", "output", "transform", "parse"],
     }
     return mapping.get(capability, [capability.replace("_", " ")])
+
+
+def to_float(value: object) -> float | None:
+    if value in {"", None, "not_applicable"}:
+        return None
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def append_reason(current: str, reason: str) -> str:
+    if not current:
+        return reason
+    if reason in current.split(";"):
+        return current
+    return f"{current};{reason}"

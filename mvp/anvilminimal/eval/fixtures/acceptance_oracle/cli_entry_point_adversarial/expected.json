@@ -1,0 +1,4 @@
+{
+  "must_not_extract": "score_or_progression",
+  "must_extract": "cli_entrypoint"
+}

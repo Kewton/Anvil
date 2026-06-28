@@ -6,6 +6,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from .plan_capability_contract import score_plan_capability_contract
+from .plan_verify_coverage import score_plan_verify_coverage
 from .simple_yaml import load_yaml
 from .verify_adequacy import score_verify_adequacy_for_plan
 
@@ -75,6 +77,11 @@ def parse_failure(error: str) -> dict[str, Any]:
         "executable_score": 0,
         "constraint_coverage_score": 0,
         "verify_strength_score": 0,
+        "plan_capability_contract_score": 0,
+        "prompt_plan_capability_coverage_score": 0,
+        "plan_verify_declared_coverage_score": 0,
+        "executed_verify_coverage_score": "",
+        "plan_verify_coverage_score": 0,
         "verify_adequacy_score": 0,
         "semantic_verify_coverage_score": 0,
         "behavior_oracle_declared_score": 0,
@@ -123,7 +130,19 @@ def score_step_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None
     executable = score_executable_step_plan(plan, scenario)
     constraint = score_constraint_coverage(plan, scenario)
     verify_strength = score_verify_strength(steps, scenario)
-    verify_adequacy = score_verify_adequacy_for_plan(plan, scenario)
+    capability_contract = score_plan_capability_contract(scenario=scenario, plan_data=plan)
+    verify_coverage = score_plan_verify_coverage(
+        scenario=scenario,
+        mode="step-plan",
+        plan_data=plan,
+        plan_capability_result=capability_contract,
+    )
+    verify_adequacy = score_verify_adequacy_for_plan(
+        plan,
+        scenario,
+        plan_verify_coverage=verify_coverage.get("plan_verify_coverage_score", ""),
+        prompt_plan_coverage=capability_contract.get("prompt_plan_capability_coverage_score", ""),
+    )
     artifact_ownership = score_artifact_ownership(steps, scenario)
     execution_shape = score_execution_shape_readiness(plan, scenario)
     return {
@@ -132,6 +151,19 @@ def score_step_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None
         "executable_score": executable["score"],
         "constraint_coverage_score": constraint["score"],
         "verify_strength_score": verify_strength["score"],
+        "plan_capability_contract_score": capability_contract.get("plan_capability_contract_score", ""),
+        "plan_capability_oracle_version": capability_contract.get("plan_capability_oracle_version", ""),
+        "prompt_plan_capability_coverage_score": capability_contract.get("prompt_plan_capability_coverage_score", ""),
+        "prompt_plan_missing_capability_count": capability_contract.get("prompt_plan_missing_capability_count", ""),
+        "plan_required_capability_count": capability_contract.get("plan_required_capability_count", ""),
+        "prompt_plan_gap_kind": capability_contract.get("prompt_plan_gap_kind", ""),
+        "plan_verify_declared_coverage_score": verify_coverage.get("plan_verify_declared_coverage_score", ""),
+        "executed_verify_coverage_score": verify_coverage.get("executed_verify_coverage_score", ""),
+        "plan_verify_coverage_score": verify_coverage.get("plan_verify_coverage_score", ""),
+        "plan_verified_capability_count": verify_coverage.get("plan_verified_capability_count", ""),
+        "plan_unverified_capability_count": verify_coverage.get("plan_unverified_capability_count", ""),
+        "plan_verify_gap_kind": verify_coverage.get("plan_verify_gap_kind", ""),
+        "plan_verify_oracle_version": verify_coverage.get("plan_verify_oracle_version", ""),
         "verify_adequacy_score": verify_adequacy["verify_adequacy_score"],
         "semantic_verify_coverage_score": verify_adequacy["semantic_verify_coverage_score"],
         "behavior_oracle_declared_score": verify_adequacy["behavior_oracle_declared_score"],
@@ -142,6 +174,8 @@ def score_step_plan(plan: dict[str, Any], scenario: dict[str, Any] | None = None
         "executable_details": executable["details"],
         "constraint_coverage_details": constraint["details"],
         "verify_strength_details": verify_strength["details"],
+        "capability_contract_details": capability_contract.get("capability_contract_details", {}),
+        "plan_verify_details": verify_coverage.get("plan_verify_details", {}),
         "verify_adequacy_details": verify_adequacy["verify_adequacy_details"],
         "artifact_ownership_details": artifact_ownership["details"],
         "execution_shape_details": execution_shape["details"],

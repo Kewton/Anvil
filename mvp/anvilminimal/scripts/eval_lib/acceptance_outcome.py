@@ -4,12 +4,14 @@ from pathlib import Path
 from typing import Any
 
 from .acceptance_contract import AcceptanceContract, contract_from_scenario
+from .plan_capability_contract import score_plan_capability_contract
 from .plan_output_adherence import evaluate_plan_output_adherence
+from .plan_verify_coverage import score_plan_verify_coverage
 from .postcheck import load_postcheck_events
 from .source_semantic_oracle import evaluate_source_semantics
 
 
-ACCEPTANCE_ORACLE_VERSION = "acceptance-v2-plan-output"
+ACCEPTANCE_ORACLE_VERSION = "acceptance-v3-plan-verify-confidence"
 
 
 def evaluate_acceptance_outcome(
@@ -23,6 +25,8 @@ def evaluate_acceptance_outcome(
     postcheck: dict[str, Any],
     plan_paths: list[Path] | None = None,
     browser_result: dict[str, Any] | None = None,
+    plan_capability: dict[str, Any] | None = None,
+    plan_verify_coverage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if mode == "step-plan":
         return not_applicable_outcome("plan_only_mode", legacy_success)
@@ -38,6 +42,18 @@ def evaluate_acceptance_outcome(
         plan_paths=plan_paths or [],
         workdir=workdir,
         scenario=scenario,
+    )
+    plan_capability = plan_capability or score_plan_capability_contract(
+        scenario=scenario,
+        plan_paths=plan_paths or [],
+    )
+    plan_verify_coverage = plan_verify_coverage or score_plan_verify_coverage(
+        scenario=scenario,
+        mode=mode,
+        plan_paths=plan_paths or [],
+        workdir=workdir,
+        postcheck_events=post_events,
+        plan_capability_result=plan_capability,
     )
     plan_output_success = plan_output.get("plan_output_adherence_success", "")
     browser_result = browser_result or {"browser_success": "", "browser_failure_kind": "", "browser_details": {}}
@@ -66,6 +82,18 @@ def evaluate_acceptance_outcome(
         semantic_failure_kind=str(semantic.get("source_semantic_failure_kind", "")),
         plan_output_failure_kind=str(plan_output.get("plan_output_failure_kind", "")),
     )
+    confidence = acceptance_confidence(
+        acceptance_success=acceptance_success,
+        plan_output_score=plan_output.get("plan_output_adherence_score", ""),
+        plan_verify_score=plan_verify_coverage.get("plan_verify_coverage_score", ""),
+        verify_adequacy_score="",
+        prompt_plan_score=plan_capability.get("prompt_plan_capability_coverage_score", ""),
+        build_success=build_success,
+        launch_success=launch_success,
+        semantic=semantic,
+        plan_output=plan_output,
+        plan_verify=plan_verify_coverage,
+    )
     false_positive = bool(legacy_success) and not bool(acceptance_success)
     return {
         "legacy_success": legacy_success,
@@ -79,6 +107,21 @@ def evaluate_acceptance_outcome(
         "plan_output_adherence_success": plan_output_success,
         "plan_output_adherence_score": plan_output.get("plan_output_adherence_score", ""),
         "plan_output_failure_kind": plan_output.get("plan_output_failure_kind", ""),
+        "plan_capability_contract_score": plan_capability.get("plan_capability_contract_score", ""),
+        "plan_capability_oracle_version": plan_capability.get("plan_capability_oracle_version", ""),
+        "prompt_plan_capability_coverage_score": plan_capability.get("prompt_plan_capability_coverage_score", ""),
+        "prompt_plan_missing_capability_count": plan_capability.get("prompt_plan_missing_capability_count", ""),
+        "plan_required_capability_count": plan_capability.get("plan_required_capability_count", ""),
+        "plan_verify_declared_coverage_score": plan_verify_coverage.get("plan_verify_declared_coverage_score", ""),
+        "executed_verify_coverage_score": plan_verify_coverage.get("executed_verify_coverage_score", ""),
+        "plan_verify_coverage_score": plan_verify_coverage.get("plan_verify_coverage_score", ""),
+        "plan_verified_capability_count": plan_verify_coverage.get("plan_verified_capability_count", ""),
+        "plan_unverified_capability_count": plan_verify_coverage.get("plan_unverified_capability_count", ""),
+        "prompt_plan_gap_kind": plan_capability.get("prompt_plan_gap_kind", ""),
+        "plan_verify_gap_kind": plan_verify_coverage.get("plan_verify_gap_kind", ""),
+        "plan_verify_oracle_version": plan_verify_coverage.get("plan_verify_oracle_version", ""),
+        "acceptance_confidence_score": confidence["acceptance_confidence_score"],
+        "acceptance_confidence_reason": confidence["acceptance_confidence_reason"],
         "prompt_contract_success": prompt_contract_success,
         "acceptance_success": acceptance_success,
         "acceptance_failure_kind": failure_kind,
@@ -88,8 +131,11 @@ def evaluate_acceptance_outcome(
         "acceptance_details": {
             "contract": contract.to_dict(),
             "source_semantic": semantic,
+            "plan_capability": plan_capability,
+            "plan_verify": plan_verify_coverage,
             "plan_output": plan_output,
             "browser": browser_result,
+            "acceptance_confidence": confidence,
         },
     }
 
@@ -107,6 +153,21 @@ def not_applicable_outcome(reason: str, legacy_success: bool) -> dict[str, Any]:
         "plan_output_adherence_success": "",
         "plan_output_adherence_score": "",
         "plan_output_failure_kind": "",
+        "plan_capability_contract_score": "",
+        "plan_capability_oracle_version": "",
+        "prompt_plan_capability_coverage_score": "",
+        "prompt_plan_missing_capability_count": "",
+        "plan_required_capability_count": "",
+        "plan_verify_declared_coverage_score": "",
+        "executed_verify_coverage_score": "",
+        "plan_verify_coverage_score": "",
+        "plan_verified_capability_count": "",
+        "plan_unverified_capability_count": "",
+        "prompt_plan_gap_kind": reason,
+        "plan_verify_gap_kind": reason,
+        "plan_verify_oracle_version": "",
+        "acceptance_confidence_score": "",
+        "acceptance_confidence_reason": reason,
         "prompt_contract_success": "",
         "acceptance_success": "",
         "acceptance_failure_kind": "",
@@ -208,3 +269,87 @@ def oracle_gap_kind(
 def is_build_command(command: str) -> bool:
     lowered = command.lower().strip()
     return lowered in {"npm run build", "pnpm build", "yarn build", "cargo build"} or "next build" in lowered or lowered.startswith("tsc")
+
+
+def acceptance_confidence(
+    *,
+    acceptance_success: bool,
+    plan_output_score: object,
+    plan_verify_score: object,
+    verify_adequacy_score: object,
+    prompt_plan_score: object,
+    build_success: object,
+    launch_success: object,
+    semantic: dict[str, Any],
+    plan_output: dict[str, Any],
+    plan_verify: dict[str, Any],
+) -> dict[str, Any]:
+    output_score = float_or_default(plan_output_score, 100.0 if plan_output_score == "" else 0.0)
+    verify_score = float_or_default(plan_verify_score, 100.0 if plan_verify_score == "" else 0.0)
+    adequacy = float_or_default(verify_adequacy_score, verify_score)
+    prompt_score = float_or_default(prompt_plan_score, 100.0 if prompt_plan_score == "" else 0.0)
+    build_score = tri_state_score(build_success)
+    launch_score = tri_state_score(launch_success)
+    score = round(
+        0.25 * output_score
+        + 0.25 * verify_score
+        + 0.20 * adequacy
+        + 0.10 * prompt_score
+        + 0.10 * build_score
+        + 0.10 * launch_score,
+        1,
+    )
+    reasons: list[str] = []
+    if output_score < 70:
+        score = min(score, 70.0)
+        reasons.append("plan_output_adherence_below_70")
+    if verify_score < 40:
+        score = min(score, 75.0)
+        reasons.append("plan_verify_coverage_below_40")
+    if prompt_score < 70:
+        score = min(score, 80.0)
+        reasons.append("prompt_plan_capability_coverage_below_70")
+    if semantic_inconclusive(semantic, plan_output, plan_verify):
+        score = min(score, 70.0)
+        reasons.append("semantic_inconclusive_needs_behavior_oracle")
+    if plan_verify.get("plan_verify_gap_kind") == "browser_required_but_not_declared":
+        reasons.append("browser_oracle_unavailable")
+    if not acceptance_success:
+        score = min(score, 50.0)
+        reasons.append("acceptance_success_false")
+    return {
+        "acceptance_confidence_score": round(max(0.0, min(100.0, score)), 1),
+        "acceptance_confidence_reason": ";".join(dict.fromkeys(reasons)),
+    }
+
+
+def tri_state_score(value: object) -> float:
+    if value is True:
+        return 100.0
+    if value is False:
+        return 0.0
+    return 100.0
+
+
+def float_or_default(value: object, default: float) -> float:
+    if value in {"", None, "not_applicable"}:
+        return default
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def semantic_inconclusive(
+    semantic: dict[str, Any],
+    plan_output: dict[str, Any],
+    plan_verify: dict[str, Any],
+) -> bool:
+    if semantic.get("source_semantic_success") is not False:
+        return False
+    missing = semantic.get("source_semantic_details", {}).get("missing_capabilities", [])
+    if not missing or len(missing) > 2:
+        return False
+    plan_score = float_or_default(plan_output.get("plan_output_adherence_score", ""), 0.0)
+    verify_score = float_or_default(plan_verify.get("plan_verify_coverage_score", ""), 0.0)
+    return plan_score >= 60.0 or verify_score >= 60.0

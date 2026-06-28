@@ -1,0 +1,9 @@
+goal: Create a CLI.
+steps:
+  - id: cli
+    kind: implement
+    instruction: Create src/main.rs containing a CLI main entry point.
+    expected_paths:
+      - src/main.rs
+    verify:
+      - cargo test
