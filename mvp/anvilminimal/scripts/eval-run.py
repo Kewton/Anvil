@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 from eval_lib.acceptance_outcome import evaluate_acceptance_outcome
+from eval_lib.acceptance_contract import contract_from_scenario
 from eval_lib.artifacts import create_run_root, write_json, write_jsonl
 from eval_lib.config import merge_dotenv_into_env
 from eval_lib.failure_classification import (
@@ -192,7 +193,7 @@ def actual_command(spec: dict, workdir: Path) -> list[str]:
 def completion_contract_for_spec(spec: dict) -> dict | None:
     if spec.get("binary_kind", "anvilminimal") != "anvilminimal":
         return None
-    if spec.get("mode") != "minimal-loop":
+    if spec.get("mode") not in {"minimal-loop", "plan-run", "ultra-plan-run"}:
         return None
     scenario = spec.get("scenario", {}) or {}
     required_paths = list(dict.fromkeys(scenario.get("expected_artifacts", []) or []))
@@ -214,14 +215,34 @@ def completion_contract_for_spec(spec: dict) -> dict | None:
         for command in commands
         if deferred_verify_requirement(command, has_dependency_setup)
     ]
+    acceptance_contract = contract_from_scenario(scenario)
+    required_capabilities = unique_strings(acceptance_contract.required_capabilities)
+    deterministic_oracles = unique_strings(
+        acceptance_contract.oracle_contract.get("deterministic_oracles", []) or []
+    )
+    required_evidence = unique_strings(
+        evidence
+        for capability in required_capabilities
+        for evidence in required_evidence_for_capability(capability)
+    )
     profile = scenario.get("profile", "generic")
     profile_value = profile if profile not in {"", "generic", "default", "none"} else None
-    if not required_paths and not verify_commands and not deferred_requirements and not profile_value:
+    if (
+        not required_paths
+        and not verify_commands
+        and not deferred_requirements
+        and not profile_value
+        and not required_capabilities
+        and not required_evidence
+    ):
         return None
     contract = {
         "required_paths": required_paths,
         "verify_commands": verify_commands,
-        "verify_repair_cap": 2,
+        "required_capabilities": required_capabilities,
+        "deterministic_oracles": deterministic_oracles,
+        "required_evidence": required_evidence,
+        "verify_repair_cap": 3 if required_capabilities or required_evidence else 2,
         "source": "eval_scenario",
     }
     if profile_value:
@@ -230,6 +251,83 @@ def completion_contract_for_spec(spec: dict) -> dict | None:
     if deferred_requirements:
         contract["deferred_verify_requirements"] = deferred_requirements
     return contract
+
+
+def unique_strings(values) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        text = str(value).strip()
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def required_evidence_for_capability(capability: str) -> list[str]:
+    mapping = {
+        "implementation": ["implementation_artifact"],
+        "entrypoint": ["implementation_artifact"],
+        "input_output_contract": ["implementation_artifact"],
+        "requested_content": ["requested_content_evidence"],
+        "deterministic_test": ["test_artifact", "bound_verify_command"],
+        "deterministic_check": [
+            "bound_verify_command",
+            "non_zero_test_or_assertion_evidence",
+        ],
+        "buildable": ["build_command_or_dependency_missing_boundary"],
+        "browser_interaction": [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+        ],
+        "playable_ui": [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+        ],
+        "stateful_interaction": [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+        ],
+        "start_or_restart_flow": [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+        ],
+        "player_control": [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+        ],
+        "adversary_or_challenge": [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+        ],
+        "progression_or_score": [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+        ],
+        "failure_or_collision_rule": [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+        ],
+        "user_input_or_action": [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+        ],
+        "visible_state_change": [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+        ],
+    }
+    return mapping.get(str(capability).strip(), [])
 
 
 def deterministic_verify_command(command: str, has_dependency_setup: bool) -> bool:
@@ -639,6 +737,14 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "last_blocking_reason": diagnostics["last_blocking_reason"],
             "missing_artifacts": diagnostics["missing_artifacts"],
             "verify_attempts": diagnostics["verify_attempts"],
+            "required_capability_count": completion_observability.get("required_capability_count", ""),
+            "missing_capability_count": completion_observability.get("missing_capability_count", ""),
+            "required_evidence_count": completion_observability.get("required_evidence_count", ""),
+            "missing_evidence_count": completion_observability.get("missing_evidence_count", ""),
+            "weak_evidence_count": completion_observability.get("weak_evidence_count", ""),
+            "runtime_acceptance_primary_reason": completion_observability.get(
+                "runtime_acceptance_primary_reason", ""
+            ),
             "last_provider_error_kind": diagnostics["last_provider_error_kind"],
             "last_provider_http_status": diagnostics["last_provider_http_status"],
             "provider_attempts": diagnostics["provider_attempts"],
@@ -785,6 +891,28 @@ def summarize_completion_observability(events: list[dict]) -> dict[str, object]:
         out["deferred_verify_requirements"] = last.get("deferred_verify_requirements", [])
     if last.get("profile_failures"):
         out["profile_failures"] = last.get("profile_failures", [])
+    required_capabilities = last.get("required_capabilities", []) or []
+    missing_capabilities = last.get("missing_capabilities", []) or []
+    required_evidence = last.get("required_evidence", []) or []
+    missing_evidence = last.get("missing_evidence", []) or []
+    weak_evidence = last.get("weak_evidence", []) or []
+    out["required_capability_count"] = len(required_capabilities)
+    out["missing_capability_count"] = len(missing_capabilities)
+    out["required_evidence_count"] = len(required_evidence)
+    out["missing_evidence_count"] = len(missing_evidence)
+    out["weak_evidence_count"] = len(weak_evidence)
+    out["runtime_acceptance_primary_reason"] = last.get("runtime_acceptance_primary_reason", "")
+    out["runtime_acceptance_passed"] = last.get("runtime_acceptance_passed", "")
+    if required_capabilities:
+        out["required_capabilities"] = required_capabilities
+    if missing_capabilities:
+        out["missing_capabilities"] = missing_capabilities
+    if required_evidence:
+        out["required_evidence"] = required_evidence
+    if missing_evidence:
+        out["missing_evidence"] = missing_evidence
+    if weak_evidence:
+        out["weak_evidence"] = weak_evidence
     return out
 
 

@@ -40,6 +40,11 @@ KNOWN_FAILURE_KINDS = {
     "verify_repair_progress_regressed",
     "verify_repair_progress_unchanged",
     "verify_command_policy_error",
+    "missing_required_capabilities",
+    "missing_required_evidence",
+    "weak_verification_evidence",
+    "build_not_verified",
+    "dependency_missing",
 }
 
 PROVIDER_FAILURE_KINDS = {
@@ -76,6 +81,14 @@ def failure_layer_for_kind(kind: str | None) -> str:
         return "planning"
     if normalized in BRIDGE_FAILURE_KINDS:
         return "bridge"
+    if normalized in {
+        "missing_required_capabilities",
+        "missing_required_evidence",
+        "weak_verification_evidence",
+        "build_not_verified",
+        "dependency_missing",
+    }:
+        return "runtime"
     if normalized in POSTCHECK_FAILURE_KINDS:
         return "postcheck"
     if normalized in ENVIRONMENT_FAILURE_KINDS:
@@ -188,6 +201,26 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "failure_kind": "deferred_verify_requirement_pending",
                 "last_loop_stop": "deferred_verify_requirement_pending",
             }
+        if name == "loop_stop" and event.get("reason") in {
+            "missing_required_capabilities",
+            "missing_required_evidence",
+            "weak_verification_evidence",
+            "build_not_verified",
+            "dependency_missing",
+        }:
+            return {
+                "failure_kind": event.get("reason"),
+                "last_loop_stop": event.get("reason", ""),
+                "missing_capabilities": ",".join(
+                    str(item) for item in event.get("missing_capabilities", []) or []
+                ),
+                "missing_evidence": ",".join(
+                    str(item) for item in event.get("missing_evidence", []) or []
+                ),
+                "weak_evidence": ",".join(
+                    str(item) for item in event.get("weak_evidence", []) or []
+                ),
+            }
         if name == "loop_stop" and event.get("reason") == "profile_contract_failure":
             return {
                 "failure_kind": "profile_contract_failure",
@@ -278,6 +311,12 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
     if "test_discovery_failure" in lower or "no tests ran" in lower or "ran 0 tests" in lower:
         return {"failure_kind": "test_discovery_failure"}
     if "completion contract verify failed" in lower:
+        if "missing_required_capabilities" in lower:
+            return {"failure_kind": "missing_required_capabilities"}
+        if "missing_required_evidence" in lower:
+            return {"failure_kind": "missing_required_evidence"}
+        if "weak_verification_evidence" in lower:
+            return {"failure_kind": "weak_verification_evidence"}
         if "deferred verify requirement pending" in lower:
             return {"failure_kind": "deferred_verify_requirement_pending"}
         if "profile contract" in lower or "scripts.build must be next build" in lower:

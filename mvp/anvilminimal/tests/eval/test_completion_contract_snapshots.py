@@ -69,6 +69,36 @@ class CompletionContractSnapshotTest(unittest.TestCase):
             contract["verify_commands"], ["python3 -m unittest test_markdown_lint.py"]
         )
         self.assertNotIn("deferred_verify_requirements", contract)
+        self.assertEqual(contract["required_capabilities"], [])
+
+    def test_functional_contract_projects_runtime_capabilities_and_evidence(self):
+        eval_run = load_eval_run()
+        contract = eval_run.completion_contract_for_spec(
+            {
+                "binary_kind": "anvilminimal",
+                "mode": "minimal-loop",
+                "scenario": {
+                    "profile": "generic",
+                    "prompt": "Fix a JavaScript date helper and add a deterministic node smoke check.",
+                    "functional_contract": {
+                        "category": "library-with-tests",
+                        "required_capabilities": [
+                            "implementation",
+                            "deterministic_test",
+                        ],
+                    },
+                    "expected_artifacts": ["date-helper.js"],
+                    "postcheck": {"commands": ["node date-helper.js"]},
+                },
+            }
+        )
+        self.assertEqual(
+            contract["required_capabilities"],
+            ["implementation", "deterministic_test"],
+        )
+        self.assertIn("implementation_artifact", contract["required_evidence"])
+        self.assertIn("test_artifact", contract["required_evidence"])
+        self.assertIn("bound_verify_command", contract["required_evidence"])
 
     def test_docs_only_contract_allows_artifact_completion(self):
         eval_run = load_eval_run()

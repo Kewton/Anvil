@@ -12,6 +12,16 @@
 
 本調査は、評価値だけではなく、生成された成果物、postcheck ログ、MVP 実装、移植元実装を照合した。
 
+本レビューでの補正方針:
+
+- 事実と推論を分ける。
+- eval 指標を runtime ロジックへ逆流させない。
+- MVP の設計思想である「小さい loop + deterministic verify」を保つ。
+- `TaskContract` や通常 loop 全体を丸ごと移植せず、必要な completion authority の考え方だけを小さい contract として再設計する。
+- package/version など変動し得る外部情報は「最新」へ追随するのではなく、deterministic に検証済みの known-good profile set として扱う。
+- 受け入れ条件は単発 run の絶対値だけで判定せず、provider error を除外した 3-run trend、false positive、失敗分類、anvildev 比較を組み合わせて判定する。
+- runtime は eval の score / acceptance 判定を見ない。runtime に渡すのは required capability / evidence / verify policy のような実行契約だけに限定する。
+
 ## 1. 事象
 
 minimal-loop 単体の acceptance 成功率で MVP が anvildev に劣っている。
@@ -287,7 +297,17 @@ MVP では、これらを直接持たず、薄い completion contract と profil
 
 ### 5.3 重要な比較結果
 
-anvildev は eval harness から MVP 用 completion contract を注入されていない。それでも minimal-loop で 11/12 acceptance を達成している。これは、anvildev 側の prompt/feedback/周辺機構が、モデルに「テスト・検証・実 build までやる」行動を引き出している可能性が高いことを示す。
+確認済みの事実:
+
+- anvildev は eval harness から MVP 用 completion contract を注入されていない。
+- それでも minimal-loop で 11/12 acceptance を達成している。
+- anvildev の Next.js 2 件は `npm install --ignore-scripts`, `npm run build`, dev server readiness が成功している。
+- anvildev の Rust CLI Gemini ケースでは `#[test]` が生成され、MVP の同ケースより deterministic check の evidence が強い。
+
+推論:
+
+- anvildev 側の prompt/feedback/周辺機構が、モデルに「テスト・検証・実 build までやる」行動を引き出している可能性が高い。
+- ただし、この推論は「anvildev minimal-loop 単体のコード差分」だけでは説明しきれない。通常 loop 側の TaskContract / verifier / deterministic fallback の思想が、移植元全体の設計文化として minimal 系にも波及していると見るのが妥当である。
 
 一方、MVP は completion contract を導入したことで artifact 作成の安定性は上がったが、その contract が artifact/profile 中心であるため、浅い完了を固定化している。
 
@@ -394,16 +414,13 @@ provider 別に runtime feedback が効いているかを eval events で確認�
 
 ### A1. CompletionContract v2 を導入する
 
-MVP の `CompletionContract` に以下を追加する。
+MVP の `CompletionContract` に runtime 用の evidence contract を追加する。
 
 ```json
 {
   "required_capabilities": ["implementation", "deterministic_test"],
   "deterministic_oracles": ["source_semantic", "postcheck"],
-  "minimum_acceptance": {
-    "source_semantic_score": 100,
-    "postcheck_required": true
-  }
+  "required_evidence": ["test_artifact", "bound_verify_command"]
 }
 ```
 
@@ -411,7 +428,9 @@ MVP の `CompletionContract` に以下を追加する。
 
 - eval 専用の文字列マッチにしない。
 - generic capability 名で表現する。
+- runtime では `source_semantic_score` や `acceptance_success` のような eval 指標を参照しない。
 - runtime では完全な semantic oracle を再実装せず、まずは「必要な検証成果物/テスト/チェックが存在するか」を deterministic に見る。
+- eval は runtime events と成果物から acceptance score を算出する。runtime は score ではなく、完了に必要な evidence が不足しているかだけを判断する。
 
 ### A2. functional_contract から completion contract へ capability を投影する
 
@@ -419,7 +438,7 @@ MVP の `CompletionContract` に以下を追加する。
 
 - `functional_contract.required_capabilities`
 - `oracle_contract.deterministic_oracles`
-- `quality_contract.minimum_acceptance`
+- runtime に渡せる `required_evidence`
 - `postcheck.commands`
 
 ただし、runtime に渡すのは汎用化済み capability のみとし、scenario 固有語に依存しない。
@@ -460,7 +479,13 @@ weak の場合は final に進ませず、以下の feedback を返す。
 
 ### A5. postcheck failure を bounded repair に戻す
 
-eval 実行時だけでなく通常実行でも使える形で、completion contract の `verify_commands` に build/test を含めるか、deferred postcheck を満了扱いにする条件を厳しくする。
+eval 実行時だけでなく通常実行でも使える形で、completion contract の `verify_commands` に安全な build/test を含めるか、deferred postcheck を満了扱いにする条件を厳しくする。
+
+非目標:
+
+- dev server の長時間起動を runtime verify に入れない。
+- network install を無条件に runtime verify として実行しない。
+- eval の postcheck runner をそのまま agent loop に埋め込まない。
 
 特に Next.js:
 
@@ -472,10 +497,15 @@ eval 実行時だけでなく通常実行でも使える形で、completion cont
 
 Next.js profile check に以下を追加する。
 
-- `typescript` は実在する安定範囲、例: `^5.5.0` など
-- Next 14 系なら React 18 系、Next 15 系なら React 19 系などの coherence
+- deterministic profile が採用する known-good dependency set を定義する。
+- Next major と React major の coherence を検証する。
 - `@types/react` と React major の不一致を warning/failure にする
 - package manager lockfile が存在する場合、package.json と矛盾しないこと
+
+注意:
+
+- ここでは「最新バージョン」を推測して追いかけない。外部 package の最新状況は変動するため、runtime profile は eval / CI で検証済みの known-good set を使う。
+- 実装時に最新 compatibility を採用する必要がある場合は、公式 documentation / registry で別途検証し、profile fixture を更新する。
 
 ### A7. source/anvil の周辺思想を MVP に小さく再設計して取り込む
 
@@ -490,6 +520,124 @@ Next.js profile check に以下を追加する。
 - repair feedback を生成する
 
 これにより、MVP の小ささを保ちながら、移植元の「完了には evidence が必要」という設計思想を回収する。
+
+### A8. 不確実性を検証してから採用する
+
+現時点で不確実な対策:
+
+- Next.js dependency major coherence の具体ルール
+- `deterministic_test` / `deterministic_check` の言語別 evidence 判定の境界
+- postcheck を runtime verify に戻す範囲
+
+検証方法:
+
+- まず fake provider / fixture で deterministic に検証する。
+- package compatibility は最新推測ではなく、known-good fixture を install/build して確認する。
+- LLM API を使う場合は「モデルがこの feedback で修復行動に移るか」の仮説検証に限定する。仕様・互換性の根拠にはしない。
+- LLM API 検証は network/API cost を伴うため、実装前の必須条件にはせず、fake provider で再現できない prompt 感度の検証時だけ実施する。
+
+## 10.1 レビュー観点別の見直し結果
+
+### 設計思想に則っているか
+
+方向性は概ね妥当。ただし初版の `minimum_acceptance.source_semantic_score` を runtime contract に入れる案は不適切だった。eval score を runtime が参照すると、評価指標へ過適応し、通常利用時の意味が曖昧になる。
+
+修正後は、runtime は `required_capabilities` と `required_evidence` の不足だけを見る。score 化は eval 側に閉じる。
+
+### 不安定な挙動をもたらさないか
+
+初版の「postcheck failure を loop 内に戻す」は、そのままだと network install / dev server 起動 / 長時間 process を runtime に混入させるリスクがあった。
+
+修正後は、安全な build/test verify と dependency_missing の明示停止に限定する。dev server readiness は eval oracle 側に残す。
+
+### 影響調査は十分か
+
+初版は minimal-loop 中心だったため、plan-run / ultra-plan-run への波及は書いていたものの、通常 TUI 実行への影響が弱かった。
+
+補足すべき影響:
+
+- TUI で `/ultra-plan-run` を実行した場合、phase / step 経由で同じ completion contract が使われる。
+- `anvilminimal --yes ...` の通常 minimal-loop でも、required evidence が増えると完了までの turn 数が増える可能性がある。
+- verify command を増やすと実行時間が伸びるため、dependency setup と dev server は runtime から分離する必要がある。
+
+### 他に影響を与えないか
+
+主な影響先:
+
+- `mvp/anvilminimal/src/minimal_loop/completion.rs`
+- `mvp/anvilminimal/src/minimal_loop/loop_run.rs`
+- `mvp/anvilminimal/src/planner/runner.rs`
+- `mvp/anvilminimal/src/planner/profiles/nextjs.rs`
+- `mvp/anvilminimal/scripts/eval-run.py`
+- `mvp/anvilminimal/scripts/eval_lib/*`
+
+互換性確保:
+
+- CompletionContract v1 は後方互換で読み込む。
+- required capabilities が空なら現行挙動を維持する。
+- plan-run step では step-local expected paths を優先し、final capabilities は最終 step / phase completion で確認する。
+
+### ソフトウェア複雑性が増大しないか
+
+複雑性リスクはある。TaskContract 全体の移植は避けるべきである。
+
+許容する追加:
+
+- `RuntimeAcceptanceContract` の小さい構造体
+- capability/evidence verifier の小さい pure function 群
+- eval-run からの contract projection
+
+避ける追加:
+
+- 通常 loop の TaskContract 全体移植
+- browser oracle の runtime 埋め込み
+- provider 別 special case
+- scenario 名に依存した条件分岐
+
+### 原因の深掘りは十分か
+
+初版では「移植境界が狭かった」と整理したが、なぜ見落としたかの分解が不足していた。追加分析は以下。
+
+- artifact success が 12/12 だったため、従来の完了条件では問題が隠れた。
+- anvildev の品質を `src/agent/minimal_loop` の差分だけで説明しようとしたため、通常 loop 側の completion authority を過小評価した。
+- eval の acceptance oracle 強化が後追いだったため、runtime 停止条件との乖離が後から顕在化した。
+- SG 棚卸しが「安全装置の存在確認」に寄り、「成功判定に寄与する cross-cutting mechanism」の依存関係確認になっていなかった。
+
+### 他に移植漏れがないか
+
+追加で確認すべき候補:
+
+- requested artifact extraction と explicit artifact obligation
+- required behavior extraction
+- test evidence binding
+- verifier command collection
+- missing evidence recovery
+- deterministic scaffold continuation note
+- Node test runner manifest fallback
+- Python test fallback
+- playable UI repair / polish fallback
+- post-loop success verifier
+
+これらをすべて移植するのではなく、MVP の completion contract に必要な input/output だけを抽出する。
+
+### 移植不備が無いか
+
+現時点で明確な移植不備:
+
+- required behavior / capability が runtime 完了条件に入っていない。
+- deterministic test/check の evidence gate がない。
+- profile static check と実 build/postcheck の境界が曖昧。
+- scaffold / shell / placeholder を「完了ではない」と扱う completion authority が弱い。
+
+### 不確実な対策方針はないか
+
+不確実な点はあるが、現段階で LLM API を実行しないと判断する。
+
+理由:
+
+- 今回の主問題は LLM 応答品質の仮説ではなく、runtime completion contract の欠落として、既存ログと成果物で再現できている。
+- 対策の第一段階は fake provider / fixture で検証可能である。
+- LLM API は prompt feedback の効き方を確認する段階で使うのが妥当であり、設計判断の根拠として使うべきではない。
 
 ## 11. 実装フェーズ案
 
@@ -517,7 +665,7 @@ Next.js profile check に以下を追加する。
 
 作業:
 
-- `CompletionContract` に `required_capabilities`, `deterministic_oracles`, `minimum_acceptance` を追加
+- `CompletionContract` に `required_capabilities`, `deterministic_oracles`, `required_evidence` を追加
 - JSON validate / dedupe / unknown capability handling
 - eval-run から functional_contract を投影
 
@@ -632,11 +780,13 @@ Next.js profile check に以下を追加する。
 
 受け入れ条件:
 
-- MVP minimal-loop acceptance success が anvildev と同等以上、目安 11/12 以上。
-- false positive が 1 件以下。
+- provider error を除外した 3-run trend で、MVP minimal-loop acceptance success の median が 11/12 以上、または anvildev median を下回らない。
+- false positive の median が 1 件以下、かつ anvildev より悪化しない。
 - artifact success 12/12 を維持。
-- Next.js 2 件の build/dev readiness が anvildev と同等。
-- 速度劣化が許容範囲、目安 +20% 以内。ただし acceptance 改善を優先する。
+- Next.js は dependency setup が成立するケースで build/dev readiness が anvildev と同等。dependency resolution が成立しない場合は、classified failure として扱い false positive にしない。
+- `completion_contract_satisfied` で停止した run は required capabilities/evidence を満たしている。
+- unclassified failure を増やさない。
+- 速度劣化は 3-run median で +20% 以内を目安とする。ただし acceptance / false positive 改善を優先し、超過時は自動不合格ではなく原因分析を必須にする。
 
 ## 12. テスト計画
 
@@ -729,17 +879,18 @@ python3 mvp/anvilminimal/scripts/eval-run.py \
 
 必須:
 
-- MVP minimal-loop `acceptance_success >= 11/12`
-- MVP minimal-loop `acceptance_false_positive <= 1`
+- provider error を除外した 3-run trend で MVP minimal-loop `acceptance_success` median が 11/12 以上、または anvildev median を下回らない。
+- provider error を除外した 3-run trend で MVP minimal-loop `acceptance_false_positive` median が 1 以下、かつ anvildev 以下。
 - MVP minimal-loop `artifact_success = 12/12`
-- MVP Next.js minimal-loop 2 件で `build_success = true`
-- MVP Next.js minimal-loop 2 件で `launch_success = true`
+- MVP Next.js minimal-loop は dependency setup が成立するケースで `build_success = true` / `launch_success = true`。dependency resolution が成立しない場合は classified failure になり、false positive にならない。
+- remaining failure は `missing_required_capabilities`, `postcheck_failure`, `dependency_missing`, `provider_http_status` などの既知分類に落ち、`unclassified_process_failure` を増やさない。
 
 望ましい:
 
 - MVP minimal-loop acceptance success が anvildev と同等以上
 - false positive が anvildev 以下
 - `completion_contract_satisfied` の場合、required capabilities も満たしている
+- speed regression は 3-run median で +20% 以内
 
 ### 13.4 成果物の手動確認ではなく機械確認する観点
 

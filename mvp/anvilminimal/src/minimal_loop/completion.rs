@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::eval_events;
+use crate::minimal_loop::evidence::{RuntimeAcceptanceReport, required_evidence_for_capability};
 use crate::planner::verify::{VerificationReport, validate_verify_command};
 use crate::tools::path_guard::{
     resolve_existing, resolve_optional_existing, validate_workspace_relative,
@@ -22,6 +23,12 @@ pub struct CompletionContract {
     pub profile: Option<String>,
     #[serde(default)]
     pub goal: Option<String>,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub deterministic_oracles: Vec<String>,
+    #[serde(default)]
+    pub required_evidence: Vec<String>,
     #[serde(default)]
     pub deferred_verify_requirements: Vec<DeferredVerifyRequirement>,
     #[serde(default = "default_verify_repair_cap")]
@@ -75,6 +82,21 @@ impl CompletionContract {
                 commands.push(command);
             }
         }
+        self.required_capabilities = normalize_unique_list(self.required_capabilities);
+        self.deterministic_oracles = normalize_unique_list(self.deterministic_oracles);
+        self.required_evidence = normalize_unique_list(self.required_evidence);
+        let mut evidence_seen = self
+            .required_evidence
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for capability in &self.required_capabilities {
+            for evidence in required_evidence_for_capability(capability) {
+                if evidence_seen.insert(evidence.clone()) {
+                    self.required_evidence.push(evidence);
+                }
+            }
+        }
         let mut seen_deferred = BTreeSet::new();
         let mut deferred = Vec::new();
         for mut requirement in self.deferred_verify_requirements {
@@ -112,6 +134,9 @@ impl CompletionContract {
     pub fn has_verify(&self) -> bool {
         !self.verify_commands.is_empty()
             || self.profile_requires_completion_gate()
+            || !self.required_capabilities.is_empty()
+            || !self.required_evidence.is_empty()
+            || !self.deterministic_oracles.is_empty()
             || !self.deferred_verify_requirements.is_empty()
     }
 
@@ -151,10 +176,7 @@ impl CompletionContract {
                         report.push_command_failure(command.clone(), reason);
                     }
                 }
-                Err(err)
-                    if err.to_string().contains("not found")
-                        || err.to_string().contains("No such file") =>
-                {
+                Err(err) if is_dependency_missing_error(command, &err.to_string()) => {
                     report.push_dependency_missing(command.clone());
                 }
                 Err(err) => {
@@ -200,7 +222,44 @@ impl CompletionContract {
                 profile_passed,
             ));
         }
+        let acceptance = self.runtime_acceptance_report(root);
+        if !acceptance.passed {
+            if !acceptance.missing_capabilities.is_empty() {
+                report.push_profile_failure(format!(
+                    "missing_required_capabilities:{}",
+                    acceptance.missing_capabilities.join(",")
+                ));
+            }
+            if !acceptance.missing_evidence.is_empty() {
+                report.push_profile_failure(format!(
+                    "missing_required_evidence:{}",
+                    acceptance.missing_evidence.join(",")
+                ));
+            }
+            if !acceptance.weak_evidence.is_empty() {
+                report.push_profile_failure(format!(
+                    "weak_verification_evidence:{}",
+                    acceptance.weak_evidence.join(",")
+                ));
+            }
+        }
         report
+    }
+
+    pub fn runtime_acceptance_report(&self, root: &Path) -> RuntimeAcceptanceReport {
+        let deferred_commands = self
+            .deferred_verify_requirements
+            .iter()
+            .map(|requirement| requirement.command.clone())
+            .collect::<Vec<_>>();
+        crate::minimal_loop::evidence::verify_runtime_acceptance(
+            root,
+            &self.required_paths,
+            &self.verify_commands,
+            &self.required_capabilities,
+            &self.required_evidence,
+            &deferred_commands,
+        )
     }
 
     pub fn deferred_status_summary(&self, root: &Path, fallback_goal: &str) -> Vec<String> {
@@ -327,12 +386,99 @@ pub fn format_verify_feedback(report: &VerificationReport) -> String {
     }
     for failure in &report.profile_failures {
         lines.push(format!("Profile contract failed: {failure}"));
+        if failure.contains("CSS side-effect imports require")
+            && failure.contains("declare module \"*.css\"")
+        {
+            lines.push(
+                "Next.js CSS repair: replace or create `src/app/global.d.ts` with exactly `declare module \"*.css\";` on its own line."
+                    .to_string(),
+            );
+        }
+        if failure.contains("must start with \"use client\"") {
+            lines.push(
+                "Next.js client component repair: put `\"use client\";` as the first non-empty statement in the interactive app page before imports."
+                    .to_string(),
+            );
+        }
+        if failure.contains("missing_required_capabilities")
+            || failure.contains("missing_required_evidence")
+            || failure.contains("weak_verification_evidence")
+        {
+            lines.push(
+                "Capability evidence guidance: add the smallest concrete test/check/UI evidence requested by the task, then keep the existing verification strong enough to exercise that evidence."
+                    .to_string(),
+            );
+            lines.extend(evidence_repair_guidance(failure));
+        }
     }
     lines.push(
         "Repair guidance: inspect the smallest relevant file range, then make a concrete Write/Edit change to the implementation, setup, or generated test artifact that actually owns the failure. Do not bypass verification or weaken assertions without evidence that the generated test contradicts the requested behavior."
             .to_string(),
     );
     lines.join("\n")
+}
+
+fn normalize_unique_list(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+fn evidence_repair_guidance(failure: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    if failure.contains("test_artifact")
+        || failure.contains("bound_verify_command")
+        || failure.contains("node_smoke_without_assertion")
+    {
+        lines.push(
+            "For JavaScript/TypeScript, add an assertion-backed self-test or test artifact that the verify command actually runs, for example `node file.js` must execute `assert` checks instead of only exporting functions."
+                .to_string(),
+        );
+    }
+    if failure.contains("non_zero_test_or_assertion_evidence")
+        || failure.contains("cargo_test_without_test_evidence")
+    {
+        lines.push(
+            "For Rust, add at least one real `#[test]` or `#[cfg(test)]` module with assertions so `cargo test` verifies behavior rather than reporting zero tests."
+                .to_string(),
+        );
+    }
+    if failure.contains("interactive_ui_source_evidence")
+        || failure.contains("non_static_screen_evidence")
+    {
+        lines.push(
+            "For interactive UI work, implement state changes and input handlers in source code; a static title or unhandled instruction text is not enough."
+                .to_string(),
+        );
+    }
+    lines
+}
+
+fn is_dependency_missing_error(command: &str, reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    let first_word = command.split_whitespace().next().unwrap_or_default();
+    let executable_markers = [
+        "command not found",
+        "not found:",
+        "no such file or directory",
+        "failed to spawn command",
+    ];
+    if !executable_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    if lower.contains("assertionerror") || lower.contains("not found in") {
+        return false;
+    }
+    first_word.is_empty() || lower.contains(&first_word.to_ascii_lowercase())
 }
 
 fn target_candidates_from_failure(command: &str, reason: &str) -> BTreeSet<String> {
@@ -602,6 +748,9 @@ mod tests {
             verify_commands: vec!["cargo test".to_string(), "cargo test".to_string()],
             profile: None,
             goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 0,
         }
@@ -610,6 +759,44 @@ mod tests {
         assert_eq!(contract.required_paths, vec!["src/main.rs"]);
         assert_eq!(contract.verify_commands, vec!["cargo test"]);
         assert_eq!(contract.verify_repair_cap, 2);
+    }
+
+    #[test]
+    fn structured_contract_deduplicates_capabilities_and_derives_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = CompletionContract {
+            required_paths: Vec::new(),
+            verify_commands: Vec::new(),
+            profile: None,
+            goal: None,
+            required_capabilities: vec![
+                " deterministic_test ".to_string(),
+                "deterministic_test".to_string(),
+            ],
+            deterministic_oracles: vec![" source_semantic ".to_string(), "".to_string()],
+            required_evidence: vec!["custom_evidence".to_string()],
+            deferred_verify_requirements: Vec::new(),
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap();
+        assert_eq!(contract.required_capabilities, vec!["deterministic_test"]);
+        assert_eq!(contract.deterministic_oracles, vec!["source_semantic"]);
+        assert!(
+            contract
+                .required_evidence
+                .contains(&"custom_evidence".to_string())
+        );
+        assert!(
+            contract
+                .required_evidence
+                .contains(&"test_artifact".to_string())
+        );
+        assert!(
+            contract
+                .required_evidence
+                .contains(&"bound_verify_command".to_string())
+        );
     }
 
     #[test]
@@ -627,6 +814,9 @@ mod tests {
                 verify_commands: Vec::new(),
                 profile: None,
                 goal: None,
+                required_capabilities: Vec::new(),
+                deterministic_oracles: Vec::new(),
+                required_evidence: Vec::new(),
                 deferred_verify_requirements: Vec::new(),
                 verify_repair_cap: 2,
             }
@@ -647,6 +837,9 @@ mod tests {
             verify_commands: Vec::new(),
             profile: None,
             goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
         }
@@ -669,6 +862,9 @@ mod tests {
                 verify_commands: vec![command.to_string()],
                 profile: None,
                 goal: None,
+                required_capabilities: Vec::new(),
+                deterministic_oracles: Vec::new(),
+                required_evidence: Vec::new(),
                 deferred_verify_requirements: Vec::new(),
                 verify_repair_cap: 2,
             }
@@ -712,6 +908,20 @@ mod tests {
     }
 
     #[test]
+    fn assertion_text_not_found_is_not_dependency_missing() {
+        let reason = "command failed: python3 -m unittest test_markdown_lint.py\n\
+            AssertionError: '2: Heading level jumps from 1 to 3' not found in '1: Invalid heading format'";
+        assert!(!is_dependency_missing_error(
+            "python3 -m unittest test_markdown_lint.py",
+            reason
+        ));
+        assert!(is_dependency_missing_error(
+            "python3 -m unittest test_markdown_lint.py",
+            "sh: python3: command not found"
+        ));
+    }
+
+    #[test]
     fn verify_feedback_includes_command_target_and_assertion_excerpt() {
         let mut report = VerificationReport::pass();
         report.push_command_failure(
@@ -742,6 +952,20 @@ mod tests {
     }
 
     #[test]
+    fn verify_feedback_includes_nextjs_profile_repairs() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "CSS side-effect imports require a declaration file such as src/app/global.d.ts with declare module \"*.css\"",
+        );
+        report.push_profile_failure(
+            "src/app/page.tsx uses browser/client APIs and must start with \"use client\"",
+        );
+        let feedback = format_verify_feedback(&report);
+        assert!(feedback.contains("declare module \"*.css\";"));
+        assert!(feedback.contains("first non-empty statement"));
+    }
+
+    #[test]
     fn unittest_zero_tests_is_not_verify_pass() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -754,6 +978,9 @@ mod tests {
             verify_commands: vec!["python3 -m unittest test_repair_report.py".to_string()],
             profile: None,
             goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
         }
@@ -796,6 +1023,9 @@ mod tests {
             verify_commands: Vec::new(),
             profile: None,
             goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
             deferred_verify_requirements: vec![DeferredVerifyRequirement {
                 command: "npm run build".to_string(),
                 reason: "requires dependency setup".to_string(),
@@ -855,6 +1085,9 @@ mod tests {
             verify_commands: Vec::new(),
             profile: Some("nextjs".to_string()),
             goal: Some("Create a Next.js app".to_string()),
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
             deferred_verify_requirements: vec![DeferredVerifyRequirement {
                 command: "npm run build".to_string(),
                 reason: "requires dependency setup".to_string(),
@@ -880,7 +1113,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
         std::fs::write(
             dir.path().join("package.json"),
-            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"15.0.0","react":"19.0.0","react-dom":"19.0.0"},"devDependencies":{"typescript":"6.0.0","@types/node":"20.0.0","@types/react":"19.0.0","@types/react-dom":"19.0.0"}}"#,
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"15.0.0","react":"19.0.0","react-dom":"19.0.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"20.0.0","@types/react":"19.0.0","@types/react-dom":"19.0.0"}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -903,6 +1136,9 @@ mod tests {
             verify_commands: Vec::new(),
             profile: Some("nextjs".to_string()),
             goal: Some("Create a Next.js app".to_string()),
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
             deferred_verify_requirements: vec![DeferredVerifyRequirement {
                 command: "npm run build".to_string(),
                 reason: "requires dependency setup".to_string(),

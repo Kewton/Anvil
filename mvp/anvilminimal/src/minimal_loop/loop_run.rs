@@ -1007,6 +1007,7 @@ fn verify_completion_contract(
 ) -> anyhow::Result<Option<VerifyFailureFeedback>> {
     *verify_attempts += 1;
     let report = contract.verify_with_goal(root, goal);
+    let runtime_acceptance = contract.runtime_acceptance_report(root);
     let ok = report.is_pass();
     let (signature, verdict) = classify_repair_progress(previous_signature, &report, had_edit);
     eval_events::emit(
@@ -1021,6 +1022,13 @@ fn verify_completion_contract(
             "dependency_missing": report.dependency_missing.clone(),
             "profile": contract.profile.as_deref().unwrap_or(""),
             "profile_failures": report.profile_failures.clone(),
+            "required_capabilities": contract.required_capabilities.clone(),
+            "required_evidence": contract.required_evidence.clone(),
+            "missing_capabilities": runtime_acceptance.missing_capabilities.clone(),
+            "missing_evidence": runtime_acceptance.missing_evidence.clone(),
+            "weak_evidence": runtime_acceptance.weak_evidence.clone(),
+            "runtime_acceptance_passed": runtime_acceptance.passed,
+            "runtime_acceptance_primary_reason": eval_events::body_snippet(&runtime_acceptance.primary_reason),
             "deferred_verify_requirements": contract.deferred_status_summary(root, goal),
             "primary_reason": eval_events::body_snippet(&report.primary_reason()),
             "failure_signature": signature.label(),
@@ -1058,6 +1066,9 @@ fn verify_completion_contract(
                 "reason": stop_reason,
                 "verify_attempts": *verify_attempts,
                 "primary_reason": eval_events::body_snippet(&report.primary_reason()),
+                "missing_capabilities": runtime_acceptance.missing_capabilities.clone(),
+                "missing_evidence": runtime_acceptance.missing_evidence.clone(),
+                "weak_evidence": runtime_acceptance.weak_evidence.clone(),
                 "repair_progress": verdict.as_str(),
                 "failure_signature": signature.label(),
             }),
@@ -1117,6 +1128,27 @@ fn terminal_verify_stop_reason(
     previous_signature: Option<&VerificationSignature>,
     verdict: RepairProgressVerdict,
 ) -> String {
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("missing_required_capabilities"))
+    {
+        return "missing_required_capabilities".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("missing_required_evidence"))
+    {
+        return "missing_required_evidence".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("weak_verification_evidence"))
+    {
+        return "weak_verification_evidence".to_string();
+    }
     if report
         .profile_failures
         .iter()

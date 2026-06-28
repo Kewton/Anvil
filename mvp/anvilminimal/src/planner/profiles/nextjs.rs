@@ -24,6 +24,9 @@ pub fn verify(root: &Path, goal: &str) -> VerificationReport {
             return profile_failure(format!("dependency missing: {dep}"));
         }
     }
+    if let Some(reason) = dependency_coherence_failure(&package) {
+        return profile_failure(reason);
+    }
     let scripts = package.get("scripts").and_then(Value::as_object);
     let build = scripts
         .and_then(|scripts| scripts.get("build"))
@@ -74,6 +77,9 @@ pub fn verify(root: &Path, goal: &str) -> VerificationReport {
         return profile_failure(reason);
     }
     if let Some(reason) = css_side_effect_import_contract_failure(&project.path) {
+        return profile_failure(reason);
+    }
+    if let Some(reason) = client_component_contract_failure(&project.path) {
         return profile_failure(reason);
     }
     if let Some(reason) = tailwind_contract_failure(&project.path, &package) {
@@ -335,8 +341,13 @@ fn object_entry<'a>(package: &'a mut Map<String, Value>, key: &str) -> &'a mut M
 }
 
 fn ensure_dependency(deps: &mut Map<String, Value>, name: &str, version: &str) {
-    deps.entry(name.to_string())
-        .or_insert_with(|| Value::String(version.to_string()));
+    let needs_update = deps
+        .get(name)
+        .and_then(Value::as_str)
+        .is_none_or(|current| dependency_version_needs_repair(name, current));
+    if needs_update {
+        deps.insert(name.to_string(), Value::String(version.to_string()));
+    }
 }
 
 fn ensure_file(path: &Path, content: &str) -> anyhow::Result<()> {
@@ -728,6 +739,66 @@ fn tailwind_contract_failure(root: &Path, package: &Value) -> Option<String> {
     None
 }
 
+fn client_component_contract_failure(root: &Path) -> Option<String> {
+    for rel in [
+        "src/app/page.tsx",
+        "src/app/page.jsx",
+        "src/app/page.ts",
+        "src/app/page.js",
+        "app/page.tsx",
+        "app/page.jsx",
+        "app/page.ts",
+        "app/page.js",
+    ] {
+        let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
+            continue;
+        };
+        if uses_client_only_features(&content) && !has_use_client_directive(&content) {
+            return Some(format!(
+                "{rel} uses browser/client APIs and must start with \"use client\""
+            ));
+        }
+    }
+    None
+}
+
+fn uses_client_only_features(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    [
+        "usestate",
+        "useeffect",
+        "useref",
+        "usereducer",
+        "window.",
+        "document.",
+        "addeventlistener",
+        "requestanimationframe",
+        "setinterval",
+        "settimeout",
+        "onclick=",
+        "onkeydown=",
+        "onkeyup=",
+        "onpointer",
+        "onmouse",
+        "ref={",
+        "<canvas",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn has_use_client_directive(content: &str) -> bool {
+    content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("//"))
+        .map(|line| {
+            let line = line.strip_suffix(';').unwrap_or(line);
+            matches!(line, "\"use client\"" | "'use client'")
+        })
+        .unwrap_or(false)
+}
+
 fn uses_tailwind(root: &Path, package: &Value) -> bool {
     package_has_dependency(package, "tailwindcss")
         || contains_in_files(root, "@tailwind")
@@ -756,13 +827,112 @@ fn package_has_dependency(package: &Value, name: &str) -> bool {
         .any(|deps| deps.contains_key(name))
 }
 
+fn dependency_coherence_failure(package: &Value) -> Option<String> {
+    let next = dependency_version(package, "next")?;
+    let react = dependency_version(package, "react")?;
+    let react_dom = dependency_version(package, "react-dom")?;
+    if dependency_version_needs_repair("next", next) {
+        return Some(
+            "next dependency must use a maintained build-safe range such as ^14.2.0".to_string(),
+        );
+    }
+    if dependency_version_needs_repair(
+        "typescript",
+        dependency_version(package, "typescript").unwrap_or(""),
+    ) {
+        return Some(
+            "typescript dependency must use a deterministic 5.x range such as ^5.5.0".to_string(),
+        );
+    }
+    let next_major = semver_major(next)?;
+    let react_major = semver_major(react)?;
+    let react_dom_major = semver_major(react_dom)?;
+    if next_major >= 15 && (react_major < 19 || react_dom_major < 19) {
+        return Some("Next 15+ requires React/React DOM 19.x compatibility".to_string());
+    }
+    if next_major <= 14 && (react_major != 18 || react_dom_major != 18) {
+        return Some("Next 14 profile expects React/React DOM 18.x compatibility".to_string());
+    }
+    if let Some(types_react) = dependency_version(package, "@types/react")
+        && let Some(types_major) = semver_major(types_react)
+        && ((react_major >= 19 && types_major < 19) || (react_major == 18 && types_major != 18))
+    {
+        return Some("@types/react major must match React major".to_string());
+    }
+    if let Some(types_react_dom) = dependency_version(package, "@types/react-dom")
+        && let Some(types_major) = semver_major(types_react_dom)
+        && ((react_dom_major >= 19 && types_major < 19)
+            || (react_dom_major == 18 && types_major != 18))
+    {
+        return Some("@types/react-dom major must match React DOM major".to_string());
+    }
+    None
+}
+
+fn dependency_version<'a>(package: &'a Value, name: &str) -> Option<&'a str> {
+    ["dependencies", "devDependencies"]
+        .iter()
+        .filter_map(|key| package.get(*key).and_then(Value::as_object))
+        .find_map(|deps| deps.get(name).and_then(Value::as_str))
+}
+
+fn dependency_version_needs_repair(name: &str, version: &str) -> bool {
+    if version.trim().is_empty() {
+        return true;
+    }
+    match name {
+        "typescript" => {
+            let Some(major) = semver_major(version) else {
+                return false;
+            };
+            major != 5 || version.trim() == "5.0.0"
+        }
+        "@types/react" | "@types/react-dom" | "@types/node" => semver_major(version).is_none(),
+        "next" => {
+            let Some((major, minor, _patch)) = semver_triplet(version) else {
+                return true;
+            };
+            major == 14 && minor < 2
+        }
+        "react" | "react-dom" => semver_major(version).is_none(),
+        _ => false,
+    }
+}
+
+fn semver_triplet(version: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = version.trim().trim_start_matches(['^', '~', '=', 'v']);
+    let mut parts = trimmed
+        .split(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+        .next()
+        .unwrap_or_default()
+        .split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn semver_major(version: &str) -> Option<u64> {
+    let trimmed = version.trim();
+    let digits = trimmed
+        .trim_start_matches(['^', '~', '=', 'v'])
+        .split(|ch: char| !ch.is_ascii_digit())
+        .next()
+        .unwrap_or_default();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::planner::verify::VerifyStatus;
 
     fn package_json() -> &'static str {
-        r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#
+        r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#
     }
 
     #[test]
@@ -863,7 +1033,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
         std::fs::write(
             dir.path().join("package.json"),
-            r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"echo ok","dev":"next dev -p 3011"}}"#,
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"echo ok","dev":"next dev -p 3011"}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -911,6 +1081,79 @@ mod tests {
             report.status,
             VerifyStatus::ProfileContractFailed(reason) if reason.contains("moduleResolution=node10")
         ));
+    }
+
+    #[test]
+    fn nextjs_rejects_invalid_typescript_exact_version() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"5.0.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("typescript dependency")
+        ));
+    }
+
+    #[test]
+    fn nextjs_rejects_next_react_major_mismatch() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^15.0.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("Next 15")
+        ));
+    }
+
+    #[test]
+    fn nextjs_rejects_legacy_14_0_dependency_range() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.2.0","react-dom":"18.2.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("build-safe range")
+        ));
+    }
+
+    #[test]
+    fn nextjs_rejects_interactive_app_page_without_use_client() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#"export default function Page() {
+  return <canvas ref={() => {}} onKeyDown={() => {}} />;
+}"#,
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("\"use client\"")
+        ));
+
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+
+export default function Page() {
+  return <canvas ref={() => {}} onKeyDown={() => {}} />;
+}"#,
+        )
+        .unwrap();
+        assert!(verify(dir.path(), "3011").is_pass());
     }
 
     #[test]

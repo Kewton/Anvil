@@ -272,6 +272,15 @@ fn run_step_plan_with_ui_inner(
     }
     let mut session = SessionSnapshot::new();
     let required_final_artifacts = required_final_artifacts(plan, &config.workspace_root);
+    let external_contract = CompletionContract::load_for_config(config)?;
+    let final_required_capabilities = external_contract
+        .as_ref()
+        .map(|contract| contract.required_capabilities.clone())
+        .unwrap_or_default();
+    let final_required_evidence = external_contract
+        .as_ref()
+        .map(|contract| contract.required_evidence.clone())
+        .unwrap_or_default();
     let mut prior_expected_paths = Vec::new();
     for step in &plan.steps {
         if ui.interrupted() {
@@ -280,6 +289,8 @@ fn run_step_plan_with_ui_inner(
         let prompt_context = StepPromptContext {
             required_final_artifacts: required_final_artifacts.clone(),
             prior_expected_paths: prior_expected_paths.clone(),
+            final_required_capabilities: final_required_capabilities.clone(),
+            final_required_evidence: final_required_evidence.clone(),
         };
         run_step(
             client,
@@ -302,6 +313,8 @@ fn run_step_plan_with_ui_inner(
 struct StepPromptContext {
     required_final_artifacts: Vec<String>,
     prior_expected_paths: Vec<String>,
+    final_required_capabilities: Vec<String>,
+    final_required_evidence: Vec<String>,
 }
 
 fn run_step(
@@ -453,6 +466,9 @@ fn verify_plan_final_contract(
     let external_report = external_contract
         .as_ref()
         .map(|contract| contract.verify_with_goal(&config.workspace_root, &plan.goal));
+    let runtime_acceptance = external_contract
+        .as_ref()
+        .map(|contract| contract.runtime_acceptance_report(&config.workspace_root));
     let external_ok = external_report
         .as_ref()
         .is_none_or(|report| report.is_pass());
@@ -475,6 +491,26 @@ fn verify_plan_final_contract(
             "missing_final_artifacts": missing_final_artifacts,
             "external_contract_checked": external_contract.is_some(),
             "external_contract_ok": external_ok,
+            "required_capabilities": external_contract
+                .as_ref()
+                .map(|contract| contract.required_capabilities.clone())
+                .unwrap_or_default(),
+            "required_evidence": external_contract
+                .as_ref()
+                .map(|contract| contract.required_evidence.clone())
+                .unwrap_or_default(),
+            "missing_capabilities": runtime_acceptance
+                .as_ref()
+                .map(|report| report.missing_capabilities.clone())
+                .unwrap_or_default(),
+            "missing_evidence": runtime_acceptance
+                .as_ref()
+                .map(|report| report.missing_evidence.clone())
+                .unwrap_or_default(),
+            "weak_evidence": runtime_acceptance
+                .as_ref()
+                .map(|report| report.weak_evidence.clone())
+                .unwrap_or_default(),
             "ok": ok,
             "primary_reason": eval_events::body_snippet(&primary_reason),
         }),
@@ -1540,6 +1576,12 @@ fn build_step_prompt(plan: &StepPlan, step: &PlanStep, context: &StepPromptConte
     prompt.push_str("\n\nRequired final artifacts:\n");
     append_bullets_or_none(&mut prompt, &context.required_final_artifacts);
 
+    prompt.push_str("\n\nRequired final capabilities:\n");
+    append_bullets_or_none(&mut prompt, &context.final_required_capabilities);
+
+    prompt.push_str("\n\nRequired final evidence:\n");
+    append_bullets_or_none(&mut prompt, &context.final_required_evidence);
+
     prompt.push_str("\n\nArtifacts available from previous steps:\n");
     append_bullets_or_none(&mut prompt, &context.prior_expected_paths);
 
@@ -1598,6 +1640,10 @@ fn emit_step_prompt_contract(
             "step_kind": step.kind,
             "has_overall_goal": prompt.contains("Overall goal:"),
             "has_required_final_artifacts": prompt.contains("Required final artifacts:"),
+            "has_required_final_capabilities": prompt.contains("Required final capabilities:"),
+            "has_required_final_evidence": prompt.contains("Required final evidence:"),
+            "required_final_capabilities": context.final_required_capabilities.clone(),
+            "required_final_evidence": context.final_required_evidence.clone(),
             "has_expected_paths": prompt.contains("Expected paths after this step:"),
             "has_verify_commands": prompt.contains("Verification commands for this step:"),
             "has_expected_result": prompt.contains("Expected verification result:"),
@@ -1962,6 +2008,8 @@ mod tests {
         let context = StepPromptContext {
             required_final_artifacts: vec!["src/app/page.tsx".to_string()],
             prior_expected_paths: vec!["package.json".to_string()],
+            final_required_capabilities: vec!["player_control".to_string()],
+            final_required_evidence: vec!["interactive_ui_source_evidence".to_string()],
         };
         let prompt = build_step_prompt(&plan, &plan.steps[0], &context);
         assert!(prompt.contains("Overall goal:"));
@@ -1970,6 +2018,10 @@ mod tests {
         assert!(prompt.contains("create-page"));
         assert!(prompt.contains("Verification commands for this step:"));
         assert!(prompt.contains("npm run build"));
+        assert!(prompt.contains("Required final capabilities:"));
+        assert!(prompt.contains("player_control"));
+        assert!(prompt.contains("Required final evidence:"));
+        assert!(prompt.contains("interactive_ui_source_evidence"));
         assert!(prompt.contains("Expected verification result:"));
         assert!(prompt.contains("Artifacts available from previous steps:"));
         assert!(prompt.contains("bounded step-local repair"));
@@ -2199,7 +2251,7 @@ mod tests {
                 .map(|_| AssistantReply::text(step_json.clone()))
                 .collect(),
         );
-        let good_package = r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let good_package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
         let bad_package =
             r#"{"dependencies":{},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
         let mut execution = FakeClient::new(vec![
@@ -2468,6 +2520,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("plan final contract failed"));
+    }
+
+    #[test]
+    fn plan_run_external_completion_contract_checks_required_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["date-helper.js"],"verify_commands":["node date-helper.js"],"required_capabilities":["implementation","deterministic_test"]}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let plan = StepPlan {
+            goal: "Create date helper".to_string(),
+            steps: vec![PlanStep {
+                id: "code".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create date-helper.js".to_string(),
+                expected_paths: vec!["date-helper.js".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"date-helper.js","content":"exports.formatDate = (d) => String(d);"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plan final contract failed"));
+        assert!(err.contains("missing_required_evidence"));
     }
 
     #[test]
