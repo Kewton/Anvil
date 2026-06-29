@@ -179,6 +179,51 @@ pub fn guidance(goal: &str) -> String {
     )
 }
 
+pub fn runtime_contract(intent: &str, goal: &str) -> String {
+    let port = if goal.contains("3011") {
+        "\n- If a 3011 port requirement exists, keep scripts.dev as next dev -p 3011 or next dev --port 3011."
+    } else {
+        ""
+    };
+    match intent {
+        "create" => format!(
+            "- Preserve the workspace as a real Next.js app.\n\
+- Keep next/react/react-dom dependencies in package.json.\n\
+- Keep scripts.build as next build; do not replace it with echo/skip/no-op commands.\n\
+- If npm run build cannot run because dependencies are not installed, report dependency_missing or use an explicit setup step; do not fake success.\
+{port}\n\
+- If using Tailwind utility classes or @tailwind directives, keep the Tailwind toolchain complete. Otherwise use plain CSS.\n\
+- Keep TypeScript and app router configuration coherent.\n\
+- Do not treat scaffold-only, package-only, or build-only output as complete."
+        ),
+        "fix" => format!(
+            "- Preserve the existing Next.js app structure.\n\
+- Keep next/react/react-dom dependencies when already present.\n\
+- Keep scripts.build as next build when already present; do not weaken build/test scripts to hide failures.\n\
+- If npm run build cannot run because dependencies are missing, report dependency_missing or use the existing dependency workflow.\
+{port}\n\
+- Keep TypeScript and app router configuration coherent.\n\
+- Do not treat scaffold-only, package-only, or build-only output as complete."
+        ),
+        "research" | "investigate" => {
+            "- Preserve the existing Next.js app unchanged unless the phase explicitly asks for fixes.\n\
+- Produce concrete findings from inspected files and commands.\n\
+- Separate observed facts from hypotheses.\n\
+- Do not weaken package scripts or test/build checks while investigating."
+                .to_string()
+        }
+        _ => format!(
+            "- Preserve the workspace as a Next.js app when one exists.\n\
+- Do not convert package.json to a standalone TypeScript/Node project.\n\
+- Keep next/react/react-dom dependencies when already present.\n\
+- Keep scripts.build as next build when already present.\
+{port}\n\
+- Keep styling and TypeScript toolchains internally consistent.\n\
+- Do not treat scaffold-only, package-only, or build-only output as complete."
+        ),
+    }
+}
+
 pub fn expected_paths(root: &Path, goal: &str) -> Vec<String> {
     let prefix = existing_project_prefix(root);
     let mut paths = vec![format!("{prefix}package.json")];

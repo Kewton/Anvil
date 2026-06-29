@@ -81,6 +81,31 @@ pub fn profile_guidance(profile: &str, goal: &str) -> Option<String> {
     }
 }
 
+pub fn profile_runtime_contract(profile: &str, intent: &str, goal: &str) -> String {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::runtime_contract(intent, goal)
+        }
+        "rust" => "- Preserve Cargo.toml and crate entrypoints.\n\
+- Prefer cargo check or cargo test for deterministic verification.\n\
+- Do not weaken tests or public behavior to hide failures."
+            .to_string(),
+        "python" => "- Preserve the existing Python package/import layout.\n\
+- Keep dependency setup separate from deterministic verification.\n\
+- Prefer pytest, unittest, or python -m py_compile checks after source files exist."
+            .to_string(),
+        "docs" | "documentation" => "- Produce or update documentation artifacts.\n\
+- Keep claims grounded in inspected files.\n\
+- Avoid source-code changes unless the phase explicitly requires them."
+            .to_string(),
+        "data" | "data-analysis" | "data-pipeline" => "- Preserve raw input data.\n\
+- Write derived outputs to explicit output artifacts.\n\
+- Use deterministic checks for generated files when practical."
+            .to_string(),
+        _ => "- Keep changes scoped to the current phase and workspace.".to_string(),
+    }
+}
+
 pub fn profile_generation_rules(profile: &str, intent: &str) -> Option<&'static str> {
     match profile {
         "nextjs" | "next-js" | "next.js" => {

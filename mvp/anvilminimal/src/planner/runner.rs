@@ -7,7 +7,7 @@ use crate::minimal_loop::completion::CompletionContract;
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::evidence::verify_runtime_acceptance;
 use crate::minimal_loop::loop_run::{
-    RunSessionOptions, RunSessionStepKind, extract_requested_artifact_paths,
+    RunSessionOptions, RunSessionOutcome, RunSessionStepKind, extract_requested_artifact_paths,
     run_session_with_outcome_with_options,
 };
 use crate::minimal_loop::repair_target::{classify_repair_target, repair_target_followed};
@@ -19,8 +19,8 @@ use crate::planner::lint::{
 use crate::planner::profile::{
     PhaseVerificationMode, profile_auto_repair, profile_before_phase, profile_expected_paths,
     profile_generation_rules, profile_guidance, profile_post_step_repair,
-    profile_quality_expectations, profile_repair_prompt, verify_profile_final,
-    verify_profile_invariant,
+    profile_quality_expectations, profile_repair_prompt, profile_runtime_contract,
+    verify_profile_final, verify_profile_invariant,
 };
 use crate::planner::repair::{
     RecoveryHandoff, RepairContext, build_repair_prompt_with_context,
@@ -1606,6 +1606,85 @@ pub fn run_ultra_plan_with_ui(
                     &profile_report,
                 )?
             {
+                let expected_paths =
+                    profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+                let continuation_prompt = profile_auto_repair_continuation_prompt(
+                    plan,
+                    phase,
+                    &profile_report,
+                    &ultra_context,
+                    &expected_paths,
+                );
+                let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "profile_auto_repair_continuation_start",
+                        "phase_id": phase.id,
+                        "shared_execution_session": true,
+                        "bounded_repair": true,
+                        "max_iterations": repair_config.max_iterations,
+                        "expected_path_count": expected_paths.len(),
+                    }),
+                );
+                let continuation_outcome = run_session_with_outcome_with_options(
+                    execution,
+                    &mut ultra_session,
+                    &continuation_prompt,
+                    &expected_paths,
+                    &repair_config,
+                    ui,
+                    RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+                )
+                .map_err(|err| {
+                    let message = err.to_string();
+                    let handoff = save_ultra_phase_recovery_handoff(
+                        config,
+                        plan,
+                        phase,
+                        "profile_auto_repair_continuation_failed",
+                        &message,
+                        &missing_final_artifacts(&config.workspace_root, &final_expected_paths),
+                        &["profile_contract".to_string()],
+                    )
+                    .unwrap_or_default();
+                    anyhow::anyhow!(
+                        "phase {} profile auto repair continuation failed: {message}{handoff}",
+                        phase.id
+                    )
+                })?;
+                push_context_items_capped(
+                    &mut ultra_context.created_or_changed_paths,
+                    &continuation_outcome.changed_paths,
+                    ULTRA_CONTEXT_MAX_PATHS,
+                    &mut ultra_context.truncated,
+                );
+                push_context_items_capped(
+                    &mut ultra_context.last_repair_changed_paths,
+                    &continuation_outcome.changed_paths,
+                    ULTRA_CONTEXT_MAX_PATHS,
+                    &mut ultra_context.truncated,
+                );
+                emit_ultra_phase_context_updated(
+                    config,
+                    plan,
+                    phase,
+                    index,
+                    &ultra_context,
+                    ultra_session.messages.len(),
+                    true,
+                );
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "profile_auto_repair_continuation_complete",
+                        "phase_id": phase.id,
+                        "shared_execution_session": true,
+                        "changed_path_count": continuation_outcome.changed_paths.len(),
+                        "iterations": continuation_outcome.iterations,
+                        "tool_calls": continuation_outcome.tool_calls,
+                    }),
+                );
                 let retry = verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
                 if retry.is_pass() {
                     emit_ultra_phase_event(
@@ -1643,20 +1722,61 @@ pub fn run_ultra_plan_with_ui(
             {
                 let expected_paths =
                     profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
-                let mut repair_session = SessionSnapshot::new();
                 let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
-                run_session_with_outcome_with_options(
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "profile_repair_start",
+                        "phase_id": phase.id,
+                        "shared_execution_session": true,
+                        "bounded_repair": true,
+                        "max_iterations": repair_config.max_iterations,
+                        "session_message_count": ultra_session.messages.len(),
+                    }),
+                );
+                let repair_outcome = run_profile_repair_with_ultra_session(
                     execution,
-                    &mut repair_session,
+                    &mut ultra_session,
                     &repair_prompt,
                     &expected_paths,
                     &repair_config,
                     ui,
-                    RunSessionOptions::plan_step(RunSessionStepKind::Implement),
                 )
                 .map_err(|err| {
                     anyhow::anyhow!("phase {} profile repair failed: {err}", phase.id)
                 })?;
+                push_context_items_capped(
+                    &mut ultra_context.created_or_changed_paths,
+                    &repair_outcome.changed_paths,
+                    ULTRA_CONTEXT_MAX_PATHS,
+                    &mut ultra_context.truncated,
+                );
+                push_context_items_capped(
+                    &mut ultra_context.last_repair_changed_paths,
+                    &repair_outcome.changed_paths,
+                    ULTRA_CONTEXT_MAX_PATHS,
+                    &mut ultra_context.truncated,
+                );
+                emit_ultra_phase_context_updated(
+                    config,
+                    plan,
+                    phase,
+                    index,
+                    &ultra_context,
+                    ultra_session.messages.len(),
+                    true,
+                );
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "profile_repair_complete",
+                        "phase_id": phase.id,
+                        "shared_execution_session": true,
+                        "changed_path_count": repair_outcome.changed_paths.len(),
+                        "iterations": repair_outcome.iterations,
+                        "tool_calls": repair_outcome.tool_calls,
+                    }),
+                );
                 let retry = verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
                 if retry.is_pass() {
                     emit_ultra_phase_event(
@@ -3074,6 +3194,7 @@ fn ultra_phase_prompt(
     let expected_paths = profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
     let expectations =
         profile_quality_expectations(&config.workspace_root, &plan.profile, &plan.goal);
+    let runtime_contract = profile_runtime_contract(&plan.profile, &plan.intent, &plan.goal);
     let required = if expected_paths.is_empty() {
         String::new()
     } else {
@@ -3099,7 +3220,7 @@ fn ultra_phase_prompt(
     let workspace_snapshot = compact_workspace_snapshot(&config.workspace_root);
     let prior_context = context.render_prompt_section();
     format!(
-        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\nProfile runtime contract:\n- keep work inside the workspace\n- satisfy required profile artifacts before final phase completion\n- use deterministic verification; preferred commands:\n{}\n{}",
+        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\nProfile runtime contract:\n{}\n\nDeterministic verification preference:\n{}\n{}",
         plan.goal,
         plan.profile,
         plan.style,
@@ -3108,8 +3229,68 @@ fn ultra_phase_prompt(
         phase.prompt,
         workspace_snapshot,
         prior_context,
+        runtime_contract,
         preferred_verify,
         required
+    )
+}
+
+fn profile_auto_repair_continuation_prompt(
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    failed_report: &VerificationReport,
+    context: &UltraRunContext,
+    expected_paths: &[String],
+) -> String {
+    let expected = if expected_paths.is_empty() {
+        "- none".to_string()
+    } else {
+        expected_paths
+            .iter()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "Continue the current ultra phase after deterministic profile repair.\n\n\
+Original ultra goal:\n{goal}\n\n\
+Profile: {profile}\nIntent: {intent}\nPhase id: {phase_id}\nPhase task:\n{phase_task}\n\n\
+Profile repair result:\n- deterministic profile repair may have materialized framework files\n- original profile failure: {failure}\n\n\
+Expected profile artifacts:\n{expected}\n\n\
+{prior_context}\n\n\
+Continuation rules:\n\
+- Treat the materialized profile files as a recovery scaffold only, not as task completion.\n\
+- Continue with task-specific implementation details from the original ultra goal and phase task.\n\
+- Prefer editing the real entrypoint or implementation files over adding metadata-only files.\n\
+- Keep this continuation bounded to one repair turn budget; do not start a new planning cycle.\n\
+- Run or preserve deterministic verification where practical, then stop.",
+        goal = plan.goal,
+        profile = plan.profile,
+        intent = plan.intent,
+        phase_id = phase.id,
+        phase_task = phase.prompt,
+        failure = failed_report.primary_reason(),
+        expected = expected,
+        prior_context = context.render_prompt_section(),
+    )
+}
+
+fn run_profile_repair_with_ultra_session(
+    execution: &mut dyn ChatClient,
+    ultra_session: &mut SessionSnapshot,
+    repair_prompt: &str,
+    expected_paths: &[String],
+    config: &Config,
+    ui: &dyn InteractionUi,
+) -> anyhow::Result<RunSessionOutcome> {
+    run_session_with_outcome_with_options(
+        execution,
+        ultra_session,
+        repair_prompt,
+        expected_paths,
+        config,
+        ui,
+        RunSessionOptions::plan_step(RunSessionStepKind::Implement),
     )
 }
 
@@ -3768,9 +3949,82 @@ mod tests {
         assert!(prompt.contains("Prior ultra context:"));
         assert!(prompt.contains("Pending final artifacts:"));
         assert!(prompt.contains("Profile runtime contract:"));
+        assert!(prompt.contains("Keep next/react/react-dom dependencies"));
+        assert!(prompt.contains("Do not treat scaffold-only"));
+        assert!(prompt.contains("Deterministic verification preference:"));
         assert!(prompt.contains("Required final artifacts:"));
         assert!(prompt.contains("- package.json"));
         assert!(prompt.contains("- src/app/page.tsx"));
+    }
+
+    #[test]
+    fn profile_auto_repair_continuation_prompt_treats_scaffold_as_incomplete() {
+        let plan = UltraPlan {
+            goal: "Create an interactive app".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![crate::planner::ultra_plan::UltraPhase {
+                id: "finish".to_string(),
+                prompt: "Finish the app".to_string(),
+            }],
+        };
+        let phase = plan.phases[0].clone();
+        let mut context = UltraRunContext::new(vec!["src/app/page.tsx".to_string()]);
+        context.last_failed_phase = Some("finish".to_string());
+        let prompt = profile_auto_repair_continuation_prompt(
+            &plan,
+            &phase,
+            &VerificationReport::missing_path("src/app/page.tsx"),
+            &context,
+            &["package.json".to_string(), "src/app/page.tsx".to_string()],
+        );
+        assert!(prompt.contains("recovery scaffold only, not as task completion"));
+        assert!(prompt.contains("task-specific implementation details"));
+        assert!(prompt.contains("one repair turn budget"));
+        assert!(prompt.contains("Pending final artifacts"));
+    }
+
+    #[test]
+    fn profile_repair_uses_existing_ultra_session_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = SessionSnapshot::new();
+        session.messages.push(ConversationMessage::user(
+            "Prior phase created package.json".to_string(),
+        ));
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"repair.txt","content":"fixed"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("done"),
+        ]);
+        let outcome = run_profile_repair_with_ultra_session(
+            &mut fake,
+            &mut session,
+            "Create repair.txt as a bounded profile repair.",
+            &["repair.txt".to_string()],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert!(dir.path().join("repair.txt").is_file());
+        assert!(outcome.changed_paths.contains(&"repair.txt".to_string()));
+        let first_request = fake
+            .messages
+            .first()
+            .expect("profile repair request")
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(first_request.contains("Prior phase created package.json"));
+        assert!(first_request.contains("Create repair.txt as a bounded profile repair."));
     }
 
     #[test]
@@ -3818,7 +4072,20 @@ mod tests {
                 prompt_tokens: None,
                 completion_tokens: None,
             },
-            AssistantReply::text("done"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Edit",
+                    serde_json::json!({
+                        "path":"src/app/page.tsx",
+                        "old":"Space Invaders",
+                        "new":"Space Invaders with keyboard controls, score, waves, and collisions"
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("continuation complete"),
         ]);
         let plan = UltraPlan {
             goal: "3011 port app".to_string(),
@@ -3845,6 +4112,24 @@ mod tests {
         .unwrap();
         assert_eq!(result, "ultra-plan-run complete: 2 phases");
         assert!(dir.path().join("src/app/page.tsx").is_file());
+        let prompts = execution
+            .messages
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("recovery scaffold only, not as task completion")),
+            "{prompts:#?}"
+        );
+        assert_eq!(execution.messages.len(), 4);
     }
 
     #[test]
