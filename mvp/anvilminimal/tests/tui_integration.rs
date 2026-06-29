@@ -43,11 +43,16 @@ fn config(root: PathBuf) -> Config {
 struct FakeClient {
     label: &'static str,
     replies: Vec<AssistantReply>,
+    requests: Vec<Vec<ConversationMessage>>,
 }
 
 impl FakeClient {
     fn new(label: &'static str, replies: Vec<AssistantReply>) -> Self {
-        Self { label, replies }
+        Self {
+            label,
+            replies,
+            requests: Vec::new(),
+        }
     }
 }
 
@@ -63,10 +68,11 @@ impl ChatClient for FakeClient {
     fn chat(
         &mut self,
         _model: &str,
-        _messages: &[ConversationMessage],
+        messages: &[ConversationMessage],
         _tools: &[ToolSpec],
         _native_tools_enabled: bool,
     ) -> anyhow::Result<AssistantReply> {
+        self.requests.push(messages.to_vec());
         Ok(self.replies.remove(0))
     }
 }
@@ -267,6 +273,15 @@ fn tui_ultra_plan_run_smoke_fake_clients() {
     )
     .unwrap();
     assert_eq!(result, "ultra-plan-run complete: 2 phases");
+    assert_eq!(planner.requests.len(), 2);
+    assert_eq!(planner.requests[0].len(), planner.requests[1].len());
+    assert_eq!(execution.requests.len(), 2);
+    assert!(
+        execution.requests[1].len() > execution.requests[0].len(),
+        "phase 2 execution should reuse the ultra execution session"
+    );
+    let second_request = format!("{:?}", execution.requests[1]);
+    assert!(second_request.contains("phase1"));
 }
 
 #[test]

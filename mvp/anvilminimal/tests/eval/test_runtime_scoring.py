@@ -227,6 +227,77 @@ class RuntimeScoringTest(unittest.TestCase):
         self.assertEqual(score["phase_scaffold_success_score"], 100.0)
         self.assertEqual(score["phase_failure_stage"], "lint")
 
+    def test_ultra_context_continuity_scores_shared_session_events(self):
+        events = [
+            {
+                "event": "ultra_context_initialized",
+                "total_phases": 2,
+                "shared_execution_session": True,
+                "session_message_count": 0,
+                "pending_final_artifacts_count": 2,
+            },
+            {
+                "event": "ultra_phase_context_attached",
+                "phase_id": "scaffold",
+                "phase_index": 1,
+                "total_phases": 2,
+                "shared_execution_session": True,
+                "session_message_count": 0,
+                "has_previous_context": False,
+                "changed_path_count": 0,
+                "unresolved_repair_target_count": 0,
+            },
+            {
+                "event": "ultra_phase_context_updated",
+                "phase_id": "scaffold",
+                "phase_index": 1,
+                "total_phases": 2,
+                "shared_execution_session": True,
+                "session_message_count": 4,
+                "changed_path_count": 2,
+                "recent_verify_failure_count": 0,
+                "unresolved_repair_target_count": 0,
+                "partial_outcome_recorded": False,
+            },
+            {
+                "event": "ultra_phase_context_attached",
+                "phase_id": "finish",
+                "phase_index": 2,
+                "total_phases": 2,
+                "shared_execution_session": True,
+                "session_message_count": 4,
+                "has_previous_context": True,
+                "changed_path_count": 2,
+                "unresolved_repair_target_count": 0,
+            },
+            {
+                "event": "ultra_phase_context_updated",
+                "phase_id": "finish",
+                "phase_index": 2,
+                "total_phases": 2,
+                "shared_execution_session": True,
+                "session_message_count": 8,
+                "changed_path_count": 3,
+                "recent_verify_failure_count": 1,
+                "unresolved_repair_target_count": 1,
+                "partial_outcome_recorded": True,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="ultra-plan-run",
+                success=False,
+                scenario={"expected_artifacts": []},
+                workdir=Path(td),
+            )
+        self.assertEqual(score["ultra_context_continuity_score"], 100.0)
+        self.assertEqual(score["ultra_shared_session_observed"], 100.0)
+        self.assertEqual(score["ultra_context_attached_after_first_phase"], 100.0)
+        self.assertEqual(score["ultra_context_bounded"], 100.0)
+        self.assertEqual(score["ultra_session_message_growth_observed"], 100.0)
+        self.assertEqual(score["ultra_partial_outcome_recorded"], 100.0)
+
     def test_ultra_runtime_scores_successful_build_repair(self):
         events = [
             {"event": "ultra_phase_start", "phase_id": "final", "total_phases": 1},

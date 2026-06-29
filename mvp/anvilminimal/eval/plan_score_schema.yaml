@@ -147,6 +147,12 @@ summary_eval_tsv_header:
   - build_repair_effectiveness_score
   - compile_diagnostic_progress_score
   - verify_repair_edit_score
+  - ultra_context_continuity_score
+  - ultra_shared_session_observed
+  - ultra_context_attached_after_first_phase
+  - ultra_context_bounded
+  - ultra_session_message_growth_observed
+  - ultra_partial_outcome_recorded
   - ultra_runtime_health_score
   - stability_score
   - ultra_phase_quality_score

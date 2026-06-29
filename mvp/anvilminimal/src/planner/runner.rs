@@ -258,24 +258,289 @@ pub fn run_step_plan_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<String> {
-    run_step_plan_with_ui_inner(client, plan, config, ui, true)
+    let mut session = SessionSnapshot::new();
+    run_step_plan_with_session_with_ui(client, &mut session, plan, config, ui, true)
+        .map(|outcome| outcome.summary)
+        .map_err(|err| anyhow::anyhow!("{}", err.message))
 }
 
-fn run_step_plan_with_ui_inner(
+#[derive(Debug, Clone, Default)]
+struct StepPlanRunOutcome {
+    summary: String,
+    completed_steps: usize,
+    total_steps: usize,
+    changed_paths: Vec<String>,
+    verify_failures: Vec<String>,
+    primary_failure: Option<String>,
+    repair_targets: Vec<String>,
+    command_failures: Vec<String>,
+    repair_attempts: usize,
+    repair_changed_paths: Vec<String>,
+    stop_reason: Option<String>,
+    partial: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UltraRunContext {
+    completed_phases: Vec<String>,
+    created_or_changed_paths: Vec<String>,
+    last_failed_phase: Option<String>,
+    last_verify_failures: Vec<String>,
+    last_repair_changed_paths: Vec<String>,
+    pending_final_artifacts: Vec<String>,
+    unresolved_repair_targets: Vec<String>,
+    truncated: bool,
+}
+
+const ULTRA_CONTEXT_MAX_PHASES: usize = 12;
+const ULTRA_CONTEXT_MAX_PATHS: usize = 24;
+const ULTRA_CONTEXT_MAX_MESSAGES: usize = 10;
+
+impl UltraRunContext {
+    fn new(pending_final_artifacts: Vec<String>) -> Self {
+        Self {
+            pending_final_artifacts,
+            ..Self::default()
+        }
+    }
+
+    fn update_after_phase(
+        &mut self,
+        phase: &UltraPhase,
+        outcome: &StepPlanRunOutcome,
+        pending_final_artifacts: Vec<String>,
+    ) {
+        self.last_failed_phase = None;
+        self.pending_final_artifacts = pending_final_artifacts;
+        push_context_unique_capped(
+            &mut self.completed_phases,
+            format!(
+                "{} ({}/{})",
+                phase.id, outcome.completed_steps, outcome.total_steps
+            ),
+            ULTRA_CONTEXT_MAX_PHASES,
+            &mut self.truncated,
+        );
+        push_context_items_capped(
+            &mut self.created_or_changed_paths,
+            &outcome.changed_paths,
+            ULTRA_CONTEXT_MAX_PATHS,
+            &mut self.truncated,
+        );
+        self.last_verify_failures.clear();
+        push_context_items_capped(
+            &mut self.last_repair_changed_paths,
+            &outcome.repair_changed_paths,
+            ULTRA_CONTEXT_MAX_PATHS,
+            &mut self.truncated,
+        );
+        self.unresolved_repair_targets.clear();
+        push_context_items_capped(
+            &mut self.unresolved_repair_targets,
+            &outcome.repair_targets,
+            ULTRA_CONTEXT_MAX_MESSAGES,
+            &mut self.truncated,
+        );
+    }
+
+    fn update_after_failure(
+        &mut self,
+        phase: &UltraPhase,
+        outcome: &StepPlanRunOutcome,
+        pending_final_artifacts: Vec<String>,
+    ) {
+        self.last_failed_phase = Some(phase.id.clone());
+        self.pending_final_artifacts = pending_final_artifacts;
+        push_context_items_capped(
+            &mut self.created_or_changed_paths,
+            &outcome.changed_paths,
+            ULTRA_CONTEXT_MAX_PATHS,
+            &mut self.truncated,
+        );
+        push_context_items_capped(
+            &mut self.last_verify_failures,
+            &outcome.verify_failures,
+            ULTRA_CONTEXT_MAX_MESSAGES,
+            &mut self.truncated,
+        );
+        if let Some(primary) = &outcome.primary_failure {
+            push_context_unique_capped(
+                &mut self.last_verify_failures,
+                primary.clone(),
+                ULTRA_CONTEXT_MAX_MESSAGES,
+                &mut self.truncated,
+            );
+        }
+        push_context_items_capped(
+            &mut self.last_repair_changed_paths,
+            &outcome.repair_changed_paths,
+            ULTRA_CONTEXT_MAX_PATHS,
+            &mut self.truncated,
+        );
+        push_context_items_capped(
+            &mut self.unresolved_repair_targets,
+            &outcome.repair_targets,
+            ULTRA_CONTEXT_MAX_MESSAGES,
+            &mut self.truncated,
+        );
+    }
+
+    fn update_after_profile_failure(
+        &mut self,
+        phase: &UltraPhase,
+        reason: &str,
+        pending_final_artifacts: Vec<String>,
+    ) {
+        self.last_failed_phase = Some(phase.id.clone());
+        self.pending_final_artifacts = pending_final_artifacts;
+        push_context_unique_capped(
+            &mut self.last_verify_failures,
+            eval_events::body_snippet(reason),
+            ULTRA_CONTEXT_MAX_MESSAGES,
+            &mut self.truncated,
+        );
+        push_context_unique_capped(
+            &mut self.unresolved_repair_targets,
+            "profile_contract".to_string(),
+            ULTRA_CONTEXT_MAX_MESSAGES,
+            &mut self.truncated,
+        );
+    }
+
+    fn render_prompt_section(&self) -> String {
+        if self.completed_phases.is_empty()
+            && self.created_or_changed_paths.is_empty()
+            && self.last_failed_phase.is_none()
+            && self.pending_final_artifacts.is_empty()
+        {
+            return "Prior ultra context:\n- none yet".to_string();
+        }
+        let mut lines = vec!["Prior ultra context:".to_string()];
+        append_context_list(&mut lines, "Completed phases", &self.completed_phases);
+        append_context_list(
+            &mut lines,
+            "Created or changed paths",
+            &self.created_or_changed_paths,
+        );
+        if let Some(phase) = &self.last_failed_phase {
+            lines.push(format!("- Last failed phase: {phase}"));
+        }
+        append_context_list(
+            &mut lines,
+            "Recent verify failures",
+            &self.last_verify_failures,
+        );
+        append_context_list(
+            &mut lines,
+            "Recent repair changed paths",
+            &self.last_repair_changed_paths,
+        );
+        append_context_list(
+            &mut lines,
+            "Pending final artifacts",
+            &self.pending_final_artifacts,
+        );
+        append_context_list(
+            &mut lines,
+            "Unresolved repair targets",
+            &self.unresolved_repair_targets,
+        );
+        if self.truncated {
+            lines.push("- Context was truncated to bounded path/failure summaries".to_string());
+        }
+        lines.join("\n")
+    }
+}
+
+impl StepPlanRunOutcome {
+    fn for_plan(plan: &StepPlan) -> Self {
+        Self {
+            total_steps: plan.steps.len(),
+            summary: format!("plan-run complete: {} steps", plan.steps.len()),
+            ..Self::default()
+        }
+    }
+
+    fn merge_step(&mut self, step: &StepRunOutcome) {
+        merge_unique_strings(&mut self.changed_paths, &step.changed_paths);
+        merge_unique_strings(&mut self.verify_failures, &step.verify_failures);
+        merge_unique_strings(&mut self.repair_targets, &step.repair_targets);
+        merge_unique_strings(&mut self.command_failures, &step.command_failures);
+        merge_unique_strings(&mut self.repair_changed_paths, &step.repair_changed_paths);
+        self.repair_attempts += step.repair_attempts;
+        if let Some(primary) = &step.primary_failure {
+            self.primary_failure = Some(primary.clone());
+        }
+        if let Some(stop) = &step.stop_reason {
+            self.stop_reason = Some(stop.clone());
+        }
+        self.partial |= step.partial;
+    }
+
+    fn mark_failure(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.primary_failure = Some(message.clone());
+        self.stop_reason = Some(message);
+        self.partial = true;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StepRunOutcome {
+    changed_paths: Vec<String>,
+    verify_failures: Vec<String>,
+    primary_failure: Option<String>,
+    repair_targets: Vec<String>,
+    command_failures: Vec<String>,
+    repair_attempts: usize,
+    repair_changed_paths: Vec<String>,
+    stop_reason: Option<String>,
+    partial: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StepRunError {
+    message: String,
+    outcome: StepRunOutcome,
+}
+
+#[derive(Debug, Clone)]
+struct StepPlanRunError {
+    message: String,
+    partial_outcome: StepPlanRunOutcome,
+}
+
+impl StepPlanRunError {
+    fn from_error(message: impl Into<String>, mut partial_outcome: StepPlanRunOutcome) -> Self {
+        let message = message.into();
+        partial_outcome.mark_failure(message.clone());
+        Self {
+            message,
+            partial_outcome,
+        }
+    }
+}
+
+fn run_step_plan_with_session_with_ui(
     client: &mut dyn ChatClient,
+    session: &mut SessionSnapshot,
     plan: &StepPlan,
     config: &Config,
     ui: &dyn InteractionUi,
     verify_final_contract: bool,
-) -> anyhow::Result<String> {
+) -> Result<StepPlanRunOutcome, StepPlanRunError> {
+    let mut outcome = StepPlanRunOutcome::for_plan(plan);
     let report = lint_step_plan_report(plan);
     if !report.is_pass() {
         emit_planner_error_for_lint(config, "plan-file", &config.planner_model, &report, 0);
-        anyhow::bail!("{}", report.primary_message());
+        return Err(StepPlanRunError::from_error(
+            report.primary_message(),
+            outcome,
+        ));
     }
-    let mut session = SessionSnapshot::new();
     let required_final_artifacts = required_final_artifacts(plan, &config.workspace_root);
-    let external_contract = CompletionContract::load_for_config(config)?;
+    let external_contract = CompletionContract::load_for_config(config)
+        .map_err(|err| StepPlanRunError::from_error(err.to_string(), outcome.clone()))?;
     let final_required_capabilities = external_contract
         .as_ref()
         .map(|contract| contract.required_capabilities.clone())
@@ -287,7 +552,7 @@ fn run_step_plan_with_ui_inner(
     let mut prior_expected_paths = Vec::new();
     for step in &plan.steps {
         if ui.interrupted() {
-            anyhow::bail!("interrupted by user");
+            return Err(StepPlanRunError::from_error("interrupted by user", outcome));
         }
         let prompt_context = StepPromptContext {
             required_final_artifacts: required_final_artifacts.clone(),
@@ -295,21 +560,25 @@ fn run_step_plan_with_ui_inner(
             final_required_capabilities: final_required_capabilities.clone(),
             final_required_evidence: final_required_evidence.clone(),
         };
-        run_step(
-            client,
-            &mut session,
-            plan,
-            step,
-            &prompt_context,
-            config,
-            ui,
-        )?;
+        match run_step(client, session, plan, step, &prompt_context, config, ui) {
+            Ok(step_outcome) => {
+                outcome.completed_steps += 1;
+                outcome.merge_step(&step_outcome);
+            }
+            Err(err) => {
+                outcome.merge_step(&err.outcome);
+                return Err(StepPlanRunError::from_error(err.message, outcome));
+            }
+        }
         merge_unique_strings(&mut prior_expected_paths, &step.expected_paths);
     }
     if verify_final_contract {
-        verify_plan_final_contract(plan, &required_final_artifacts, config)?;
+        if let Err(err) = verify_plan_final_contract(plan, &required_final_artifacts, config) {
+            return Err(StepPlanRunError::from_error(err.to_string(), outcome));
+        }
     }
-    Ok(format!("plan-run complete: {} steps", plan.steps.len()))
+    outcome.summary = format!("plan-run complete: {} steps", plan.steps.len());
+    Ok(outcome)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -328,14 +597,14 @@ fn run_step(
     prompt_context: &StepPromptContext,
     config: &Config,
     ui: &dyn InteractionUi,
-) -> anyhow::Result<()> {
+) -> Result<StepRunOutcome, StepRunError> {
     let instruction = build_step_prompt(plan, step, prompt_context);
     emit_step_prompt_contract(config, step, prompt_context, &instruction);
     if step.step_kind() == StepKind::Report
         && step.expected_paths.is_empty()
         && step.verify.is_empty()
     {
-        return Ok(());
+        return Ok(StepRunOutcome::default());
     }
     let step_config = capped_config(config, STEP_TURN_MAX_ITERATIONS);
     let step_options = step_run_session_options(step);
@@ -347,19 +616,49 @@ fn run_step(
         &step_config,
         ui,
         step_options,
-    )?;
-    let _ = profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal)?;
+    )
+    .map_err(|err| StepRunError {
+        message: err.to_string(),
+        outcome: StepRunOutcome {
+            primary_failure: Some(err.to_string()),
+            stop_reason: Some("initial_turn_error".to_string()),
+            partial: true,
+            ..StepRunOutcome::default()
+        },
+    })?;
+    let mut outcome = StepRunOutcome {
+        changed_paths: initial.changed_paths.clone(),
+        stop_reason: Some(format!("{:?}", initial.stop_reason)),
+        ..StepRunOutcome::default()
+    };
+    if let Err(err) = profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal)
+    {
+        outcome.primary_failure = Some(err.to_string());
+        outcome.stop_reason = Some("profile_post_step_repair_error".to_string());
+        outcome.partial = true;
+        return Err(StepRunError {
+            message: err.to_string(),
+            outcome,
+        });
+    }
     let setup_authority = step_verify_setup_authority(plan, step);
     let report = verify_step_with_setup(&config.workspace_root, step, setup_authority);
     if report.is_pass() {
-        return Ok(());
+        return Ok(outcome);
     }
+    let first_target = classify_repair_target(&report).as_str().to_string();
+    outcome.primary_failure = Some(report.primary_reason());
+    outcome.verify_failures.push(report.primary_reason());
+    outcome.repair_targets.push(first_target.clone());
+    outcome
+        .command_failures
+        .extend(command_failure_summaries(&report));
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
             "event": "step_verify_failure",
             "step_id": step.id,
-            "repair_target": classify_repair_target(&report).as_str(),
+            "repair_target": first_target,
             "primary_reason": eval_events::body_snippet(&report.primary_reason()),
             "missing_paths": report.missing_paths.clone(),
             "command_failures": report.command_failures.len(),
@@ -397,20 +696,62 @@ fn run_step(
             &repair_config,
             ui,
             step_options,
-        )?;
+        )
+        .map_err(|err| {
+            outcome.primary_failure = Some(err.to_string());
+            outcome.stop_reason = Some("repair_turn_error".to_string());
+            outcome.repair_attempts = attempt;
+            outcome.partial = true;
+            StepRunError {
+                message: err.to_string(),
+                outcome: outcome.clone(),
+            }
+        })?;
+        outcome.repair_attempts = attempt;
         repair_stop_reason = Some(format!("{:?}", repair.stop_reason));
         merge_changed_files(&mut context, &repair.changed_paths);
+        merge_unique_strings(&mut outcome.changed_paths, &repair.changed_paths);
+        merge_unique_strings(&mut outcome.repair_changed_paths, &repair.changed_paths);
         if !repair.changed_paths.is_empty() {
             file_changing_repairs += 1;
         }
-        if profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal)? {
-            let package_path = "package.json".to_string();
-            merge_changed_files(&mut context, &[package_path]);
+        match profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal) {
+            Ok(true) => {
+                let package_path = "package.json".to_string();
+                merge_changed_files(&mut context, std::slice::from_ref(&package_path));
+                merge_unique_strings(
+                    &mut outcome.changed_paths,
+                    std::slice::from_ref(&package_path),
+                );
+                merge_unique_strings(&mut outcome.repair_changed_paths, &[package_path]);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                outcome.primary_failure = Some(err.to_string());
+                outcome.stop_reason = Some("profile_post_step_repair_error".to_string());
+                outcome.partial = true;
+                return Err(StepRunError {
+                    message: err.to_string(),
+                    outcome,
+                });
+            }
         }
         let retry = verify_step_with_setup(&config.workspace_root, step, setup_authority);
         let retry_target = classify_repair_target(&retry);
         let previous_target = classify_repair_target(&current_report);
         let repair_target_followed = repair_target_followed(previous_target, &repair.changed_paths);
+        merge_unique_strings(
+            &mut outcome.repair_targets,
+            &[retry_target.as_str().to_string()],
+        );
+        if !retry.is_pass() {
+            merge_unique_strings(&mut outcome.verify_failures, &[retry.primary_reason()]);
+            merge_unique_strings(
+                &mut outcome.command_failures,
+                &command_failure_summaries(&retry),
+            );
+            outcome.primary_failure = Some(retry.primary_reason());
+        }
         eval_events::emit(
             config.eval_events_path.as_deref(),
             json!({
@@ -428,7 +769,9 @@ fn run_step(
             }),
         );
         if retry.is_pass() {
-            return Ok(());
+            outcome.primary_failure = None;
+            outcome.stop_reason = repair_stop_reason.clone();
+            return Ok(outcome);
         }
         let next_missing = retry.missing_paths.len();
         if next_missing >= previous_missing {
@@ -448,12 +791,26 @@ fn run_step(
         }
     }
     context.repair_stop_reason = repair_stop_reason;
-    save_repair_report_with_context(&config.workspace_root, &step.id, &current_report, &context)?;
-    anyhow::bail!(
+    if let Err(err) =
+        save_repair_report_with_context(&config.workspace_root, &step.id, &current_report, &context)
+    {
+        outcome.primary_failure = Some(err.to_string());
+        outcome.stop_reason = Some("repair_report_save_error".to_string());
+        outcome.partial = true;
+        return Err(StepRunError {
+            message: err.to_string(),
+            outcome,
+        });
+    }
+    let message = format!(
         "step {} failed verification after bounded repair: {}",
         step.id,
         current_report.primary_reason()
-    )
+    );
+    outcome.primary_failure = Some(current_report.primary_reason());
+    outcome.stop_reason = Some("bounded_repair_exhausted".to_string());
+    outcome.partial = true;
+    Err(StepRunError { message, outcome })
 }
 
 fn step_verify_setup_authority(plan: &StepPlan, step: &PlanStep) -> NodeDependencySetupAuthority {
@@ -598,6 +955,57 @@ fn merge_unique_strings(out: &mut Vec<String>, incoming: &[String]) {
         if !out.contains(item) {
             out.push(item.clone());
         }
+    }
+}
+
+fn command_failure_summaries(report: &VerificationReport) -> Vec<String> {
+    report
+        .command_failures
+        .iter()
+        .map(|failure| {
+            format!(
+                "{}: {}",
+                failure.command,
+                eval_events::body_snippet(&failure.reason)
+            )
+        })
+        .collect()
+}
+
+fn push_context_items_capped(
+    out: &mut Vec<String>,
+    incoming: &[String],
+    cap: usize,
+    truncated: &mut bool,
+) {
+    for item in incoming {
+        push_context_unique_capped(out, item.clone(), cap, truncated);
+    }
+}
+
+fn push_context_unique_capped(
+    out: &mut Vec<String>,
+    item: String,
+    cap: usize,
+    truncated: &mut bool,
+) {
+    if out.contains(&item) {
+        return;
+    }
+    if out.len() >= cap {
+        *truncated = true;
+        return;
+    }
+    out.push(item);
+}
+
+fn append_context_list(lines: &mut Vec<String>, label: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    lines.push(format!("- {label}:"));
+    for value in values {
+        lines.push(format!("  - {value}"));
     }
 }
 
@@ -846,6 +1254,14 @@ pub fn run_ultra_plan_with_ui(
         emit_planner_error_for_lint(config, "ultra-plan-file", &config.planner_model, &report, 0);
         anyhow::bail!("{}", report.primary_message());
     }
+    let final_expected_paths =
+        profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+    let mut ultra_context = UltraRunContext::new(missing_final_artifacts(
+        &config.workspace_root,
+        &final_expected_paths,
+    ));
+    let mut ultra_session = SessionSnapshot::new();
+    emit_ultra_context_initialized(config, plan, &ultra_context, ultra_session.messages.len());
     for (index, phase) in plan.phases.iter().enumerate() {
         if ui.interrupted() {
             anyhow::bail!("interrupted by user");
@@ -862,7 +1278,15 @@ pub fn run_ultra_plan_with_ui(
             None,
         );
         let profile_snapshot = profile_before_phase(&config.workspace_root, &plan.profile)?;
-        let phase_prompt = ultra_phase_prompt(plan, phase, config);
+        emit_ultra_phase_context_attached(
+            config,
+            plan,
+            phase,
+            index,
+            &ultra_context,
+            ultra_session.messages.len(),
+        );
+        let phase_prompt = ultra_phase_prompt(plan, phase, config, &ultra_context);
         let step_plan =
             generate_step_plan_with_ui(planner, &phase_prompt, config, ui).map_err(|err| {
                 emit_ultra_phase_event(
@@ -911,22 +1335,59 @@ pub fn run_ultra_plan_with_ui(
         );
         save_step_plan(&config.workspace_root, &step_plan)?;
         let final_phase = index + 1 == plan.phases.len();
-        if let Err(err) =
-            run_step_plan_with_ui_inner(execution, &step_plan, config, ui, final_phase)
-        {
-            emit_ultra_phase_event(
-                config,
-                "ultra_phase_failed",
-                plan,
-                phase,
-                index,
-                "execute",
-                Some(false),
-                Some(&err.to_string()),
-                None,
-            );
-            return Err(anyhow::anyhow!("phase {} failed: {err}", phase.id));
-        }
+        let step_outcome = match run_step_plan_with_session_with_ui(
+            execution,
+            &mut ultra_session,
+            &step_plan,
+            config,
+            ui,
+            final_phase,
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let message = err.message.clone();
+                ultra_context.update_after_failure(
+                    phase,
+                    &err.partial_outcome,
+                    missing_final_artifacts(&config.workspace_root, &final_expected_paths),
+                );
+                emit_ultra_phase_context_updated(
+                    config,
+                    plan,
+                    phase,
+                    index,
+                    &ultra_context,
+                    ultra_session.messages.len(),
+                    true,
+                );
+                emit_ultra_phase_event(
+                    config,
+                    "ultra_phase_failed",
+                    plan,
+                    phase,
+                    index,
+                    "execute",
+                    Some(false),
+                    Some(&message),
+                    None,
+                );
+                return Err(anyhow::anyhow!("phase {} failed: {message}", phase.id));
+            }
+        };
+        ultra_context.update_after_phase(
+            phase,
+            &step_outcome,
+            missing_final_artifacts(&config.workspace_root, &final_expected_paths),
+        );
+        emit_ultra_phase_context_updated(
+            config,
+            plan,
+            phase,
+            index,
+            &ultra_context,
+            ultra_session.messages.len(),
+            step_outcome.partial,
+        );
         emit_ultra_phase_event(
             config,
             "ultra_phase_execute_complete",
@@ -941,6 +1402,20 @@ pub fn run_ultra_plan_with_ui(
         let snapshot_report =
             profile_after_phase(&config.workspace_root, &plan.profile, &profile_snapshot);
         if !snapshot_report.is_pass() {
+            ultra_context.update_after_profile_failure(
+                phase,
+                &snapshot_report.primary_reason(),
+                missing_final_artifacts(&config.workspace_root, &final_expected_paths),
+            );
+            emit_ultra_phase_context_updated(
+                config,
+                plan,
+                phase,
+                index,
+                &ultra_context,
+                ultra_session.messages.len(),
+                true,
+            );
             emit_ultra_phase_event(
                 config,
                 "ultra_phase_failed",
@@ -960,6 +1435,20 @@ pub fn run_ultra_plan_with_ui(
         }
         let profile_report = verify_profile(&config.workspace_root, &plan.profile, &plan.goal);
         if !profile_report.is_pass() {
+            ultra_context.update_after_profile_failure(
+                phase,
+                &profile_report.primary_reason(),
+                missing_final_artifacts(&config.workspace_root, &final_expected_paths),
+            );
+            emit_ultra_phase_context_updated(
+                config,
+                plan,
+                phase,
+                index,
+                &ultra_context,
+                ultra_session.messages.len(),
+                true,
+            );
             emit_ultra_phase_event(
                 config,
                 "ultra_phase_profile_check",
@@ -1150,6 +1639,85 @@ fn emit_ultra_phase_event(
             "ok": ok,
             "reason": reason.map(eval_events::body_snippet).unwrap_or_default(),
             "step_count": step_count,
+        }),
+    );
+}
+
+fn emit_ultra_context_initialized(
+    config: &Config,
+    plan: &UltraPlan,
+    context: &UltraRunContext,
+    session_message_count: usize,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_context_initialized",
+            "total_phases": plan.phases.len(),
+            "shared_execution_session": true,
+            "session_message_count": session_message_count,
+            "pending_final_artifacts_count": context.pending_final_artifacts.len(),
+            "context_truncated": context.truncated,
+        }),
+    );
+}
+
+fn emit_ultra_phase_context_attached(
+    config: &Config,
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    index: usize,
+    context: &UltraRunContext,
+    session_message_count: usize,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_phase_context_attached",
+            "phase_id": phase.id,
+            "phase_index": index + 1,
+            "total_phases": plan.phases.len(),
+            "shared_execution_session": true,
+            "session_message_count": session_message_count,
+            "completed_phase_count": context.completed_phases.len(),
+            "changed_path_count": context.created_or_changed_paths.len(),
+            "pending_final_artifacts_count": context.pending_final_artifacts.len(),
+            "unresolved_repair_target_count": context.unresolved_repair_targets.len(),
+            "has_previous_context": index > 0
+                && (!context.completed_phases.is_empty()
+                    || !context.created_or_changed_paths.is_empty()
+                    || context.last_failed_phase.is_some()),
+            "context_truncated": context.truncated,
+        }),
+    );
+}
+
+fn emit_ultra_phase_context_updated(
+    config: &Config,
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    index: usize,
+    context: &UltraRunContext,
+    session_message_count: usize,
+    partial_outcome_recorded: bool,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_phase_context_updated",
+            "phase_id": phase.id,
+            "phase_index": index + 1,
+            "total_phases": plan.phases.len(),
+            "shared_execution_session": true,
+            "session_message_count": session_message_count,
+            "completed_phase_count": context.completed_phases.len(),
+            "changed_path_count": context.created_or_changed_paths.len(),
+            "pending_final_artifacts_count": context.pending_final_artifacts.len(),
+            "recent_verify_failure_count": context.last_verify_failures.len(),
+            "recent_repair_changed_path_count": context.last_repair_changed_paths.len(),
+            "unresolved_repair_target_count": context.unresolved_repair_targets.len(),
+            "partial_outcome_recorded": partial_outcome_recorded,
+            "context_truncated": context.truncated,
         }),
     );
 }
@@ -2094,7 +2662,12 @@ fn prompt_with_required_paths(instruction: &str, paths: &[String]) -> String {
     )
 }
 
-fn ultra_phase_prompt(plan: &UltraPlan, phase: &UltraPhase, config: &Config) -> String {
+fn ultra_phase_prompt(
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    config: &Config,
+    context: &UltraRunContext,
+) -> String {
     let expected_paths = profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
     let expectations =
         profile_quality_expectations(&config.workspace_root, &plan.profile, &plan.goal);
@@ -2121,8 +2694,9 @@ fn ultra_phase_prompt(plan: &UltraPlan, phase: &UltraPhase, config: &Config) -> 
             .join("\n")
     };
     let workspace_snapshot = compact_workspace_snapshot(&config.workspace_root);
+    let prior_context = context.render_prompt_section();
     format!(
-        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\nProfile runtime contract:\n- keep work inside the workspace\n- satisfy required profile artifacts before final phase completion\n- use deterministic verification; preferred commands:\n{}\n{}",
+        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\nProfile runtime contract:\n- keep work inside the workspace\n- satisfy required profile artifacts before final phase completion\n- use deterministic verification; preferred commands:\n{}\n{}",
         plan.goal,
         plan.profile,
         plan.style,
@@ -2130,6 +2704,7 @@ fn ultra_phase_prompt(plan: &UltraPlan, phase: &UltraPhase, config: &Config) -> 
         phase.id,
         phase.prompt,
         workspace_snapshot,
+        prior_context,
         preferred_verify,
         required
     )
@@ -2781,11 +3356,14 @@ mod tests {
                 prompt: "Finish project".to_string(),
             },
             &config(dir.path().to_path_buf()),
+            &UltraRunContext::new(vec!["src/app/page.tsx".to_string()]),
         );
         assert!(prompt.contains("Original ultra goal: 3011 port app"));
         assert!(prompt.contains("Profile: nextjs"));
         assert!(prompt.contains("Phase id: finish"));
         assert!(prompt.contains("Workspace snapshot:"));
+        assert!(prompt.contains("Prior ultra context:"));
+        assert!(prompt.contains("Pending final artifacts:"));
         assert!(prompt.contains("Profile runtime contract:"));
         assert!(prompt.contains("Required final artifacts:"));
         assert!(prompt.contains("- package.json"));

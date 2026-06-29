@@ -451,6 +451,12 @@ def additional_plan_metric_rankings(rows: list[dict[str, str]]) -> list[str]:
         "build_repair_effectiveness_score",
         "compile_diagnostic_progress_score",
         "verify_repair_edit_score",
+        "ultra_context_continuity_score",
+        "ultra_shared_session_observed",
+        "ultra_context_attached_after_first_phase",
+        "ultra_context_bounded",
+        "ultra_session_message_growth_observed",
+        "ultra_partial_outcome_recorded",
         "ultra_runtime_health_score",
     ]
     lines = ["## Detailed Metric Diagnostics", ""]
@@ -1049,6 +1055,11 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             "ultra_runtime_health_score_avg",
             mean([to_float(r.get("ultra_runtime_health_score")) for r in base]),
             mean([to_float(r.get("ultra_runtime_health_score")) for r in exp]),
+        ),
+        (
+            "ultra_context_continuity_score_avg",
+            mean([to_float(r.get("ultra_context_continuity_score")) for r in base]),
+            mean([to_float(r.get("ultra_context_continuity_score")) for r in exp]),
         ),
         (
             "phase_completion_score_avg",

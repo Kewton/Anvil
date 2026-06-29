@@ -103,6 +103,9 @@ def score_runtime_health(
         "ultra_phase_profile_check",
         "ultra_phase_complete",
         "ultra_phase_failed",
+        "ultra_context_initialized",
+        "ultra_phase_context_attached",
+        "ultra_phase_context_updated",
         "ultra_plan_complete",
     }
     has_runtime_events = any(event.get("event") in runtime_event_names for event in events)
@@ -747,6 +750,7 @@ def score_ultra_runtime_health(
     phase_completion = score_phase_completion(events, success=success)
     phase_stage_scores = score_phase_stage_scores(events, success=success)
     build_scores = score_build_repair(events)
+    context_scores = score_ultra_context_continuity(events)
     available = [
         (0.20, phase_completion),
         (0.15, phase_stage_scores["phase_step_execution_score"]),
@@ -774,6 +778,7 @@ def score_ultra_runtime_health(
         "phase_completion_score": phase_completion,
         **phase_stage_scores,
         **build_scores,
+        **context_scores,
         "ultra_runtime_health_score": ultra_runtime,
     }
 
@@ -792,7 +797,73 @@ def empty_ultra_runtime_scores() -> dict[str, str]:
         "build_repair_effectiveness_score": "",
         "compile_diagnostic_progress_score": "",
         "verify_repair_edit_score": "",
+        "ultra_context_continuity_score": "",
+        "ultra_shared_session_observed": "",
+        "ultra_context_attached_after_first_phase": "",
+        "ultra_context_bounded": "",
+        "ultra_session_message_growth_observed": "",
+        "ultra_partial_outcome_recorded": "",
         "ultra_runtime_health_score": "",
+    }
+
+
+def score_ultra_context_continuity(events: list[dict[str, Any]]) -> dict[str, float | str]:
+    initialized = [
+        event for event in events if event.get("event") == "ultra_context_initialized"
+    ]
+    attached = [
+        event for event in events if event.get("event") == "ultra_phase_context_attached"
+    ]
+    updated = [
+        event for event in events if event.get("event") == "ultra_phase_context_updated"
+    ]
+    context_events = initialized + attached + updated
+    if not context_events:
+        return {
+            "ultra_context_continuity_score": "",
+            "ultra_shared_session_observed": "",
+            "ultra_context_attached_after_first_phase": "",
+            "ultra_context_bounded": "",
+            "ultra_session_message_growth_observed": "",
+            "ultra_partial_outcome_recorded": "",
+        }
+    shared_session = any(bool(event.get("shared_execution_session")) for event in context_events)
+    attached_after_first = any(
+        safe_int_event(event.get("phase_index")) > 1
+        and bool(event.get("has_previous_context"))
+        for event in attached
+    )
+    bounded = all(
+        safe_int_event(event.get("changed_path_count")) <= 24
+        and safe_int_event(event.get("recent_verify_failure_count")) <= 10
+        and safe_int_event(event.get("unresolved_repair_target_count")) <= 10
+        for event in updated
+    )
+    message_counts = [
+        safe_int_event(event.get("session_message_count"))
+        for event in context_events
+        if event.get("session_message_count") is not None
+    ]
+    message_growth = len(message_counts) >= 2 and max(message_counts) > min(message_counts)
+    partial_outcome = any(bool(event.get("partial_outcome_recorded")) for event in updated)
+    subscores = [
+        100.0 if shared_session else 0.0,
+        100.0 if attached_after_first or len(attached) <= 1 else 0.0,
+        100.0 if bounded else 0.0,
+        100.0 if message_growth or len(attached) <= 1 else 0.0,
+        100.0 if updated else 0.0,
+    ]
+    return {
+        "ultra_context_continuity_score": round(sum(subscores) / len(subscores), 1),
+        "ultra_shared_session_observed": 100.0 if shared_session else 0.0,
+        "ultra_context_attached_after_first_phase": 100.0
+        if attached_after_first or len(attached) <= 1
+        else 0.0,
+        "ultra_context_bounded": 100.0 if bounded else 0.0,
+        "ultra_session_message_growth_observed": 100.0
+        if message_growth or len(attached) <= 1
+        else 0.0,
+        "ultra_partial_outcome_recorded": 100.0 if partial_outcome else 0.0,
     }
 
 def score_phase_completion(events: list[dict[str, Any]], *, success: bool) -> float | str:
