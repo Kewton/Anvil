@@ -83,6 +83,69 @@ impl BuildVerifierLifecycleObservation {
             .map(|setup| setup.status.as_str())
             .unwrap_or("not_required")
     }
+
+    pub fn lifecycle_stages(&self) -> Vec<&'static str> {
+        let mut stages = vec!["dependency_check"];
+        if self.before_setup.status == BuildVerifierStatus::DependencyMissing
+            && self.requirement.requires_dependency_setup
+        {
+            match self.setup.as_ref().map(|setup| setup.status) {
+                Some(NodeDependencySetupStatus::Blocked) => stages.push("setup_blocked"),
+                Some(NodeDependencySetupStatus::Attempted) => stages.push("setup_attempted"),
+                Some(NodeDependencySetupStatus::Passed) => stages.push("setup_passed"),
+                Some(NodeDependencySetupStatus::Failed) => stages.push("setup_failed"),
+                Some(NodeDependencySetupStatus::TimedOut) => stages.push("setup_timed_out"),
+                Some(NodeDependencySetupStatus::NotRequired) => stages.push("setup_not_required"),
+                None => stages.push("setup_not_requested"),
+            }
+        }
+        if self.after_setup.is_some() {
+            stages.push("build_rerun");
+        }
+        stages.push(match self.final_status {
+            BuildVerifierStatus::Passed => "verification_passed",
+            BuildVerifierStatus::Failed => "verification_failed",
+            BuildVerifierStatus::Blocked => "verification_blocked",
+            BuildVerifierStatus::DependencyMissing => "verification_dependency_missing",
+            BuildVerifierStatus::PolicyRejected => "verification_policy_rejected",
+        });
+        stages
+    }
+}
+
+pub fn emit_dependency_build_lifecycle(
+    eval_events_path: Option<&Path>,
+    mode: &str,
+    step_id: Option<&str>,
+    lifecycle: &BuildVerifierLifecycleObservation,
+) {
+    eval_events::emit(
+        eval_events_path,
+        serde_json::json!({
+            "event": "dependency_build_lifecycle",
+            "mode": mode,
+            "step_id": step_id.unwrap_or(""),
+            "lifecycle_stage": "dependency_setup_build",
+            "lifecycle_stages": lifecycle.lifecycle_stages(),
+            "command": lifecycle.requirement.command,
+            "profile": lifecycle.requirement.profile,
+            "authority": lifecycle.requirement.authority,
+            "required_for_completion": lifecycle.requirement.required_for_completion,
+            "requires_dependency_setup": lifecycle.requirement.requires_dependency_setup,
+            "before_status": lifecycle.before_setup.status_str(),
+            "before_attempted": lifecycle.before_setup.attempted,
+            "setup_status": lifecycle.setup_status(),
+            "setup_attempted": lifecycle.setup.as_ref().is_some_and(|setup| setup.attempted),
+            "setup_authority": lifecycle.setup.as_ref().map(|setup| setup.authority.as_str()).unwrap_or("none"),
+            "setup_command": lifecycle.setup.as_ref().map(|setup| setup.command.as_str()).unwrap_or(""),
+            "setup_changed_paths": lifecycle.setup.as_ref().map(|setup| setup.changed_paths.clone()).unwrap_or_default(),
+            "after_status": lifecycle.after_setup.as_ref().map(BuildVerifierObservation::status_str).unwrap_or(""),
+            "after_attempted": lifecycle.after_setup.as_ref().is_some_and(|observation| observation.attempted),
+            "build_rerun_attempted": lifecycle.after_setup.as_ref().is_some_and(|observation| observation.attempted),
+            "final_status": lifecycle.final_status.as_str(),
+            "final_reason": eval_events::body_snippet(&lifecycle.final_reason),
+        }),
+    );
 }
 
 pub fn requirement_from_deferred(
@@ -183,6 +246,20 @@ pub fn observe_requirement_lifecycle(
     requirement: &BuildVerifierRequirement,
     setup_authority: NodeDependencySetupAuthority,
 ) -> BuildVerifierLifecycleObservation {
+    observe_requirement_lifecycle_with_setup_program(
+        root,
+        requirement,
+        setup_authority,
+        Path::new("npm"),
+    )
+}
+
+pub(crate) fn observe_requirement_lifecycle_with_setup_program(
+    root: &Path,
+    requirement: &BuildVerifierRequirement,
+    setup_authority: NodeDependencySetupAuthority,
+    npm_program: &Path,
+) -> BuildVerifierLifecycleObservation {
     let before_setup = observe_requirement(root, requirement);
     let mut setup = None;
     let mut after_setup = None;
@@ -197,7 +274,11 @@ pub fn observe_requirement_lifecycle(
             setup_authority,
         );
         let setup_observation = if setup_requirement.allowed {
-            dependency_setup::run_node_dependency_setup(root, &setup_requirement)
+            dependency_setup::run_node_dependency_setup_with_program(
+                root,
+                &setup_requirement,
+                npm_program,
+            )
         } else {
             NodeDependencySetupObservation::blocked(
                 setup_requirement.package_manager,
@@ -255,9 +336,19 @@ fn requires_dependency_setup(command: &str) -> bool {
 
 fn dependency_ready(root: &Path, command: &str) -> bool {
     if requires_next_binary(command) {
+        if requires_package_manifest(command) && !root.join("package.json").is_file() {
+            return false;
+        }
         return root.join("node_modules/.bin/next").is_file();
     }
     true
+}
+
+fn requires_package_manifest(command: &str) -> bool {
+    let normalized = command.to_ascii_lowercase();
+    normalized.starts_with("npm ")
+        || normalized.starts_with("pnpm ")
+        || normalized.starts_with("yarn ")
 }
 
 fn dependency_missing_reason(command: &str) -> String {
@@ -323,6 +414,117 @@ mod tests {
         let observation = observe_requirement(dir.path(), &requirement);
         assert_eq!(observation.status, BuildVerifierStatus::DependencyMissing);
         assert!(!observation.attempted);
+    }
+
+    #[test]
+    fn dependency_missing_then_setup_blocked_records_lifecycle_taxonomy() {
+        let dir = TempDir::new().unwrap();
+        let requirement = requirement_from_deferred(
+            "node_modules/.bin/next build",
+            Some("nextjs"),
+            "final build check",
+            "profile:nextjs",
+            "pending",
+        )
+        .unwrap();
+        let lifecycle = observe_requirement_lifecycle(
+            dir.path(),
+            &requirement,
+            NodeDependencySetupAuthority::None,
+        );
+        assert_eq!(
+            lifecycle.before_setup.status,
+            BuildVerifierStatus::DependencyMissing
+        );
+        assert_eq!(lifecycle.setup_status(), "blocked");
+        assert_eq!(
+            lifecycle.lifecycle_stages(),
+            vec![
+                "dependency_check",
+                "setup_blocked",
+                "verification_dependency_missing"
+            ]
+        );
+    }
+
+    #[test]
+    fn dependency_missing_setup_allowed_then_build_rerun_records_lifecycle() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        let fake_npm = dir.path().join("fake-npm.sh");
+        std::fs::write(
+            &fake_npm,
+            "#!/bin/sh\nmkdir -p node_modules/.bin\ncat > node_modules/.bin/next <<'EOF'\n#!/bin/sh\nexit 0\nEOF\nchmod +x node_modules/.bin/next\ntouch package-lock.json\nexit 0\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_npm).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_npm, perms).unwrap();
+        }
+        let requirement = requirement_from_deferred(
+            "node_modules/.bin/next build",
+            Some("nextjs"),
+            "final build check",
+            "profile:nextjs",
+            "pending",
+        )
+        .unwrap();
+        let lifecycle = observe_requirement_lifecycle_with_setup_program(
+            dir.path(),
+            &requirement,
+            NodeDependencySetupAuthority::EvalExplicit,
+            &fake_npm,
+        );
+        assert_eq!(lifecycle.setup_status(), "passed");
+        assert_eq!(lifecycle.final_status, BuildVerifierStatus::Passed);
+        assert!(lifecycle.after_setup.is_some());
+        assert!(lifecycle.lifecycle_stages().contains(&"setup_passed"));
+        assert!(lifecycle.lifecycle_stages().contains(&"build_rerun"));
+        assert!(
+            lifecycle
+                .lifecycle_stages()
+                .contains(&"verification_passed")
+        );
+    }
+
+    #[test]
+    fn dependency_build_lifecycle_event_uses_same_taxonomy_for_modes() {
+        let dir = TempDir::new().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let requirement = requirement_from_deferred(
+            "npm run build",
+            Some("nextjs"),
+            "final build check",
+            "profile:nextjs",
+            "pending",
+        )
+        .unwrap();
+        let lifecycle = observe_requirement_lifecycle(
+            dir.path(),
+            &requirement,
+            NodeDependencySetupAuthority::None,
+        );
+        for mode in ["minimal-loop", "plan-run", "ultra-plan-run"] {
+            emit_dependency_build_lifecycle(Some(&events), mode, Some("step"), &lifecycle);
+        }
+        let text = std::fs::read_to_string(events).unwrap();
+        assert_eq!(
+            text.matches("\"event\":\"dependency_build_lifecycle\"")
+                .count(),
+            3
+        );
+        assert!(text.contains("\"mode\":\"minimal-loop\""));
+        assert!(text.contains("\"mode\":\"plan-run\""));
+        assert!(text.contains("\"mode\":\"ultra-plan-run\""));
+        assert!(text.contains("\"lifecycle_stage\":\"dependency_setup_build\""));
+        assert!(text.contains("setup_blocked"));
     }
 
     #[test]

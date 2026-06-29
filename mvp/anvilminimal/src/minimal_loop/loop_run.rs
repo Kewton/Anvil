@@ -1078,6 +1078,14 @@ fn verify_completion_contract(
             "repair_progress": verdict.as_str(),
         }),
     );
+    for lifecycle in &build_verifier_lifecycles {
+        super::build_verifier::emit_dependency_build_lifecycle(
+            eval_events_path,
+            "minimal-loop",
+            None,
+            lifecycle,
+        );
+    }
     if ok {
         return Ok(None);
     }

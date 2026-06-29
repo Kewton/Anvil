@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::eval_events;
+use crate::minimal_loop::build_verifier::emit_dependency_build_lifecycle;
 use crate::minimal_loop::completion::CompletionContract;
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::evidence::verify_runtime_acceptance;
@@ -31,7 +32,7 @@ use crate::planner::step_plan::{
     parse_step_plan, render_step_plan, repair_generated_step_plan_contract,
 };
 use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
-use crate::planner::verify::{VerificationReport, verify_step_with_setup};
+use crate::planner::verify::{VerificationReport, verify_step_with_setup_observed};
 use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
 use crate::tools::path_guard::resolve_existing;
@@ -263,7 +264,7 @@ pub fn run_step_plan_with_ui(
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<String> {
     let mut session = SessionSnapshot::new();
-    run_step_plan_with_session_with_ui(client, &mut session, plan, config, ui, true)
+    run_step_plan_with_session_with_ui(client, &mut session, plan, config, ui, true, "plan-run")
         .map(|outcome| outcome.summary)
         .map_err(|err| anyhow::anyhow!("{}", err.message))
 }
@@ -532,6 +533,7 @@ fn run_step_plan_with_session_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
     verify_final_contract: bool,
+    mode: &'static str,
 ) -> Result<StepPlanRunOutcome, StepPlanRunError> {
     let mut outcome = StepPlanRunOutcome::for_plan(plan);
     let report = lint_step_plan_report(plan);
@@ -564,7 +566,16 @@ fn run_step_plan_with_session_with_ui(
             final_required_capabilities: final_required_capabilities.clone(),
             final_required_evidence: final_required_evidence.clone(),
         };
-        match run_step(client, session, plan, step, &prompt_context, config, ui) {
+        match run_step(
+            client,
+            session,
+            plan,
+            step,
+            &prompt_context,
+            config,
+            ui,
+            mode,
+        ) {
             Ok(step_outcome) => {
                 outcome.completed_steps += 1;
                 outcome.merge_step(&step_outcome);
@@ -601,6 +612,7 @@ fn run_step(
     prompt_context: &StepPromptContext,
     config: &Config,
     ui: &dyn InteractionUi,
+    mode: &'static str,
 ) -> Result<StepRunOutcome, StepRunError> {
     let instruction = build_step_prompt(plan, step, prompt_context);
     emit_step_prompt_contract(config, step, prompt_context, &instruction);
@@ -646,7 +658,16 @@ fn run_step(
         });
     }
     let setup_authority = step_verify_setup_authority(plan, step);
-    let report = verify_step_with_setup(&config.workspace_root, step, setup_authority);
+    let (report, build_lifecycles) =
+        verify_step_with_setup_observed(&config.workspace_root, step, setup_authority);
+    for lifecycle in &build_lifecycles {
+        emit_dependency_build_lifecycle(
+            config.eval_events_path.as_deref(),
+            mode,
+            Some(&step.id),
+            lifecycle,
+        );
+    }
     if report.is_pass() {
         return Ok(outcome);
     }
@@ -741,7 +762,16 @@ fn run_step(
                 });
             }
         }
-        let retry = verify_step_with_setup(&config.workspace_root, step, setup_authority);
+        let (retry, retry_lifecycles) =
+            verify_step_with_setup_observed(&config.workspace_root, step, setup_authority);
+        for lifecycle in &retry_lifecycles {
+            emit_dependency_build_lifecycle(
+                config.eval_events_path.as_deref(),
+                mode,
+                Some(&step.id),
+                lifecycle,
+            );
+        }
         let retry_target = classify_repair_target(&retry);
         let previous_target = classify_repair_target(&current_report);
         let repair_target_followed = repair_target_followed(previous_target, &repair.changed_paths);
@@ -1387,6 +1417,7 @@ pub fn run_ultra_plan_with_ui(
             config,
             ui,
             final_phase,
+            "ultra-plan-run",
         ) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -4732,6 +4763,51 @@ export default function Page(){
         let result = run_step_plan(&mut fake, &plan, &config(dir.path().to_path_buf())).unwrap();
         assert_eq!(result, "plan-run complete: 1 steps");
         assert!(dir.path().join("a.txt").is_file());
+    }
+
+    #[test]
+    fn plan_run_emits_dependency_build_lifecycle_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let package = r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#;
+        let plan = StepPlan {
+            goal: "Create a Next.js app".to_string(),
+            steps: vec![PlanStep {
+                id: "app".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create package.json and src/app/page.tsx then verify build"
+                    .to_string(),
+                expected_paths: vec!["package.json".to_string(), "src/app/page.tsx".to_string()],
+                verify: vec!["npm run build".to_string()],
+            }],
+        };
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"package.json","content":package}),
+                ),
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main/>;}"}),
+                ),
+            ],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.is_empty());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"dependency_build_lifecycle\""));
+        assert!(event_text.contains("\"mode\":\"plan-run\""));
+        assert!(event_text.contains("setup_blocked"));
+        assert!(event_text.contains("verification_dependency_missing"));
     }
 
     #[test]

@@ -176,10 +176,53 @@ impl CompletionContract {
                 report.push_command_failure(command.clone(), err.to_string());
                 continue;
             }
-            if build_verifier::requires_next_binary(command)
-                && !root.join("node_modules/.bin/next").is_file()
-            {
-                report.push_dependency_missing("node_modules/.bin/next missing for Next.js build");
+            if is_node_test_command(command) && !root.join("package.json").is_file() {
+                report.push_dependency_missing("package.json missing before Node test verifier");
+                continue;
+            }
+            if let Some(build_requirement) = build_verifier::requirement_from_deferred(
+                command,
+                self.active_profile(),
+                "completion verify command",
+                "completion_contract",
+                "required",
+            ) {
+                let lifecycle = build_verifier::observe_requirement_lifecycle(
+                    root,
+                    &build_requirement,
+                    NodeDependencySetupAuthority::None,
+                );
+                let observation = lifecycle.final_observation();
+                if observation.status != BuildVerifierStatus::Passed {
+                    match observation.status {
+                        BuildVerifierStatus::DependencyMissing => {
+                            report.push_dependency_missing(format!(
+                                "dependency_setup_missing: {}",
+                                lifecycle.final_reason
+                            ));
+                        }
+                        BuildVerifierStatus::PolicyRejected => {
+                            report.push_command_failure(
+                                command.clone(),
+                                format!("build_verify_policy_rejected: {}", lifecycle.final_reason),
+                            );
+                        }
+                        BuildVerifierStatus::Blocked => {
+                            report.push_profile_failure(format!(
+                                "build_verify_blocked: command `{}` reason `{}`",
+                                command, lifecycle.final_reason
+                            ));
+                        }
+                        BuildVerifierStatus::Failed => {
+                            report.push_command_failure(
+                                command.clone(),
+                                format!("build_verify_failed: {}", lifecycle.final_reason),
+                            );
+                        }
+                        BuildVerifierStatus::Passed => {}
+                    }
+                }
+                build_verifier_observations.push(lifecycle);
                 continue;
             }
             match crate::tools::bash::run_checked(command, root, false) {
@@ -429,6 +472,17 @@ fn setup_authority_for_deferred(
     } else {
         NodeDependencySetupAuthority::None
     }
+}
+
+fn is_node_test_command(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower == "npm test"
+        || lower == "npm run test"
+        || lower.starts_with("npm run test ")
+        || lower == "pnpm test"
+        || lower.starts_with("pnpm test ")
+        || lower == "yarn test"
+        || lower.starts_with("yarn test ")
 }
 
 pub fn format_verify_feedback(report: &VerificationReport) -> String {
@@ -1047,6 +1101,34 @@ mod tests {
             report.primary_reason().contains("dependency_setup_missing"),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn manifest_only_nextjs_build_verify_is_not_success() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        )
+        .unwrap();
+        let contract = CompletionContract {
+            required_paths: vec!["package.json".to_string()],
+            verify_commands: vec!["npm run build".to_string()],
+            profile: None,
+            goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
+            deferred_verify_requirements: Vec::new(),
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap();
+        let (report, lifecycles) = contract.verify_with_goal_observed(dir.path(), "");
+        assert!(!report.is_pass(), "{report:?}");
+        assert!(report.primary_reason().contains("dependency_setup_missing"));
+        assert_eq!(lifecycles.len(), 1);
+        assert!(lifecycles[0].lifecycle_stages().contains(&"setup_blocked"));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use crate::minimal_loop::build_verifier::{self, BuildVerifierStatus};
+use crate::minimal_loop::build_verifier::{
+    self, BuildVerifierLifecycleObservation, BuildVerifierStatus,
+};
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::planner::step_plan::{ExpectedResult, PlanStep};
 use crate::tools::path_guard::{resolve_existing, validate_workspace_relative};
@@ -171,7 +173,16 @@ pub fn verify_step_with_setup(
     step: &PlanStep,
     setup_authority: NodeDependencySetupAuthority,
 ) -> VerificationReport {
+    verify_step_with_setup_observed(root, step, setup_authority).0
+}
+
+pub fn verify_step_with_setup_observed(
+    root: &Path,
+    step: &PlanStep,
+    setup_authority: NodeDependencySetupAuthority,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
     let mut report = VerificationReport::pass();
+    let mut build_lifecycles = Vec::new();
     for path in &step.expected_paths {
         if resolve_existing(root, path).is_err() {
             report.push_missing_path(path.clone());
@@ -182,54 +193,51 @@ pub fn verify_step_with_setup(
             report.push_command_failure(command.clone(), err.to_string());
             continue;
         }
-        if is_nextjs_build_command(command) && !root.join("node_modules/.bin/next").is_file() {
-            if setup_authority.allows_setup()
-                && let Some(requirement) = build_verifier::requirement_from_deferred(
-                    command,
-                    Some("nextjs"),
-                    "step verify requires Next.js dependencies",
-                    setup_authority.as_str(),
-                    "required",
-                )
-            {
-                let lifecycle = build_verifier::observe_requirement_lifecycle(
-                    root,
-                    &requirement,
-                    setup_authority,
-                );
-                let observation = lifecycle.final_observation();
-                match observation.status {
-                    BuildVerifierStatus::Passed => {
-                        continue;
-                    }
-                    BuildVerifierStatus::DependencyMissing => {
-                        report.push_dependency_missing(format!(
-                            "dependency_setup_missing: {}",
-                            lifecycle.final_reason
-                        ));
-                    }
-                    BuildVerifierStatus::PolicyRejected => {
-                        report.push_command_failure(
-                            command.clone(),
-                            format!("build_verify_policy_rejected: {}", lifecycle.final_reason),
-                        );
-                    }
-                    BuildVerifierStatus::Blocked => {
-                        report.push_profile_failure(format!(
-                            "build_verify_blocked: command `{}` reason `{}`",
-                            command, lifecycle.final_reason
-                        ));
-                    }
-                    BuildVerifierStatus::Failed => {
-                        report.push_command_failure(
-                            command.clone(),
-                            format!("build_verify_failed: {}", lifecycle.final_reason),
-                        );
-                    }
+        if is_node_test_command(command) && !root.join("package.json").is_file() {
+            report.push_dependency_missing("package.json missing before Node test verifier");
+            continue;
+        }
+        if let Some(requirement) = build_verifier::requirement_from_deferred(
+            command,
+            build_verifier_profile(command),
+            "step verify requires build lifecycle",
+            setup_authority.as_str(),
+            "required",
+        ) {
+            let lifecycle =
+                build_verifier::observe_requirement_lifecycle(root, &requirement, setup_authority);
+            let observation = lifecycle.final_observation();
+            match observation.status {
+                BuildVerifierStatus::Passed => {
+                    build_lifecycles.push(lifecycle);
+                    continue;
                 }
-                continue;
+                BuildVerifierStatus::DependencyMissing => {
+                    report.push_dependency_missing(format!(
+                        "dependency_setup_missing: {}",
+                        lifecycle.final_reason
+                    ));
+                }
+                BuildVerifierStatus::PolicyRejected => {
+                    report.push_command_failure(
+                        command.clone(),
+                        format!("build_verify_policy_rejected: {}", lifecycle.final_reason),
+                    );
+                }
+                BuildVerifierStatus::Blocked => {
+                    report.push_profile_failure(format!(
+                        "build_verify_blocked: command `{}` reason `{}`",
+                        command, lifecycle.final_reason
+                    ));
+                }
+                BuildVerifierStatus::Failed => {
+                    report.push_command_failure(
+                        command.clone(),
+                        format!("build_verify_failed: {}", lifecycle.final_reason),
+                    );
+                }
             }
-            report.push_dependency_missing("node_modules/.bin/next missing for Next.js build");
+            build_lifecycles.push(lifecycle);
             continue;
         }
         match crate::tools::bash::run_checked(command, root, false) {
@@ -256,7 +264,7 @@ pub fn verify_step_with_setup(
             }
         }
     }
-    report
+    (report, build_lifecycles)
 }
 
 pub fn validate_verify_command(command: &str) -> anyhow::Result<()> {
@@ -360,6 +368,25 @@ fn is_nextjs_build_command(command: &str) -> bool {
         || lower.starts_with("pnpm build ")
         || lower == "yarn build"
         || lower.starts_with("yarn build ")
+}
+
+fn is_node_test_command(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower == "npm test"
+        || lower == "npm run test"
+        || lower.starts_with("npm run test ")
+        || lower == "pnpm test"
+        || lower.starts_with("pnpm test ")
+        || lower == "yarn test"
+        || lower.starts_with("yarn test ")
+}
+
+fn build_verifier_profile(command: &str) -> Option<&'static str> {
+    if is_nextjs_build_command(command) {
+        Some("nextjs")
+    } else {
+        None
+    }
 }
 
 fn manifest_path_arg(command: &str) -> Option<&str> {
@@ -511,6 +538,46 @@ mod tests {
             verify_step(dir.path(), &step).status,
             VerifyStatus::DependencyMissing(_)
         ));
+    }
+
+    #[test]
+    fn nextjs_build_step_returns_dependency_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"x","react":"x","react-dom":"x"}}"#,
+        )
+        .unwrap();
+        let step = PlanStep {
+            id: "s".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "x".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["npm run build".to_string()],
+        };
+        let (report, lifecycles) =
+            verify_step_with_setup_observed(dir.path(), &step, NodeDependencySetupAuthority::None);
+        assert!(report.primary_reason().contains("dependency_setup_missing"));
+        assert_eq!(lifecycles.len(), 1);
+        assert!(lifecycles[0].lifecycle_stages().contains(&"setup_blocked"));
+    }
+
+    #[test]
+    fn node_test_without_package_manifest_is_dependency_missing_without_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let step = PlanStep {
+            id: "test".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Run Node tests".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["npm test".to_string()],
+        };
+        let (report, lifecycles) =
+            verify_step_with_setup_observed(dir.path(), &step, NodeDependencySetupAuthority::None);
+        assert!(report.primary_reason().contains("package.json missing"));
+        assert!(lifecycles.is_empty());
     }
 
     #[test]

@@ -94,6 +94,7 @@ def score_runtime_health(
         "step_verify_repair",
         "plan_final_contract",
         "completion_verify",
+        "dependency_build_lifecycle",
         "verify_repair_progress",
         "verify_repair_turn",
         "ultra_phase_start",
