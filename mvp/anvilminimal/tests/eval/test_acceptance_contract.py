@@ -19,6 +19,8 @@ class AcceptanceContractTest(unittest.TestCase):
         )
         self.assertEqual(contract.category, "interactive-game")
         self.assertIn("player_control", contract.required_capabilities)
+        self.assertIn("implementation", contract.required_obligations)
+        self.assertIn("acceptance_evidence", contract.required_obligations)
         self.assertIn("static_title_only", contract.forbidden_minimal_outputs)
         self.assertEqual(contract.runtime["port"], 3011)
 
@@ -45,7 +47,13 @@ class AcceptanceContractTest(unittest.TestCase):
         )
         self.assertEqual(contract.category, "interactive-web-app")
         self.assertEqual(contract.required_capabilities, ["user_input_or_action"])
+        self.assertIn("implementation", contract.required_obligations)
         self.assertTrue(contract.explicit)
+
+    def test_docs_contract_uses_acceptance_evidence_obligation_only(self):
+        contract = contract_from_scenario({"prompt": "Write README usage docs"})
+        self.assertEqual(contract.category, "docs-content")
+        self.assertEqual(contract.required_obligations, ["acceptance_evidence"])
 
 
 if __name__ == "__main__":

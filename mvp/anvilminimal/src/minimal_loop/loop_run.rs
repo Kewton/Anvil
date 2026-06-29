@@ -1060,6 +1060,7 @@ fn verify_completion_contract(
             "missing_capabilities": runtime_acceptance.missing_capabilities.clone(),
             "missing_evidence": runtime_acceptance.missing_evidence.clone(),
             "weak_evidence": runtime_acceptance.weak_evidence.clone(),
+            "artifact_obligations": runtime_acceptance.artifact_obligations.clone(),
             "inconclusive_reasons": runtime_acceptance.inconclusive_reasons.clone(),
             "runtime_acceptance_passed": runtime_acceptance.passed,
             "runtime_acceptance_inconclusive": runtime_acceptance.inconclusive,

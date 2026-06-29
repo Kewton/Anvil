@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeAcceptanceReport {
     pub passed: bool,
@@ -9,7 +11,17 @@ pub struct RuntimeAcceptanceReport {
     pub missing_evidence: Vec<String>,
     pub weak_evidence: Vec<String>,
     pub inconclusive_reasons: Vec<String>,
+    pub artifact_obligations: Vec<ArtifactObligationEvidence>,
     pub primary_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ArtifactObligationEvidence {
+    pub path: String,
+    pub role: String,
+    pub evidence: Vec<String>,
+    pub satisfies_implementation: bool,
+    pub required_capabilities_supported: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +50,33 @@ impl EvidenceKind {
             Self::NonStaticScreenEvidence => "non_static_screen_evidence",
             Self::RequestedContent => "requested_content_evidence",
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactRoleLite {
+    Setup,
+    Scaffold,
+    Style,
+    Implementation,
+    Verification,
+    AcceptanceEvidence,
+}
+
+impl ArtifactRoleLite {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Setup => "setup",
+            Self::Scaffold => "scaffold",
+            Self::Style => "style",
+            Self::Implementation => "implementation",
+            Self::Verification => "verification",
+            Self::AcceptanceEvidence => "acceptance_evidence",
+        }
+    }
+
+    fn satisfies_implementation(self) -> bool {
+        self == Self::Implementation
     }
 }
 
@@ -80,6 +119,8 @@ pub fn verify_runtime_acceptance(
     }
 
     let workspace = collect_workspace_evidence(root);
+    let artifact_obligations =
+        artifact_obligation_evidence(root, required_paths, required_capabilities);
     let mut required = BTreeSet::new();
     let mut missing_capabilities = Vec::new();
     for capability in required_capabilities {
@@ -158,6 +199,7 @@ pub fn verify_runtime_acceptance(
     }
 
     collect_weak_verify_evidence(verify_commands, &workspace, &mut weak_evidence);
+    collect_weak_obligation_evidence(&artifact_obligations, &required, &mut weak_evidence);
     let inconclusive = !inconclusive_reasons.is_empty();
     let passed = missing_capabilities.is_empty() && missing_evidence.is_empty() && !inconclusive;
     let primary_reason = if let Some(reason) = missing_capabilities.first() {
@@ -179,8 +221,50 @@ pub fn verify_runtime_acceptance(
         missing_evidence,
         weak_evidence,
         inconclusive_reasons,
+        artifact_obligations,
         primary_reason,
     }
+}
+
+pub fn artifact_obligation_evidence(
+    root: &Path,
+    required_paths: &[String],
+    required_capabilities: &[String],
+) -> Vec<ArtifactObligationEvidence> {
+    let mut out = Vec::new();
+    for path in required_paths {
+        let full = root.join(path);
+        if !full.is_file() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&full).unwrap_or_default();
+        let file = SourceFile {
+            rel: path.clone(),
+            content,
+        };
+        let role = artifact_role_for_file(&file);
+        let evidence = evidence_kinds_for_file(&file)
+            .into_iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        let required_capabilities_supported = required_capabilities
+            .iter()
+            .filter(|capability| {
+                evidence_kinds_for_capability(capability)
+                    .into_iter()
+                    .any(|kind| evidence.contains(kind.as_str()))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        out.push(ArtifactObligationEvidence {
+            path: path.clone(),
+            role: role.as_str().to_string(),
+            evidence: evidence.into_iter().collect(),
+            satisfies_implementation: role.satisfies_implementation(),
+            required_capabilities_supported,
+        });
+    }
+    out
 }
 
 fn evidence_kinds_for_capability(capability: &str) -> Vec<EvidenceKind> {
@@ -311,12 +395,21 @@ fn has_implementation_artifact(
     required_paths: &[String],
     workspace: &WorkspaceEvidence,
 ) -> bool {
-    required_paths.iter().any(|path| root.join(path).is_file())
-        || workspace.source_files.iter().any(|file| {
-            !looks_like_test_file(&file.rel)
-                && !file.rel.eq_ignore_ascii_case("README.md")
-                && !file.content.trim().is_empty()
+    required_paths.iter().any(|path| {
+        let full = root.join(path);
+        if !full.is_file() {
+            return false;
+        }
+        let content = std::fs::read_to_string(full).unwrap_or_default();
+        artifact_role_for_file(&SourceFile {
+            rel: path.clone(),
+            content,
         })
+        .satisfies_implementation()
+    }) || workspace
+        .source_files
+        .iter()
+        .any(|file| artifact_role_for_file(file).satisfies_implementation())
 }
 
 fn has_test_artifact(workspace: &WorkspaceEvidence) -> bool {
@@ -471,44 +564,182 @@ fn verify_command_kind(command: &str, workspace: &WorkspaceEvidence) -> VerifyCo
 }
 
 fn has_interactive_ui_source(workspace: &WorkspaceEvidence) -> bool {
-    workspace.source_files.iter().any(|file| {
-        let content = file.content.as_str();
-        let lower = content.to_ascii_lowercase();
-        (content.contains("useState")
-            || content.contains("useReducer")
-            || content.contains("addEventListener")
-            || content.contains("onKeyDown")
-            || content.contains("onClick")
-            || content.contains("requestAnimationFrame")
-            || lower.contains("<canvas"))
-            && (lower.contains("keydown")
-                || lower.contains("arrow")
-                || lower.contains("click")
-                || lower.contains("pointer")
-                || lower.contains("touch")
-                || lower.contains("canvas"))
-    })
+    workspace
+        .source_files
+        .iter()
+        .any(source_file_has_interactive_ui)
 }
 
 fn has_non_static_screen_evidence(workspace: &WorkspaceEvidence) -> bool {
-    workspace.source_files.iter().any(|file| {
-        let lower = file.content.to_ascii_lowercase();
-        (lower.contains("score")
-            || lower.contains("level")
-            || lower.contains("life")
-            || lower.contains("lives")
-            || lower.contains("enemy")
-            || lower.contains("invader")
-            || lower.contains("collision")
-            || lower.contains("bullet")
-            || lower.contains("shot")
-            || lower.contains("state"))
-            && (lower.contains("setinterval")
-                || lower.contains("requestanimationframe")
-                || lower.contains("usestate")
-                || lower.contains("usereducer")
-                || lower.contains("canvas"))
-    })
+    workspace
+        .source_files
+        .iter()
+        .any(source_file_has_non_static_screen)
+}
+
+fn artifact_role_for_file(file: &SourceFile) -> ArtifactRoleLite {
+    let lower_path = file.rel.to_ascii_lowercase();
+    if looks_like_setup_path(&lower_path) {
+        return ArtifactRoleLite::Setup;
+    }
+    if looks_like_style_path(&lower_path) {
+        return ArtifactRoleLite::Style;
+    }
+    if looks_like_test_file(&file.rel) {
+        return ArtifactRoleLite::Verification;
+    }
+    if lower_path.ends_with(".md") {
+        return ArtifactRoleLite::AcceptanceEvidence;
+    }
+    if looks_like_scaffold_file(file) {
+        return ArtifactRoleLite::Scaffold;
+    }
+    if looks_like_source_or_test(&file.rel) && !file.content.trim().is_empty() {
+        return ArtifactRoleLite::Implementation;
+    }
+    ArtifactRoleLite::Scaffold
+}
+
+fn looks_like_setup_path(lower_path: &str) -> bool {
+    matches!(
+        lower_path,
+        "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lockb"
+            | "cargo.toml"
+            | "cargo.lock"
+            | "pyproject.toml"
+            | "requirements.txt"
+            | "tsconfig.json"
+            | "next.config.js"
+            | "next.config.mjs"
+            | "next.config.ts"
+            | "postcss.config.js"
+            | "tailwind.config.js"
+            | "tailwind.config.ts"
+            | "vite.config.js"
+            | "vite.config.ts"
+    ) || lower_path.ends_with(".d.ts")
+}
+
+fn looks_like_style_path(lower_path: &str) -> bool {
+    lower_path.ends_with(".css")
+        || lower_path.ends_with(".scss")
+        || lower_path.ends_with(".sass")
+        || lower_path.ends_with(".less")
+}
+
+fn looks_like_scaffold_file(file: &SourceFile) -> bool {
+    let lower_path = file.rel.to_ascii_lowercase();
+    let lower = file.content.to_ascii_lowercase();
+    if file.content.trim().is_empty() {
+        return true;
+    }
+    if lower_path.ends_with("layout.tsx") || lower_path.ends_with("layout.jsx") {
+        return true;
+    }
+    let placeholder = [
+        "todo",
+        "placeholder",
+        "coming soon",
+        "hello world",
+        "press any key",
+        "start screen",
+        "title screen",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    placeholder && !source_file_has_interactive_ui(file) && !source_file_has_non_static_screen(file)
+}
+
+fn evidence_kinds_for_file(file: &SourceFile) -> Vec<EvidenceKind> {
+    let mut kinds = Vec::new();
+    match artifact_role_for_file(file) {
+        ArtifactRoleLite::Implementation => kinds.push(EvidenceKind::ImplementationArtifact),
+        ArtifactRoleLite::Verification => {
+            kinds.push(EvidenceKind::TestArtifact);
+            if has_inline_test_or_self_test(file) || contains_assertion(&file.content) {
+                kinds.push(EvidenceKind::NonZeroTestOrAssertionEvidence);
+            }
+        }
+        ArtifactRoleLite::AcceptanceEvidence => kinds.push(EvidenceKind::RequestedContent),
+        ArtifactRoleLite::Setup | ArtifactRoleLite::Scaffold | ArtifactRoleLite::Style => {}
+    }
+    if has_inline_test_or_self_test(file) || contains_assertion(&file.content) {
+        kinds.push(EvidenceKind::TestArtifact);
+        kinds.push(EvidenceKind::NonZeroTestOrAssertionEvidence);
+    }
+    if source_file_has_interactive_ui(file) {
+        kinds.push(EvidenceKind::InteractiveUiSourceEvidence);
+    }
+    if source_file_has_non_static_screen(file) {
+        kinds.push(EvidenceKind::NonStaticScreenEvidence);
+    }
+    kinds.sort_by_key(|kind| kind.as_str());
+    kinds.dedup();
+    kinds
+}
+
+fn collect_weak_obligation_evidence(
+    obligations: &[ArtifactObligationEvidence],
+    required_evidence: &BTreeSet<String>,
+    weak: &mut Vec<String>,
+) {
+    if !required_evidence.contains("implementation_artifact") {
+        return;
+    }
+    if obligations
+        .iter()
+        .any(|obligation| obligation.satisfies_implementation)
+    {
+        return;
+    }
+    let roles = obligations
+        .iter()
+        .map(|obligation| obligation.role.as_str())
+        .collect::<BTreeSet<_>>();
+    for role in roles {
+        weak.push(format!("non_implementation_obligation_only:{role}"));
+    }
+}
+
+fn source_file_has_interactive_ui(file: &SourceFile) -> bool {
+    let content = file.content.as_str();
+    let lower = content.to_ascii_lowercase();
+    (content.contains("useState")
+        || content.contains("useReducer")
+        || content.contains("addEventListener")
+        || content.contains("onKeyDown")
+        || content.contains("onClick")
+        || content.contains("requestAnimationFrame")
+        || lower.contains("<canvas"))
+        && (lower.contains("keydown")
+            || lower.contains("arrow")
+            || lower.contains("click")
+            || lower.contains("pointer")
+            || lower.contains("touch")
+            || lower.contains("canvas"))
+}
+
+fn source_file_has_non_static_screen(file: &SourceFile) -> bool {
+    let lower = file.content.to_ascii_lowercase();
+    (lower.contains("score")
+        || lower.contains("level")
+        || lower.contains("life")
+        || lower.contains("lives")
+        || lower.contains("enemy")
+        || lower.contains("invader")
+        || lower.contains("collision")
+        || lower.contains("bullet")
+        || lower.contains("shot")
+        || lower.contains("state"))
+        && (lower.contains("setinterval")
+            || lower.contains("requestanimationframe")
+            || lower.contains("usestate")
+            || lower.contains("usereducer")
+            || lower.contains("canvas"))
 }
 
 #[cfg(test)]
@@ -654,6 +885,145 @@ mod tests {
             report
                 .missing_evidence
                 .contains(&"interactive_ui_source_evidence".to_string())
+        );
+    }
+
+    #[test]
+    fn setup_only_does_not_satisfy_implementation_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["package.json".to_string()],
+            &[],
+            &["implementation".to_string()],
+            &[],
+            &[],
+        );
+        assert!(!report.passed);
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"implementation_artifact".to_string())
+        );
+        assert_eq!(report.artifact_obligations[0].role, "setup");
+        assert!(
+            report
+                .weak_evidence
+                .contains(&"non_implementation_obligation_only:setup".to_string())
+        );
+    }
+
+    #[test]
+    fn scaffold_only_does_not_satisfy_implementation_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){ return <main>Press any key to start</main>; }\n",
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["implementation".to_string()],
+            &[],
+            &[],
+        );
+        assert!(!report.passed);
+        assert_eq!(report.artifact_obligations[0].role, "scaffold");
+    }
+
+    #[test]
+    fn style_only_does_not_satisfy_implementation_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "body { color: white; }\n",
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/globals.css".to_string()],
+            &[],
+            &["implementation".to_string()],
+            &[],
+            &[],
+        );
+        assert!(!report.passed);
+        assert_eq!(report.artifact_obligations[0].role, "style");
+    }
+
+    #[test]
+    fn docs_only_output_does_not_satisfy_game_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Game\nUse arrow keys.\n").unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["README.md".to_string()],
+            &[],
+            &[
+                "player_control".to_string(),
+                "adversary_or_challenge".to_string(),
+            ],
+            &[],
+            &[],
+        );
+        assert!(!report.passed);
+        assert_eq!(report.artifact_obligations[0].role, "acceptance_evidence");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"implementation_artifact".to_string())
+        );
+    }
+
+    #[test]
+    fn required_capability_maps_to_expected_artifact_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") setScore((value) => value + 1);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+  return <canvas data-score={score} />;
+}
+"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["player_control".to_string()],
+            &[],
+            &[],
+        );
+        assert!(report.artifact_obligations[0].satisfies_implementation);
+        assert!(
+            report.artifact_obligations[0]
+                .evidence
+                .contains(&"interactive_ui_source_evidence".to_string())
+        );
+        assert!(
+            report.artifact_obligations[0]
+                .required_capabilities_supported
+                .contains(&"player_control".to_string())
         );
     }
 

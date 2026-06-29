@@ -2124,6 +2124,7 @@ fn ultra_final_acceptance_report(
             "missing_capabilities": acceptance.missing_capabilities.clone(),
             "missing_evidence": acceptance.missing_evidence.clone(),
             "weak_evidence": acceptance.weak_evidence.clone(),
+            "artifact_obligations": acceptance.artifact_obligations.clone(),
             "inconclusive_reasons": acceptance.inconclusive_reasons.clone(),
             "primary_reason": eval_events::body_snippet(&acceptance.primary_reason),
         }),

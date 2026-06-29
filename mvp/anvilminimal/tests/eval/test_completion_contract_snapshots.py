@@ -96,6 +96,8 @@ class CompletionContractSnapshotTest(unittest.TestCase):
             contract["required_capabilities"],
             ["implementation", "deterministic_test"],
         )
+        self.assertIn("implementation", contract["required_obligations"])
+        self.assertIn("verification", contract["required_obligations"])
         self.assertIn("implementation_artifact", contract["required_evidence"])
         self.assertIn("test_artifact", contract["required_evidence"])
         self.assertIn("bound_verify_command", contract["required_evidence"])

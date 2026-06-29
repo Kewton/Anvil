@@ -287,6 +287,7 @@ def completion_contract_for_spec(spec: dict) -> dict | None:
     ]
     acceptance_contract = contract_from_scenario(scenario)
     required_capabilities = unique_strings(acceptance_contract.required_capabilities)
+    required_obligations = unique_strings(acceptance_contract.required_obligations)
     deterministic_oracles = unique_strings(
         acceptance_contract.oracle_contract.get("deterministic_oracles", []) or []
     )
@@ -310,6 +311,7 @@ def completion_contract_for_spec(spec: dict) -> dict | None:
         "required_paths": required_paths,
         "verify_commands": verify_commands,
         "required_capabilities": required_capabilities,
+        "required_obligations": required_obligations,
         "deterministic_oracles": deterministic_oracles,
         "required_evidence": required_evidence,
         "verify_repair_cap": 3 if required_capabilities or required_evidence else 2,

@@ -163,8 +163,12 @@ def score_plan_capability_contract(
     missing = sorted(prompt_set.difference(plan_set))
     coverage = score_ratio(len(prompt_set.intersection(plan_set)), len(prompt_set))
     evidence = score_evidence_completeness(plan_items, plan_caps)
+    obligation_alignment = score_obligation_alignment(plan_items, plan_caps)
     vague_penalty = vague_promise_penalty(plan_text, plan_caps)
-    contract_score = round(max(0.0, min(100.0, 0.65 * coverage + 0.35 * evidence - vague_penalty)), 1)
+    contract_score = round(
+        max(0.0, min(100.0, 0.45 * coverage + 0.25 * evidence + 0.30 * obligation_alignment - vague_penalty)),
+        1,
+    )
     gap_kind = prompt_plan_gap_kind(prompt_caps, plan_caps, missing, plan_text)
     return {
         "plan_capability_contract_score": contract_score,
@@ -182,6 +186,7 @@ def score_plan_capability_contract(
             "prompt_sources": prompt_sources,
             "plan_sources": plan_sources,
             "evidence_completeness_score": evidence,
+            "obligation_alignment_score": obligation_alignment,
             "vague_promise_penalty": vague_penalty,
             "parse_errors": parse_errors,
             "plan_items": [
@@ -190,6 +195,7 @@ def score_plan_capability_contract(
                     "kind": item.get("kind", ""),
                     "capabilities": item.get("capabilities", []),
                     "expected_paths": item.get("expected_paths", []),
+                    "artifact_roles": item.get("artifact_roles", []),
                     "verify": item.get("verify", []),
                 }
                 for item in plan_items
@@ -243,6 +249,7 @@ def collect_plan_contract(plan_paths: list[Path], plan_data: dict[str, Any] | No
     for item in items:
         caps, _ = extract_capabilities(item.get("text", ""), "plan")
         item["capabilities"] = caps
+        item["artifact_roles"] = sorted({artifact_role_for_path(path) for path in item.get("expected_paths", [])})
     return "\n".join(chunk for chunk in chunks if chunk).lower(), items, parse_errors
 
 
@@ -386,13 +393,75 @@ def score_evidence_completeness(plan_items: list[dict[str, Any]], plan_caps: lis
         best = 0.0
         for item in matching:
             score = 40.0
-            if item.get("expected_paths"):
+            roles = set(item.get("artifact_roles", []))
+            if roles.intersection({"implementation", "verification", "acceptance_evidence"}):
                 score += 30.0
             if item.get("verify"):
                 score += 30.0
             best = max(best, score)
         capability_scores.append(best)
     return round(sum(capability_scores) / len(capability_scores), 1)
+
+
+def score_obligation_alignment(plan_items: list[dict[str, Any]], plan_caps: list[str]) -> float:
+    if not plan_caps:
+        return 0.0
+    capability_scores: list[float] = []
+    for cap in plan_caps:
+        matching = [item for item in plan_items if cap in item.get("capabilities", [])]
+        if not matching:
+            capability_scores.append(0.0)
+            continue
+        best = 0.0
+        for item in matching:
+            roles = set(item.get("artifact_roles", []))
+            score = 0.0
+            if roles.intersection({"implementation", "verification"}):
+                score += 70.0
+            elif roles.intersection({"setup", "scaffold", "style"}):
+                score += 20.0
+            if item.get("verify"):
+                score += 30.0
+            best = max(best, min(100.0, score))
+        capability_scores.append(best)
+    return round(sum(capability_scores) / len(capability_scores), 1)
+
+
+def artifact_role_for_path(path: str) -> str:
+    lower = str(path).strip().lower()
+    name = lower.rsplit("/", 1)[-1]
+    if name in {
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lockb",
+        "cargo.toml",
+        "cargo.lock",
+        "pyproject.toml",
+        "requirements.txt",
+        "tsconfig.json",
+    } or name.startswith(("next.config", "postcss.config", "tailwind.config", "vite.config")):
+        return "setup"
+    if lower.endswith((".css", ".scss", ".sass", ".less")):
+        return "style"
+    if lower.endswith(".d.ts") or lower.endswith("layout.tsx") or lower.endswith("layout.jsx"):
+        return "scaffold"
+    if (
+        "/test" in lower
+        or lower.startswith("test")
+        or ".test." in lower
+        or ".spec." in lower
+        or "smoke" in name
+        or name.endswith("_test.py")
+        or name.endswith("_test.rs")
+    ):
+        return "verification"
+    if lower.endswith(".md"):
+        return "acceptance_evidence"
+    if lower.endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".py", ".rs", ".go", ".java")):
+        return "implementation"
+    return "scaffold"
 
 
 def vague_promise_penalty(plan_text: str, plan_caps: list[str]) -> float:

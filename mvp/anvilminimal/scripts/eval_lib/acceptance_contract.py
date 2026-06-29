@@ -45,6 +45,7 @@ class AcceptanceContract:
     category: str = "generic"
     required_capabilities: list[str] = field(default_factory=list)
     optional_capabilities: list[str] = field(default_factory=list)
+    required_obligations: list[str] = field(default_factory=list)
     forbidden_minimal_outputs: list[str] = field(default_factory=list)
     interaction: dict[str, Any] = field(default_factory=dict)
     runtime: dict[str, Any] = field(default_factory=dict)
@@ -57,6 +58,7 @@ class AcceptanceContract:
             "category": self.category,
             "required_capabilities": self.required_capabilities,
             "optional_capabilities": self.optional_capabilities,
+            "required_obligations": self.required_obligations,
             "forbidden_minimal_outputs": self.forbidden_minimal_outputs,
             "interaction": self.interaction,
             "runtime": self.runtime,
@@ -76,6 +78,9 @@ def contract_from_scenario(scenario: dict[str, Any]) -> AcceptanceContract:
     category = str(explicit_contract.get("category") or infer_contract_category(scenario))
     required = list(explicit_contract.get("required_capabilities") or default_capabilities(category))
     optional = list(explicit_contract.get("optional_capabilities") or [])
+    required_obligations = list(
+        explicit_contract.get("required_obligations") or default_obligations(category)
+    )
     forbidden = list(
         explicit_contract.get("forbidden_minimal_outputs")
         or quality_contract.get("forbidden_minimal_outputs")
@@ -104,6 +109,7 @@ def contract_from_scenario(scenario: dict[str, Any]) -> AcceptanceContract:
         category=category,
         required_capabilities=[str(item) for item in required if str(item).strip()],
         optional_capabilities=[str(item) for item in optional if str(item).strip()],
+        required_obligations=[str(item) for item in required_obligations if str(item).strip()],
         forbidden_minimal_outputs=[str(item) for item in forbidden if str(item).strip()],
         interaction=interaction,
         runtime=runtime,
@@ -140,6 +146,25 @@ def default_capabilities(category: str) -> list[str]:
         "library-with-tests": LIBRARY_WITH_TESTS_CAPABILITIES,
         "docs-content": DOCS_CONTENT_CAPABILITIES,
         "data-transform": DATA_TRANSFORM_CAPABILITIES,
+    }
+    return list(mapping.get(category, []))
+
+
+def default_obligations(category: str) -> list[str]:
+    mapping = {
+        "interactive-game": [
+            "setup",
+            "scaffold",
+            "implementation",
+            "verification",
+            "acceptance_evidence",
+        ],
+        "interactive-web-app": ["setup", "scaffold", "implementation", "verification"],
+        "web-app": ["setup", "scaffold", "implementation", "verification"],
+        "cli-tool": ["implementation", "verification"],
+        "library-with-tests": ["implementation", "verification"],
+        "docs-content": ["acceptance_evidence"],
+        "data-transform": ["implementation", "verification", "acceptance_evidence"],
     }
     return list(mapping.get(category, []))
 
