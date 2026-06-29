@@ -13,11 +13,13 @@ from .run_summary import read_summary
 def generate_report(run_root: Path) -> str:
     rows = read_summary(run_root / "summary.eval.tsv")
     lines = ["# anvilminimal Eval Report", ""]
+    lines.extend(acceptance_summary(rows))
+    lines.extend(schema_summary(rows))
+    lines.extend(speed_diagnostics_summary(rows))
     lines.extend(section_table("Mode Summary", aggregate(rows, "mode")))
     lines.extend(section_table("Size Summary", aggregate(rows, "size")))
     lines.extend(section_table("Model Profile Summary", aggregate(rows, "main_provider")))
     lines.extend(core_metric_summary(rows))
-    lines.extend(acceptance_summary(rows))
     lines.extend(target_metric_summary(rows))
     lines.extend(plan_rankings(rows))
     lines.extend(executable_plan_rankings(rows))
@@ -50,6 +52,8 @@ def aggregate(rows: list[dict[str, str]], key: str) -> list[dict[str, str]]:
             {
                 "group": name,
                 "success": f"{success_count}/{len(group)}",
+                "acceptance": acceptance_count_cell(group),
+                "false_positive": str(sum(1 for row in group if row.get("acceptance_false_positive") == "true")),
                 "p50_exec_sec": fmt(percentile(elapsed, 50)),
                 "p90_exec_sec": fmt(percentile(elapsed, 90)),
                 "avg_score": fmt(mean([to_float(row.get("overall_score")) for row in group])),
@@ -192,6 +196,7 @@ def acceptance_summary(rows: list[dict[str, str]]) -> list[str]:
                 "mode": mode,
                 "legacy_success": success_count_cell(group),
                 "acceptance_success": acceptance_count_cell(group),
+                "capability_acceptance": capability_acceptance_count_cell(group),
                 "false_positive": str(len(false_positive)),
                 "source_semantic_avg": fmt(mean([to_float(row.get("source_semantic_score")) for row in scoped])),
                 "plan_output_avg": fmt(mean([to_float(row.get("plan_output_adherence_score")) for row in scoped])),
@@ -203,12 +208,14 @@ def acceptance_summary(rows: list[dict[str, str]]) -> list[str]:
         for row in scoped:
             if row.get("acceptance_failure_kind"):
                 failure_counter[row["acceptance_failure_kind"]] += 1
+            for reason in split_reasons(row.get("acceptance_failure_reasons", "")):
+                failure_counter[f"reason:{reason}"] += 1
             if row.get("oracle_gap_kind"):
                 gap_counter[row["oracle_gap_kind"]] += 1
     lines = ["## Acceptance Outcomes", ""]
     if not out:
         return lines + ["No acceptance outcome rows.", ""]
-    lines.extend(table_rows(out, ["mode", "legacy_success", "acceptance_success", "false_positive", "source_semantic_avg", "plan_output_avg", "prompt_plan_avg", "plan_verify_avg", "confidence_avg"]))
+    lines.extend(table_rows(out, ["mode", "legacy_success", "acceptance_success", "capability_acceptance", "false_positive", "source_semantic_avg", "plan_output_avg", "prompt_plan_avg", "plan_verify_avg", "confidence_avg"]))
     if failure_counter:
         lines.extend(table_rows(
             [{"kind": kind, "count": str(count)} for kind, count in sorted(failure_counter.items())],
@@ -221,6 +228,50 @@ def acceptance_summary(rows: list[dict[str, str]]) -> list[str]:
         ))
     lines.extend(capability_contract_outcomes(rows))
     return lines
+
+
+def schema_summary(rows: list[dict[str, str]]) -> list[str]:
+    counter = Counter(row.get("eval_schema_version", "legacy") or "legacy" for row in rows)
+    lines = ["## Eval Schema", ""]
+    return lines + table_rows(
+        [{"schema": schema, "count": str(count)} for schema, count in sorted(counter.items())],
+        ["schema", "count"],
+    )
+
+
+def speed_diagnostics_summary(rows: list[dict[str, str]]) -> list[str]:
+    out = []
+    for mode, group in sorted(group_rows(rows, "mode").items()):
+        out.append(
+            {
+                "mode": mode,
+                "p50_wall_sec": fmt(percentile([to_float(row.get("wall_clock_sec")) for row in group], 50)),
+                "p90_wall_sec": fmt(percentile([to_float(row.get("wall_clock_sec")) for row in group], 90)),
+                "p50_queue_sec": fmt(percentile([to_float(row.get("queue_wait_sec")) for row in group], 50)),
+                "p90_provider_wait_sec": fmt(percentile([to_float(row.get("provider_wait_sec")) for row in group], 90)),
+                "p50_acceptance_oracle_sec": fmt(percentile([to_float(row.get("acceptance_oracle_sec")) for row in group], 50)),
+                "provider_limit": most_common(group, "provider_limit"),
+                "parallel_limit": most_common(group, "parallel_limit"),
+                "lane": most_common(group, "scheduler_lane"),
+            }
+        )
+    lines = ["## Speed Diagnostics", ""]
+    if not out:
+        return lines + ["No speed diagnostics.", ""]
+    return lines + table_rows(
+        out,
+        [
+            "mode",
+            "p50_wall_sec",
+            "p90_wall_sec",
+            "p50_queue_sec",
+            "p90_provider_wait_sec",
+            "p50_acceptance_oracle_sec",
+            "provider_limit",
+            "parallel_limit",
+            "lane",
+        ],
+    )
 
 
 def capability_contract_outcomes(rows: list[dict[str, str]]) -> list[str]:
@@ -377,6 +428,17 @@ def additional_plan_metric_rankings(rows: list[dict[str, str]]) -> list[str]:
         "execution_contract_adherence_raw_score",
         "execution_contract_adherence_score",
         "execution_contract_min_subscore",
+        "build_verifier_completion_score",
+        "dependency_setup_boundary_score",
+        "dependency_setup_bridge_score",
+        "build_verifier_lifecycle_score",
+        "profile_repair_symmetry_score",
+        "step_runtime_bridge_score",
+        "repair_target_followthrough_score",
+        "plan_run_success_predictor",
+        "repair_target_resolution_score",
+        "repair_stagnation_score",
+        "profile_static_vs_build_gap_score",
         "step_obligation_scope_score",
         "phase_completion_score",
         "phase_plan_validity_score",
@@ -865,7 +927,18 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
     metrics = [
         ("success_rate", success_rate(base), success_rate(exp)),
         ("acceptance_success_rate", acceptance_rate(base), acceptance_rate(exp)),
+        ("capability_acceptance_success_rate", capability_acceptance_rate(base), capability_acceptance_rate(exp)),
         ("acceptance_false_positive_count", false_positive_count(base), false_positive_count(exp)),
+        (
+            "p50_wall_sec",
+            percentile([to_float(r.get("wall_clock_sec")) for r in base], 50),
+            percentile([to_float(r.get("wall_clock_sec")) for r in exp], 50),
+        ),
+        (
+            "p90_provider_wait_sec",
+            percentile([to_float(r.get("provider_wait_sec")) for r in base], 90),
+            percentile([to_float(r.get("provider_wait_sec")) for r in exp], 90),
+        ),
         (
             "plan_output_adherence_score_avg",
             mean([to_float(r.get("plan_output_adherence_score")) for r in base]),
@@ -986,6 +1059,51 @@ def compare_summaries(baseline: Path, experiment: Path) -> str:
             "build_verify_pass_score_avg",
             mean([to_float(r.get("build_verify_pass_score")) for r in base]),
             mean([to_float(r.get("build_verify_pass_score")) for r in exp]),
+        ),
+        (
+            "build_verifier_completion_score_avg",
+            mean([to_float(r.get("build_verifier_completion_score")) for r in base]),
+            mean([to_float(r.get("build_verifier_completion_score")) for r in exp]),
+        ),
+        (
+            "dependency_setup_boundary_score_avg",
+            mean([to_float(r.get("dependency_setup_boundary_score")) for r in base]),
+            mean([to_float(r.get("dependency_setup_boundary_score")) for r in exp]),
+        ),
+        (
+            "dependency_setup_bridge_score_avg",
+            mean([to_float(r.get("dependency_setup_bridge_score")) for r in base]),
+            mean([to_float(r.get("dependency_setup_bridge_score")) for r in exp]),
+        ),
+        (
+            "build_verifier_lifecycle_score_avg",
+            mean([to_float(r.get("build_verifier_lifecycle_score")) for r in base]),
+            mean([to_float(r.get("build_verifier_lifecycle_score")) for r in exp]),
+        ),
+        (
+            "profile_repair_symmetry_score_avg",
+            mean([to_float(r.get("profile_repair_symmetry_score")) for r in base]),
+            mean([to_float(r.get("profile_repair_symmetry_score")) for r in exp]),
+        ),
+        (
+            "step_runtime_bridge_score_avg",
+            mean([to_float(r.get("step_runtime_bridge_score")) for r in base]),
+            mean([to_float(r.get("step_runtime_bridge_score")) for r in exp]),
+        ),
+        (
+            "repair_target_followthrough_score_avg",
+            mean([to_float(r.get("repair_target_followthrough_score")) for r in base]),
+            mean([to_float(r.get("repair_target_followthrough_score")) for r in exp]),
+        ),
+        (
+            "plan_run_success_predictor_avg",
+            mean([to_float(r.get("plan_run_success_predictor")) for r in base]),
+            mean([to_float(r.get("plan_run_success_predictor")) for r in exp]),
+        ),
+        (
+            "repair_target_resolution_score_avg",
+            mean([to_float(r.get("repair_target_resolution_score")) for r in base]),
+            mean([to_float(r.get("repair_target_resolution_score")) for r in exp]),
         ),
         (
             "build_repair_effectiveness_score_avg",
@@ -1168,6 +1286,13 @@ def acceptance_rate(rows: list[dict[str, str]]) -> float | None:
     return 100.0 * sum(1 for row in scoped if row.get("acceptance_success") == "true") / len(scoped)
 
 
+def capability_acceptance_rate(rows: list[dict[str, str]]) -> float | None:
+    scoped = [row for row in rows if row.get("capability_acceptance_success") not in {"", None}]
+    if not scoped:
+        return None
+    return 100.0 * sum(1 for row in scoped if row.get("capability_acceptance_success") == "true") / len(scoped)
+
+
 def false_positive_count(rows: list[dict[str, str]]) -> float:
     return float(sum(1 for row in rows if row.get("acceptance_false_positive") == "true"))
 
@@ -1188,6 +1313,13 @@ def acceptance_count_cell(rows: list[dict[str, str]]) -> str:
     if not scoped:
         return "n/a"
     return f"{sum(1 for row in scoped if row.get('acceptance_success') == 'true')}/{len(scoped)}"
+
+
+def capability_acceptance_count_cell(rows: list[dict[str, str]]) -> str:
+    scoped = [row for row in rows if row.get("capability_acceptance_success") not in {"", None}]
+    if not scoped:
+        return "n/a"
+    return f"{sum(1 for row in scoped if row.get('capability_acceptance_success') == 'true')}/{len(scoped)}"
 
 
 def valid_plan_count_cell(rows: list[dict[str, str]]) -> str:
@@ -1222,6 +1354,13 @@ def group_rows(rows: list[dict[str, str]], key: str) -> dict[str, list[dict[str,
     return groups
 
 
+def most_common(rows: list[dict[str, str]], key: str) -> str:
+    counter = Counter(str(row.get(key, "")) for row in rows if row.get(key) not in {"", None})
+    if not counter:
+        return ""
+    return counter.most_common(1)[0][0]
+
+
 def capability_cell(row: dict[str, str]) -> str:
     extras = parse_extras(row)
     return str(capability_failure_included(str(extras.get("failure_kind", "")))).lower()
@@ -1230,6 +1369,14 @@ def capability_cell(row: dict[str, str]) -> str:
 def split_reasons(raw: str | None) -> list[str]:
     if not raw:
         return []
+    text = str(raw)
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(part) for part in parsed if str(part)]
     return [part for part in str(raw).split(";") if part]
 
 

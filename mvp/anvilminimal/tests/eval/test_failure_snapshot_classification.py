@@ -244,6 +244,27 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
         )
         self.assertEqual(stderr["failure_kind"], "deferred_verify_requirement_pending")
 
+    def test_classifies_build_dependency_boundary_failure(self):
+        classified = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "dependency_setup_missing",
+                    "repair_target": "dependency_setup",
+                    "build_verifier_statuses": ["npm run build:dependency_missing"],
+                }
+            ]
+        )
+        self.assertEqual(classified["failure_kind"], "dependency_setup_missing")
+        self.assertEqual(classified["repair_target"], "dependency_setup")
+        self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
+        stderr = classify_stderr(
+            "error: completion contract verify failed after 1 attempts: dependency_setup_missing: node_modules/.bin/next missing for Next.js build",
+            rc=1,
+        )
+        self.assertEqual(stderr["failure_kind"], "dependency_setup_missing")
+
     def test_classifies_repair_progress_from_events(self):
         classified = classify_events(
             [

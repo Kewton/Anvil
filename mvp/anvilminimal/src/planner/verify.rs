@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::minimal_loop::build_verifier::{self, BuildVerifierStatus};
+use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::planner::step_plan::{ExpectedResult, PlanStep};
 use crate::tools::path_guard::{resolve_existing, validate_workspace_relative};
 
@@ -161,6 +163,14 @@ impl VerificationReport {
 }
 
 pub fn verify_step(root: &Path, step: &PlanStep) -> VerificationReport {
+    verify_step_with_setup(root, step, NodeDependencySetupAuthority::None)
+}
+
+pub fn verify_step_with_setup(
+    root: &Path,
+    step: &PlanStep,
+    setup_authority: NodeDependencySetupAuthority,
+) -> VerificationReport {
     let mut report = VerificationReport::pass();
     for path in &step.expected_paths {
         if resolve_existing(root, path).is_err() {
@@ -173,6 +183,52 @@ pub fn verify_step(root: &Path, step: &PlanStep) -> VerificationReport {
             continue;
         }
         if is_nextjs_build_command(command) && !root.join("node_modules/.bin/next").is_file() {
+            if setup_authority.allows_setup()
+                && let Some(requirement) = build_verifier::requirement_from_deferred(
+                    command,
+                    Some("nextjs"),
+                    "step verify requires Next.js dependencies",
+                    setup_authority.as_str(),
+                    "required",
+                )
+            {
+                let lifecycle = build_verifier::observe_requirement_lifecycle(
+                    root,
+                    &requirement,
+                    setup_authority,
+                );
+                let observation = lifecycle.final_observation();
+                match observation.status {
+                    BuildVerifierStatus::Passed => {
+                        continue;
+                    }
+                    BuildVerifierStatus::DependencyMissing => {
+                        report.push_dependency_missing(format!(
+                            "dependency_setup_missing: {}",
+                            lifecycle.final_reason
+                        ));
+                    }
+                    BuildVerifierStatus::PolicyRejected => {
+                        report.push_command_failure(
+                            command.clone(),
+                            format!("build_verify_policy_rejected: {}", lifecycle.final_reason),
+                        );
+                    }
+                    BuildVerifierStatus::Blocked => {
+                        report.push_profile_failure(format!(
+                            "build_verify_blocked: command `{}` reason `{}`",
+                            command, lifecycle.final_reason
+                        ));
+                    }
+                    BuildVerifierStatus::Failed => {
+                        report.push_command_failure(
+                            command.clone(),
+                            format!("build_verify_failed: {}", lifecycle.final_reason),
+                        );
+                    }
+                }
+                continue;
+            }
             report.push_dependency_missing("node_modules/.bin/next missing for Next.js build");
             continue;
         }
@@ -299,6 +355,7 @@ fn is_nextjs_build_command(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
     lower == "npm run build"
         || lower.starts_with("npm run build ")
+        || lower.contains("next build")
         || lower == "pnpm build"
         || lower.starts_with("pnpm build ")
         || lower == "yarn build"

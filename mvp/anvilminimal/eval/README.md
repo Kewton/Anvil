@@ -174,6 +174,25 @@ actually close through the minimal loop:
 - `build_verify_pass_score`: whether a strong build verify such as
   `npm run build`, `pnpm build`, `yarn build`, `cargo build`, or `tsc` passed
   in the completion contract.
+- `build_verifier_completion_score`: whether a required build verifier reached
+  a real terminal state. Passing build verification scores highest; dependency
+  missing, policy rejection, blocked execution, and compile failure are kept as
+  distinct lower-scored states. This score is derived from runtime events and
+  is not read by the runtime.
+- `dependency_setup_boundary_score`: whether dependency setup was correctly
+  separated from build verification. A missing `node_modules/.bin/next` before
+  a Next.js build is treated as an explicit setup boundary, not as a successful
+  build or as an arbitrary implementation failure.
+- `repair_target_resolution_score`: whether bounded repair has a structured
+  target such as dependency setup, package config, framework config,
+  implementation, or test/evidence. This is diagnostic; it does not make the
+  runtime choose success.
+- `repair_stagnation_score`: whether verifier repair progressed instead of
+  repeating inspection-only or no-edit turns.
+- `profile_static_vs_build_gap_score`: whether a static profile pass was backed
+  by actual build verification when a build verifier was required. This helps
+  catch false positives where files and profile shape look valid but the app
+  was never built.
 - `build_repair_effectiveness_score`: whether bounded repair after a build
   verify failure edited relevant files and improved the deterministic
   diagnostic before the repair cap was exhausted.
@@ -542,3 +561,68 @@ python3 -m unittest discover -s tests/eval -p 'test_*.py'
 Live provider/network checks are not part of unit tests. Run
 `eval-preflight.py --live-provider-smoke all` before cloud eval to verify the
 current model/endpoint/tool-declaration contract.
+
+## Runtime Bridge Diagnostics
+
+Phase 019 adds bridge diagnostics for cases where a plan is structurally good
+but fails while moving through dependency setup, build verification, or repair.
+
+- `dependency_setup_bridge_score`: whether runtime-owned dependency setup was
+  explicitly authorized, bounded, and completed without mixing package managers.
+- `build_verifier_lifecycle_score`: whether required build verification moved
+  from missing verifier to setup to actual build execution and pass/fail.
+- `profile_repair_symmetry_score`: whether profile verification failures remain
+  repairable by the same profile auto-repair contract.
+- `step_runtime_bridge_score`: whether plan-run step verification could bridge
+  setup/build boundaries without weakening verify commands.
+- `repair_target_followthrough_score`: whether repair edits touched files that
+  match the classified repair target.
+- `plan_run_success_predictor`: a capped diagnostic score that combines runtime
+  friction, finalization, execution-contract adherence, setup bridge, verifier
+  lifecycle, step bridge, and repair follow-through. It is not a replacement for
+  acceptance success.
+
+`verifier_bootstrap_state` appears in `completion_verify` events to distinguish
+`dependency_setup_required`, `dependency_setup_blocked`,
+`dependency_setup_failed`, `verifier_ready`, `verifier_passed`, and
+`verifier_failed`. Network/setup failures should be analyzed as bridge/runtime
+diagnostics, not as clean plan-quality failures.
+
+## Phase 020 Acceptance And Speed Diagnostics
+
+Use `speed-cloud-5x` only for cloud-only speed runs. It raises the provider lane
+limit to 5 and keeps local LLM profiles out of the matrix.
+
+```bash
+python3 scripts/eval-run.py \
+  --suite eval/suites/mvp-smoke.yaml \
+  --model-profile speed-cloud-5x \
+  --modes minimal-loop,step-plan,plan-run,ultra-plan-run \
+  --runs 3 \
+  --parallel 5 \
+  --provider-limit 5 \
+  --binary target/release/anvilminimal \
+  --binary-kind anvilminimal
+```
+
+If provider HTTP/rate-limit failures increase, rerun the same matrix with
+`--provider-limit 3` or `--provider-limit 4` and compare provider error rates.
+
+For source `anvildev`, pass `--binary-kind anvildev`; do not pass
+`--engine minimal` to `eval-run.py` itself. The harness adds `--engine minimal`
+to the child command.
+
+New summary/report fields separate process success from accepted artifact
+success:
+
+- `capability_acceptance_success`
+- `acceptance_failure_reasons`
+- `eval_schema_version`
+- `provider_wait_sec`
+- `wall_clock_sec`
+- `acceptance_oracle_sec`
+- `provider_limit`
+- `parallel_limit`
+
+Acceptance gates and predictor scores are intentionally separate. A predictor
+score can explain risk, but it does not force acceptance success.

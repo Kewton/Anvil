@@ -18,6 +18,7 @@ use crate::tools::registry::{
 use crate::tui::status::UiStatus;
 use crate::tui::{InteractionUi, NOOP_UI};
 
+use super::build_verifier::{BuildVerifierLifecycleObservation, BuildVerifierStatus};
 use super::compact::compact_if_needed;
 use super::completion::{CompletionContract, format_verify_feedback};
 use super::import_scan::{format_missing_import_feedback, scan_relative_imports};
@@ -25,6 +26,8 @@ use super::prompt::{ToolPromptMode, build_request_messages};
 use super::repair_progress::{
     RepairProgressVerdict, VerificationSignature, classify_repair_progress,
 };
+use super::repair_target::{RepairTarget, classify_repair_target};
+use super::verifier_bootstrap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunStopReason {
@@ -188,6 +191,7 @@ impl RunSessionStepKind {
 #[derive(Debug, Default)]
 struct VerifyRepairState {
     pending_signature: Option<VerificationSignature>,
+    pending_target: Option<RepairTarget>,
     no_edit_turns: usize,
 }
 
@@ -195,6 +199,7 @@ struct VerifyRepairState {
 struct VerifyFailureFeedback {
     feedback: String,
     signature: VerificationSignature,
+    target: RepairTarget,
 }
 
 #[derive(Debug, Default)]
@@ -601,6 +606,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                         session.messages.pop();
                         last_blocking_reason = Some("completion verify failed".to_string());
                         verify_repair_state.pending_signature = Some(feedback.signature);
+                        verify_repair_state.pending_target = Some(feedback.target);
                         verify_repair_state.no_edit_turns = 0;
                         pending_feedback = Some(feedback.feedback);
                         continue;
@@ -837,6 +843,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     Ok(Some(feedback)) => {
                         last_blocking_reason = Some("completion verify failed".to_string());
                         verify_repair_state.pending_signature = Some(feedback.signature);
+                        verify_repair_state.pending_target = Some(feedback.target);
                         verify_repair_state.no_edit_turns = 0;
                         pending_feedback = Some(feedback.feedback);
                         continue;
@@ -895,17 +902,15 @@ pub(crate) fn run_session_with_outcome_with_options(
     } else {
         "required_artifacts_missing"
     };
-    eval_events::emit(
-        config.eval_events_path.as_deref(),
-        json!({
+    let loop_stop_event = json!({
             "event": "loop_stop",
             "reason": reason,
             "missing_paths": missing,
             "verify_attempts": verify_attempts,
             "last_blocking_reason": last_blocking_reason,
             "last_provider_error": last_provider_error.as_deref().map(eval_events::body_snippet),
-        }),
-    );
+    });
+    eval_events::emit(config.eval_events_path.as_deref(), loop_stop_event);
     bail!(
         "minimal loop reached max_iterations ({})",
         config.max_iterations
@@ -1006,10 +1011,38 @@ fn verify_completion_contract(
     had_edit: bool,
 ) -> anyhow::Result<Option<VerifyFailureFeedback>> {
     *verify_attempts += 1;
-    let report = contract.verify_with_goal(root, goal);
+    let (report, build_verifier_lifecycles) = contract.verify_with_goal_observed(root, goal);
+    let build_verifier_observations = build_verifier_lifecycles
+        .iter()
+        .map(|lifecycle| lifecycle.final_observation().clone())
+        .collect::<Vec<_>>();
     let runtime_acceptance = contract.runtime_acceptance_report(root);
     let ok = report.is_pass();
     let (signature, verdict) = classify_repair_progress(previous_signature, &report, had_edit);
+    let repair_target = classify_repair_target(&report);
+    let build_verifier_required = build_verifier_lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.requirement.required_for_completion);
+    let build_verifier_attempted = build_verifier_lifecycles.iter().any(|lifecycle| {
+        lifecycle.before_setup.attempted
+            || lifecycle
+                .after_setup
+                .as_ref()
+                .is_some_and(|observation| observation.attempted)
+            || lifecycle
+                .setup
+                .as_ref()
+                .is_some_and(|setup| setup.attempted)
+    });
+    let build_verifier_statuses = build_verifier_observations
+        .iter()
+        .map(|observation| format!("{}:{}", observation.command, observation.status_str()))
+        .collect::<Vec<_>>();
+    let dependency_setup_status = dependency_setup_status(&build_verifier_lifecycles);
+    let verifier_bootstrap_state = verifier_bootstrap::state_from_lifecycles(
+        build_verifier_required,
+        &build_verifier_lifecycles,
+    );
     eval_events::emit(
         eval_events_path,
         json!({
@@ -1030,6 +1063,14 @@ fn verify_completion_contract(
             "runtime_acceptance_passed": runtime_acceptance.passed,
             "runtime_acceptance_primary_reason": eval_events::body_snippet(&runtime_acceptance.primary_reason),
             "deferred_verify_requirements": contract.deferred_status_summary(root, goal),
+            "build_verifier_required": build_verifier_required,
+            "build_verifier_attempted": build_verifier_attempted,
+            "build_verifier_statuses": build_verifier_statuses,
+            "build_verifier_observations": build_verifier_observations.clone(),
+            "build_verifier_lifecycle": build_verifier_lifecycles.clone(),
+            "dependency_setup_status": dependency_setup_status,
+            "verifier_bootstrap_state": verifier_bootstrap_state.as_str(),
+            "repair_target": repair_target.as_str(),
             "primary_reason": eval_events::body_snippet(&report.primary_reason()),
             "failure_signature": signature.label(),
             "repair_progress": verdict.as_str(),
@@ -1057,8 +1098,13 @@ fn verify_completion_contract(
             contract.verify_repair_cap
         };
     if *verify_attempts >= effective_repair_cap {
-        let stop_reason =
-            terminal_verify_stop_reason(&report, &signature, previous_signature, verdict);
+        let stop_reason = terminal_verify_stop_reason(
+            &report,
+            &signature,
+            previous_signature,
+            verdict,
+            repair_target,
+        );
         eval_events::emit(
             eval_events_path,
             json!({
@@ -1071,6 +1117,14 @@ fn verify_completion_contract(
                 "weak_evidence": runtime_acceptance.weak_evidence.clone(),
                 "repair_progress": verdict.as_str(),
                 "failure_signature": signature.label(),
+                "repair_target": repair_target.as_str(),
+                "dependency_setup_status": dependency_setup_status,
+                "verifier_bootstrap_state": verifier_bootstrap_state.as_str(),
+                "build_verifier_lifecycle": build_verifier_lifecycles.clone(),
+                "build_verifier_statuses": build_verifier_observations
+                    .iter()
+                    .map(|observation| format!("{}:{}", observation.command, observation.status_str()))
+                    .collect::<Vec<_>>(),
             }),
         );
         bail!(
@@ -1082,7 +1136,51 @@ fn verify_completion_contract(
     Ok(Some(VerifyFailureFeedback {
         feedback: format_verify_feedback(&report),
         signature,
+        target: repair_target,
     }))
+}
+
+fn dependency_setup_status(lifecycles: &[BuildVerifierLifecycleObservation]) -> &'static str {
+    if lifecycles.is_empty() {
+        return "not_required";
+    }
+    if lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.setup_status() == "passed")
+    {
+        return "ready";
+    }
+    if lifecycles
+        .iter()
+        .any(|lifecycle| matches!(lifecycle.setup_status(), "failed" | "timed_out"))
+    {
+        return "failed";
+    }
+    if lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.setup_status() == "blocked")
+    {
+        return "blocked";
+    }
+    if lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.final_status == BuildVerifierStatus::DependencyMissing)
+    {
+        return "missing";
+    }
+    if lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.final_status == BuildVerifierStatus::PolicyRejected)
+    {
+        return "policy_rejected";
+    }
+    if lifecycles
+        .iter()
+        .all(|lifecycle| lifecycle.final_status == BuildVerifierStatus::Passed)
+    {
+        return "ready";
+    }
+    "blocked"
 }
 
 fn handle_verify_repair_no_edit(
@@ -1100,6 +1198,7 @@ fn handle_verify_repair_no_edit(
             "has_edit": false,
             "inspect_only": state.no_edit_turns == 1,
             "failure_signature": signature.label(),
+            "repair_target": state.pending_target.map(RepairTarget::as_str).unwrap_or(""),
             "no_edit_turns": state.no_edit_turns,
         }),
     );
@@ -1110,6 +1209,7 @@ fn handle_verify_repair_no_edit(
                 "event": "loop_stop",
                 "reason": "verify_repair_no_change",
                 "failure_signature": signature.label(),
+                "repair_target": state.pending_target.map(RepairTarget::as_str).unwrap_or(""),
                 "no_edit_turns": state.no_edit_turns,
             }),
         );
@@ -1127,7 +1227,31 @@ fn terminal_verify_stop_reason(
     signature: &VerificationSignature,
     previous_signature: Option<&VerificationSignature>,
     verdict: RepairProgressVerdict,
+    repair_target: RepairTarget,
 ) -> String {
+    if !report.dependency_missing.is_empty() {
+        return "dependency_setup_missing".to_string();
+    }
+    if report.command_failures.iter().any(|failure| {
+        failure.reason.contains("build_verify_policy_rejected")
+            || failure.reason.contains("verify command may not")
+    }) {
+        return "verify_command_policy_error".to_string();
+    }
+    if report.command_failures.iter().any(|failure| {
+        failure.reason.contains("build_verify_failed")
+            || failure.command.contains("npm run build")
+            || failure.command.contains("next build")
+    }) {
+        return "build_verify_failed".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("build_verify_blocked"))
+    {
+        return "build_verify_blocked".to_string();
+    }
     if report
         .profile_failures
         .iter()
@@ -1174,6 +1298,9 @@ fn terminal_verify_stop_reason(
             RepairProgressVerdict::Unchanged
             | RepairProgressVerdict::Regressed
             | RepairProgressVerdict::Invalid => {
+                if repair_target == RepairTarget::DependencySetup {
+                    return "dependency_setup_blocked".to_string();
+                }
                 return format!("verify_repair_progress_{}", verdict.as_str());
             }
             RepairProgressVerdict::Passed | RepairProgressVerdict::Improved => {}

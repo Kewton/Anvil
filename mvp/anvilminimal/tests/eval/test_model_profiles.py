@@ -24,6 +24,13 @@ class ModelProfileTest(unittest.TestCase):
         self.assertFalse(profiles["speed-cloud"]["runs"][0]["local_llm_used"])
         self.assertEqual(warnings, [])
 
+    def test_load_speed_cloud_5x(self):
+        profiles, _ = load_model_profiles(ROOT / "eval/model_profiles.yaml")
+        self.assertIn("speed-cloud-5x", profiles)
+        self.assertEqual(profiles["speed-cloud-5x"]["provider_limit"], 5)
+        self.assertTrue(profiles["speed-cloud-5x"]["parallel"])
+        self.assertFalse(any(run["local_llm_used"] for run in profiles["speed-cloud-5x"]["runs"]))
+
     def test_cli_args(self):
         profiles, _ = load_model_profiles(ROOT / "eval/model_profiles.yaml")
         run = profiles["speed-cloud"]["runs"][0]
@@ -34,4 +41,3 @@ class ModelProfileTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

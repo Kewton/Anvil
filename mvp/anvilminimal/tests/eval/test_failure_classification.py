@@ -62,6 +62,36 @@ class FailureClassificationTest(unittest.TestCase):
         self.assertEqual(failure_layer_for_kind("tool_validation_error"), "runtime")
         self.assertEqual(capability_failure_included("tool_validation_error"), True)
 
+    def test_dependency_setup_missing_loop_stop_can_classify_blocked_setup(self):
+        result = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "dependency_setup_missing",
+                    "dependency_setup_status": "blocked",
+                    "verifier_bootstrap_state": "dependency_setup_blocked",
+                }
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "dependency_setup_blocked")
+        self.assertEqual(failure_layer_for_kind(result["failure_kind"]), "bridge")
+
+    def test_build_failed_after_setup_is_distinct_from_plain_build_failure(self):
+        result = classify_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "reason": "build_verify_failed",
+                    "build_verifier_lifecycle": [
+                        {
+                            "setup": {"status": "passed"},
+                            "final_status": "failed",
+                        }
+                    ],
+                }
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "build_after_setup_failed")
 
 if __name__ == "__main__":
     unittest.main()

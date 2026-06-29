@@ -156,6 +156,7 @@ def evaluate_source_semantics(
     missing = [capability for capability, ok in capability_results.items() if not ok]
     static_title = detects_static_title_only(text, contract)
     placeholder_tokens = detects_placeholder_tokens(text, contract)
+    connection = interactive_connection_evidence(text, contract)
     hit_count = len(required) - len(missing)
     score = round(100.0 * hit_count / max(1, len(required)), 1)
     failure_kind = ""
@@ -165,9 +166,14 @@ def evaluate_source_semantics(
     elif static_title:
         score = min(score, 35.0)
         failure_kind = "static_title_only"
+    elif connection.get("applicable") and not connection.get("connected"):
+        score = min(score, float(connection.get("score_cap", 55.0)))
+        failure_kind = str(connection.get("failure_kind", "interactive_connection_missing"))
     elif missing:
         failure_kind = "missing_required_capabilities"
-    success = not missing and not static_title and not placeholder_tokens
+    success = not missing and not static_title and not placeholder_tokens and not (
+        connection.get("applicable") and not connection.get("connected")
+    )
     return {
         "source_semantic_success": success,
         "source_semantic_score": score,
@@ -180,6 +186,7 @@ def evaluate_source_semantics(
             "missing_capabilities": missing,
             "static_title_only": static_title,
             "placeholder_tokens": placeholder_tokens,
+            "interactive_connection": connection,
         },
     }
 
@@ -219,6 +226,102 @@ def collect_source_corpus(workdir: Path, scenario: dict[str, Any]) -> list[tuple
 def capability_detected(capability: str, text: str) -> bool:
     patterns = CAPABILITY_PATTERNS.get(capability, [])
     return any(pattern in text for pattern in patterns)
+
+
+def interactive_connection_evidence(text: str, contract: AcceptanceContract) -> dict[str, Any]:
+    if contract.category not in {"interactive-game", "interactive-web-app"}:
+        return {"applicable": False}
+    signals = {
+        "input_subscription": has_pattern(
+            text,
+            [
+                r"addeventlistener\s*\(\s*['\"](?:keydown|keyup|click|pointer|mouse)",
+                r"\bon(?:key|click|submit|change)",
+                r"keyboardevent",
+            ],
+        ),
+        "state_mutation": has_pattern(
+            text,
+            [
+                r"\buse(?:state|reducer)\b",
+                r"\bset[A-Z][A-Za-z0-9_]*\s*\(",
+                r"\bdispatch\s*\(",
+                r"\.current\s*=",
+                r"\+=|-=|\+\+|--",
+            ],
+        ),
+        "render_or_tick": has_pattern(
+            text,
+            [
+                r"requestanimationframe",
+                r"setinterval\s*\(",
+                r"settimeout\s*\(",
+                r"\bcanvas\b",
+                r"getcontext\s*\(",
+                r"\bmap\s*\(",
+            ],
+        ),
+        "domain_entities": has_pattern(
+            text,
+            [
+                r"\bplayer\b",
+                r"\benem(?:y|ies)\b",
+                r"\binvader",
+                r"\bbullet",
+                r"\bprojectile",
+                r"\bscore\b",
+                r"\blives?\b",
+            ],
+        ),
+        "progression_update": has_pattern(
+            text,
+            [
+                r"setscore\s*\(",
+                r"setlives\s*\(",
+                r"setgamestate\s*\(",
+                r"\bscore\s*(?:\+|=)",
+                r"\blives?\s*(?:-|=)",
+                r"gameover",
+            ],
+        ),
+        "rule_or_collision": has_pattern(
+            text,
+            [
+                r"\bcollid",
+                r"\bhit\b",
+                r"\bintersect",
+                r"\boverlap",
+                r"\bdamage",
+                r"\.x\s*[<>]=?\s*[^&|;\n]+\.x",
+                r"\.y\s*[<>]=?\s*[^&|;\n]+\.y",
+            ],
+        ),
+    }
+    required = 4 if contract.category == "interactive-game" else 2
+    if contract.category == "interactive-game" and not signals["input_subscription"]:
+        return {
+            "applicable": True,
+            "connected": False,
+            "failure_kind": "interactive_input_not_connected",
+            "score_cap": 50.0,
+            "required_signal_count": required,
+            "signals": signals,
+        }
+    count = sum(1 for value in signals.values() if value)
+    connected = count >= required
+    return {
+        "applicable": True,
+        "connected": connected,
+        "failure_kind": "" if connected else "interactive_connection_missing",
+        "score_cap": 55.0,
+        "required_signal_count": required,
+        "signal_count": count,
+        "signals": signals,
+    }
+
+
+def has_pattern(text: str, patterns: list[str]) -> bool:
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
 
 
 def detects_static_title_only(text: str, contract: AcceptanceContract) -> bool:

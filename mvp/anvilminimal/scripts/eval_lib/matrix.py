@@ -142,6 +142,8 @@ def render_command(
             *cli_model_args(main, planner),
             "--cwd",
             str(workdir),
+            "--state-dir",
+            str(workdir / ".anvil" / "state"),
         ]
     else:
         raise ValueError(f"unknown binary kind: {binary_kind}")

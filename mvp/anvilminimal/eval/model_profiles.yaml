@@ -9,6 +9,16 @@ profiles:
         planner: gemini:gemini-3.5-flash
       - main: gemini:gemini-3.1-flash-lite
         planner: openai:gpt-5.4-mini
+  speed-cloud-5x:
+    description: Cloud-only high-throughput profile. No local LLM is used; provider lanes default to 5.
+    parallel: true
+    provider_limit: 5
+    chat_retries: 2
+    runs:
+      - main: openai:gpt-5.4-mini
+        planner: gemini:gemini-3.5-flash
+      - main: gemini:gemini-3.1-flash-lite
+        planner: openai:gpt-5.4-mini
   openai-only:
     parallel: true
     provider_limit: 2

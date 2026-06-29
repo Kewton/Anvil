@@ -831,11 +831,6 @@ fn dependency_coherence_failure(package: &Value) -> Option<String> {
     let next = dependency_version(package, "next")?;
     let react = dependency_version(package, "react")?;
     let react_dom = dependency_version(package, "react-dom")?;
-    if dependency_version_needs_repair("next", next) {
-        return Some(
-            "next dependency must use a maintained build-safe range such as ^14.2.0".to_string(),
-        );
-    }
     if dependency_version_needs_repair(
         "typescript",
         dependency_version(package, "typescript").unwrap_or(""),
@@ -887,29 +882,14 @@ fn dependency_version_needs_repair(name: &str, version: &str) -> bool {
             };
             major != 5 || version.trim() == "5.0.0"
         }
-        "@types/react" | "@types/react-dom" | "@types/node" => semver_major(version).is_none(),
-        "next" => {
-            let Some((major, minor, _patch)) = semver_triplet(version) else {
-                return true;
-            };
-            major == 14 && minor < 2
+        "@types/node" => semver_major(version).is_none_or(|major| major != 20),
+        "@types/react" | "@types/react-dom" => {
+            semver_major(version).is_none_or(|major| major != 18)
         }
-        "react" | "react-dom" => semver_major(version).is_none(),
+        "next" => semver_major(version).is_none_or(|major| major != 14),
+        "react" | "react-dom" => semver_major(version).is_none_or(|major| major != 18),
         _ => false,
     }
-}
-
-fn semver_triplet(version: &str) -> Option<(u64, u64, u64)> {
-    let trimmed = version.trim().trim_start_matches(['^', '~', '=', 'v']);
-    let mut parts = trimmed
-        .split(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
-        .next()
-        .unwrap_or_default()
-        .split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().unwrap_or("0").parse().ok()?;
-    let patch = parts.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
 }
 
 fn semver_major(version: &str) -> Option<u64> {
@@ -1114,18 +1094,38 @@ mod tests {
     }
 
     #[test]
-    fn nextjs_rejects_legacy_14_0_dependency_range() {
+    fn repair_manifest_coherence_restores_known_good_dependency_set() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^15.0.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"5.0.0","@types/node":"^18.0.0","@types/react":"^19.0.0","@types/react-dom":"^19.0.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+
+        assert!(repair_manifest_coherence(dir.path(), "3011").unwrap());
+        let package: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(dependency_version(&package, "next"), Some("^14.2.0"));
+        assert_eq!(dependency_version(&package, "react"), Some("^18.3.0"));
+        assert_eq!(
+            dependency_version(&package, "@types/react"),
+            Some("^18.3.0")
+        );
+        assert_eq!(dependency_version(&package, "typescript"), Some("^5.5.0"));
+        assert!(verify(dir.path(), "3011").is_pass());
+    }
+
+    #[test]
+    fn nextjs_allows_legacy_14_0_dependency_range_until_build_verifier_runs() {
         let dir = complete_app();
         std::fs::write(
             dir.path().join("package.json"),
             r#"{"dependencies":{"next":"14.0.0","react":"18.2.0","react-dom":"18.2.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
         )
         .unwrap();
-        let report = verify(dir.path(), "3011");
-        assert!(matches!(
-            report.status,
-            VerifyStatus::ProfileContractFailed(reason) if reason.contains("build-safe range")
-        ));
+        assert!(verify(dir.path(), "3011").is_pass());
     }
 
     #[test]

@@ -4,10 +4,12 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::eval_events;
 use crate::minimal_loop::completion::CompletionContract;
+use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::loop_run::{
     RunSessionOptions, RunSessionStepKind, extract_requested_artifact_paths,
     run_session_with_outcome_with_options,
 };
+use crate::minimal_loop::repair_target::{classify_repair_target, repair_target_followed};
 use crate::planner::intent::detect_intent;
 use crate::planner::lint::{
     PlanLintReport, PlanQualityContext, PlanQualityReport, lint_step_plan_report,
@@ -26,7 +28,7 @@ use crate::planner::step_plan::{
     parse_step_plan, render_step_plan, repair_generated_step_plan_contract,
 };
 use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
-use crate::planner::verify::{VerificationReport, verify_step};
+use crate::planner::verify::{VerificationReport, verify_step_with_setup};
 use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
 use crate::tools::path_guard::resolve_existing;
@@ -346,10 +348,25 @@ fn run_step(
         step_options,
     )?;
     let _ = profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal)?;
-    let report = verify_step(&config.workspace_root, step);
+    let setup_authority = step_verify_setup_authority(plan, step);
+    let report = verify_step_with_setup(&config.workspace_root, step, setup_authority);
     if report.is_pass() {
         return Ok(());
     }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "step_verify_failure",
+            "step_id": step.id,
+            "repair_target": classify_repair_target(&report).as_str(),
+            "primary_reason": eval_events::body_snippet(&report.primary_reason()),
+            "missing_paths": report.missing_paths.clone(),
+            "command_failures": report.command_failures.len(),
+            "dependency_missing": report.dependency_missing.clone(),
+            "profile_failures": report.profile_failures.clone(),
+            "dependency_setup_authority": setup_authority.as_str(),
+        }),
+    );
     let mut context = RepairContext {
         overall_goal: Some(plan.goal.clone()),
         required_final_artifacts: prompt_context.required_final_artifacts.clone(),
@@ -389,7 +406,26 @@ fn run_step(
             let package_path = "package.json".to_string();
             merge_changed_files(&mut context, &[package_path]);
         }
-        let retry = verify_step(&config.workspace_root, step);
+        let retry = verify_step_with_setup(&config.workspace_root, step, setup_authority);
+        let retry_target = classify_repair_target(&retry);
+        let previous_target = classify_repair_target(&current_report);
+        let repair_target_followed = repair_target_followed(previous_target, &repair.changed_paths);
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "step_verify_repair",
+                "step_id": step.id,
+                "attempt": attempt,
+                "ok": retry.is_pass(),
+                "repair_target": retry_target.as_str(),
+                "previous_repair_target": previous_target.as_str(),
+                "repair_target_followed": repair_target_followed,
+                "primary_reason": eval_events::body_snippet(&retry.primary_reason()),
+                "changed_paths": repair.changed_paths.clone(),
+                "repair_stop_reason": repair_stop_reason.clone().unwrap_or_default(),
+                "dependency_setup_authority": setup_authority.as_str(),
+            }),
+        );
         if retry.is_pass() {
             return Ok(());
         }
@@ -417,6 +453,25 @@ fn run_step(
         step.id,
         current_report.primary_reason()
     )
+}
+
+fn step_verify_setup_authority(plan: &StepPlan, step: &PlanStep) -> NodeDependencySetupAuthority {
+    if step.step_kind() == StepKind::Setup {
+        return NodeDependencySetupAuthority::PlanSetupStep;
+    }
+    if step.step_kind() != StepKind::Verify {
+        return NodeDependencySetupAuthority::None;
+    }
+    let prior_setup_exists = plan
+        .steps
+        .iter()
+        .take_while(|candidate| candidate.id != step.id)
+        .any(|candidate| candidate.step_kind() == StepKind::Setup);
+    if prior_setup_exists {
+        NodeDependencySetupAuthority::PlanSetupStep
+    } else {
+        NodeDependencySetupAuthority::None
+    }
 }
 
 fn step_run_session_options(step: &PlanStep) -> RunSessionOptions {

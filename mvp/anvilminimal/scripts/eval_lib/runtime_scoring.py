@@ -90,6 +90,8 @@ def score_runtime_health(
         "artifact_stagnation_feedback",
         "loop_stop",
         "step_obligation_scope",
+        "step_verify_failure",
+        "step_verify_repair",
         "plan_final_contract",
         "completion_verify",
         "verify_repair_progress",
@@ -208,6 +210,13 @@ def score_runtime_health(
         run_dir=run_dir,
         mode=mode,
     )
+    build_lifecycle_scores = score_build_lifecycle(events)
+    plan_run_success_predictor = score_plan_run_success_predictor(
+        bridge_scores=bridge_scores,
+        build_lifecycle_scores=build_lifecycle_scores,
+        finalization_scores=finalization_scores,
+        runtime_friction=runtime_friction,
+    )
     ultra_scores = score_ultra_runtime_health(events, mode=mode, success=success)
     return {
         "runtime_friction_score": round(runtime_friction, 1),
@@ -219,6 +228,8 @@ def score_runtime_health(
         "plan_run_runtime_health_score": runtime_health,
         "prompt_contract_score": score_prompt_contract(events),
         **bridge_scores,
+        **build_lifecycle_scores,
+        "plan_run_success_predictor": plan_run_success_predictor,
         "step_obligation_scope_score": obligation_scope_score,
         "step_obligation_scope_violation_count": obligation_scope_violations,
         **ultra_scores,
@@ -236,6 +247,17 @@ def empty_bridge_scores() -> dict[str, str]:
         "execution_contract_adherence_score": "",
         "execution_contract_min_subscore": "",
         "execution_contract_cap_reason": "",
+        "build_verifier_completion_score": "",
+        "dependency_setup_boundary_score": "",
+        "dependency_setup_bridge_score": "",
+        "build_verifier_lifecycle_score": "",
+        "profile_repair_symmetry_score": "",
+        "step_runtime_bridge_score": "",
+        "repair_target_followthrough_score": "",
+        "plan_run_success_predictor": "",
+        "repair_target_resolution_score": "",
+        "repair_stagnation_score": "",
+        "profile_static_vs_build_gap_score": "",
     }
 
 
@@ -773,7 +795,6 @@ def empty_ultra_runtime_scores() -> dict[str, str]:
         "ultra_runtime_health_score": "",
     }
 
-
 def score_phase_completion(events: list[dict[str, Any]], *, success: bool) -> float | str:
     phase_events = [
         event
@@ -966,11 +987,313 @@ def score_build_repair(events: list[dict[str, Any]]) -> dict[str, float | str]:
     }
 
 
+def score_build_lifecycle(events: list[dict[str, Any]]) -> dict[str, float | str]:
+    completion_events = [
+        event for event in events if event.get("event") == "completion_verify"
+    ]
+    if not completion_events:
+        step_bridge = score_step_runtime_bridge(events)
+        repair_followthrough = score_repair_target_followthrough(events)
+        return {
+            "build_verifier_completion_score": "",
+            "dependency_setup_boundary_score": "",
+            "dependency_setup_bridge_score": "",
+            "build_verifier_lifecycle_score": "",
+            "profile_repair_symmetry_score": "",
+            "step_runtime_bridge_score": round(step_bridge, 1)
+            if isinstance(step_bridge, (int, float))
+            else "",
+            "repair_target_followthrough_score": round(repair_followthrough, 1)
+            if isinstance(repair_followthrough, (int, float))
+            else "",
+            "repair_target_resolution_score": "",
+            "repair_stagnation_score": "",
+            "profile_static_vs_build_gap_score": "",
+        }
+    observations = []
+    for event in completion_events:
+        for observation in event.get("build_verifier_observations", []) or []:
+            if isinstance(observation, dict):
+                observations.append(observation)
+    build_required = any(bool(event.get("build_verifier_required")) for event in completion_events)
+    build_required = build_required or bool(observations)
+    stop = next((event for event in reversed(events) if event.get("event") == "loop_stop"), {})
+    stop_reason = str(stop.get("reason", ""))
+    final_event = completion_events[-1]
+    final_ok = bool(final_event.get("ok"))
+    final_observations = [
+        observation
+        for observation in final_event.get("build_verifier_observations", []) or []
+        if isinstance(observation, dict)
+    ]
+    final_statuses = [
+        str(observation.get("status", ""))
+        for observation in final_observations
+        if observation.get("required_for_completion", True)
+    ]
+    final_lifecycles = [
+        lifecycle
+        for lifecycle in final_event.get("build_verifier_lifecycle", []) or []
+        if isinstance(lifecycle, dict)
+    ]
+    lifecycle_statuses = [
+        str(lifecycle.get("final_status", ""))
+        for lifecycle in final_lifecycles
+        if (lifecycle.get("requirement") or {}).get("required_for_completion", True)
+    ]
+    setup_statuses = [
+        str((lifecycle.get("setup") or {}).get("status", ""))
+        for lifecycle in final_lifecycles
+        if isinstance(lifecycle.get("setup"), dict)
+    ]
+    if lifecycle_statuses:
+        final_statuses = lifecycle_statuses
+
+    if not build_required:
+        build_completion: float | str = ""
+        dependency_boundary: float | str = ""
+        profile_gap: float | str = ""
+        setup_bridge: float | str = ""
+        lifecycle_score: float | str = ""
+    elif final_statuses and all(status == "passed" for status in final_statuses):
+        build_completion = 100.0
+        dependency_boundary = 100.0
+        profile_gap = 100.0
+        setup_bridge = 100.0
+        lifecycle_score = 100.0
+    elif "dependency_missing" in final_statuses:
+        build_completion = 30.0
+        dependency_boundary = 85.0
+        setup_bridge = 55.0
+        profile_gap = 70.0
+        lifecycle_score = 35.0
+    elif "policy_rejected" in final_statuses:
+        build_completion = 0.0
+        dependency_boundary = 20.0
+        setup_bridge = 20.0
+        profile_gap = 60.0
+        lifecycle_score = 10.0
+    elif "blocked" in final_statuses:
+        build_completion = 20.0
+        dependency_boundary = 60.0
+        setup_bridge = 45.0
+        profile_gap = 70.0
+        lifecycle_score = 25.0
+    elif "failed" in final_statuses:
+        build_completion = 40.0
+        dependency_boundary = 90.0
+        setup_bridge = 100.0 if "passed" in setup_statuses else 70.0
+        profile_gap = 80.0
+        lifecycle_score = 55.0 if "passed" in setup_statuses else 45.0
+    elif final_ok:
+        build_completion = 0.0
+        dependency_boundary = 0.0
+        setup_bridge = 0.0
+        profile_gap = 0.0
+        lifecycle_score = 0.0
+    else:
+        build_completion = 50.0
+        dependency_boundary = 60.0
+        setup_bridge = 60.0
+        profile_gap = 60.0
+        lifecycle_score = 50.0
+    if setup_statuses:
+        if any(status in {"failed", "timed_out"} for status in setup_statuses):
+            setup_bridge = min_score(setup_bridge, 25.0)
+        elif any(status == "blocked" for status in setup_statuses):
+            setup_bridge = min_score(setup_bridge, 45.0)
+        elif any(status == "passed" for status in setup_statuses):
+            setup_bridge = max_score(setup_bridge, 90.0)
+
+    repair_targets = [
+        str(event.get("repair_target", ""))
+        for event in completion_events
+        if event.get("repair_target")
+    ]
+    if final_ok:
+        repair_target_resolution = 100.0
+    elif stop_reason == "repair_target_misdirected":
+        repair_target_resolution = 0.0
+    elif repair_targets and repair_targets[-1] != "unknown":
+        repair_target_resolution = 70.0
+    elif repair_targets:
+        repair_target_resolution = 40.0
+    else:
+        repair_target_resolution = ""
+
+    progress_events = [
+        event for event in events if event.get("event") == "verify_repair_progress"
+    ]
+    if final_ok:
+        repair_stagnation = 100.0
+    elif stop_reason in {
+        "verify_repair_no_change",
+        "repair_stagnation",
+        "verify_repair_progress_unchanged",
+        "verify_repair_progress_regressed",
+        "verify_repair_progress_invalid",
+    }:
+        repair_stagnation = 20.0
+    elif any(str(event.get("verdict", "")) == "improved" for event in progress_events):
+        repair_stagnation = 75.0
+    elif progress_events:
+        repair_stagnation = 50.0
+    else:
+        repair_stagnation = 70.0
+
+    step_bridge = score_step_runtime_bridge(events)
+    repair_followthrough = score_repair_target_followthrough(events)
+    profile_symmetry = score_profile_repair_symmetry(completion_events, final_ok=final_ok)
+
+    return {
+        "build_verifier_completion_score": round(build_completion, 1)
+        if isinstance(build_completion, (int, float))
+        else "",
+        "dependency_setup_boundary_score": round(dependency_boundary, 1)
+        if isinstance(dependency_boundary, (int, float))
+        else "",
+        "dependency_setup_bridge_score": round(setup_bridge, 1)
+        if isinstance(setup_bridge, (int, float))
+        else "",
+        "build_verifier_lifecycle_score": round(lifecycle_score, 1)
+        if isinstance(lifecycle_score, (int, float))
+        else "",
+        "profile_repair_symmetry_score": round(profile_symmetry, 1)
+        if isinstance(profile_symmetry, (int, float))
+        else "",
+        "step_runtime_bridge_score": round(step_bridge, 1)
+        if isinstance(step_bridge, (int, float))
+        else "",
+        "repair_target_followthrough_score": round(repair_followthrough, 1)
+        if isinstance(repair_followthrough, (int, float))
+        else "",
+        "repair_target_resolution_score": round(repair_target_resolution, 1)
+        if isinstance(repair_target_resolution, (int, float))
+        else "",
+        "repair_stagnation_score": round(repair_stagnation, 1)
+        if isinstance(repair_stagnation, (int, float))
+        else "",
+        "profile_static_vs_build_gap_score": round(profile_gap, 1)
+        if isinstance(profile_gap, (int, float))
+        else "",
+    }
+
+
+def score_step_runtime_bridge(events: list[dict[str, Any]]) -> float | str:
+    step_events = [
+        event
+        for event in events
+        if event.get("event") in {"step_verify_failure", "step_verify_repair"}
+    ]
+    if not step_events:
+        return ""
+    if any(event.get("event") == "step_verify_repair" and event.get("ok") is True for event in step_events):
+        return 100.0
+    score = 80.0
+    for event in step_events:
+        dependency_missing = bool(event.get("dependency_missing"))
+        authority = str(event.get("dependency_setup_authority", ""))
+        if dependency_missing and authority in {"none", ""}:
+            score -= 35.0
+        elif dependency_missing:
+            score -= 20.0
+        if event.get("event") == "step_verify_repair" and event.get("repair_target_followed") is False:
+            score -= 25.0
+    return clamp(score)
+
+
+def score_repair_target_followthrough(events: list[dict[str, Any]]) -> float | str:
+    repair_events = [
+        event
+        for event in events
+        if event.get("event") == "step_verify_repair"
+        and event.get("repair_target_followed") is not None
+    ]
+    if not repair_events:
+        return ""
+    followed = sum(1 for event in repair_events if event.get("repair_target_followed") is True)
+    return round(100.0 * followed / len(repair_events), 1)
+
+
+def score_profile_repair_symmetry(
+    completion_events: list[dict[str, Any]], *, final_ok: bool
+) -> float | str:
+    profile_events = [
+        event
+        for event in completion_events
+        if event.get("profile_failures") or str(event.get("repair_target", "")) in {"package_config", "framework_config"}
+    ]
+    if not profile_events:
+        return ""
+    if final_ok:
+        return 100.0
+    final = profile_events[-1]
+    failures = " ".join(str(item) for item in final.get("profile_failures", []) or []).lower()
+    if any(token in failures for token in ["dependency", "typescript", "react", "next", "scripts.build"]):
+        return 35.0
+    if any(token in failures for token in ["tsconfig", "css", "layout", "use client"]):
+        return 50.0
+    return 65.0
+
+
+def score_plan_run_success_predictor(
+    *,
+    bridge_scores: dict[str, float | str],
+    build_lifecycle_scores: dict[str, float | str],
+    finalization_scores: dict[str, float | str],
+    runtime_friction: float,
+) -> float | str:
+    candidates: list[float] = [float(runtime_friction)]
+    for source, key in [
+        (bridge_scores, "execution_contract_adherence_score"),
+        (build_lifecycle_scores, "dependency_setup_bridge_score"),
+        (build_lifecycle_scores, "build_verifier_lifecycle_score"),
+        (build_lifecycle_scores, "step_runtime_bridge_score"),
+        (build_lifecycle_scores, "repair_target_followthrough_score"),
+        (finalization_scores, "finalization_score"),
+    ]:
+        value = source.get(key)
+        if isinstance(value, (int, float)):
+            candidates.append(float(value))
+    if not candidates:
+        return ""
+    mean_score = sum(candidates) / len(candidates)
+    min_score_value = min(candidates)
+    cap = 100.0
+    if min_score_value < 40.0:
+        cap = 55.0
+    elif min_score_value < 60.0:
+        cap = 70.0
+    return round(min(mean_score, cap), 1)
+
+
+def min_score(value: float | str, cap: float) -> float:
+    if isinstance(value, (int, float)):
+        return min(float(value), cap)
+    return cap
+
+
+def max_score(value: float | str, floor: float) -> float:
+    if isinstance(value, (int, float)):
+        return max(float(value), floor)
+    return floor
+
+
 def is_build_verify_event(event: dict[str, Any]) -> bool:
     text_parts = [
         str(event.get("primary_reason", "")),
         str(event.get("failure_signature", "")),
+        str(event.get("dependency_setup_status", "")),
     ]
+    if event.get("build_verifier_required"):
+        return True
+    for status in event.get("build_verifier_statuses", []) or []:
+        text_parts.append(str(status))
+    for observation in event.get("build_verifier_observations", []) or []:
+        if isinstance(observation, dict):
+            text_parts.append(str(observation.get("command", "")))
+            text_parts.append(str(observation.get("status", "")))
+            text_parts.append(str(observation.get("primary_reason", "")))
     for requirement in event.get("deferred_verify_requirements", []) or []:
         if isinstance(requirement, dict):
             text_parts.append(str(requirement.get("command", "")))

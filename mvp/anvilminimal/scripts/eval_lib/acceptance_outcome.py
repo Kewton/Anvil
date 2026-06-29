@@ -11,7 +11,7 @@ from .postcheck import load_postcheck_events
 from .source_semantic_oracle import evaluate_source_semantics
 
 
-ACCEPTANCE_ORACLE_VERSION = "acceptance-v3-plan-verify-confidence"
+ACCEPTANCE_ORACLE_VERSION = "acceptance-v4-capability-calibrated"
 
 
 def evaluate_acceptance_outcome(
@@ -59,6 +59,11 @@ def evaluate_acceptance_outcome(
     browser_result = browser_result or {"browser_success": "", "browser_failure_kind": "", "browser_details": {}}
     behavior_success = combine_behavior_success(semantic_success, browser_result.get("browser_success", ""))
     prompt_contract_success = semantic_success if semantic_success != "" else True
+    capability_acceptance_success = (
+        semantic_success is not False
+        and plan_output_success is not False
+        and browser_result.get("browser_success", "") is not False
+    )
 
     acceptance_success = (
         bool(process_success)
@@ -81,6 +86,17 @@ def evaluate_acceptance_outcome(
         post_ok=bool(postcheck.get("ok", True)),
         semantic_failure_kind=str(semantic.get("source_semantic_failure_kind", "")),
         plan_output_failure_kind=str(plan_output.get("plan_output_failure_kind", "")),
+    )
+    failure_reasons = acceptance_failure_reasons(
+        process_success=process_success,
+        artifact_success=artifact_success,
+        build_success=build_success,
+        launch_success=launch_success,
+        semantic_success=semantic_success,
+        plan_output_success=plan_output_success,
+        browser_success=browser_result.get("browser_success", ""),
+        post_ok=bool(postcheck.get("ok", True)),
+        failure_kind=failure_kind,
     )
     confidence = acceptance_confidence(
         acceptance_success=acceptance_success,
@@ -123,8 +139,10 @@ def evaluate_acceptance_outcome(
         "acceptance_confidence_score": confidence["acceptance_confidence_score"],
         "acceptance_confidence_reason": confidence["acceptance_confidence_reason"],
         "prompt_contract_success": prompt_contract_success,
+        "capability_acceptance_success": capability_acceptance_success,
         "acceptance_success": acceptance_success,
         "acceptance_failure_kind": failure_kind,
+        "acceptance_failure_reasons": failure_reasons,
         "acceptance_false_positive": false_positive,
         "oracle_gap_kind": oracle_gap_kind(false_positive, semantic, plan_output, postcheck),
         "acceptance_oracle_version": ACCEPTANCE_ORACLE_VERSION,
@@ -169,8 +187,10 @@ def not_applicable_outcome(reason: str, legacy_success: bool) -> dict[str, Any]:
         "acceptance_confidence_score": "",
         "acceptance_confidence_reason": reason,
         "prompt_contract_success": "",
+        "capability_acceptance_success": "",
         "acceptance_success": "",
         "acceptance_failure_kind": "",
+        "acceptance_failure_reasons": [],
         "acceptance_false_positive": "",
         "oracle_gap_kind": reason,
         "acceptance_oracle_version": ACCEPTANCE_ORACLE_VERSION,
@@ -247,6 +267,40 @@ def acceptance_failure_kind(
     if browser_success is False:
         return "browser_behavior_failure"
     return ""
+
+
+def acceptance_failure_reasons(
+    *,
+    process_success: bool,
+    artifact_success: bool,
+    build_success: bool | str,
+    launch_success: bool | str,
+    semantic_success: object,
+    plan_output_success: object,
+    browser_success: object,
+    post_ok: bool,
+    failure_kind: str,
+) -> list[str]:
+    reasons: list[str] = []
+    if not process_success:
+        reasons.append("process_failure")
+    if not artifact_success:
+        reasons.append("artifact_failure")
+    if not post_ok:
+        reasons.append("postcheck_failure")
+    if build_success is False:
+        reasons.append("build_failure")
+    if launch_success is False:
+        reasons.append("launch_failure")
+    if semantic_success is False:
+        reasons.append("source_semantic_failure")
+    if plan_output_success is False:
+        reasons.append("plan_output_contract_failure")
+    if browser_success is False:
+        reasons.append("browser_behavior_failure")
+    if failure_kind and failure_kind not in reasons:
+        reasons.append(failure_kind)
+    return reasons
 
 
 def oracle_gap_kind(

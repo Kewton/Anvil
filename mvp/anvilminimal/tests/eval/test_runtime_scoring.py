@@ -518,6 +518,111 @@ steps:
         self.assertLessEqual(score["execution_contract_adherence_score"], 55.0)
         self.assertIn("postcheck_stability_below_60", score["execution_contract_cap_reason"])
 
+    def test_build_lifecycle_scores_dependency_boundary_and_repair_target(self):
+        events = [
+            {
+                "event": "completion_verify",
+                "ok": False,
+                "build_verifier_required": True,
+                "build_verifier_attempted": False,
+                "dependency_setup_status": "missing",
+                "repair_target": "dependency_setup",
+                "build_verifier_observations": [
+                    {
+                        "command": "npm run build",
+                        "status": "dependency_missing",
+                        "required_for_completion": True,
+                        "requires_dependency_setup": True,
+                        "attempted": False,
+                    }
+                ],
+            },
+            {
+                "event": "loop_stop",
+                "reason": "dependency_setup_missing",
+                "repair_target": "dependency_setup",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="plan-run",
+                success=False,
+                scenario={"expected_artifacts": ["package.json"]},
+                workdir=Path(td),
+            )
+        self.assertEqual(score["build_verifier_completion_score"], 30.0)
+        self.assertEqual(score["dependency_setup_boundary_score"], 85.0)
+        self.assertEqual(score["dependency_setup_bridge_score"], 55.0)
+        self.assertEqual(score["build_verifier_lifecycle_score"], 35.0)
+        self.assertEqual(score["repair_target_resolution_score"], 70.0)
+        self.assertEqual(score["repair_stagnation_score"], 70.0)
+        self.assertEqual(score["profile_static_vs_build_gap_score"], 70.0)
+        self.assertLess(score["plan_run_success_predictor"], 80.0)
+
+    def test_build_lifecycle_scores_setup_passed_then_build_failed(self):
+        events = [
+            {
+                "event": "completion_verify",
+                "ok": False,
+                "build_verifier_required": True,
+                "dependency_setup_status": "ready",
+                "build_verifier_lifecycle": [
+                    {
+                        "requirement": {
+                            "command": "npm run build",
+                            "required_for_completion": True,
+                        },
+                        "setup": {"status": "passed"},
+                        "final_status": "failed",
+                    }
+                ],
+                "build_verifier_observations": [
+                    {
+                        "command": "npm run build",
+                        "status": "failed",
+                        "required_for_completion": True,
+                    }
+                ],
+            },
+            {"event": "loop_stop", "reason": "build_verify_failed"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="plan-run",
+                success=False,
+                scenario={"expected_artifacts": []},
+                workdir=Path(td),
+            )
+        self.assertEqual(score["dependency_setup_bridge_score"], 100.0)
+        self.assertEqual(score["build_verifier_lifecycle_score"], 55.0)
+
+    def test_step_runtime_bridge_scores_repair_followthrough(self):
+        events = [
+            {
+                "event": "step_verify_failure",
+                "dependency_missing": ["node_modules/.bin/next missing"],
+                "dependency_setup_authority": "plan_setup_step",
+            },
+            {
+                "event": "step_verify_repair",
+                "ok": False,
+                "repair_target_followed": False,
+                "dependency_setup_authority": "plan_setup_step",
+            },
+            {"event": "loop_stop", "reason": "step_verify_failure"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="plan-run",
+                success=False,
+                scenario={"expected_artifacts": []},
+                workdir=Path(td),
+            )
+        self.assertLess(score["step_runtime_bridge_score"], 80.0)
+        self.assertEqual(score["repair_target_followthrough_score"], 0.0)
 
 if __name__ == "__main__":
     unittest.main()

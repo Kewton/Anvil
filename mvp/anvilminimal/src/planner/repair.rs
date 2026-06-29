@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::minimal_loop::repair_target::classify_repair_target;
 use crate::planner::verify::VerificationReport;
 
 #[derive(Debug, Clone, Default)]
@@ -29,10 +30,14 @@ pub fn build_repair_prompt_with_context(
     report: &VerificationReport,
     context: &RepairContext,
 ) -> String {
+    let repair_target = classify_repair_target(report);
     let mut prompt = format!(
         "Repair step `{step_id}`. Verification failed: {}.\n\
+Repair target: {}. {}\n\
 Make the smallest bounded change, then stop.",
-        report.primary_reason()
+        report.primary_reason(),
+        repair_target.as_str(),
+        repair_target.guidance()
     );
     if let Some(goal) = &context.overall_goal {
         prompt.push_str("\n\nOverall goal:\n");
@@ -124,6 +129,7 @@ fn render_repair_report(
         "# Repair exhausted\n\n\
 Step: `{step_id}`\n\n\
 Primary failure: {}\n\n\
+Repair target: {}\n\n\
 ## Missing Paths\n{}\n\n\
 ## Command Failures\n{}\n\n\
 ## Dependency Missing\n{}\n\n\
@@ -141,6 +147,7 @@ Primary failure: {}\n\n\
 ## Suggested Replan\n\
 Run `/plan-run` again with the original goal and include the missing paths above as required artifacts.\n",
         report.primary_reason(),
+        classify_repair_target(report).as_str(),
         list_or_none(&report.missing_paths),
         list_or_none(
             &report
@@ -234,5 +241,6 @@ mod tests {
         assert!(prompt.contains("Verification commands for this step:"));
         assert!(prompt.contains("Expected verification result:"));
         assert!(prompt.contains("attempt 1/4"));
+        assert!(prompt.contains("Repair target:"));
     }
 }

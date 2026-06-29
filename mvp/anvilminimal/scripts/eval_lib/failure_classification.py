@@ -45,6 +45,18 @@ KNOWN_FAILURE_KINDS = {
     "weak_verification_evidence",
     "build_not_verified",
     "dependency_missing",
+    "dependency_setup_blocked",
+    "dependency_setup_failed",
+    "dependency_setup_missing",
+    "build_after_setup_failed",
+    "build_verify_blocked",
+    "build_verify_failed",
+    "verifier_missing",
+    "verifier_bootstrap_blocked",
+    "repair_target_misdirected",
+    "repair_stagnation",
+    "package_lock_stale",
+    "profile_static_build_gap",
 }
 
 PROVIDER_FAILURE_KINDS = {
@@ -66,6 +78,14 @@ BRIDGE_FAILURE_KINDS = {
     "step_obligation_scope_violation",
     "step_verify_failure",
     "deferred_verify_requirement_pending",
+    "dependency_setup_blocked",
+    "dependency_setup_failed",
+    "dependency_setup_missing",
+    "build_after_setup_failed",
+    "build_verify_blocked",
+    "verifier_missing",
+    "verifier_bootstrap_blocked",
+    "profile_static_build_gap",
 }
 POSTCHECK_FAILURE_KINDS = {"postcheck_failure"}
 ENVIRONMENT_FAILURE_KINDS = {"timeout", "diagnostic_skipped"}
@@ -87,6 +107,18 @@ def failure_layer_for_kind(kind: str | None) -> str:
         "weak_verification_evidence",
         "build_not_verified",
         "dependency_missing",
+        "dependency_setup_blocked",
+        "dependency_setup_failed",
+        "dependency_setup_missing",
+        "build_after_setup_failed",
+        "build_verify_blocked",
+        "build_verify_failed",
+        "verifier_missing",
+        "verifier_bootstrap_blocked",
+        "repair_target_misdirected",
+        "repair_stagnation",
+        "package_lock_stale",
+        "profile_static_build_gap",
     }:
         return "runtime"
     if normalized in POSTCHECK_FAILURE_KINDS:
@@ -172,6 +204,7 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             return {
                 "failure_kind": "verify_repair_no_change",
                 "last_loop_stop": "verify_repair_no_change",
+                "repair_target": event.get("repair_target", ""),
             }
         if name == "loop_stop" and event.get("reason") == "test_discovery_failure":
             return {
@@ -207,10 +240,44 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             "weak_verification_evidence",
             "build_not_verified",
             "dependency_missing",
+            "dependency_setup_blocked",
+            "dependency_setup_failed",
+            "dependency_setup_missing",
+            "build_after_setup_failed",
+            "build_verify_blocked",
+            "build_verify_failed",
+            "verifier_missing",
+            "verifier_bootstrap_blocked",
+            "repair_target_misdirected",
+            "repair_stagnation",
+            "package_lock_stale",
+            "profile_static_build_gap",
         }:
+            kind = event.get("reason")
+            if kind == "dependency_setup_missing":
+                setup_status = str(event.get("dependency_setup_status", ""))
+                verifier_state = str(event.get("verifier_bootstrap_state", ""))
+                if setup_status in {"blocked", "timed_out"}:
+                    kind = "dependency_setup_blocked"
+                elif setup_status == "failed":
+                    kind = "dependency_setup_failed"
+                elif verifier_state == "verifier_missing":
+                    kind = "verifier_missing"
+                elif verifier_state in {"dependency_setup_blocked", "dependency_setup_failed"}:
+                    kind = "verifier_bootstrap_blocked"
+            if kind == "build_verify_failed":
+                lifecycle = event.get("build_verifier_lifecycle", []) or []
+                statuses = [
+                    str((item.get("setup") or {}).get("status", ""))
+                    for item in lifecycle
+                    if isinstance(item, dict) and isinstance(item.get("setup"), dict)
+                ]
+                if "passed" in statuses:
+                    kind = "build_after_setup_failed"
             return {
-                "failure_kind": event.get("reason"),
+                "failure_kind": kind,
                 "last_loop_stop": event.get("reason", ""),
+                "repair_target": event.get("repair_target", ""),
                 "missing_capabilities": ",".join(
                     str(item) for item in event.get("missing_capabilities", []) or []
                 ),
@@ -219,6 +286,9 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 ),
                 "weak_evidence": ",".join(
                     str(item) for item in event.get("weak_evidence", []) or []
+                ),
+                "build_verifier_statuses": ",".join(
+                    str(item) for item in event.get("build_verifier_statuses", []) or []
                 ),
             }
         if name == "loop_stop" and event.get("reason") == "profile_contract_failure":
@@ -311,6 +381,14 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
     if "test_discovery_failure" in lower or "no tests ran" in lower or "ran 0 tests" in lower:
         return {"failure_kind": "test_discovery_failure"}
     if "completion contract verify failed" in lower:
+        if "dependency_setup_missing" in lower or "node_modules/.bin/next missing" in lower:
+            return {"failure_kind": "dependency_setup_missing"}
+        if "build_verify_failed" in lower:
+            return {"failure_kind": "build_verify_failed"}
+        if "build_verify_blocked" in lower:
+            return {"failure_kind": "build_verify_blocked"}
+        if "build_verify_policy_rejected" in lower or "verify command may not" in lower:
+            return {"failure_kind": "verify_command_policy_error"}
         if "missing_required_capabilities" in lower:
             return {"failure_kind": "missing_required_capabilities"}
         if "missing_required_evidence" in lower:

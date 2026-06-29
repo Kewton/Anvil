@@ -19,7 +19,17 @@ class SummarySchemaTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "summary.eval.tsv"
             write_summary(path, [{"run_id": "x", "suite": "s"}])
-            self.assertEqual(read_summary(path)[0]["run_id"], "x")
+            row = read_summary(path)[0]
+            self.assertEqual(row["run_id"], "x")
+            self.assertIn("eval_schema_version", row)
+
+    def test_legacy_summary_subset_is_read_with_schema_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "legacy.summary.eval.tsv"
+            path.write_text("run_id\tsuite\nx\ts\n", encoding="utf-8")
+            row = read_summary(path)[0]
+            self.assertEqual(row["run_id"], "x")
+            self.assertEqual(row["eval_schema_version"], "legacy")
 
     def test_compare_generates_markdown(self):
         text = compare_summaries(
@@ -30,6 +40,7 @@ class SummarySchemaTest(unittest.TestCase):
         self.assertIn("success_rate", text)
         self.assertIn("acceptance_success_rate", text)
         self.assertIn("acceptance_false_positive_count", text)
+        self.assertIn("capability_acceptance", text)
         self.assertIn("plan_output_adherence_score_avg", text)
         self.assertIn("plan_capability_contract_score_avg", text)
         self.assertIn("prompt_plan_capability_coverage_score_avg", text)
@@ -57,6 +68,15 @@ class SummarySchemaTest(unittest.TestCase):
         self.assertIn("ultra_runtime_health_score_avg", text)
         self.assertIn("phase_completion_score_avg", text)
         self.assertIn("build_verify_pass_score_avg", text)
+        self.assertIn("build_verifier_completion_score_avg", text)
+        self.assertIn("dependency_setup_boundary_score_avg", text)
+        self.assertIn("dependency_setup_bridge_score_avg", text)
+        self.assertIn("build_verifier_lifecycle_score_avg", text)
+        self.assertIn("profile_repair_symmetry_score_avg", text)
+        self.assertIn("step_runtime_bridge_score_avg", text)
+        self.assertIn("repair_target_followthrough_score_avg", text)
+        self.assertIn("plan_run_success_predictor_avg", text)
+        self.assertIn("repair_target_resolution_score_avg", text)
         self.assertIn("build_repair_effectiveness_score_avg", text)
         self.assertIn("compile_diagnostic_progress_score_avg", text)
         self.assertIn("verify_repair_edit_score_avg", text)
@@ -101,6 +121,8 @@ class SummarySchemaTest(unittest.TestCase):
             write_summary(run_root / "summary.eval.tsv", [row])
             report = generate_report(run_root)
             self.assertIn("blocking: all required runs failed", report)
+            self.assertIn("## Eval Schema", report)
+            self.assertIn("## Speed Diagnostics", report)
             self.assertIn("| tool_validation_error | 1 |", report)
             self.assertIn("verify_repair_exhausted", report)
             self.assertIn("command failed", report)

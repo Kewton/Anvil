@@ -5,9 +5,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .schema import EVAL_SCHEMA_VERSION
+
 
 SUMMARY_HEADER = [
     "run_id",
+    "eval_schema_version",
     "suite",
     "scenario",
     "size",
@@ -48,12 +51,23 @@ SUMMARY_HEADER = [
     "acceptance_confidence_score",
     "acceptance_confidence_reason",
     "prompt_contract_success",
+    "capability_acceptance_success",
     "acceptance_success",
     "acceptance_failure_kind",
+    "acceptance_failure_reasons",
     "acceptance_false_positive",
     "oracle_gap_kind",
     "acceptance_oracle_version",
     "queue_wait_sec",
+    "provider_wait_sec",
+    "port_mutex_wait_sec",
+    "scheduler_lane",
+    "serial_reason",
+    "effective_parallelism",
+    "provider_limit",
+    "parallel_limit",
+    "wall_clock_sec",
+    "acceptance_oracle_sec",
     "process_elapsed_sec",
     "exec_elapsed_sec",
     "model_elapsed_sec",
@@ -147,6 +161,17 @@ SUMMARY_HEADER = [
     "execution_contract_adherence_score",
     "execution_contract_min_subscore",
     "execution_contract_cap_reason",
+    "build_verifier_completion_score",
+    "dependency_setup_boundary_score",
+    "dependency_setup_bridge_score",
+    "build_verifier_lifecycle_score",
+    "profile_repair_symmetry_score",
+    "step_runtime_bridge_score",
+    "repair_target_followthrough_score",
+    "plan_run_success_predictor",
+    "repair_target_resolution_score",
+    "repair_stagnation_score",
+    "profile_static_vs_build_gap_score",
     "step_obligation_scope_score",
     "step_obligation_scope_violation_count",
     "phase_completion_score",
@@ -177,6 +202,7 @@ def empty_summary_row(spec: dict[str, Any]) -> dict[str, Any]:
     scenario = spec["scenario"]
     return {
         "run_id": spec["run_id"],
+        "eval_schema_version": EVAL_SCHEMA_VERSION,
         "suite": spec["suite"],
         "scenario": scenario["id"],
         "size": scenario["size"],
@@ -217,12 +243,23 @@ def empty_summary_row(spec: dict[str, Any]) -> dict[str, Any]:
         "acceptance_confidence_score": "",
         "acceptance_confidence_reason": "",
         "prompt_contract_success": "",
+        "capability_acceptance_success": "",
         "acceptance_success": "",
         "acceptance_failure_kind": "",
+        "acceptance_failure_reasons": "",
         "acceptance_false_positive": "",
         "oracle_gap_kind": "",
         "acceptance_oracle_version": "",
         "queue_wait_sec": "",
+        "provider_wait_sec": "",
+        "port_mutex_wait_sec": "",
+        "scheduler_lane": "",
+        "serial_reason": "",
+        "effective_parallelism": "",
+        "provider_limit": "",
+        "parallel_limit": "",
+        "wall_clock_sec": "",
+        "acceptance_oracle_sec": "",
         "process_elapsed_sec": "",
         "exec_elapsed_sec": "",
         "model_elapsed_sec": "",
@@ -316,6 +353,17 @@ def empty_summary_row(spec: dict[str, Any]) -> dict[str, Any]:
         "execution_contract_adherence_score": "",
         "execution_contract_min_subscore": "",
         "execution_contract_cap_reason": "",
+        "build_verifier_completion_score": "",
+        "dependency_setup_boundary_score": "",
+        "dependency_setup_bridge_score": "",
+        "build_verifier_lifecycle_score": "",
+        "profile_repair_symmetry_score": "",
+        "step_runtime_bridge_score": "",
+        "repair_target_followthrough_score": "",
+        "plan_run_success_predictor": "",
+        "repair_target_resolution_score": "",
+        "repair_stagnation_score": "",
+        "profile_static_vs_build_gap_score": "",
         "step_obligation_scope_score": "",
         "step_obligation_scope_violation_count": "",
         "phase_completion_score": "",
@@ -355,13 +403,12 @@ def read_summary(path: Path) -> list[dict[str, str]]:
     with path.open(encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
         fieldnames = reader.fieldnames or []
-        projected_header = [key for key in SUMMARY_HEADER if key in fieldnames]
-        if fieldnames != projected_header:
-            raise ValueError(f"unsupported summary header in {path}: {reader.fieldnames}")
         rows = list(reader)
         for row in rows:
             for key in SUMMARY_HEADER:
                 row.setdefault(key, "")
+            if not row.get("eval_schema_version"):
+                row["eval_schema_version"] = "legacy"
         return rows
 
 

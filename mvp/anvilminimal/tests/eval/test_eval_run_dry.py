@@ -94,7 +94,7 @@ class EvalRunDryTest(unittest.TestCase):
                 {
                     "command": "npm run build",
                     "reason": "requires dependency setup",
-                    "authority": "postcheck",
+                    "authority": "eval_setup",
                     "profile": "nextjs",
                     "status": "blocked_by_dependency_setup",
                 }
@@ -218,6 +218,8 @@ class EvalRunDryTest(unittest.TestCase):
             command_files = list((run_root / "runs").glob("*/command.txt"))
             commands = "\n".join(path.read_text() for path in command_files)
             self.assertIn('"--engine" "minimal"', commands)
+            self.assertIn('"--state-dir"', commands)
+            self.assertIn('/workdir/.anvil/state"', commands)
             self.assertIn('"--plan-run"', commands)
             self.assertIn('"--ultra-plan-run"', commands)
             self.assertIn('"--run-plan" "<phase-step-plan.yaml>"', commands)

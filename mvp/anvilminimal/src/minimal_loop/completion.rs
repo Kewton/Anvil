@@ -3,11 +3,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use serde::Deserialize;
-use serde_json::Value;
 
 use crate::config::Config;
 use crate::eval_events;
+use crate::minimal_loop::build_verifier::{
+    self, BuildVerifierLifecycleObservation, BuildVerifierStatus,
+};
+use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::evidence::{RuntimeAcceptanceReport, required_evidence_for_capability};
+use crate::minimal_loop::repair_target::classify_repair_target;
 use crate::planner::verify::{VerificationReport, validate_verify_command};
 use crate::tools::path_guard::{
     resolve_existing, resolve_optional_existing, validate_workspace_relative,
@@ -142,7 +146,8 @@ impl CompletionContract {
 
     pub fn dependency_precondition_active(&self, root: &Path) -> bool {
         self.verify_commands.iter().any(|command| {
-            requires_next_binary(command) && !root.join("node_modules/.bin/next").is_file()
+            build_verifier::requires_next_binary(command)
+                && !root.join("node_modules/.bin/next").is_file()
         })
     }
 
@@ -151,7 +156,16 @@ impl CompletionContract {
     }
 
     pub fn verify_with_goal(&self, root: &Path, fallback_goal: &str) -> VerificationReport {
+        self.verify_with_goal_observed(root, fallback_goal).0
+    }
+
+    pub fn verify_with_goal_observed(
+        &self,
+        root: &Path,
+        fallback_goal: &str,
+    ) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
         let mut report = VerificationReport::pass();
+        let mut build_verifier_observations = Vec::new();
         for path in &self.required_paths {
             if resolve_existing(root, path).is_err() {
                 report.push_missing_path(path.clone());
@@ -162,7 +176,9 @@ impl CompletionContract {
                 report.push_command_failure(command.clone(), err.to_string());
                 continue;
             }
-            if requires_next_binary(command) && !root.join("node_modules/.bin/next").is_file() {
+            if build_verifier::requires_next_binary(command)
+                && !root.join("node_modules/.bin/next").is_file()
+            {
                 report.push_dependency_missing("node_modules/.bin/next missing for Next.js build");
                 continue;
             }
@@ -213,6 +229,56 @@ impl CompletionContract {
             }
         }
         for requirement in &self.deferred_verify_requirements {
+            if let Some(build_requirement) = build_verifier::requirement_from_deferred(
+                &requirement.command,
+                requirement.profile.as_deref(),
+                &requirement.reason,
+                &requirement.authority,
+                &requirement.status,
+            ) {
+                let lifecycle = build_verifier::observe_requirement_lifecycle(
+                    root,
+                    &build_requirement,
+                    setup_authority_for_deferred(requirement),
+                );
+                let observation = lifecycle.final_observation();
+                if build_requirement.required_for_completion
+                    && observation.status != BuildVerifierStatus::Passed
+                {
+                    match observation.status {
+                        BuildVerifierStatus::DependencyMissing => {
+                            report.push_dependency_missing(format!(
+                                "dependency_setup_missing: {}",
+                                observation.primary_reason
+                            ));
+                        }
+                        BuildVerifierStatus::PolicyRejected => {
+                            report.push_command_failure(
+                                requirement.command.clone(),
+                                format!(
+                                    "build_verify_policy_rejected: {}",
+                                    observation.primary_reason
+                                ),
+                            );
+                        }
+                        BuildVerifierStatus::Blocked => {
+                            report.push_profile_failure(format!(
+                                "build_verify_blocked: command `{}` reason `{}`",
+                                requirement.command, observation.primary_reason
+                            ));
+                        }
+                        BuildVerifierStatus::Failed => {
+                            report.push_command_failure(
+                                requirement.command.clone(),
+                                format!("build_verify_failed: {}", observation.primary_reason),
+                            );
+                        }
+                        BuildVerifierStatus::Passed => {}
+                    }
+                }
+                build_verifier_observations.push(lifecycle);
+                continue;
+            }
             if self.deferred_requirement_covered(root, requirement, profile_passed) {
                 continue;
             }
@@ -243,7 +309,7 @@ impl CompletionContract {
                 ));
             }
         }
-        report
+        (report, build_verifier_observations)
     }
 
     pub fn runtime_acceptance_report(&self, root: &Path) -> RuntimeAcceptanceReport {
@@ -273,11 +339,28 @@ impl CompletionContract {
         self.deferred_verify_requirements
             .iter()
             .map(|requirement| {
-                let status = if self.deferred_requirement_covered(root, requirement, profile_passed)
-                {
-                    "covered_by_static_profile_check"
+                let status = if let Some(build_requirement) =
+                    build_verifier::requirement_from_deferred(
+                        &requirement.command,
+                        requirement.profile.as_deref(),
+                        &requirement.reason,
+                        &requirement.authority,
+                        &requirement.status,
+                    ) {
+                    if !build_requirement.required_for_completion {
+                        build_requirement.status
+                    } else if build_requirement.requires_dependency_setup
+                        && build_verifier::requires_next_binary(&build_requirement.command)
+                        && !root.join("node_modules/.bin/next").is_file()
+                    {
+                        "dependency_setup_missing".to_string()
+                    } else {
+                        "build_verifier_required".to_string()
+                    }
+                } else if self.deferred_requirement_covered(root, requirement, profile_passed) {
+                    "covered_by_static_profile_check".to_string()
                 } else {
-                    requirement.status.as_str()
+                    requirement.status.clone()
                 };
                 format!("{}:{status}", requirement.command)
             })
@@ -303,12 +386,8 @@ impl CompletionContract {
         if requirement.status == "covered_by_static_profile_check" {
             return true;
         }
-        profile_passed
-            && self
-                .active_profile()
-                .is_some_and(|profile| requirement_matches_profile(requirement, profile))
-            && requires_next_binary(&requirement.command)
-            && nextjs_static_build_coverage(root).is_none()
+        let _ = (root, profile_passed);
+        false
     }
 
     fn deferred_requirement_blocking_reason(
@@ -323,21 +402,26 @@ impl CompletionContract {
                 requirement.command, requirement.status, requirement.reason
             );
         }
-        if self
-            .active_profile()
-            .is_some_and(|profile| requirement_matches_profile(requirement, profile))
-            && requires_next_binary(&requirement.command)
-            && let Some(reason) = nextjs_static_build_coverage(root)
-        {
-            return format!(
-                "deferred verify requirement pending: command `{}` requires static Next.js build coverage: {reason}",
-                requirement.command
-            );
-        }
+        let _ = root;
         format!(
             "deferred verify requirement pending: command `{}` status `{}` reason `{}`",
             requirement.command, requirement.status, requirement.reason
         )
+    }
+}
+
+fn setup_authority_for_deferred(
+    requirement: &DeferredVerifyRequirement,
+) -> NodeDependencySetupAuthority {
+    let authority = requirement.authority.to_ascii_lowercase();
+    if authority.contains("eval") && authority.contains("setup") {
+        NodeDependencySetupAuthority::EvalExplicit
+    } else if authority.contains("completion") && authority.contains("setup") {
+        NodeDependencySetupAuthority::CompletionContract
+    } else if authority.contains("tui") && authority.contains("setup") {
+        NodeDependencySetupAuthority::TuiConfirmed
+    } else {
+        NodeDependencySetupAuthority::None
     }
 }
 
@@ -346,6 +430,12 @@ pub fn format_verify_feedback(report: &VerificationReport) -> String {
         "Deterministic completion verification failed. Fix the implementation and retry."
             .to_string(),
     ];
+    let target = classify_repair_target(report);
+    lines.push(format!(
+        "Repair target: {}. {}",
+        target.as_str(),
+        target.guidance()
+    ));
     if !report.missing_paths.is_empty() {
         lines.push(format!(
             "Missing required paths: {}",
@@ -593,100 +683,8 @@ fn normalize_contract_file_path(root: &Path, raw: &Path) -> anyhow::Result<PathB
     }
 }
 
-fn requires_next_binary(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    lower == "npm run build"
-        || lower.starts_with("npm run build ")
-        || lower == "pnpm build"
-        || lower.starts_with("pnpm build ")
-        || lower == "yarn build"
-        || lower.starts_with("yarn build ")
-}
-
-fn nextjs_static_build_coverage(root: &Path) -> Option<String> {
-    let project = nextjs_project_root(root)?;
-    let tsconfig_path = project.join("tsconfig.json");
-    let tsconfig = match std::fs::read_to_string(&tsconfig_path) {
-        Ok(tsconfig) => tsconfig,
-        Err(_) => {
-            return Some("tsconfig.json missing; add a checked-in tsconfig with moduleResolution bundler or node16 before treating npm run build as statically covered".to_string());
-        }
-    };
-    let Ok(tsconfig_json): Result<Value, _> = serde_json::from_str(&tsconfig) else {
-        return Some("tsconfig.json invalid".to_string());
-    };
-    let compiler_options = tsconfig_json
-        .get("compilerOptions")
-        .and_then(Value::as_object);
-    let module_resolution = compiler_options
-        .and_then(|options| options.get("moduleResolution"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if module_resolution.eq_ignore_ascii_case("node10") {
-        return Some(
-            "tsconfig compilerOptions.moduleResolution=node10 is deprecated; use bundler or node16"
-                .to_string(),
-        );
-    }
-    if !matches!(
-        module_resolution.to_ascii_lowercase().as_str(),
-        "bundler" | "node16" | "nodenext"
-    ) {
-        return Some(
-            "tsconfig compilerOptions.moduleResolution must be bundler, node16, or nodenext"
-                .to_string(),
-        );
-    }
-    let package = std::fs::read_to_string(project.join("package.json")).ok()?;
-    let Ok(package): Result<Value, _> = serde_json::from_str(&package) else {
-        return Some("package.json invalid".to_string());
-    };
-    let dev_deps = package.get("devDependencies").and_then(Value::as_object);
-    for dep in [
-        "typescript",
-        "@types/node",
-        "@types/react",
-        "@types/react-dom",
-    ] {
-        if dev_deps.is_none_or(|deps| !deps.contains_key(dep)) {
-            return Some(format!("devDependency missing: {dep}"));
-        }
-    }
-    None
-}
-
-fn nextjs_project_root(root: &Path) -> Option<PathBuf> {
-    if root.join("package.json").is_file() {
-        return Some(root.to_path_buf());
-    }
-    let entries = std::fs::read_dir(root).ok()?;
-    let mut matches = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.is_dir() && path.join("package.json").is_file() {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    if matches.len() == 1 {
-        matches.pop()
-    } else {
-        None
-    }
-}
-
 fn profile_is_generic(profile: &str) -> bool {
     matches!(profile, "" | "generic" | "default" | "none")
-}
-
-fn requirement_matches_profile(requirement: &DeferredVerifyRequirement, profile: &str) -> bool {
-    requirement
-        .profile
-        .as_deref()
-        .is_none_or(|candidate| candidate == profile)
 }
 
 fn classify_python_test_discovery_failure(
@@ -1040,14 +1038,13 @@ mod tests {
         let report = contract.verify(dir.path());
         assert!(!report.is_pass());
         assert!(
-            report
-                .primary_reason()
-                .contains("deferred verify requirement pending")
+            report.primary_reason().contains("dependency_setup_missing"),
+            "{report:?}"
         );
     }
 
     #[test]
-    fn completion_contract_profile_substitute_records_covered_deferred_requirement() {
+    fn completion_contract_deferred_nextjs_build_requires_dependency_setup() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
         std::fs::write(
@@ -1100,15 +1097,19 @@ mod tests {
         .validate(dir.path())
         .unwrap();
         let report = contract.verify(dir.path());
-        assert!(report.is_pass(), "{report:?}");
+        assert!(!report.is_pass(), "{report:?}");
+        assert!(
+            report.primary_reason().contains("node_modules/.bin/next"),
+            "{report:?}"
+        );
         assert_eq!(
             contract.deferred_status_summary(dir.path(), "Create a Next.js app"),
-            vec!["npm run build:covered_by_static_profile_check"]
+            vec!["npm run build:dependency_setup_missing"]
         );
     }
 
     #[test]
-    fn completion_contract_deferred_nextjs_build_requires_static_tsconfig_coverage() {
+    fn completion_contract_deferred_nextjs_build_does_not_use_static_tsconfig_coverage() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
         std::fs::write(
@@ -1153,7 +1154,7 @@ mod tests {
         let report = contract.verify(dir.path());
         assert!(!report.is_pass());
         assert!(
-            report.primary_reason().contains("tsconfig.json missing"),
+            report.primary_reason().contains("node_modules/.bin/next"),
             "{report:?}"
         );
     }

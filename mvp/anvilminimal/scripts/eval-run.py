@@ -56,6 +56,7 @@ def main() -> int:
     parser.add_argument("--scenario")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--parallel", type=int, default=4)
+    parser.add_argument("--provider-limit", type=int)
     parser.add_argument("--context-budget", type=int, default=65536)
     parser.add_argument("--binary", default="anvilminimal")
     parser.add_argument(
@@ -83,11 +84,13 @@ def main() -> int:
     profiles, warnings = load_model_profiles(args.model_profiles)
     if args.model_profile not in profiles:
         raise SystemExit(f"unknown model profile: {args.model_profile}")
+    profile_config = profiles[args.model_profile]
     if args.provider_smoke_summary and not args.allow_provider_smoke_failure:
         assert_provider_smoke_green(Path(args.provider_smoke_summary))
+    provider_limit = args.provider_limit if args.provider_limit is not None else profile_config.get("provider_limit", 2)
     matrix = expand_matrix(
         suite,
-        profiles[args.model_profile],
+        profile_config,
         parse_modes(args.modes),
         args.runs,
         args.context_budget,
@@ -95,6 +98,10 @@ def main() -> int:
         binary_kind=args.binary_kind,
         scenario_filter=args.scenario,
     )
+    for spec in matrix:
+        spec["_provider_limit"] = provider_limit
+        spec["_parallel_limit"] = args.parallel
+        spec["_model_profile"] = args.model_profile
     write_jsonl(run_root / "warnings.jsonl", warnings)
     write_json(run_root / "matrix.json", scrub_matrix(matrix))
     print(f"[eval] run_root={run_root}")
@@ -124,7 +131,6 @@ def main() -> int:
     if args.dry_run:
         print("[done] dry-run complete")
         return 0
-    provider_limit = profiles[args.model_profile].get("provider_limit", 2)
     semaphores = {
         "openai": threading.Semaphore(provider_limit),
         "gemini": threading.Semaphore(provider_limit),
@@ -134,11 +140,20 @@ def main() -> int:
     results: list[tuple[int, dict, list[dict]]] = []
     if parallel_items:
         print(f"[scheduler] cloud_parallel={min(args.parallel, len(parallel_items))} serial={len(serial_items)}")
+        queued_at = time.monotonic()
+        for _, spec, _, _, _ in parallel_items:
+            spec["_queued_at"] = queued_at
+            spec["_scheduler_lane"] = "cloud"
+            spec["_effective_parallelism"] = min(args.parallel, len(parallel_items))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.parallel)) as pool:
             futures = [pool.submit(run_prepared, item, args.timeout_sec, semaphores, len(matrix)) for item in parallel_items]
             for future in concurrent.futures.as_completed(futures):
                 results.append(future.result())
     for item in serial_items:
+        _, spec, _, _, _ = item
+        spec["_queued_at"] = time.monotonic()
+        spec["_scheduler_lane"] = "serial"
+        spec["_effective_parallelism"] = 1
         results.append(run_prepared(item, args.timeout_sec, semaphores, len(matrix)))
     for _, row, run_events in sorted(results, key=lambda item: item[0]):
         rows.append(row)
@@ -164,17 +179,64 @@ def run_prepared(
     index, spec, command, run_dir, workdir = item
     providers = sorted({spec["main"]["provider"], spec["planner"]["provider"]})
     acquired: list[threading.Semaphore] = []
+    started_at = time.monotonic()
+    queued_at = float(spec.get("_queued_at", started_at) or started_at)
+    queue_wait_sec = max(0.0, started_at - queued_at)
+    provider_wait_start = time.monotonic()
+    provider_wait_sec = 0.0
     try:
         for provider in providers:
             sem = semaphores.get(provider)
             if sem:
                 sem.acquire()
                 acquired.append(sem)
+        provider_wait_sec = max(0.0, time.monotonic() - provider_wait_start)
         print(
             f"[run {index:02d}/{total:02d}] {spec['scenario']['id']} {spec['mode']} "
             f"{spec['main']['provider']}:{spec['main']['model']}"
         )
         row, run_events = run_one(spec, command, run_dir, workdir, timeout_sec)
+        wall_clock_sec = max(0.0, time.monotonic() - queued_at)
+        serial_reason = ""
+        if spec.get("port_mutex"):
+            serial_reason = "port_mutex"
+        elif spec.get("serial_lane"):
+            serial_reason = "local_llm_or_profile_serial"
+        row.update(
+            {
+                "queue_wait_sec": round(queue_wait_sec, 3),
+                "provider_wait_sec": round(provider_wait_sec, 3),
+                "port_mutex_wait_sec": 0.0,
+                "scheduler_lane": spec.get("_scheduler_lane", ""),
+                "serial_reason": serial_reason,
+                "effective_parallelism": spec.get("_effective_parallelism", ""),
+                "provider_limit": spec.get("_provider_limit", ""),
+                "parallel_limit": spec.get("_parallel_limit", ""),
+                "wall_clock_sec": round(wall_clock_sec, 3),
+            }
+        )
+        row.setdefault("extras_json", {})
+        row["extras_json"].update(
+            {
+                "scheduler_lane": row["scheduler_lane"],
+                "provider_limit": row["provider_limit"],
+                "parallel_limit": row["parallel_limit"],
+                "provider_wait_sec": row["provider_wait_sec"],
+                "queue_wait_sec": row["queue_wait_sec"],
+                "wall_clock_sec": row["wall_clock_sec"],
+            }
+        )
+        run_events.append(
+            {
+                "event": "scheduler_diagnostics",
+                "run_id": spec["run_id"],
+                "queue_wait_sec": row["queue_wait_sec"],
+                "provider_wait_sec": row["provider_wait_sec"],
+                "scheduler_lane": row["scheduler_lane"],
+                "provider_limit": row["provider_limit"],
+                "parallel_limit": row["parallel_limit"],
+            }
+        )
         print(
             f"[result] {spec['run_id']} success={row['success']} rc={row['rc']} "
             f"elapsed={row['exec_elapsed_sec']}"
@@ -187,7 +249,15 @@ def run_prepared(
 
 def actual_command(spec: dict, workdir: Path) -> list[str]:
     command = list(spec["command"])
-    return [str(workdir) if part == "workdir" else part for part in command]
+    rendered = []
+    for part in command:
+        if part == "workdir":
+            rendered.append(str(workdir))
+        elif isinstance(part, str) and part.startswith("workdir/"):
+            rendered.append(str(workdir / part.removeprefix("workdir/")))
+        else:
+            rendered.append(part)
+    return rendered
 
 
 def completion_contract_for_spec(spec: dict) -> dict | None:
@@ -208,7 +278,7 @@ def completion_contract_for_spec(spec: dict) -> dict | None:
         {
             "command": command,
             "reason": "requires dependency setup",
-            "authority": "postcheck",
+            "authority": "eval_setup",
             "profile": scenario.get("profile", "generic"),
             "status": "blocked_by_dependency_setup",
         }
@@ -574,6 +644,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         plan_unverified_capability_count = runtime_verify_coverage["plan_unverified_capability_count"]
     plan_verify_gap_kind = str(runtime_verify_coverage.get("plan_verify_gap_kind", plan_verify_gap_kind) or plan_verify_gap_kind)
     plan_verify_oracle_version = str(runtime_verify_coverage.get("plan_verify_oracle_version", plan_verify_oracle_version) or plan_verify_oracle_version)
+    acceptance_start = time.monotonic()
     acceptance = evaluate_acceptance_outcome(
         scenario=spec["scenario"],
         workdir=workdir,
@@ -586,6 +657,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         plan_capability=runtime_capability_contract,
         plan_verify_coverage=runtime_verify_coverage,
     )
+    acceptance_oracle_sec = round(time.monotonic() - acceptance_start, 3)
     events.append({"event": "acceptance_summary", "run_id": spec["run_id"], **acceptance})
     diagnostics = summarize_run_events(events, post)
     lint_repair_score = calculate_lint_repair_score(diagnostics)
@@ -718,12 +790,23 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "acceptance_confidence_score": acceptance.get("acceptance_confidence_score", ""),
             "acceptance_confidence_reason": acceptance.get("acceptance_confidence_reason", ""),
             "prompt_contract_success": acceptance.get("prompt_contract_success", ""),
+            "capability_acceptance_success": acceptance.get("capability_acceptance_success", ""),
             "acceptance_success": acceptance.get("acceptance_success", ""),
             "acceptance_failure_kind": acceptance.get("acceptance_failure_kind", ""),
+            "acceptance_failure_reasons": acceptance.get("acceptance_failure_reasons", ""),
             "acceptance_false_positive": acceptance.get("acceptance_false_positive", ""),
             "oracle_gap_kind": acceptance.get("oracle_gap_kind", ""),
             "acceptance_oracle_version": acceptance.get("acceptance_oracle_version", ""),
             "queue_wait_sec": 0.0,
+            "provider_wait_sec": 0.0,
+            "port_mutex_wait_sec": 0.0,
+            "scheduler_lane": spec.get("_scheduler_lane", ""),
+            "serial_reason": "",
+            "effective_parallelism": spec.get("_effective_parallelism", ""),
+            "provider_limit": spec.get("_provider_limit", ""),
+            "parallel_limit": spec.get("_parallel_limit", ""),
+            "wall_clock_sec": "",
+            "acceptance_oracle_sec": acceptance_oracle_sec,
             "process_elapsed_sec": round(process_elapsed, 3),
             "exec_elapsed_sec": round(process_elapsed + float(post["postcheck_elapsed_sec"]) - float(post["dependency_elapsed_sec"]), 3),
             "model_elapsed_sec": "",
