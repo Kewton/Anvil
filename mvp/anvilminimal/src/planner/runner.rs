@@ -17,8 +17,8 @@ use crate::planner::lint::{
 };
 use crate::planner::profile::{
     profile_after_phase, profile_auto_repair, profile_before_phase, profile_expected_paths,
-    profile_guidance, profile_post_step_repair, profile_quality_expectations,
-    profile_repair_prompt, verify_profile,
+    profile_generation_rules, profile_guidance, profile_post_step_repair,
+    profile_quality_expectations, profile_repair_prompt, verify_profile,
 };
 use crate::planner::repair::{
     RepairContext, build_repair_prompt_with_context, save_repair_report_with_context,
@@ -40,6 +40,7 @@ const STEP_TURN_MAX_ITERATIONS: usize = 8;
 const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
 const STEP_REPAIR_MAX_TURNS: usize = 4;
 const STEP_REPAIR_MAX_FILE_CHANGING_TURNS: usize = 2;
+const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
 
 pub fn generate_step_plan(
     client: &mut dyn ChatClient,
@@ -629,71 +630,148 @@ pub fn generate_ultra_plan_with_ui(
     if ui.interrupted() {
         anyhow::bail!("interrupted by user");
     }
-    let messages = vec![crate::state::ConversationMessage::user(format!(
-        "Create a YAML UltraPlan for profile {} and goal: {goal}",
-        config.profile
-    ))];
     let model = model_for(config, true);
-    let reply = {
-        let _guard = ui.before_model_call(&format!("planner {} {model}", client.label()));
-        client.chat(model, &messages, &[], false)?
-    };
-    ui.publish_status(UiStatus::for_model_reply(
-        config,
-        model,
-        client.label(),
-        reply.prompt_tokens,
-        reply.completion_tokens,
-    ));
-    match parse_ultra_plan(&reply.content) {
-        Ok(plan) => {
-            let report = lint_ultra_plan_report(&plan);
-            if report.is_pass() {
-                Ok(plan)
-            } else {
-                emit_planner_error_for_lint(config, client.label(), model, &report, 1);
-                emit_planner_schema_repaired(
-                    config,
-                    client.label(),
-                    model,
-                    "scaffold",
-                    &report.primary_message(),
-                    1,
-                );
-                Ok(UltraPlan::deterministic(
-                    goal,
-                    &config.profile,
-                    &config.style,
-                    detect_intent(goal),
-                ))
-            }
-        }
-        Err(err) => {
+    let intent = detect_intent(goal);
+    let mut messages = ultra_plan_generation_messages(goal, config);
+    let mut last_error = None;
+    for attempt in 1..=ULTRA_PLAN_GENERATION_ATTEMPTS {
+        emit_ultra_plan_generation_attempt(
+            config,
+            client.label(),
+            model,
+            attempt,
+            &config.profile,
+            &config.style,
+            intent,
+        );
+        let reply = {
+            let _guard = ui.before_model_call(&format!("planner {} {model}", client.label()));
+            client.chat(model, &messages, &[], false)?
+        };
+        ui.publish_status(UiStatus::for_model_reply(
+            config,
+            model,
+            client.label(),
+            reply.prompt_tokens,
+            reply.completion_tokens,
+        ));
+        emit_ultra_plan_raw_output_shape(config, client.label(), model, attempt, &reply.content);
+        if !reply.tool_calls.is_empty() {
+            let message = format!(
+                "ultra plan generation must not emit tool calls: {}",
+                tool_call_names(&reply.tool_calls)
+            );
+            last_error = Some(message.clone());
+            emit_ultra_plan_generation_tool_call_rejected(
+                config,
+                client.label(),
+                model,
+                attempt,
+                &message,
+            );
             emit_planner_error(
                 config,
                 client.label(),
                 model,
                 "schema",
                 "planner_schema_error",
-                &err.to_string(),
-                1,
+                &message,
+                attempt,
             );
-            emit_planner_schema_repaired(
-                config,
-                client.label(),
-                model,
-                "schema",
-                &err.to_string(),
-                1,
-            );
-            Ok(UltraPlan::deterministic(
-                goal,
-                &config.profile,
-                &config.style,
-                detect_intent(goal),
-            ))
+            if attempt < ULTRA_PLAN_GENERATION_ATTEMPTS {
+                emit_ultra_plan_generation_retry(
+                    config,
+                    client.label(),
+                    model,
+                    attempt,
+                    "planner_schema_error",
+                    &message,
+                );
+                messages.push(crate::state::ConversationMessage::user(
+                    build_ultra_plan_tool_call_retry_prompt(goal, attempt),
+                ));
+                continue;
+            }
+            break;
+        }
+        match parse_ultra_plan(&reply.content) {
+            Ok(mut plan) => {
+                let normalized =
+                    normalize_ultra_plan_metadata(&mut plan, goal, &config.profile, &config.style);
+                if !normalized.is_empty() {
+                    emit_ultra_plan_generation_metadata_normalized(
+                        config,
+                        client.label(),
+                        model,
+                        attempt,
+                        &normalized,
+                    );
+                }
+                let report = lint_ultra_plan_report(&plan);
+                if report.is_pass() {
+                    emit_ultra_plan_generation_succeeded(
+                        config,
+                        client.label(),
+                        model,
+                        attempt,
+                        plan.phases.len(),
+                    );
+                    return Ok(plan);
+                } else {
+                    emit_planner_error_for_lint(config, client.label(), model, &report, attempt);
+                    let message = report.primary_message();
+                    last_error = Some(message.clone());
+                    if attempt < ULTRA_PLAN_GENERATION_ATTEMPTS {
+                        let (_stage, kind) = planner_stage_and_kind_for_lint(&report);
+                        emit_ultra_plan_generation_retry(
+                            config,
+                            client.label(),
+                            model,
+                            attempt,
+                            kind,
+                            &message,
+                        );
+                        messages.push(crate::state::ConversationMessage::user(
+                            build_ultra_plan_lint_retry_prompt(goal, &report, attempt),
+                        ));
+                        continue;
+                    }
+                    break;
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                last_error = Some(message.clone());
+                emit_planner_error(
+                    config,
+                    client.label(),
+                    model,
+                    "schema",
+                    "planner_schema_error",
+                    &message,
+                    attempt,
+                );
+                if attempt < ULTRA_PLAN_GENERATION_ATTEMPTS {
+                    emit_ultra_plan_generation_retry(
+                        config,
+                        client.label(),
+                        model,
+                        attempt,
+                        "planner_schema_error",
+                        &message,
+                    );
+                    messages.push(crate::state::ConversationMessage::user(
+                        build_ultra_plan_schema_retry_prompt(goal, &message, attempt),
+                    ));
+                    continue;
+                }
+                break;
+            }
         }
     }
+    let message = last_error.unwrap_or_else(|| "unknown UltraPlan generation error".to_string());
+    emit_ultra_plan_generation_failed(config, client.label(), model, &message);
+    anyhow::bail!("invalid generated UltraPlan after corrective retries: {message}")
 }
 
 pub fn save_ultra_plan(root: &Path, plan: &UltraPlan) -> anyhow::Result<PathBuf> {
@@ -1147,6 +1225,153 @@ fn emit_planner_raw_output_shape(
     );
 }
 
+fn emit_ultra_plan_raw_output_shape(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    content: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_plan_raw_output_shape",
+            "planner_provider": provider,
+            "planner_model": model,
+            "attempt": attempt,
+            "content_len": content.chars().count(),
+            "has_yaml_fence": content.contains("```yaml") || content.contains("```yml"),
+            "contains_goal_key": content.contains("goal:"),
+            "contains_profile_key": content.contains("profile:"),
+            "contains_style_key": content.contains("style:"),
+            "contains_intent_key": content.contains("intent:"),
+            "contains_phases_key": content.contains("phases:"),
+            "preview": eval_events::body_snippet(content),
+        }),
+    );
+}
+
+fn emit_ultra_plan_generation_attempt(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    profile: &str,
+    style: &str,
+    intent: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_plan_generation_attempt",
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+            "profile": profile,
+            "style": style,
+            "intent": intent,
+            "degraded": false,
+        }),
+    );
+}
+
+fn emit_ultra_plan_generation_retry(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    failure_kind: &str,
+    message: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_plan_generation_retry",
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+            "planner_error_kind": failure_kind,
+            "planner_error_message": eval_events::body_snippet(message),
+            "degraded": false,
+        }),
+    );
+}
+
+fn emit_ultra_plan_generation_failed(config: &Config, provider: &str, model: &str, message: &str) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_plan_generation_failed",
+            "planner_provider": provider,
+            "planner_model": model,
+            "planner_error_kind": "planner_schema_error",
+            "planner_error_message": eval_events::body_snippet(message),
+            "degraded": false,
+        }),
+    );
+}
+
+fn emit_ultra_plan_generation_succeeded(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    phase_count: usize,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_plan_generation_succeeded",
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+            "phase_count": phase_count,
+            "degraded": false,
+        }),
+    );
+}
+
+fn emit_ultra_plan_generation_tool_call_rejected(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    message: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_plan_generation_tool_call_rejected",
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+            "planner_error_kind": "planner_schema_error",
+            "planner_error_message": eval_events::body_snippet(message),
+            "degraded": false,
+        }),
+    );
+}
+
+fn emit_ultra_plan_generation_metadata_normalized(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    fields: &[String],
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_plan_generation_metadata_normalized",
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+            "fields": fields,
+            "degraded": false,
+        }),
+    );
+}
+
 fn emit_planner_quality_warnings(
     config: &Config,
     provider: &str,
@@ -1259,28 +1484,6 @@ fn emit_planner_quality_retry_exhausted(
             "planner_model": model,
             "repair_attempt": attempt,
             "planner_quality_issue_count": report.issues.len(),
-        }),
-    );
-}
-
-fn emit_planner_schema_repaired(
-    config: &Config,
-    provider: &str,
-    model: &str,
-    stage: &str,
-    message: &str,
-    attempt: usize,
-) {
-    eval_events::emit(
-        config.eval_events_path.as_deref(),
-        json!({
-            "event": "planner_schema_repaired",
-            "planner_stage": stage,
-            "planner_error_kind": "planner_schema_repaired",
-            "planner_error_message": eval_events::body_snippet(message),
-            "planner_provider": provider,
-            "planner_model": model,
-            "repair_attempt": attempt,
         }),
     );
 }
@@ -1447,6 +1650,170 @@ fn step_plan_messages(prompt: &str) -> Vec<crate::state::ConversationMessage> {
         crate::state::ConversationMessage::system(plan_generation_system_prompt()),
         crate::state::ConversationMessage::user(prompt.to_string()),
     ]
+}
+
+fn ultra_plan_generation_messages(
+    goal: &str,
+    config: &Config,
+) -> Vec<crate::state::ConversationMessage> {
+    let intent = detect_intent(goal);
+    vec![
+        crate::state::ConversationMessage::system(ultra_plan_generation_system_prompt(
+            &config.profile,
+            &config.style,
+            intent,
+        )),
+        crate::state::ConversationMessage::user(ultra_plan_generation_user_prompt(
+            goal,
+            &config.profile,
+            &config.style,
+            intent,
+        )),
+    ]
+}
+
+fn ultra_plan_generation_system_prompt(profile: &str, style: &str, intent: &str) -> String {
+    let style_rules = match style {
+        "tdd" => {
+            "- Style tdd: use phases for inspect, failing test, implementation, focused verification, and cleanup. The failing-test phase should ask /plan-run to create an expected_result:\"fail\" red verification step.\n"
+        }
+        "test-hardening" => {
+            "- Style test-hardening: inspect existing tests, identify uncovered behavior, add focused tests, make only necessary fixes, then run broader verification.\n"
+        }
+        _ => {
+            "- Style default: use ordinary phased delivery unless the user explicitly asks for TDD or test hardening.\n"
+        }
+    };
+    let profile_rules = profile_generation_rules(profile, intent).unwrap_or(
+        "- Profile generic: keep phases concrete, local, deterministic, and safe. Separate setup, implementation, and verification responsibilities.\n",
+    );
+    format!(
+        "You are Anvil's ultra planner. You do not execute tools or emit tool calls. Produce a top-level phase plan whose phases will each be executed by /plan-run.\n\
+Output YAML only, with this exact shape:\n\
+goal: \"...\"\n\
+profile: \"{profile}\"\n\
+style: \"{style}\"\n\
+intent: \"{intent}\"\n\
+phases:\n\
+  - id: \"kebab-id\"\n\
+    prompt: \"focused natural-language /plan-run goal\"\n\
+Rules:\n\
+- Return 2 to 6 phases for most tasks, never more than 8.\n\
+- Each phase prompt must be a focused natural-language task that can be handled by one /plan-run.\n\
+- Phase prompts should name the concrete outcome and the verification expectation when practical.\n\
+- If the user goal contains a Required final artifacts list, preserve those exact repository-relative paths across phases. Do not rename or relocate them.\n\
+- Do not make a phase prompt a shell command or a REPL command.\n\
+- Do not include long-running dev servers, network setup, or package installation as a phase unless the user explicitly requires it.\n\
+- Stop at a clean final verification or cleanup phase.\n\
+{profile_rules}{style_rules}"
+    )
+}
+
+fn ultra_plan_generation_user_prompt(
+    goal: &str,
+    profile: &str,
+    style: &str,
+    intent: &str,
+) -> String {
+    format!(
+        "Create an UltraPlan YAML for this task using profile `{profile}`, style `{style}`, and work intent `{intent}`.\n\
+Use the exact YAML shape from the system message and return YAML only.\n\n\
+Task:\n{goal}"
+    )
+}
+
+fn build_ultra_plan_schema_retry_prompt(goal: &str, error: &str, attempt: usize) -> String {
+    format!(
+        "Your previous UltraPlan output failed schema parsing on attempt {attempt}/{ULTRA_PLAN_GENERATION_ATTEMPTS}: {error}.\n\
+Return corrected YAML only, no markdown fences, no prose, and no tool calls.\n\
+Required YAML shape:\n\
+goal: \"{goal}\"\n\
+profile: \"...\"\n\
+style: \"...\"\n\
+intent: \"...\"\n\
+phases:\n\
+  - id: \"kebab-id\"\n\
+    prompt: \"focused natural-language /plan-run goal\"\n\
+Rules:\n\
+- Include top-level goal and 2-8 phases.\n\
+- Each phase must have id and prompt.\n\
+- Phase prompts must be natural-language tasks, not shell commands.\n\n\
+Goal: {goal}"
+    )
+}
+
+fn build_ultra_plan_lint_retry_prompt(
+    goal: &str,
+    report: &PlanLintReport,
+    attempt: usize,
+) -> String {
+    let errors = report
+        .errors
+        .iter()
+        .map(|err| format!("- [{}] {}", err.category, err.message))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Your previous UltraPlan YAML failed deterministic lint on attempt {attempt}/{ULTRA_PLAN_GENERATION_ATTEMPTS}.\n\
+Fix these issues without weakening safety rules:\n{errors}\n\n\
+Return corrected YAML only, no markdown fences, no prose, and no tool calls.\n\
+Hard constraints:\n\
+- Keep 2-8 phases.\n\
+- Use unique kebab-case phase ids.\n\
+- Phase prompts must be natural-language /plan-run goals, not shell commands or REPL commands.\n\
+- Keep concrete outcomes and verification expectations in phase prompts.\n\
+- Preserve any Required final artifacts from the user goal.\n\n\
+Goal: {goal}"
+    )
+}
+
+fn build_ultra_plan_tool_call_retry_prompt(goal: &str, attempt: usize) -> String {
+    format!(
+        "Your previous UltraPlan generation attempted to emit tool calls on attempt {attempt}/{ULTRA_PLAN_GENERATION_ATTEMPTS}.\n\
+Do not call tools. Return corrected UltraPlan YAML only.\n\
+Use natural-language phase prompts for later /plan-run execution.\n\n\
+Goal: {goal}"
+    )
+}
+
+fn normalize_ultra_plan_metadata(
+    plan: &mut UltraPlan,
+    goal: &str,
+    profile: &str,
+    style: &str,
+) -> Vec<String> {
+    let intent = detect_intent(goal);
+    let mut normalized = Vec::new();
+    if plan.goal != goal {
+        plan.goal = goal.to_string();
+        normalized.push("goal".to_string());
+    }
+    if plan.profile != profile {
+        plan.profile = profile.to_string();
+        normalized.push("profile".to_string());
+    }
+    if plan.style != style {
+        plan.style = style.to_string();
+        normalized.push("style".to_string());
+    }
+    if plan.intent != intent {
+        plan.intent = intent.to_string();
+        normalized.push("intent".to_string());
+    }
+    normalized
+}
+
+fn tool_call_names(tool_calls: &[crate::state::ToolCall]) -> String {
+    let names = tool_calls
+        .iter()
+        .map(|call| call.name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    if names.is_empty() {
+        "<unknown>".to_string()
+    } else {
+        names
+    }
 }
 
 fn plan_generation_system_prompt() -> String {
@@ -2185,6 +2552,134 @@ mod tests {
     }
 
     #[test]
+    fn ultra_plan_prompt_includes_source_parity_rules() {
+        let mut cfg = config(PathBuf::from("/tmp/work"));
+        cfg.profile = "nextjs".to_string();
+        let messages = ultra_plan_generation_messages("Build a Next.js app on port 3011", &cfg);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0].content.contains("You do not execute tools"));
+        assert!(messages[0].content.contains("Output YAML only"));
+        assert!(messages[0].content.contains("phases:"));
+        assert!(messages[0].content.contains("next/react/react-dom"));
+        assert!(
+            messages[0]
+                .content
+                .contains("dependency setup before any npm run build")
+        );
+        assert!(messages[0].content.contains("Tailwind"));
+        assert_eq!(messages[1].role, "user");
+        assert!(
+            messages[1]
+                .content
+                .contains("Build a Next.js app on port 3011")
+        );
+    }
+
+    #[test]
+    fn ultra_plan_prompt_does_not_bake_in_game_scenario_terms() {
+        let mut cfg = config(PathBuf::from("/tmp/work"));
+        cfg.profile = "nextjs".to_string();
+        let system =
+            ultra_plan_generation_messages("Build a Space Invaders game on port 3011", &cfg)
+                .remove(0)
+                .content;
+        for term in ["Space Invaders", "enemy", "bullet", "collision", "score"] {
+            assert!(!system.contains(term), "{term}: {system}");
+        }
+    }
+
+    #[test]
+    fn ultra_plan_generation_retries_invalid_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text("not yaml"),
+            AssistantReply::text(generated_ultra_plan_yaml("goal")),
+        ]);
+        let plan =
+            generate_ultra_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
+        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(plan.goal, "goal");
+        assert_eq!(plan.phases.len(), 2);
+    }
+
+    #[test]
+    fn ultra_plan_generation_rejects_tool_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"x","content":"x"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text(generated_ultra_plan_yaml("goal")),
+        ]);
+        let plan =
+            generate_ultra_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
+        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(plan.phases[0].id, "scaffold");
+    }
+
+    #[test]
+    fn ultra_plan_generation_normalizes_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.style = "default".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "different goal".to_string(),
+            profile: "generic".to_string(),
+            style: "tdd".to_string(),
+            intent: "fix".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "scaffold".to_string(),
+                    prompt: "Create the Next.js package and app entrypoint, then verify the files exist.".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "verify".to_string(),
+                    prompt: "Run deterministic Next.js build verification and repair failures.".to_string(),
+                },
+            ],
+        };
+        let mut planner = FakeClient::new(vec![AssistantReply::text(render_ultra_plan(&plan))]);
+        let generated = generate_ultra_plan(&mut planner, "Build app", &cfg).unwrap();
+        assert_eq!(generated.goal, "Build app");
+        assert_eq!(generated.profile, "nextjs");
+        assert_eq!(generated.style, "default");
+        assert_eq!(generated.intent, "create");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("ultra_plan_generation_metadata_normalized"));
+    }
+
+    #[test]
+    fn invalid_ultra_plan_generation_does_not_save_plan_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text("not yaml"),
+            AssistantReply::text("still not yaml"),
+            AssistantReply::text("nope"),
+        ]);
+        let mut execution = FakeClient::new(vec![]);
+        let err = generate_and_run_ultra_plan(
+            &mut planner,
+            &mut execution,
+            "goal",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid generated UltraPlan after corrective retries"));
+        assert!(!dir.path().join(".anvil/plans").exists());
+    }
+
+    #[test]
     fn step_plan_quality_warning_does_not_change_exit_status() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -2735,6 +3230,27 @@ mod tests {
 
     fn generated_step_plan_json(goal: &str) -> String {
         serde_json::to_string(&StepPlan::single(goal)).unwrap()
+    }
+
+    fn generated_ultra_plan_yaml(goal: &str) -> String {
+        render_ultra_plan(&UltraPlan {
+            goal: goal.to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "scaffold".to_string(),
+                    prompt: format!("Create the required project artifacts for {goal}."),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "verify".to_string(),
+                    prompt: format!(
+                        "Run deterministic verification for {goal} and repair failures."
+                    ),
+                },
+            ],
+        })
     }
 
     fn generated_nextjs_artifact_plan_json(goal: &str) -> String {

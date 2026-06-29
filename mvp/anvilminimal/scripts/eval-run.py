@@ -941,6 +941,25 @@ def summarize_planner_observability(events: list[dict]) -> dict[str, object]:
     quality_degraded = [
         event for event in events if event.get("event") == "planner_quality_retry_degraded"
     ]
+    ultra_generation_attempts = [
+        event for event in events if event.get("event") == "ultra_plan_generation_attempt"
+    ]
+    ultra_generation_retries = [
+        event for event in events if event.get("event") == "ultra_plan_generation_retry"
+    ]
+    ultra_generation_failures = [
+        event for event in events if event.get("event") == "ultra_plan_generation_failed"
+    ]
+    ultra_generation_tool_rejections = [
+        event
+        for event in events
+        if event.get("event") == "ultra_plan_generation_tool_call_rejected"
+    ]
+    ultra_generation_metadata_normalized = [
+        event
+        for event in events
+        if event.get("event") == "ultra_plan_generation_metadata_normalized"
+    ]
     out: dict[str, object] = {}
     if raw_shapes:
         out["planner_raw_output_shape_count"] = len(raw_shapes)
@@ -955,6 +974,23 @@ def summarize_planner_observability(events: list[dict]) -> dict[str, object]:
         out["planner_quality_retry_count"] = len(quality_retries)
     if quality_degraded:
         out["planner_quality_retry_degraded_count"] = len(quality_degraded)
+    if ultra_generation_attempts:
+        out["ultra_plan_generation_attempt_count"] = len(ultra_generation_attempts)
+    if ultra_generation_retries:
+        out["ultra_plan_generation_retry_count"] = len(ultra_generation_retries)
+        out["ultra_plan_generation_retry_kinds"] = [
+            str(event.get("planner_error_kind", "")) for event in ultra_generation_retries
+        ]
+    if ultra_generation_failures:
+        out["ultra_plan_generation_failed"] = True
+    if ultra_generation_tool_rejections:
+        out["ultra_plan_generation_tool_call_rejected_count"] = len(
+            ultra_generation_tool_rejections
+        )
+    if ultra_generation_metadata_normalized:
+        out["ultra_plan_generation_metadata_normalized_count"] = len(
+            ultra_generation_metadata_normalized
+        )
     return out
 
 

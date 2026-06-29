@@ -169,6 +169,36 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "planner_model": event.get("planner_model", ""),
                 "planner_repair_attempts": event.get("repair_attempt", ""),
             }
+        if name == "step_verify_failure":
+            return {
+                "failure_kind": "step_verify_failure",
+                "last_loop_stop": "step_verify_failure",
+                "repair_target": event.get("repair_target", ""),
+            }
+        if name == "ultra_phase_failed":
+            reason = str(event.get("reason", ""))
+            lower_reason = reason.lower()
+            if "failed verification after bounded repair" in lower_reason:
+                return {
+                    "failure_kind": "step_verify_failure",
+                    "last_loop_stop": "ultra_phase_failed",
+                    "phase_failure_stage": event.get("stage", ""),
+                    "phase_id": event.get("phase_id", ""),
+                }
+            if "profile verification" in lower_reason:
+                return {
+                    "failure_kind": "profile_contract_failure",
+                    "last_loop_stop": "ultra_phase_failed",
+                    "phase_failure_stage": event.get("stage", ""),
+                    "phase_id": event.get("phase_id", ""),
+                }
+            if event.get("stage") in {"scaffold", "lint"}:
+                return {
+                    "failure_kind": "phase_scaffold_error",
+                    "last_loop_stop": "ultra_phase_failed",
+                    "phase_failure_stage": event.get("stage", ""),
+                    "phase_id": event.get("phase_id", ""),
+                }
         if name == "plan_final_contract" and event.get("ok") is False:
             return {
                 "failure_kind": "plan_final_contract_failure",
@@ -439,7 +469,27 @@ def classify_planner_stderr(stderr: str) -> dict[str, Any]:
         "stepplan missing goal" in lower
         or "stepplan has no steps" in lower
         or "stepplan invalid json" in lower
+        or "ultraplan missing goal" in lower
+        or "ultraplan has no phases" in lower
+        or "ultra plan generation must not emit tool calls" in lower
     ):
+        return {
+            "failure_kind": "planner_schema_error",
+            "planner_stage": "schema",
+            "planner_error_kind": "planner_schema_error",
+        }
+    if "invalid generated ultraplan after corrective retries" in lower:
+        if (
+            "ultra phase" in lower
+            or "ultraplan must have" in lower
+            or "natural-language goal" in lower
+            or "repl command" in lower
+        ):
+            return {
+                "failure_kind": "phase_scaffold_error",
+                "planner_stage": "scaffold",
+                "planner_error_kind": "phase_scaffold_error",
+            }
         return {
             "failure_kind": "planner_schema_error",
             "planner_stage": "schema",

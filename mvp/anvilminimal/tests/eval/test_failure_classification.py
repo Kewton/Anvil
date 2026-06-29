@@ -54,6 +54,20 @@ class FailureClassificationTest(unittest.TestCase):
         )
         self.assertEqual(result["failure_kind"], "step_verify_failure")
 
+    def test_stderr_classifies_ultra_plan_generation_schema_failure(self):
+        result = classify_stderr(
+            "error: invalid generated UltraPlan after corrective retries: UltraPlan missing goal",
+            rc=1,
+        )
+        self.assertEqual(result["failure_kind"], "planner_schema_error")
+
+    def test_stderr_classifies_ultra_plan_generation_lint_failure(self):
+        result = classify_stderr(
+            "error: invalid generated UltraPlan after corrective retries: ultra phase prompt must be a plain natural-language goal, not a shell command",
+            rc=1,
+        )
+        self.assertEqual(result["failure_kind"], "phase_scaffold_error")
+
     def test_failure_layers_separate_provider_from_capability_failures(self):
         self.assertEqual(failure_layer_for_kind("provider_http_status"), "provider")
         self.assertEqual(capability_failure_included("provider_http_status"), False)
@@ -75,6 +89,42 @@ class FailureClassificationTest(unittest.TestCase):
         )
         self.assertEqual(result["failure_kind"], "dependency_setup_blocked")
         self.assertEqual(failure_layer_for_kind(result["failure_kind"]), "bridge")
+
+    def test_later_step_verify_event_wins_over_older_planner_error(self):
+        result = classify_events(
+            [
+                {
+                    "event": "planner_error",
+                    "planner_error_kind": "planner_lint_error",
+                    "planner_stage": "lint",
+                },
+                {
+                    "event": "step_verify_failure",
+                    "repair_target": "implementation",
+                },
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "step_verify_failure")
+        self.assertEqual(failure_layer_for_kind(result["failure_kind"]), "bridge")
+
+    def test_ultra_phase_execute_failure_is_runtime_not_stale_planning(self):
+        result = classify_events(
+            [
+                {
+                    "event": "planner_error",
+                    "planner_error_kind": "planner_lint_error",
+                    "planner_stage": "lint",
+                },
+                {
+                    "event": "ultra_phase_failed",
+                    "stage": "execute",
+                    "phase_id": "implement",
+                    "reason": "step verify failed verification after bounded repair: command failed",
+                },
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "step_verify_failure")
+        self.assertEqual(result["phase_failure_stage"], "execute")
 
     def test_build_failed_after_setup_is_distinct_from_plain_build_failure(self):
         result = classify_events(

@@ -6,6 +6,23 @@ use crate::planner::profile::ProfileQualityExpectations;
 use crate::planner::profile::profile_failure;
 use crate::planner::verify::{VerificationReport, VerifyStatus};
 
+pub fn generation_rules(intent: &str) -> &'static str {
+    match intent {
+        "create" => {
+            "- Profile nextjs/create: preserve a real Next.js app contract. Include next/react/react-dom dependencies, keep scripts.build as next build, and end with a build verification phase. Put dependency setup before any npm run build verification when node_modules is not already present; setup instructions may install dependencies, but verify must not contain npm install. If dependency setup is not allowed or cannot run, stop with dependency_missing instead of claiming build success. If you use Tailwind utility classes or @tailwind directives, include tailwindcss/postcss/autoprefixer and create tailwind.config.* plus postcss.config.*; otherwise use plain CSS and do not write Tailwind utility classes. If the goal mentions port 3011, keep scripts.dev as next dev -p 3011 or next dev --port 3011.\n"
+        }
+        "fix" => {
+            "- Profile nextjs/fix: preserve the existing Next.js structure and verifier integrity. Do not weaken next/react/react-dom dependencies, scripts.build, app/page, layout, or TypeScript configuration to make a failing verifier pass.\n"
+        }
+        "research" => {
+            "- Profile nextjs/research: inspect the existing app and produce concrete findings. Do not modify source unless the user explicitly asks for fixes.\n"
+        }
+        _ => {
+            "- Profile nextjs: preserve a real Next.js app when present. Keep next/react/react-dom dependencies, scripts.build as next build, app/ or pages/ entrypoints, and a final build verification phase. Keep styling toolchains internally consistent.\n"
+        }
+    }
+}
+
 pub fn verify(root: &Path, goal: &str) -> VerificationReport {
     let project = match locate_project_root(root) {
         Ok(project) => project,

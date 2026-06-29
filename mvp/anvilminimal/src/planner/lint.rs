@@ -681,6 +681,12 @@ pub fn lint_ultra_plan_report(plan: &UltraPlan) -> PlanLintReport {
         if phase.prompt.trim_start().starts_with('/') {
             report.push("scaffold", "ultra phase prompt must not be a REPL command");
         }
+        if looks_like_shell_command(&phase.prompt) {
+            report.push(
+                "scaffold",
+                "ultra phase prompt must be a plain natural-language goal, not a shell command",
+            );
+        }
     }
     report
 }
@@ -1510,6 +1516,29 @@ mod tests {
         let report = lint_ultra_plan_report(&plan);
         assert!(report.has_category("scaffold"));
         assert!(report.errors.len() >= 2);
+    }
+
+    #[test]
+    fn ultra_plan_lint_rejects_shell_command_phase_prompt() {
+        let plan = UltraPlan {
+            goal: "goal".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "setup".to_string(),
+                    prompt: "npm run build".to_string(),
+                },
+                UltraPhase {
+                    id: "verify".to_string(),
+                    prompt: "Verify the generated app with deterministic checks.".to_string(),
+                },
+            ],
+        };
+        let report = lint_ultra_plan_report(&plan);
+        assert!(report.has_category("scaffold"));
+        assert!(report.primary_message().contains("natural-language"));
     }
 
     fn nextjs_quality_context() -> PlanQualityContext {

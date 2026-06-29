@@ -53,6 +53,21 @@ pub fn profile_guidance(profile: &str, goal: &str) -> Option<String> {
     }
 }
 
+pub fn profile_generation_rules(profile: &str, intent: &str) -> Option<&'static str> {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            Some(crate::planner::profiles::nextjs::generation_rules(intent))
+        }
+        "rust" => Some(
+            "- Profile rust: preserve Cargo project semantics. Keep Cargo.toml before cargo check/test verification, do not weaken scripts or tests to hide failures, and end with cargo check or cargo test when practical.\n",
+        ),
+        "python" => Some(
+            "- Profile python: keep dependency setup separate from deterministic verification. Prefer python -m py_compile, pytest, or unittest checks after source files exist. Do not put package installation in verify commands.\n",
+        ),
+        _ => None,
+    }
+}
+
 pub fn profile_expected_paths(root: &Path, profile: &str, goal: &str) -> Vec<String> {
     match profile {
         "nextjs" | "next-js" | "next.js" => {
