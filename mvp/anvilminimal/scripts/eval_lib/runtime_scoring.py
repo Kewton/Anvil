@@ -106,6 +106,11 @@ def score_runtime_health(
         "ultra_context_initialized",
         "ultra_phase_context_attached",
         "ultra_phase_context_updated",
+        "ultra_final_acceptance_failed",
+        "final_acceptance_repair_start",
+        "final_acceptance_repair_complete",
+        "final_acceptance_repair_failed",
+        "final_acceptance_repair_exhausted",
         "ultra_plan_complete",
     }
     has_runtime_events = any(event.get("event") in runtime_event_names for event in events)

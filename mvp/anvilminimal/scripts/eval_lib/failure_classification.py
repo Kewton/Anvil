@@ -12,6 +12,9 @@ KNOWN_FAILURE_KINDS = {
     "missing_tool_call",
     "path_confinement_error",
     "plan_final_contract_failure",
+    "final_acceptance_failure",
+    "final_acceptance_repair_failed",
+    "final_acceptance_repair_exhausted",
     "phase_scaffold_error",
     "planner_lint_error",
     "planner_schema_error",
@@ -74,6 +77,9 @@ PLANNING_FAILURE_KINDS = {
 }
 BRIDGE_FAILURE_KINDS = {
     "plan_final_contract_failure",
+    "final_acceptance_failure",
+    "final_acceptance_repair_failed",
+    "final_acceptance_repair_exhausted",
     "profile_contract_failure",
     "step_obligation_scope_violation",
     "step_verify_failure",
@@ -199,6 +205,33 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                     "phase_failure_stage": event.get("stage", ""),
                     "phase_id": event.get("phase_id", ""),
                 }
+        if name == "final_acceptance_repair_exhausted":
+            return {
+                "failure_kind": "final_acceptance_repair_exhausted",
+                "last_loop_stop": "final_acceptance_repair_exhausted",
+                "lifecycle_stage": event.get("lifecycle_stage", ""),
+                "repair_target": event.get("repair_target", ""),
+                "missing_artifacts": ",".join(
+                    str(path) for path in event.get("missing_paths", []) or []
+                ),
+            }
+        if name == "final_acceptance_repair_failed":
+            return {
+                "failure_kind": "final_acceptance_repair_failed",
+                "last_loop_stop": "final_acceptance_repair_failed",
+                "lifecycle_stage": event.get("lifecycle_stage", ""),
+                "repair_target": event.get("repair_target", ""),
+            }
+        if name == "ultra_final_acceptance_failed":
+            return {
+                "failure_kind": "final_acceptance_failure",
+                "last_loop_stop": "ultra_final_acceptance_failed",
+                "lifecycle_stage": event.get("lifecycle_stage", ""),
+                "repair_target": event.get("repair_target", ""),
+                "missing_artifacts": ",".join(
+                    str(path) for path in event.get("missing_paths", []) or []
+                ),
+            }
         if name == "plan_final_contract" and event.get("ok") is False:
             return {
                 "failure_kind": "plan_final_contract_failure",
@@ -432,6 +465,12 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
         return {"failure_kind": "verify_repair_exhausted"}
     if "plan final contract failed" in lower:
         return {"failure_kind": "plan_final_contract_failure"}
+    if "ultra final acceptance failed after bounded repair" in lower:
+        return {"failure_kind": "final_acceptance_repair_exhausted"}
+    if "ultra final acceptance repair failed" in lower:
+        return {"failure_kind": "final_acceptance_repair_failed"}
+    if "ultra final acceptance failed" in lower:
+        return {"failure_kind": "final_acceptance_failure"}
     if "step obligation scope" in lower:
         return {"failure_kind": "step_obligation_scope_violation"}
     if "failed verification after bounded repair" in lower:

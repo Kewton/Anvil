@@ -47,6 +47,54 @@ class FailureClassificationTest(unittest.TestCase):
         result = classify_stderr("error: plan final contract failed: README.md", rc=1)
         self.assertEqual(result["failure_kind"], "plan_final_contract_failure")
 
+    def test_failure_classification_recognizes_final_acceptance_lifecycle(self):
+        result = classify_events(
+            [
+                {
+                    "event": "ultra_final_acceptance_failed",
+                    "lifecycle_stage": "final_acceptance",
+                    "repair_target": "missing_path",
+                    "missing_paths": ["src/app/page.tsx"],
+                }
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "final_acceptance_failure")
+        self.assertEqual(result["lifecycle_stage"], "final_acceptance")
+        self.assertEqual(result["repair_target"], "missing_path")
+        self.assertEqual(result["missing_artifacts"], "src/app/page.tsx")
+
+    def test_failure_classification_recognizes_final_acceptance_repair_exhausted(self):
+        result = classify_events(
+            [
+                {
+                    "event": "ultra_final_acceptance_failed",
+                    "lifecycle_stage": "final_acceptance",
+                    "repair_target": "missing_path",
+                },
+                {
+                    "event": "final_acceptance_repair_exhausted",
+                    "lifecycle_stage": "final_acceptance_repair",
+                    "repair_target": "missing_path",
+                    "missing_paths": ["src/app/page.tsx"],
+                },
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "final_acceptance_repair_exhausted")
+        self.assertEqual(result["lifecycle_stage"], "final_acceptance_repair")
+        self.assertEqual(result["missing_artifacts"], "src/app/page.tsx")
+
+    def test_stderr_classifies_final_acceptance_repair_failures(self):
+        result = classify_stderr(
+            "error: ultra final acceptance failed after bounded repair: src/app/page.tsx",
+            rc=1,
+        )
+        self.assertEqual(result["failure_kind"], "final_acceptance_repair_exhausted")
+        result = classify_stderr(
+            "error: ultra final acceptance repair failed: fake client exhausted",
+            rc=1,
+        )
+        self.assertEqual(result["failure_kind"], "final_acceptance_repair_failed")
+
     def test_stderr_classifies_step_verify_failure(self):
         result = classify_stderr(
             "error: step create-main-rs failed verification after bounded repair: command failed",

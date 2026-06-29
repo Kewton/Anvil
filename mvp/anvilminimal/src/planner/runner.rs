@@ -44,6 +44,7 @@ const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
 const STEP_REPAIR_MAX_TURNS: usize = 4;
 const STEP_REPAIR_MAX_FILE_CHANGING_TURNS: usize = 2;
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
+const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 1;
 
 pub fn generate_step_plan(
     client: &mut dyn ChatClient,
@@ -1889,35 +1890,148 @@ pub fn run_ultra_plan_with_ui(
             None,
         );
     }
-    let acceptance_report = ultra_final_acceptance_report(plan, config)?;
+    let mut acceptance_report = ultra_final_acceptance_report(plan, config)?;
     if !acceptance_report.is_pass() {
-        let reason = acceptance_report.primary_reason();
-        let target = classify_repair_target(&acceptance_report);
+        let initial_reason = acceptance_report.primary_reason();
+        let initial_target = classify_repair_target(&acceptance_report);
         eval_events::emit(
             config.eval_events_path.as_deref(),
             json!({
                 "event": "ultra_final_acceptance_failed",
-                "primary_reason": eval_events::body_snippet(&reason),
-                "repair_target": target.as_str(),
+                "lifecycle_stage": "final_acceptance",
+                "primary_reason": eval_events::body_snippet(&initial_reason),
+                "repair_target": initial_target.as_str(),
                 "missing_paths": acceptance_report.missing_paths.clone(),
                 "profile_failures": acceptance_report.profile_failures.clone(),
+                "bounded_repair_available": true,
+                "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
             }),
         );
         let fallback_phase = plan.phases.last().cloned().unwrap_or_else(|| UltraPhase {
             id: "final".to_string(),
             prompt: "Final acceptance".to_string(),
         });
-        let handoff = save_ultra_phase_recovery_handoff(
-            config,
+        let expected_paths =
+            final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
+        let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
+        let repair_prompt = final_acceptance_repair_prompt(
             plan,
-            &fallback_phase,
-            "final_acceptance_failure",
-            &reason,
-            &acceptance_report.missing_paths,
-            &[target.as_str().to_string()],
-        )
-        .unwrap_or_default();
-        anyhow::bail!("ultra final acceptance failed: {reason}{handoff}");
+            &acceptance_report,
+            &ultra_context,
+            initial_target.as_str(),
+            &expected_paths,
+            1,
+            FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+        );
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "final_acceptance_repair_start",
+                "lifecycle_stage": "final_acceptance_repair",
+                "attempt": 1,
+                "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                "repair_target": initial_target.as_str(),
+                "missing_paths": acceptance_report.missing_paths.clone(),
+                "profile_failures": acceptance_report.profile_failures.clone(),
+                "bounded_repair": true,
+                "max_iterations": repair_config.max_iterations,
+                "shared_execution_session": true,
+                "session_message_count": ultra_session.messages.len(),
+            }),
+        );
+        let repair_outcome = match run_final_acceptance_repair_with_ultra_session(
+            execution,
+            &mut ultra_session,
+            &repair_prompt,
+            &expected_paths,
+            &repair_config,
+            ui,
+        ) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let err_text = err.to_string();
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "final_acceptance_repair_failed",
+                        "lifecycle_stage": "final_acceptance_repair",
+                        "attempt": 1,
+                        "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                        "repair_target": initial_target.as_str(),
+                        "reason": eval_events::body_snippet(&err_text),
+                        "bounded_repair_exhausted": true,
+                    }),
+                );
+                let handoff = save_ultra_phase_recovery_handoff(
+                    config,
+                    plan,
+                    &fallback_phase,
+                    "final_acceptance_repair_failed",
+                    &err_text,
+                    &acceptance_report.missing_paths,
+                    &[initial_target.as_str().to_string()],
+                )
+                .unwrap_or_default();
+                anyhow::bail!("ultra final acceptance repair failed: {err_text}{handoff}");
+            }
+        };
+        push_context_items_capped(
+            &mut ultra_context.created_or_changed_paths,
+            &repair_outcome.changed_paths,
+            ULTRA_CONTEXT_MAX_PATHS,
+            &mut ultra_context.truncated,
+        );
+        push_context_items_capped(
+            &mut ultra_context.last_repair_changed_paths,
+            &repair_outcome.changed_paths,
+            ULTRA_CONTEXT_MAX_PATHS,
+            &mut ultra_context.truncated,
+        );
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "final_acceptance_repair_complete",
+                "lifecycle_stage": "final_acceptance_repair",
+                "attempt": 1,
+                "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                "repair_target": initial_target.as_str(),
+                "changed_path_count": repair_outcome.changed_paths.len(),
+                "iterations": repair_outcome.iterations,
+                "tool_calls": repair_outcome.tool_calls,
+                "shared_execution_session": true,
+                "session_message_count": ultra_session.messages.len(),
+            }),
+        );
+        acceptance_report = ultra_final_acceptance_report(plan, config)?;
+        if !acceptance_report.is_pass() {
+            let reason = acceptance_report.primary_reason();
+            let target = classify_repair_target(&acceptance_report);
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "final_acceptance_repair_exhausted",
+                    "lifecycle_stage": "final_acceptance_repair",
+                    "attempt": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                    "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                    "repair_target": target.as_str(),
+                    "primary_reason": eval_events::body_snippet(&reason),
+                    "missing_paths": acceptance_report.missing_paths.clone(),
+                    "profile_failures": acceptance_report.profile_failures.clone(),
+                    "bounded_repair_exhausted": true,
+                }),
+            );
+            let handoff = save_ultra_phase_recovery_handoff(
+                config,
+                plan,
+                &fallback_phase,
+                "final_acceptance_repair_exhausted",
+                &reason,
+                &acceptance_report.missing_paths,
+                &[target.as_str().to_string()],
+            )
+            .unwrap_or_default();
+            anyhow::bail!("ultra final acceptance failed after bounded repair: {reason}{handoff}");
+        }
     }
     eval_events::emit(
         config.eval_events_path.as_deref(),
@@ -3275,7 +3389,101 @@ Continuation rules:\n\
     )
 }
 
+fn final_acceptance_repair_expected_paths(
+    plan: &UltraPlan,
+    config: &Config,
+    report: &VerificationReport,
+) -> anyhow::Result<Vec<String>> {
+    let mut expected = profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+    if let Some(contract) = CompletionContract::load_for_config(config)? {
+        merge_unique_strings(&mut expected, &contract.required_paths);
+    }
+    merge_unique_strings(&mut expected, &report.missing_paths);
+    Ok(expected)
+}
+
+fn final_acceptance_repair_prompt(
+    plan: &UltraPlan,
+    report: &VerificationReport,
+    context: &UltraRunContext,
+    repair_target: &str,
+    expected_paths: &[String],
+    attempt: usize,
+    max_attempts: usize,
+) -> String {
+    let expected = render_prompt_bullets(expected_paths);
+    let missing = render_prompt_bullets(&report.missing_paths);
+    let dependencies = render_prompt_bullets(&report.dependency_missing);
+    let profile_failures = render_prompt_bullets(&report.profile_failures);
+    let command_failures = command_failure_summaries(report);
+    let command_failures = render_prompt_bullets(&command_failures);
+    format!(
+        "Repair the final acceptance failure for the current ultra run.\n\n\
+Original ultra goal:\n{goal}\n\n\
+Profile: {profile}\nIntent: {intent}\n\n\
+Final acceptance failure:\n\
+- primary reason: {primary_reason}\n\
+- repair target: {repair_target}\n\
+- attempt: {attempt}/{max_attempts}\n\n\
+Missing paths:\n{missing}\n\n\
+Dependency failures:\n{dependencies}\n\n\
+Command failures:\n{command_failures}\n\n\
+Profile failures:\n{profile_failures}\n\n\
+Expected paths to preserve or create:\n{expected}\n\n\
+{prior_context}\n\n\
+Bounded repair rules:\n\
+- This is a bounded final acceptance repair, not a new planning cycle.\n\
+- Repair the concrete missing or failed acceptance obligations without weakening verification, package scripts, or profile contracts.\n\
+- If a scaffold exists, continue task-specific implementation instead of treating scaffold/build-only output as complete.\n\
+- Prefer the smallest necessary file changes, then stop.",
+        goal = plan.goal,
+        profile = plan.profile,
+        intent = plan.intent,
+        primary_reason = report.primary_reason(),
+        repair_target = repair_target,
+        attempt = attempt,
+        max_attempts = max_attempts,
+        missing = missing,
+        dependencies = dependencies,
+        command_failures = command_failures,
+        profile_failures = profile_failures,
+        expected = expected,
+        prior_context = context.render_prompt_section(),
+    )
+}
+
+fn render_prompt_bullets(items: &[String]) -> String {
+    if items.is_empty() {
+        "- none".to_string()
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 fn run_profile_repair_with_ultra_session(
+    execution: &mut dyn ChatClient,
+    ultra_session: &mut SessionSnapshot,
+    repair_prompt: &str,
+    expected_paths: &[String],
+    config: &Config,
+    ui: &dyn InteractionUi,
+) -> anyhow::Result<RunSessionOutcome> {
+    run_session_with_outcome_with_options(
+        execution,
+        ultra_session,
+        repair_prompt,
+        expected_paths,
+        config,
+        ui,
+        RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+    )
+}
+
+fn run_final_acceptance_repair_with_ultra_session(
     execution: &mut dyn ChatClient,
     ultra_session: &mut SessionSnapshot,
     repair_prompt: &str,
@@ -4028,6 +4236,213 @@ mod tests {
     }
 
     #[test]
+    fn ultra_final_acceptance_failure_runs_bounded_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(generated_nextjs_fixture_plan_json(
+                "scaffold phase",
+                "check_scaffold.py",
+            )),
+            AssistantReply::text(generated_nextjs_fixture_plan_json(
+                "finish phase",
+                "check_finish.py",
+            )),
+        ]);
+        let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let static_page =
+            "export default function Page(){return <main>Press any key to start</main>;}";
+        let interactive_page = r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  return <main tabIndex={0} onKeyDown={() => setScore(score + 1)}>
+    <canvas />
+    <p>score {score}</p>
+    <p>enemy invader bullet collision state</p>
+  </main>;
+}"#;
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"package.json","content":package}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"check_scaffold.py","content":"x = 1\n"}),
+                    ),
+                ],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"check_finish.py","content":"x = 2\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":interactive_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+        let plan = UltraPlan {
+            goal: "Create an interactive Space Invaders style game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "scaffold".to_string(),
+                    prompt: "Scaffold Next.js game app".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "finish".to_string(),
+                    prompt: "Finish interactive game".to_string(),
+                },
+            ],
+        };
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let page = std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap();
+        assert!(page.contains("onKeyDown"));
+        assert!(page.contains("score"));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("ultra_final_acceptance_failed"));
+        assert!(event_text.contains("final_acceptance_repair_start"));
+        assert!(event_text.contains("final_acceptance_repair_complete"));
+        assert!(event_text.contains("ultra_plan_complete"));
+        assert!(!event_text.contains("recovery_prompt_saved"));
+        let repair_prompt = execution
+            .messages
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .find(|prompt| prompt.contains("Repair the final acceptance failure"))
+            .expect("final acceptance repair request");
+        assert!(repair_prompt.contains("Repair the final acceptance failure"));
+        assert!(repair_prompt.contains("attempt: 1/1"));
+        assert!(repair_prompt.contains("without weakening verification"));
+    }
+
+    #[test]
+    fn ultra_final_acceptance_repair_failure_saves_recovery_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(generated_nextjs_fixture_plan_json(
+                "scaffold phase",
+                "check_scaffold.py",
+            )),
+            AssistantReply::text(generated_nextjs_fixture_plan_json(
+                "finish phase",
+                "check_finish.py",
+            )),
+        ]);
+        let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let static_page =
+            "export default function Page(){return <main>Press any key to start</main>;}";
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"package.json","content":package}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"check_scaffold.py","content":"x = 1\n"}),
+                    ),
+                ],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"check_finish.py","content":"x = 2\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+        let plan = UltraPlan {
+            goal: "Create an interactive Space Invaders style game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "scaffold".to_string(),
+                    prompt: "Scaffold Next.js game app".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "finish".to_string(),
+                    prompt: "Finish interactive game".to_string(),
+                },
+            ],
+        };
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ultra final acceptance repair failed"));
+        let repairs_dir = dir.path().join(".anvil/repairs");
+        assert!(repairs_dir.is_dir());
+        assert!(std::fs::read_dir(&repairs_dir).unwrap().next().is_some());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("final_acceptance_repair_start"));
+        assert!(event_text.contains("final_acceptance_repair_failed"));
+        assert!(event_text.contains("recovery_prompt_saved"));
+        assert!(event_text.contains("suggested_recovery_command"));
+    }
+
+    #[test]
     fn ultra_plan_final_profile_failure_runs_repair() {
         let dir = tempfile::tempdir().unwrap();
         let step_json = generated_nextjs_artifact_plan_json("Scaffold project");
@@ -4534,6 +4949,33 @@ mod tests {
                     "src/app/global.d.ts".to_string(),
                 ],
                 verify: Vec::new(),
+            }],
+        })
+        .unwrap()
+    }
+
+    fn generated_nextjs_fixture_plan_json(goal: &str, check_path: &str) -> String {
+        let mut expected_paths = vec![check_path.to_string()];
+        if check_path.contains("scaffold") {
+            expected_paths = vec![
+                "package.json".to_string(),
+                "src/app/page.tsx".to_string(),
+                "src/app/layout.tsx".to_string(),
+                "src/app/global.d.ts".to_string(),
+                check_path.to_string(),
+            ];
+        }
+        serde_json::to_string(&StepPlan {
+            goal: goal.to_string(),
+            steps: vec![PlanStep {
+                id: "create-and-check-artifacts".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: format!(
+                    "Create the declared artifacts including {check_path} and keep the Next.js files coherent"
+                ),
+                expected_paths,
+                verify: vec![format!("python3 -m py_compile {check_path}")],
             }],
         })
         .unwrap()

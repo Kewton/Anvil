@@ -71,6 +71,42 @@ class RuntimeScoringTest(unittest.TestCase):
         self.assertEqual(score["execution_contract_adherence_raw_score"], "")
         self.assertEqual(score["postcheck_stability_reason"], "")
 
+    def test_final_acceptance_repair_events_are_runtime_events(self):
+        events = [
+            {"event": "ultra_phase_start", "phase_id": "finish", "total_phases": 1},
+            {"event": "ultra_phase_scaffold_complete", "phase_id": "finish", "total_phases": 1},
+            {"event": "ultra_phase_execute_complete", "phase_id": "finish", "total_phases": 1},
+            {"event": "ultra_phase_profile_check", "phase_id": "finish", "total_phases": 1, "ok": True},
+            {"event": "ultra_phase_complete", "phase_id": "finish", "total_phases": 1},
+            {
+                "event": "ultra_final_acceptance_failed",
+                "lifecycle_stage": "final_acceptance",
+                "repair_target": "missing_path",
+            },
+            {
+                "event": "final_acceptance_repair_start",
+                "lifecycle_stage": "final_acceptance_repair",
+                "attempt": 1,
+                "max_attempts": 1,
+            },
+            {
+                "event": "final_acceptance_repair_exhausted",
+                "lifecycle_stage": "final_acceptance_repair",
+                "attempt": 1,
+                "max_attempts": 1,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="ultra-plan-run",
+                success=False,
+                scenario={"expected_artifacts": ["src/app/page.tsx"]},
+                workdir=Path(td),
+            )
+        self.assertNotEqual(score["runtime_friction_score"], "")
+        self.assertNotEqual(score["ultra_runtime_health_score"], "")
+
     def test_prompt_contract_score_uses_boolean_event_without_prompt_body(self):
         events = [
             {
