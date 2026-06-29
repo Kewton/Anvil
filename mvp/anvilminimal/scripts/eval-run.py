@@ -124,7 +124,14 @@ def main() -> int:
         (run_dir / "command.txt").write_text(" ".join(json.dumps(part) for part in command) + "\n", encoding="utf-8")
         write_json(run_dir / "meta.json", scrub_spec(spec))
         if args.dry_run:
-            rows.append({**empty_summary_row(spec), "workdir": str(workdir), "extras_json": {"dry_run": True}})
+            rows.append({
+                **empty_summary_row(spec),
+                "workdir": str(workdir),
+                "extras_json": {
+                    "dry_run": True,
+                    "provider_probe": spec.get("provider_probe", {}),
+                },
+            })
             continue
         prepared.append((index, spec, command, run_dir, workdir))
 
@@ -670,6 +677,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         "metric_source": "events+process" if child_events else "process",
         "elapsed_total_sec": round(time.monotonic() - start, 3),
         "oracle_kind": post.get("oracle_kind", ""),
+        "provider_probe": spec.get("provider_probe", {}),
     }
     failure_kind = ""
     if not success:

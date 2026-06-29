@@ -67,6 +67,7 @@ def expand_matrix(
                         "chat_retries": int(profile.get("chat_retries", 1)),
                         "binary": binary,
                         "binary_kind": resolved_binary_kind,
+                        "provider_probe": suite.get("provider_probe", {}),
                     }
                     row["command"] = render_command(
                         binary=binary,

@@ -1,13 +1,23 @@
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anvilminimal::config::{Action, Config, Provider, load_api_key};
 use anvilminimal::providers::ChatClient;
 use anvilminimal::providers::gemini::GeminiClient;
-use anvilminimal::providers::gemini_function_calling::build_interactions_request;
+use anvilminimal::providers::gemini_function_calling::{
+    build_interactions_request, parse_interactions_response,
+};
 use anvilminimal::providers::ollama::OllamaClient;
-use anvilminimal::providers::openai::{OpenAiClient, build_response_request};
+use anvilminimal::providers::ollama::parse_chat_response;
+use anvilminimal::providers::openai::{
+    OpenAiClient, build_response_request, parse_openai_response,
+};
 use anvilminimal::state::ConversationMessage;
 use anvilminimal::tools::registry::ToolRegistry;
+use serde_json::{Value, json};
+
+static PROVIDER_PROBE_EVENT_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn planner_live_provider_smoke_skips_without_keys() {
@@ -48,6 +58,173 @@ fn planner_live_openai_gemini_json_contract() {
     let gemini_plan = anvilminimal::planner::generate_step_plan(&mut gemini, goal, &gemini_config)
         .expect("Gemini planner JSON contract");
     assert!(!gemini_plan.steps.is_empty());
+}
+
+#[test]
+fn provider_probe_openai_tool_args_shape_skips_without_key() {
+    if !provider_probe_enabled() {
+        return;
+    }
+    let Some(openai_root) = find_workspace_with_key("OPENAI_API_KEY") else {
+        record_provider_probe(json!({
+            "provider": "openai",
+            "probe": "tool_args_shape",
+            "status": "skipped",
+            "reason": "missing_openai_api_key",
+        }));
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut config = smoke_config(tmp.path(), openai_root, Provider::Openai);
+    config.model =
+        std::env::var("ANVIL_OPENAI_SMOKE_MODEL").unwrap_or_else(|_| "gpt-5.4-mini".to_string());
+    let mut client = OpenAiClient::from_env(&config).expect("openai client");
+    let result = client.chat(
+        &config.model,
+        &[ConversationMessage::user(
+            "Use the Write tool exactly once with path provider-probe.txt and content provider probe ok. Do not answer in plain text."
+                .to_string(),
+        )],
+        ToolRegistry::default().specs(),
+        true,
+    );
+    match result {
+        Ok(reply) => {
+            let tool_names = reply
+                .tool_calls
+                .iter()
+                .map(|call| call.name.clone())
+                .collect::<Vec<_>>();
+            let args_shape_ok = reply
+                .tool_calls
+                .iter()
+                .all(|call| call.arguments.as_object().is_some());
+            record_provider_probe(json!({
+                "provider": "openai",
+                "model": config.model,
+                "probe": "tool_args_shape",
+                "status": if args_shape_ok && !reply.tool_calls.is_empty() { "passed" } else { "failed" },
+                "tool_calls": reply.tool_calls.len(),
+                "tool_names": tool_names,
+                "arguments_shape": if args_shape_ok { "object" } else { "non_object_or_missing" },
+            }));
+            assert!(
+                !reply.tool_calls.is_empty(),
+                "OpenAI probe returned no tool calls"
+            );
+            assert!(args_shape_ok, "OpenAI probe returned non-object arguments");
+        }
+        Err(err) => {
+            record_provider_probe(json!({
+                "provider": "openai",
+                "model": config.model,
+                "probe": "tool_args_shape",
+                "status": "failed",
+                "error_kind": "provider_error",
+                "message": err.to_string(),
+            }));
+            panic!("OpenAI provider probe failed: {err}");
+        }
+    }
+}
+
+#[test]
+fn provider_probe_gemini_function_calling_schema_skips_without_key() {
+    if !provider_probe_enabled() {
+        return;
+    }
+    let Some(gemini_root) = find_workspace_with_key("GEMINI_API_KEY") else {
+        record_provider_probe(json!({
+            "provider": "gemini",
+            "probe": "function_calling_schema",
+            "status": "skipped",
+            "reason": "missing_gemini_api_key",
+        }));
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut config = smoke_config(tmp.path(), gemini_root, Provider::Gemini);
+    config.planner_model = std::env::var("ANVIL_GEMINI_SMOKE_MODEL")
+        .unwrap_or_else(|_| "gemini-3.5-flash".to_string());
+    let mut client = GeminiClient::from_env(&config).expect("gemini client");
+    let result = client.chat(
+        &config.planner_model,
+        &[ConversationMessage::user(
+            "Use the Write function exactly once with path provider-probe.txt and content provider probe ok. Do not answer in plain text."
+                .to_string(),
+        )],
+        ToolRegistry::default().specs(),
+        true,
+    );
+    match result {
+        Ok(reply) => {
+            let tool_names = reply
+                .tool_calls
+                .iter()
+                .map(|call| call.name.clone())
+                .collect::<Vec<_>>();
+            let args_shape_ok = reply
+                .tool_calls
+                .iter()
+                .all(|call| call.arguments.as_object().is_some());
+            record_provider_probe(json!({
+                "provider": "gemini",
+                "model": config.planner_model,
+                "probe": "function_calling_schema",
+                "status": if args_shape_ok && !reply.tool_calls.is_empty() { "passed" } else { "failed" },
+                "tool_calls": reply.tool_calls.len(),
+                "tool_names": tool_names,
+                "arguments_shape": if args_shape_ok { "object" } else { "non_object_or_missing" },
+            }));
+            assert!(
+                !reply.tool_calls.is_empty(),
+                "Gemini probe returned no tool calls"
+            );
+            assert!(args_shape_ok, "Gemini probe returned non-object arguments");
+        }
+        Err(err) => {
+            record_provider_probe(json!({
+                "provider": "gemini",
+                "model": config.planner_model,
+                "probe": "function_calling_schema",
+                "status": "failed",
+                "error_kind": "provider_error",
+                "message": err.to_string(),
+            }));
+            panic!("Gemini provider probe failed: {err}");
+        }
+    }
+}
+
+#[test]
+fn provider_probe_parser_fixtures_cover_tool_argument_shapes() {
+    let openai = parse_openai_response(
+        r#"{"output":[{"type":"function_call","name":"Write","call_id":"c1","arguments":"{\"path\":\"provider-probe.txt\",\"content\":\"ok\"}"}]}"#,
+    )
+    .expect("OpenAI string arguments fixture");
+    assert_eq!(openai.tool_calls[0].arguments["path"], "provider-probe.txt");
+
+    let gemini = parse_interactions_response(
+        r#"{"output":[{"type":"function_call","name":"Write","call_id":"c1","arguments":"{\"path\":\"provider-probe.txt\",\"content\":\"ok\"}"}]}"#,
+    )
+    .expect("Gemini string arguments fixture");
+    assert_eq!(gemini.tool_calls[0].arguments["content"], "ok");
+
+    let ollama = parse_chat_response(
+        r#"{"message":{"content":"<function_call>{\"name\":\"Write\",\"arguments\":{\"path\":\"provider-probe.txt\",\"content\":\"ok\"}}</function_call>"}}"#,
+        &["Write".to_string()],
+        true,
+    )
+    .expect("Ollama XML fallback fixture");
+    assert_eq!(ollama.tool_calls[0].name, "Write");
+    assert_eq!(ollama.tool_calls[0].arguments["path"], "provider-probe.txt");
+
+    record_provider_probe(json!({
+        "provider": "fixture",
+        "probe": "tool_argument_parser_shapes",
+        "status": "passed",
+        "providers": ["openai", "gemini", "ollama_xml_fallback"],
+    }));
 }
 
 #[test]
@@ -218,6 +395,31 @@ fn find_workspace_with_key(name: &str) -> Option<PathBuf> {
         Some(PathBuf::from("."))
     } else {
         None
+    }
+}
+
+fn provider_probe_enabled() -> bool {
+    std::env::var("ANVIL_PROVIDER_PROBE").ok().as_deref() == Some("1")
+        || std::env::var("ANVIL_LIVE_PROVIDER_TESTS").ok().as_deref() == Some("1")
+}
+
+fn record_provider_probe(mut value: Value) {
+    let Some(path) = std::env::var_os("ANVIL_PROVIDER_PROBE_OUT").map(PathBuf::from) else {
+        return;
+    };
+    let _guard = PROVIDER_PROBE_EVENT_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    value["event"] = json!("provider_probe");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{}", value);
     }
 }
 

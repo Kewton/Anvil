@@ -23,7 +23,7 @@ pub fn extract_tool_calls(
 ) -> anyhow::Result<(Vec<ToolCall>, String)> {
     let mut remaining = strip_think_tags(input);
     let mut calls = Vec::new();
-    for tag in ["anvil_tool_call", "tool_call"] {
+    for tag in ["anvil_tool_call", "tool_call", "function_call"] {
         loop {
             let open = format!("<{tag}>");
             let close = format!("</{tag}>");
@@ -65,6 +65,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls[0].name, "Read");
+        assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn extracts_source_style_function_call_tag() {
+        let (calls, text) = extract_tool_calls(
+            r#"hi <function_call>{"name":"Write","arguments":{"path":"provider-probe.txt","content":"ok"}}</function_call>"#,
+            &["Write".to_string()],
+        )
+        .unwrap();
+        assert_eq!(calls[0].name, "Write");
+        assert_eq!(calls[0].arguments["path"], "provider-probe.txt");
         assert_eq!(text, "hi");
     }
 }

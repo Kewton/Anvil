@@ -29,7 +29,12 @@ def load_suite(path: str | Path) -> dict[str, Any]:
             continue
         ids.add(scenario["id"])
         deduped.append(scenario)
-    return {"name": name, "description": data.get("description", ""), "scenarios": deduped}
+    return {
+        "name": name,
+        "description": data.get("description", ""),
+        "provider_probe": data.get("provider_probe", {}),
+        "scenarios": deduped,
+    }
 
 
 def load_benchmark_as_scenarios(path: Path) -> list[dict[str, Any]]:
