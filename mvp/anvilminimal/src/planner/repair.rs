@@ -1,10 +1,12 @@
 use std::path::Path;
 
+use crate::eval_events;
 use crate::minimal_loop::repair_target::classify_repair_target;
 use crate::planner::verify::VerificationReport;
 
 #[derive(Debug, Clone, Default)]
 pub struct RepairContext {
+    pub profile: Option<String>,
     pub overall_goal: Option<String>,
     pub required_final_artifacts: Vec<String>,
     pub step_instruction: Option<String>,
@@ -19,6 +21,20 @@ pub struct RepairContext {
     pub initial_stop_reason: Option<String>,
     pub repair_stop_reason: Option<String>,
     pub progress_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RecoveryHandoff {
+    pub profile: String,
+    pub original_goal: String,
+    pub failed_phase: Option<String>,
+    pub failed_step: Option<String>,
+    pub failure_kind: String,
+    pub failure_evidence: Vec<String>,
+    pub missing_paths: Vec<String>,
+    pub verify_commands: Vec<String>,
+    pub changed_paths: Vec<String>,
+    pub repair_targets: Vec<String>,
 }
 
 pub fn build_repair_prompt(step_id: &str, report: &VerificationReport) -> String {
@@ -115,9 +131,59 @@ pub fn save_repair_report_with_context(
 ) -> anyhow::Result<std::path::PathBuf> {
     let dir = root.join(".anvil").join("repairs");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("repair-{step_id}.md"));
+    let path = dir.join(format!("repair-{step_id}-{}.md", uuid::Uuid::now_v7()));
     std::fs::write(&path, render_repair_report(step_id, report, context))?;
     Ok(path)
+}
+
+pub fn save_ultra_recovery_prompt(
+    root: &Path,
+    scope: &str,
+    handoff: &RecoveryHandoff,
+) -> anyhow::Result<std::path::PathBuf> {
+    let dir = root.join(".anvil").join("repairs");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("repair-{scope}-{}.md", uuid::Uuid::now_v7()));
+    std::fs::write(&path, render_ultra_recovery_prompt(handoff))?;
+    Ok(path)
+}
+
+pub fn suggested_ultra_recovery_command(path: &Path, profile: &str) -> String {
+    format!(
+        "/ultra-plan-run --profile {} \"$(cat {})\"",
+        shell_quote_token(profile),
+        path.display()
+    )
+}
+
+pub fn render_ultra_recovery_prompt(handoff: &RecoveryHandoff) -> String {
+    format!(
+        "Recover this failed run by producing and executing a focused ultra plan.\n\n\
+Original goal:\n{}\n\n\
+Profile: {}\n\n\
+Failure scope:\n- phase: {}\n- step: {}\n- kind: {}\n\n\
+Failure evidence:\n{}\n\n\
+Missing paths:\n{}\n\n\
+Verification commands:\n{}\n\n\
+Changed paths:\n{}\n\n\
+Repair targets:\n{}\n\n\
+Required recovery action:\n\
+- Inspect the current workspace state first.\n\
+- Preserve already useful artifacts.\n\
+- Create or repair the missing implementation artifacts.\n\
+- Use deterministic verification.\n\
+- Do not treat scaffold-only or build-only output as complete.\n",
+        handoff.original_goal,
+        handoff.profile,
+        handoff.failed_phase.as_deref().unwrap_or("unknown"),
+        handoff.failed_step.as_deref().unwrap_or("unknown"),
+        handoff.failure_kind,
+        list_or_none(&redacted_list(&handoff.failure_evidence)),
+        list_or_none(&handoff.missing_paths),
+        list_or_none(&handoff.verify_commands),
+        list_or_none(&handoff.changed_paths),
+        list_or_none(&handoff.repair_targets),
+    )
 }
 
 fn render_repair_report(
@@ -125,6 +191,26 @@ fn render_repair_report(
     report: &VerificationReport,
     context: &RepairContext,
 ) -> String {
+    let profile = context.profile.as_deref().unwrap_or("generic");
+    let recovery = RecoveryHandoff {
+        profile: profile.to_string(),
+        original_goal: context.overall_goal.clone().unwrap_or_default(),
+        failed_phase: None,
+        failed_step: Some(step_id.to_string()),
+        failure_kind: classify_repair_target(report).as_str().to_string(),
+        failure_evidence: std::iter::once(report.primary_reason())
+            .chain(
+                report
+                    .command_failures
+                    .iter()
+                    .map(|failure| format!("{}: {}", failure.command, failure.reason)),
+            )
+            .collect(),
+        missing_paths: report.missing_paths.clone(),
+        verify_commands: context.verify_commands.clone(),
+        changed_paths: context.changed_files.clone(),
+        repair_targets: vec![classify_repair_target(report).as_str().to_string()],
+    };
     format!(
         "# Repair exhausted\n\n\
 Step: `{step_id}`\n\n\
@@ -145,7 +231,11 @@ Repair target: {}\n\n\
 - initial: {}\n\
 - repair: {}\n\n\
 ## Suggested Replan\n\
-Run `/plan-run` again with the original goal and include the missing paths above as required artifacts.\n",
+Next step: switch from local repair to explicit replanning with `/ultra-plan-run`.\n\n\
+Suggested command:\n\
+`/ultra-plan-run --profile {profile} \"$(cat .anvil/repairs/repair-...)\"`\n\n\
+## Ultra Recovery Prompt\n\
+{}\n",
         report.primary_reason(),
         classify_repair_target(report).as_str(),
         list_or_none(&report.missing_paths),
@@ -165,7 +255,8 @@ Run `/plan-run` again with the original goal and include the missing paths above
         list_or_none(&context.expected_paths),
         list_or_none(&context.verify_commands),
         context.initial_stop_reason.as_deref().unwrap_or("unknown"),
-        context.repair_stop_reason.as_deref().unwrap_or("unknown")
+        context.repair_stop_reason.as_deref().unwrap_or("unknown"),
+        render_ultra_recovery_prompt(&recovery)
     )
 }
 
@@ -183,6 +274,24 @@ fn bullet_list(items: &[String]) -> String {
         .map(|item| format!("- {item}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn redacted_list(items: &[String]) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| eval_events::body_snippet(item))
+        .collect()
+}
+
+fn shell_quote_token(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        value.to_string()
+    } else {
+        "generic".to_string()
+    }
 }
 
 #[cfg(test)]

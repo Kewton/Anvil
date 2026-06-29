@@ -5,6 +5,10 @@ pub enum RepairTarget {
     DependencySetup,
     PackageConfig,
     FrameworkConfig,
+    MissingEntrypoint,
+    EmptyApp,
+    CapabilityMissing,
+    RequiredEvidenceMissing,
     Implementation,
     TestOrEvidence,
     Unknown,
@@ -16,6 +20,10 @@ impl RepairTarget {
             Self::DependencySetup => "dependency_setup",
             Self::PackageConfig => "package_config",
             Self::FrameworkConfig => "framework_config",
+            Self::MissingEntrypoint => "missing_entrypoint",
+            Self::EmptyApp => "empty_app",
+            Self::CapabilityMissing => "capability_missing",
+            Self::RequiredEvidenceMissing => "required_evidence_missing",
             Self::Implementation => "implementation",
             Self::TestOrEvidence => "test_or_evidence",
             Self::Unknown => "unknown",
@@ -32,6 +40,18 @@ impl RepairTarget {
             }
             Self::FrameworkConfig => {
                 "Fix framework configuration, routing boundaries, or generated type declarations."
+            }
+            Self::MissingEntrypoint => {
+                "Create or restore the executable entrypoint required by the selected profile."
+            }
+            Self::EmptyApp => {
+                "Replace metadata-only or static shell output with real application behavior."
+            }
+            Self::CapabilityMissing => {
+                "Implement the missing user-facing capability required by the goal or contract."
+            }
+            Self::RequiredEvidenceMissing => {
+                "Add deterministic source, test, or verification evidence for the requested behavior."
             }
             Self::Implementation => {
                 "Fix the implementation files that should satisfy the requested behavior."
@@ -92,8 +112,63 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
         contains_any(
             reason,
             &[
+                "entrypoint missing",
+                "next entrypoint missing",
+                "missing entrypoint",
+                "src/app/page",
+                "pages/index",
+            ],
+        )
+    }) || report
+        .missing_paths
+        .iter()
+        .any(|path| contains_any(path, &["src/app/page", "app/page", "pages/index"]))
+    {
+        return RepairTarget::MissingEntrypoint;
+    }
+    if report.profile_failures.iter().any(|reason| {
+        contains_any(
+            reason,
+            &[
+                "empty app",
+                "metadata-only",
+                "static shell",
+                "static_title_only",
+                "build-only",
+            ],
+        )
+    }) {
+        return RepairTarget::EmptyApp;
+    }
+    if report.profile_failures.iter().any(|reason| {
+        contains_any(
+            reason,
+            &[
+                "missing_required_capabilities",
+                "plan_output_missing_required_capabilities",
+                "capability missing",
+            ],
+        )
+    }) {
+        return RepairTarget::CapabilityMissing;
+    }
+    if report.profile_failures.iter().any(|reason| {
+        contains_any(
+            reason,
+            &[
                 "missing_required_evidence",
                 "weak_verification_evidence",
+                "inconclusive_acceptance",
+                "required evidence missing",
+            ],
+        )
+    }) {
+        return RepairTarget::RequiredEvidenceMissing;
+    }
+    if report.profile_failures.iter().any(|reason| {
+        contains_any(
+            reason,
+            &[
                 "required_capabilities",
                 "non_zero_test",
                 "test_artifact",
@@ -181,6 +256,39 @@ pub fn repair_target_matches_changed_path(target: RepairTarget, path: &str) -> b
                 "layout.jsx",
             ],
         ),
+        RepairTarget::MissingEntrypoint => contains_any(
+            &lower,
+            &[
+                "src/app/page",
+                "app/page",
+                "pages/index",
+                "src/pages/index",
+                "main.rs",
+                "lib.rs",
+                "main.py",
+                "app.py",
+            ],
+        ),
+        RepairTarget::EmptyApp | RepairTarget::CapabilityMissing => {
+            contains_any(
+                &lower,
+                &[
+                    "src/", "app/", "pages/", ".rs", ".py", ".ts", ".tsx", ".js", ".jsx",
+                ],
+            ) && !lower.ends_with("package.json")
+        }
+        RepairTarget::RequiredEvidenceMissing => contains_any(
+            &lower,
+            &[
+                "test",
+                "spec",
+                "__tests__",
+                ".snap",
+                "evidence",
+                "README",
+                "readme",
+            ],
+        ),
         RepairTarget::Implementation => {
             contains_any(
                 &lower,
@@ -240,12 +348,12 @@ mod tests {
     }
 
     #[test]
-    fn evidence_failures_target_tests_or_evidence() {
+    fn evidence_failures_target_required_evidence() {
         let mut report = VerificationReport::pass();
         report.push_profile_failure("missing_required_evidence:non_zero_test");
         assert_eq!(
             classify_repair_target(&report),
-            RepairTarget::TestOrEvidence
+            RepairTarget::RequiredEvidenceMissing
         );
     }
 
@@ -259,6 +367,35 @@ mod tests {
             RepairTarget::PackageConfig,
             &["src/app/page.tsx".to_string()]
         ));
+    }
+
+    #[test]
+    fn classifies_missing_entrypoint() {
+        let report = VerificationReport::missing_path("src/app/page.tsx");
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::MissingEntrypoint
+        );
+    }
+
+    #[test]
+    fn classifies_capability_missing() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure("missing_required_capabilities:player_control");
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::CapabilityMissing
+        );
+    }
+
+    #[test]
+    fn classifies_required_evidence_missing() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure("missing_required_evidence:interactive_ui_source_evidence");
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::RequiredEvidenceMissing
+        );
     }
 
     #[test]

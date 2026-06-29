@@ -16,10 +16,38 @@ pub enum ProfileSnapshot {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseVerificationMode {
+    IntermediateInvariant,
+    FinalAcceptance,
+}
+
 pub fn verify_profile(root: &Path, profile: &str, goal: &str) -> VerificationReport {
+    verify_profile_final(root, profile, goal)
+}
+
+pub fn verify_profile_final(root: &Path, profile: &str, goal: &str) -> VerificationReport {
     match profile {
         "nextjs" | "next-js" | "next.js" => crate::planner::profiles::nextjs::verify(root, goal),
         "data" | "data-analysis" | "data-pipeline" => crate::planner::profiles::data::verify(root),
+        _ => VerificationReport::pass(),
+    }
+}
+
+pub fn verify_profile_invariant(
+    root: &Path,
+    profile: &str,
+    goal: &str,
+    snapshot: &ProfileSnapshot,
+) -> VerificationReport {
+    let snapshot_report = profile_after_phase(root, profile, snapshot);
+    if !snapshot_report.is_pass() {
+        return snapshot_report;
+    }
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::verify_invariant(root, goal)
+        }
         _ => VerificationReport::pass(),
     }
 }

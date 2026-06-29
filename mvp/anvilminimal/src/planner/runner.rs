@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::eval_events;
 use crate::minimal_loop::completion::CompletionContract;
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
+use crate::minimal_loop::evidence::verify_runtime_acceptance;
 use crate::minimal_loop::loop_run::{
     RunSessionOptions, RunSessionStepKind, extract_requested_artifact_paths,
     run_session_with_outcome_with_options,
@@ -16,12 +17,14 @@ use crate::planner::lint::{
     lint_ultra_plan_report, step_plan_quality_report, step_plan_quality_warnings,
 };
 use crate::planner::profile::{
-    profile_after_phase, profile_auto_repair, profile_before_phase, profile_expected_paths,
+    PhaseVerificationMode, profile_auto_repair, profile_before_phase, profile_expected_paths,
     profile_generation_rules, profile_guidance, profile_post_step_repair,
-    profile_quality_expectations, profile_repair_prompt, verify_profile,
+    profile_quality_expectations, profile_repair_prompt, verify_profile_final,
+    verify_profile_invariant,
 };
 use crate::planner::repair::{
-    RepairContext, build_repair_prompt_with_context, save_repair_report_with_context,
+    RecoveryHandoff, RepairContext, build_repair_prompt_with_context,
+    save_repair_report_with_context, save_ultra_recovery_prompt, suggested_ultra_recovery_command,
 };
 use crate::planner::step_plan::{
     PlanStep, StepKind, StepPlan, extract_json_object, parse_generated_step_plan_json,
@@ -668,6 +671,7 @@ fn run_step(
         }),
     );
     let mut context = RepairContext {
+        profile: Some(config.profile.clone()),
         overall_goal: Some(plan.goal.clone()),
         required_final_artifacts: prompt_context.required_final_artifacts.clone(),
         step_instruction: Some(step.instruction.clone()),
@@ -791,21 +795,42 @@ fn run_step(
         }
     }
     context.repair_stop_reason = repair_stop_reason;
-    if let Err(err) =
-        save_repair_report_with_context(&config.workspace_root, &step.id, &current_report, &context)
-    {
-        outcome.primary_failure = Some(err.to_string());
-        outcome.stop_reason = Some("repair_report_save_error".to_string());
-        outcome.partial = true;
-        return Err(StepRunError {
-            message: err.to_string(),
-            outcome,
-        });
-    }
+    let repair_report_path = match save_repair_report_with_context(
+        &config.workspace_root,
+        &step.id,
+        &current_report,
+        &context,
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            outcome.primary_failure = Some(err.to_string());
+            outcome.stop_reason = Some("repair_report_save_error".to_string());
+            outcome.partial = true;
+            return Err(StepRunError {
+                message: err.to_string(),
+                outcome,
+            });
+        }
+    };
+    let suggested_command = suggested_ultra_recovery_command(&repair_report_path, &config.profile);
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "recovery_prompt_saved",
+            "recovery_handoff_kind": "step_repair_exhausted",
+            "step_id": step.id,
+            "recovery_prompt_path": repair_report_path.display().to_string(),
+            "suggested_recovery_command": suggested_command,
+            "recovery_profile": config.profile,
+            "local_repair_exhausted": true,
+        }),
+    );
     let message = format!(
-        "step {} failed verification after bounded repair: {}",
+        "step {} failed verification after bounded repair: {}; repair prompt saved: {}; suggested command: {}",
         step.id,
-        current_report.primary_reason()
+        current_report.primary_reason(),
+        repair_report_path.display(),
+        suggested_ultra_recovery_command(&repair_report_path, &config.profile)
     );
     outcome.primary_failure = Some(current_report.primary_reason());
     outcome.stop_reason = Some("bounded_repair_exhausted".to_string());
@@ -924,6 +949,14 @@ fn verify_plan_final_contract(
                 .as_ref()
                 .map(|report| report.weak_evidence.clone())
                 .unwrap_or_default(),
+            "inconclusive_reasons": runtime_acceptance
+                .as_ref()
+                .map(|report| report.inconclusive_reasons.clone())
+                .unwrap_or_default(),
+            "runtime_acceptance_inconclusive": runtime_acceptance
+                .as_ref()
+                .map(|report| report.inconclusive)
+                .unwrap_or(false),
             "ok": ok,
             "primary_reason": eval_events::body_snippet(&primary_reason),
         }),
@@ -1289,6 +1322,7 @@ pub fn run_ultra_plan_with_ui(
         let phase_prompt = ultra_phase_prompt(plan, phase, config, &ultra_context);
         let step_plan =
             generate_step_plan_with_ui(planner, &phase_prompt, config, ui).map_err(|err| {
+                let message = err.to_string();
                 emit_ultra_phase_event(
                     config,
                     "ultra_phase_failed",
@@ -1297,7 +1331,7 @@ pub fn run_ultra_plan_with_ui(
                     index,
                     "scaffold",
                     Some(false),
-                    Some(&err.to_string()),
+                    Some(&message),
                     None,
                 );
                 emit_planner_error(
@@ -1306,10 +1340,20 @@ pub fn run_ultra_plan_with_ui(
                     &config.planner_model,
                     "scaffold",
                     "phase_scaffold_error",
-                    &format!("phase scaffold failed: {}", err),
+                    &format!("phase scaffold failed: {}", message),
                     index + 1,
                 );
-                anyhow::anyhow!("phase scaffold failed: {}", err)
+                let handoff = save_ultra_phase_recovery_handoff(
+                    config,
+                    plan,
+                    phase,
+                    "phase_scaffold_error",
+                    &message,
+                    &missing_final_artifacts(&config.workspace_root, &final_expected_paths),
+                    &["phase_scaffold".to_string()],
+                )
+                .unwrap_or_default();
+                anyhow::anyhow!("phase scaffold failed: {}{}", message, handoff)
             })?;
         emit_ultra_phase_event(
             config,
@@ -1371,7 +1415,20 @@ pub fn run_ultra_plan_with_ui(
                     Some(&message),
                     None,
                 );
-                return Err(anyhow::anyhow!("phase {} failed: {message}", phase.id));
+                let handoff = save_ultra_phase_recovery_handoff(
+                    config,
+                    plan,
+                    phase,
+                    "phase_execute_error",
+                    &message,
+                    &missing_final_artifacts(&config.workspace_root, &final_expected_paths),
+                    &err.partial_outcome.repair_targets,
+                )
+                .unwrap_or_default();
+                return Err(anyhow::anyhow!(
+                    "phase {} failed: {message}{handoff}",
+                    phase.id
+                ));
             }
         };
         ultra_context.update_after_phase(
@@ -1399,12 +1456,16 @@ pub fn run_ultra_plan_with_ui(
             None,
             None,
         );
-        let snapshot_report =
-            profile_after_phase(&config.workspace_root, &plan.profile, &profile_snapshot);
-        if !snapshot_report.is_pass() {
+        let invariant_report = verify_profile_invariant(
+            &config.workspace_root,
+            &plan.profile,
+            &plan.goal,
+            &profile_snapshot,
+        );
+        if !invariant_report.is_pass() {
             ultra_context.update_after_profile_failure(
                 phase,
-                &snapshot_report.primary_reason(),
+                &invariant_report.primary_reason(),
                 missing_final_artifacts(&config.workspace_root, &final_expected_paths),
             );
             emit_ultra_phase_context_updated(
@@ -1418,22 +1479,90 @@ pub fn run_ultra_plan_with_ui(
             );
             emit_ultra_phase_event(
                 config,
-                "ultra_phase_failed",
+                if final_phase {
+                    "ultra_phase_profile_check"
+                } else {
+                    "ultra_phase_failed"
+                },
                 plan,
                 phase,
                 index,
-                "profile_snapshot",
+                "profile_invariant",
                 Some(false),
-                Some(&snapshot_report.primary_reason()),
+                Some(&invariant_report.primary_reason()),
                 None,
             );
-            return Err(anyhow::anyhow!(
-                "phase {} profile snapshot verification failed: {}",
-                phase.id,
-                snapshot_report.primary_reason()
-            ));
+            emit_phase_verification_event(
+                config,
+                plan,
+                phase,
+                index,
+                PhaseVerificationMode::IntermediateInvariant,
+                false,
+                Some(&invariant_report.primary_reason()),
+            );
+            if !final_phase {
+                let handoff = save_ultra_phase_recovery_handoff(
+                    config,
+                    plan,
+                    phase,
+                    "profile_invariant_failure",
+                    &invariant_report.primary_reason(),
+                    &invariant_report.missing_paths,
+                    &["profile_contract".to_string()],
+                );
+                return Err(anyhow::anyhow!(
+                    "phase {} profile invariant verification failed: {}{}",
+                    phase.id,
+                    invariant_report.primary_reason(),
+                    handoff.unwrap_or_default()
+                ));
+            }
+        } else {
+            emit_phase_verification_event(
+                config,
+                plan,
+                phase,
+                index,
+                PhaseVerificationMode::IntermediateInvariant,
+                true,
+                None,
+            );
         }
-        let profile_report = verify_profile(&config.workspace_root, &plan.profile, &plan.goal);
+        if !final_phase {
+            emit_ultra_phase_event(
+                config,
+                "ultra_phase_profile_check",
+                plan,
+                phase,
+                index,
+                "profile_invariant",
+                Some(true),
+                None,
+                None,
+            );
+            emit_ultra_phase_event(
+                config,
+                "ultra_phase_complete",
+                plan,
+                phase,
+                index,
+                "complete",
+                Some(true),
+                None,
+                None,
+            );
+            continue;
+        }
+        let profile_report = {
+            let final_report =
+                verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
+            if final_report.is_pass() && !invariant_report.is_pass() {
+                invariant_report.clone()
+            } else {
+                final_report
+            }
+        };
         if !profile_report.is_pass() {
             ultra_context.update_after_profile_failure(
                 phase,
@@ -1460,6 +1589,15 @@ pub fn run_ultra_plan_with_ui(
                 Some(&profile_report.primary_reason()),
                 None,
             );
+            emit_phase_verification_event(
+                config,
+                plan,
+                phase,
+                index,
+                PhaseVerificationMode::FinalAcceptance,
+                false,
+                Some(&profile_report.primary_reason()),
+            );
             if final_phase
                 && profile_auto_repair(
                     &config.workspace_root,
@@ -1468,7 +1606,7 @@ pub fn run_ultra_plan_with_ui(
                     &profile_report,
                 )?
             {
-                let retry = verify_profile(&config.workspace_root, &plan.profile, &plan.goal);
+                let retry = verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
                 if retry.is_pass() {
                     emit_ultra_phase_event(
                         config,
@@ -1519,7 +1657,7 @@ pub fn run_ultra_plan_with_ui(
                 .map_err(|err| {
                     anyhow::anyhow!("phase {} profile repair failed: {err}", phase.id)
                 })?;
-                let retry = verify_profile(&config.workspace_root, &plan.profile, &plan.goal);
+                let retry = verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
                 if retry.is_pass() {
                     emit_ultra_phase_event(
                         config,
@@ -1557,9 +1695,19 @@ pub fn run_ultra_plan_with_ui(
                     None,
                 );
                 return Err(anyhow::anyhow!(
-                    "phase {} profile verification failed after repair: {:?}",
+                    "phase {} profile verification failed after repair: {:?}{}",
                     phase.id,
-                    retry.status
+                    retry.status,
+                    save_ultra_phase_recovery_handoff(
+                        config,
+                        plan,
+                        phase,
+                        "profile_repair_failed",
+                        &format!("{:?}", retry.status),
+                        &retry.missing_paths,
+                        &["profile_contract".to_string()],
+                    )
+                    .unwrap_or_default()
                 ));
             }
             emit_ultra_phase_event(
@@ -1573,12 +1721,31 @@ pub fn run_ultra_plan_with_ui(
                 Some(&format!("{:?}", profile_report.status)),
                 None,
             );
+            let handoff = save_ultra_phase_recovery_handoff(
+                config,
+                plan,
+                phase,
+                "profile_final_failure",
+                &format!("{:?}", profile_report.status),
+                &profile_report.missing_paths,
+                &["profile_contract".to_string()],
+            );
             return Err(anyhow::anyhow!(
-                "phase {} profile verification failed: {:?}",
+                "phase {} profile verification failed: {:?}{}",
                 phase.id,
-                profile_report.status
+                profile_report.status,
+                handoff.unwrap_or_default()
             ));
         }
+        emit_phase_verification_event(
+            config,
+            plan,
+            phase,
+            index,
+            PhaseVerificationMode::FinalAcceptance,
+            true,
+            None,
+        );
         emit_ultra_phase_event(
             config,
             "ultra_phase_profile_check",
@@ -1602,6 +1769,36 @@ pub fn run_ultra_plan_with_ui(
             None,
         );
     }
+    let acceptance_report = ultra_final_acceptance_report(plan, config)?;
+    if !acceptance_report.is_pass() {
+        let reason = acceptance_report.primary_reason();
+        let target = classify_repair_target(&acceptance_report);
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "ultra_final_acceptance_failed",
+                "primary_reason": eval_events::body_snippet(&reason),
+                "repair_target": target.as_str(),
+                "missing_paths": acceptance_report.missing_paths.clone(),
+                "profile_failures": acceptance_report.profile_failures.clone(),
+            }),
+        );
+        let fallback_phase = plan.phases.last().cloned().unwrap_or_else(|| UltraPhase {
+            id: "final".to_string(),
+            prompt: "Final acceptance".to_string(),
+        });
+        let handoff = save_ultra_phase_recovery_handoff(
+            config,
+            plan,
+            &fallback_phase,
+            "final_acceptance_failure",
+            &reason,
+            &acceptance_report.missing_paths,
+            &[target.as_str().to_string()],
+        )
+        .unwrap_or_default();
+        anyhow::bail!("ultra final acceptance failed: {reason}{handoff}");
+    }
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -1614,6 +1811,101 @@ pub fn run_ultra_plan_with_ui(
         "ultra-plan-run complete: {} phases",
         plan.phases.len()
     ))
+}
+
+fn ultra_final_acceptance_report(
+    plan: &UltraPlan,
+    config: &Config,
+) -> anyhow::Result<VerificationReport> {
+    let external_contract = CompletionContract::load_for_config(config)?;
+    let mut required_paths =
+        profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+    let mut required_capabilities = inferred_required_capabilities(&plan.profile, &plan.goal);
+    let mut required_evidence = Vec::new();
+    let mut deferred_commands = Vec::new();
+    if let Some(contract) = external_contract.as_ref() {
+        merge_unique_strings(&mut required_paths, &contract.required_paths);
+        merge_unique_strings(&mut required_capabilities, &contract.required_capabilities);
+        merge_unique_strings(&mut required_evidence, &contract.required_evidence);
+        deferred_commands.extend(
+            contract
+                .deferred_verify_requirements
+                .iter()
+                .map(|requirement| requirement.command.clone()),
+        );
+    }
+    let missing = missing_final_artifacts(&config.workspace_root, &required_paths);
+    let acceptance = verify_runtime_acceptance(
+        &config.workspace_root,
+        &required_paths,
+        &external_contract
+            .as_ref()
+            .map(|contract| contract.verify_commands.clone())
+            .unwrap_or_default(),
+        &required_capabilities,
+        &required_evidence,
+        &deferred_commands,
+    );
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_final_acceptance",
+            "required_paths": required_paths.clone(),
+            "missing_paths": missing.clone(),
+            "required_capabilities": required_capabilities.clone(),
+            "required_evidence": required_evidence.clone(),
+            "runtime_acceptance_passed": acceptance.passed,
+            "runtime_acceptance_inconclusive": acceptance.inconclusive,
+            "missing_capabilities": acceptance.missing_capabilities.clone(),
+            "missing_evidence": acceptance.missing_evidence.clone(),
+            "weak_evidence": acceptance.weak_evidence.clone(),
+            "inconclusive_reasons": acceptance.inconclusive_reasons.clone(),
+            "primary_reason": eval_events::body_snippet(&acceptance.primary_reason),
+        }),
+    );
+    let mut report = VerificationReport::pass();
+    for path in missing {
+        report.push_missing_path(path);
+    }
+    if !acceptance.passed {
+        report.push_profile_failure(acceptance.primary_reason);
+    }
+    Ok(report)
+}
+
+fn inferred_required_capabilities(profile: &str, goal: &str) -> Vec<String> {
+    let lower = goal.to_ascii_lowercase();
+    let is_next = matches!(profile, "nextjs" | "next-js" | "next.js");
+    let mut capabilities = Vec::new();
+    if is_next
+        && (lower.contains("game")
+            || lower.contains("playable")
+            || lower.contains("interactive")
+            || lower.contains("player")
+            || lower.contains("enemy")
+            || lower.contains("score")
+            || goal.contains("ゲーム")
+            || goal.contains("インベーダー"))
+    {
+        merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
+        merge_unique_strings(&mut capabilities, &["player_control".to_string()]);
+        merge_unique_strings(&mut capabilities, &["adversary_or_challenge".to_string()]);
+        merge_unique_strings(&mut capabilities, &["progression_or_score".to_string()]);
+        merge_unique_strings(
+            &mut capabilities,
+            &["failure_or_collision_rule".to_string()],
+        );
+    } else if is_next
+        && (lower.contains("button")
+            || lower.contains("form")
+            || lower.contains("keyboard")
+            || lower.contains("input"))
+    {
+        merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
+        merge_unique_strings(&mut capabilities, &["user_input_or_action".to_string()]);
+        merge_unique_strings(&mut capabilities, &["visible_state_change".to_string()]);
+    }
+    capabilities
 }
 
 fn emit_ultra_phase_event(
@@ -1641,6 +1933,117 @@ fn emit_ultra_phase_event(
             "step_count": step_count,
         }),
     );
+}
+
+fn emit_phase_verification_event(
+    config: &Config,
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    index: usize,
+    mode: PhaseVerificationMode,
+    ok: bool,
+    reason: Option<&str>,
+) {
+    let mode = match mode {
+        PhaseVerificationMode::IntermediateInvariant => "intermediate_invariant",
+        PhaseVerificationMode::FinalAcceptance => "final_acceptance",
+    };
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "phase_verification_result",
+            "phase_id": phase.id,
+            "phase_index": index + 1,
+            "total_phases": plan.phases.len(),
+            "phase_verification_mode": mode,
+            "ok": ok,
+            "reason": reason.map(eval_events::body_snippet).unwrap_or_default(),
+        }),
+    );
+}
+
+fn save_ultra_phase_recovery_handoff(
+    config: &Config,
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    failure_kind: &str,
+    reason: &str,
+    missing_paths: &[String],
+    repair_targets: &[String],
+) -> Option<String> {
+    let handoff = RecoveryHandoff {
+        profile: plan.profile.clone(),
+        original_goal: plan.goal.clone(),
+        failed_phase: Some(phase.id.clone()),
+        failed_step: None,
+        failure_kind: failure_kind.to_string(),
+        failure_evidence: vec![reason.to_string()],
+        missing_paths: missing_paths.to_vec(),
+        verify_commands: Vec::new(),
+        changed_paths: Vec::new(),
+        repair_targets: repair_targets.to_vec(),
+    };
+    let scope = format!("phase-{}", recovery_scope_token(&phase.id));
+    let path = match save_ultra_recovery_prompt(&config.workspace_root, &scope, &handoff) {
+        Ok(path) => path,
+        Err(err) => {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "recovery_prompt_save_failed",
+                    "recovery_handoff_kind": failure_kind,
+                    "phase_id": phase.id,
+                    "reason": eval_events::body_snippet(&err.to_string()),
+                }),
+            );
+            return Some(format!("; recovery prompt save failed: {err}"));
+        }
+    };
+    let command = suggested_ultra_recovery_command(&path, &plan.profile);
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "recovery_prompt_saved",
+            "recovery_handoff_kind": failure_kind,
+            "phase_id": phase.id,
+            "recovery_prompt_path": path.display().to_string(),
+            "suggested_recovery_command": command,
+            "recovery_profile": plan.profile,
+            "local_repair_exhausted": true,
+        }),
+    );
+    eval_events::write_run_summary(
+        config.eval_events_path.as_deref(),
+        &format!(
+            "Recovery prompt saved: {}\nSuggested command: {}\nFailure: {}",
+            path.display(),
+            suggested_ultra_recovery_command(&path, &plan.profile),
+            reason
+        ),
+    );
+    Some(format!(
+        "; repair prompt saved: {}; suggested command: {}",
+        path.display(),
+        suggested_ultra_recovery_command(&path, &plan.profile)
+    ))
+}
+
+fn recovery_scope_token(value: &str) -> String {
+    let token = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if token.trim_matches('-').is_empty() {
+        "phase".to_string()
+    } else {
+        token
+    }
 }
 
 fn emit_ultra_context_initialized(
@@ -3541,7 +3944,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("phase scaffold profile verification failed"));
+        assert!(err.contains("phase scaffold profile invariant verification failed"));
     }
 
     #[test]
@@ -3587,7 +3990,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("profile snapshot verification failed"));
+        assert!(err.contains("profile invariant verification failed"));
         assert!(err.contains("content changed"));
     }
 

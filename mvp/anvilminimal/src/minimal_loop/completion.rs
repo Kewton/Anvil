@@ -308,6 +308,12 @@ impl CompletionContract {
                     acceptance.weak_evidence.join(",")
                 ));
             }
+            if !acceptance.inconclusive_reasons.is_empty() {
+                report.push_profile_failure(format!(
+                    "inconclusive_acceptance:{}",
+                    acceptance.inconclusive_reasons.join(",")
+                ));
+            }
         }
         (report, build_verifier_observations)
     }

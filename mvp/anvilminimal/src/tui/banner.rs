@@ -79,6 +79,12 @@ pub fn render_startup_banner(config: &Config, style: BannerStyle) -> String {
         "context_budget={} yes={}\n",
         config.context_budget, config.yes
     ));
+    if let Some(path) = &config.eval_events_path {
+        out.push_str(&format!(
+            "run_log={}\n",
+            sanitize_banner_text(&path.display().to_string())
+        ));
+    }
     out
 }
 

@@ -12,6 +12,27 @@ pub fn path_from_env() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+pub fn path_from_env_or_default(root: &Path) -> Option<PathBuf> {
+    if let Some(path) = path_from_env() {
+        return Some(path);
+    }
+    if std::env::var_os("ANVIL_NO_RUN_LOG").is_some_and(|value| value == "1" || value == "true") {
+        return None;
+    }
+    Some(default_run_events_path(root))
+}
+
+pub fn default_run_events_path(root: &Path) -> PathBuf {
+    root.join(".anvil")
+        .join("runs")
+        .join(uuid::Uuid::now_v7().to_string())
+        .join("events.jsonl")
+}
+
+pub fn is_eval_events_override() -> bool {
+    path_from_env().is_some()
+}
+
 pub fn emit(path: Option<&Path>, mut event: Value) {
     let Some(path) = path else {
         return;
@@ -33,6 +54,20 @@ fn append(path: &Path, event: &Value) -> anyhow::Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     writeln!(file, "{}", serde_json::to_string(event)?)?;
     Ok(())
+}
+
+pub fn write_run_summary(path: Option<&Path>, text: &str) {
+    let Some(path) = path else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let summary = parent.join("summary.md");
+    let content = body_snippet(text);
+    if let Err(err) = std::fs::write(summary, format!("{content}\n")) {
+        eprintln!("warning: failed to write run summary: {err}");
+    }
 }
 
 pub fn argument_shape(arguments: &Value) -> Value {
@@ -188,5 +223,13 @@ mod tests {
         assert!(snippet.contains("<redacted>"));
         assert!(snippet.contains("/Users/<user>/project"));
         assert!(snippet.chars().count() <= SNIPPET_LIMIT);
+    }
+
+    #[test]
+    fn default_run_events_path_uses_anvil_runs_events_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = default_run_events_path(dir.path());
+        assert!(path.starts_with(dir.path().join(".anvil").join("runs")));
+        assert_eq!(path.file_name().unwrap(), "events.jsonl");
     }
 }

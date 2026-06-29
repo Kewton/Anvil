@@ -81,10 +81,11 @@ impl Config {
             .context("failed to canonicalize workspace root")?;
         let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
         let action = action_from_cli(&cli)?;
+        let eval_events_path = crate::eval_events::path_from_env_or_default(&workspace_root);
         Ok(Self {
             workspace_root,
             state_dir,
-            eval_events_path: crate::eval_events::path_from_env(),
+            eval_events_path,
             completion_contract_path: cli.completion_contract_json,
             yes: cli.yes,
             offline: cli.offline,

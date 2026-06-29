@@ -4,9 +4,11 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeAcceptanceReport {
     pub passed: bool,
+    pub inconclusive: bool,
     pub missing_capabilities: Vec<String>,
     pub missing_evidence: Vec<String>,
     pub weak_evidence: Vec<String>,
+    pub inconclusive_reasons: Vec<String>,
     pub primary_reason: String,
 }
 
@@ -98,6 +100,13 @@ pub fn verify_runtime_acceptance(
 
     let mut missing_evidence = Vec::new();
     let mut weak_evidence = Vec::new();
+    let mut inconclusive_reasons = Vec::new();
+    if required_capabilities
+        .iter()
+        .any(|capability| capability.trim() == "browser_interaction")
+    {
+        inconclusive_reasons.push("browser_required_but_not_available".to_string());
+    }
     for evidence in &required {
         match evidence.as_str() {
             "implementation_artifact" => {
@@ -149,11 +158,14 @@ pub fn verify_runtime_acceptance(
     }
 
     collect_weak_verify_evidence(verify_commands, &workspace, &mut weak_evidence);
-    let passed = missing_capabilities.is_empty() && missing_evidence.is_empty();
+    let inconclusive = !inconclusive_reasons.is_empty();
+    let passed = missing_capabilities.is_empty() && missing_evidence.is_empty() && !inconclusive;
     let primary_reason = if let Some(reason) = missing_capabilities.first() {
         format!("missing_required_capabilities:{reason}")
     } else if let Some(reason) = missing_evidence.first() {
         format!("missing_required_evidence:{reason}")
+    } else if let Some(reason) = inconclusive_reasons.first() {
+        format!("inconclusive_acceptance:{reason}")
     } else if let Some(reason) = weak_evidence.first() {
         format!("weak_verification_evidence:{reason}")
     } else {
@@ -162,9 +174,11 @@ pub fn verify_runtime_acceptance(
 
     RuntimeAcceptanceReport {
         passed,
+        inconclusive,
         missing_capabilities,
         missing_evidence,
         weak_evidence,
+        inconclusive_reasons,
         primary_reason,
     }
 }
@@ -640,6 +654,34 @@ mod tests {
             report
                 .missing_evidence
                 .contains(&"interactive_ui_source_evidence".to_string())
+        );
+    }
+
+    #[test]
+    fn browser_interaction_is_inconclusive_without_browser_oracle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+export default function Page(){ return <button onClick={() => alert("ok")}>Go</button>; }
+"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["browser_interaction".to_string()],
+            &[],
+            &[],
+        );
+        assert!(!report.passed);
+        assert!(report.inconclusive);
+        assert!(
+            report
+                .inconclusive_reasons
+                .contains(&"browser_required_but_not_available".to_string())
         );
     }
 }

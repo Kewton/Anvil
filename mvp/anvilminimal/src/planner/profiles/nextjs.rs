@@ -105,6 +105,62 @@ pub fn verify(root: &Path, goal: &str) -> VerificationReport {
     VerificationReport::pass()
 }
 
+pub fn verify_invariant(root: &Path, goal: &str) -> VerificationReport {
+    let project = match locate_project_root(root) {
+        Ok(project) => project,
+        Err(reason) if reason == "package.json missing" => return VerificationReport::pass(),
+        Err(reason) => return profile_failure(reason),
+    };
+    let package_path = project.path.join("package.json");
+    let Ok(content) = std::fs::read_to_string(&package_path) else {
+        return profile_failure(project.rel_path("package.json unreadable"));
+    };
+    let Ok(package): Result<Value, _> = serde_json::from_str(&content) else {
+        return profile_failure(project.rel_path("package.json invalid"));
+    };
+    let deps = package.get("dependencies").and_then(Value::as_object);
+    for dep in ["next", "react", "react-dom"] {
+        if deps.is_none_or(|deps| !deps.contains_key(dep)) {
+            return profile_failure(format!("dependency missing: {dep}"));
+        }
+    }
+    if let Some(reason) = dependency_coherence_failure(&package) {
+        return profile_failure(reason);
+    }
+    let scripts = package.get("scripts").and_then(Value::as_object);
+    let build = scripts
+        .and_then(|scripts| scripts.get("build"))
+        .and_then(Value::as_str);
+    if build.is_some_and(|build| build != "next build" || is_weakened_script(build)) {
+        return profile_failure("scripts.build must be next build");
+    }
+    if goal.contains("3011") {
+        let dev = scripts
+            .and_then(|scripts| scripts.get("dev"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if !dev.is_empty()
+            && !(dev.contains("next dev")
+                && (dev.contains("-p 3011") || dev.contains("--port 3011")))
+        {
+            return profile_failure("dev script must run next dev on port 3011");
+        }
+    }
+    if let Some(reason) = tsconfig_contract_failure(&project.path) {
+        return profile_failure(reason);
+    }
+    if let Some(reason) = css_side_effect_import_contract_failure(&project.path) {
+        return profile_failure(reason);
+    }
+    if let Some(reason) = client_component_contract_failure(&project.path) {
+        return profile_failure(reason);
+    }
+    if let Some(reason) = tailwind_contract_failure(&project.path, &package) {
+        return profile_failure(reason);
+    }
+    VerificationReport::pass()
+}
+
 pub fn guidance(goal: &str) -> String {
     let port = if goal.contains("3011") {
         " The dev script must run `next dev -p 3011` or `next dev --port 3011`."
@@ -954,6 +1010,28 @@ mod tests {
         assert!(matches!(
             report.status,
             VerifyStatus::ProfileContractFailed(reason) if reason.contains("entrypoint")
+        ));
+    }
+
+    #[test]
+    fn nextjs_invariant_allows_pending_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), package_json()).unwrap();
+        assert!(verify_invariant(dir.path(), "3011").is_pass());
+    }
+
+    #[test]
+    fn nextjs_invariant_rejects_weakened_build_script() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"echo ok","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        let report = verify_invariant(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("scripts.build")
         ));
     }
 
