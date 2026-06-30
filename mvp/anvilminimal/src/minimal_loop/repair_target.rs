@@ -14,6 +14,35 @@ pub enum RepairTarget {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairFollowThrough {
+    NoChange,
+    TargetMatched,
+    TargetMisdirected,
+}
+
+impl RepairFollowThrough {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoChange => "no_change",
+            Self::TargetMatched => "target_matched",
+            Self::TargetMisdirected => "target_misdirected",
+        }
+    }
+
+    pub fn failure_kind(self) -> Option<&'static str> {
+        match self {
+            Self::NoChange => Some("verify_repair_no_change"),
+            Self::TargetMisdirected => Some("repair_target_misdirected"),
+            Self::TargetMatched => None,
+        }
+    }
+
+    pub fn followed(self) -> bool {
+        matches!(self, Self::TargetMatched)
+    }
+}
+
 impl RepairTarget {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -144,6 +173,8 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
         contains_any(
             reason,
             &[
+                "interactive_ui_source_evidence",
+                "non_static_screen_evidence",
                 "missing_required_capabilities",
                 "plan_output_missing_required_capabilities",
                 "capability missing",
@@ -177,6 +208,14 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
         )
     }) {
         return RepairTarget::TestOrEvidence;
+    }
+    if report.command_failures.iter().any(|failure| {
+        contains_any(
+            &format!("{} {}", failure.command, failure.reason),
+            &["src/app/page", "app/page", "pages/index", "src/pages/index"],
+        )
+    }) {
+        return RepairTarget::MissingEntrypoint;
     }
     if report.command_failures.iter().any(|failure| {
         contains_any(
@@ -236,8 +275,22 @@ pub fn repair_target_matches_changed_path(target: RepairTarget, path: &str) -> b
     let lower = path.to_ascii_lowercase();
     match target {
         RepairTarget::DependencySetup => {
-            lower == "package-lock.json"
+            lower == "package.json"
+                || lower == "package-lock.json"
+                || lower == "pnpm-lock.yaml"
+                || lower == "yarn.lock"
+                || lower == "cargo.toml"
+                || lower == "cargo.lock"
+                || lower == "pyproject.toml"
+                || lower == "requirements.txt"
+                || lower.ends_with("/package.json")
                 || lower.ends_with("/package-lock.json")
+                || lower.ends_with("/pnpm-lock.yaml")
+                || lower.ends_with("/yarn.lock")
+                || lower.ends_with("/cargo.toml")
+                || lower.ends_with("/cargo.lock")
+                || lower.ends_with("/pyproject.toml")
+                || lower.ends_with("/requirements.txt")
                 || lower.contains("node_modules/.bin/")
         }
         RepairTarget::PackageConfig => {
@@ -313,11 +366,25 @@ pub fn repair_target_matches_changed_path(target: RepairTarget, path: &str) -> b
     }
 }
 
+pub fn classify_repair_follow_through(
+    target: RepairTarget,
+    changed_paths: &[String],
+) -> RepairFollowThrough {
+    if changed_paths.is_empty() {
+        return RepairFollowThrough::NoChange;
+    }
+    if changed_paths
+        .iter()
+        .any(|path| repair_target_matches_changed_path(target, path))
+    {
+        RepairFollowThrough::TargetMatched
+    } else {
+        RepairFollowThrough::TargetMisdirected
+    }
+}
+
 pub fn repair_target_followed(target: RepairTarget, changed_paths: &[String]) -> bool {
-    changed_paths.is_empty()
-        || changed_paths
-            .iter()
-            .any(|path| repair_target_matches_changed_path(target, path))
+    classify_repair_follow_through(target, changed_paths).followed()
 }
 
 fn contains_any(value: &str, needles: &[&str]) -> bool {
@@ -370,6 +437,52 @@ mod tests {
     }
 
     #[test]
+    fn repair_follow_through_distinguishes_no_change() {
+        assert_eq!(
+            classify_repair_follow_through(RepairTarget::MissingEntrypoint, &[]),
+            RepairFollowThrough::NoChange
+        );
+        assert!(!repair_target_followed(
+            RepairTarget::MissingEntrypoint,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn repair_follow_through_distinguishes_target_misdirected() {
+        assert_eq!(
+            classify_repair_follow_through(
+                RepairTarget::MissingEntrypoint,
+                &["README.md".to_string()]
+            ),
+            RepairFollowThrough::TargetMisdirected
+        );
+    }
+
+    #[test]
+    fn repair_follow_through_accepts_missing_entrypoint_artifact() {
+        assert_eq!(
+            classify_repair_follow_through(
+                RepairTarget::MissingEntrypoint,
+                &["src/app/page.tsx".to_string()]
+            ),
+            RepairFollowThrough::TargetMatched
+        );
+    }
+
+    #[test]
+    fn dependency_setup_target_accepts_manifest_or_lockfile_changes() {
+        assert!(repair_target_followed(
+            RepairTarget::DependencySetup,
+            &["package.json".to_string()]
+        ));
+        assert!(repair_target_followed(
+            RepairTarget::DependencySetup,
+            &["package-lock.json".to_string()]
+        ));
+    }
+
+    #[test]
     fn classifies_missing_entrypoint() {
         let report = VerificationReport::missing_path("src/app/page.tsx");
         assert_eq!(
@@ -389,12 +502,12 @@ mod tests {
     }
 
     #[test]
-    fn classifies_required_evidence_missing() {
+    fn classifies_interactive_source_evidence_as_capability_missing() {
         let mut report = VerificationReport::pass();
         report.push_profile_failure("missing_required_evidence:interactive_ui_source_evidence");
         assert_eq!(
             classify_repair_target(&report),
-            RepairTarget::RequiredEvidenceMissing
+            RepairTarget::CapabilityMissing
         );
     }
 

@@ -204,6 +204,17 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "last_loop_stop": "step_verify_failure",
                 "repair_target": event.get("repair_target", ""),
             }
+        if name == "step_verify_repair" and event.get("failure_kind") in {
+            "verify_repair_no_change",
+            "repair_target_misdirected",
+        }:
+            return {
+                "failure_kind": event.get("failure_kind"),
+                "last_loop_stop": event.get("failure_kind"),
+                "repair_target": event.get("previous_repair_target")
+                or event.get("repair_target", ""),
+                "repair_follow_through": event.get("repair_follow_through", ""),
+            }
         if name == "ultra_phase_failed":
             reason = str(event.get("reason", ""))
             lower_reason = reason.lower()

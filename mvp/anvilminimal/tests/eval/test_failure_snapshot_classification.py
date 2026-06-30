@@ -213,6 +213,21 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
         self.assertEqual(classified["failure_kind"], "verify_repair_no_change")
         self.assertTrue(known_failure_kind(classified["failure_kind"]))
 
+    def test_classifies_step_verify_repair_followthrough_failure_from_events(self):
+        classified = classify_events(
+            [
+                {
+                    "event": "step_verify_repair",
+                    "failure_kind": "repair_target_misdirected",
+                    "previous_repair_target": "missing_entrypoint",
+                    "repair_follow_through": "target_misdirected",
+                }
+            ]
+        )
+        self.assertEqual(classified["failure_kind"], "repair_target_misdirected")
+        self.assertEqual(classified["repair_target"], "missing_entrypoint")
+        self.assertTrue(known_failure_kind(classified["failure_kind"]))
+
     def test_classifies_profile_and_deferred_completion_failures(self):
         deferred = classify_events(
             [

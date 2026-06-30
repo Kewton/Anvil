@@ -11,7 +11,9 @@ use crate::minimal_loop::loop_run::{
     RunSessionOptions, RunSessionOutcome, RunSessionStepKind, extract_requested_artifact_paths,
     run_session_with_outcome_with_options,
 };
-use crate::minimal_loop::repair_target::{classify_repair_target, repair_target_followed};
+use crate::minimal_loop::repair_target::{
+    RepairFollowThrough, classify_repair_follow_through, classify_repair_target,
+};
 use crate::planner::intent::detect_intent;
 use crate::planner::lint::{
     PlanLintReport, PlanQualityContext, PlanQualityReport, lint_step_plan_report,
@@ -44,6 +46,8 @@ const STEP_TURN_MAX_ITERATIONS: usize = 8;
 const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
 const STEP_REPAIR_MAX_TURNS: usize = 4;
 const STEP_REPAIR_MAX_FILE_CHANGING_TURNS: usize = 2;
+const STEP_REPAIR_NO_CHANGE_LIMIT: usize = 2;
+const STEP_REPAIR_MISDIRECTED_LIMIT: usize = 2;
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
 const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 1;
 
@@ -709,6 +713,9 @@ fn run_step(
     let mut current_report = report;
     let mut previous_missing = current_report.missing_paths.len();
     let mut repair_stop_reason = None;
+    let mut terminal_repair_failure_kind: Option<&'static str> = None;
+    let mut no_change_repairs = 0usize;
+    let mut misdirected_repairs = 0usize;
     let mut file_changing_repairs = 0usize;
     let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
     for attempt in 1..=STEP_REPAIR_MAX_TURNS {
@@ -735,6 +742,7 @@ fn run_step(
         })?;
         outcome.repair_attempts = attempt;
         repair_stop_reason = Some(format!("{:?}", repair.stop_reason));
+        let mut repair_turn_changed_paths = repair.changed_paths.clone();
         merge_changed_files(&mut context, &repair.changed_paths);
         merge_unique_strings(&mut outcome.changed_paths, &repair.changed_paths);
         merge_unique_strings(&mut outcome.repair_changed_paths, &repair.changed_paths);
@@ -750,6 +758,10 @@ fn run_step(
                     std::slice::from_ref(&package_path),
                 );
                 merge_unique_strings(&mut outcome.repair_changed_paths, &[package_path]);
+                merge_unique_strings(
+                    &mut repair_turn_changed_paths,
+                    &["package.json".to_string()],
+                );
             }
             Ok(false) => {}
             Err(err) => {
@@ -774,7 +786,32 @@ fn run_step(
         }
         let retry_target = classify_repair_target(&retry);
         let previous_target = classify_repair_target(&current_report);
-        let repair_target_followed = repair_target_followed(previous_target, &repair.changed_paths);
+        let repair_follow_through =
+            classify_repair_follow_through(previous_target, &repair_turn_changed_paths);
+        let repair_target_followed = repair_follow_through.followed();
+        match repair_follow_through {
+            RepairFollowThrough::NoChange => {
+                no_change_repairs += 1;
+            }
+            RepairFollowThrough::TargetMisdirected => {
+                misdirected_repairs += 1;
+            }
+            RepairFollowThrough::TargetMatched => {
+                no_change_repairs = 0;
+                misdirected_repairs = 0;
+            }
+        }
+        let repair_failure_kind = match repair_follow_through {
+            RepairFollowThrough::NoChange if no_change_repairs >= STEP_REPAIR_NO_CHANGE_LIMIT => {
+                repair_follow_through.failure_kind().unwrap_or("")
+            }
+            RepairFollowThrough::TargetMisdirected
+                if misdirected_repairs >= STEP_REPAIR_MISDIRECTED_LIMIT =>
+            {
+                repair_follow_through.failure_kind().unwrap_or("")
+            }
+            _ => "",
+        };
         merge_unique_strings(
             &mut outcome.repair_targets,
             &[retry_target.as_str().to_string()],
@@ -797,8 +834,10 @@ fn run_step(
                 "repair_target": retry_target.as_str(),
                 "previous_repair_target": previous_target.as_str(),
                 "repair_target_followed": repair_target_followed,
+                "repair_follow_through": repair_follow_through.as_str(),
+                "failure_kind": repair_failure_kind,
                 "primary_reason": eval_events::body_snippet(&retry.primary_reason()),
-                "changed_paths": repair.changed_paths.clone(),
+                "changed_paths": repair_turn_changed_paths.clone(),
                 "repair_stop_reason": repair_stop_reason.clone().unwrap_or_default(),
                 "dependency_setup_authority": setup_authority.as_str(),
             }),
@@ -821,11 +860,32 @@ fn run_step(
         }
         previous_missing = next_missing;
         current_report = retry;
+        if no_change_repairs >= STEP_REPAIR_NO_CHANGE_LIMIT {
+            terminal_repair_failure_kind = Some("verify_repair_no_change");
+            break;
+        }
+        if misdirected_repairs >= STEP_REPAIR_MISDIRECTED_LIMIT {
+            terminal_repair_failure_kind = Some("repair_target_misdirected");
+            break;
+        }
         if file_changing_repairs >= STEP_REPAIR_MAX_FILE_CHANGING_TURNS {
             break;
         }
     }
-    context.repair_stop_reason = repair_stop_reason;
+    let final_failure_kind = terminal_repair_failure_kind.unwrap_or("bounded_repair_exhausted");
+    context.repair_stop_reason = Some(final_failure_kind.to_string());
+    let final_repair_target = classify_repair_target(&current_report);
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "loop_stop",
+            "reason": final_failure_kind,
+            "step_id": step.id,
+            "repair_target": final_repair_target.as_str(),
+            "repair_stop_reason": repair_stop_reason.clone().unwrap_or_default(),
+            "local_repair_exhausted": true,
+        }),
+    );
     let repair_report_path = match save_repair_report_with_context(
         &config.workspace_root,
         &step.id,
@@ -854,6 +914,7 @@ fn run_step(
             "suggested_recovery_command": suggested_command,
             "recovery_profile": config.profile,
             "local_repair_exhausted": true,
+            "failure_kind": final_failure_kind,
         }),
     );
     let message = format!(
@@ -864,7 +925,7 @@ fn run_step(
         suggested_ultra_recovery_command(&repair_report_path, &config.profile)
     );
     outcome.primary_failure = Some(current_report.primary_reason());
-    outcome.stop_reason = Some("bounded_repair_exhausted".to_string());
+    outcome.stop_reason = Some(final_failure_kind.to_string());
     outcome.partial = true;
     Err(StepRunError { message, outcome })
 }
@@ -4880,6 +4941,188 @@ export default function Page(){
             .to_string();
         assert!(err.contains("plan final contract failed"));
         assert!(err.contains("missing_required_evidence"));
+    }
+
+    #[test]
+    fn step_repair_missing_entrypoint_followthrough_creates_expected_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let plan = StepPlan {
+            goal: "Create app entrypoint\n\nRequired final artifacts:\n- src/app/page.tsx"
+                .to_string(),
+            steps: vec![PlanStep {
+                id: "entrypoint".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify and repair src/app/page.tsx if missing".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["test -f src/app/page.tsx".to_string()],
+            }],
+        };
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("initial incomplete"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main>ok</main>; }"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("repair done"),
+        ]);
+        let result = run_step_plan(&mut fake, &plan, &cfg).unwrap();
+        assert_eq!(result, "plan-run complete: 1 steps");
+        assert!(dir.path().join("src/app/page.tsx").is_file());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"step_verify_repair\""));
+        assert!(event_text.contains("\"previous_repair_target\":\"missing_entrypoint\""));
+        assert!(event_text.contains("\"repair_follow_through\":\"target_matched\""));
+        assert!(event_text.contains("\"repair_target_followed\":true"));
+    }
+
+    #[test]
+    fn step_repair_no_change_is_classified_and_handoff_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let plan = StepPlan {
+            goal: "Create app entrypoint\n\nRequired final artifacts:\n- src/app/page.tsx"
+                .to_string(),
+            steps: vec![PlanStep {
+                id: "entrypoint".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify and repair src/app/page.tsx if missing".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["test -f src/app/page.tsx".to_string()],
+            }],
+        };
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("initial incomplete"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("still incomplete"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("still incomplete again"),
+        ]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repair prompt saved"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"repair_follow_through\":\"no_change\""));
+        assert!(event_text.contains("\"reason\":\"verify_repair_no_change\""));
+        assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
+        assert!(event_text.contains("\"failure_kind\":\"verify_repair_no_change\""));
+        let repair_dir = dir.path().join(".anvil/repairs");
+        assert!(repair_dir.is_dir());
+        assert!(std::fs::read_dir(repair_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "md")
+        }));
+    }
+
+    #[test]
+    fn step_repair_target_not_followed_is_classified_and_handoff_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let plan = StepPlan {
+            goal: "Create app entrypoint\n\nRequired final artifacts:\n- src/app/page.tsx"
+                .to_string(),
+            steps: vec![PlanStep {
+                id: "entrypoint".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify and repair src/app/page.tsx if missing".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["test -f src/app/page.tsx".to_string()],
+            }],
+        };
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("initial incomplete"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"README.md","content":"not the app entrypoint"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("repair one done"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"docs/notes.md","content":"still not the app entrypoint"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("repair two done"),
+        ]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repair prompt saved"), "{err}");
+        assert!(!dir.path().join("src/app/page.tsx").exists());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"repair_follow_through\":\"target_misdirected\""));
+        assert!(event_text.contains("\"reason\":\"repair_target_misdirected\""));
+        assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
+        assert!(event_text.contains("\"failure_kind\":\"repair_target_misdirected\""));
     }
 
     #[test]
