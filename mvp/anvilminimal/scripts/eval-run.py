@@ -856,6 +856,8 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "acceptance_failure_kind": acceptance.get("acceptance_failure_kind", ""),
             "acceptance_failure_reasons": acceptance.get("acceptance_failure_reasons", ""),
             "acceptance_false_positive": acceptance.get("acceptance_false_positive", ""),
+            "release_gate_status": acceptance.get("release_gate_status", ""),
+            "release_gate_reasons": acceptance.get("release_gate_reasons", ""),
             "oracle_gap_kind": acceptance.get("oracle_gap_kind", ""),
             "acceptance_oracle_version": acceptance.get("acceptance_oracle_version", ""),
             "queue_wait_sec": 0.0,

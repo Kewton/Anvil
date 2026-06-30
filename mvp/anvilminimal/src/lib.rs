@@ -20,8 +20,8 @@ use tui::markdown::PlainRenderer;
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     let config = Config::from_cli(cli)?;
     emit_run_start(&config);
-    match config.action.clone() {
-        Action::Repl => repl::run_repl(config),
+    let result = match config.action.clone() {
+        Action::Repl => repl::run_repl(config.clone()),
         Action::Prompt(prompt) => {
             let mut client = providers::client_from_config(&config, false)?;
             let resume = if config.fresh_session {
@@ -93,7 +93,9 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{report}");
             Ok(())
         }
-    }
+    };
+    emit_run_stop(&config, &result);
+    result
 }
 
 fn emit_run_start(config: &Config) {
@@ -112,4 +114,32 @@ fn emit_run_start(config: &Config) {
             "eval_events_override": eval_events::is_eval_events_override(),
         }),
     );
+}
+
+fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
+    let (ok, stop_reason, failure_kind) = match result {
+        Ok(()) => (true, "completed".to_string(), ""),
+        Err(err) => (
+            false,
+            eval_events::body_snippet(&err.to_string()),
+            "process_failure",
+        ),
+    };
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "run_stop",
+            "ok": ok,
+            "lifecycle_stage": "process",
+            "action": format!("{:?}", config.action),
+            "stop_reason": stop_reason,
+            "failure_kind": failure_kind,
+        }),
+    );
+    if !ok {
+        eval_events::write_run_summary(
+            config.eval_events_path.as_deref(),
+            &format!("run failed: {stop_reason}"),
+        );
+    }
 }

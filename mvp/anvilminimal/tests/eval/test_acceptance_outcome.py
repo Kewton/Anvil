@@ -57,6 +57,7 @@ class AcceptanceOutcomeTest(unittest.TestCase):
         self.assertTrue(outcome["acceptance_false_positive"], outcome)
         self.assertEqual(outcome["acceptance_failure_kind"], "static_title_only")
         self.assertEqual(outcome["oracle_gap_kind"], "postcheck_too_weak_for_semantic_contract")
+        self.assertEqual(outcome["release_gate_status"], "failed")
         self.assertLessEqual(outcome["acceptance_confidence_score"], 50, outcome)
         self.assertIn("acceptance_success_false", outcome["acceptance_confidence_reason"])
 
@@ -113,6 +114,55 @@ steps:
         self.assertFalse(outcome["plan_output_adherence_success"], outcome)
         self.assertLessEqual(outcome["acceptance_confidence_score"], 50, outcome)
         self.assertIn("plan_verify_coverage_below_40", outcome["acceptance_confidence_reason"])
+
+    def test_browser_required_success_is_release_gate_partial_without_browser_oracle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workdir = root / "workdir"
+            run_dir = root / "run"
+            (workdir / "src/app").mkdir(parents=True)
+            (run_dir / "postcheck").mkdir(parents=True)
+            (workdir / "package.json").write_text("{}", encoding="utf-8")
+            (workdir / "src/app/page.tsx").write_text(
+                '''
+"use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  useEffect(() => {
+    const onKeyDown = () => setScore((value) => value + 1);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+  return <main><canvas /><p>enemy bullet collision score {score}</p></main>;
+}
+''',
+                encoding="utf-8",
+            )
+            (workdir / "src/app/layout.tsx").write_text("export default function Layout({children}){return children}", encoding="utf-8")
+            (workdir / "src/app/global.d.ts").write_text("declare module '*.css';", encoding="utf-8")
+            events = [
+                {"event": "postcheck", "command": "npm install --ignore-scripts", "rc": 0},
+                {"event": "postcheck", "command": "npm run build", "rc": 0},
+                {"event": "dev_server", "ready": True},
+            ]
+            events_path = run_dir / "postcheck/events.jsonl"
+            events_path.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+            outcome = evaluate_acceptance_outcome(
+                scenario=SCENARIO,
+                workdir=workdir,
+                run_dir=run_dir,
+                mode="plan-run",
+                process_success=True,
+                legacy_success=True,
+                postcheck={"ok": True, "events_path": str(events_path)},
+            )
+        self.assertTrue(outcome["acceptance_success"], outcome)
+        self.assertEqual(outcome["release_gate_status"], "partial")
+        self.assertIn(
+            "browser_readiness_or_interaction_evidence_required:not_enabled",
+            outcome["release_gate_reasons"],
+        )
 
 
 if __name__ == "__main__":

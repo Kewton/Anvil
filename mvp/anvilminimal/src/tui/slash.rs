@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::bail;
+use serde_json::json;
 
 use crate::config::Config;
 use crate::providers::ChatClient;
@@ -39,7 +40,18 @@ pub fn handle_command(
     let mut config = config.clone();
     config.profile = parsed.profile;
     config.style = parsed.style;
-    match parsed.command.as_str() {
+    crate::eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "tui_command_start",
+            "lifecycle_stage": "tui_command",
+            "command": parsed.command,
+            "profile": config.profile,
+            "style": config.style,
+            "goal": crate::eval_events::body_snippet(&parsed.goal),
+        }),
+    );
+    let result = (|| match parsed.command.as_str() {
         "/plan-steps" => {
             let plan =
                 crate::planner::generate_step_plan_with_ui(planner, &parsed.goal, &config, ui)?;
@@ -77,6 +89,45 @@ pub fn handle_command(
             ui,
         ),
         other => bail!("unknown slash command: {other}"),
+    })();
+    emit_tui_command_stop(&config, &parsed.command, &result);
+    result
+}
+
+fn emit_tui_command_stop(config: &Config, command: &str, result: &anyhow::Result<String>) {
+    let (ok, failure_kind, stop_reason) = match result {
+        Ok(_) => (true, "", "completed".to_string()),
+        Err(err) => (
+            false,
+            "tui_command_failed",
+            crate::eval_events::body_snippet(&err.to_string()),
+        ),
+    };
+    crate::eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "tui_command_stop",
+            "lifecycle_stage": "tui_command",
+            "command": command,
+            "ok": ok,
+            "failure_kind": failure_kind,
+            "stop_reason": stop_reason,
+        }),
+    );
+    if !ok {
+        crate::eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "loop_stop",
+                "lifecycle_stage": "tui_command",
+                "reason": failure_kind,
+                "primary_reason": stop_reason,
+            }),
+        );
+        crate::eval_events::write_run_summary(
+            config.eval_events_path.as_deref(),
+            &format!("TUI command failed: {stop_reason}"),
+        );
     }
 }
 

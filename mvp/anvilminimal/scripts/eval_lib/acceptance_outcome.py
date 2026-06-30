@@ -110,6 +110,11 @@ def evaluate_acceptance_outcome(
         plan_output=plan_output,
         plan_verify=plan_verify_coverage,
     )
+    release_gate = release_gate_status(
+        contract=contract,
+        acceptance_success=acceptance_success,
+        browser_result=browser_result,
+    )
     false_positive = bool(legacy_success) and not bool(acceptance_success)
     return {
         "legacy_success": legacy_success,
@@ -138,6 +143,8 @@ def evaluate_acceptance_outcome(
         "plan_verify_oracle_version": plan_verify_coverage.get("plan_verify_oracle_version", ""),
         "acceptance_confidence_score": confidence["acceptance_confidence_score"],
         "acceptance_confidence_reason": confidence["acceptance_confidence_reason"],
+        "release_gate_status": release_gate["release_gate_status"],
+        "release_gate_reasons": release_gate["release_gate_reasons"],
         "prompt_contract_success": prompt_contract_success,
         "capability_acceptance_success": capability_acceptance_success,
         "acceptance_success": acceptance_success,
@@ -153,6 +160,7 @@ def evaluate_acceptance_outcome(
             "plan_verify": plan_verify_coverage,
             "plan_output": plan_output,
             "browser": browser_result,
+            "release_gate": release_gate,
             "acceptance_confidence": confidence,
         },
     }
@@ -186,6 +194,8 @@ def not_applicable_outcome(reason: str, legacy_success: bool) -> dict[str, Any]:
         "plan_verify_oracle_version": "",
         "acceptance_confidence_score": "",
         "acceptance_confidence_reason": reason,
+        "release_gate_status": "",
+        "release_gate_reasons": [],
         "prompt_contract_success": "",
         "capability_acceptance_success": "",
         "acceptance_success": "",
@@ -195,6 +205,32 @@ def not_applicable_outcome(reason: str, legacy_success: bool) -> dict[str, Any]:
         "oracle_gap_kind": reason,
         "acceptance_oracle_version": ACCEPTANCE_ORACLE_VERSION,
         "acceptance_details": {"reason": reason},
+    }
+
+
+def release_gate_status(
+    *,
+    contract: AcceptanceContract,
+    acceptance_success: bool,
+    browser_result: dict[str, Any],
+) -> dict[str, Any]:
+    browser_required = "browser_interaction" in (
+        contract.oracle_contract.get("deterministic_oracles") or []
+    )
+    if not acceptance_success:
+        return {
+            "release_gate_status": "failed",
+            "release_gate_reasons": ["acceptance_success_false"],
+        }
+    if browser_required and browser_result.get("browser_success", "") is not True:
+        status = str(browser_result.get("browser_details", {}).get("status", "not_enabled"))
+        return {
+            "release_gate_status": "partial",
+            "release_gate_reasons": [f"browser_readiness_or_interaction_evidence_required:{status}"],
+        }
+    return {
+        "release_gate_status": "pass",
+        "release_gate_reasons": [],
     }
 
 

@@ -994,7 +994,8 @@ fn verify_plan_final_contract(
     let external_contract = CompletionContract::load_for_config(config)?;
     let mut required_paths = required_final_artifacts.to_vec();
     let mut required_capabilities = inferred_required_capabilities(&config.profile, &plan.goal);
-    let mut required_evidence = Vec::new();
+    let mut required_evidence =
+        inferred_required_evidence(&config.profile, &plan.goal, &required_capabilities);
     let mut required_obligations =
         inferred_required_obligations(&config.profile, &plan.goal, &required_capabilities);
     let mut verify_commands = Vec::new();
@@ -1030,6 +1031,12 @@ fn verify_plan_final_contract(
             &deferred_commands,
         )
     });
+    let release_gate = final_acceptance_release_gate(
+        &config.profile,
+        &plan.goal,
+        &required_capabilities,
+        runtime_acceptance.as_ref(),
+    );
     let external_ok = external_report
         .as_ref()
         .is_none_or(|report| report.is_pass());
@@ -1084,6 +1091,8 @@ fn verify_plan_final_contract(
                 .as_ref()
                 .map(|report| report.inconclusive)
                 .unwrap_or(false),
+            "release_gate_status": release_gate.status,
+            "release_gate_reasons": release_gate.reasons,
             "ok": ok,
             "primary_reason": eval_events::body_snippet(&primary_reason),
         }),
@@ -2184,7 +2193,8 @@ fn ultra_final_acceptance_report(
     let mut required_capabilities = inferred_required_capabilities(&plan.profile, &plan.goal);
     let mut required_obligations =
         inferred_required_obligations(&plan.profile, &plan.goal, &required_capabilities);
-    let mut required_evidence = Vec::new();
+    let mut required_evidence =
+        inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities);
     let mut deferred_commands = Vec::new();
     let mut verify_commands = Vec::new();
     if let Some(contract) = external_contract.as_ref() {
@@ -2210,6 +2220,12 @@ fn ultra_final_acceptance_report(
         &required_obligations,
         &deferred_commands,
     );
+    let release_gate = final_acceptance_release_gate(
+        &plan.profile,
+        &plan.goal,
+        &required_capabilities,
+        Some(&acceptance),
+    );
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -2227,6 +2243,8 @@ fn ultra_final_acceptance_report(
             "weak_evidence": acceptance.weak_evidence.clone(),
             "artifact_obligations": acceptance.artifact_obligations.clone(),
             "inconclusive_reasons": acceptance.inconclusive_reasons.clone(),
+            "release_gate_status": release_gate.status,
+            "release_gate_reasons": release_gate.reasons,
             "primary_reason": eval_events::body_snippet(&acceptance.primary_reason),
         }),
     );
@@ -2275,6 +2293,33 @@ fn inferred_required_capabilities(profile: &str, goal: &str) -> Vec<String> {
     capabilities
 }
 
+fn inferred_required_evidence(
+    profile: &str,
+    goal: &str,
+    required_capabilities: &[String],
+) -> Vec<String> {
+    let mut evidence = Vec::new();
+    let lower = goal.to_ascii_lowercase();
+    let is_next = matches!(profile, "nextjs" | "next-js" | "next.js");
+    let app_like_goal = lower.contains("app")
+        || lower.contains("game")
+        || lower.contains("interactive")
+        || lower.contains("ui")
+        || goal.contains("アプリ")
+        || goal.contains("ゲーム")
+        || !required_capabilities.is_empty();
+    if is_next && app_like_goal {
+        merge_unique_strings(
+            &mut evidence,
+            &[
+                "nextjs_route_evidence".to_string(),
+                "build_command_or_dependency_missing_boundary".to_string(),
+            ],
+        );
+    }
+    evidence
+}
+
 fn inferred_required_obligations(
     profile: &str,
     goal: &str,
@@ -2309,6 +2354,60 @@ fn inferred_required_obligations(
         return vec!["implementation".to_string()];
     }
     Vec::new()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseGateSummary {
+    status: &'static str,
+    reasons: Vec<String>,
+}
+
+fn final_acceptance_release_gate(
+    profile: &str,
+    goal: &str,
+    required_capabilities: &[String],
+    acceptance: Option<&crate::minimal_loop::evidence::RuntimeAcceptanceReport>,
+) -> ReleaseGateSummary {
+    let lower = goal.to_ascii_lowercase();
+    let is_next = matches!(profile, "nextjs" | "next-js" | "next.js");
+    let requires_browser = is_next
+        && (required_capabilities.iter().any(|capability| {
+            matches!(
+                capability.as_str(),
+                "stateful_interaction"
+                    | "player_control"
+                    | "user_input_or_action"
+                    | "visible_state_change"
+                    | "adversary_or_challenge"
+                    | "progression_or_score"
+                    | "failure_or_collision_rule"
+            )
+        }) || lower.contains("interactive")
+            || lower.contains("game")
+            || lower.contains("keyboard")
+            || goal.contains("ゲーム"));
+    let Some(report) = acceptance else {
+        return ReleaseGateSummary {
+            status: "not_applicable",
+            reasons: Vec::new(),
+        };
+    };
+    if !report.passed {
+        return ReleaseGateSummary {
+            status: "failed",
+            reasons: vec![report.primary_reason.clone()],
+        };
+    }
+    if requires_browser {
+        return ReleaseGateSummary {
+            status: "partial",
+            reasons: vec!["browser_readiness_or_interaction_evidence_required".to_string()],
+        };
+    }
+    ReleaseGateSummary {
+        status: "pass",
+        reasons: Vec::new(),
+    }
 }
 
 fn emit_ultra_phase_event(
@@ -4987,7 +5086,7 @@ export default function Page(){
             .unwrap_err()
             .to_string();
         assert!(err.contains("plan final contract failed"), "{err}");
-        assert!(err.contains("implementation_artifact"), "{err}");
+        assert!(err.contains("build_command_or_dependency_missing_boundary"), "{err}");
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"runtime_acceptance_inconclusive\":false"));
         assert!(event_text.contains("\"missing_evidence\""));
@@ -5023,7 +5122,78 @@ export default function Page(){
             .unwrap_err()
             .to_string();
         assert!(err.contains("plan final contract failed"), "{err}");
-        assert!(err.contains("implementation_artifact"), "{err}");
+        assert!(err.contains("build_command_or_dependency_missing_boundary"), "{err}");
+    }
+
+    #[test]
+    fn plan_run_nextjs_interactive_app_records_partial_release_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = StepPlan {
+            goal: "Create an interactive browser game\n\nRequired final artifacts:\n- package.json\n- src/app/page.tsx\n- src/app/layout.tsx\n- src/app/global.d.ts".to_string(),
+            steps: vec![PlanStep {
+                id: "app".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the interactive Next.js game app".to_string(),
+                expected_paths: vec![
+                    "package.json".to_string(),
+                    "src/app/page.tsx".to_string(),
+                    "src/app/layout.tsx".to_string(),
+                    "src/app/global.d.ts".to_string(),
+                ],
+                verify: Vec::new(),
+            }],
+        };
+        let page = r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  useEffect(() => {
+    const onKeyDown = () => setScore((value) => value + 1);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+  return <main><canvas /><p>enemy bullet collision score {score}</p></main>;
+}
+"#;
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"package.json","content":"{\"scripts\":{\"build\":\"next build\"},\"dependencies\":{\"next\":\"^14.2.0\",\"react\":\"^18.3.0\",\"react-dom\":\"^18.3.0\"}}"}),
+                ),
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":page}),
+                ),
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+                ),
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";"}),
+                ),
+            ],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let result = run_step_plan(&mut fake, &plan, &cfg).unwrap();
+        assert_eq!(result, "plan-run complete: 1 steps");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"ok\":true"));
+        assert!(event_text.contains("\"nextjs_route_evidence\""));
+        assert!(event_text.contains("\"build_command_or_dependency_missing_boundary\""));
+        assert!(event_text.contains("\"release_gate_status\":\"partial\""));
+        assert!(
+            event_text.contains("browser_readiness_or_interaction_evidence_required"),
+            "{event_text}"
+        );
     }
 
     #[test]

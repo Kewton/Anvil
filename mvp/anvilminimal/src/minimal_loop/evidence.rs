@@ -34,6 +34,7 @@ enum EvidenceKind {
     BuildCommandOrDependencyBoundary,
     InteractiveUiSourceEvidence,
     NonStaticScreenEvidence,
+    NextJsRouteEvidence,
     RequestedContent,
 }
 
@@ -49,6 +50,7 @@ impl EvidenceKind {
             }
             Self::InteractiveUiSourceEvidence => "interactive_ui_source_evidence",
             Self::NonStaticScreenEvidence => "non_static_screen_evidence",
+            Self::NextJsRouteEvidence => "nextjs_route_evidence",
             Self::RequestedContent => "requested_content_evidence",
         }
     }
@@ -194,6 +196,11 @@ pub fn verify_runtime_acceptance(
                     missing_evidence.push(evidence.clone());
                 }
             }
+            "nextjs_route_evidence" => {
+                if !has_nextjs_route_evidence(&workspace) {
+                    missing_evidence.push(evidence.clone());
+                }
+            }
             "requested_content_evidence" => {
                 if !workspace.readme && required_paths.iter().all(|path| !path.ends_with(".md")) {
                     missing_evidence.push(evidence.clone());
@@ -306,6 +313,7 @@ fn evidence_kinds_for_capability(capability: &str) -> Vec<EvidenceKind> {
             EvidenceKind::InteractiveUiSourceEvidence,
             EvidenceKind::NonStaticScreenEvidence,
         ],
+        "nextjs_route" | "route" => vec![EvidenceKind::NextJsRouteEvidence],
         _ => Vec::new(),
     }
 }
@@ -491,6 +499,7 @@ fn has_build_command_or_dependency_boundary(
         || deferred_verify_requirements
             .iter()
             .any(|command| verify_command_kind(command, workspace).is_build())
+        || package_json_has_next_build_script(workspace)
 }
 
 fn collect_weak_verify_evidence(
@@ -588,6 +597,37 @@ fn has_non_static_screen_evidence(workspace: &WorkspaceEvidence) -> bool {
         .source_files
         .iter()
         .any(source_file_has_non_static_screen)
+}
+
+fn has_nextjs_route_evidence(workspace: &WorkspaceEvidence) -> bool {
+    workspace.source_files.iter().any(|file| {
+        let path = file.rel.to_ascii_lowercase();
+        matches!(
+            path.as_str(),
+            "src/app/page.tsx"
+                | "src/app/page.jsx"
+                | "app/page.tsx"
+                | "app/page.jsx"
+                | "pages/index.tsx"
+                | "pages/index.jsx"
+                | "pages/index.js"
+        ) && !file.content.trim().is_empty()
+    })
+}
+
+fn package_json_has_next_build_script(workspace: &WorkspaceEvidence) -> bool {
+    let Some(package_json) = workspace.package_json.as_ref() else {
+        return false;
+    };
+    let Ok(package): Result<serde_json::Value, _> = serde_json::from_str(package_json) else {
+        return false;
+    };
+    package
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|scripts| scripts.get("build"))
+        .and_then(serde_json::Value::as_str)
+        == Some("next build")
 }
 
 fn artifact_role_for_file(file: &SourceFile) -> ArtifactRoleLite {
@@ -1169,5 +1209,64 @@ export default function Page(){ return <button onClick={() => alert("ok")}>Go</b
                 .inconclusive_reasons
                 .contains(&"browser_required_but_not_available".to_string())
         );
+    }
+
+    #[test]
+    fn nextjs_interactive_app_requires_route_and_build_contract_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  useEffect(() => {
+    const onKeyDown = () => setScore((value) => value + 1);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+  return <main><canvas /><p>enemy bullet collision score {score}</p></main>;
+}
+"#,
+        )
+        .unwrap();
+        let missing_build = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["player_control".to_string()],
+            &[
+                "nextjs_route_evidence".to_string(),
+                "build_command_or_dependency_missing_boundary".to_string(),
+            ],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(!missing_build.passed);
+        assert!(
+            missing_build
+                .missing_evidence
+                .contains(&"build_command_or_dependency_missing_boundary".to_string())
+        );
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        let passed = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["player_control".to_string()],
+            &[
+                "nextjs_route_evidence".to_string(),
+                "build_command_or_dependency_missing_boundary".to_string(),
+            ],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(passed.passed, "{passed:?}");
     }
 }

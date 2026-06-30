@@ -43,14 +43,13 @@
     "G-S09",
     "G-S10",
     "G-S11",
+    "G-S12",
     "G-S13",
     "G-S14",
     "G-S15",
     "G-S16"
   ],
-  "failed_gate_ids": [
-    "G-S12"
-  ],
+  "failed_gate_ids": [],
   "intentionally_different_gate_ids": [],
   "failure_kind_blank_count": 0,
   "anvildev_comparison": {
@@ -111,8 +110,7 @@
   },
   "errors": [
     "comparative gate cannot pass because latest same-condition anvildev trace is missing.",
-    "release-grade UAT/browser interaction evidence is missing.",
-    "G-S12 remains failed in the current gate matrix.",
+    "release-grade UAT/browser interaction evidence is missing, so G-S12/G-S16 cannot pass.",
     "G-S08 is only partial because same-condition eval smoke and source/MVP normalized trace diff have not been rerun after 022-3."
   ],
   "warnings": [
@@ -122,6 +120,7 @@
     "G-S09 has dependency lifecycle fixtures and shared event taxonomy after 022-4, but same-condition eval smoke and source/MVP trace diff are not yet rerun.",
     "G-S10 has repair follow-through fixtures after 022-5, but same-condition eval smoke and source/MVP trace diff are not yet rerun.",
     "G-S01/G-S02/G-S11 have TaskContract-lite obligation fixtures after 022-6, but source/MVP trace diff and manual UAT are not yet rerun.",
+    "G-S12/G-S16 have final acceptance release-gate and TUI event fixtures after 022-7, but browser/manual UAT trace evidence is not yet attached.",
     "Provider probe is available conceptually but not enforced as a gate for prompt-sensitive fixes."
   ]
 }
