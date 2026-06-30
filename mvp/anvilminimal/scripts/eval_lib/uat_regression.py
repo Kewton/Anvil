@@ -34,6 +34,12 @@ def summarize_uat_regression_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     ]
     recovery_prompts = list(artifacts.get("recovery_prompts") or [])
     recovery_ultra_plans = list(artifacts.get("recovery_ultra_plans") or [])
+    recovery_ultra_plan_events = [
+        event
+        for event in recovery_prompt_events
+        if event.get("recovery_ultra_plan_path")
+        and event.get("recovery_yaml_missing") is not True
+    ]
 
     build_passed = build.get("ok") is True
     browser_failed = browser.get("ok") is False
@@ -48,7 +54,9 @@ def summarize_uat_regression_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
         ],
         "recovery_prompt_saved": bool(recovery_prompt_events or recovery_prompts),
         "recovery_ultra_plan_missing": bool(
-            (recovery_prompt_events or recovery_prompts) and not recovery_ultra_plans
+            (recovery_prompt_events or recovery_prompts)
+            and not recovery_ultra_plans
+            and not recovery_ultra_plan_events
         ),
         "build_pass_browser_fail": build_passed and browser_failed,
         "browser_http_status": browser.get("http_status", ""),
@@ -67,4 +75,3 @@ def first_non_empty(events: list[dict[str, Any]], key: str) -> Any:
         if value not in (None, ""):
             return value
     return ""
-

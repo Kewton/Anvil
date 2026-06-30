@@ -26,8 +26,9 @@ use crate::planner::profile::{
     verify_profile_final, verify_profile_invariant,
 };
 use crate::planner::repair::{
-    RecoveryHandoff, RepairContext, build_repair_prompt_with_context,
-    save_repair_report_with_context, save_ultra_recovery_prompt, suggested_ultra_recovery_command,
+    RecoveryHandoff, RepairContext, build_repair_prompt_with_context, save_recovery_ultra_plan,
+    save_repair_report_with_context, save_ultra_recovery_prompt,
+    suggested_recovery_ultra_plan_command, suggested_ultra_recovery_command,
 };
 use crate::planner::step_plan::{
     PlanStep, StepKind, StepPlan, extract_json_object, parse_generated_step_plan_json,
@@ -916,7 +917,51 @@ fn run_step(
             });
         }
     };
+    let step_handoff = RecoveryHandoff {
+        profile: config.profile.clone(),
+        original_goal: context
+            .overall_goal
+            .clone()
+            .unwrap_or_else(|| plan.goal.clone()),
+        failed_phase: None,
+        failed_step: Some(step.id.clone()),
+        failure_kind: final_failure_kind.to_string(),
+        failure_evidence: std::iter::once(current_report.primary_reason())
+            .chain(
+                current_report
+                    .command_failures
+                    .iter()
+                    .map(|failure| format!("{}: {}", failure.command, failure.reason)),
+            )
+            .collect(),
+        missing_paths: current_report.missing_paths.clone(),
+        missing_capabilities: vec![final_repair_target.as_str().to_string()],
+        verify_commands: context.verify_commands.clone(),
+        changed_paths: context.changed_files.clone(),
+        repair_targets: vec![final_repair_target.as_str().to_string()],
+    };
+    let recovery_plan_path =
+        match save_recovery_ultra_plan(&config.workspace_root, &step.id, &step_handoff) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "recovery_ultra_plan_save_failed",
+                        "recovery_handoff_kind": final_failure_kind,
+                        "step_id": step.id,
+                        "recovery_prompt_path": repair_report_path.display().to_string(),
+                        "reason": eval_events::body_snippet(&err.to_string()),
+                        "recovery_yaml_missing": true,
+                    }),
+                );
+                None
+            }
+        };
     let suggested_command = suggested_ultra_recovery_command(&repair_report_path, &config.profile);
+    let suggested_yaml_command = recovery_plan_path
+        .as_ref()
+        .map(|path| suggested_recovery_ultra_plan_command(path));
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -924,18 +969,60 @@ fn run_step(
             "recovery_handoff_kind": "step_repair_exhausted",
             "step_id": step.id,
             "recovery_prompt_path": repair_report_path.display().to_string(),
+            "recovery_ultra_plan_path": recovery_plan_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            "recovery_yaml_missing": recovery_plan_path.is_none(),
             "suggested_recovery_command": suggested_command,
+            "suggested_recovery_yaml_command": suggested_yaml_command.clone().unwrap_or_default(),
             "recovery_profile": config.profile,
             "local_repair_exhausted": true,
             "failure_kind": final_failure_kind,
+            "status": "incomplete",
         }),
     );
+    let yaml_summary = recovery_plan_path
+        .as_ref()
+        .map(|path| format!("Recovery UltraPlan YAML saved: {}", path.display()))
+        .unwrap_or_else(|| {
+            "Recovery UltraPlan YAML missing: failed to save valid recovery plan".to_string()
+        });
+    let yaml_command_summary = suggested_yaml_command
+        .as_ref()
+        .map(|command| format!("Suggested YAML command: {command}"))
+        .unwrap_or_else(|| {
+            "Suggested YAML command: unavailable because recovery YAML is missing".to_string()
+        });
+    eval_events::write_run_summary(
+        config.eval_events_path.as_deref(),
+        &format!(
+            "Status: incomplete\n{}\n{}\nRecovery prompt saved: {}\nSuggested prompt command: {}\nFailure: {}",
+            yaml_summary,
+            yaml_command_summary,
+            repair_report_path.display(),
+            suggested_command,
+            current_report.primary_reason()
+        ),
+    );
+    let yaml_message = recovery_plan_path
+        .as_ref()
+        .zip(suggested_yaml_command.as_ref())
+        .map(|(path, command)| {
+            format!(
+                "; incomplete; recovery YAML saved: {}; suggested YAML command: {}",
+                path.display(),
+                command
+            )
+        })
+        .unwrap_or_else(|| "; incomplete; recovery YAML missing".to_string());
     let message = format!(
-        "step {} failed verification after bounded repair: {}; repair prompt saved: {}; suggested command: {}",
+        "step {} failed verification after bounded repair: {}; repair prompt saved: {}; suggested command: {}{}",
         step.id,
         current_report.primary_reason(),
         repair_report_path.display(),
-        suggested_ultra_recovery_command(&repair_report_path, &config.profile)
+        suggested_ultra_recovery_command(&repair_report_path, &config.profile),
+        yaml_message
     );
     outcome.primary_failure = Some(current_report.primary_reason());
     outcome.stop_reason = Some(final_failure_kind.to_string());
@@ -2490,6 +2577,7 @@ fn save_ultra_phase_recovery_handoff(
         failure_kind: failure_kind.to_string(),
         failure_evidence: vec![reason.to_string()],
         missing_paths: missing_paths.to_vec(),
+        missing_capabilities: repair_targets.to_vec(),
         verify_commands: Vec::new(),
         changed_paths: Vec::new(),
         repair_targets: repair_targets.to_vec(),
@@ -2510,7 +2598,27 @@ fn save_ultra_phase_recovery_handoff(
             return Some(format!("; recovery prompt save failed: {err}"));
         }
     };
-    let command = suggested_ultra_recovery_command(&path, &plan.profile);
+    let prompt_command = suggested_ultra_recovery_command(&path, &plan.profile);
+    let recovery_plan = match save_recovery_ultra_plan(&config.workspace_root, &scope, &handoff) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "recovery_ultra_plan_save_failed",
+                    "recovery_handoff_kind": failure_kind,
+                    "phase_id": phase.id,
+                    "recovery_prompt_path": path.display().to_string(),
+                    "reason": eval_events::body_snippet(&err.to_string()),
+                    "recovery_yaml_missing": true,
+                }),
+            );
+            None
+        }
+    };
+    let recovery_plan_command = recovery_plan
+        .as_ref()
+        .map(|path| suggested_recovery_ultra_plan_command(path));
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -2518,24 +2626,57 @@ fn save_ultra_phase_recovery_handoff(
             "recovery_handoff_kind": failure_kind,
             "phase_id": phase.id,
             "recovery_prompt_path": path.display().to_string(),
-            "suggested_recovery_command": command,
+            "recovery_ultra_plan_path": recovery_plan
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            "recovery_yaml_missing": recovery_plan.is_none(),
+            "suggested_recovery_command": prompt_command,
+            "suggested_recovery_yaml_command": recovery_plan_command.clone().unwrap_or_default(),
             "recovery_profile": plan.profile,
             "local_repair_exhausted": true,
+            "status": "incomplete",
         }),
     );
+    let recovery_yaml_summary = recovery_plan
+        .as_ref()
+        .map(|path| format!("Recovery UltraPlan YAML saved: {}", path.display()))
+        .unwrap_or_else(|| {
+            "Recovery UltraPlan YAML missing: failed to save valid recovery plan".to_string()
+        });
+    let recovery_yaml_command_summary = recovery_plan_command
+        .as_ref()
+        .map(|command| format!("Suggested YAML command: {command}"))
+        .unwrap_or_else(|| {
+            "Suggested YAML command: unavailable because recovery YAML is missing".to_string()
+        });
     eval_events::write_run_summary(
         config.eval_events_path.as_deref(),
         &format!(
-            "Recovery prompt saved: {}\nSuggested command: {}\nFailure: {}",
+            "Status: incomplete\n{}\n{}\nRecovery prompt saved: {}\nSuggested prompt command: {}\nFailure: {}",
+            recovery_yaml_summary,
+            recovery_yaml_command_summary,
             path.display(),
-            suggested_ultra_recovery_command(&path, &plan.profile),
+            prompt_command,
             reason
         ),
     );
+    let recovery_yaml_message = recovery_plan
+        .as_ref()
+        .zip(recovery_plan_command.as_ref())
+        .map(|(path, command)| {
+            format!(
+                "; incomplete; recovery YAML saved: {}; suggested YAML command: {}",
+                path.display(),
+                command
+            )
+        })
+        .unwrap_or_else(|| "; incomplete; recovery YAML missing".to_string());
     Some(format!(
-        "; repair prompt saved: {}; suggested command: {}",
+        "; repair prompt saved: {}; suggested command: {}{}",
         path.display(),
-        suggested_ultra_recovery_command(&path, &plan.profile)
+        prompt_command,
+        recovery_yaml_message
     ))
 }
 
@@ -4779,11 +4920,99 @@ export default function Page(){
         let repairs_dir = dir.path().join(".anvil/repairs");
         assert!(repairs_dir.is_dir());
         assert!(std::fs::read_dir(&repairs_dir).unwrap().next().is_some());
+        let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
+        assert_eq!(recovery_plan.goal, plan.goal);
+        assert_eq!(recovery_plan.profile, "nextjs");
+        assert!(recovery_plan.phases.iter().any(|phase| {
+            phase
+                .prompt
+                .contains("Missing capability or artifact signals")
+        }));
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("final_acceptance_repair_start"));
         assert!(event_text.contains("final_acceptance_repair_failed"));
         assert!(event_text.contains("recovery_prompt_saved"));
+        assert!(event_text.contains("recovery_ultra_plan_path"));
+        assert!(event_text.contains("suggested_recovery_yaml_command"));
         assert!(event_text.contains("suggested_recovery_command"));
+        let summary = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+        assert!(summary.contains("Status: incomplete"));
+        assert!(summary.contains("Recovery UltraPlan YAML saved:"));
+        assert!(summary.contains("Suggested YAML command:"));
+    }
+
+    #[test]
+    fn ultra_phase_scaffold_failure_saves_recovery_yaml_and_incomplete_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text("not a step plan"),
+            AssistantReply::text("still not a step plan"),
+            AssistantReply::text("no valid step plan"),
+        ]);
+        let mut execution = FakeClient::new(Vec::new());
+        let plan = UltraPlan {
+            goal: "Build an interactive web game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "web-audio-synth-and-ui".to_string(),
+                    prompt: "Add audio, HUD, overlays, and deterministic verification".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "final-verify".to_string(),
+                    prompt: "Verify the recovered interactive app".to_string(),
+                },
+            ],
+        };
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("phase scaffold failed"), "{err}");
+        assert!(err.contains("incomplete"), "{err}");
+        assert!(err.contains("recovery YAML saved"), "{err}");
+        assert!(
+            err.contains("/run-ultra-plan .anvil/plans/recovery-ultra-plan-"),
+            "{err}"
+        );
+        let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
+        assert_eq!(recovery_plan.goal, "Build an interactive web game");
+        assert_eq!(recovery_plan.profile, "nextjs");
+        let rendered = render_ultra_plan(&recovery_plan);
+        assert_eq!(parse_ultra_plan(&rendered).unwrap(), recovery_plan);
+        assert!(
+            recovery_plan
+                .phases
+                .iter()
+                .any(|phase| phase.prompt.contains("web-audio-synth-and-ui"))
+        );
+        assert!(recovery_plan.phases.iter().any(|phase| {
+            phase
+                .prompt
+                .contains("Missing capability or artifact signals")
+        }));
+        assert!(
+            recovery_plan
+                .phases
+                .iter()
+                .any(|phase| phase.prompt.contains("Verify preference"))
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"planner_error_kind\":\"phase_scaffold_error\""));
+        assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
+        assert!(event_text.contains("\"status\":\"incomplete\""));
+        assert!(event_text.contains("\"recovery_yaml_missing\":false"));
+        assert!(event_text.contains("\"recovery_ultra_plan_path\""));
+        assert!(event_text.contains("\"suggested_recovery_yaml_command\""));
+        let summary = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+        assert!(summary.contains("Status: incomplete"));
+        assert!(summary.contains("Recovery UltraPlan YAML saved:"));
+        assert!(summary.contains("Suggested YAML command:"));
     }
 
     #[test]
@@ -5478,6 +5707,16 @@ export default function Page(){
         assert!(event_text.contains("\"reason\":\"verify_repair_no_change\""));
         assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
         assert!(event_text.contains("\"failure_kind\":\"verify_repair_no_change\""));
+        assert!(event_text.contains("\"recovery_ultra_plan_path\""));
+        assert!(event_text.contains("\"suggested_recovery_yaml_command\""));
+        let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
+        assert!(recovery_plan.goal.contains("Create app entrypoint"));
+        assert!(
+            recovery_plan
+                .phases
+                .iter()
+                .any(|phase| phase.prompt.contains("verify_repair_no_change"))
+        );
         let repair_dir = dir.path().join(".anvil/repairs");
         assert!(repair_dir.is_dir());
         assert!(std::fs::read_dir(repair_dir).unwrap().any(|entry| {
@@ -5633,6 +5872,29 @@ export default function Page(){
             capped_config(&cfg, STEP_REPAIR_MAX_ITERATIONS).max_iterations,
             6
         );
+    }
+
+    fn assert_single_recovery_ultra_plan(root: &Path) -> UltraPlan {
+        let plans_dir = root.join(".anvil/plans");
+        assert!(
+            plans_dir.is_dir(),
+            "missing plans dir: {}",
+            plans_dir.display()
+        );
+        let mut paths = std::fs::read_dir(&plans_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("recovery-ultra-plan-") && name.ends_with(".yaml")
+                    })
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths.len(), 1, "recovery plan paths: {paths:#?}");
+        parse_ultra_plan(&std::fs::read_to_string(&paths[0]).unwrap()).unwrap()
     }
 
     struct FakeClient {

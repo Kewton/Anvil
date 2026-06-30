@@ -56,6 +56,17 @@ class UatRegressionFixturesTest(unittest.TestCase):
         self.assertTrue(fixed_summary["recovery_prompt_saved"])
         self.assertFalse(fixed_summary["recovery_ultra_plan_missing"])
 
+        fixed_by_event = copy.deepcopy(fixture)
+        for event in fixed_by_event["events"]:
+            if event.get("event") == "recovery_prompt_saved":
+                event["recovery_ultra_plan_path"] = (
+                    ".anvil/plans/recovery-ultra-plan-example.yaml"
+                )
+                event["recovery_yaml_missing"] = False
+        event_summary = summarize_uat_regression_fixture(fixed_by_event)
+        self.assertTrue(event_summary["recovery_prompt_saved"])
+        self.assertFalse(event_summary["recovery_ultra_plan_missing"])
+
     def test_test0630_fixture_detects_build_pass_browser_fail(self):
         fixture = self.load_fixture()
         summary = summarize_uat_regression_fixture(fixture)
