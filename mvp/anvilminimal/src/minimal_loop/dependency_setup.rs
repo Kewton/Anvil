@@ -33,6 +33,22 @@ impl PackageManagerKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum NodeDependencySetupKind {
+    NextBuildDependencies,
+    NodeTestRunnerManifest,
+}
+
+impl NodeDependencySetupKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NextBuildDependencies => "next_build_dependencies",
+            Self::NodeTestRunnerManifest => "node_test_runner_manifest",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum NodeDependencySetupAuthority {
     PlanSetupStep,
     CompletionContract,
@@ -60,6 +76,7 @@ impl NodeDependencySetupAuthority {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NodeDependencySetupRequirement {
     pub profile: Option<String>,
+    pub setup_kind: NodeDependencySetupKind,
     pub package_manager: PackageManagerKind,
     pub project_root: String,
     pub reason: String,
@@ -96,6 +113,7 @@ impl NodeDependencySetupStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NodeDependencySetupObservation {
     pub status: NodeDependencySetupStatus,
+    pub setup_kind: NodeDependencySetupKind,
     pub package_manager: PackageManagerKind,
     pub authority: NodeDependencySetupAuthority,
     pub attempted: bool,
@@ -106,9 +124,13 @@ pub struct NodeDependencySetupObservation {
 }
 
 impl NodeDependencySetupObservation {
-    pub fn not_required(package_manager: PackageManagerKind) -> Self {
+    pub fn not_required(
+        setup_kind: NodeDependencySetupKind,
+        package_manager: PackageManagerKind,
+    ) -> Self {
         Self {
             status: NodeDependencySetupStatus::NotRequired,
+            setup_kind,
             package_manager,
             authority: NodeDependencySetupAuthority::None,
             attempted: false,
@@ -120,12 +142,14 @@ impl NodeDependencySetupObservation {
     }
 
     pub fn blocked(
+        setup_kind: NodeDependencySetupKind,
         package_manager: PackageManagerKind,
         authority: NodeDependencySetupAuthority,
         reason: impl Into<String>,
     ) -> Self {
         Self {
             status: NodeDependencySetupStatus::Blocked,
+            setup_kind,
             package_manager,
             authority,
             attempted: false,
@@ -212,9 +236,47 @@ pub fn requirement_for_next_build(
     NodeDependencySetupRequirement {
         profile: profile.map(str::to_string),
         package_manager,
+        setup_kind: NodeDependencySetupKind::NextBuildDependencies,
         project_root: ".".to_string(),
         reason: reason.to_string(),
         required_binary: "node_modules/.bin/next".to_string(),
+        setup_authority: authority,
+        allowed,
+        blocked_reason,
+    }
+}
+
+pub fn requirement_for_node_test_runner(
+    root: &Path,
+    profile: Option<&str>,
+    reason: &str,
+    authority: NodeDependencySetupAuthority,
+) -> NodeDependencySetupRequirement {
+    let package_manager = package_manager_for_root(root);
+    let mut blocked_reason = None;
+    if !workspace_has_node_test_file(root) {
+        blocked_reason = Some("node test artifact missing".to_string());
+    } else if node_test_runner_bindable(root) {
+        blocked_reason = Some("node test runner already bindable".to_string());
+    } else if !authority.allows_setup() {
+        blocked_reason = Some("dependency setup authority missing".to_string());
+    } else if matches!(
+        package_manager,
+        PackageManagerKind::Pnpm | PackageManagerKind::Yarn | PackageManagerKind::Mixed
+    ) {
+        blocked_reason = Some(format!(
+            "package manager {} is not supported by initial npm-only test runner setup bridge",
+            package_manager.as_str()
+        ));
+    }
+    let allowed = blocked_reason.is_none();
+    NodeDependencySetupRequirement {
+        profile: profile.map(str::to_string),
+        setup_kind: NodeDependencySetupKind::NodeTestRunnerManifest,
+        package_manager,
+        project_root: ".".to_string(),
+        reason: reason.to_string(),
+        required_binary: "package.json:scripts.test".to_string(),
         setup_authority: authority,
         allowed,
         blocked_reason,
@@ -235,6 +297,7 @@ pub(crate) fn run_node_dependency_setup_with_program(
 ) -> NodeDependencySetupObservation {
     if !requirement.allowed {
         return NodeDependencySetupObservation::blocked(
+            requirement.setup_kind,
             requirement.package_manager,
             requirement.setup_authority,
             requirement
@@ -243,11 +306,15 @@ pub(crate) fn run_node_dependency_setup_with_program(
                 .unwrap_or_else(|| "dependency setup blocked".to_string()),
         );
     }
+    if requirement.setup_kind == NodeDependencySetupKind::NodeTestRunnerManifest {
+        return run_node_test_runner_manifest_setup(root, requirement);
+    }
     if requirement.package_manager == PackageManagerKind::Pnpm
         || requirement.package_manager == PackageManagerKind::Yarn
         || requirement.package_manager == PackageManagerKind::Mixed
     {
         return NodeDependencySetupObservation::blocked(
+            requirement.setup_kind,
             requirement.package_manager,
             requirement.setup_authority,
             "non-npm package manager setup is deferred",
@@ -268,6 +335,7 @@ pub(crate) fn run_node_dependency_setup_with_program(
         Err(err) => {
             return NodeDependencySetupObservation {
                 status: NodeDependencySetupStatus::Failed,
+                setup_kind: requirement.setup_kind,
                 package_manager: requirement.package_manager,
                 authority: requirement.setup_authority,
                 attempted: true,
@@ -305,6 +373,7 @@ pub(crate) fn run_node_dependency_setup_with_program(
                 };
                 return NodeDependencySetupObservation {
                     status: status_kind,
+                    setup_kind: requirement.setup_kind,
                     package_manager: requirement.package_manager,
                     authority: requirement.setup_authority,
                     attempted: true,
@@ -322,6 +391,7 @@ pub(crate) fn run_node_dependency_setup_with_program(
             Err(err) => {
                 return NodeDependencySetupObservation {
                     status: NodeDependencySetupStatus::Failed,
+                    setup_kind: requirement.setup_kind,
                     package_manager: requirement.package_manager,
                     authority: requirement.setup_authority,
                     attempted: true,
@@ -337,6 +407,7 @@ pub(crate) fn run_node_dependency_setup_with_program(
             let _ = child.wait();
             return NodeDependencySetupObservation {
                 status: NodeDependencySetupStatus::TimedOut,
+                setup_kind: requirement.setup_kind,
                 package_manager: requirement.package_manager,
                 authority: requirement.setup_authority,
                 attempted: true,
@@ -351,6 +422,185 @@ pub(crate) fn run_node_dependency_setup_with_program(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn run_node_test_runner_manifest_setup(
+    root: &Path,
+    requirement: &NodeDependencySetupRequirement,
+) -> NodeDependencySetupObservation {
+    let existing = std::fs::read_to_string(root.join("package.json")).ok();
+    let Some(completion) = complete_node_test_runner_manifest(existing.as_deref()) else {
+        return NodeDependencySetupObservation::blocked(
+            requirement.setup_kind,
+            requirement.package_manager,
+            requirement.setup_authority,
+            "node test runner manifest cannot be completed safely",
+        );
+    };
+    match std::fs::write(root.join("package.json"), completion.contents.as_bytes()) {
+        Ok(()) => NodeDependencySetupObservation {
+            status: NodeDependencySetupStatus::Passed,
+            setup_kind: requirement.setup_kind,
+            package_manager: requirement.package_manager,
+            authority: requirement.setup_authority,
+            attempted: true,
+            command: format!("deterministic package.json {}", completion.action.as_str()),
+            primary_reason: format!("node test runner manifest {}", completion.action.as_str()),
+            output_snippet: String::new(),
+            changed_paths: vec!["package.json".to_string()],
+        },
+        Err(err) => NodeDependencySetupObservation {
+            status: NodeDependencySetupStatus::Failed,
+            setup_kind: requirement.setup_kind,
+            package_manager: requirement.package_manager,
+            authority: requirement.setup_authority,
+            attempted: true,
+            command: format!("deterministic package.json {}", completion.action.as_str()),
+            primary_reason: format!("failed to write package.json: {err}"),
+            output_snippet: String::new(),
+            changed_paths: Vec::new(),
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeManifestAction {
+    CreateManifest,
+    AddTestScript,
+}
+
+impl NodeManifestAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateManifest => "create_manifest",
+            Self::AddTestScript => "add_test_script",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeManifestCompletion {
+    action: NodeManifestAction,
+    contents: String,
+}
+
+fn complete_node_test_runner_manifest(existing: Option<&str>) -> Option<NodeManifestCompletion> {
+    let Some(raw) = existing else {
+        return Some(NodeManifestCompletion {
+            action: NodeManifestAction::CreateManifest,
+            contents: created_node_test_manifest_contents(),
+        });
+    };
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let serde_json::Value::Object(mut object) = value else {
+        return None;
+    };
+    if manifest_has_script(&object, "test") {
+        return None;
+    }
+    let scripts = object
+        .entry("scripts".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let serde_json::Value::Object(scripts) = scripts else {
+        return None;
+    };
+    scripts.insert(
+        "test".to_string(),
+        serde_json::Value::String("node --test".to_string()),
+    );
+    let mut contents = serde_json::to_string_pretty(&serde_json::Value::Object(object)).ok()?;
+    contents.push('\n');
+    Some(NodeManifestCompletion {
+        action: NodeManifestAction::AddTestScript,
+        contents,
+    })
+}
+
+fn created_node_test_manifest_contents() -> String {
+    r#"{
+  "name": "app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
+"#
+    .to_string()
+}
+
+pub fn node_test_runner_bindable(root: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(root.join("package.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    manifest_has_script(object, "test")
+}
+
+fn manifest_has_script(object: &serde_json::Map<String, serde_json::Value>, script: &str) -> bool {
+    object
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scripts| {
+            scripts.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case(script)
+                    && value
+                        .as_str()
+                        .is_some_and(|command| !command.trim().is_empty())
+            })
+        })
+}
+
+const NODE_TEST_FILE_SUFFIXES: &[&str] = &[
+    ".test.js",
+    ".test.mjs",
+    ".test.cjs",
+    ".test.jsx",
+    ".test.ts",
+    ".test.mts",
+    ".test.cts",
+    ".test.tsx",
+    ".spec.js",
+    ".spec.mjs",
+    ".spec.cjs",
+    ".spec.jsx",
+    ".spec.ts",
+    ".spec.mts",
+    ".spec.cts",
+    ".spec.tsx",
+];
+
+pub fn workspace_has_node_test_file(root: &Path) -> bool {
+    dir_has_node_test_file(root)
+        || ["tests", "test", "__tests__"]
+            .iter()
+            .any(|subdir| dir_has_node_test_file(&root.join(subdir)))
+}
+
+fn dir_has_node_test_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.path().is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_node_test_filename)
+    })
+}
+
+fn is_node_test_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    NODE_TEST_FILE_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 pub fn nextjs_build_fallback_command(root: &Path) -> Option<String> {
@@ -484,6 +734,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let requirement = NodeDependencySetupRequirement {
             profile: Some("nextjs".to_string()),
+            setup_kind: NodeDependencySetupKind::NextBuildDependencies,
             package_manager: PackageManagerKind::Npm,
             project_root: ".".to_string(),
             reason: "test".to_string(),
@@ -496,5 +747,91 @@ mod tests {
             run_node_dependency_setup_with_program(dir.path(), &requirement, Path::new("missing"));
         assert_eq!(observation.status, NodeDependencySetupStatus::Blocked);
         assert!(!observation.attempted);
+    }
+
+    #[test]
+    fn node_test_runner_manifest_setup_is_blocked_without_authority() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("tests")).unwrap();
+        fs::write(
+            dir.path().join("tests").join("main.test.js"),
+            "import 'node:test';\n",
+        )
+        .unwrap();
+        let requirement = requirement_for_node_test_runner(
+            dir.path(),
+            Some("js"),
+            "node test verifier",
+            NodeDependencySetupAuthority::None,
+        );
+        assert!(!requirement.allowed);
+        assert_eq!(
+            requirement.setup_kind,
+            NodeDependencySetupKind::NodeTestRunnerManifest
+        );
+        assert_eq!(
+            requirement.blocked_reason.as_deref(),
+            Some("dependency setup authority missing")
+        );
+    }
+
+    #[test]
+    fn node_test_runner_manifest_setup_creates_package_manifest_without_network() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("tests")).unwrap();
+        fs::write(
+            dir.path().join("tests").join("main.test.js"),
+            "import test from 'node:test';\n",
+        )
+        .unwrap();
+        let requirement = requirement_for_node_test_runner(
+            dir.path(),
+            Some("js"),
+            "node test verifier",
+            NodeDependencySetupAuthority::CompletionContract,
+        );
+        assert!(requirement.allowed);
+        let observation =
+            run_node_dependency_setup_with_program(dir.path(), &requirement, Path::new("missing"));
+        assert_eq!(observation.status, NodeDependencySetupStatus::Passed);
+        assert_eq!(
+            observation.setup_kind,
+            NodeDependencySetupKind::NodeTestRunnerManifest
+        );
+        assert!(observation.command.contains("create_manifest"));
+        assert!(node_test_runner_bindable(dir.path()));
+        assert!(
+            observation
+                .changed_paths
+                .contains(&"package.json".to_string())
+        );
+    }
+
+    #[test]
+    fn node_test_runner_manifest_setup_adds_script_without_clobbering_manifest() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("test")).unwrap();
+        fs::write(
+            dir.path().join("test").join("main.spec.js"),
+            "test('x',()=>{});\n",
+        )
+        .unwrap();
+        write_package(
+            dir.path(),
+            r#"{"name":"keep","scripts":{"build":"node build.js"}}"#,
+        );
+        let requirement = requirement_for_node_test_runner(
+            dir.path(),
+            Some("js"),
+            "node test verifier",
+            NodeDependencySetupAuthority::CompletionContract,
+        );
+        let observation =
+            run_node_dependency_setup_with_program(dir.path(), &requirement, Path::new("missing"));
+        assert_eq!(observation.status, NodeDependencySetupStatus::Passed);
+        let package = fs::read_to_string(dir.path().join("package.json")).unwrap();
+        assert!(package.contains("\"name\": \"keep\""));
+        assert!(package.contains("\"build\": \"node build.js\""));
+        assert!(package.contains("\"test\": \"node --test\""));
     }
 }

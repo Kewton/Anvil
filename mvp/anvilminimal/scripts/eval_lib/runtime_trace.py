@@ -279,8 +279,10 @@ def stage_for_event(event: dict[str, Any]) -> str:
         if event_bool(event.get("runtime_acceptance_passed")):
             return "acceptance_passed"
     if name == "dependency_build_lifecycle":
-        lifecycle = str(event.get("stage", event.get("lifecycle_stage", ""))).lower()
-        if "setup" in lifecycle or "install" in lifecycle:
+        if event_bool(event.get("setup_attempted")):
+            return "dependency_setup_attempted"
+        lifecycle = " ".join(str(item) for item in event.get("lifecycle_stages", []) or [])
+        if "setup_attempted" in lifecycle or "setup_passed" in lifecycle:
             return "dependency_setup_attempted"
     if name == "loop_stop":
         return loop_stop_stage(event)

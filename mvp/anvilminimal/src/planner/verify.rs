@@ -193,10 +193,6 @@ pub fn verify_step_with_setup_observed(
             report.push_command_failure(command.clone(), err.to_string());
             continue;
         }
-        if is_node_test_command(command) && !root.join("package.json").is_file() {
-            report.push_dependency_missing("package.json missing before Node test verifier");
-            continue;
-        }
         if let Some(requirement) = build_verifier::requirement_from_deferred(
             command,
             build_verifier_profile(command),
@@ -368,17 +364,6 @@ fn is_nextjs_build_command(command: &str) -> bool {
         || lower.starts_with("pnpm build ")
         || lower == "yarn build"
         || lower.starts_with("yarn build ")
-}
-
-fn is_node_test_command(command: &str) -> bool {
-    let lower = command.trim().to_ascii_lowercase();
-    lower == "npm test"
-        || lower == "npm run test"
-        || lower.starts_with("npm run test ")
-        || lower == "pnpm test"
-        || lower.starts_with("pnpm test ")
-        || lower == "yarn test"
-        || lower.starts_with("yarn test ")
 }
 
 fn build_verifier_profile(command: &str) -> Option<&'static str> {
@@ -566,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn node_test_without_package_manifest_is_dependency_missing_without_execution() {
+    fn node_test_without_package_manifest_records_dependency_lifecycle_without_execution() {
         let dir = tempfile::tempdir().unwrap();
         let step = PlanStep {
             id: "test".to_string(),
@@ -578,8 +563,19 @@ mod tests {
         };
         let (report, lifecycles) =
             verify_step_with_setup_observed(dir.path(), &step, NodeDependencySetupAuthority::None);
-        assert!(report.primary_reason().contains("package.json missing"));
-        assert!(lifecycles.is_empty());
+        assert!(
+            report
+                .primary_reason()
+                .contains("package.json scripts.test missing"),
+            "{report:?}"
+        );
+        assert_eq!(lifecycles.len(), 1);
+        assert!(lifecycles[0].lifecycle_stages().contains(&"setup_blocked"));
+        assert!(
+            lifecycles[0]
+                .lifecycle_stages()
+                .contains(&"verification_dependency_missing")
+        );
     }
 
     #[test]

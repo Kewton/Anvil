@@ -16,7 +16,7 @@ class RuntimeSemanticsTraceTest(unittest.TestCase):
         events = [
             {"event": "tool_call_raw", "run_id": "r1", "argument_shape": {"path": "string"}},
             {"event": "ultra_phase_context_attached", "run_id": "r1", "phase_id": "implement"},
-            {"event": "dependency_build_lifecycle", "run_id": "r1", "stage": "setup_allowed"},
+            {"event": "dependency_build_lifecycle", "run_id": "r1", "setup_attempted": True, "lifecycle_stages": ["dependency_check", "setup_passed", "build_rerun", "verification_passed"]},
             {"event": "acceptance_summary", "run_id": "r1", "acceptance_success": False, "acceptance_failure_kind": "missing_required_capabilities"},
             {"event": "recovery_prompt_saved", "run_id": "r1"},
         ]

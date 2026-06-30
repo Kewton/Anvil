@@ -40,6 +40,7 @@
     "G-S06",
     "G-S07",
     "G-S08",
+    "G-S09",
     "G-S11",
     "G-S13",
     "G-S14",
@@ -47,7 +48,6 @@
     "G-S16"
   ],
   "failed_gate_ids": [
-    "G-S09",
     "G-S10",
     "G-S12"
   ],
@@ -112,13 +112,14 @@
   "errors": [
     "comparative gate cannot pass because latest same-condition anvildev trace is missing.",
     "release-grade UAT/browser interaction evidence is missing.",
-    "G-S09/G-S10/G-S12 remain failed in the current gate matrix.",
+    "G-S10/G-S12 remain failed in the current gate matrix.",
     "G-S08 is only partial because same-condition eval smoke and source/MVP normalized trace diff have not been rerun after 022-3."
   ],
   "warnings": [
     "Normalized trace writer is available, but several gates still lack source/MVP same-condition trace diff.",
     "G-S14 remains partial until a fresh eval summary is generated with runtime-semantics-trace-report.json attached to the trace manifest.",
     "G-S08 has positive/negative verifier policy fixtures, but eval smoke improvement is not yet measured.",
+    "G-S09 has dependency lifecycle fixtures and shared event taxonomy after 022-4, but same-condition eval smoke and source/MVP trace diff are not yet rerun.",
     "Provider probe is available conceptually but not enforced as a gate for prompt-sensitive fixes."
   ]
 }

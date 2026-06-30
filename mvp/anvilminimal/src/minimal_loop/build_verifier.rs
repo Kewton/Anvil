@@ -4,7 +4,8 @@ use serde::Serialize;
 
 use crate::eval_events;
 use crate::minimal_loop::dependency_setup::{
-    self, NodeDependencySetupAuthority, NodeDependencySetupObservation, NodeDependencySetupStatus,
+    self, NodeDependencySetupAuthority, NodeDependencySetupKind, NodeDependencySetupObservation,
+    NodeDependencySetupStatus,
 };
 use crate::planner::verify::validate_verify_command;
 use crate::tools::bash;
@@ -137,6 +138,7 @@ pub fn emit_dependency_build_lifecycle(
             "setup_status": lifecycle.setup_status(),
             "setup_attempted": lifecycle.setup.as_ref().is_some_and(|setup| setup.attempted),
             "setup_authority": lifecycle.setup.as_ref().map(|setup| setup.authority.as_str()).unwrap_or("none"),
+            "setup_kind": lifecycle.setup.as_ref().map(|setup| setup.setup_kind.as_str()).unwrap_or("none"),
             "setup_command": lifecycle.setup.as_ref().map(|setup| setup.command.as_str()).unwrap_or(""),
             "setup_changed_paths": lifecycle.setup.as_ref().map(|setup| setup.changed_paths.clone()).unwrap_or_default(),
             "after_status": lifecycle.after_setup.as_ref().map(BuildVerifierObservation::status_str).unwrap_or(""),
@@ -265,14 +267,8 @@ pub(crate) fn observe_requirement_lifecycle_with_setup_program(
     let mut after_setup = None;
     if before_setup.status == BuildVerifierStatus::DependencyMissing
         && requirement.requires_dependency_setup
-        && requires_next_binary(&requirement.command)
     {
-        let setup_requirement = dependency_setup::requirement_for_next_build(
-            root,
-            requirement.profile.as_deref(),
-            &requirement.reason,
-            setup_authority,
-        );
+        let setup_requirement = dependency_setup_requirement(root, requirement, setup_authority);
         let setup_observation = if setup_requirement.allowed {
             dependency_setup::run_node_dependency_setup_with_program(
                 root,
@@ -281,6 +277,7 @@ pub(crate) fn observe_requirement_lifecycle_with_setup_program(
             )
         } else {
             NodeDependencySetupObservation::blocked(
+                setup_requirement.setup_kind,
                 setup_requirement.package_manager,
                 setup_requirement.setup_authority,
                 setup_requirement
@@ -313,11 +310,19 @@ pub(crate) fn observe_requirement_lifecycle_with_setup_program(
 pub fn is_build_verifier_command(command: &str) -> bool {
     let normalized = command.to_ascii_lowercase();
     normalized == "npm run build"
+        || normalized == "npm test"
+        || normalized == "npm run test"
         || normalized == "pnpm build"
+        || normalized == "pnpm test"
         || normalized == "yarn build"
+        || normalized == "yarn test"
         || normalized.starts_with("npm run build ")
+        || normalized.starts_with("npm test ")
+        || normalized.starts_with("npm run test ")
         || normalized.starts_with("pnpm build ")
+        || normalized.starts_with("pnpm test ")
         || normalized.starts_with("yarn build ")
+        || normalized.starts_with("yarn test ")
         || normalized.contains("next build")
         || normalized.contains("cargo build")
 }
@@ -331,7 +336,7 @@ pub fn requires_next_binary(command: &str) -> bool {
 }
 
 fn requires_dependency_setup(command: &str) -> bool {
-    requires_next_binary(command)
+    requires_next_binary(command) || requires_node_test_runner(command)
 }
 
 fn dependency_ready(root: &Path, command: &str) -> bool {
@@ -340,6 +345,9 @@ fn dependency_ready(root: &Path, command: &str) -> bool {
             return false;
         }
         return root.join("node_modules/.bin/next").is_file();
+    }
+    if requires_node_test_runner(command) {
+        return dependency_setup::node_test_runner_bindable(root);
     }
     true
 }
@@ -354,8 +362,56 @@ fn requires_package_manifest(command: &str) -> bool {
 fn dependency_missing_reason(command: &str) -> String {
     if requires_next_binary(command) {
         "node_modules/.bin/next missing for Next.js build".to_string()
+    } else if requires_node_test_runner(command) {
+        "package.json scripts.test missing before Node test verifier".to_string()
     } else {
         format!("dependency setup missing before `{command}`")
+    }
+}
+
+fn requires_node_test_runner(command: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase();
+    normalized == "npm test"
+        || normalized == "npm run test"
+        || normalized == "pnpm test"
+        || normalized == "yarn test"
+        || normalized.starts_with("npm test ")
+        || normalized.starts_with("npm run test ")
+        || normalized.starts_with("pnpm test ")
+        || normalized.starts_with("yarn test ")
+}
+
+fn dependency_setup_requirement(
+    root: &Path,
+    requirement: &BuildVerifierRequirement,
+    setup_authority: NodeDependencySetupAuthority,
+) -> dependency_setup::NodeDependencySetupRequirement {
+    if requires_next_binary(&requirement.command) {
+        return dependency_setup::requirement_for_next_build(
+            root,
+            requirement.profile.as_deref(),
+            &requirement.reason,
+            setup_authority,
+        );
+    }
+    if requires_node_test_runner(&requirement.command) {
+        return dependency_setup::requirement_for_node_test_runner(
+            root,
+            requirement.profile.as_deref(),
+            &requirement.reason,
+            setup_authority,
+        );
+    }
+    dependency_setup::NodeDependencySetupRequirement {
+        profile: requirement.profile.clone(),
+        setup_kind: NodeDependencySetupKind::NextBuildDependencies,
+        package_manager: dependency_setup::package_manager_for_root(root),
+        project_root: ".".to_string(),
+        reason: requirement.reason.clone(),
+        required_binary: "unknown".to_string(),
+        setup_authority,
+        allowed: false,
+        blocked_reason: Some("unsupported dependency setup requirement".to_string()),
     }
 }
 
@@ -485,6 +541,85 @@ mod tests {
         assert_eq!(lifecycle.setup_status(), "passed");
         assert_eq!(lifecycle.final_status, BuildVerifierStatus::Passed);
         assert!(lifecycle.after_setup.is_some());
+        assert!(lifecycle.lifecycle_stages().contains(&"setup_passed"));
+        assert!(lifecycle.lifecycle_stages().contains(&"build_rerun"));
+        assert!(
+            lifecycle
+                .lifecycle_stages()
+                .contains(&"verification_passed")
+        );
+    }
+
+    #[test]
+    fn node_test_runner_missing_manifest_setup_blocked_records_lifecycle() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("tests").join("main.test.js"),
+            "import test from 'node:test';\n",
+        )
+        .unwrap();
+        let requirement = requirement_from_deferred(
+            "npm test",
+            Some("js"),
+            "node test verifier",
+            "profile:js",
+            "required",
+        )
+        .unwrap();
+        let lifecycle = observe_requirement_lifecycle(
+            dir.path(),
+            &requirement,
+            NodeDependencySetupAuthority::None,
+        );
+        assert_eq!(
+            lifecycle.before_setup.status,
+            BuildVerifierStatus::DependencyMissing
+        );
+        assert_eq!(lifecycle.setup_status(), "blocked");
+        assert_eq!(
+            lifecycle
+                .setup
+                .as_ref()
+                .map(|setup| setup.setup_kind.as_str()),
+            Some("node_test_runner_manifest")
+        );
+        assert_eq!(
+            lifecycle.lifecycle_stages(),
+            vec![
+                "dependency_check",
+                "setup_blocked",
+                "verification_dependency_missing"
+            ]
+        );
+    }
+
+    #[test]
+    fn node_test_runner_setup_allowed_then_test_rerun_records_lifecycle() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("tests").join("main.test.js"),
+            "import test from 'node:test';\nimport assert from 'node:assert/strict';\ntest('ok', () => assert.equal(1, 1));\n",
+        )
+        .unwrap();
+        let requirement = requirement_from_deferred(
+            "npm test",
+            Some("js"),
+            "node test verifier",
+            "profile:js",
+            "required",
+        )
+        .unwrap();
+        let lifecycle = observe_requirement_lifecycle(
+            dir.path(),
+            &requirement,
+            NodeDependencySetupAuthority::CompletionContract,
+        );
+        assert_eq!(lifecycle.setup_status(), "passed");
+        assert_eq!(lifecycle.final_status, BuildVerifierStatus::Passed);
+        assert!(lifecycle.after_setup.is_some());
+        assert!(dir.path().join("package.json").is_file());
         assert!(lifecycle.lifecycle_stages().contains(&"setup_passed"));
         assert!(lifecycle.lifecycle_stages().contains(&"build_rerun"));
         assert!(

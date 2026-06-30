@@ -176,10 +176,6 @@ impl CompletionContract {
                 report.push_command_failure(command.clone(), err.to_string());
                 continue;
             }
-            if is_node_test_command(command) && !root.join("package.json").is_file() {
-                report.push_dependency_missing("package.json missing before Node test verifier");
-                continue;
-            }
             if let Some(build_requirement) = build_verifier::requirement_from_deferred(
                 command,
                 self.active_profile(),
@@ -472,17 +468,6 @@ fn setup_authority_for_deferred(
     } else {
         NodeDependencySetupAuthority::None
     }
-}
-
-fn is_node_test_command(command: &str) -> bool {
-    let lower = command.trim().to_ascii_lowercase();
-    lower == "npm test"
-        || lower == "npm run test"
-        || lower.starts_with("npm run test ")
-        || lower == "pnpm test"
-        || lower.starts_with("pnpm test ")
-        || lower == "yarn test"
-        || lower.starts_with("yarn test ")
 }
 
 pub fn format_verify_feedback(report: &VerificationReport) -> String {
