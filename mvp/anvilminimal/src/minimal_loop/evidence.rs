@@ -34,6 +34,13 @@ enum EvidenceKind {
     BuildCommandOrDependencyBoundary,
     InteractiveUiSourceEvidence,
     NonStaticScreenEvidence,
+    VisibleInteractiveSurfaceEvidence,
+    UserInputHandlerEvidence,
+    StatefulUpdateEvidence,
+    ChallengeOrAdversaryEvidence,
+    ScoreOrProgressionEvidence,
+    FailureOrCollisionEvidence,
+    RestartOrRecoverableStateEvidence,
     NextJsRouteEvidence,
     RequestedContent,
 }
@@ -50,6 +57,13 @@ impl EvidenceKind {
             }
             Self::InteractiveUiSourceEvidence => "interactive_ui_source_evidence",
             Self::NonStaticScreenEvidence => "non_static_screen_evidence",
+            Self::VisibleInteractiveSurfaceEvidence => "visible_interactive_surface_evidence",
+            Self::UserInputHandlerEvidence => "user_input_handler_evidence",
+            Self::StatefulUpdateEvidence => "stateful_update_evidence",
+            Self::ChallengeOrAdversaryEvidence => "challenge_or_adversary_evidence",
+            Self::ScoreOrProgressionEvidence => "score_or_progression_evidence",
+            Self::FailureOrCollisionEvidence => "failure_or_collision_evidence",
+            Self::RestartOrRecoverableStateEvidence => "restart_or_recoverable_state_evidence",
             Self::NextJsRouteEvidence => "nextjs_route_evidence",
             Self::RequestedContent => "requested_content_evidence",
         }
@@ -196,6 +210,41 @@ pub fn verify_runtime_acceptance(
                     missing_evidence.push(evidence.clone());
                 }
             }
+            "visible_interactive_surface_evidence" => {
+                if !has_visible_interactive_surface_evidence(&workspace) {
+                    missing_evidence.push(evidence.clone());
+                }
+            }
+            "user_input_handler_evidence" => {
+                if !has_user_input_handler_evidence(&workspace) {
+                    missing_evidence.push(evidence.clone());
+                }
+            }
+            "stateful_update_evidence" => {
+                if !has_stateful_update_evidence(&workspace) {
+                    missing_evidence.push(evidence.clone());
+                }
+            }
+            "challenge_or_adversary_evidence" => {
+                if !has_challenge_or_adversary_evidence(&workspace) {
+                    missing_evidence.push(evidence.clone());
+                }
+            }
+            "score_or_progression_evidence" => {
+                if !has_score_or_progression_evidence(&workspace) {
+                    missing_evidence.push(evidence.clone());
+                }
+            }
+            "failure_or_collision_evidence" => {
+                if !has_failure_or_collision_evidence(&workspace) {
+                    missing_evidence.push(evidence.clone());
+                }
+            }
+            "restart_or_recoverable_state_evidence" => {
+                if !has_restart_or_recoverable_state_evidence(&workspace) {
+                    missing_evidence.push(evidence.clone());
+                }
+            }
             "nextjs_route_evidence" => {
                 if !has_nextjs_route_evidence(&workspace) {
                     missing_evidence.push(evidence.clone());
@@ -299,19 +348,58 @@ fn evidence_kinds_for_capability(capability: &str) -> Vec<EvidenceKind> {
             EvidenceKind::NonZeroTestOrAssertionEvidence,
         ],
         "buildable" => vec![EvidenceKind::BuildCommandOrDependencyBoundary],
-        "browser_interaction"
-        | "playable_ui"
-        | "stateful_interaction"
-        | "start_or_restart_flow"
-        | "player_control"
-        | "adversary_or_challenge"
-        | "progression_or_score"
-        | "failure_or_collision_rule"
-        | "user_input_or_action"
-        | "visible_state_change" => vec![
+        "browser_interaction" | "playable_ui" => vec![
             EvidenceKind::ImplementationArtifact,
+            EvidenceKind::VisibleInteractiveSurfaceEvidence,
+            EvidenceKind::UserInputHandlerEvidence,
+            EvidenceKind::StatefulUpdateEvidence,
             EvidenceKind::InteractiveUiSourceEvidence,
             EvidenceKind::NonStaticScreenEvidence,
+        ],
+        "stateful_interaction" => vec![
+            EvidenceKind::ImplementationArtifact,
+            EvidenceKind::VisibleInteractiveSurfaceEvidence,
+            EvidenceKind::UserInputHandlerEvidence,
+            EvidenceKind::StatefulUpdateEvidence,
+            EvidenceKind::InteractiveUiSourceEvidence,
+            EvidenceKind::NonStaticScreenEvidence,
+        ],
+        "start_or_restart_flow" => vec![
+            EvidenceKind::ImplementationArtifact,
+            EvidenceKind::VisibleInteractiveSurfaceEvidence,
+            EvidenceKind::UserInputHandlerEvidence,
+            EvidenceKind::RestartOrRecoverableStateEvidence,
+            EvidenceKind::InteractiveUiSourceEvidence,
+        ],
+        "player_control" | "user_input_or_action" => vec![
+            EvidenceKind::ImplementationArtifact,
+            EvidenceKind::VisibleInteractiveSurfaceEvidence,
+            EvidenceKind::UserInputHandlerEvidence,
+            EvidenceKind::InteractiveUiSourceEvidence,
+        ],
+        "adversary_or_challenge" => vec![
+            EvidenceKind::ImplementationArtifact,
+            EvidenceKind::ChallengeOrAdversaryEvidence,
+            EvidenceKind::StatefulUpdateEvidence,
+            EvidenceKind::NonStaticScreenEvidence,
+        ],
+        "progression_or_score" => vec![
+            EvidenceKind::ImplementationArtifact,
+            EvidenceKind::ScoreOrProgressionEvidence,
+            EvidenceKind::StatefulUpdateEvidence,
+            EvidenceKind::NonStaticScreenEvidence,
+        ],
+        "failure_or_collision_rule" => vec![
+            EvidenceKind::ImplementationArtifact,
+            EvidenceKind::FailureOrCollisionEvidence,
+            EvidenceKind::StatefulUpdateEvidence,
+            EvidenceKind::NonStaticScreenEvidence,
+        ],
+        "visible_state_change" => vec![
+            EvidenceKind::ImplementationArtifact,
+            EvidenceKind::VisibleInteractiveSurfaceEvidence,
+            EvidenceKind::StatefulUpdateEvidence,
+            EvidenceKind::InteractiveUiSourceEvidence,
         ],
         "nextjs_route" | "route" => vec![EvidenceKind::NextJsRouteEvidence],
         _ => Vec::new(),
@@ -599,6 +687,55 @@ fn has_non_static_screen_evidence(workspace: &WorkspaceEvidence) -> bool {
         .any(source_file_has_non_static_screen)
 }
 
+fn has_visible_interactive_surface_evidence(workspace: &WorkspaceEvidence) -> bool {
+    workspace
+        .source_files
+        .iter()
+        .any(source_file_has_visible_interactive_surface)
+}
+
+fn has_user_input_handler_evidence(workspace: &WorkspaceEvidence) -> bool {
+    workspace
+        .source_files
+        .iter()
+        .any(source_file_has_user_input_handler)
+}
+
+fn has_stateful_update_evidence(workspace: &WorkspaceEvidence) -> bool {
+    workspace
+        .source_files
+        .iter()
+        .any(source_file_has_stateful_update)
+}
+
+fn has_challenge_or_adversary_evidence(workspace: &WorkspaceEvidence) -> bool {
+    workspace
+        .source_files
+        .iter()
+        .any(source_file_has_challenge_or_adversary)
+}
+
+fn has_score_or_progression_evidence(workspace: &WorkspaceEvidence) -> bool {
+    workspace
+        .source_files
+        .iter()
+        .any(source_file_has_score_or_progression)
+}
+
+fn has_failure_or_collision_evidence(workspace: &WorkspaceEvidence) -> bool {
+    workspace
+        .source_files
+        .iter()
+        .any(source_file_has_failure_or_collision)
+}
+
+fn has_restart_or_recoverable_state_evidence(workspace: &WorkspaceEvidence) -> bool {
+    workspace
+        .source_files
+        .iter()
+        .any(source_file_has_restart_or_recoverable_state)
+}
+
 fn has_nextjs_route_evidence(workspace: &WorkspaceEvidence) -> bool {
     workspace.source_files.iter().any(|file| {
         let path = file.rel.to_ascii_lowercase();
@@ -730,6 +867,27 @@ fn evidence_kinds_for_file(file: &SourceFile) -> Vec<EvidenceKind> {
     if source_file_has_non_static_screen(file) {
         kinds.push(EvidenceKind::NonStaticScreenEvidence);
     }
+    if source_file_has_visible_interactive_surface(file) {
+        kinds.push(EvidenceKind::VisibleInteractiveSurfaceEvidence);
+    }
+    if source_file_has_user_input_handler(file) {
+        kinds.push(EvidenceKind::UserInputHandlerEvidence);
+    }
+    if source_file_has_stateful_update(file) {
+        kinds.push(EvidenceKind::StatefulUpdateEvidence);
+    }
+    if source_file_has_challenge_or_adversary(file) {
+        kinds.push(EvidenceKind::ChallengeOrAdversaryEvidence);
+    }
+    if source_file_has_score_or_progression(file) {
+        kinds.push(EvidenceKind::ScoreOrProgressionEvidence);
+    }
+    if source_file_has_failure_or_collision(file) {
+        kinds.push(EvidenceKind::FailureOrCollisionEvidence);
+    }
+    if source_file_has_restart_or_recoverable_state(file) {
+        kinds.push(EvidenceKind::RestartOrRecoverableStateEvidence);
+    }
     kinds.sort_by_key(|kind| kind.as_str());
     kinds.dedup();
     kinds
@@ -859,6 +1017,136 @@ fn source_file_has_non_static_screen(file: &SourceFile) -> bool {
             || lower.contains("usestate")
             || lower.contains("usereducer")
             || lower.contains("canvas"))
+}
+
+fn source_file_has_visible_interactive_surface(file: &SourceFile) -> bool {
+    let lower = file.content.to_ascii_lowercase();
+    lower.contains("<canvas")
+        || lower.contains("<button")
+        || lower.contains("<input")
+        || lower.contains("<select")
+        || lower.contains("<textarea")
+        || lower.contains("onclick")
+        || lower.contains("onkeydown")
+        || lower.contains("onpointer")
+        || lower.contains("role=\"button\"")
+        || lower.contains("role='button'")
+        || lower.contains("tabindex")
+}
+
+fn source_file_has_user_input_handler(file: &SourceFile) -> bool {
+    let content = file.content.as_str();
+    let lower = content.to_ascii_lowercase();
+    content.contains("addEventListener")
+        || lower.contains("onkeydown")
+        || lower.contains("onkeyup")
+        || lower.contains("onclick")
+        || lower.contains("onpointer")
+        || lower.contains("onmousedown")
+        || lower.contains("onmouseup")
+        || lower.contains("ontouch")
+        || lower.contains("onsubmit")
+        || lower.contains("onchange")
+        || lower.contains("keydown")
+        || lower.contains("keyup")
+        || lower.contains("pointerdown")
+        || lower.contains("touchstart")
+}
+
+fn source_file_has_stateful_update(file: &SourceFile) -> bool {
+    let content = file.content.as_str();
+    let lower = content.to_ascii_lowercase();
+    content.contains("useState")
+        || content.contains("useReducer")
+        || content.contains("setState")
+        || lower.contains("setinterval")
+        || lower.contains("settimeout")
+        || lower.contains("requestanimationframe")
+        || lower.contains("dispatch(")
+        || lower.contains("=> set")
+}
+
+fn source_file_has_challenge_or_adversary(file: &SourceFile) -> bool {
+    let lower = file.content.to_ascii_lowercase();
+    [
+        "enemy",
+        "enemies",
+        "adversary",
+        "opponent",
+        "obstacle",
+        "hazard",
+        "wave",
+        "spawn",
+        "target",
+        "challenge",
+        "boss",
+        "敵",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn source_file_has_score_or_progression(file: &SourceFile) -> bool {
+    let lower = file.content.to_ascii_lowercase();
+    [
+        "score",
+        "points",
+        "level",
+        "stage",
+        "wave",
+        "combo",
+        "lives",
+        "life",
+        "health",
+        "progress",
+        "スコア",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn source_file_has_failure_or_collision(file: &SourceFile) -> bool {
+    let lower = file.content.to_ascii_lowercase();
+    [
+        "collision",
+        "collide",
+        "hit",
+        "damage",
+        "gameover",
+        "game over",
+        "lives",
+        "life",
+        "health",
+        "intersect",
+        "overlap",
+        "bounds",
+        "lose",
+        "fail",
+        "衝突",
+        "当たり",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn source_file_has_restart_or_recoverable_state(file: &SourceFile) -> bool {
+    let lower = file.content.to_ascii_lowercase();
+    let has_recoverable_state = [
+        "start",
+        "restart",
+        "reset",
+        "pause",
+        "resume",
+        "gameover",
+        "game over",
+        "play again",
+        "try again",
+        "スタート",
+        "開始",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    has_recoverable_state && source_file_has_user_input_handler(file)
 }
 
 #[cfg(test)]
@@ -1136,6 +1424,110 @@ mod tests {
                 .missing_evidence
                 .contains(&"implementation_artifact".to_string())
         );
+    }
+
+    #[test]
+    fn title_only_output_does_not_satisfy_interactive_game_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){ return <main><h1>Game</h1><p>Press any key to start</p></main>; }\n",
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[
+                "stateful_interaction".to_string(),
+                "start_or_restart_flow".to_string(),
+                "player_control".to_string(),
+                "adversary_or_challenge".to_string(),
+                "progression_or_score".to_string(),
+                "failure_or_collision_rule".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(!report.passed);
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"visible_interactive_surface_evidence".to_string())
+        );
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"user_input_handler_evidence".to_string())
+        );
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"restart_or_recoverable_state_evidence".to_string())
+        );
+    }
+
+    #[test]
+    fn interactive_game_source_satisfies_generic_capability_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  const [gameState, setGameState] = useState("ready");
+  const enemies = [{ x: 10, y: 20 }];
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") {
+        setGameState("playing");
+        setScore((value) => value + 1);
+      }
+    };
+    const frame = requestAnimationFrame(() => {
+      const collision = enemies.some((enemy) => enemy.x > 0);
+      if (collision) setGameState("gameover");
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button><canvas /><p>score {score} enemy collision {gameState}</p></main>;
+}
+"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[
+                "stateful_interaction".to_string(),
+                "start_or_restart_flow".to_string(),
+                "player_control".to_string(),
+                "adversary_or_challenge".to_string(),
+                "progression_or_score".to_string(),
+                "failure_or_collision_rule".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(report.passed, "{report:?}");
+        let evidence = &report.artifact_obligations[0].evidence;
+        assert!(evidence.contains(&"visible_interactive_surface_evidence".to_string()));
+        assert!(evidence.contains(&"user_input_handler_evidence".to_string()));
+        assert!(evidence.contains(&"stateful_update_evidence".to_string()));
+        assert!(evidence.contains(&"challenge_or_adversary_evidence".to_string()));
+        assert!(evidence.contains(&"score_or_progression_evidence".to_string()));
+        assert!(evidence.contains(&"failure_or_collision_evidence".to_string()));
+        assert!(evidence.contains(&"restart_or_recoverable_state_evidence".to_string()));
     }
 
     #[test]

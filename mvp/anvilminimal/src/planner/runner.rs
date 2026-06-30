@@ -6,7 +6,7 @@ use crate::eval_events;
 use crate::minimal_loop::build_verifier::emit_dependency_build_lifecycle;
 use crate::minimal_loop::completion::CompletionContract;
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
-use crate::minimal_loop::evidence::verify_runtime_acceptance;
+use crate::minimal_loop::evidence::{required_evidence_for_capability, verify_runtime_acceptance};
 use crate::minimal_loop::loop_run::{
     RunSessionOptions, RunSessionOutcome, RunSessionStepKind, extract_requested_artifact_paths,
     run_session_with_outcome_with_options,
@@ -569,10 +569,11 @@ fn run_step_plan_with_session_with_ui(
             &contract.required_capabilities,
         );
     }
-    let final_required_evidence = external_contract
-        .as_ref()
-        .map(|contract| contract.required_evidence.clone())
-        .unwrap_or_default();
+    let mut final_required_evidence =
+        inferred_required_evidence(&config.profile, &plan.goal, &final_required_capabilities);
+    if let Some(contract) = external_contract.as_ref() {
+        merge_unique_strings(&mut final_required_evidence, &contract.required_evidence);
+    }
     let mut prior_expected_paths = Vec::new();
     for step in &plan.steps {
         if ui.interrupted() {
@@ -1109,6 +1110,10 @@ fn verify_plan_final_contract(
                 .map(|requirement| requirement.command.clone()),
         );
     }
+    merge_unique_strings(
+        &mut required_evidence,
+        &inferred_required_evidence(&config.profile, &plan.goal, &required_capabilities),
+    );
     let missing_final_artifacts = missing_final_artifacts(&config.workspace_root, &required_paths);
     let external_report = external_contract
         .as_ref()
@@ -2306,6 +2311,10 @@ fn ultra_final_acceptance_report(
                 .map(|requirement| requirement.command.clone()),
         );
     }
+    merge_unique_strings(
+        &mut required_evidence,
+        &inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities),
+    );
     let missing = missing_final_artifacts(&config.workspace_root, &required_paths);
     let acceptance = verify_runtime_acceptance(
         &config.workspace_root,
@@ -2358,17 +2367,24 @@ fn inferred_required_capabilities(profile: &str, goal: &str) -> Vec<String> {
     let lower = goal.to_ascii_lowercase();
     let is_next = matches!(profile, "nextjs" | "next-js" | "next.js");
     let mut capabilities = Vec::new();
-    if is_next
-        && (lower.contains("game")
-            || lower.contains("playable")
-            || lower.contains("interactive")
-            || lower.contains("player")
-            || lower.contains("enemy")
-            || lower.contains("score")
-            || goal.contains("ゲーム")
-            || goal.contains("インベーダー"))
-    {
+    let game_like = lower.contains("game")
+        || lower.contains("playable")
+        || lower.contains("canvas")
+        || lower.contains("player")
+        || lower.contains("enemy")
+        || lower.contains("enemies")
+        || lower.contains("adversary")
+        || lower.contains("opponent")
+        || lower.contains("obstacle")
+        || lower.contains("collision")
+        || lower.contains("bullet")
+        || lower.contains("lives")
+        || lower.contains("game over")
+        || goal.contains("ゲーム")
+        || goal.contains("シューティング");
+    if is_next && game_like {
         merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
+        merge_unique_strings(&mut capabilities, &["start_or_restart_flow".to_string()]);
         merge_unique_strings(&mut capabilities, &["player_control".to_string()]);
         merge_unique_strings(&mut capabilities, &["adversary_or_challenge".to_string()]);
         merge_unique_strings(&mut capabilities, &["progression_or_score".to_string()]);
@@ -2380,7 +2396,10 @@ fn inferred_required_capabilities(profile: &str, goal: &str) -> Vec<String> {
         && (lower.contains("button")
             || lower.contains("form")
             || lower.contains("keyboard")
-            || lower.contains("input"))
+            || lower.contains("input")
+            || lower.contains("interactive")
+            || lower.contains("score")
+            || goal.contains("操作"))
     {
         merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
         merge_unique_strings(&mut capabilities, &["user_input_or_action".to_string()]);
@@ -2412,6 +2431,9 @@ fn inferred_required_evidence(
                 "build_command_or_dependency_missing_boundary".to_string(),
             ],
         );
+    }
+    for capability in required_capabilities {
+        merge_unique_strings(&mut evidence, &required_evidence_for_capability(capability));
     }
     evidence
 }
@@ -3852,6 +3874,10 @@ fn ultra_phase_prompt(
     let expectations =
         profile_quality_expectations(&config.workspace_root, &plan.profile, &plan.goal);
     let runtime_contract = profile_runtime_contract(&plan.profile, &plan.intent, &plan.goal);
+    let phase_contract_text = format!("{}\n{}", plan.goal, phase.prompt);
+    let required_capabilities = inferred_required_capabilities(&plan.profile, &phase_contract_text);
+    let required_evidence =
+        inferred_required_evidence(&plan.profile, &phase_contract_text, &required_capabilities);
     let required = if expected_paths.is_empty() {
         String::new()
     } else {
@@ -3860,6 +3886,30 @@ fn ultra_phase_prompt(
             expected_paths
                 .iter()
                 .map(|path| format!("- {path}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let capability_section = if required_capabilities.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nRequired final capabilities:\n{}",
+            required_capabilities
+                .iter()
+                .map(|capability| format!("- {capability}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let evidence_section = if required_evidence.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nRequired final evidence:\n{}",
+            required_evidence
+                .iter()
+                .map(|evidence| format!("- {evidence}"))
                 .collect::<Vec<_>>()
                 .join("\n")
         )
@@ -3877,7 +3927,7 @@ fn ultra_phase_prompt(
     let workspace_snapshot = compact_workspace_snapshot(&config.workspace_root);
     let prior_context = context.render_prompt_section();
     format!(
-        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\nProfile runtime contract:\n{}\n\nDeterministic verification preference:\n{}\n{}",
+        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\nProfile runtime contract:\n{}\n\nDeterministic verification preference:\n{}\n{}{}{}",
         plan.goal,
         plan.profile,
         plan.style,
@@ -3888,7 +3938,9 @@ fn ultra_phase_prompt(
         prior_context,
         runtime_contract,
         preferred_verify,
-        required
+        required,
+        capability_section,
+        evidence_section
     )
 }
 
@@ -4739,6 +4791,40 @@ mod tests {
     }
 
     #[test]
+    fn ultra_phase_prompt_derives_interactive_capability_evidence_from_goal_and_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![crate::planner::ultra_plan::UltraPhase {
+                id: "gameplay".to_string(),
+                prompt:
+                    "Implement keyboard controls, score progression, collision rules, and restart state."
+                        .to_string(),
+            }],
+        };
+        let prompt = ultra_phase_prompt(
+            &plan,
+            &plan.phases[0],
+            &config(dir.path().to_path_buf()),
+            &UltraRunContext::new(vec!["src/app/page.tsx".to_string()]),
+        );
+        assert!(prompt.contains("Required final capabilities:"));
+        assert!(prompt.contains("- stateful_interaction"));
+        assert!(prompt.contains("- start_or_restart_flow"));
+        assert!(prompt.contains("- player_control"));
+        assert!(prompt.contains("Required final evidence:"));
+        assert!(prompt.contains("- visible_interactive_surface_evidence"));
+        assert!(prompt.contains("- user_input_handler_evidence"));
+        assert!(prompt.contains("- stateful_update_evidence"));
+        assert!(prompt.contains("- score_or_progression_evidence"));
+        assert!(prompt.contains("- failure_or_collision_evidence"));
+        assert!(prompt.contains("- restart_or_recoverable_state_evidence"));
+    }
+
+    #[test]
     fn profile_auto_repair_continuation_prompt_treats_scaffold_as_incomplete() {
         let plan = UltraPlan {
             goal: "Create an interactive app".to_string(),
@@ -4831,9 +4917,12 @@ mod tests {
 import { useState } from "react";
 export default function Page(){
   const [score,setScore] = useState(0);
-  return <main tabIndex={0} onKeyDown={() => setScore(score + 1)}>
+  const [gameState,setGameState] = useState("ready");
+  return <main tabIndex={0} onKeyDown={() => { setGameState("playing"); setScore(score + 1); }}>
+    <button onClick={() => setGameState("playing")}>Start</button>
+    <button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button>
     <canvas />
-    <p>score {score}</p>
+    <p>score {score} {gameState}</p>
     <p>enemy invader bullet collision state</p>
   </main>;
 }"#;
@@ -5483,6 +5572,11 @@ export default function Page(){
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"runtime_acceptance_inconclusive\":false"));
         assert!(event_text.contains("\"missing_evidence\""));
+        assert!(event_text.contains("\"step_prompt_contract\""));
+        assert!(event_text.contains("\"has_required_final_evidence\":true"));
+        assert!(event_text.contains("\"visible_interactive_surface_evidence\""));
+        assert!(event_text.contains("\"user_input_handler_evidence\""));
+        assert!(event_text.contains("\"restart_or_recoverable_state_evidence\""));
     }
 
     #[test]
@@ -5548,12 +5642,16 @@ export default function Page(){
 import { useEffect, useState } from "react";
 export default function Page(){
   const [score,setScore] = useState(0);
+  const [gameState,setGameState] = useState("ready");
   useEffect(() => {
-    const onKeyDown = () => setScore((value) => value + 1);
+    const onKeyDown = () => {
+      setGameState("playing");
+      setScore((value) => value + 1);
+    };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
-  return <main><canvas /><p>enemy bullet collision score {score}</p></main>;
+  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button><canvas /><p>enemy bullet collision score {score} {gameState}</p></main>;
 }
 "#;
         let mut fake = FakeClient::new(vec![AssistantReply {
