@@ -2728,6 +2728,8 @@ fn emit_planner_quality_retry_exhausted(
 fn planner_stage_and_kind_for_lint(report: &PlanLintReport) -> (&'static str, &'static str) {
     if report.has_category("verify_policy") {
         ("verify_policy", "verify_command_policy_error")
+    } else if report.has_category("dependency_order") {
+        ("dependency_order", "verify_dependency_order_error")
     } else if report.has_category("scaffold") {
         ("scaffold", "phase_scaffold_error")
     } else {
@@ -3786,6 +3788,18 @@ mod tests {
     }
 
     #[test]
+    fn dependency_order_lint_maps_to_specific_planner_failure_kind() {
+        let mut report = PlanLintReport::pass();
+        report.push(
+            "dependency_order",
+            "verify command requires dependency setup or package manifest first",
+        );
+        let (stage, kind) = planner_stage_and_kind_for_lint(&report);
+        assert_eq!(stage, "dependency_order");
+        assert_eq!(kind, "verify_dependency_order_error");
+    }
+
+    #[test]
     fn schema_retry_prompt_reports_missing_goal() {
         let prompt = build_schema_retry_prompt("Build app", "StepPlan missing goal", 1);
         assert!(prompt.contains("Detected schema issues:"));
@@ -3911,7 +3925,7 @@ mod tests {
     #[test]
     fn invalid_planner_lint_does_not_save_plan_file() {
         let dir = tempfile::tempdir().unwrap();
-        let invalid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js || node check2.js"]}]}"#;
+        let invalid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js || node check2.js"]}]}"#;
         let mut planner = FakeClient::new(vec![
             AssistantReply::text(invalid),
             AssistantReply::text(invalid),
@@ -4084,7 +4098,7 @@ mod tests {
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
-        let plan_json = r#"{"goal":"Build a Next.js game app","steps":[{"id":"s1","kind":"implement","instruction":"Create the app","expected_paths":["package.json","src/app/page.tsx"],"verify":[]}]}"#;
+        let plan_json = r#"{"goal":"Build a Next.js game app","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create the app","expected_paths":["package.json","src/app/page.tsx"],"verify":[]}]}"#;
         let mut planner = FakeClient::new(vec![AssistantReply::text(plan_json)]);
         let plan = generate_step_plan(&mut planner, "Build a Next.js game app", &cfg).unwrap();
         assert_eq!(plan.steps.len(), 1);

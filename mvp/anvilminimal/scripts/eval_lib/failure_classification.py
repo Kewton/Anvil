@@ -43,6 +43,7 @@ KNOWN_FAILURE_KINDS = {
     "verify_repair_progress_regressed",
     "verify_repair_progress_unchanged",
     "verify_command_policy_error",
+    "verify_dependency_order_error",
     "process_failure",
     "artifact_failure",
     "build_failure",
@@ -82,6 +83,7 @@ PLANNING_FAILURE_KINDS = {
     "planner_lint_error",
     "planner_schema_error",
     "verify_command_policy_error",
+    "verify_dependency_order_error",
     "phase_scaffold_error",
 }
 BRIDGE_FAILURE_KINDS = {
@@ -580,22 +582,38 @@ def classify_planner_stderr(stderr: str) -> dict[str, Any]:
             "planner_stage": "schema",
             "planner_error_kind": "planner_schema_error",
         }
-    if "verify command may not use shell control syntax" in lower or "verify command is blocked" in lower:
+    if (
+        "verify command may not use shell control syntax" in lower
+        or "verify command is blocked" in lower
+        or "verify command may not perform setup or start a dev server" in lower
+        or "verify command manifest path escapes workspace" in lower
+    ):
         return {
             "failure_kind": "verify_command_policy_error",
             "planner_stage": "verify_policy",
             "planner_error_kind": "verify_command_policy_error",
         }
+    if "stepplan missing expected_result" in lower:
+        return {
+            "failure_kind": "planner_schema_error",
+            "planner_stage": "schema",
+            "planner_error_kind": "planner_schema_error",
+        }
     if (
         "duplicate expected path ownership" in lower
         or "implement step must declare concrete expected paths" in lower
-        or "verify command requires dependency setup or package manifest first" in lower
         or "next.js build verify requires an entrypoint expected path first" in lower
     ):
         return {
             "failure_kind": "planner_lint_error",
             "planner_stage": "lint",
             "planner_error_kind": "planner_lint_error",
+        }
+    if "verify command requires dependency setup or package manifest first" in lower:
+        return {
+            "failure_kind": "verify_dependency_order_error",
+            "planner_stage": "dependency_order",
+            "planner_error_kind": "verify_dependency_order_error",
         }
     if "phase scaffold failed" in lower:
         return {

@@ -119,6 +119,30 @@ class FailureClassificationTest(unittest.TestCase):
         )
         self.assertEqual(result["failure_kind"], "phase_scaffold_error")
 
+    def test_stderr_classifies_verify_dependency_order(self):
+        result = classify_stderr(
+            "error: invalid StepPlan after corrective retries: verify command requires dependency setup or package manifest first",
+            rc=1,
+        )
+        self.assertEqual(result["failure_kind"], "verify_dependency_order_error")
+        self.assertEqual(result["planner_stage"], "dependency_order")
+
+    def test_stderr_classifies_verify_setup_or_dev_server_policy(self):
+        result = classify_stderr(
+            "error: invalid StepPlan after corrective retries: verify command may not perform setup or start a dev server",
+            rc=1,
+        )
+        self.assertEqual(result["failure_kind"], "verify_command_policy_error")
+        self.assertEqual(result["planner_stage"], "verify_policy")
+
+    def test_stderr_classifies_missing_expected_result_as_schema(self):
+        result = classify_stderr(
+            "error: invalid StepPlan after corrective retries: StepPlan missing expected_result in step 1",
+            rc=1,
+        )
+        self.assertEqual(result["failure_kind"], "planner_schema_error")
+        self.assertEqual(result["planner_stage"], "schema")
+
     def test_failure_layers_separate_provider_from_capability_failures(self):
         self.assertEqual(failure_layer_for_kind("provider_http_status"), "provider")
         self.assertEqual(capability_failure_included("provider_http_status"), False)

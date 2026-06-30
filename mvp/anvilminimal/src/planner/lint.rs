@@ -1052,6 +1052,30 @@ mod tests {
     }
 
     #[test]
+    fn dependency_verify_without_setup_has_specific_category() {
+        let plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![PlanStep {
+                id: "s1".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify project".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["npm run build".to_string()],
+            }],
+        };
+        let report = lint_step_plan_report(&plan);
+        assert!(report.has_category("dependency_order"), "{report:?}");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|err| err.message.contains("requires dependency setup")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
     fn planner_lint_python_unittest_without_setup_passes() {
         let plan = StepPlan {
             goal: "Create Python linter".to_string(),

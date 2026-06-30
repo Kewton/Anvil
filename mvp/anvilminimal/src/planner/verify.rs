@@ -351,12 +351,12 @@ fn verify_command_violation(
 }
 
 fn contains_shell_control_syntax(command: &str) -> bool {
-    command.contains("&&")
-        || command.contains("||")
-        || command.contains('|')
-        || command.contains(';')
-        || command.contains("`")
-        || command.contains("$(")
+    command.bytes().any(|byte| {
+        matches!(
+            byte,
+            b';' | b'&' | b'|' | b'<' | b'>' | b'`' | b'\n' | b'\r' | b'\\'
+        )
+    }) || command.contains("$(")
 }
 
 fn is_nextjs_build_command(command: &str) -> bool {
@@ -489,6 +489,8 @@ mod tests {
             "npm test && npm run build",
             "cargo test | cat",
             "npm test; echo ok",
+            "cargo test > out.log",
+            "cargo test \\; echo ok",
         ] {
             assert!(validate_verify_command(command).is_err(), "{command}");
         }

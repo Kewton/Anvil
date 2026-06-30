@@ -45,8 +45,8 @@ struct GeneratedPlanStep {
     id: Value,
     #[serde(default = "default_step_kind")]
     kind: String,
-    #[serde(default = "default_expected_result")]
-    expected_result: String,
+    #[serde(default)]
+    expected_result: Option<String>,
     instruction: String,
     #[serde(default)]
     expected_paths: Value,
@@ -77,10 +77,6 @@ impl PlanStep {
 
 fn default_step_kind() -> String {
     "implement".to_string()
-}
-
-fn default_expected_result() -> String {
-    "pass".to_string()
 }
 
 impl StepPlan {
@@ -183,7 +179,7 @@ fn normalize_generated_step_plan(
         let normalized = PlanStep {
             id: normalize_step_id(&step.id, index),
             kind: normalize_step_kind(&step.kind),
-            expected_result: normalize_expected_result(&step.expected_result),
+            expected_result: normalize_generated_expected_result(step.expected_result, index)?,
             instruction: step.instruction,
             expected_paths,
             verify,
@@ -243,6 +239,19 @@ fn normalize_step_kind(kind: &str) -> String {
     }
 }
 
+fn normalize_generated_expected_result(
+    value: Option<String>,
+    index: usize,
+) -> anyhow::Result<String> {
+    let Some(value) = value else {
+        anyhow::bail!("StepPlan missing expected_result in step {}", index + 1);
+    };
+    if value.trim().is_empty() {
+        anyhow::bail!("StepPlan missing expected_result in step {}", index + 1);
+    }
+    Ok(normalize_expected_result(&value))
+}
+
 fn normalize_expected_result(value: &str) -> String {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "pass" | "passed" | "success" | "succeed" | "succeeds" => "pass".to_string(),
@@ -287,22 +296,6 @@ fn normalize_verify_command(command: &str) -> Vec<String> {
     }
     if let Some(path) = node_exists_sync_path(trimmed) {
         return vec![format!("test -f {path}")];
-    }
-    if trimmed.contains("&&") {
-        return trimmed
-            .split("&&")
-            .flat_map(normalize_verify_command)
-            .collect();
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.contains("npm install")
-        || lower.contains("pnpm install")
-        || lower.contains("yarn install")
-        || lower.contains("cargo install")
-        || lower.contains("next dev")
-        || lower.contains("vite --host")
-    {
-        return Vec::new();
     }
     vec![trimmed.to_string()]
 }
@@ -598,7 +591,11 @@ steps:
         repair_generated_step_plan_contract(&mut plan);
         assert_eq!(
             plan.steps[0].verify,
-            vec!["npm test", "npm run build", "test -f src/app/page.tsx"]
+            vec![
+                "npm test && npm run build",
+                "npm install",
+                "test -f src/app/page.tsx"
+            ]
         );
     }
 
@@ -670,7 +667,7 @@ steps:
 
     #[test]
     fn extract_step_plan_json_from_fenced_or_prefixed_text() {
-        let raw = "Here is the plan:\n```json\n{\"goal\":\"g\",\"steps\":[{\"id\":\"s1\",\"instruction\":\"do it\"}]}\n```";
+        let raw = "Here is the plan:\n```json\n{\"goal\":\"g\",\"steps\":[{\"id\":\"s1\",\"expected_result\":\"pass\",\"instruction\":\"do it\"}]}\n```";
         let extracted = extract_json_object(raw).unwrap();
         assert!(extracted.starts_with('{'));
         let plan = parse_generated_step_plan_json(raw, "goal").unwrap();
@@ -680,7 +677,7 @@ steps:
     #[test]
     fn generated_step_plan_preserves_original_goal() {
         let plan = parse_generated_step_plan_json(
-            r#"{"goal":"short","steps":[{"id":"s1","instruction":"do it"}]}"#,
+            r#"{"goal":"short","steps":[{"id":"s1","expected_result":"pass","instruction":"do it"}]}"#,
             "long original goal",
         )
         .unwrap();
@@ -690,7 +687,7 @@ steps:
     #[test]
     fn generated_step_plan_rejects_missing_goal_or_steps() {
         let missing_goal =
-            parse_generated_step_plan_json(r#"{"steps":[{"id":"s1","instruction":"do it"}]}"#, "g")
+            parse_generated_step_plan_json(r#"{"steps":[{"id":"s1","expected_result":"pass","instruction":"do it"}]}"#, "g")
                 .unwrap_err()
                 .to_string();
         assert!(missing_goal.contains("StepPlan missing goal"));
@@ -701,9 +698,20 @@ steps:
     }
 
     #[test]
+    fn generated_step_plan_rejects_missing_expected_result() {
+        let err = parse_generated_step_plan_json(
+            r#"{"goal":"g","steps":[{"id":"s1","instruction":"do it"}]}"#,
+            "g",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("StepPlan missing expected_result"));
+    }
+
+    #[test]
     fn generated_step_plan_rejects_unsafe_expected_paths() {
         let err = parse_generated_step_plan_json(
-            r#"{"goal":"g","steps":[{"id":"s1","instruction":"do it","expected_paths":["../secret"]}]}"#,
+            r#"{"goal":"g","steps":[{"id":"s1","expected_result":"pass","instruction":"do it","expected_paths":["../secret"]}]}"#,
             "g",
         )
         .unwrap_err()
@@ -727,7 +735,7 @@ steps:
     #[test]
     fn generated_step_plan_normalizes_string_lists() {
         let plan = parse_generated_step_plan_json(
-            r#"{"goal":"g","steps":[{"id":"s1","kind":"implement","instruction":"Create README","expected_paths":"README.md","verify":"test -f README.md"}]}"#,
+            r#"{"goal":"g","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create README","expected_paths":"README.md","verify":"test -f README.md"}]}"#,
             "g",
         )
         .unwrap();
@@ -735,7 +743,7 @@ steps:
         assert_eq!(plan.steps[0].verify, vec!["test -f README.md"]);
 
         let empty = parse_generated_step_plan_json(
-            r#"{"goal":"g","steps":[{"id":"s1","kind":"inspect","instruction":"Inspect","expected_paths":"","verify":""}]}"#,
+            r#"{"goal":"g","steps":[{"id":"s1","kind":"inspect","expected_result":"pass","instruction":"Inspect","expected_paths":"","verify":""}]}"#,
             "g",
         )
         .unwrap();
