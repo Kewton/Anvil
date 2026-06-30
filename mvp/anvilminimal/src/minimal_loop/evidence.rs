@@ -9,6 +9,7 @@ pub struct RuntimeAcceptanceReport {
     pub inconclusive: bool,
     pub missing_capabilities: Vec<String>,
     pub missing_evidence: Vec<String>,
+    pub missing_obligations: Vec<String>,
     pub weak_evidence: Vec<String>,
     pub inconclusive_reasons: Vec<String>,
     pub artifact_obligations: Vec<ArtifactObligationEvidence>,
@@ -108,9 +109,13 @@ pub fn verify_runtime_acceptance(
     verify_commands: &[String],
     required_capabilities: &[String],
     required_evidence: &[String],
+    required_obligations: &[String],
     deferred_verify_requirements: &[String],
 ) -> RuntimeAcceptanceReport {
-    if required_capabilities.is_empty() && required_evidence.is_empty() {
+    if required_capabilities.is_empty()
+        && required_evidence.is_empty()
+        && required_obligations.is_empty()
+    {
         return RuntimeAcceptanceReport {
             passed: true,
             primary_reason: "pass".to_string(),
@@ -200,12 +205,19 @@ pub fn verify_runtime_acceptance(
 
     collect_weak_verify_evidence(verify_commands, &workspace, &mut weak_evidence);
     collect_weak_obligation_evidence(&artifact_obligations, &required, &mut weak_evidence);
+    let missing_obligations =
+        missing_required_obligations(required_obligations, &artifact_obligations, &workspace);
     let inconclusive = !inconclusive_reasons.is_empty();
-    let passed = missing_capabilities.is_empty() && missing_evidence.is_empty() && !inconclusive;
+    let passed = missing_capabilities.is_empty()
+        && missing_evidence.is_empty()
+        && missing_obligations.is_empty()
+        && !inconclusive;
     let primary_reason = if let Some(reason) = missing_capabilities.first() {
         format!("missing_required_capabilities:{reason}")
     } else if let Some(reason) = missing_evidence.first() {
         format!("missing_required_evidence:{reason}")
+    } else if let Some(reason) = missing_obligations.first() {
+        format!("missing_required_obligations:{reason}")
     } else if let Some(reason) = inconclusive_reasons.first() {
         format!("inconclusive_acceptance:{reason}")
     } else if let Some(reason) = weak_evidence.first() {
@@ -219,6 +231,7 @@ pub fn verify_runtime_acceptance(
         inconclusive,
         missing_capabilities,
         missing_evidence,
+        missing_obligations,
         weak_evidence,
         inconclusive_reasons,
         artifact_obligations,
@@ -705,6 +718,72 @@ fn collect_weak_obligation_evidence(
     }
 }
 
+fn missing_required_obligations(
+    required_obligations: &[String],
+    artifact_obligations: &[ArtifactObligationEvidence],
+    workspace: &WorkspaceEvidence,
+) -> Vec<String> {
+    let mut missing = Vec::new();
+    for obligation in normalize_obligation_roles(required_obligations) {
+        if !obligation_role_satisfied(&obligation, artifact_obligations, workspace) {
+            missing.push(obligation);
+        }
+    }
+    missing
+}
+
+fn normalize_obligation_roles(required_obligations: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for obligation in required_obligations {
+        let normalized = obligation.trim().to_ascii_lowercase().replace('-', "_");
+        if matches!(
+            normalized.as_str(),
+            "setup" | "scaffold" | "implementation" | "verification" | "acceptance_evidence"
+        ) && seen.insert(normalized.clone())
+        {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+fn obligation_role_satisfied(
+    role: &str,
+    artifact_obligations: &[ArtifactObligationEvidence],
+    workspace: &WorkspaceEvidence,
+) -> bool {
+    match role {
+        "setup" => workspace.package_json.is_some() || workspace.cargo_toml,
+        "scaffold" => {
+            artifact_obligations
+                .iter()
+                .any(|obligation| obligation.role == "scaffold")
+                || workspace
+                    .source_files
+                    .iter()
+                    .any(|file| artifact_role_for_file(file) == ArtifactRoleLite::Scaffold)
+        }
+        "implementation" => {
+            artifact_obligations
+                .iter()
+                .any(|obligation| obligation.satisfies_implementation)
+                || workspace
+                    .source_files
+                    .iter()
+                    .any(|file| artifact_role_for_file(file).satisfies_implementation())
+        }
+        "verification" => has_test_artifact(workspace) || has_assertion_or_test_evidence(workspace),
+        "acceptance_evidence" => {
+            workspace.readme
+                || artifact_obligations
+                    .iter()
+                    .any(|obligation| obligation.role == "acceptance_evidence")
+        }
+        _ => false,
+    }
+}
+
 fn source_file_has_interactive_ui(file: &SourceFile) -> bool {
     let content = file.content.as_str();
     let lower = content.to_ascii_lowercase();
@@ -764,6 +843,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(!report.passed);
         assert!(
@@ -801,6 +881,7 @@ mod tests {
             ],
             &[],
             &[],
+            &[],
         );
         assert!(report.passed, "{report:?}");
     }
@@ -824,6 +905,7 @@ mod tests {
             &["Cargo.toml".to_string(), "src/main.rs".to_string()],
             &["cargo test".to_string()],
             &["entrypoint".to_string(), "deterministic_check".to_string()],
+            &[],
             &[],
             &[],
         );
@@ -856,6 +938,7 @@ mod tests {
             &["entrypoint".to_string(), "deterministic_check".to_string()],
             &[],
             &[],
+            &[],
         );
         assert!(report.passed, "{report:?}");
     }
@@ -877,6 +960,7 @@ mod tests {
                 "player_control".to_string(),
                 "progression_or_score".to_string(),
             ],
+            &[],
             &[],
             &["npm run build".to_string()],
         );
@@ -903,6 +987,7 @@ mod tests {
             &["implementation".to_string()],
             &[],
             &[],
+            &[],
         );
         assert!(!report.passed);
         assert!(
@@ -915,6 +1000,32 @@ mod tests {
             report
                 .weak_evidence
                 .contains(&"non_implementation_obligation_only:setup".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_implementation_obligation_rejects_setup_only_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"scripts":{}}"#).unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["package.json".to_string()],
+            &[],
+            &[],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(!report.passed);
+        assert!(
+            report
+                .missing_obligations
+                .contains(&"implementation".to_string())
+        );
+        assert!(
+            report
+                .primary_reason
+                .contains("missing_required_obligations")
         );
     }
 
@@ -932,6 +1043,7 @@ mod tests {
             &["src/app/page.tsx".to_string()],
             &[],
             &["implementation".to_string()],
+            &[],
             &[],
             &[],
         );
@@ -955,6 +1067,7 @@ mod tests {
             &["implementation".to_string()],
             &[],
             &[],
+            &[],
         );
         assert!(!report.passed);
         assert_eq!(report.artifact_obligations[0].role, "style");
@@ -972,6 +1085,7 @@ mod tests {
                 "player_control".to_string(),
                 "adversary_or_challenge".to_string(),
             ],
+            &[],
             &[],
             &[],
         );
@@ -1013,6 +1127,7 @@ export default function Page(){
             &["player_control".to_string()],
             &[],
             &[],
+            &[],
         );
         assert!(report.artifact_obligations[0].satisfies_implementation);
         assert!(
@@ -1043,6 +1158,7 @@ export default function Page(){ return <button onClick={() => alert("ok")}>Go</b
             &["src/app/page.tsx".to_string()],
             &[],
             &["browser_interaction".to_string()],
+            &[],
             &[],
             &[],
         );

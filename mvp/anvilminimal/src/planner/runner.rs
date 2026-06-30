@@ -551,10 +551,14 @@ fn run_step_plan_with_session_with_ui(
     let required_final_artifacts = required_final_artifacts(plan, &config.workspace_root);
     let external_contract = CompletionContract::load_for_config(config)
         .map_err(|err| StepPlanRunError::from_error(err.to_string(), outcome.clone()))?;
-    let final_required_capabilities = external_contract
-        .as_ref()
-        .map(|contract| contract.required_capabilities.clone())
-        .unwrap_or_default();
+    let mut final_required_capabilities =
+        inferred_required_capabilities(&config.profile, &plan.goal);
+    if let Some(contract) = external_contract.as_ref() {
+        merge_unique_strings(
+            &mut final_required_capabilities,
+            &contract.required_capabilities,
+        );
+    }
     let final_required_evidence = external_contract
         .as_ref()
         .map(|contract| contract.required_evidence.clone())
@@ -989,25 +993,57 @@ fn verify_plan_final_contract(
 ) -> anyhow::Result<()> {
     let external_contract = CompletionContract::load_for_config(config)?;
     let mut required_paths = required_final_artifacts.to_vec();
+    let mut required_capabilities = inferred_required_capabilities(&config.profile, &plan.goal);
+    let mut required_evidence = Vec::new();
+    let mut required_obligations =
+        inferred_required_obligations(&config.profile, &plan.goal, &required_capabilities);
+    let mut verify_commands = Vec::new();
+    let mut deferred_commands = Vec::new();
     if let Some(contract) = external_contract.as_ref() {
         merge_unique_strings(&mut required_paths, &contract.required_paths);
+        merge_unique_strings(&mut required_capabilities, &contract.required_capabilities);
+        merge_unique_strings(&mut required_evidence, &contract.required_evidence);
+        merge_unique_strings(&mut required_obligations, &contract.required_obligations);
+        merge_unique_strings(&mut verify_commands, &contract.verify_commands);
+        deferred_commands.extend(
+            contract
+                .deferred_verify_requirements
+                .iter()
+                .map(|requirement| requirement.command.clone()),
+        );
     }
     let missing_final_artifacts = missing_final_artifacts(&config.workspace_root, &required_paths);
     let external_report = external_contract
         .as_ref()
         .map(|contract| contract.verify_with_goal(&config.workspace_root, &plan.goal));
-    let runtime_acceptance = external_contract
-        .as_ref()
-        .map(|contract| contract.runtime_acceptance_report(&config.workspace_root));
+    let runtime_acceptance_required = !required_capabilities.is_empty()
+        || !required_evidence.is_empty()
+        || !required_obligations.is_empty();
+    let runtime_acceptance = runtime_acceptance_required.then(|| {
+        verify_runtime_acceptance(
+            &config.workspace_root,
+            &required_paths,
+            &verify_commands,
+            &required_capabilities,
+            &required_evidence,
+            &required_obligations,
+            &deferred_commands,
+        )
+    });
     let external_ok = external_report
         .as_ref()
         .is_none_or(|report| report.is_pass());
-    let ok = missing_final_artifacts.is_empty() && external_ok;
+    let runtime_ok = runtime_acceptance
+        .as_ref()
+        .is_none_or(|report| report.passed);
+    let ok = missing_final_artifacts.is_empty() && external_ok && runtime_ok;
     let primary_reason = if !missing_final_artifacts.is_empty() {
         format!(
             "missing final artifacts: {}",
             missing_final_artifacts.join(", ")
         )
+    } else if let Some(report) = runtime_acceptance.as_ref().filter(|report| !report.passed) {
+        report.primary_reason.clone()
     } else if let Some(report) = external_report.as_ref().filter(|report| !report.is_pass()) {
         report.primary_reason()
     } else {
@@ -1021,14 +1057,9 @@ fn verify_plan_final_contract(
             "missing_final_artifacts": missing_final_artifacts,
             "external_contract_checked": external_contract.is_some(),
             "external_contract_ok": external_ok,
-            "required_capabilities": external_contract
-                .as_ref()
-                .map(|contract| contract.required_capabilities.clone())
-                .unwrap_or_default(),
-            "required_evidence": external_contract
-                .as_ref()
-                .map(|contract| contract.required_evidence.clone())
-                .unwrap_or_default(),
+            "required_capabilities": required_capabilities,
+            "required_evidence": required_evidence,
+            "required_obligations": required_obligations,
             "missing_capabilities": runtime_acceptance
                 .as_ref()
                 .map(|report| report.missing_capabilities.clone())
@@ -1036,6 +1067,10 @@ fn verify_plan_final_contract(
             "missing_evidence": runtime_acceptance
                 .as_ref()
                 .map(|report| report.missing_evidence.clone())
+                .unwrap_or_default(),
+            "missing_obligations": runtime_acceptance
+                .as_ref()
+                .map(|report| report.missing_obligations.clone())
                 .unwrap_or_default(),
             "weak_evidence": runtime_acceptance
                 .as_ref()
@@ -2147,12 +2182,17 @@ fn ultra_final_acceptance_report(
     let mut required_paths =
         profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
     let mut required_capabilities = inferred_required_capabilities(&plan.profile, &plan.goal);
+    let mut required_obligations =
+        inferred_required_obligations(&plan.profile, &plan.goal, &required_capabilities);
     let mut required_evidence = Vec::new();
     let mut deferred_commands = Vec::new();
+    let mut verify_commands = Vec::new();
     if let Some(contract) = external_contract.as_ref() {
         merge_unique_strings(&mut required_paths, &contract.required_paths);
         merge_unique_strings(&mut required_capabilities, &contract.required_capabilities);
         merge_unique_strings(&mut required_evidence, &contract.required_evidence);
+        merge_unique_strings(&mut required_obligations, &contract.required_obligations);
+        merge_unique_strings(&mut verify_commands, &contract.verify_commands);
         deferred_commands.extend(
             contract
                 .deferred_verify_requirements
@@ -2164,12 +2204,10 @@ fn ultra_final_acceptance_report(
     let acceptance = verify_runtime_acceptance(
         &config.workspace_root,
         &required_paths,
-        &external_contract
-            .as_ref()
-            .map(|contract| contract.verify_commands.clone())
-            .unwrap_or_default(),
+        &verify_commands,
         &required_capabilities,
         &required_evidence,
+        &required_obligations,
         &deferred_commands,
     );
     eval_events::emit(
@@ -2180,10 +2218,12 @@ fn ultra_final_acceptance_report(
             "missing_paths": missing.clone(),
             "required_capabilities": required_capabilities.clone(),
             "required_evidence": required_evidence.clone(),
+            "required_obligations": required_obligations.clone(),
             "runtime_acceptance_passed": acceptance.passed,
             "runtime_acceptance_inconclusive": acceptance.inconclusive,
             "missing_capabilities": acceptance.missing_capabilities.clone(),
             "missing_evidence": acceptance.missing_evidence.clone(),
+            "missing_obligations": acceptance.missing_obligations.clone(),
             "weak_evidence": acceptance.weak_evidence.clone(),
             "artifact_obligations": acceptance.artifact_obligations.clone(),
             "inconclusive_reasons": acceptance.inconclusive_reasons.clone(),
@@ -2233,6 +2273,42 @@ fn inferred_required_capabilities(profile: &str, goal: &str) -> Vec<String> {
         merge_unique_strings(&mut capabilities, &["visible_state_change".to_string()]);
     }
     capabilities
+}
+
+fn inferred_required_obligations(
+    profile: &str,
+    goal: &str,
+    required_capabilities: &[String],
+) -> Vec<String> {
+    let lower = goal.to_ascii_lowercase();
+    let is_app_profile = matches!(profile, "nextjs" | "next-js" | "next.js" | "web" | "vite");
+    let app_like_goal = lower.contains("app")
+        || lower.contains("game")
+        || lower.contains("interactive")
+        || lower.contains("ui")
+        || goal.contains("アプリ")
+        || goal.contains("ゲーム");
+    if is_app_profile && (app_like_goal || !required_capabilities.is_empty()) {
+        return vec!["implementation".to_string()];
+    }
+    if required_capabilities.iter().any(|capability| {
+        matches!(
+            capability.as_str(),
+            "implementation"
+                | "entrypoint"
+                | "input_output_contract"
+                | "player_control"
+                | "stateful_interaction"
+                | "user_input_or_action"
+                | "visible_state_change"
+                | "adversary_or_challenge"
+                | "progression_or_score"
+                | "failure_or_collision_rule"
+        )
+    }) {
+        return vec!["implementation".to_string()];
+    }
+    Vec::new()
 }
 
 fn emit_ultra_phase_event(
@@ -4839,6 +4915,115 @@ export default function Page(){
         let result = run_step_plan(&mut fake, &plan, &config(dir.path().to_path_buf())).unwrap();
         assert_eq!(result, "plan-run complete: 1 steps");
         assert!(dir.path().join("a.txt").is_file());
+    }
+
+    #[test]
+    fn plan_run_nextjs_game_setup_only_fails_inferred_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = StepPlan {
+            goal: "Create an interactive browser game\n\nRequired final artifacts:\n- package.json"
+                .to_string(),
+            steps: vec![PlanStep {
+                id: "setup".to_string(),
+                kind: "setup".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create package.json".to_string(),
+                expected_paths: vec!["package.json".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"package.json","content":"{\"scripts\":{\"build\":\"next build\"}}"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plan final contract failed"), "{err}");
+        assert!(err.contains("missing_required_evidence"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"required_obligations\":[\"implementation\"]"));
+        assert!(event_text.contains("\"missing_obligations\":[\"implementation\"]"));
+    }
+
+    #[test]
+    fn plan_run_nextjs_game_scaffold_only_fails_inferred_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = StepPlan {
+            goal: "Create an interactive browser game\n\nRequired final artifacts:\n- src/app/page.tsx"
+                .to_string(),
+            steps: vec![PlanStep {
+                id: "page".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create src/app/page.tsx".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){ return <main>Press any key to start</main>; }"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plan final contract failed"), "{err}");
+        assert!(err.contains("implementation_artifact"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"runtime_acceptance_inconclusive\":false"));
+        assert!(event_text.contains("\"missing_evidence\""));
+    }
+
+    #[test]
+    fn plan_run_nextjs_game_docs_only_fails_inferred_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        let plan = StepPlan {
+            goal: "Create an interactive browser game\n\nRequired final artifacts:\n- README.md"
+                .to_string(),
+            steps: vec![PlanStep {
+                id: "docs".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create README.md".to_string(),
+                expected_paths: vec!["README.md".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"README.md","content":"# Game\nUse arrow keys."}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plan final contract failed"), "{err}");
+        assert!(err.contains("implementation_artifact"), "{err}");
     }
 
     #[test]

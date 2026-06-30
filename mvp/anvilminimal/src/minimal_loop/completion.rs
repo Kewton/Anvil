@@ -34,6 +34,8 @@ pub struct CompletionContract {
     #[serde(default)]
     pub required_evidence: Vec<String>,
     #[serde(default)]
+    pub required_obligations: Vec<String>,
+    #[serde(default)]
     pub deferred_verify_requirements: Vec<DeferredVerifyRequirement>,
     #[serde(default = "default_verify_repair_cap")]
     pub verify_repair_cap: usize,
@@ -89,6 +91,7 @@ impl CompletionContract {
         self.required_capabilities = normalize_unique_list(self.required_capabilities);
         self.deterministic_oracles = normalize_unique_list(self.deterministic_oracles);
         self.required_evidence = normalize_unique_list(self.required_evidence);
+        self.required_obligations = normalize_obligation_roles(self.required_obligations)?;
         let mut evidence_seen = self
             .required_evidence
             .iter()
@@ -140,6 +143,7 @@ impl CompletionContract {
             || self.profile_requires_completion_gate()
             || !self.required_capabilities.is_empty()
             || !self.required_evidence.is_empty()
+            || !self.required_obligations.is_empty()
             || !self.deterministic_oracles.is_empty()
             || !self.deferred_verify_requirements.is_empty()
     }
@@ -347,6 +351,12 @@ impl CompletionContract {
                     acceptance.weak_evidence.join(",")
                 ));
             }
+            if !acceptance.missing_obligations.is_empty() {
+                report.push_profile_failure(format!(
+                    "missing_required_evidence:required_obligation:{}",
+                    acceptance.missing_obligations.join(",")
+                ));
+            }
             if !acceptance.inconclusive_reasons.is_empty() {
                 report.push_profile_failure(format!(
                     "inconclusive_acceptance:{}",
@@ -369,6 +379,7 @@ impl CompletionContract {
             &self.verify_commands,
             &self.required_capabilities,
             &self.required_evidence,
+            &self.required_obligations,
             &deferred_commands,
         )
     }
@@ -563,6 +574,27 @@ fn normalize_unique_list(values: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+fn normalize_obligation_roles(values: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+        if normalized.is_empty() {
+            continue;
+        }
+        if !matches!(
+            normalized.as_str(),
+            "setup" | "scaffold" | "implementation" | "verification" | "acceptance_evidence"
+        ) {
+            bail!("unsupported completion obligation role: {value}");
+        }
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
 }
 
 fn evidence_repair_guidance(failure: &str) -> Vec<String> {
@@ -794,6 +826,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 0,
         }
@@ -818,6 +851,7 @@ mod tests {
             ],
             deterministic_oracles: vec![" source_semantic ".to_string(), "".to_string()],
             required_evidence: vec!["custom_evidence".to_string()],
+            required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
         }
@@ -843,6 +877,49 @@ mod tests {
     }
 
     #[test]
+    fn structured_contract_normalizes_required_obligations() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = CompletionContract {
+            required_paths: Vec::new(),
+            verify_commands: Vec::new(),
+            profile: None,
+            goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
+            required_obligations: vec![
+                " implementation ".to_string(),
+                "acceptance-evidence".to_string(),
+                "implementation".to_string(),
+            ],
+            deferred_verify_requirements: Vec::new(),
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap();
+        assert_eq!(
+            contract.required_obligations,
+            vec!["implementation", "acceptance_evidence"]
+        );
+        let err = CompletionContract {
+            required_paths: Vec::new(),
+            verify_commands: Vec::new(),
+            profile: None,
+            goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
+            required_obligations: vec!["reporting".to_string()],
+            deferred_verify_requirements: Vec::new(),
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unsupported completion obligation role"));
+    }
+
+    #[test]
     fn contract_rejects_escape_and_secret_paths() {
         let dir = tempfile::tempdir().unwrap();
         for path in [
@@ -860,6 +937,7 @@ mod tests {
                 required_capabilities: Vec::new(),
                 deterministic_oracles: Vec::new(),
                 required_evidence: Vec::new(),
+                required_obligations: Vec::new(),
                 deferred_verify_requirements: Vec::new(),
                 verify_repair_cap: 2,
             }
@@ -883,6 +961,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
         }
@@ -908,6 +987,7 @@ mod tests {
                 required_capabilities: Vec::new(),
                 deterministic_oracles: Vec::new(),
                 required_evidence: Vec::new(),
+                required_obligations: Vec::new(),
                 deferred_verify_requirements: Vec::new(),
                 verify_repair_cap: 2,
             }
@@ -1024,6 +1104,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
         }
@@ -1069,6 +1150,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            required_obligations: Vec::new(),
             deferred_verify_requirements: vec![DeferredVerifyRequirement {
                 command: "npm run build".to_string(),
                 reason: "requires dependency setup".to_string(),
@@ -1104,6 +1186,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
         }
@@ -1158,6 +1241,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            required_obligations: Vec::new(),
             deferred_verify_requirements: vec![DeferredVerifyRequirement {
                 command: "npm run build".to_string(),
                 reason: "requires dependency setup".to_string(),
@@ -1213,6 +1297,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            required_obligations: Vec::new(),
             deferred_verify_requirements: vec![DeferredVerifyRequirement {
                 command: "npm run build".to_string(),
                 reason: "requires dependency setup".to_string(),
