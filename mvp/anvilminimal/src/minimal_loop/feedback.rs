@@ -21,6 +21,33 @@ pub fn completion_without_write() -> String {
     "The task appears to require workspace changes, but no Write/Edit tool call has happened yet. Create or modify the required files before final response, or explain why no file change is required.".to_string()
 }
 
+pub fn missing_capability_evidence(
+    missing_evidence: &[String],
+    missing_capabilities: &[String],
+) -> String {
+    let evidence = if missing_evidence.is_empty() {
+        "- none".to_string()
+    } else {
+        missing_evidence
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let capabilities = if missing_capabilities.is_empty() {
+        "- none".to_string()
+    } else {
+        missing_capabilities
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "The expected files now exist, but this interactive app/game step is not complete because capability evidence is still missing.\nMissing evidence:\n{evidence}\nMissing capabilities:\n{capabilities}\nContinue implementation with Write/Edit. Add concrete interactive behavior, state updates, challenge/progression/failure logic, and restart/recoverable state as required. Do not answer in prose until the implementation evidence exists."
+    )
+}
+
 pub fn malformed_tool_call(error: &str) -> String {
     format!("The previous tool call was malformed: {error}. Retry with a valid tool call.")
 }

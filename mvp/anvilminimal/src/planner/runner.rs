@@ -4901,31 +4901,20 @@ mod tests {
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
         let mut planner = FakeClient::new(vec![
-            AssistantReply::text(generated_nextjs_fixture_plan_json(
+            AssistantReply::text(generated_nextjs_fixture_plan_json_with_kind(
                 "scaffold phase",
                 "check_scaffold.py",
+                "setup",
             )),
-            AssistantReply::text(generated_nextjs_fixture_plan_json(
+            AssistantReply::text(generated_nextjs_fixture_plan_json_with_kind(
                 "finish phase",
                 "check_finish.py",
+                "setup",
             )),
         ]);
         let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
         let static_page =
             "export default function Page(){return <main>Press any key to start</main>;}";
-        let interactive_page = r#""use client";
-import { useState } from "react";
-export default function Page(){
-  const [score,setScore] = useState(0);
-  const [gameState,setGameState] = useState("ready");
-  return <main tabIndex={0} onKeyDown={() => { setGameState("playing"); setScore(score + 1); }}>
-    <button onClick={() => setGameState("playing")}>Start</button>
-    <button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button>
-    <canvas />
-    <p>score {score} {gameState}</p>
-    <p>enemy invader bullet collision state</p>
-  </main>;
-}"#;
         let mut execution = FakeClient::new(vec![
             AssistantReply {
                 content: String::new(),
@@ -4966,26 +4955,30 @@ export default function Page(){
             AssistantReply {
                 content: String::new(),
                 tool_calls: vec![crate::state::ToolCall::new(
-                    "Write",
-                    serde_json::json!({"path":"src/app/page.tsx","content":interactive_page}),
+                    "Edit",
+                    serde_json::json!({
+                        "path":"src/app/page.tsx",
+                        "old": static_page,
+                        "new": interactive_game_page_source()
+                    }),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
             },
         ]);
         let plan = UltraPlan {
-            goal: "Create an interactive Space Invaders style game".to_string(),
+            goal: "Create an interactive browser game".to_string(),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
             phases: vec![
                 crate::planner::ultra_plan::UltraPhase {
                     id: "scaffold".to_string(),
-                    prompt: "Scaffold Next.js game app".to_string(),
+                    prompt: "Scaffold Next.js app".to_string(),
                 },
                 crate::planner::ultra_plan::UltraPhase {
                     id: "finish".to_string(),
-                    prompt: "Finish interactive game".to_string(),
+                    prompt: "Finish the app".to_string(),
                 },
             ],
         };
@@ -4994,6 +4987,7 @@ export default function Page(){
         let page = std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap();
         assert!(page.contains("onKeyDown"));
         assert!(page.contains("score"));
+        assert!(page.contains("collision"));
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("ultra_final_acceptance_failed"));
         assert!(event_text.contains("final_acceptance_repair_start"));
@@ -5024,13 +5018,15 @@ export default function Page(){
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
         let mut planner = FakeClient::new(vec![
-            AssistantReply::text(generated_nextjs_fixture_plan_json(
+            AssistantReply::text(generated_nextjs_fixture_plan_json_with_kind(
                 "scaffold phase",
                 "check_scaffold.py",
+                "setup",
             )),
-            AssistantReply::text(generated_nextjs_fixture_plan_json(
+            AssistantReply::text(generated_nextjs_fixture_plan_json_with_kind(
                 "finish phase",
                 "check_finish.py",
+                "setup",
             )),
         ]);
         let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
@@ -5075,18 +5071,18 @@ export default function Page(){
             },
         ]);
         let plan = UltraPlan {
-            goal: "Create an interactive Space Invaders style game".to_string(),
+            goal: "Create an interactive browser game".to_string(),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
             phases: vec![
                 crate::planner::ultra_plan::UltraPhase {
                     id: "scaffold".to_string(),
-                    prompt: "Scaffold Next.js game app".to_string(),
+                    prompt: "Scaffold Next.js app".to_string(),
                 },
                 crate::planner::ultra_plan::UltraPhase {
                     id: "finish".to_string(),
-                    prompt: "Finish interactive game".to_string(),
+                    prompt: "Finish the app".to_string(),
                 },
             ],
         };
@@ -5552,15 +5548,18 @@ export default function Page(){
                 verify: Vec::new(),
             }],
         };
-        let mut fake = FakeClient::new(vec![AssistantReply {
-            content: String::new(),
-            tool_calls: vec![crate::state::ToolCall::new(
-                "Write",
-                serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){ return <main>Press any key to start</main>; }"}),
-            )],
-            prompt_tokens: None,
-            completion_tokens: None,
-        }]);
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){ return <main>Press any key to start</main>; }"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("done"),
+        ]);
         let err = run_step_plan(&mut fake, &plan, &cfg)
             .unwrap_err()
             .to_string();
@@ -5596,15 +5595,18 @@ export default function Page(){
                 verify: Vec::new(),
             }],
         };
-        let mut fake = FakeClient::new(vec![AssistantReply {
-            content: String::new(),
-            tool_calls: vec![crate::state::ToolCall::new(
-                "Write",
-                serde_json::json!({"path":"README.md","content":"# Game\nUse arrow keys."}),
-            )],
-            prompt_tokens: None,
-            completion_tokens: None,
-        }]);
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"README.md","content":"# Game\nUse arrow keys."}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("done"),
+        ]);
         let err = run_step_plan(&mut fake, &plan, &cfg)
             .unwrap_err()
             .to_string();
@@ -6170,7 +6172,11 @@ export default function Page(){
         .unwrap()
     }
 
-    fn generated_nextjs_fixture_plan_json(goal: &str, check_path: &str) -> String {
+    fn generated_nextjs_fixture_plan_json_with_kind(
+        goal: &str,
+        check_path: &str,
+        kind: &str,
+    ) -> String {
         let mut expected_paths = vec![check_path.to_string()];
         if check_path.contains("scaffold") {
             expected_paths = vec![
@@ -6181,20 +6187,54 @@ export default function Page(){
                 check_path.to_string(),
             ];
         }
+        let verify = if kind == "setup" {
+            Vec::new()
+        } else {
+            vec![format!("python3 -m py_compile {check_path}")]
+        };
         serde_json::to_string(&StepPlan {
             goal: goal.to_string(),
             steps: vec![PlanStep {
                 id: "create-and-check-artifacts".to_string(),
-                kind: "implement".to_string(),
+                kind: kind.to_string(),
                 expected_result: "pass".to_string(),
                 instruction: format!(
                     "Create the declared artifacts including {check_path} and keep the Next.js files coherent"
                 ),
                 expected_paths,
-                verify: vec![format!("python3 -m py_compile {check_path}")],
+                verify,
             }],
         })
         .unwrap()
+    }
+
+    fn interactive_game_page_source() -> &'static str {
+        r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  const [gameState, setGameState] = useState("ready");
+  const enemies = [{ x: 10, y: 20 }];
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") {
+        setGameState("playing");
+        setScore((value) => value + 1);
+      }
+    };
+    const frame = requestAnimationFrame(() => {
+      const collision = enemies.some((enemy) => enemy.x > 0);
+      if (collision) setGameState("gameover");
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button><canvas /><p>score {score} enemy collision {gameState}</p></main>;
+}
+"#
     }
 
     fn generated_data_mutation_plan_json(goal: &str) -> String {

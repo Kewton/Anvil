@@ -22,6 +22,7 @@ use crate::tui::{InteractionUi, NOOP_UI};
 use super::build_verifier::{BuildVerifierLifecycleObservation, BuildVerifierStatus};
 use super::compact::compact_if_needed;
 use super::completion::{CompletionContract, format_verify_feedback};
+use super::evidence::verify_runtime_acceptance;
 use super::import_scan::{format_missing_import_feedback, scan_relative_imports};
 use super::prompt::{ToolPromptMode, build_request_messages};
 use super::repair_progress::{
@@ -366,6 +367,7 @@ pub(crate) fn run_session_with_outcome_with_options(
     let mut verify_repair_state = VerifyRepairState::default();
     let mut recoverable_tool_error_state = RecoverableToolErrorState::default();
     let mut malformed_native_tool_feedbacks = 0usize;
+    let step_capability_gate = StepCapabilityGate::from_prompt(user_prompt, options);
     let iteration_limit = if contract_runtime_enabled && completion_contract.is_some() {
         config.max_iterations
             + ARTIFACT_RECOVERY_ATTEMPT_LIMIT.saturating_mul(required_paths.len().max(1))
@@ -870,6 +872,17 @@ pub(crate) fn run_session_with_outcome_with_options(
                     }
                 }
             }
+            if let Some(gate) = step_capability_gate.as_ref()
+                && let Some(feedback) = gate.maybe_feedback(
+                    &config.workspace_root,
+                    config.eval_events_path.as_deref(),
+                    &required_paths,
+                )
+            {
+                last_blocking_reason = Some("capability evidence missing".to_string());
+                pending_feedback = Some(feedback);
+                continue;
+            }
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
@@ -940,6 +953,149 @@ fn missing_paths(root: &std::path::Path, required_paths: &[String]) -> Vec<Strin
         .filter(|path| resolve_existing(root, path).is_err())
         .cloned()
         .collect()
+}
+
+#[derive(Debug, Clone)]
+struct StepCapabilityGate {
+    required_capabilities: Vec<String>,
+    required_evidence: Vec<String>,
+}
+
+impl StepCapabilityGate {
+    fn from_prompt(prompt: &str, options: RunSessionOptions) -> Option<Self> {
+        if options.scope != RunSessionScope::PlanRunStep
+            || options.step_kind != Some(RunSessionStepKind::Implement)
+        {
+            return None;
+        }
+        let required_capabilities =
+            parse_prompt_bullet_section(prompt, "Required final capabilities:");
+        let required_evidence = parse_prompt_bullet_section(prompt, "Required final evidence:")
+            .into_iter()
+            .filter(|evidence| capability_step_evidence(evidence))
+            .collect::<Vec<_>>();
+        if !required_capabilities
+            .iter()
+            .any(|capability| interactive_capability(capability))
+            && !required_evidence
+                .iter()
+                .any(|evidence| interactive_evidence(evidence))
+        {
+            return None;
+        }
+        Some(Self {
+            required_capabilities,
+            required_evidence,
+        })
+    }
+
+    fn maybe_feedback(
+        &self,
+        root: &Path,
+        eval_events_path: Option<&Path>,
+        required_paths: &[String],
+    ) -> Option<String> {
+        let report = verify_runtime_acceptance(
+            root,
+            required_paths,
+            &[],
+            &self.required_capabilities,
+            &self.required_evidence,
+            &["implementation".to_string()],
+            &[],
+        );
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "step_capability_evidence_check",
+                "ok": report.passed,
+                "required_capabilities": self.required_capabilities.clone(),
+                "required_evidence": self.required_evidence.clone(),
+                "missing_capabilities": report.missing_capabilities.clone(),
+                "missing_evidence": report.missing_evidence.clone(),
+                "missing_obligations": report.missing_obligations.clone(),
+                "weak_evidence": report.weak_evidence.clone(),
+                "primary_reason": eval_events::body_snippet(&report.primary_reason),
+            }),
+        );
+        if report.passed {
+            return None;
+        }
+        Some(super::feedback::missing_capability_evidence(
+            &report.missing_evidence,
+            &report.missing_capabilities,
+        ))
+    }
+}
+
+fn parse_prompt_bullet_section(prompt: &str, header: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if trimmed.is_empty() {
+            if out.is_empty() {
+                continue;
+            }
+            break;
+        }
+        let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        else {
+            break;
+        };
+        let item = item.trim();
+        if !item.is_empty() && item != "none" {
+            out.push(item.to_string());
+        }
+    }
+    out
+}
+
+fn interactive_capability(capability: &str) -> bool {
+    matches!(
+        capability.trim(),
+        "browser_interaction"
+            | "playable_ui"
+            | "stateful_interaction"
+            | "start_or_restart_flow"
+            | "player_control"
+            | "adversary_or_challenge"
+            | "progression_or_score"
+            | "failure_or_collision_rule"
+            | "user_input_or_action"
+            | "visible_state_change"
+    )
+}
+
+fn capability_step_evidence(evidence: &str) -> bool {
+    !matches!(
+        evidence.trim(),
+        "nextjs_route_evidence" | "build_command_or_dependency_missing_boundary"
+    )
+}
+
+fn interactive_evidence(evidence: &str) -> bool {
+    matches!(
+        evidence.trim(),
+        "interactive_ui_source_evidence"
+            | "non_static_screen_evidence"
+            | "visible_interactive_surface_evidence"
+            | "user_input_handler_evidence"
+            | "stateful_update_evidence"
+            | "challenge_or_adversary_evidence"
+            | "score_or_progression_evidence"
+            | "failure_or_collision_evidence"
+            | "restart_or_recoverable_state_evidence"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1808,6 +1964,112 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+    }
+
+    #[test]
+    fn plan_step_interactive_completion_requires_capability_evidence_after_path_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let static_page = "export default function Page(){ return <main><canvas /></main>; }";
+        let interactive_page = r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  const enemies = [{ x: 1, y: 2 }];
+  useEffect(() => {
+    const onKeyDown = () => setScore((value) => value + 1);
+    const frame = requestAnimationFrame(() => {
+      const collision = enemies.some((enemy) => enemy.x > 0);
+      if (collision) setScore((value) => value + 10);
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+  return <main tabIndex={0} onKeyDown={() => setScore(score + 1)}><canvas /><p>enemy collision score {score}</p></main>;
+}
+"#;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":static_page}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":interactive_page}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let prompt = "Execute exactly one StepPlan step.\n\nCurrent step kind:\nimplement\n\nRequired final capabilities:\n- stateful_interaction\n- player_control\n- adversary_or_challenge\n- progression_or_score\n- failure_or_collision_rule\n\nRequired final evidence:\n- implementation_artifact\n- visible_interactive_surface_evidence\n- user_input_handler_evidence\n- stateful_update_evidence\n- challenge_or_adversary_evidence\n- score_or_progression_evidence\n- failure_or_collision_evidence\n\nExpected paths after this step:\n- src/app/page.tsx";
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            prompt,
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert_eq!(outcome.iterations, 2);
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"step_capability_evidence_check\""));
+        assert!(event_text.contains("\"ok\":false"));
+        assert!(event_text.contains("\"ok\":true"));
+        assert!(event_text.contains("stateful_update_evidence"));
+        assert!(event_text.contains("failure_or_collision_evidence"));
+    }
+
+    #[test]
+    fn plan_step_non_interactive_completion_preserves_path_only_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Execute one implement step.\n\nExpected paths after this step:\n- a.txt",
+            &["a.txt".to_string()],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert_eq!(outcome.iterations, 1);
     }
 
     #[test]
