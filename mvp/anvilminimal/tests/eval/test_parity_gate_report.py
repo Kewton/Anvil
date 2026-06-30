@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from eval_lib.parity_gate import (
     REQUIRED_GATE_IDS,
     build_parity_gate_report,
+    release_evidence_blockers,
     release_evidence_gaps,
     validate_parity_gate_report,
 )
@@ -116,15 +117,98 @@ class ParityGateReportTest(unittest.TestCase):
         errors = validate_parity_gate_report(report)
         self.assertTrue(any("release gate cannot pass" in item for item in errors))
 
-        report["uat_equivalent"] = {
-            "status": "pass",
-            "evidence_paths": ["uat.md"],
-            "browser_readiness_evidence_paths": ["browser.json"],
-            "interaction_evidence_paths": ["interaction.json"],
-            "tui_run_event_paths": ["events.jsonl"],
-        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            uat = root / "uat.md"
+            browser = root / "browser.json"
+            interaction = root / "interaction.json"
+            events = root / "events.jsonl"
+            uat.write_text("manual UAT evidence", encoding="utf-8")
+            browser.write_text(json.dumps({"ok": True, "http_status": 200}), encoding="utf-8")
+            interaction.write_text(json.dumps({"ok": True}), encoding="utf-8")
+            events.write_text(
+                json.dumps({"event": "tui_command_stop", "ok": True}) + "\n",
+                encoding="utf-8",
+            )
+            report = build_parity_gate_report(
+                base_report=self.base_report(),
+                gate_level="release",
+                uat_evidence_paths=[str(uat)],
+                browser_evidence_paths=[str(browser)],
+                interaction_evidence_paths=[str(interaction)],
+                tui_event_paths=[str(events)],
+            )
         self.assertEqual(release_evidence_gaps(report["uat_equivalent"]), [])
+        self.assertEqual(release_evidence_blockers(report["uat_equivalent"]), [])
+        self.assertEqual(report["uat_equivalent"]["status"], "pass")
         self.assertEqual(validate_parity_gate_report(report), [])
+
+    def test_release_gate_reads_browser_evidence_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            uat, browser, interaction, events = release_evidence_files(root)
+            browser.write_text(json.dumps({"ok": False, "http_status": 500}), encoding="utf-8")
+            report = build_parity_gate_report(
+                base_report=self.base_report(),
+                gate_level="release",
+                uat_evidence_paths=[str(uat)],
+                browser_evidence_paths=[str(browser)],
+                interaction_evidence_paths=[str(interaction)],
+                tui_event_paths=[str(events)],
+            )
+        uat_equivalent = report["uat_equivalent"]
+        self.assertEqual(uat_equivalent["status"], "fail")
+        self.assertIn("browser_readiness:browser_http_500", release_evidence_blockers(uat_equivalent))
+        self.assertIn("browser_http_500", uat_equivalent["reason"])
+
+    def test_release_gate_rejects_tui_command_stop_false(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            uat, browser, interaction, events = release_evidence_files(root)
+            events.write_text(
+                json.dumps(
+                    {
+                        "event": "tui_command_stop",
+                        "ok": False,
+                        "failure_kind": "tui_command_failed",
+                        "primary_reason": "dependency_setup_missing",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = build_parity_gate_report(
+                base_report=self.base_report(),
+                gate_level="release",
+                uat_evidence_paths=[str(uat)],
+                browser_evidence_paths=[str(browser)],
+                interaction_evidence_paths=[str(interaction)],
+                tui_event_paths=[str(events)],
+            )
+        uat_equivalent = report["uat_equivalent"]
+        self.assertEqual(uat_equivalent["status"], "fail")
+        self.assertIn("tui:tui_command_failed", release_evidence_blockers(uat_equivalent))
+
+    def test_release_gate_rejects_malformed_evidence_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            uat, browser, interaction, events = release_evidence_files(root)
+            browser.write_text("{not-json", encoding="utf-8")
+            report = build_parity_gate_report(
+                base_report=self.base_report(),
+                gate_level="release",
+                uat_evidence_paths=[str(uat)],
+                browser_evidence_paths=[str(browser)],
+                interaction_evidence_paths=[str(interaction)],
+                tui_event_paths=[str(events)],
+            )
+        uat_equivalent = report["uat_equivalent"]
+        self.assertEqual(uat_equivalent["status"], "fail")
+        self.assertIn("browser_readiness:evidence_invalid", release_evidence_blockers(uat_equivalent))
+        self.assertEqual(
+            uat_equivalent["evidence_results"]["browser_readiness"]["reason"],
+            "evidence_invalid",
+        )
 
 
 def summary_row(
@@ -155,6 +239,21 @@ def summary_row(
         }
     )
     return row
+
+
+def release_evidence_files(root: Path):
+    uat = root / "uat.md"
+    browser = root / "browser.json"
+    interaction = root / "interaction.json"
+    events = root / "events.jsonl"
+    uat.write_text("manual UAT evidence", encoding="utf-8")
+    browser.write_text(json.dumps({"ok": True, "http_status": 200}), encoding="utf-8")
+    interaction.write_text(json.dumps({"ok": True}), encoding="utf-8")
+    events.write_text(
+        json.dumps({"event": "tui_command_stop", "ok": True}) + "\n",
+        encoding="utf-8",
+    )
+    return uat, browser, interaction, events
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +79,12 @@ def validate_parity_gate_report(report: dict[str, Any]) -> list[str]:
             errors.append(
                 "release gate cannot pass without required UAT evidence: "
                 + ", ".join(missing)
+            )
+        blockers = release_evidence_blockers(uat)
+        if blockers:
+            errors.append(
+                "release gate cannot pass with failing or invalid UAT evidence: "
+                + ", ".join(blockers)
             )
     return errors
 
@@ -283,13 +290,23 @@ def release_gate_evidence(
     evidence["tui_run_event_paths"] = merge_paths(
         list(evidence.get("tui_run_event_paths", []) or []), tui_event_paths
     )
+    evidence["evidence_results"] = release_evidence_results(evidence)
     gaps = release_evidence_gaps(evidence)
+    blockers = release_evidence_blockers(evidence)
     if gate_level == "release":
-        evidence["status"] = "pass" if not gaps else "partial"
+        if blockers:
+            evidence["status"] = "fail"
+        else:
+            evidence["status"] = "pass" if not gaps else "partial"
         evidence["missing_required_evidence"] = gaps
     else:
-        evidence.setdefault("status", "partial" if gaps else "pass")
-    if gaps:
+        if blockers:
+            evidence["status"] = "fail"
+        else:
+            evidence.setdefault("status", "partial" if gaps else "pass")
+    if blockers:
+        evidence["reason"] = "Release evidence content failed: " + "; ".join(blockers)
+    elif gaps:
         evidence["reason"] = "Release gate full pass requires browser readiness, interaction, and TUI run event evidence."
     return evidence
 
@@ -304,7 +321,251 @@ def release_evidence_gaps(uat: dict[str, Any]) -> list[str]:
         missing.append("interaction_evidence_paths")
     if not (uat.get("tui_run_event_paths") or []):
         missing.append("tui_run_event_paths")
+    results = uat.get("evidence_results", {}) or {}
+    for key, value in results.items():
+        if not isinstance(value, dict):
+            continue
+        if value.get("status") in {"missing", "partial"}:
+            missing.append(f"{key}:{value.get('reason') or value.get('failure_kind') or value.get('status')}")
     return missing
+
+
+def release_evidence_blockers(uat: dict[str, Any]) -> list[str]:
+    blockers: list[str] = []
+    results = uat.get("evidence_results", {}) or {}
+    for key, value in results.items():
+        if not isinstance(value, dict):
+            continue
+        if value.get("status") in {"fail", "invalid"}:
+            reason = value.get("failure_kind") or value.get("reason") or value.get("status")
+            blockers.append(f"{key}:{reason}")
+    return blockers
+
+
+def release_evidence_results(evidence: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        "uat": evaluate_text_evidence(evidence.get("evidence_paths", []) or []),
+        "browser_readiness": evaluate_browser_evidence(
+            evidence.get("browser_readiness_evidence_paths", []) or []
+        ),
+        "interaction": evaluate_interaction_evidence(
+            evidence.get("interaction_evidence_paths", []) or []
+        ),
+        "tui": evaluate_tui_evidence(evidence.get("tui_run_event_paths", []) or []),
+    }
+
+
+def evaluate_text_evidence(paths: list[str]) -> dict[str, Any]:
+    if not paths:
+        return {"status": "missing", "reason": "uat_evidence_missing"}
+    for raw in paths:
+        path = Path(raw)
+        if not path.is_file():
+            return {"status": "invalid", "path": raw, "reason": "evidence_missing"}
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as err:
+            return {
+                "status": "invalid",
+                "path": raw,
+                "reason": "evidence_unreadable",
+                "error": type(err).__name__,
+            }
+        if text.strip():
+            return {"status": "pass", "path": raw}
+    return {"status": "invalid", "path": paths[0], "reason": "evidence_empty"}
+
+
+def evaluate_browser_evidence(paths: list[str]) -> dict[str, Any]:
+    parsed = first_json_evidence(paths)
+    if parsed["status"] != "loaded":
+        return parsed
+    value = parsed["value"]
+    path = parsed["path"]
+    ok = bool_field(value, "ok", "success", "browser_success", "http_ok")
+    status_code = int_field(value, "http_status", "status", "status_code")
+    details = value.get("browser_details") if isinstance(value.get("browser_details"), dict) else {}
+    if status_code is None:
+        status_code = int_field(details, "http_status", "status", "status_code")
+    if ok is False:
+        failure = browser_failure_kind(value, details, status_code)
+        return {
+            "status": "fail",
+            "path": path,
+            "failure_kind": failure,
+            "http_status": status_code or "",
+            "reason": failure,
+        }
+    if status_code is not None and status_code >= 400:
+        return {
+            "status": "fail",
+            "path": path,
+            "failure_kind": f"browser_http_{status_code}",
+            "http_status": status_code,
+            "reason": f"http_{status_code}",
+        }
+    text_status = text_field(value, "status") or text_field(details, "status")
+    if ok is True:
+        return {"status": "pass", "path": path, "http_status": status_code or ""}
+    if text_status in {"not_enabled", "adapter_not_implemented", "unavailable"}:
+        return {
+            "status": "partial",
+            "path": path,
+            "reason": text_status,
+            "http_status": status_code or "",
+        }
+    if text_status in {"ok", "pass", "passed", "ready"}:
+        return {"status": "pass", "path": path, "http_status": status_code or ""}
+    return {
+        "status": "invalid",
+        "path": path,
+        "reason": "evidence_missing_required_key",
+    }
+
+
+def evaluate_interaction_evidence(paths: list[str]) -> dict[str, Any]:
+    parsed = first_json_evidence(paths)
+    if parsed["status"] != "loaded":
+        return parsed
+    value = parsed["value"]
+    path = parsed["path"]
+    ok = bool_field(value, "ok", "success", "interaction_success")
+    if ok is True:
+        return {"status": "pass", "path": path}
+    if ok is False:
+        return {
+            "status": "fail",
+            "path": path,
+            "failure_kind": text_field(value, "failure_kind", "error_kind") or "interaction_failed",
+            "reason": text_field(value, "reason") or "interaction_failed",
+        }
+    if value.get("skipped") is True:
+        return {
+            "status": "partial",
+            "path": path,
+            "reason": text_field(value, "reason") or "interaction_skipped",
+        }
+    return {
+        "status": "invalid",
+        "path": path,
+        "reason": "evidence_missing_required_key",
+    }
+
+
+def evaluate_tui_evidence(paths: list[str]) -> dict[str, Any]:
+    if not paths:
+        return {"status": "missing", "reason": "tui_run_event_paths_missing"}
+    for raw in paths:
+        path = Path(raw)
+        if not path.is_file():
+            return {"status": "invalid", "path": raw, "reason": "evidence_missing"}
+        try:
+            events = read_jsonl(path)
+        except ValueError as err:
+            return {
+                "status": "invalid",
+                "path": raw,
+                "reason": "evidence_invalid",
+                "error": str(err),
+            }
+        stop = next((event for event in reversed(events) if event.get("event") == "tui_command_stop"), None)
+        if stop is None:
+            return {
+                "status": "partial",
+                "path": raw,
+                "reason": "tui_command_stop_missing",
+            }
+        if stop.get("ok") is True:
+            return {"status": "pass", "path": raw}
+        return {
+            "status": "fail",
+            "path": raw,
+            "failure_kind": stop.get("failure_kind") or "tui_command_failed",
+            "reason": stop.get("primary_reason") or stop.get("failure_kind") or "tui_command_failed",
+        }
+    return {"status": "missing", "reason": "tui_run_event_paths_missing"}
+
+
+def first_json_evidence(paths: list[str]) -> dict[str, Any]:
+    if not paths:
+        return {"status": "missing", "reason": "evidence_missing"}
+    for raw in paths:
+        path = Path(raw)
+        if not path.is_file():
+            return {"status": "invalid", "path": raw, "reason": "evidence_missing"}
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as err:
+            return {
+                "status": "invalid",
+                "path": raw,
+                "reason": "evidence_invalid",
+                "error": type(err).__name__,
+            }
+        if not isinstance(parsed, dict):
+            return {"status": "invalid", "path": raw, "reason": "evidence_invalid"}
+        return {"status": "loaded", "path": raw, "value": parsed}
+    return {"status": "missing", "reason": "evidence_missing"}
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as err:
+            raise ValueError(f"line {line_number}: {err.msg}") from err
+        if not isinstance(event, dict):
+            raise ValueError(f"line {line_number}: event must be an object")
+        events.append(event)
+    return events
+
+
+def browser_failure_kind(
+    value: dict[str, Any],
+    details: dict[str, Any],
+    status_code: int | None,
+) -> str:
+    if status_code is not None and status_code >= 400:
+        return f"browser_http_{status_code}"
+    return (
+        text_field(value, "browser_failure_kind", "failure_kind", "error_kind")
+        or text_field(details, "browser_failure_kind", "failure_kind", "error_kind")
+        or "browser_failed"
+    )
+
+
+def bool_field(value: dict[str, Any], *keys: str) -> bool | None:
+    for key in keys:
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            return raw
+    return None
+
+
+def int_field(value: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            continue
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, str):
+            try:
+                return int(raw)
+            except ValueError:
+                continue
+    return None
+
+
+def text_field(value: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        raw = value.get(key)
+        if isinstance(raw, str):
+            return raw.strip().lower()
+    return ""
 
 
 def int_or_none(value: Any) -> int | None:
