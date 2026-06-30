@@ -289,6 +289,17 @@ pub fn normalize_verify_command(command: &str) -> anyhow::Result<String> {
     Ok(diagnosis.normalized)
 }
 
+pub fn normalize_planner_verify_command(command: &str) -> anyhow::Result<Vec<String>> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !contains_shell_control_syntax(trimmed) {
+        return Ok(vec![normalize_verify_command(trimmed)?]);
+    }
+    normalize_planner_shell_and_verify_command(trimmed)
+}
+
 pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
     let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -332,6 +343,127 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
         violation: None,
         reason: None,
     }
+}
+
+fn normalize_planner_shell_and_verify_command(command: &str) -> anyhow::Result<Vec<String>> {
+    if has_unsupported_shell_control_for_planner_split(command) || !command.contains("&&") {
+        anyhow::bail!(
+            "{}",
+            VerifyCommandViolationKind::ShellControlSyntax.message()
+        );
+    }
+    let mut out = Vec::new();
+    for part in command.split("&&") {
+        let normalized = normalize_verify_command(part.trim())?;
+        if !is_safe_split_verify_fragment(&normalized) {
+            anyhow::bail!(
+                "verify command shell split contains unsupported fragment: {}",
+                normalized
+            );
+        }
+        out.push(normalized);
+    }
+    if out.is_empty() {
+        anyhow::bail!(
+            "{}",
+            VerifyCommandViolationKind::ShellControlSyntax.message()
+        );
+    }
+    Ok(out)
+}
+
+fn has_unsupported_shell_control_for_planner_split(command: &str) -> bool {
+    if command.contains("$(") {
+        return true;
+    }
+    if command.bytes().any(|byte| {
+        matches!(
+            byte,
+            b';' | b'|' | b'<' | b'>' | b'`' | b'\n' | b'\r' | b'\\'
+        )
+    }) {
+        return true;
+    }
+    contains_single_ampersand(command)
+}
+
+fn contains_single_ampersand(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'&' {
+            index += 1;
+            continue;
+        }
+        if index + 1 < bytes.len() && bytes[index + 1] == b'&' {
+            index += 2;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn is_safe_split_verify_fragment(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower == "npm test"
+        || lower.starts_with("npm test ")
+        || lower == "npm run test"
+        || lower.starts_with("npm run test ")
+        || lower == "npm run build"
+        || lower.starts_with("npm run build ")
+        || lower == "npm run lint"
+        || lower.starts_with("npm run lint ")
+        || lower == "npm run typecheck"
+        || lower.starts_with("npm run typecheck ")
+        || lower == "pnpm test"
+        || lower.starts_with("pnpm test ")
+        || lower == "pnpm build"
+        || lower.starts_with("pnpm build ")
+        || lower == "pnpm lint"
+        || lower.starts_with("pnpm lint ")
+        || lower == "yarn test"
+        || lower.starts_with("yarn test ")
+        || lower == "yarn build"
+        || lower.starts_with("yarn build ")
+        || lower == "yarn lint"
+        || lower.starts_with("yarn lint ")
+        || lower == "next build"
+        || lower.starts_with("next build ")
+        || lower == "cargo test"
+        || lower.starts_with("cargo test ")
+        || lower == "cargo check"
+        || lower.starts_with("cargo check ")
+        || lower == "cargo build"
+        || lower.starts_with("cargo build ")
+        || lower == "cargo fmt --check"
+        || lower.starts_with("cargo fmt --check ")
+        || lower == "pytest"
+        || lower.starts_with("pytest ")
+        || lower == "python -m pytest"
+        || lower.starts_with("python -m pytest ")
+        || lower == "python3 -m pytest"
+        || lower.starts_with("python3 -m pytest ")
+        || lower == "python -m unittest"
+        || lower.starts_with("python -m unittest ")
+        || lower == "python3 -m unittest"
+        || lower.starts_with("python3 -m unittest ")
+        || lower.starts_with("python -m py_compile ")
+        || lower.starts_with("python3 -m py_compile ")
+        || lower == "tsc --noemit"
+        || lower.starts_with("tsc --noemit ")
+        || lower == "npx tsc --noemit"
+        || lower.starts_with("npx tsc --noemit ")
+        || lower.starts_with("node --check ")
+        || is_safe_test_path_command(command)
+}
+
+fn is_safe_test_path_command(command: &str) -> bool {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if parts.len() != 3 || parts[0] != "test" || !matches!(parts[1], "-f" | "-d" | "-s") {
+        return false;
+    }
+    validate_workspace_relative(parts[2]).is_ok()
 }
 
 fn verify_command_violation(
@@ -457,6 +589,10 @@ mod tests {
             diagnosis.violation,
             Some(VerifyCommandViolationKind::ShellControlSyntax)
         );
+        let normalized =
+            normalize_planner_verify_command("npm run build && test -f package.json").unwrap();
+        assert_eq!(normalized, vec!["npm run build", "test -f package.json"]);
+        assert!(validate_verify_command("npm run build && test -f package.json").is_err());
     }
 
     #[test]
@@ -478,6 +614,35 @@ mod tests {
             "cargo test \\; echo ok",
         ] {
             assert!(validate_verify_command(command).is_err(), "{command}");
+        }
+    }
+
+    #[test]
+    fn planner_verify_normalization_splits_only_allowlisted_and_commands() {
+        let normalized = normalize_planner_verify_command(
+            "npm test && npm run build && test -f src/app/page.tsx",
+        )
+        .unwrap();
+        assert_eq!(
+            normalized,
+            vec!["npm test", "npm run build", "test -f src/app/page.tsx"]
+        );
+    }
+
+    #[test]
+    fn planner_verify_normalization_rejects_unsafe_shell_syntax() {
+        for command in [
+            "npm test || npm run build",
+            "npm test; npm run build",
+            "npm test | cat",
+            "npm test > out.log",
+            "npm test && echo ok",
+            "npm test && test -f ../secret",
+        ] {
+            assert!(
+                normalize_planner_verify_command(command).is_err(),
+                "{command}"
+            );
         }
     }
 

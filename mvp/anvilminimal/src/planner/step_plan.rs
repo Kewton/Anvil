@@ -297,6 +297,9 @@ fn normalize_verify_command(command: &str) -> Vec<String> {
     if let Some(path) = node_exists_sync_path(trimmed) {
         return vec![format!("test -f {path}")];
     }
+    if let Ok(commands) = crate::planner::verify::normalize_planner_verify_command(trimmed) {
+        return commands;
+    }
     vec![trimmed.to_string()]
 }
 
@@ -592,11 +595,29 @@ steps:
         assert_eq!(
             plan.steps[0].verify,
             vec![
-                "npm test && npm run build",
+                "npm test",
+                "npm run build",
                 "npm install",
                 "test -f src/app/page.tsx"
             ]
         );
+    }
+
+    #[test]
+    fn generated_plan_repair_leaves_unsafe_shell_verify_for_lint_rejection() {
+        let mut plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![PlanStep {
+                id: "verify".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Run checks".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["npm test || npm run build".to_string()],
+            }],
+        };
+        repair_generated_step_plan_contract(&mut plan);
+        assert_eq!(plan.steps[0].verify, vec!["npm test || npm run build"]);
     }
 
     #[test]
@@ -686,10 +707,12 @@ steps:
 
     #[test]
     fn generated_step_plan_rejects_missing_goal_or_steps() {
-        let missing_goal =
-            parse_generated_step_plan_json(r#"{"steps":[{"id":"s1","expected_result":"pass","instruction":"do it"}]}"#, "g")
-                .unwrap_err()
-                .to_string();
+        let missing_goal = parse_generated_step_plan_json(
+            r#"{"steps":[{"id":"s1","expected_result":"pass","instruction":"do it"}]}"#,
+            "g",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(missing_goal.contains("StepPlan missing goal"));
         let empty_steps = parse_generated_step_plan_json(r#"{"goal":"g","steps":[]}"#, "g")
             .unwrap_err()

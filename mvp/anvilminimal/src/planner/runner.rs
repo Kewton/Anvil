@@ -96,7 +96,16 @@ pub fn generate_step_plan_with_ui(
         emit_planner_raw_output_shape(config, client.label(), model, attempt, &reply.content);
         match parse_generated_step_plan_json(&reply.content, goal) {
             Ok(mut plan) => {
+                let verify_before_repair = collect_step_verify_commands(&plan);
                 repair_generated_step_plan_contract(&mut plan);
+                emit_planner_verify_command_normalized(
+                    config,
+                    client.label(),
+                    model,
+                    attempt,
+                    &verify_before_repair,
+                    &collect_step_verify_commands(&plan),
+                );
                 strengthen_step_plan_for_profile(&mut plan, config);
                 repair_generated_step_plan_contract(&mut plan);
                 let lint_report = lint_step_plan_report(&plan);
@@ -2698,6 +2707,41 @@ fn emit_planner_raw_output_shape(
     );
 }
 
+fn collect_step_verify_commands(plan: &StepPlan) -> Vec<String> {
+    plan.steps
+        .iter()
+        .flat_map(|step| step.verify.iter().cloned())
+        .collect()
+}
+
+fn emit_planner_verify_command_normalized(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    before: &[String],
+    after: &[String],
+) {
+    if before == after {
+        return;
+    }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "planner_verify_command_normalized",
+            "planner_stage": "verify_policy",
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+            "before_count": before.len(),
+            "after_count": after.len(),
+            "contains_safe_shell_split": before.iter().any(|command| command.contains("&&")),
+            "before_preview": eval_events::body_snippet(&before.join(" | ")),
+            "after_preview": eval_events::body_snippet(&after.join(" | ")),
+        }),
+    );
+}
+
 fn emit_ultra_plan_raw_output_shape(
     config: &Config,
     provider: &str,
@@ -3955,6 +3999,24 @@ mod tests {
     }
 
     #[test]
+    fn safe_and_verify_policy_is_normalized_without_corrective_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let generated = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create package.json for the app","expected_paths":["package.json"],"verify":["npm test && test -f package.json"]}]}"#;
+        let mut planner = FakeClient::new(vec![AssistantReply::text(generated)]);
+        let plan = generate_step_plan(&mut planner, "goal", &cfg).unwrap();
+        assert_eq!(
+            plan.steps[0].verify,
+            vec!["npm test".to_string(), "test -f package.json".to_string()]
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("planner_verify_command_normalized"));
+        assert!(!event_text.contains("\"event\":\"planner_error\""));
+    }
+
+    #[test]
     fn nextjs_profile_strengthening_does_not_reintroduce_duplicate_package_owner() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = config(dir.path().to_path_buf());
@@ -5089,7 +5151,10 @@ export default function Page(){
             .unwrap_err()
             .to_string();
         assert!(err.contains("plan final contract failed"), "{err}");
-        assert!(err.contains("build_command_or_dependency_missing_boundary"), "{err}");
+        assert!(
+            err.contains("build_command_or_dependency_missing_boundary"),
+            "{err}"
+        );
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"runtime_acceptance_inconclusive\":false"));
         assert!(event_text.contains("\"missing_evidence\""));
@@ -5125,7 +5190,10 @@ export default function Page(){
             .unwrap_err()
             .to_string();
         assert!(err.contains("plan final contract failed"), "{err}");
-        assert!(err.contains("build_command_or_dependency_missing_boundary"), "{err}");
+        assert!(
+            err.contains("build_command_or_dependency_missing_boundary"),
+            "{err}"
+        );
     }
 
     #[test]
