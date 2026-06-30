@@ -45,6 +45,7 @@ from eval_lib.run_summary import (
     write_summary,
 )
 from eval_lib.runtime_scoring import score_runtime_health
+from eval_lib.runtime_trace import write_trace_artifacts
 from eval_lib.suites import load_suite
 
 
@@ -172,10 +173,34 @@ def main() -> int:
     write_jsonl(run_root / "events.jsonl", events)
     print(f"[write] {run_root / 'summary.eval.tsv'}")
     print(f"[write] {run_root / 'events.jsonl'}")
+    trace = write_trace_artifacts(
+        run_root,
+        subject=trace_subject(matrix, args.binary_kind),
+        binary_kind=trace_binary_kind(matrix, args.binary_kind),
+        binary_path=args.binary,
+        commit_sha=os.environ.get("ANVIL_EVAL_COMMIT_SHA", ""),
+    )
+    print(f"[write] {trace['report_path']}")
+    print(f"[write] {trace['manifest_path']}")
     failed = [row for row in rows if row.get("success") not in {True, "true", "diagnostic_skipped"}]
     skipped = [row for row in rows if row.get("success") == "diagnostic_skipped"]
     print(f"[done] success={len(rows)-len(failed)-len(skipped)} failed={len(failed)} skipped={len(skipped)}")
     return 1 if failed else 0
+
+
+def trace_binary_kind(matrix: list[dict], requested: str) -> str:
+    if matrix:
+        return str(matrix[0].get("binary_kind", requested if requested != "auto" else "anvilminimal"))
+    if requested == "auto":
+        return "anvilminimal"
+    return requested
+
+
+def trace_subject(matrix: list[dict], requested: str) -> str:
+    binary_kind = trace_binary_kind(matrix, requested)
+    if binary_kind == "anvildev":
+        return "source-anvildev"
+    return "mvp-anvilminimal"
 
 
 def run_prepared(

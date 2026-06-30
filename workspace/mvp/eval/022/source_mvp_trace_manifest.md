@@ -70,6 +70,30 @@ Failure layer:
 | `source-current-same-condition` | source anvildev | missing | 同一 suite / provider profile / modes / run count の最新 trace が必要 |
 | `source-code-reference` | source anvildev | partial | source code references は確認済みだが、trace 証跡ではない |
 
+## 4.1 Trace Writer Status
+
+022-2 で `mvp/anvilminimal/scripts/eval_lib/runtime_trace.py` と `mvp/anvilminimal/scripts/eval-trace.py` を追加した。
+
+出力される artifact:
+
+| Artifact | 内容 |
+| --- | --- |
+| `runtime-semantics-normalized-events.jsonl` | raw event を normalized lifecycle stage / gate ids へ写像した JSONL |
+| `runtime-semantics-trace-report.json` | subject、binary kind、stage counts、gate counts、silent exit count、known gaps |
+| `runtime-semantics-trace-manifest.md` | 再実行可能な redacted command と run ごとの trace 状態 |
+| `runtime-semantics-trace-diff.json` | source/MVP trace report の stage/gate 差分 |
+
+redaction:
+
+- task prompt は `<redacted-task-prompt>` に置換する。
+- API key / bearer token / request id は `eval_lib.redaction` を通す。
+- provider raw response body は trace に保存しない。
+
+gate への影響:
+
+- G-S05/G-S06/G-S14/G-S16 は normalized trace writer の実装により evidence を追加できる状態になった。
+- ただし source same-condition trace と manual TUI trace が未登録のため、該当 gate は `partial` のままとする。
+
 ## 5. Source Code References Used For Trace Planning
 
 | Stage | Source refs |
@@ -107,10 +131,9 @@ Failure layer:
 | Gap | Impact | Gate ids |
 | --- | --- | --- |
 | latest same-condition `anvildev` trace missing | source parity cannot be pass | G-S01〜G-S16 |
-| `failure_kind` blank rows remain | diagnostics gate fail | G-S14 |
 | manual TUI UAT trace missing for latest state | TUI observability cannot pass | G-S16 |
 | browser readiness / interaction evidence missing | release gate cannot pass | G-S12 |
-| normalized event sequence generator not implemented | diff is still manual | G-S14, G-S16 |
+| latest trace diff not attached for source/MVP same-condition run | comparative gate cannot pass | G-S01〜G-S16 |
 
 ## 8. Required Next Trace Commands
 
@@ -140,4 +163,23 @@ python3 mvp/anvilminimal/scripts/eval-run.py \
   --provider-limit 5 \
   --binary anvildev \
   --binary-kind anvildev
+```
+
+既存 run root へ後付けで trace artifact を生成する場合:
+
+```bash
+python3 mvp/anvilminimal/scripts/eval-trace.py \
+  --run-root /path/to/eval-run-root \
+  --subject mvp-anvilminimal \
+  --binary-kind anvilminimal \
+  --binary-path mvp/anvilminimal/target/release/anvilminimal
+```
+
+source/MVP の normalized diff を生成する場合:
+
+```bash
+python3 mvp/anvilminimal/scripts/eval-trace.py \
+  --compare-source-report /path/to/source/runtime-semantics-trace-report.json \
+  --compare-mvp-report /path/to/mvp/runtime-semantics-trace-report.json \
+  --diff-output /path/to/runtime-semantics-trace-diff.json
 ```

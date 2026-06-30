@@ -59,6 +59,21 @@
     "stage_regressions": [],
     "required_next_trace": "Run anvildev --engine minimal with the same mvp-smoke/provider-smoke suites, model profile, modes, run count, and provider limits."
   },
+  "normalized_trace": {
+    "status": "writer_available",
+    "writer": "mvp/anvilminimal/scripts/eval_lib/runtime_trace.py",
+    "cli": "mvp/anvilminimal/scripts/eval-trace.py",
+    "artifacts": [
+      "runtime-semantics-normalized-events.jsonl",
+      "runtime-semantics-trace-report.json",
+      "runtime-semantics-trace-manifest.md",
+      "runtime-semantics-trace-diff.json"
+    ],
+    "remaining_gate_blockers": [
+      "latest same-condition anvildev trace is missing",
+      "latest manual TUI trace is missing"
+    ]
+  },
   "uat_equivalent": {
     "status": "partial",
     "evidence_paths": [],
@@ -100,8 +115,8 @@
     "G-S08/G-S09/G-S10/G-S12 remain failed in the current gate matrix."
   ],
   "warnings": [
-    "Several gates have implementation pieces but lack source/MVP normalized trace diff.",
-    "G-S14 is partial until a fresh eval summary is generated with eval-summary-v3-failure-gate and attached to the trace manifest.",
+    "Normalized trace writer is available, but several gates still lack source/MVP same-condition trace diff.",
+    "G-S14 remains partial until a fresh eval summary is generated with runtime-semantics-trace-report.json attached to the trace manifest.",
     "Provider probe is available conceptually but not enforced as a gate for prompt-sensitive fixes."
   ]
 }
