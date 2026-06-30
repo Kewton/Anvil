@@ -20,6 +20,7 @@ from eval_lib.failure_classification import (
     capability_failure_included,
     classify_failure,
     failure_layer_for_kind,
+    normalize_failure_kind,
     read_jsonl,
 )
 from eval_lib.matrix import expand_matrix, parse_modes
@@ -698,6 +699,31 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             failure["failure_layer"] = failure_layer_for_kind(failure_kind)
             failure["agent_capability_failure"] = capability_failure_included(failure_kind)
         extras.update(failure)
+    if not failure_kind and acceptance.get("acceptance_success") is False:
+        failure_kind = str(acceptance.get("acceptance_failure_kind", "") or "")
+        if failure_kind:
+            extras["failure_kind"] = failure_kind
+            extras["failure_layer"] = failure_layer_for_kind(failure_kind)
+            extras["agent_capability_failure"] = capability_failure_included(failure_kind)
+    if not failure_kind:
+        failure_kind = normalize_failure_kind(
+            {
+                "success": success,
+                "rc": result.rc,
+                "process_success": acceptance.get("process_success", ""),
+                "acceptance_success": acceptance.get("acceptance_success", ""),
+                "acceptance_failure_kind": acceptance.get("acceptance_failure_kind", ""),
+                "plan_output_adherence_success": acceptance.get(
+                    "plan_output_adherence_success", ""
+                ),
+                "plan_output_failure_kind": acceptance.get("plan_output_failure_kind", ""),
+                "extras_json": extras,
+            }
+        )
+        if failure_kind:
+            extras["failure_kind"] = failure_kind
+            extras["failure_layer"] = failure_layer_for_kind(failure_kind)
+            extras["agent_capability_failure"] = capability_failure_included(failure_kind)
     readiness_outcome = classify_readiness_outcome(
         plan_run_readiness.get("plan_run_readiness_score", ""),
         success=success,
@@ -858,6 +884,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
                 "planner_quality_retry_degraded_count"
             ],
             "valid_plan_generated": valid_plan_generated,
+            "failure_kind": failure_kind,
             "failure_layer": str(extras.get("failure_layer", "")),
             "capability_failure_included": str(extras.get("agent_capability_failure", "")).lower()
             if extras.get("agent_capability_failure") not in {"", None}

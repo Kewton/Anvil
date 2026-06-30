@@ -6,7 +6,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
 
-from .failure_classification import capability_failure_included, failure_layer_for_kind
+from .failure_classification import (
+    capability_failure_included,
+    failure_layer_for_kind,
+    failure_kind_required_for_row,
+    normalize_failure_kind,
+)
 from .run_summary import read_summary
 
 
@@ -641,11 +646,11 @@ def plan_run_readiness_summary(rows: list[dict[str, str]]) -> list[str]:
 def failure_summary(rows: list[dict[str, str]]) -> list[str]:
     counter = Counter()
     for row in rows:
-        if row.get("success") == "true":
+        if not diagnostic_failure_row(row):
             continue
-        extras = parse_extras(row)
-        if extras.get("failure_kind"):
-            counter[str(extras["failure_kind"])] += 1
+        kind = normalize_failure_kind(row)
+        if kind:
+            counter[kind] += 1
         elif row.get("success") == "diagnostic_skipped":
             counter["diagnostic_skipped"] += 1
         elif row.get("rc") == "124":
@@ -696,19 +701,17 @@ def failure_layer_summary(rows: list[dict[str, str]]) -> list[str]:
     counter = Counter()
     included = Counter()
     for row in rows:
-        if row.get("success") == "true":
+        if not diagnostic_failure_row(row):
             continue
         layer = row.get("failure_layer", "")
         if not layer:
-            extras = parse_extras(row)
-            layer = failure_layer_for_kind(str(extras.get("failure_kind", "")))
+            layer = failure_layer_for_kind(normalize_failure_kind(row))
         if not layer:
             layer = "unknown"
         counter[layer] += 1
         include_value = row.get("capability_failure_included", "")
         if include_value == "":
-            extras = parse_extras(row)
-            include_value = str(capability_failure_included(str(extras.get("failure_kind", "")))).lower()
+            include_value = str(capability_failure_included(normalize_failure_kind(row))).lower()
         included[(layer, include_value)] += 1
     lines = ["## Failure Layers", ""]
     if not counter:
@@ -877,14 +880,14 @@ def planner_quality_issue_summary(rows: list[dict[str, str]]) -> list[str]:
 def stop_reason_summary(rows: list[dict[str, str]]) -> list[str]:
     detail_rows = []
     for row in rows:
-        if row.get("success") == "true":
+        if not diagnostic_failure_row(row):
             continue
         extras = parse_extras(row)
         detail_rows.append(
             {
                 "scenario": row.get("scenario", ""),
                 "mode": row.get("mode", ""),
-                "failure_kind": str(extras.get("failure_kind", "")),
+                "failure_kind": normalize_failure_kind(row),
                 "stop_reason": row.get("stop_reason", ""),
                 "blocking": row.get("last_blocking_reason", ""),
                 "provider": row.get("last_provider_error_kind", ""),
@@ -905,6 +908,12 @@ def blocking_summary(rows: list[dict[str, str]]) -> list[str]:
     if required and all(row.get("success") != "true" for row in required):
         return ["## Blocking", "", "blocking: all required runs failed", ""]
     return []
+
+
+def diagnostic_failure_row(row: dict[str, str]) -> bool:
+    if row.get("success") == "diagnostic_skipped":
+        return False
+    return row.get("success") != "true" or failure_kind_required_for_row(row)
 
 
 def table_rows(rows: list[dict[str, str]], headers: list[str]) -> list[str]:
@@ -1373,8 +1382,7 @@ def most_common(rows: list[dict[str, str]], key: str) -> str:
 
 
 def capability_cell(row: dict[str, str]) -> str:
-    extras = parse_extras(row)
-    return str(capability_failure_included(str(extras.get("failure_kind", "")))).lower()
+    return str(capability_failure_included(normalize_failure_kind(row))).lower()
 
 
 def split_reasons(raw: str | None) -> list[str]:

@@ -1,0 +1,143 @@
+# Source / MVP Trace Manifest
+
+作成日: 2026-06-29
+
+## 1. Baseline
+
+| Item | Value |
+| --- | --- |
+| baseline commit | `2bc9209131b2ca83564aa7c2fca458e3e83e0124` |
+| repo | `/Users/maenokota/share/work/github_kewton/Anvil-develop` |
+| MVP binary under evaluation | `mvp/anvilminimal/target/release/anvilminimal` or `target/release/anvilminimal` depending eval command |
+| source binary | `anvildev --engine minimal` |
+| trace schema | `workspace/mvp/eval/022/parity_gate_trace_schema.md` |
+| report schema | `workspace/mvp/eval/022/parity_gate_report_schema.md` |
+
+## 2. Current MVP Runs
+
+| trace_id | subject | run_root | summary | suite | modes | result | known gaps |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `mvp-0219-smoke` | MVP anvilminimal | `/private/tmp/anvilminimal-eval-0219-mvp-smoke` | `/private/tmp/anvilminimal-eval-0219-mvp-smoke/summary.eval.tsv` | `mvp-smoke` | all 4 modes | 38/48 success | `failure_kind` blank 10 rows, source same-condition comparison missing |
+| `mvp-0219-provider-smoke` | MVP anvilminimal | `/private/tmp/anvilminimal-eval-0219-provider-smoke` | `/private/tmp/anvilminimal-eval-0219-provider-smoke/summary.eval.tsv` | `mvp-provider-smoke` | all 4 modes | 19/24 success | `failure_kind` blank 5 rows, provider drift still planning-visible |
+
+### Current MVP Summary
+
+`mvp-0219-smoke`:
+
+| Mode | Success |
+| --- | ---: |
+| minimal-loop | 10/12 |
+| step-plan | 11/12 |
+| plan-run | 8/12 |
+| ultra-plan-run | 9/12 |
+
+Failure layer:
+
+| Layer | Count |
+| --- | ---: |
+| runtime | 2 |
+| bridge | 4 |
+| planning | 4 |
+
+`mvp-0219-provider-smoke`:
+
+| Mode | Success |
+| --- | ---: |
+| minimal-loop | 6/6 |
+| step-plan | 5/6 |
+| plan-run | 5/6 |
+| ultra-plan-run | 3/6 |
+
+Failure layer:
+
+| Layer | Count |
+| --- | ---: |
+| planning | 5 |
+
+## 3. Previous MVP Comparison Runs
+
+| trace_id | subject | run_root | summary | result | use |
+| --- | --- | --- | --- | --- | --- |
+| `mvp-0213-postcommit-smoke` | MVP anvilminimal | `/private/tmp/anvilminimal-0213-postcommit-smoke` | `/private/tmp/anvilminimal-0213-postcommit-smoke/summary.eval.tsv` | 37/48 success | pre-021-5〜021-9 comparison |
+| `mvp-rollback-provider-smoke` | MVP anvilminimal | `/private/tmp/anvilminimal-eval-rollback-provider-smoke` | `/private/tmp/anvilminimal-eval-rollback-provider-smoke/summary.eval.tsv` | 18/24 success | provider smoke rollback baseline |
+
+## 4. Source Trace Status
+
+現時点で、0219 の MVP run と同条件の最新 `anvildev --engine minimal` trace はこの manifest には未登録である。したがって、G-S01〜G-S16 のうち source trace を必須とする gate は `partial` 以下とする。
+
+| trace_id | subject | status | note |
+| --- | --- | --- | --- |
+| `source-current-same-condition` | source anvildev | missing | 同一 suite / provider profile / modes / run count の最新 trace が必要 |
+| `source-code-reference` | source anvildev | partial | source code references は確認済みだが、trace 証跡ではない |
+
+## 5. Source Code References Used For Trace Planning
+
+| Stage | Source refs |
+| --- | --- |
+| UltraPlan generation | `src/agent/minimal_step_runner.rs::generate_ultra_plan` |
+| Ultra phase execution | `src/agent/minimal_step_runner.rs::run_ultra_plan` |
+| Profiled phase prompt | `src/agent/minimal_step_runner/profile.rs::build_profiled_phase_prompt` |
+| Phase profile verify | `src/agent/minimal_step_runner/profile.rs::verify_profile_after_phase` |
+| Step repair prompt | `src/agent/minimal_step_runner/repair.rs::build_repair_prompt` |
+| Repair exhausted handoff | `src/agent/minimal_step_runner/repair.rs::build_repair_exhausted_report` |
+| Task contract | `src/agent/loop_run/task_contract*.rs` |
+| Verifier / repair lifecycle | `src/agent/loop_run/verifier*.rs`, `src/agent/loop_run/repair_lifecycle.rs` |
+| Scaffold pipeline | `src/agent/loop_run/scaffold_pipeline.rs` |
+| Project/dependency probe | `src/agent/loop_run/project_probe.rs`, `src/agent/loop_run/project_verifier.rs`, `src/agent/loop_run/node_*` |
+| Provider XML fallback | `src/ollama/xml_fallback.rs` |
+
+## 6. MVP Code References Used For Trace Planning
+
+| Stage | MVP refs |
+| --- | --- |
+| Plan/phase runner | `mvp/anvilminimal/src/planner/runner.rs` |
+| Step plan schema | `mvp/anvilminimal/src/planner/step_plan.rs` |
+| Plan verify policy | `mvp/anvilminimal/src/planner/verify.rs` |
+| Next.js profile verifier | `mvp/anvilminimal/src/planner/profiles/nextjs.rs` |
+| Repair handoff | `mvp/anvilminimal/src/planner/repair.rs` |
+| Completion contract | `mvp/anvilminimal/src/minimal_loop/completion.rs` |
+| Acceptance evidence | `mvp/anvilminimal/src/minimal_loop/evidence.rs` |
+| Repair target | `mvp/anvilminimal/src/minimal_loop/repair_target.rs` |
+| Dependency setup/build verify | `mvp/anvilminimal/src/minimal_loop/dependency_setup.rs`, `mvp/anvilminimal/src/minimal_loop/build_verifier.rs` |
+| Runtime events | `mvp/anvilminimal/src/eval_events.rs` |
+| Eval scoring/classification | `mvp/anvilminimal/scripts/eval_lib/*.py` |
+
+## 7. Trace Gaps Registered As Gate Issues
+
+| Gap | Impact | Gate ids |
+| --- | --- | --- |
+| latest same-condition `anvildev` trace missing | source parity cannot be pass | G-S01〜G-S16 |
+| `failure_kind` blank rows remain | diagnostics gate fail | G-S14 |
+| manual TUI UAT trace missing for latest state | TUI observability cannot pass | G-S16 |
+| browser readiness / interaction evidence missing | release gate cannot pass | G-S12 |
+| normalized event sequence generator not implemented | diff is still manual | G-S14, G-S16 |
+
+## 8. Required Next Trace Commands
+
+MVP:
+
+```bash
+python3 mvp/anvilminimal/scripts/eval-run.py \
+  --suite mvp/anvilminimal/eval/suites/mvp-smoke.yaml \
+  --model-profile speed-cloud-5x \
+  --modes minimal-loop,step-plan,plan-run,ultra-plan-run \
+  --runs 1 \
+  --parallel 5 \
+  --provider-limit 5 \
+  --binary mvp/anvilminimal/target/release/anvilminimal \
+  --binary-kind anvilminimal
+```
+
+Source:
+
+```bash
+python3 mvp/anvilminimal/scripts/eval-run.py \
+  --suite mvp/anvilminimal/eval/suites/mvp-smoke.yaml \
+  --model-profile speed-cloud-5x \
+  --modes minimal-loop,step-plan,plan-run,ultra-plan-run \
+  --runs 1 \
+  --parallel 5 \
+  --provider-limit 5 \
+  --binary anvildev \
+  --binary-kind anvildev
+```

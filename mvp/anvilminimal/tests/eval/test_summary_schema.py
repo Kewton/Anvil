@@ -22,6 +22,7 @@ class SummarySchemaTest(unittest.TestCase):
             row = read_summary(path)[0]
             self.assertEqual(row["run_id"], "x")
             self.assertIn("eval_schema_version", row)
+            self.assertIn("failure_kind", row)
 
     def test_legacy_summary_subset_is_read_with_schema_default(self):
         with tempfile.TemporaryDirectory() as td:
@@ -132,6 +133,32 @@ class SummarySchemaTest(unittest.TestCase):
             self.assertIn("schema_repaired", report)
             self.assertIn("## Failure Layers", report)
             self.assertIn("| runtime | 1 | 1 | 0 |", report)
+
+    def test_report_uses_top_level_failure_kind(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td)
+            row = {key: "" for key in SUMMARY_HEADER}
+            row.update(
+                {
+                    "run_id": "x",
+                    "suite": "s",
+                    "scenario": "scenario",
+                    "size": "small",
+                    "category": "acceptance",
+                    "mode": "plan-run",
+                    "main_provider": "openai",
+                    "success": "true",
+                    "rc": "0",
+                    "acceptance_success": "false",
+                    "acceptance_failure_kind": "static_title_only",
+                    "failure_kind": "static_title_only",
+                    "failure_layer": "acceptance",
+                }
+            )
+            write_summary(run_root / "summary.eval.tsv", [row])
+            report = generate_report(run_root)
+            self.assertIn("| static_title_only | 1 |", report)
+            self.assertIn("| acceptance | 1 | 1 | 0 |", report)
 
 
 if __name__ == "__main__":

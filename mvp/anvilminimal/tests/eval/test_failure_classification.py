@@ -6,10 +6,13 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from eval_lib.failure_classification import (
+    blank_failure_kind_gate_violations,
     capability_failure_included,
     classify_events,
     classify_stderr,
     failure_layer_for_kind,
+    failure_kind_required_for_row,
+    normalize_failure_kind,
 )
 
 
@@ -190,6 +193,58 @@ class FailureClassificationTest(unittest.TestCase):
             ]
         )
         self.assertEqual(result["failure_kind"], "build_after_setup_failed")
+
+    def test_acceptance_summary_failure_is_classified(self):
+        result = classify_events(
+            [
+                {
+                    "event": "acceptance_summary",
+                    "acceptance_success": False,
+                    "acceptance_failure_kind": "static_title_only",
+                    "acceptance_failure_reasons": ["source_semantic_failure"],
+                }
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "static_title_only")
+        self.assertEqual(failure_layer_for_kind(result["failure_kind"]), "acceptance")
+
+    def test_summary_row_failure_kind_normalizes_from_acceptance_failure(self):
+        row = {
+            "run_id": "r1",
+            "success": "true",
+            "rc": "0",
+            "acceptance_success": "false",
+            "acceptance_failure_kind": "plan_output_missing_required_capabilities",
+            "extras_json": "{}",
+        }
+        self.assertTrue(failure_kind_required_for_row(row))
+        self.assertEqual(
+            normalize_failure_kind(row),
+            "plan_output_missing_required_capabilities",
+        )
+        self.assertEqual(blank_failure_kind_gate_violations([row]), [])
+
+    def test_summary_row_blank_failure_kind_gate_detects_process_failure(self):
+        row = {
+            "run_id": "r1",
+            "scenario": "s",
+            "mode": "plan-run",
+            "success": "false",
+            "rc": "1",
+            "process_success": "",
+            "acceptance_success": "",
+            "extras_json": "{}",
+        }
+        violations = blank_failure_kind_gate_violations([row])
+        self.assertEqual(len(violations), 1)
+        self.assertEqual(violations[0]["run_id"], "r1")
+
+    def test_dry_run_and_diagnostic_skipped_do_not_require_failure_kind(self):
+        rows = [
+            {"success": "diagnostic_skipped", "rc": "", "extras_json": "{}"},
+            {"success": "", "rc": "", "extras_json": {"dry_run": True}},
+        ]
+        self.assertEqual(blank_failure_kind_gate_violations(rows), [])
 
 if __name__ == "__main__":
     unittest.main()

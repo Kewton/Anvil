@@ -43,6 +43,15 @@ KNOWN_FAILURE_KINDS = {
     "verify_repair_progress_regressed",
     "verify_repair_progress_unchanged",
     "verify_command_policy_error",
+    "process_failure",
+    "artifact_failure",
+    "build_failure",
+    "launch_failure",
+    "plan_output_contract_failure",
+    "plan_output_missing_required_capabilities",
+    "source_semantic_failure",
+    "static_title_only",
+    "browser_behavior_failure",
     "missing_required_capabilities",
     "missing_required_evidence",
     "weak_verification_evidence",
@@ -95,6 +104,16 @@ BRIDGE_FAILURE_KINDS = {
 }
 POSTCHECK_FAILURE_KINDS = {"postcheck_failure"}
 ENVIRONMENT_FAILURE_KINDS = {"timeout", "diagnostic_skipped"}
+ACCEPTANCE_FAILURE_KINDS = {
+    "artifact_failure",
+    "build_failure",
+    "launch_failure",
+    "plan_output_contract_failure",
+    "plan_output_missing_required_capabilities",
+    "source_semantic_failure",
+    "static_title_only",
+    "browser_behavior_failure",
+}
 
 
 def failure_layer_for_kind(kind: str | None) -> str:
@@ -131,6 +150,8 @@ def failure_layer_for_kind(kind: str | None) -> str:
         return "postcheck"
     if normalized in ENVIRONMENT_FAILURE_KINDS:
         return "environment"
+    if normalized in ACCEPTANCE_FAILURE_KINDS:
+        return "acceptance"
     return "runtime"
 
 
@@ -403,6 +424,19 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             }
         if name == "postcheck_summary" and event.get("ok") is False:
             return {"failure_kind": "postcheck_failure"}
+        if (
+            name == "acceptance_summary"
+            and event.get("acceptance_success") is False
+            and event.get("process_success") is not False
+        ):
+            return {
+                "failure_kind": event.get("acceptance_failure_kind")
+                or "final_acceptance_failure",
+                "acceptance_failure_reasons": ",".join(
+                    str(reason)
+                    for reason in event.get("acceptance_failure_reasons", []) or []
+                ),
+            }
         if name == "diagnostic_skipped":
             return {"failure_kind": "diagnostic_skipped"}
     if last_provider_error:
@@ -590,3 +624,79 @@ def classify_failure(
 
 def known_failure_kind(kind: str) -> bool:
     return kind in KNOWN_FAILURE_KINDS
+
+
+def normalize_failure_kind(row: dict[str, Any]) -> str:
+    direct = str(row.get("failure_kind", "") or "").strip()
+    if direct:
+        return direct
+    extras = parse_extras_json(row.get("extras_json", ""))
+    extra_kind = str(extras.get("failure_kind", "") or "").strip()
+    if extra_kind:
+        return extra_kind
+    acceptance_kind = str(row.get("acceptance_failure_kind", "") or "").strip()
+    if row_value_is_false(row.get("acceptance_success")) and acceptance_kind:
+        return acceptance_kind
+    plan_output_kind = str(row.get("plan_output_failure_kind", "") or "").strip()
+    if row_value_is_false(row.get("plan_output_adherence_success")) and plan_output_kind:
+        return plan_output_kind
+    return ""
+
+
+def failure_kind_required_for_row(row: dict[str, Any]) -> bool:
+    success = str(row.get("success", "") or "").strip().lower()
+    if success in {"true", "diagnostic_skipped"}:
+        return row_value_is_false(row.get("acceptance_success"))
+    extras = parse_extras_json(row.get("extras_json", ""))
+    if extras.get("dry_run") is True:
+        return False
+    if success in {"dry-run", "dry_run", "skipped"}:
+        return False
+    if str(row.get("rc", "") or "").strip() not in {"", "0"}:
+        return True
+    if row_value_is_false(row.get("process_success")):
+        return True
+    if row_value_is_false(row.get("acceptance_success")):
+        return True
+    if success == "false":
+        return True
+    return False
+
+
+def blank_failure_kind_gate_violations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    violations: list[dict[str, Any]] = []
+    for row in rows:
+        if not failure_kind_required_for_row(row):
+            continue
+        if normalize_failure_kind(row):
+            continue
+        violations.append(
+            {
+                "run_id": row.get("run_id", ""),
+                "scenario": row.get("scenario", ""),
+                "mode": row.get("mode", ""),
+                "rc": row.get("rc", ""),
+                "success": row.get("success", ""),
+                "process_success": row.get("process_success", ""),
+                "acceptance_success": row.get("acceptance_success", ""),
+            }
+        )
+    return violations
+
+
+def row_value_is_false(value: Any) -> bool:
+    if value is False:
+        return True
+    return str(value).strip().lower() == "false"
+
+
+def parse_extras_json(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
