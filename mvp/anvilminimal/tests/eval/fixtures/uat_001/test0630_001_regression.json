@@ -1,0 +1,148 @@
+{
+  "id": "test0630_001_ultra_plan_run_regression",
+  "source": "workspace/mvp/uat/001/test0630_ultra_plan_run_quality_root_cause.md",
+  "description": "UAT regression fixture for an incomplete ultra-plan-run with scaffold failure, missing recovery UltraPlan YAML, build pass, browser fail, and path-only step completion.",
+  "artifacts": {
+    "plans": [
+      ".anvil/plans/ultra-plan-019f1754-2d9c-71d1-8475-afd83b610f28.yaml",
+      ".anvil/plans/plan-019f1755-0c6a-7462-bee3-3a6490df8e5c.yaml",
+      ".anvil/plans/plan-019f1756-7ffc-7851-b7f9-9c1e419c887d.yaml",
+      ".anvil/plans/plan-019f1757-7745-7111-930e-c8db9b103452.yaml"
+    ],
+    "recovery_prompts": [
+      ".anvil/repairs/repair-phase-web-audio-synth-and-ui-019f1758-94ab-75f2-b835-64513f49ddce.md"
+    ],
+    "recovery_ultra_plans": []
+  },
+  "build": {
+    "ok": true,
+    "command": "npm run build",
+    "event": "dependency_build_lifecycle",
+    "final_status": "passed"
+  },
+  "browser": {
+    "ok": false,
+    "failure_kind": "browser_http_500",
+    "http_status": 500,
+    "route": "/",
+    "error": "./src/app/globals.css Module parse failed: Unexpected character '@' (1:0)"
+  },
+  "generated_file_evidence": {
+    "src/app/page.tsx": {
+      "present_markers": [
+        "canvas",
+        "keyboard handler",
+        "score",
+        "combo",
+        "particles",
+        "collision"
+      ],
+      "missing_markers": [
+        "AudioContext",
+        "localStorage",
+        "lives",
+        "pause state",
+        "start overlay",
+        "restart flow",
+        "high score persistence"
+      ]
+    },
+    "src/app/globals.css": {
+      "present_markers": [
+        "@tailwind base",
+        "@tailwind components",
+        "@tailwind utilities"
+      ]
+    }
+  },
+  "events": [
+    {
+      "event": "loop_stop",
+      "reason": "required_artifacts_satisfied_after_tool",
+      "required_paths": [
+        "src/app/page.tsx",
+        "src/app/layout.tsx",
+        "src/app/global.d.ts"
+      ]
+    },
+    {
+      "event": "dependency_build_lifecycle",
+      "command": "npm run build",
+      "mode": "ultra-plan-run",
+      "profile": "nextjs",
+      "final_status": "passed",
+      "final_reason": "build verifier passed",
+      "required_for_completion": true
+    },
+    {
+      "event": "planner_error",
+      "planner_error_kind": "verify_command_policy_error",
+      "planner_error_message": "verify command may not use shell control syntax",
+      "planner_stage": "verify_policy",
+      "planner_provider": "gemini",
+      "planner_model": "gemini-3.5-flash",
+      "repair_attempt": 1
+    },
+    {
+      "event": "planner_error",
+      "planner_error_kind": "planner_schema_error",
+      "planner_error_message": "StepPlan missing expected_result in step 1",
+      "planner_stage": "schema",
+      "planner_provider": "gemini",
+      "planner_model": "gemini-3.5-flash",
+      "repair_attempt": 2
+    },
+    {
+      "event": "planner_error",
+      "planner_error_kind": "verify_command_policy_error",
+      "planner_error_message": "verify command may not use shell control syntax",
+      "planner_stage": "verify_policy",
+      "planner_provider": "gemini",
+      "planner_model": "gemini-3.5-flash",
+      "repair_attempt": 3
+    },
+    {
+      "event": "ultra_phase_failed",
+      "phase_id": "web-audio-synth-and-ui",
+      "phase_index": 4,
+      "total_phases": 5,
+      "stage": "scaffold",
+      "ok": false,
+      "reason": "invalid StepPlan after corrective retries: verify command may not use shell control syntax"
+    },
+    {
+      "event": "planner_error",
+      "planner_error_kind": "phase_scaffold_error",
+      "planner_error_message": "phase scaffold failed: invalid StepPlan after corrective retries: verify command may not use shell control syntax",
+      "planner_stage": "scaffold",
+      "planner_provider": "gemini",
+      "planner_model": "gemini-3.5-flash",
+      "repair_attempt": 4
+    },
+    {
+      "event": "recovery_prompt_saved",
+      "recovery_handoff_kind": "phase_scaffold_error",
+      "phase_id": "web-audio-synth-and-ui",
+      "recovery_profile": "nextjs",
+      "recovery_prompt_path": ".anvil/repairs/repair-phase-web-audio-synth-and-ui-019f1758-94ab-75f2-b835-64513f49ddce.md",
+      "suggested_recovery_command": "/ultra-plan-run --profile nextjs \"$(cat .anvil/repairs/repair-phase-web-audio-synth-and-ui-019f1758-94ab-75f2-b835-64513f49ddce.md)\""
+    },
+    {
+      "event": "tui_command_stop",
+      "command": "/ultra-plan-run",
+      "ok": false,
+      "failure_kind": "tui_command_failed",
+      "lifecycle_stage": "tui_command",
+      "stop_reason": "phase scaffold failed: invalid StepPlan after corrective retries: verify command may not use shell control syntax"
+    }
+  ],
+  "expected": {
+    "failure_kind": "phase_scaffold_error",
+    "failed_phase_id": "web-audio-synth-and-ui",
+    "verify_command_policy_error_detected": true,
+    "recovery_prompt_saved": true,
+    "recovery_ultra_plan_missing": true,
+    "build_pass_browser_fail": true,
+    "path_only_early_stop_detected": true
+  }
+}
