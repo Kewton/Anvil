@@ -73,6 +73,42 @@
       "latest manual TUI trace is missing"
     ]
   },
+  "provider_probe_gate": {
+    "status": "partial",
+    "result_attachment": {
+      "cli": "mvp/anvilminimal/scripts/eval-run.py --provider-probe-results <ANVIL_PROVIDER_PROBE_OUT.jsonl>",
+      "summary_columns": [
+        "provider_probe_required",
+        "provider_probe_status",
+        "provider_probe_passed",
+        "provider_probe_failed",
+        "provider_probe_skipped",
+        "provider_probe_result_paths"
+      ],
+      "trace_event": "provider_probe"
+    },
+    "tool_args_recovery": {
+      "status": "fixture_covered",
+      "recoverable_shapes": [
+        "nested arguments/args/payload wrappers",
+        "JSON string arguments that decode to object",
+        "file/file_path/filename -> path",
+        "body/text/contents -> content",
+        "cmd -> command",
+        "query -> pattern"
+      ],
+      "hard_rejections": [
+        "absolute paths",
+        "parent-directory paths",
+        "NUL-containing paths",
+        "workspace hidden metadata policy violations"
+      ]
+    },
+    "remaining_gate_blockers": [
+      "OpenAI/Gemini live provider probes have not been rerun with current code.",
+      "same-condition source/MVP trace diff is missing for G-S07/G-S15."
+    ]
+  },
   "uat_equivalent": {
     "status": "partial",
     "evidence_paths": [],
@@ -121,6 +157,6 @@
     "G-S10 has repair follow-through fixtures after 022-5, but same-condition eval smoke and source/MVP trace diff are not yet rerun.",
     "G-S01/G-S02/G-S11 have TaskContract-lite obligation fixtures after 022-6, but source/MVP trace diff and manual UAT are not yet rerun.",
     "G-S12/G-S16 have final acceptance release-gate and TUI event fixtures after 022-7, but browser/manual UAT trace evidence is not yet attached.",
-    "Provider probe is available conceptually but not enforced as a gate for prompt-sensitive fixes."
+    "G-S07/G-S15 have provider probe result attachment and tool args recovery after 022-8, but live provider probes and source/MVP trace diff are not yet rerun."
   ]
 }

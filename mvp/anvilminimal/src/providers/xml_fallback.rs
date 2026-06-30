@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 use crate::state::ToolCall;
+use crate::tools::args_recovery::recover_tool_arguments;
 
 pub fn strip_think_tags(input: &str) -> String {
     let mut out = input.to_string();
@@ -45,6 +46,7 @@ pub fn extract_tool_calls(
                 return Err(anyhow::anyhow!("unknown tool in XML fallback: {name}"));
             }
             let arguments = value.get("arguments").cloned().unwrap_or(Value::Null);
+            let arguments = recover_tool_arguments(name, arguments).arguments;
             calls.push(ToolCall::new(name, arguments));
             let end = json_end + close.len();
             remaining.replace_range(start..end, "");
@@ -78,5 +80,16 @@ mod tests {
         assert_eq!(calls[0].name, "Write");
         assert_eq!(calls[0].arguments["path"], "provider-probe.txt");
         assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn recovers_tool_like_argument_aliases() {
+        let (calls, _) = extract_tool_calls(
+            r#"<function_call>{"name":"Write","arguments":{"file":"provider-probe.txt","body":"ok"}}</function_call>"#,
+            &["Write".to_string()],
+        )
+        .unwrap();
+        assert_eq!(calls[0].arguments["path"], "provider-probe.txt");
+        assert_eq!(calls[0].arguments["content"], "ok");
     }
 }

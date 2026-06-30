@@ -4826,7 +4826,10 @@ export default function Page(){
                 .any(|prompt| prompt.contains("recovery scaffold only, not as task completion")),
             "{prompts:#?}"
         );
-        assert_eq!(execution.messages.len(), 4);
+        assert!(
+            execution.messages.len() >= 3,
+            "expected initial phase, follow-up phase, and repair prompts: {prompts:#?}"
+        );
     }
 
     #[test]

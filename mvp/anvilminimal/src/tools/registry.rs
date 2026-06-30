@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use crate::mode::ExecutionMode;
 
+use super::args_recovery::recover_tool_arguments;
 use super::path_guard::{resolve_existing, resolve_for_create, resolve_optional_existing};
 use super::workspace_policy::{WorkspacePolicy, ensure_tool_path_allowed};
 
@@ -61,6 +62,8 @@ impl ToolRegistry {
         if is_mutating(name) && !context.auto_approve && !context.interactive_approval {
             bail!("approval required for {name}; rerun with --yes or use interactive approval");
         }
+        let recovered = recover_tool_arguments(name, arguments.clone());
+        let arguments = &recovered.arguments;
         match name {
             "Bash" => {
                 let command = required_string(arguments, "command")?;
@@ -143,7 +146,11 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
         "missing_arg"
     } else if message.starts_with("unknown tool:") {
         "unknown_tool"
-    } else if message.contains("path escapes workspace") {
+    } else if message.contains("path escapes workspace")
+        || message.contains("path may not contain ..")
+        || message.contains("absolute path is not allowed")
+        || message.contains("path contains NUL byte")
+    {
         "path_confinement_error"
     } else if message.contains("path_not_found_recoverable") {
         "path_not_found_recoverable"
@@ -176,7 +183,6 @@ pub fn recoverable_tool_error(err: &anyhow::Error) -> bool {
         "missing_arg"
             | "unknown_tool"
             | "path_not_found_recoverable"
-            | "workspace_policy_blocked"
             | "invalid_glob"
             | "read_directory"
             | "edit_anchor_not_found"
@@ -318,6 +324,7 @@ mod tests {
             .execute("Read", &json!({"path":".anvil/session.json"}), &context)
             .unwrap_err();
         assert_eq!(tool_error_kind(&err), "workspace_policy_blocked");
+        assert!(!recoverable_tool_error(&err));
     }
 
     #[test]
@@ -369,6 +376,54 @@ mod tests {
             "/etc/passwd",
         )
         .unwrap_err();
+        assert!(!recoverable_tool_error(&err));
+    }
+
+    #[test]
+    fn recoverable_provider_aliases_are_executed() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+        };
+        registry
+            .execute(
+                "Write",
+                &json!({"arguments":{"file":"notes.txt","body":"ok"}}),
+                &context,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn unsafe_alias_path_is_not_recoverable() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+        };
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"arguments":{"file":"../secret.txt","body":"no"}}),
+                &context,
+            )
+            .unwrap_err();
+        assert_eq!(tool_error_kind(&err), "path_confinement_error");
         assert!(!recoverable_tool_error(&err));
     }
 }

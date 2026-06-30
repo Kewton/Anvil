@@ -9,6 +9,7 @@ use crate::eval_events;
 use crate::mode::ExecutionMode;
 use crate::providers::ChatClient;
 use crate::state::{ConversationMessage, SessionSnapshot};
+use crate::tools::args_recovery::recover_tool_arguments;
 use crate::tools::path_guard::{
     resolve_existing, resolve_optional_existing, validate_workspace_relative,
 };
@@ -481,7 +482,32 @@ pub(crate) fn run_session_with_outcome_with_options(
         if ui.interrupted() {
             bail!("interrupted by user");
         }
-        let tool_calls = reply.tool_calls.clone();
+        let mut tool_calls = Vec::new();
+        for mut call in reply.tool_calls.clone() {
+            let raw_shape = eval_events::argument_shape(&call.arguments);
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "tool_call_raw",
+                    "name": call.name.as_str(),
+                    "arguments": raw_shape,
+                }),
+            );
+            let recovered = recover_tool_arguments(&call.name, call.arguments.clone());
+            if recovered.changed {
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "tool_args_recovered",
+                        "name": call.name.as_str(),
+                        "changes": recovered.changes,
+                        "arguments": eval_events::argument_shape(&recovered.arguments),
+                    }),
+                );
+                call.arguments = recovered.arguments;
+            }
+            tool_calls.push(call);
+        }
         tool_call_count += tool_calls.len();
         session.messages.push(ConversationMessage::assistant(
             reply.content.clone(),
@@ -654,15 +680,6 @@ pub(crate) fn run_session_with_outcome_with_options(
             if !names_seen.insert(call.name.clone()) {
                 // Multiple same-tool calls are fine; this keeps clippy from seeing unused state.
             }
-            let shape = eval_events::argument_shape(&call.arguments);
-            eval_events::emit(
-                config.eval_events_path.as_deref(),
-                json!({
-                    "event": "tool_call_raw",
-                    "name": call.name.as_str(),
-                    "arguments": shape,
-                }),
-            );
             let result = {
                 let _guard = ui.before_tool_call(&call.name);
                 registry.execute(&call.name, &call.arguments, &context)

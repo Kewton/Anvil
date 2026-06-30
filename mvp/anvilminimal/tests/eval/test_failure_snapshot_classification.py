@@ -168,6 +168,19 @@ class FailureSnapshotClassificationTest(unittest.TestCase):
             ]
         )
         self.assertEqual(tool_exec["failure_kind"], "tool_execution_error")
+
+        path_confinement = classify_events(
+            [
+                {
+                    "event": "tool_execute",
+                    "name": "Write",
+                    "status": "error",
+                    "error_kind": "path_confinement_error",
+                }
+            ]
+        )
+        self.assertEqual(path_confinement["failure_kind"], "path_confinement_error")
+        self.assertEqual(path_confinement["tool_error_kind"], "path_confinement_error")
         self.assertEqual(tool_exec["tool_name"], "Read")
 
     def test_classifies_verify_repair_exhausted_from_events(self):

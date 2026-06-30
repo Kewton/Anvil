@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::state::{ConversationMessage, ToolCall};
+use crate::tools::args_recovery::recover_tool_arguments;
 use crate::tools::registry::ToolSpec;
 
 use super::AssistantReply;
@@ -211,6 +212,7 @@ fn parse_step(step: &Value, content: &mut String, calls: &mut Vec<ToolCall>) -> 
                 .unwrap_or(name)
                 .to_string();
             let arguments = normalize_function_arguments(step.get("arguments").cloned())?;
+            let arguments = recover_tool_arguments(name, arguments).arguments;
             calls.push(ToolCall {
                 id,
                 name: name.to_string(),
@@ -348,6 +350,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reply.tool_calls[0].arguments["pattern"], "TODO");
+    }
+
+    #[test]
+    fn recovers_provider_argument_aliases() {
+        let reply = parse_interactions_response(
+            r#"{"output":[{"type":"function_call","name":"Write","call_id":"c1","arguments":{"file":"provider-probe.txt","body":"ok"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.tool_calls[0].arguments["path"], "provider-probe.txt");
+        assert_eq!(reply.tool_calls[0].arguments["content"], "ok");
     }
 
     #[test]

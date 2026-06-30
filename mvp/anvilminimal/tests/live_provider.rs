@@ -199,25 +199,28 @@ fn provider_probe_gemini_function_calling_schema_skips_without_key() {
 #[test]
 fn provider_probe_parser_fixtures_cover_tool_argument_shapes() {
     let openai = parse_openai_response(
-        r#"{"output":[{"type":"function_call","name":"Write","call_id":"c1","arguments":"{\"path\":\"provider-probe.txt\",\"content\":\"ok\"}"}]}"#,
+        r#"{"output":[{"type":"function_call","name":"Write","call_id":"c1","arguments":"{\"file\":\"provider-probe.txt\",\"body\":\"ok\"}"}]}"#,
     )
     .expect("OpenAI string arguments fixture");
     assert_eq!(openai.tool_calls[0].arguments["path"], "provider-probe.txt");
+    assert_eq!(openai.tool_calls[0].arguments["content"], "ok");
 
     let gemini = parse_interactions_response(
-        r#"{"output":[{"type":"function_call","name":"Write","call_id":"c1","arguments":"{\"path\":\"provider-probe.txt\",\"content\":\"ok\"}"}]}"#,
+        r#"{"output":[{"type":"function_call","name":"Write","call_id":"c1","arguments":"{\"file\":\"provider-probe.txt\",\"body\":\"ok\"}"}]}"#,
     )
     .expect("Gemini string arguments fixture");
+    assert_eq!(gemini.tool_calls[0].arguments["path"], "provider-probe.txt");
     assert_eq!(gemini.tool_calls[0].arguments["content"], "ok");
 
     let ollama = parse_chat_response(
-        r#"{"message":{"content":"<function_call>{\"name\":\"Write\",\"arguments\":{\"path\":\"provider-probe.txt\",\"content\":\"ok\"}}</function_call>"}}"#,
+        r#"{"message":{"content":"<function_call>{\"name\":\"Write\",\"arguments\":{\"file\":\"provider-probe.txt\",\"body\":\"ok\"}}</function_call>"}}"#,
         &["Write".to_string()],
         true,
     )
     .expect("Ollama XML fallback fixture");
     assert_eq!(ollama.tool_calls[0].name, "Write");
     assert_eq!(ollama.tool_calls[0].arguments["path"], "provider-probe.txt");
+    assert_eq!(ollama.tool_calls[0].arguments["content"], "ok");
 
     record_provider_probe(json!({
         "provider": "fixture",
@@ -225,6 +228,36 @@ fn provider_probe_parser_fixtures_cover_tool_argument_shapes() {
         "status": "passed",
         "providers": ["openai", "gemini", "ollama_xml_fallback"],
     }));
+}
+
+#[test]
+fn provider_probe_ollama_xml_fallback_tool_like_output() {
+    if !provider_probe_enabled() {
+        return;
+    }
+    let reply = parse_chat_response(
+        r#"{"message":{"content":"<function_call>{\"name\":\"Write\",\"arguments\":{\"file\":\"provider-probe.txt\",\"body\":\"ok\"}}</function_call>"}}"#,
+        &["Write".to_string()],
+        true,
+    )
+    .expect("Ollama XML fallback probe fixture");
+    let passed = reply.tool_calls.len() == 1
+        && reply.tool_calls[0].name == "Write"
+        && reply.tool_calls[0].arguments["path"] == "provider-probe.txt"
+        && reply.tool_calls[0].arguments["content"] == "ok";
+    record_provider_probe(json!({
+        "provider": "ollama",
+        "probe": "xml_fallback_tool_like_output",
+        "status": if passed { "passed" } else { "failed" },
+        "tool_calls": reply.tool_calls.len(),
+        "tool_names": reply.tool_calls.iter().map(|call| call.name.clone()).collect::<Vec<_>>(),
+        "arguments_shape": if passed { "object_recovered" } else { "unexpected" },
+        "live": false,
+    }));
+    assert!(
+        passed,
+        "Ollama XML fallback did not recover tool-like output"
+    );
 }
 
 #[test]

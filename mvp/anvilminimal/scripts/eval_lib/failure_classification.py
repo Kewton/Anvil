@@ -410,6 +410,12 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "tool_name": event.get("name", ""),
             }
         if name == "tool_execute" and event.get("status") == "error":
+            if event.get("error_kind") == "path_confinement_error":
+                return {
+                    "failure_kind": "path_confinement_error",
+                    "tool_error_kind": event.get("error_kind", ""),
+                    "tool_name": event.get("name", ""),
+                }
             return {
                 "failure_kind": "tool_execution_error",
                 "tool_error_kind": event.get("error_kind", ""),

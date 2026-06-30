@@ -1,3 +1,4 @@
+pub mod args_recovery;
 pub mod bash;
 pub mod edit;
 pub mod glob;

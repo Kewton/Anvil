@@ -73,6 +73,7 @@ MVP_EVENT_STAGE: dict[str, str] = {
     "planner_raw_output_shape": "plan_generated",
     "postcheck_summary": "acceptance_started",
     "provider_error": "provider_observed",
+    "provider_probe": "provider_observed",
     "provider_response": "provider_observed",
     "recovery_prompt_saved": "recovery_handoff_saved",
     "run_start": "request_understood",
@@ -81,6 +82,7 @@ MVP_EVENT_STAGE: dict[str, str] = {
     "step_verify_failure": "verify_failed",
     "step_verify_repair": "repair_attempted",
     "tool_call_raw": "tool_requested",
+    "tool_args_recovered": "tool_requested",
     "tool_execute": "tool_executed",
     "tool_validation_error": "tool_requested",
     "ultra_context_initialized": "phase_context_attached",
@@ -289,6 +291,8 @@ def stage_for_event(event: dict[str, Any]) -> str:
     if name == "tool_execute":
         return "tool_executed"
     if name == "tool_validation_error":
+        return "tool_requested"
+    if name == "tool_args_recovered":
         return "tool_requested"
     return stage
 

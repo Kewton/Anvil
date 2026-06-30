@@ -3,6 +3,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::state::{ConversationMessage, ToolCall};
+use crate::tools::args_recovery::recover_tool_arguments;
 use crate::tools::registry::ToolSpec;
 
 use super::parsing::tool_names;
@@ -188,7 +189,11 @@ pub fn parse_chat_response(
     let tool_calls = message
         .tool_calls
         .into_iter()
-        .map(|call| ToolCall::new(call.function.name, call.function.arguments))
+        .map(|call| {
+            let arguments =
+                recover_tool_arguments(&call.function.name, call.function.arguments).arguments;
+            ToolCall::new(call.function.name, arguments)
+        })
         .collect();
     Ok(AssistantReply {
         content: message.content,

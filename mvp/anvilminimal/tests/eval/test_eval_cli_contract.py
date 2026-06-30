@@ -111,6 +111,74 @@ class EvalCliContractTest(unittest.TestCase):
             {"openai", "gemini", "ollama"},
         )
 
+    def test_provider_probe_results_are_recorded_in_dry_run_summary(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            run_root = td_path / "run"
+            probe = td_path / "provider-probe.jsonl"
+            probe.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "event": "provider_probe",
+                                "provider": "openai",
+                                "probe": "tool_args_shape",
+                                "status": "passed",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "event": "provider_probe",
+                                "provider": "gemini",
+                                "probe": "function_calling_schema",
+                                "status": "skipped",
+                                "reason": "missing_gemini_api_key",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-run.py",
+                    "--suite",
+                    "eval/suites/mvp-provider-smoke.yaml",
+                    "--model-profile",
+                    "openai-only",
+                    "--modes",
+                    "minimal-loop",
+                    "--runs",
+                    "1",
+                    "--scenario",
+                    "write-one-file-small",
+                    "--run-root",
+                    str(run_root),
+                    "--provider-probe-results",
+                    str(probe),
+                    "--dry-run",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = (run_root / "summary.eval.tsv").read_text(encoding="utf-8")
+            events = (run_root / "events.jsonl").read_text(encoding="utf-8")
+            provider_summary = json.loads(
+                (run_root / "provider_probe_summary.json").read_text(encoding="utf-8")
+            )
+        self.assertIn("provider_probe_status", summary)
+        self.assertIn("\tpassed\t1\t0\t1\t", summary)
+        self.assertIn('"event": "provider_probe"', events)
+        self.assertIn('"provider": "openai"', events)
+        self.assertEqual(provider_summary["status"], "passed")
+        self.assertEqual(provider_summary["passed"], 1)
+        self.assertEqual(provider_summary["skipped"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -75,6 +75,12 @@ def main() -> int:
         help="Path to mvp-provider-smoke summary.eval.tsv that must be green before this run.",
     )
     parser.add_argument(
+        "--provider-probe-results",
+        action="append",
+        default=[],
+        help="JSONL result file from ANVIL_PROVIDER_PROBE_OUT to attach to this eval summary.",
+    )
+    parser.add_argument(
         "--allow-provider-smoke-failure",
         action="store_true",
         help="Explicitly bypass a failed provider smoke summary.",
@@ -89,6 +95,10 @@ def main() -> int:
     profile_config = profiles[args.model_profile]
     if args.provider_smoke_summary and not args.allow_provider_smoke_failure:
         assert_provider_smoke_green(Path(args.provider_smoke_summary))
+    provider_probe_summary = summarize_provider_probe_results(
+        [Path(path) for path in args.provider_probe_results]
+    )
+    write_json(run_root / "provider_probe_summary.json", provider_probe_summary)
     provider_limit = args.provider_limit if args.provider_limit is not None else profile_config.get("provider_limit", 2)
     matrix = expand_matrix(
         suite,
@@ -104,6 +114,7 @@ def main() -> int:
         spec["_provider_limit"] = provider_limit
         spec["_parallel_limit"] = args.parallel
         spec["_model_profile"] = args.model_profile
+        spec["_provider_probe_summary"] = provider_probe_summary
     write_jsonl(run_root / "warnings.jsonl", warnings)
     write_json(run_root / "matrix.json", scrub_matrix(matrix))
     print(f"[eval] run_root={run_root}")
@@ -112,6 +123,7 @@ def main() -> int:
     prepared = []
     rows = []
     events: list[dict] = []
+    events.extend(provider_probe_events_for_summary(provider_probe_summary))
     for index, spec in enumerate(matrix, start=1):
         run_dir = run_root / "runs" / spec["run_id"]
         workdir = run_dir / "workdir"
@@ -129,15 +141,21 @@ def main() -> int:
             rows.append({
                 **empty_summary_row(spec),
                 "workdir": str(workdir),
+                **provider_probe_row_fields(spec),
                 "extras_json": {
                     "dry_run": True,
                     "provider_probe": spec.get("provider_probe", {}),
+                    "provider_probe_summary": provider_probe_summary,
                 },
             })
             continue
         prepared.append((index, spec, command, run_dir, workdir))
 
     if args.dry_run:
+        write_summary(run_root / "summary.eval.tsv", rows)
+        write_jsonl(run_root / "events.jsonl", events)
+        print(f"[write] {run_root / 'summary.eval.tsv'}")
+        print(f"[write] {run_root / 'events.jsonl'}")
         print("[done] dry-run complete")
         return 0
     semaphores = {
@@ -201,6 +219,100 @@ def trace_subject(matrix: list[dict], requested: str) -> str:
     if binary_kind == "anvildev":
         return "source-anvildev"
     return "mvp-anvilminimal"
+
+
+def summarize_provider_probe_results(paths: list[Path]) -> dict:
+    if not paths:
+        return {
+            "status": "not_run",
+            "result_paths": [],
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "events": [],
+        }
+    events: list[dict] = []
+    missing: list[str] = []
+    for path in paths:
+        if not path.exists():
+            missing.append(str(path))
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                events.append(
+                    {
+                        "event": "provider_probe",
+                        "provider": "unknown",
+                        "probe": "parse_jsonl",
+                        "status": "failed",
+                        "reason": "invalid_jsonl",
+                    }
+                )
+                continue
+            if event.get("event") == "provider_probe":
+                events.append(redact_json(event))
+    passed = sum(1 for event in events if event.get("status") == "passed")
+    failed = sum(1 for event in events if event.get("status") == "failed")
+    skipped = sum(1 for event in events if event.get("status") == "skipped")
+    status = "passed"
+    if missing:
+        status = "missing_results"
+    elif failed:
+        status = "failed"
+    elif not events:
+        status = "empty"
+    elif passed == 0 and skipped:
+        status = "skipped"
+    return {
+        "status": status,
+        "result_paths": [str(path) for path in paths],
+        "missing_paths": missing,
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "events": events,
+    }
+
+
+def provider_probe_row_fields(spec: dict) -> dict[str, object]:
+    summary = spec.get("_provider_probe_summary", {}) or {}
+    metadata = spec.get("provider_probe", {}) or {}
+    return {
+        "provider_probe_required": str(
+            bool(metadata.get("required_for_prompt_sensitive_fix"))
+        ).lower()
+        if metadata
+        else "",
+        "provider_probe_status": summary.get("status", ""),
+        "provider_probe_passed": summary.get("passed", ""),
+        "provider_probe_failed": summary.get("failed", ""),
+        "provider_probe_skipped": summary.get("skipped", ""),
+        "provider_probe_result_paths": ",".join(
+            str(path) for path in summary.get("result_paths", []) or []
+        ),
+    }
+
+
+def provider_probe_events_for_summary(summary: dict) -> list[dict]:
+    events = []
+    for event in summary.get("events", []) or []:
+        if isinstance(event, dict):
+            events.append({"run_id": "provider-probe", **event})
+    if not events:
+        events.append(
+            {
+                "event": "provider_probe",
+                "run_id": "provider-probe",
+                "provider": "all",
+                "probe": "provider_probe_results",
+                "status": summary.get("status", "not_run"),
+            }
+        )
+    return events
 
 
 def run_prepared(
@@ -704,6 +816,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         "elapsed_total_sec": round(time.monotonic() - start, 3),
         "oracle_kind": post.get("oracle_kind", ""),
         "provider_probe": spec.get("provider_probe", {}),
+        "provider_probe_summary": spec.get("_provider_probe_summary", {}),
     }
     failure_kind = ""
     if not success:
@@ -868,6 +981,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "effective_parallelism": spec.get("_effective_parallelism", ""),
             "provider_limit": spec.get("_provider_limit", ""),
             "parallel_limit": spec.get("_parallel_limit", ""),
+            **provider_probe_row_fields(spec),
             "wall_clock_sec": "",
             "acceptance_oracle_sec": acceptance_oracle_sec,
             "process_elapsed_sec": round(process_elapsed, 3),

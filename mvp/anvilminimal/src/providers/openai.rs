@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use crate::config::{Config, load_api_key};
 use crate::eval_events;
 use crate::state::{ConversationMessage, ToolCall};
+use crate::tools::args_recovery::recover_tool_arguments;
 use crate::tools::registry::ToolSpec;
 
 use super::parsing::sanitized_tool_schema;
@@ -274,6 +275,7 @@ pub fn parse_openai_response(body: &str) -> anyhow::Result<AssistantReply> {
                 .name
                 .ok_or_else(|| anyhow::anyhow!("OpenAI function_call missing name"))?;
             let arguments = normalize_function_arguments(item.arguments)?;
+            let arguments = recover_tool_arguments(&name, arguments).arguments;
             tool_calls.push(ToolCall {
                 id: item
                     .call_id
@@ -362,6 +364,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reply.tool_calls[0].arguments["pattern"], "TODO");
+    }
+
+    #[test]
+    fn recovers_provider_argument_aliases() {
+        let reply = parse_openai_response(
+            r#"{"output":[{"type":"function_call","name":"Write","call_id":"c1","arguments":{"file":"provider-probe.txt","body":"ok"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.tool_calls[0].arguments["path"], "provider-probe.txt");
+        assert_eq!(reply.tool_calls[0].arguments["content"], "ok");
     }
 
     #[test]
