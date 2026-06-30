@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 const SNIPPET_LIMIT: usize = 500;
+const SUMMARY_LIMIT: usize = 8_000;
 
 pub fn path_from_env() -> Option<PathBuf> {
     std::env::var_os("ANVIL_EVAL_EVENTS")
@@ -64,9 +65,37 @@ pub fn write_run_summary(path: Option<&Path>, text: &str) {
         return;
     };
     let summary = parent.join("summary.md");
-    let content = body_snippet(text);
+    let content = summary_body(text);
+    if let Err(err) = std::fs::create_dir_all(parent) {
+        eprintln!("warning: failed to create run summary directory: {err}");
+        return;
+    }
     if let Err(err) = std::fs::write(summary, format!("{content}\n")) {
         eprintln!("warning: failed to write run summary: {err}");
+    }
+}
+
+pub fn append_run_summary(path: Option<&Path>, text: &str) {
+    let Some(path) = path else {
+        return;
+    };
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let summary = parent.join("summary.md");
+    let content = summary_body(text);
+    if let Err(err) = std::fs::create_dir_all(parent) {
+        eprintln!("warning: failed to create run summary directory: {err}");
+        return;
+    }
+    let existing = std::fs::read_to_string(&summary).unwrap_or_default();
+    let combined = if existing.trim().is_empty() {
+        format!("{content}\n")
+    } else {
+        format!("{}\n---\n\n{content}\n", existing.trim_end())
+    };
+    if let Err(err) = std::fs::write(summary, combined) {
+        eprintln!("warning: failed to append run summary: {err}");
     }
 }
 
@@ -114,6 +143,19 @@ pub fn body_snippet(body: &str) -> String {
     clean = redact_secret_like(&clean);
     clean = redact_home_paths(&clean);
     clean.chars().take(SNIPPET_LIMIT).collect()
+}
+
+fn summary_body(body: &str) -> String {
+    let clean = body.replace("\r\n", "\n").replace('\r', "\n");
+    let clean = redact_home_paths(&clean);
+    clean
+        .lines()
+        .map(redact_secret_like)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .take(SUMMARY_LIMIT)
+        .collect()
 }
 
 fn argument_value_summary(key: &str, value: &Value) -> Value {
@@ -231,5 +273,21 @@ mod tests {
         let path = default_run_events_path(dir.path());
         assert!(path.starts_with(dir.path().join(".anvil").join("runs")));
         assert_eq!(path.file_name().unwrap(), "events.jsonl");
+    }
+
+    #[test]
+    fn run_summary_preserves_human_readable_sections_and_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".anvil/runs/test/events.jsonl");
+        write_run_summary(
+            Some(&path),
+            "Status: incomplete\nCompleted phases:\n- scaffold\napi_key sk-test",
+        );
+        append_run_summary(Some(&path), "TUI command failed: phase failed");
+        let summary = std::fs::read_to_string(path.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains("Status: incomplete\nCompleted phases:\n- scaffold"));
+        assert!(summary.contains("---\n\nTUI command failed: phase failed"));
+        assert!(summary.contains("<redacted>"));
+        assert!(!summary.contains("sk-test"));
     }
 }

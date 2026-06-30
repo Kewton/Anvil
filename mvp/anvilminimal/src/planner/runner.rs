@@ -2619,6 +2619,7 @@ fn save_ultra_phase_recovery_handoff(
     let recovery_plan_command = recovery_plan
         .as_ref()
         .map(|path| suggested_recovery_ultra_plan_command(path));
+    let (completed_phases, pending_phases) = ultra_phase_status(plan, phase);
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -2638,6 +2639,25 @@ fn save_ultra_phase_recovery_handoff(
             "status": "incomplete",
         }),
     );
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_partial_artifact_summary",
+            "status": "incomplete",
+            "completed_phase_ids": completed_phases.clone(),
+            "failed_phase_id": phase.id,
+            "pending_phase_ids": pending_phases.clone(),
+            "failure_kind": failure_kind,
+            "recovery_prompt_path": path.display().to_string(),
+            "recovery_ultra_plan_path": recovery_plan
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            "recovery_yaml_missing": recovery_plan.is_none(),
+            "suggested_recovery_command": prompt_command,
+            "suggested_recovery_yaml_command": recovery_plan_command.clone().unwrap_or_default(),
+        }),
+    );
     let recovery_yaml_summary = recovery_plan
         .as_ref()
         .map(|path| format!("Recovery UltraPlan YAML saved: {}", path.display()))
@@ -2652,14 +2672,17 @@ fn save_ultra_phase_recovery_handoff(
         });
     eval_events::write_run_summary(
         config.eval_events_path.as_deref(),
-        &format!(
-            "Status: incomplete\n{}\n{}\nRecovery prompt saved: {}\nSuggested prompt command: {}\nFailure: {}",
-            recovery_yaml_summary,
-            recovery_yaml_command_summary,
-            path.display(),
-            prompt_command,
-            reason
-        ),
+        &render_ultra_partial_run_summary(UltraPartialRunSummary {
+            completed_phases: &completed_phases,
+            failed_phase: &phase.id,
+            pending_phases: &pending_phases,
+            failure_kind,
+            reason,
+            recovery_prompt_path: &path.display().to_string(),
+            recovery_yaml_summary: &recovery_yaml_summary,
+            prompt_command: &prompt_command,
+            recovery_yaml_command_summary: &recovery_yaml_command_summary,
+        }),
     );
     let recovery_yaml_message = recovery_plan
         .as_ref()
@@ -2678,6 +2701,71 @@ fn save_ultra_phase_recovery_handoff(
         prompt_command,
         recovery_yaml_message
     ))
+}
+
+struct UltraPartialRunSummary<'a> {
+    completed_phases: &'a [String],
+    failed_phase: &'a str,
+    pending_phases: &'a [String],
+    failure_kind: &'a str,
+    reason: &'a str,
+    recovery_prompt_path: &'a str,
+    recovery_yaml_summary: &'a str,
+    prompt_command: &'a str,
+    recovery_yaml_command_summary: &'a str,
+}
+
+fn render_ultra_partial_run_summary(summary: UltraPartialRunSummary<'_>) -> String {
+    format!(
+        "Status: incomplete\n\n\
+Completed phases:\n{}\n\n\
+Failed phase:\n- {} ({})\n\n\
+Pending phases:\n{}\n\n\
+Recovery next action:\n- {}\n- Recovery prompt saved: {}\n- Suggested prompt command: {}\n- {}\n\n\
+Failure:\n{}",
+        render_summary_bullets(summary.completed_phases),
+        summary.failed_phase,
+        summary.failure_kind,
+        render_summary_bullets(summary.pending_phases),
+        summary.recovery_yaml_summary,
+        summary.recovery_prompt_path,
+        summary.prompt_command,
+        summary.recovery_yaml_command_summary,
+        summary.reason,
+    )
+}
+
+fn render_summary_bullets(items: &[String]) -> String {
+    if items.is_empty() {
+        "- none".to_string()
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn ultra_phase_status(plan: &UltraPlan, failed_phase: &UltraPhase) -> (Vec<String>, Vec<String>) {
+    let failed_index = plan
+        .phases
+        .iter()
+        .position(|phase| phase.id == failed_phase.id)
+        .unwrap_or(0);
+    let completed = plan
+        .phases
+        .iter()
+        .take(failed_index)
+        .map(|phase| phase.id.clone())
+        .collect();
+    let pending = plan
+        .phases
+        .iter()
+        .skip(failed_index + 1)
+        .map(|phase| phase.id.clone())
+        .collect();
+    (completed, pending)
 }
 
 fn recovery_scope_token(value: &str) -> String {
@@ -4937,6 +5025,10 @@ export default function Page(){
         assert!(event_text.contains("suggested_recovery_command"));
         let summary = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
         assert!(summary.contains("Status: incomplete"));
+        assert!(summary.contains("Completed phases:\n- scaffold"));
+        assert!(summary.contains("Failed phase:\n- finish"));
+        assert!(summary.contains("Pending phases:\n- none"));
+        assert!(summary.contains("Recovery next action:"));
         assert!(summary.contains("Recovery UltraPlan YAML saved:"));
         assert!(summary.contains("Suggested YAML command:"));
     }
@@ -5011,6 +5103,10 @@ export default function Page(){
         assert!(event_text.contains("\"suggested_recovery_yaml_command\""));
         let summary = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
         assert!(summary.contains("Status: incomplete"));
+        assert!(summary.contains("Completed phases:\n- none"));
+        assert!(summary.contains("Failed phase:\n- web-audio-synth-and-ui"));
+        assert!(summary.contains("Pending phases:\n- final-verify"));
+        assert!(summary.contains("Recovery next action:"));
         assert!(summary.contains("Recovery UltraPlan YAML saved:"));
         assert!(summary.contains("Suggested YAML command:"));
     }

@@ -315,6 +315,39 @@ fn tui_slash_failure_records_run_events_and_failure_stage() {
 }
 
 #[test]
+fn tui_slash_failure_appends_to_existing_partial_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    anvilminimal::eval_events::write_run_summary(
+        cfg.eval_events_path.as_deref(),
+        "Status: incomplete\nCompleted phases:\n- scaffold\nFailed phase:\n- final\nPending phases:\n- none\nRecovery next action:\n- /run-ultra-plan .anvil/plans/recovery-ultra-plan-final.yaml",
+    );
+    let mut planner = FakeClient::new("planner", Vec::new());
+    let mut execution = FakeClient::new("exec", Vec::new());
+    let ui = FakeUi::default();
+    let err = anvilminimal::tui::slash::handle_command(
+        "/unknown-command test",
+        &cfg,
+        &mut planner,
+        &mut execution,
+        &ui,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("unknown slash command"));
+    let summary =
+        std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
+    assert!(summary.contains("Status: incomplete"));
+    assert!(summary.contains("Completed phases:\n- scaffold"));
+    assert!(summary.contains("Failed phase:\n- final"));
+    assert!(summary.contains("Pending phases:\n- none"));
+    assert!(summary.contains("Recovery next action:"));
+    assert!(summary.contains("TUI command failed"));
+}
+
+#[test]
 fn plain_renderer_keeps_raw_output() {
     let renderer = anvilminimal::tui::markdown::PlainRenderer;
     renderer

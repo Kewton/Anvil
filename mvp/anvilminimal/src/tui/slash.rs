@@ -124,7 +124,7 @@ fn emit_tui_command_stop(config: &Config, command: &str, result: &anyhow::Result
                 "primary_reason": stop_reason,
             }),
         );
-        crate::eval_events::write_run_summary(
+        crate::eval_events::append_run_summary(
             config.eval_events_path.as_deref(),
             &format!("TUI command failed: {stop_reason}"),
         );
