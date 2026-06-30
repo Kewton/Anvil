@@ -15,6 +15,7 @@ from pathlib import Path
 from eval_lib.acceptance_outcome import evaluate_acceptance_outcome
 from eval_lib.acceptance_contract import contract_from_scenario
 from eval_lib.artifacts import create_run_root, write_json, write_jsonl
+from eval_lib.browser_oracle import evaluate_browser_oracle
 from eval_lib.config import merge_dotenv_into_env
 from eval_lib.failure_classification import (
     capability_failure_included,
@@ -809,6 +810,14 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
     plan_verify_gap_kind = str(runtime_verify_coverage.get("plan_verify_gap_kind", plan_verify_gap_kind) or plan_verify_gap_kind)
     plan_verify_oracle_version = str(runtime_verify_coverage.get("plan_verify_oracle_version", plan_verify_oracle_version) or plan_verify_oracle_version)
     acceptance_start = time.monotonic()
+    browser_result = evaluate_browser_oracle(
+        spec["scenario"],
+        workdir,
+        run_dir=run_dir,
+        postcheck=post,
+        enabled=str(os.environ.get("ANVIL_EVAL_BROWSER_ORACLE", "")).lower() in {"1", "true", "yes"},
+    )
+    events.append({"event": "browser_oracle_summary", "run_id": spec["run_id"], **browser_result})
     acceptance = evaluate_acceptance_outcome(
         scenario=spec["scenario"],
         workdir=workdir,
@@ -818,6 +827,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
         legacy_success=success,
         postcheck=post,
         plan_paths=plans,
+        browser_result=browser_result,
         plan_capability=runtime_capability_contract,
         plan_verify_coverage=runtime_verify_coverage,
     )
@@ -941,6 +951,9 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "build_success": acceptance.get("build_success", ""),
             "launch_success": acceptance.get("launch_success", ""),
             "behavior_success": acceptance.get("behavior_success", ""),
+            "browser_success": acceptance.get("browser_success", ""),
+            "browser_failure_kind": acceptance.get("browser_failure_kind", ""),
+            "browser_status": acceptance.get("browser_status", ""),
             "source_semantic_success": acceptance.get("source_semantic_success", ""),
             "source_semantic_score": acceptance.get("source_semantic_score", ""),
             "plan_output_adherence_success": acceptance.get("plan_output_adherence_success", ""),

@@ -57,6 +57,9 @@ def evaluate_acceptance_outcome(
     )
     plan_output_success = plan_output.get("plan_output_adherence_success", "")
     browser_result = browser_result or {"browser_success": "", "browser_failure_kind": "", "browser_details": {}}
+    browser_details = browser_result.get("browser_details", {})
+    if not isinstance(browser_details, dict):
+        browser_details = {}
     behavior_success = combine_behavior_success(semantic_success, browser_result.get("browser_success", ""))
     prompt_contract_success = semantic_success if semantic_success != "" else True
     capability_acceptance_success = (
@@ -86,6 +89,7 @@ def evaluate_acceptance_outcome(
         post_ok=bool(postcheck.get("ok", True)),
         semantic_failure_kind=str(semantic.get("source_semantic_failure_kind", "")),
         plan_output_failure_kind=str(plan_output.get("plan_output_failure_kind", "")),
+        browser_failure_kind=str(browser_result.get("browser_failure_kind", "")),
     )
     failure_reasons = acceptance_failure_reasons(
         process_success=process_success,
@@ -123,6 +127,9 @@ def evaluate_acceptance_outcome(
         "build_success": build_success,
         "launch_success": launch_success,
         "behavior_success": behavior_success,
+        "browser_success": browser_result.get("browser_success", ""),
+        "browser_failure_kind": browser_result.get("browser_failure_kind", ""),
+        "browser_status": browser_details.get("status", ""),
         "source_semantic_success": semantic_success,
         "source_semantic_score": semantic.get("source_semantic_score", ""),
         "plan_output_adherence_success": plan_output_success,
@@ -174,6 +181,9 @@ def not_applicable_outcome(reason: str, legacy_success: bool) -> dict[str, Any]:
         "build_success": "",
         "launch_success": "",
         "behavior_success": "",
+        "browser_success": "",
+        "browser_failure_kind": "",
+        "browser_status": "",
         "source_semantic_success": "",
         "source_semantic_score": "",
         "plan_output_adherence_success": "",
@@ -217,6 +227,13 @@ def release_gate_status(
     browser_required = "browser_interaction" in (
         contract.oracle_contract.get("deterministic_oracles") or []
     )
+    if browser_required and browser_result.get("browser_success", "") is False:
+        return {
+            "release_gate_status": "failed",
+            "release_gate_reasons": [
+                str(browser_result.get("browser_failure_kind") or "browser_behavior_failure")
+            ],
+        }
     if not acceptance_success:
         return {
             "release_gate_status": "failed",
@@ -285,6 +302,7 @@ def acceptance_failure_kind(
     post_ok: bool,
     semantic_failure_kind: str,
     plan_output_failure_kind: str,
+    browser_failure_kind: str,
 ) -> str:
     if not process_success:
         return "process_failure"
@@ -294,14 +312,14 @@ def acceptance_failure_kind(
         return "postcheck_failure"
     if build_success is False:
         return "build_failure"
+    if browser_success is False:
+        return browser_failure_kind or "browser_behavior_failure"
     if launch_success is False:
         return "launch_failure"
     if plan_output_success is False:
         return plan_output_failure_kind or "plan_output_contract_failure"
     if semantic_success is False:
         return semantic_failure_kind or "source_semantic_failure"
-    if browser_success is False:
-        return "browser_behavior_failure"
     return ""
 
 

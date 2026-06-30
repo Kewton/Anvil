@@ -113,6 +113,7 @@ def score_runtime_health(
         "final_acceptance_repair_failed",
         "final_acceptance_repair_exhausted",
         "ultra_plan_complete",
+        "browser_oracle_summary",
     }
     has_runtime_events = any(event.get("event") in runtime_event_names for event in events)
     if mode not in RUNTIME_EXECUTION_MODES or not has_runtime_events:
@@ -681,6 +682,13 @@ def score_finalization_details(
     if no_tool_responses:
         step = min(step, 50.0)
         reasons.append("missing_tool_call")
+    browser_events = [event for event in events if event.get("event") == "browser_oracle_summary"]
+    if any(event.get("browser_success") is False for event in browser_events):
+        step = min(step, 0.0)
+        reasons.append("browser_readiness_failed")
+    elif any(event.get("browser_success") == "" for event in browser_events):
+        step = min(step, 80.0)
+        reasons.append("browser_evidence_unavailable")
     step = clamp(step)
 
     plan: float | str = ""

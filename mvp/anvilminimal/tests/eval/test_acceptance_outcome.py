@@ -164,6 +164,58 @@ export default function Page(){
             outcome["release_gate_reasons"],
         )
 
+    def test_browser_http_500_is_acceptance_failure_kind(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            workdir = root / "workdir"
+            run_dir = root / "run"
+            (workdir / "src/app").mkdir(parents=True)
+            (run_dir / "postcheck").mkdir(parents=True)
+            (workdir / "package.json").write_text("{}", encoding="utf-8")
+            (workdir / "src/app/page.tsx").write_text(
+                '''
+"use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  useEffect(() => {
+    const onKeyDown = () => setScore((value) => value + 1);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+  return <main><canvas /><p>enemy bullet collision score {score}</p></main>;
+}
+''',
+                encoding="utf-8",
+            )
+            (workdir / "src/app/layout.tsx").write_text("export default function Layout({children}){return children}", encoding="utf-8")
+            (workdir / "src/app/global.d.ts").write_text("declare module '*.css';", encoding="utf-8")
+            events = [
+                {"event": "postcheck", "command": "npm install --ignore-scripts", "rc": 0},
+                {"event": "postcheck", "command": "npm run build", "rc": 0},
+                {"event": "dev_server", "ready": False, "status": 500},
+            ]
+            events_path = run_dir / "postcheck/events.jsonl"
+            events_path.write_text("\n".join(json.dumps(event) for event in events), encoding="utf-8")
+            outcome = evaluate_acceptance_outcome(
+                scenario=SCENARIO,
+                workdir=workdir,
+                run_dir=run_dir,
+                mode="plan-run",
+                process_success=True,
+                legacy_success=True,
+                postcheck={"ok": True, "events_path": str(events_path)},
+                browser_result={
+                    "browser_success": False,
+                    "browser_failure_kind": "browser_http_500",
+                    "browser_details": {"status": "failed", "http_status": 500},
+                },
+            )
+        self.assertFalse(outcome["acceptance_success"], outcome)
+        self.assertEqual(outcome["acceptance_failure_kind"], "browser_http_500")
+        self.assertEqual(outcome["release_gate_status"], "failed")
+        self.assertEqual(outcome["browser_status"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

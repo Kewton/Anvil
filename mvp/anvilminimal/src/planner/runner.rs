@@ -41,7 +41,7 @@ use crate::state::SessionSnapshot;
 use crate::tools::path_guard::resolve_existing;
 use crate::tui::status::UiStatus;
 use crate::tui::{InteractionUi, NOOP_UI};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const STEP_TURN_MAX_ITERATIONS: usize = 8;
 const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
@@ -1133,6 +1133,7 @@ fn verify_plan_final_contract(
         )
     });
     let release_gate = final_acceptance_release_gate(
+        config,
         &config.profile,
         &plan.goal,
         &required_capabilities,
@@ -1144,7 +1145,9 @@ fn verify_plan_final_contract(
     let runtime_ok = runtime_acceptance
         .as_ref()
         .is_none_or(|report| report.passed);
-    let ok = missing_final_artifacts.is_empty() && external_ok && runtime_ok;
+    let release_gate_failed = release_gate.status == "failed";
+    let ok =
+        missing_final_artifacts.is_empty() && external_ok && runtime_ok && !release_gate_failed;
     let primary_reason = if !missing_final_artifacts.is_empty() {
         format!(
             "missing final artifacts: {}",
@@ -1154,9 +1157,18 @@ fn verify_plan_final_contract(
         report.primary_reason.clone()
     } else if let Some(report) = external_report.as_ref().filter(|report| !report.is_pass()) {
         report.primary_reason()
+    } else if release_gate_failed {
+        format!("release gate failed: {}", release_gate.reasons.join("; "))
     } else {
         "ok".to_string()
     };
+    if release_gate.status != "pass"
+        && runtime_ok
+        && missing_final_artifacts.is_empty()
+        && external_ok
+    {
+        append_release_gate_summary(config, &release_gate);
+    }
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -1192,8 +1204,12 @@ fn verify_plan_final_contract(
                 .as_ref()
                 .map(|report| report.inconclusive)
                 .unwrap_or(false),
-            "release_gate_status": release_gate.status,
-            "release_gate_reasons": release_gate.reasons,
+            "release_gate_status": release_gate.status.clone(),
+            "release_gate_reasons": release_gate.reasons.clone(),
+            "browser_readiness_status": release_gate.browser_readiness_status.clone(),
+            "browser_readiness_evidence_path": release_gate.browser_readiness_evidence_path.clone(),
+            "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
+            "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "ok": ok,
             "primary_reason": eval_events::body_snippet(&primary_reason),
         }),
@@ -2326,11 +2342,15 @@ fn ultra_final_acceptance_report(
         &deferred_commands,
     );
     let release_gate = final_acceptance_release_gate(
+        config,
         &plan.profile,
         &plan.goal,
         &required_capabilities,
         Some(&acceptance),
     );
+    if release_gate.status != "pass" && acceptance.passed && missing.is_empty() {
+        append_release_gate_summary(config, &release_gate);
+    }
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -2348,8 +2368,12 @@ fn ultra_final_acceptance_report(
             "weak_evidence": acceptance.weak_evidence.clone(),
             "artifact_obligations": acceptance.artifact_obligations.clone(),
             "inconclusive_reasons": acceptance.inconclusive_reasons.clone(),
-            "release_gate_status": release_gate.status,
-            "release_gate_reasons": release_gate.reasons,
+            "release_gate_status": release_gate.status.clone(),
+            "release_gate_reasons": release_gate.reasons.clone(),
+            "browser_readiness_status": release_gate.browser_readiness_status.clone(),
+            "browser_readiness_evidence_path": release_gate.browser_readiness_evidence_path.clone(),
+            "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
+            "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "primary_reason": eval_events::body_snippet(&acceptance.primary_reason),
         }),
     );
@@ -2359,6 +2383,12 @@ fn ultra_final_acceptance_report(
     }
     if !acceptance.passed {
         report.push_profile_failure(acceptance.primary_reason);
+    }
+    if release_gate.status == "failed" {
+        report.push_profile_failure(format!(
+            "release gate failed: {}",
+            release_gate.reasons.join("; ")
+        ));
     }
     Ok(report)
 }
@@ -2476,11 +2506,16 @@ fn inferred_required_obligations(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReleaseGateSummary {
-    status: &'static str,
+    status: String,
     reasons: Vec<String>,
+    browser_readiness_status: String,
+    browser_readiness_evidence_path: String,
+    interaction_evidence_status: String,
+    interaction_evidence_path: String,
 }
 
 fn final_acceptance_release_gate(
+    config: &Config,
     profile: &str,
     goal: &str,
     required_capabilities: &[String],
@@ -2506,26 +2541,308 @@ fn final_acceptance_release_gate(
             || goal.contains("ゲーム"));
     let Some(report) = acceptance else {
         return ReleaseGateSummary {
-            status: "not_applicable",
+            status: "not_applicable".to_string(),
             reasons: Vec::new(),
+            browser_readiness_status: "not_applicable".to_string(),
+            browser_readiness_evidence_path: String::new(),
+            interaction_evidence_status: "not_applicable".to_string(),
+            interaction_evidence_path: String::new(),
         };
     };
     if !report.passed {
         return ReleaseGateSummary {
-            status: "failed",
+            status: "failed".to_string(),
             reasons: vec![report.primary_reason.clone()],
+            browser_readiness_status: "not_checked".to_string(),
+            browser_readiness_evidence_path: String::new(),
+            interaction_evidence_status: "not_checked".to_string(),
+            interaction_evidence_path: String::new(),
         };
     }
     if requires_browser {
+        return browser_release_gate(config);
+    }
+    ReleaseGateSummary {
+        status: "pass".to_string(),
+        reasons: Vec::new(),
+        browser_readiness_status: "not_applicable".to_string(),
+        browser_readiness_evidence_path: String::new(),
+        interaction_evidence_status: "not_applicable".to_string(),
+        interaction_evidence_path: String::new(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReleaseEvidenceStatus {
+    Passed,
+    Failed(String),
+    Unavailable(String),
+}
+
+impl ReleaseEvidenceStatus {
+    fn as_status(&self) -> String {
+        match self {
+            Self::Passed => "passed".to_string(),
+            Self::Failed(reason) => format!("failed:{reason}"),
+            Self::Unavailable(reason) => format!("unavailable:{reason}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReleaseEvidence {
+    status: ReleaseEvidenceStatus,
+    path: String,
+}
+
+fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
+    let browser = read_release_evidence(
+        config,
+        &[
+            "browser-readiness.json",
+            "browser.json",
+            "browser-readiness-evidence.json",
+        ],
+        "browser_readiness_evidence_missing",
+    );
+    let interaction = read_release_evidence(
+        config,
+        &[
+            "interaction-evidence.json",
+            "interaction.json",
+            "browser-interaction.json",
+        ],
+        "interaction_evidence_missing",
+    );
+    let browser_status = browser.status.as_status();
+    let interaction_status = interaction.status.as_status();
+    if let ReleaseEvidenceStatus::Failed(reason) = &browser.status {
         return ReleaseGateSummary {
-            status: "partial",
-            reasons: vec!["browser_readiness_or_interaction_evidence_required".to_string()],
+            status: "failed".to_string(),
+            reasons: vec![format!("browser_readiness_failed:{reason}")],
+            browser_readiness_status: browser_status,
+            browser_readiness_evidence_path: browser.path,
+            interaction_evidence_status: interaction_status,
+            interaction_evidence_path: interaction.path,
+        };
+    }
+    if let ReleaseEvidenceStatus::Failed(reason) = &interaction.status {
+        return ReleaseGateSummary {
+            status: "failed".to_string(),
+            reasons: vec![format!("browser_interaction_failed:{reason}")],
+            browser_readiness_status: browser_status,
+            browser_readiness_evidence_path: browser.path,
+            interaction_evidence_status: interaction_status,
+            interaction_evidence_path: interaction.path,
+        };
+    }
+    if let ReleaseEvidenceStatus::Unavailable(reason) = &browser.status {
+        return ReleaseGateSummary {
+            status: "partial".to_string(),
+            reasons: vec![format!(
+                "browser_readiness_or_interaction_evidence_required:{reason}"
+            )],
+            browser_readiness_status: browser_status,
+            browser_readiness_evidence_path: browser.path,
+            interaction_evidence_status: interaction_status,
+            interaction_evidence_path: interaction.path,
+        };
+    }
+    if let ReleaseEvidenceStatus::Unavailable(reason) = &interaction.status {
+        return ReleaseGateSummary {
+            status: "partial".to_string(),
+            reasons: vec![format!("browser_interaction_evidence_required:{reason}")],
+            browser_readiness_status: browser_status,
+            browser_readiness_evidence_path: browser.path,
+            interaction_evidence_status: interaction_status,
+            interaction_evidence_path: interaction.path,
         };
     }
     ReleaseGateSummary {
-        status: "pass",
+        status: "pass".to_string(),
         reasons: Vec::new(),
+        browser_readiness_status: browser_status,
+        browser_readiness_evidence_path: browser.path,
+        interaction_evidence_status: interaction_status,
+        interaction_evidence_path: interaction.path,
     }
+}
+
+fn read_release_evidence(
+    config: &Config,
+    names: &[&str],
+    missing_reason: &'static str,
+) -> ReleaseEvidence {
+    for path in release_evidence_candidate_paths(config, names) {
+        if !path.is_file() {
+            continue;
+        }
+        let display = path.display().to_string();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return ReleaseEvidence {
+                status: ReleaseEvidenceStatus::Failed("evidence_unreadable".to_string()),
+                path: display,
+            };
+        };
+        let Ok(json) = serde_json::from_str::<Value>(&text) else {
+            return ReleaseEvidence {
+                status: ReleaseEvidenceStatus::Failed("evidence_invalid_json".to_string()),
+                path: display,
+            };
+        };
+        return ReleaseEvidence {
+            status: classify_release_evidence_json(&json),
+            path: display,
+        };
+    }
+    ReleaseEvidence {
+        status: ReleaseEvidenceStatus::Unavailable(missing_reason.to_string()),
+        path: String::new(),
+    }
+}
+
+fn release_evidence_candidate_paths(config: &Config, names: &[&str]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(events_path) = &config.eval_events_path
+        && let Some(run_dir) = events_path.parent()
+    {
+        for name in names {
+            out.push(run_dir.join(name));
+        }
+    }
+    for name in names {
+        out.push(config.workspace_root.join(".anvil").join(name));
+        out.push(config.workspace_root.join(name));
+    }
+    out
+}
+
+fn classify_release_evidence_json(value: &Value) -> ReleaseEvidenceStatus {
+    if let Some(success) = bool_field(value, &["ok", "success", "browser_success"]) {
+        if success {
+            return ReleaseEvidenceStatus::Passed;
+        }
+        return ReleaseEvidenceStatus::Failed(evidence_failure_reason(value));
+    }
+    if let Some(details) = value
+        .get("browser_details")
+        .or_else(|| value.get("details"))
+    {
+        if let Some(success) = bool_field(details, &["ok", "success", "browser_success"]) {
+            if success {
+                return ReleaseEvidenceStatus::Passed;
+            }
+            return ReleaseEvidenceStatus::Failed(evidence_failure_reason(details));
+        }
+        if let Some(status) = text_field(details, &["status"]) {
+            if matches!(
+                status.as_str(),
+                "not_enabled" | "adapter_not_implemented" | "unavailable"
+            ) {
+                return ReleaseEvidenceStatus::Unavailable(status);
+            }
+        }
+    }
+    if let Some(status) = numeric_field(value, &["http_status", "status", "status_code"]) {
+        if status >= 400 {
+            return ReleaseEvidenceStatus::Failed(format!("http_{status}"));
+        }
+        if (200..400).contains(&status) {
+            return ReleaseEvidenceStatus::Passed;
+        }
+    }
+    if let Some(kind) = text_field(
+        value,
+        &["browser_failure_kind", "failure_kind", "error_kind"],
+    ) {
+        if !kind.is_empty() {
+            return ReleaseEvidenceStatus::Failed(kind);
+        }
+    }
+    if let Some(status) = text_field(value, &["status"]) {
+        if matches!(
+            status.as_str(),
+            "not_enabled" | "adapter_not_implemented" | "unavailable"
+        ) {
+            return ReleaseEvidenceStatus::Unavailable(status);
+        }
+        if matches!(status.as_str(), "ok" | "pass" | "passed" | "ready") {
+            return ReleaseEvidenceStatus::Passed;
+        }
+        if !status.is_empty() {
+            return ReleaseEvidenceStatus::Failed(status);
+        }
+    }
+    ReleaseEvidenceStatus::Unavailable("evidence_inconclusive".to_string())
+}
+
+fn evidence_failure_reason(value: &Value) -> String {
+    if let Some(status) = numeric_field(value, &["http_status", "status", "status_code"])
+        && status >= 400
+    {
+        return format!("http_{status}");
+    }
+    text_field(
+        value,
+        &[
+            "browser_failure_kind",
+            "failure_kind",
+            "error_kind",
+            "status",
+        ],
+    )
+    .unwrap_or_else(|| "browser_check_failed".to_string())
+}
+
+fn bool_field(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_bool))
+}
+
+fn numeric_field(value: &Value, keys: &[&str]) -> Option<i64> {
+    for key in keys {
+        let Some(raw) = value.get(*key) else {
+            continue;
+        };
+        if let Some(number) = raw.as_i64() {
+            return Some(number);
+        }
+        if let Some(text) = raw.as_str()
+            && let Ok(number) = text.parse::<i64>()
+        {
+            return Some(number);
+        }
+    }
+    None
+}
+
+fn text_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(|text| text.trim().to_ascii_lowercase())
+}
+
+fn append_release_gate_summary(config: &Config, release_gate: &ReleaseGateSummary) {
+    eval_events::append_run_summary(
+        config.eval_events_path.as_deref(),
+        &format!(
+            "Release gate: {}\nReasons:\n{}\nBrowser readiness: {}\nBrowser readiness evidence: {}\nInteraction evidence: {}\nInteraction evidence path: {}",
+            release_gate.status,
+            render_prompt_bullets(&release_gate.reasons),
+            release_gate.browser_readiness_status,
+            if release_gate.browser_readiness_evidence_path.is_empty() {
+                "missing"
+            } else {
+                release_gate.browser_readiness_evidence_path.as_str()
+            },
+            release_gate.interaction_evidence_status,
+            if release_gate.interaction_evidence_path.is_empty() {
+                "missing"
+            } else {
+                release_gate.interaction_evidence_path.as_str()
+            },
+        ),
+    );
 }
 
 fn emit_ultra_phase_event(
@@ -5690,6 +6007,169 @@ export default function Page(){
             event_text.contains("browser_readiness_or_interaction_evidence_required"),
             "{event_text}"
         );
+    }
+
+    #[test]
+    fn plan_run_nextjs_browser_http_500_fails_final_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":false,"http_status":500,"failure_kind":"browser_http_500"}"#,
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Create an interactive browser game\n\nRequired final artifacts:\n- package.json\n- src/app/page.tsx\n- src/app/layout.tsx\n- src/app/global.d.ts".to_string(),
+            steps: vec![PlanStep {
+                id: "app".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the interactive Next.js game app".to_string(),
+                expected_paths: vec![
+                    "package.json".to_string(),
+                    "src/app/page.tsx".to_string(),
+                    "src/app/layout.tsx".to_string(),
+                    "src/app/global.d.ts".to_string(),
+                ],
+                verify: Vec::new(),
+            }],
+        };
+        let page = interactive_game_page_source();
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: nextjs_interactive_app_tool_calls(page),
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("plan final contract failed"), "{err}");
+        assert!(err.contains("release gate failed"), "{err}");
+        assert!(err.contains("browser_readiness_failed:http_500"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"release_gate_status\":\"failed\""));
+        assert!(event_text.contains("\"browser_readiness_status\":\"failed:http_500\""));
+    }
+
+    #[test]
+    fn plan_run_nextjs_browser_ready_without_interaction_is_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":true,"http_status":200}"#,
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Create an interactive browser game\n\nRequired final artifacts:\n- package.json\n- src/app/page.tsx\n- src/app/layout.tsx\n- src/app/global.d.ts".to_string(),
+            steps: vec![PlanStep {
+                id: "app".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the interactive Next.js game app".to_string(),
+                expected_paths: vec![
+                    "package.json".to_string(),
+                    "src/app/page.tsx".to_string(),
+                    "src/app/layout.tsx".to_string(),
+                    "src/app/global.d.ts".to_string(),
+                ],
+                verify: Vec::new(),
+            }],
+        };
+        let page = interactive_game_page_source();
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: nextjs_interactive_app_tool_calls(page),
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let result = run_step_plan(&mut fake, &plan, &cfg).unwrap();
+        assert_eq!(result, "plan-run complete: 1 steps");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"release_gate_status\":\"partial\""));
+        assert!(event_text.contains("\"browser_readiness_status\":\"passed\""));
+        assert!(
+            event_text.contains(
+                "\"interaction_evidence_status\":\"unavailable:interaction_evidence_missing\""
+            ),
+            "{event_text}"
+        );
+    }
+
+    #[test]
+    fn plan_run_nextjs_browser_and_interaction_evidence_passes_release_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":true,"http_status":200}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("interaction-evidence.json"),
+            r#"{"ok":true}"#,
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Create an interactive browser game\n\nRequired final artifacts:\n- package.json\n- src/app/page.tsx\n- src/app/layout.tsx\n- src/app/global.d.ts".to_string(),
+            steps: vec![PlanStep {
+                id: "app".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the interactive Next.js game app".to_string(),
+                expected_paths: vec![
+                    "package.json".to_string(),
+                    "src/app/page.tsx".to_string(),
+                    "src/app/layout.tsx".to_string(),
+                    "src/app/global.d.ts".to_string(),
+                ],
+                verify: Vec::new(),
+            }],
+        };
+        let page = interactive_game_page_source();
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: nextjs_interactive_app_tool_calls(page),
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let result = run_step_plan(&mut fake, &plan, &cfg).unwrap();
+        assert_eq!(result, "plan-run complete: 1 steps");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"release_gate_status\":\"pass\""));
+        assert!(event_text.contains("\"browser_readiness_status\":\"passed\""));
+        assert!(event_text.contains("\"interaction_evidence_status\":\"passed\""));
+    }
+
+    fn nextjs_interactive_app_tool_calls(page: &str) -> Vec<crate::state::ToolCall> {
+        vec![
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"package.json","content":"{\"scripts\":{\"build\":\"next build\"},\"dependencies\":{\"next\":\"^14.2.0\",\"react\":\"^18.3.0\",\"react-dom\":\"^18.3.0\"}}"}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/page.tsx","content":page}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";"}),
+            ),
+        ]
     }
 
     #[test]
