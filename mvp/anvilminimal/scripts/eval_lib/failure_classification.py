@@ -52,6 +52,7 @@ KNOWN_FAILURE_KINDS = {
     "plan_output_missing_required_capabilities",
     "source_semantic_failure",
     "static_title_only",
+    "browser_http_500",
     "browser_behavior_failure",
     "missing_required_capabilities",
     "missing_required_evidence",
@@ -114,6 +115,7 @@ ACCEPTANCE_FAILURE_KINDS = {
     "plan_output_missing_required_capabilities",
     "source_semantic_failure",
     "static_title_only",
+    "browser_http_500",
     "browser_behavior_failure",
 }
 
@@ -443,6 +445,13 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             }
         if name == "postcheck_summary" and event.get("ok") is False:
             return {"failure_kind": "postcheck_failure"}
+        if name == "browser_oracle_summary" and event.get("browser_success") is False:
+            return {
+                "failure_kind": event.get("browser_failure_kind")
+                or "browser_behavior_failure",
+                "browser_status": (event.get("browser_details") or {}).get("status", ""),
+                "browser_http_status": (event.get("browser_details") or {}).get("http_status", ""),
+            }
         if (
             name == "acceptance_summary"
             and event.get("acceptance_success") is False

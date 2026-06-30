@@ -834,7 +834,7 @@ fn tailwind_contract_failure(root: &Path, package: &Value) -> Option<String> {
     if !uses_tailwind(root, package) {
         return None;
     }
-    for dep in ["tailwindcss", "postcss"] {
+    for dep in ["tailwindcss", "postcss", "autoprefixer"] {
         if !package_has_dependency(package, dep) {
             return Some(format!("Tailwind toolchain dependency missing: {dep}"));
         }
@@ -842,17 +842,33 @@ fn tailwind_contract_failure(root: &Path, package: &Value) -> Option<String> {
     if !(root.join("tailwind.config.js").is_file() || root.join("tailwind.config.ts").is_file()) {
         return Some("Tailwind config file missing".to_string());
     }
-    if !(root.join("postcss.config.js").is_file()
-        || root.join("postcss.config.mjs").is_file()
-        || root.join("postcss.config.cjs").is_file())
-    {
+    let Some(postcss_config) = postcss_config_path(root) else {
         return Some("PostCSS config file missing for Tailwind".to_string());
+    };
+    let postcss_config = std::fs::read_to_string(postcss_config).unwrap_or_default();
+    let postcss_lower = postcss_config.to_ascii_lowercase();
+    if !(postcss_lower.contains("tailwindcss") || postcss_lower.contains("@tailwindcss/postcss")) {
+        return Some("PostCSS config must include the Tailwind plugin".to_string());
     }
-    let layout = std::fs::read_to_string(root.join("src/app/layout.tsx"))
-        .or_else(|_| std::fs::read_to_string(root.join("app/layout.tsx")))
-        .unwrap_or_default();
-    if !layout.contains("globals.css") {
-        return Some("globals.css must be imported by app layout".to_string());
+    if !postcss_lower.contains("autoprefixer") {
+        return Some("PostCSS config must include autoprefixer for Tailwind".to_string());
+    }
+    let tailwind_css_files = tailwind_directive_files(root);
+    if !tailwind_css_files.is_empty() {
+        let imported = imported_app_css_paths(root);
+        if !tailwind_css_files
+            .iter()
+            .any(|path| imported.iter().any(|imported| imported == path))
+        {
+            let css_list = tailwind_css_files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some(format!(
+                "@tailwind CSS file must be imported by app layout: {css_list}"
+            ));
+        }
     }
     None
 }
@@ -919,23 +935,93 @@ fn has_use_client_directive(content: &str) -> bool {
 
 fn uses_tailwind(root: &Path, package: &Value) -> bool {
     package_has_dependency(package, "tailwindcss")
-        || contains_in_files(root, "@tailwind")
+        || !tailwind_directive_files(root).is_empty()
         || root.join("tailwind.config.js").is_file()
         || root.join("tailwind.config.ts").is_file()
         || postcss_config_references_tailwind(root)
 }
 
 fn postcss_config_references_tailwind(root: &Path) -> bool {
+    let Some(path) = postcss_config_path(root) else {
+        return false;
+    };
+    std::fs::read_to_string(path)
+        .is_ok_and(|content| content.to_ascii_lowercase().contains("tailwind"))
+}
+
+fn postcss_config_path(root: &Path) -> Option<PathBuf> {
     [
         "postcss.config.js",
         "postcss.config.mjs",
         "postcss.config.cjs",
     ]
     .iter()
-    .any(|rel| {
-        std::fs::read_to_string(root.join(rel))
-            .is_ok_and(|content| content.to_ascii_lowercase().contains("tailwind"))
+    .map(|rel| root.join(rel))
+    .find(|path| path.is_file())
+}
+
+fn tailwind_directive_files(root: &Path) -> Vec<PathBuf> {
+    [
+        "src/app/globals.css",
+        "src/app/global.css",
+        "app/globals.css",
+        "app/global.css",
+        "src/styles/globals.css",
+        "styles/globals.css",
+    ]
+    .iter()
+    .filter_map(|rel| {
+        let path = root.join(rel);
+        std::fs::read_to_string(&path)
+            .ok()
+            .filter(|content| content.contains("@tailwind"))
+            .map(|_| path)
     })
+    .collect()
+}
+
+fn imported_app_css_paths(root: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for rel in [
+        "src/app/layout.tsx",
+        "src/app/layout.jsx",
+        "src/app/layout.ts",
+        "src/app/layout.js",
+        "app/layout.tsx",
+        "app/layout.jsx",
+        "app/layout.ts",
+        "app/layout.js",
+    ] {
+        let layout_path = root.join(rel);
+        let Ok(content) = std::fs::read_to_string(&layout_path) else {
+            continue;
+        };
+        let layout_dir = layout_path.parent().unwrap_or(root);
+        for import in css_imports_from_content(&content) {
+            let path = layout_dir
+                .join(import.trim_start_matches("./"))
+                .components()
+                .collect::<PathBuf>();
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn css_imports_from_content(content: &str) -> Vec<String> {
+    let mut imports = Vec::new();
+    for quote in ['"', '\''] {
+        let mut parts = content.split(quote);
+        while let Some(_) = parts.next() {
+            let Some(candidate) = parts.next() else {
+                break;
+            };
+            if candidate.ends_with(".css") {
+                imports.push(candidate.to_string());
+            }
+        }
+    }
+    imports
 }
 
 fn package_has_dependency(package: &Value, name: &str) -> bool {
@@ -1329,6 +1415,142 @@ export default function Page() {
             report.status,
             VerifyStatus::ProfileContractFailed(reason) if reason.contains("Tailwind")
         ));
+    }
+
+    #[test]
+    fn nextjs_rejects_tailwind_without_autoprefixer_dependency() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/layout.tsx"),
+            "import './globals.css';\nexport default function Layout({children}:{children:React.ReactNode}){return children;}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tailwind.config.js"),
+            "module.exports = { content: ['./src/**/*.{ts,tsx}'], theme: { extend: {} }, plugins: [] };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("postcss.config.js"),
+            "module.exports = { plugins: { tailwindcss: {} } };\n",
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("autoprefixer")
+        ));
+    }
+
+    #[test]
+    fn nextjs_rejects_tailwind_postcss_config_without_plugins() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/layout.tsx"),
+            "import './globals.css';\nexport default function Layout({children}:{children:React.ReactNode}){return children;}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tailwind.config.js"),
+            "module.exports = { content: ['./src/**/*.{ts,tsx}'], theme: { extend: {} }, plugins: [] };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("postcss.config.js"),
+            "module.exports = { plugins: {} };\n",
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("PostCSS config must include the Tailwind plugin")
+        ));
+    }
+
+    #[test]
+    fn nextjs_rejects_tailwind_directive_css_not_imported_by_layout() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tailwind.config.js"),
+            "module.exports = { content: ['./src/**/*.{ts,tsx}'], theme: { extend: {} }, plugins: [] };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("postcss.config.js"),
+            "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n",
+        )
+        .unwrap();
+        let report = verify(dir.path(), "3011");
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("@tailwind CSS file must be imported")
+        ));
+    }
+
+    #[test]
+    fn nextjs_allows_plain_css_without_tailwind_toolchain() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("src/app/layout.tsx"),
+            "import './globals.css';\nexport default function Layout({children}:{children:React.ReactNode}){return children;}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "body { margin: 0; background: #05070d; color: white; }\n",
+        )
+        .unwrap();
+        assert!(verify(dir.path(), "3011").is_pass());
     }
 
     #[test]

@@ -218,6 +218,21 @@ class FailureClassificationTest(unittest.TestCase):
         )
         self.assertEqual(result["failure_kind"], "build_after_setup_failed")
 
+    def test_browser_http_500_is_distinct_runtime_acceptance_failure(self):
+        result = classify_events(
+            [
+                {
+                    "event": "browser_oracle_summary",
+                    "browser_success": False,
+                    "browser_failure_kind": "browser_http_500",
+                    "browser_details": {"status": "failed", "http_status": 500},
+                }
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "browser_http_500")
+        self.assertEqual(result["browser_http_status"], 500)
+        self.assertEqual(failure_layer_for_kind("browser_http_500"), "acceptance")
+
     def test_acceptance_summary_failure_is_classified(self):
         result = classify_events(
             [
