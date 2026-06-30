@@ -6,6 +6,9 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from eval_lib.run_summary import SUMMARY_HEADER, write_summary
 
 
 class EvalCliContractTest(unittest.TestCase):
@@ -178,6 +181,108 @@ class EvalCliContractTest(unittest.TestCase):
         self.assertEqual(provider_summary["status"], "passed")
         self.assertEqual(provider_summary["passed"], 1)
         self.assertEqual(provider_summary["skipped"], 1)
+
+    def test_eval_preflight_writes_comparative_parity_gate_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            run_root = td_path / "preflight"
+            mvp = td_path / "mvp.summary.eval.tsv"
+            source = td_path / "source.summary.eval.tsv"
+            report = td_path / "parity_gate_report.json"
+            write_summary(mvp, [summary_row(True), summary_row(True)])
+            write_summary(source, [summary_row(True), summary_row(True)])
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-preflight.py",
+                    "--suite",
+                    "eval/suites/mvp-smoke.yaml",
+                    "--model-profile",
+                    "openai-only",
+                    "--modes",
+                    "minimal-loop",
+                    "--runs",
+                    "1",
+                    "--binary",
+                    "python3",
+                    "--offline-ok",
+                    "--gate-level",
+                    "comparative",
+                    "--mvp-summary",
+                    str(mvp),
+                    "--anvildev-summary",
+                    str(source),
+                    "--write-parity-gate-report",
+                    str(report),
+                    "--run-root",
+                    str(run_root),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            generated = json.loads(report.read_text(encoding="utf-8"))
+            preflight = json.loads((run_root / "preflight.json").read_text(encoding="utf-8"))
+        self.assertEqual(generated["anvildev_comparison"]["status"], "compared")
+        self.assertEqual(generated["anvildev_comparison"]["threshold"]["status"], "pass")
+        self.assertTrue(preflight["parity_gate"]["ok"])
+
+    def test_eval_preflight_fails_comparative_gate_threshold(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            mvp = td_path / "mvp.summary.eval.tsv"
+            source = td_path / "source.summary.eval.tsv"
+            write_summary(mvp, [summary_row(False), summary_row(False)])
+            write_summary(source, [summary_row(True), summary_row(True)])
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-preflight.py",
+                    "--suite",
+                    "eval/suites/mvp-smoke.yaml",
+                    "--model-profile",
+                    "openai-only",
+                    "--modes",
+                    "minimal-loop",
+                    "--runs",
+                    "1",
+                    "--binary",
+                    "python3",
+                    "--offline-ok",
+                    "--gate-level",
+                    "comparative",
+                    "--mvp-summary",
+                    str(mvp),
+                    "--anvildev-summary",
+                    str(source),
+                    "--run-root",
+                    str(td_path / "preflight"),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 5, result.stdout)
+
+
+def summary_row(success: bool):
+    row = {key: "" for key in SUMMARY_HEADER}
+    row.update(
+        {
+            "run_id": f"r-{success}",
+            "suite": "s",
+            "scenario": "case",
+            "mode": "minimal-loop",
+            "success": str(success).lower(),
+            "rc": "0" if success else "1",
+            "failure_kind": "" if success else "runtime_failure",
+            "failure_layer": "" if success else "runtime",
+            "acceptance_success": str(success).lower(),
+            "acceptance_false_positive": "false",
+        }
+    )
+    return row
 
 
 if __name__ == "__main__":

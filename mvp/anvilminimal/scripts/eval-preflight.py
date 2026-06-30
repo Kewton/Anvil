@@ -17,6 +17,7 @@ from eval_lib.models import (
     openai_responses_smoke,
     required_providers_for_profile,
 )
+from eval_lib.parity_gate import build_parity_gate_report, validate_parity_gate_report
 from eval_lib.postcheck import port_available
 from eval_lib.process import command_available
 from eval_lib.suites import load_suite
@@ -35,6 +36,34 @@ def main() -> int:
     parser.add_argument("--run-root")
     parser.add_argument("--offline-ok", action="store_true")
     parser.add_argument("--ollama-host", default="http://localhost:11434")
+    parser.add_argument(
+        "--gate-level",
+        choices=["local", "network", "comparative", "release"],
+        default="local",
+        help="Requested parity gate level. Comparative/release checks are opt-in.",
+    )
+    parser.add_argument(
+        "--parity-gate-report",
+        help="Existing parity_gate_report.json to validate or update.",
+    )
+    parser.add_argument(
+        "--write-parity-gate-report",
+        help="Output path for generated parity_gate_report.json. Defaults to run-root when gate inputs are supplied.",
+    )
+    parser.add_argument("--mvp-summary", help="MVP summary.eval.tsv for parity comparison.")
+    parser.add_argument("--anvildev-summary", help="anvildev --engine minimal summary.eval.tsv for parity comparison.")
+    parser.add_argument(
+        "--intentional-difference-evidence",
+        action="append",
+        default=[],
+        help="Evidence path explaining an intentional MVP/source difference.",
+    )
+    parser.add_argument("--uat-evidence", action="append", default=[])
+    parser.add_argument("--browser-evidence", action="append", default=[])
+    parser.add_argument("--interaction-evidence", action="append", default=[])
+    parser.add_argument("--tui-events", action="append", default=[])
+    parser.add_argument("--warn-delta-pp", type=float, default=5.0)
+    parser.add_argument("--fail-delta-pp", type=float, default=10.0)
     parser.add_argument(
         "--live-provider-smoke",
         nargs="?",
@@ -105,6 +134,9 @@ def main() -> int:
             for smoke in provider.values():
                 if not smoke.get("ok"):
                     ok = False
+    parity_gate = parity_gate_status(args, run_root)
+    if parity_gate.get("requested") and not parity_gate.get("ok"):
+        ok = False
 
     payload = {
         "ok": ok,
@@ -117,10 +149,13 @@ def main() -> int:
         "ports": ports,
         "ollama": ollama,
         "live_provider_smoke": live_provider_smoke,
+        "parity_gate": parity_gate,
     }
     write_json(run_root / "preflight.json", payload)
     write_jsonl(run_root / "warnings.jsonl", warnings)
     print(json.dumps({"run_root": str(run_root), **payload}, ensure_ascii=False, indent=2))
+    if parity_gate.get("requested") and not parity_gate.get("ok"):
+        return 5
     if ok or args.offline_ok:
         return 0
     if any(status == "missing" for status in deps.values()):
@@ -128,6 +163,59 @@ def main() -> int:
     if any(status == "missing" for status in credentials.values()) or ollama:
         return 3
     return 4
+
+
+def parity_gate_status(args: argparse.Namespace, run_root: Path) -> dict:
+    requested = any(
+        [
+            args.parity_gate_report,
+            args.write_parity_gate_report,
+            args.mvp_summary,
+            args.anvildev_summary,
+            args.gate_level != "local",
+            args.uat_evidence,
+            args.browser_evidence,
+            args.interaction_evidence,
+            args.tui_events,
+        ]
+    )
+    if not requested:
+        return {"requested": False}
+    base_report = {}
+    if args.parity_gate_report:
+        base_report = json.loads(Path(args.parity_gate_report).read_text(encoding="utf-8"))
+    report = build_parity_gate_report(
+        base_report=base_report,
+        gate_level=args.gate_level,
+        mvp_summary_path=args.mvp_summary,
+        anvildev_summary_path=args.anvildev_summary,
+        uat_evidence_paths=args.uat_evidence,
+        browser_evidence_paths=args.browser_evidence,
+        interaction_evidence_paths=args.interaction_evidence,
+        tui_event_paths=args.tui_events,
+        intentional_difference_evidence_paths=args.intentional_difference_evidence,
+        warn_delta_pp=args.warn_delta_pp,
+        fail_delta_pp=args.fail_delta_pp,
+    )
+    output_path = (
+        Path(args.write_parity_gate_report)
+        if args.write_parity_gate_report
+        else run_root / "parity_gate_report.json"
+    )
+    write_json(output_path, report)
+    schema_errors = validate_parity_gate_report(report)
+    report_errors = list(report.get("errors", []) or [])
+    return {
+        "requested": True,
+        "ok": not schema_errors and not report_errors,
+        "gate_level": args.gate_level,
+        "report_path": str(output_path),
+        "schema_errors": schema_errors,
+        "report_errors": report_errors,
+        "warnings": list(report.get("warnings", []) or []),
+        "anvildev_comparison": report.get("anvildev_comparison", {}),
+        "uat_equivalent": report.get("uat_equivalent", {}),
+    }
 
 
 def smoke_openai_models(profile: dict, api_key: str | None) -> dict[str, dict]:

@@ -55,8 +55,33 @@
   "anvildev_comparison": {
     "status": "missing_current_same_condition_trace",
     "success_rate_delta_pp": null,
+    "threshold": {
+      "warn_delta_pp": 5.0,
+      "fail_delta_pp": 10.0,
+      "status": "missing_comparison"
+    },
     "stage_regressions": [],
     "required_next_trace": "Run anvildev --engine minimal with the same mvp-smoke/provider-smoke suites, model profile, modes, run count, and provider limits."
+  },
+  "comparative_gate_operation": {
+    "status": "implemented",
+    "preflight_cli": "mvp/anvilminimal/scripts/eval-preflight.py --gate-level comparative --mvp-summary <mvp-summary.eval.tsv> --anvildev-summary <anvildev-summary.eval.tsv> --write-parity-gate-report <parity_gate_report.json>",
+    "required_inputs": [
+      "MVP summary.eval.tsv",
+      "anvildev --engine minimal summary.eval.tsv",
+      "same suite/model profile/modes/runs/provider limits",
+      "intentional difference evidence when MVP is >=10pp below source"
+    ],
+    "threshold_policy": {
+      "warn_delta_pp": 5.0,
+      "fail_delta_pp": 10.0,
+      "correct_failure_detection_must_be_separated_from_regression": true
+    },
+    "rollback_policy": {
+      "blank_failure_kind_must_remain_blocked": true,
+      "build_only_false_positive_must_remain_blocked": true,
+      "threshold_can_be_downgraded_only_to_warning": true
+    }
   },
   "normalized_trace": {
     "status": "writer_available",
@@ -112,6 +137,15 @@
   "uat_equivalent": {
     "status": "partial",
     "evidence_paths": [],
+    "browser_readiness_evidence_paths": [],
+    "interaction_evidence_paths": [],
+    "tui_run_event_paths": [],
+    "missing_required_evidence": [
+      "uat_evidence_paths",
+      "browser_readiness_evidence_paths",
+      "interaction_evidence_paths",
+      "tui_run_event_paths"
+    ],
     "reason": "Latest manual TUI/browser readiness/interaction evidence is not attached to this gate report."
   },
   "current_success": {
@@ -157,6 +191,7 @@
     "G-S10 has repair follow-through fixtures after 022-5, but same-condition eval smoke and source/MVP trace diff are not yet rerun.",
     "G-S01/G-S02/G-S11 have TaskContract-lite obligation fixtures after 022-6, but source/MVP trace diff and manual UAT are not yet rerun.",
     "G-S12/G-S16 have final acceptance release-gate and TUI event fixtures after 022-7, but browser/manual UAT trace evidence is not yet attached.",
-    "G-S07/G-S15 have provider probe result attachment and tool args recovery after 022-8, but live provider probes and source/MVP trace diff are not yet rerun."
+    "G-S07/G-S15 have provider probe result attachment and tool args recovery after 022-8, but live provider probes and source/MVP trace diff are not yet rerun.",
+    "022-9 comparative/release gate operation is implemented in eval-preflight, but the latest MVP/anvildev same-condition comparison and release evidence have not been attached yet."
   ]
 }

@@ -10,6 +10,7 @@
 - `intentionally_different`: source と違うが、MVP 境界上の意図的差分として代替 gate がある。
 
 現状では最新同条件の `anvildev` trace が未登録であるため、全体として parity complete ではない。
+022-9 で comparative / release gate operation は `eval-preflight.py` に接続済みだが、実際の MVP/anvildev same-condition summary と browser/interaction/TUI evidence はまだ未添付である。
 
 | gate_id | lifecycle_stage | source_refs | mvp_refs | source_semantics | mvp_semantics | parity_status | difference_kind | affected_modes | affected_profiles | positive_fixture | negative_fixture | live_probe_required | gate_level | targeted_eval | comparison_threshold | uat_acceptance | failure_kind_coverage | complexity_impact | rollback_plan | owner_phase | status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

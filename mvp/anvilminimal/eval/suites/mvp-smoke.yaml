@@ -1,5 +1,16 @@
 name: mvp-smoke
 description: Short eval suite for PR and local smoke checks.
+parity_gate:
+  default_gate_level: comparative
+  source_binary_kind: anvildev
+  source_engine: minimal
+  warn_delta_pp: 5
+  fail_delta_pp: 10
+  require_same_condition_summary: true
+  required_release_evidence:
+    - browser_readiness
+    - interaction
+    - tui_run_events
 scenarios:
   - id: fix-js-date-helper-small
     size: small
