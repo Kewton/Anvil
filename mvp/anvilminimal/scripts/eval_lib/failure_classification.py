@@ -69,6 +69,8 @@ KNOWN_FAILURE_KINDS = {
     "verifier_missing",
     "verifier_bootstrap_blocked",
     "repair_target_misdirected",
+    "repair_target_not_followed",
+    "repair_unrelated_change",
     "repair_stagnation",
     "package_lock_stale",
     "profile_static_build_gap",
@@ -151,6 +153,8 @@ def failure_layer_for_kind(kind: str | None) -> str:
         "verifier_missing",
         "verifier_bootstrap_blocked",
         "repair_target_misdirected",
+        "repair_target_not_followed",
+        "repair_unrelated_change",
         "repair_stagnation",
         "package_lock_stale",
         "profile_static_build_gap",
@@ -246,6 +250,8 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         if name == "step_verify_repair" and event.get("failure_kind") in {
             "verify_repair_no_change",
             "repair_target_misdirected",
+            "repair_target_not_followed",
+            "repair_unrelated_change",
         }:
             return {
                 "failure_kind": event.get("failure_kind"),
@@ -401,6 +407,8 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             "verifier_missing",
             "verifier_bootstrap_blocked",
             "repair_target_misdirected",
+            "repair_target_not_followed",
+            "repair_unrelated_change",
             "repair_stagnation",
             "package_lock_stale",
             "profile_static_build_gap",
@@ -601,6 +609,10 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
         return {"failure_kind": "artifact_recovery_exhausted"}
     if "verify repair made no file changes" in lower:
         return {"failure_kind": "verify_repair_no_change"}
+    if "repair_target_not_followed" in lower or "target_not_followed" in lower:
+        return {"failure_kind": "repair_target_not_followed"}
+    if "repair_unrelated_change" in lower or "unrelated_change" in lower:
+        return {"failure_kind": "repair_unrelated_change"}
     if "test_framework_mismatch" in lower or "pytest_style_under_unittest" in lower:
         return {"failure_kind": "test_framework_mismatch"}
     if "test_discovery_failure" in lower or "no tests ran" in lower or "ran 0 tests" in lower:

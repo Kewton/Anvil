@@ -82,7 +82,7 @@ REC の状態は以下で管理する。
 | REC-002 | P0 | partial | browser readiness evidence、manual UAT、full eval、anvildev same-condition trace。 | release-level evidence 未実施。unit/eval では Tailwind installed evidence、plain CSS pass、browser HTTP 500 fail を確認済み。 |
 | REC-003 | P1 | partial | manual UAT、source/MVP trace diff、browser/interaction evidence。 | unit/eval では empty/scaffold/title/style/docs/manifest-only rejection、fallback event、fallback-only non-completion を確認済み。 |
 | REC-004 | P1 | partial | source/MVP trace diff、unsupported source obligation の deferred/intentionally_different 整理。 | unit/eval では obligation-to-artifact binding、missing implementation repair target、plan/ultra event 伝播を確認済み。 |
-| REC-005 | P1 | open | repair target follow-through fixture、no-change / target-not-followed classification、recovery YAML roundtrip。 | no-change repair の retry 継続、target 無関係変更の success、handoff 保存だけの success。 |
+| REC-005 | P1 | pass | 実装レベルの受入条件は unit/fixture/eval/YAML roundtrip で確認済み。release-level manual/TUI evidence は REC-010 で扱う。 | none。source full `RepairJob` は移植せず、MVP の薄い lifecycle 写像として管理する。 |
 | REC-006 | P1 | open | final acceptance fixture、browser/interaction evidence content、release gate report。 | build-only / path-only / browser unavailable の full pass 扱い。 |
 | REC-007 | P1 | open | MVP/anvildev same-condition normalized trace diff、G-S01〜G-S16 status update。 | code reference だけで parity pass、trace 欠損 gate の pass 扱い。 |
 | REC-008 | P2 | open | provider probe summary、skip reason、provider-specific args shape observation。 | fake fixture のみで provider-sensitive fix を完了扱い、unsafe args recovery。 |
@@ -461,6 +461,22 @@ source の repair は failure -> target -> allowed action -> follow-through -> r
 - 保存された recovery YAML を使った manual/fixture recovery 成功可否を gate に入れる。
 - repair が実行された場合、before/after changed paths と target relation を event に残す。
 - repair が verifier を弱める、package script を no-op 化する、または unrelated artifact だけを変更する場合は success にしない。
+
+### 実装結果
+
+| 項目 | 内容 |
+| --- | --- |
+| status | pass |
+| 実施日 | 2026-07-01 |
+| 実施 step | RECOVERY-001-C / REC-005 |
+| 実装概要 | MVP の repair lifecycle を failure -> `RepairTarget` -> allowed action -> repair turn changed paths -> target relation -> verifier rerun -> failure handoff の薄い写像へ寄せた。`no_change` は即座に `verify_repair_no_change` として分類し、target artifact を外した変更は `repair_target_not_followed`、unrelated artifact だけの変更は `repair_unrelated_change` として success にしない。repair 実行時は before/after changed paths、repair turn changed paths、target relation、allowed action を event に残す。bounded repair exhausted では recovery `.md` と recovery UltraPlan `.yaml` を保存するが、保存自体を success にはしない。 |
+| source parity 判断 | source と差分あり。source の full `RepairJob` / diagnostic-before-safe-stop / fresh read graph は丸ごと移植せず、MVP の `RepairTarget` と runner event に source semantics を写像した。 |
+| 証跡 | `mvp/anvilminimal/src/minimal_loop/repair_target.rs` unit tests: `target_not_followed` / `unrelated_change` / no-change follow-through classification。`mvp/anvilminimal/src/planner/runner.rs` unit tests: `step_repair_missing_entrypoint_followthrough_creates_expected_artifact`、`step_repair_no_change_is_classified_and_handoff_saved`、`step_repair_target_not_followed_is_classified_and_handoff_saved`、`step_repair_unrelated_change_is_classified_and_handoff_saved`、`saved_recovery_ultra_plan_can_drive_fixture_recovery_success`。`mvp/anvilminimal/src/minimal_loop/loop_run.rs` unit test: verify repair no-change handoff and recovery yaml saved。`mvp/anvilminimal/tests/eval/test_failure_classification.py`、`test_failure_snapshot_classification.py`、`test_runtime_scoring.py`: repair target relation taxonomy / scoring。 |
+| 通過した確認 | unit / fixture / targeted eval / full eval。`cargo test --manifest-path mvp/anvilminimal/Cargo.toml` は 409 passed。`pytest -q mvp/anvilminimal/tests/eval` は 202 passed, 1 skipped, 65 subtests passed。 |
+| 未確認事項 | manual TUI recovery UAT と source/MVP same-condition normalized trace diff は未実施。REC-005 の acceptance は fixture recovery gate で確認済みとし、manual/TUI evidence は REC-010、source trace diff は REC-007 で扱う。 |
+| blocking condition | none |
+| 次の確認タイミング | REC-007 source/MVP trace diff 後 / REC-010 manual TUI recovery UAT 後 / release gate 判定時 |
+| rollback 判断 | rollback 不要。残リスクは full source `RepairJob` を移植しないことによる診断力の差で、MVP では target relation taxonomy、event evidence、recovery YAML fixture gate で管理する。 |
 
 ---
 

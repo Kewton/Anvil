@@ -1083,9 +1083,15 @@ def score_build_lifecycle(events: list[dict[str, Any]]) -> dict[str, float | str
         completion_events = [
             dependency_lifecycle_completion_event(dependency_lifecycle_events)
         ]
+    stop = next((event for event in reversed(events) if event.get("event") == "loop_stop"), {})
+    stop_reason = str(stop.get("reason", ""))
     if not completion_events:
         step_bridge = score_step_runtime_bridge(events)
         repair_followthrough = score_repair_target_followthrough(events)
+        repair_target_resolution = score_repair_target_resolution_from_step_events(
+            events,
+            stop_reason=stop_reason,
+        )
         return {
             "build_verifier_completion_score": "",
             "dependency_setup_boundary_score": "",
@@ -1098,7 +1104,9 @@ def score_build_lifecycle(events: list[dict[str, Any]]) -> dict[str, float | str
             "repair_target_followthrough_score": round(repair_followthrough, 1)
             if isinstance(repair_followthrough, (int, float))
             else "",
-            "repair_target_resolution_score": "",
+            "repair_target_resolution_score": round(repair_target_resolution, 1)
+            if isinstance(repair_target_resolution, (int, float))
+            else "",
             "repair_stagnation_score": "",
             "profile_static_vs_build_gap_score": "",
         }
@@ -1109,8 +1117,6 @@ def score_build_lifecycle(events: list[dict[str, Any]]) -> dict[str, float | str
                 observations.append(observation)
     build_required = any(bool(event.get("build_verifier_required")) for event in completion_events)
     build_required = build_required or bool(observations)
-    stop = next((event for event in reversed(events) if event.get("event") == "loop_stop"), {})
-    stop_reason = str(stop.get("reason", ""))
     final_event = completion_events[-1]
     final_ok = bool(final_event.get("ok"))
     final_observations = [
@@ -1204,7 +1210,7 @@ def score_build_lifecycle(events: list[dict[str, Any]]) -> dict[str, float | str
     ]
     if final_ok:
         repair_target_resolution = 100.0
-    elif stop_reason == "repair_target_misdirected":
+    elif stop_reason in {"repair_target_misdirected", "repair_target_not_followed", "repair_unrelated_change"}:
         repair_target_resolution = 0.0
     elif repair_targets and repair_targets[-1] != "unknown":
         repair_target_resolution = 70.0
@@ -1224,6 +1230,8 @@ def score_build_lifecycle(events: list[dict[str, Any]]) -> dict[str, float | str
         "verify_repair_progress_unchanged",
         "verify_repair_progress_regressed",
         "verify_repair_progress_invalid",
+        "repair_target_not_followed",
+        "repair_unrelated_change",
     }:
         repair_stagnation = 20.0
     elif any(str(event.get("verdict", "")) == "improved" for event in progress_events):
@@ -1366,7 +1374,45 @@ def score_repair_target_followthrough(events: list[dict[str, Any]]) -> float | s
     if not repair_events:
         return ""
     followed = sum(1 for event in repair_events if event.get("repair_target_followed") is True)
-    return round(100.0 * followed / len(repair_events), 1)
+    score = 100.0 * followed / len(repair_events)
+    unrelated = sum(
+        1
+        for event in repair_events
+        if str(event.get("repair_follow_through", "")) == "unrelated_change"
+    )
+    target_not_followed = sum(
+        1
+        for event in repair_events
+        if str(event.get("repair_follow_through", "")) == "target_not_followed"
+    )
+    score -= 20.0 * unrelated
+    score -= 10.0 * target_not_followed
+    return round(clamp(score), 1)
+
+
+def score_repair_target_resolution_from_step_events(
+    events: list[dict[str, Any]], *, stop_reason: str
+) -> float | str:
+    repair_events = [
+        event
+        for event in events
+        if event.get("event") == "step_verify_repair"
+        and event.get("repair_target_followed") is not None
+    ]
+    if not repair_events:
+        return ""
+    if any(event.get("ok") is True for event in repair_events):
+        return 100.0
+    if stop_reason in {
+        "repair_target_misdirected",
+        "repair_target_not_followed",
+        "repair_unrelated_change",
+        "verify_repair_no_change",
+    }:
+        return 0.0
+    if any(event.get("repair_target_followed") is False for event in repair_events):
+        return 40.0
+    return 70.0
 
 
 def score_profile_repair_symmetry(

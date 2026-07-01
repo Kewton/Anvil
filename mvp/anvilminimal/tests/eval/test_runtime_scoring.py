@@ -137,6 +137,32 @@ class RuntimeScoringTest(unittest.TestCase):
             )
         self.assertEqual(score["prompt_contract_score"], 100.0)
 
+    def test_repair_followthrough_scores_target_relation_failures(self):
+        events = [
+            {"event": "provider_response", "tool_calls": 1},
+            {
+                "event": "step_verify_repair",
+                "ok": False,
+                "repair_target_followed": False,
+                "repair_follow_through": "unrelated_change",
+                "previous_repair_target": "missing_entrypoint",
+                "changed_paths_before": [],
+                "repair_turn_changed_paths": ["README.md"],
+                "changed_paths_after": ["README.md"],
+            },
+            {"event": "loop_stop", "reason": "repair_unrelated_change"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="plan-run",
+                success=False,
+                scenario={"expected_artifacts": ["src/app/page.tsx"]},
+                workdir=Path(td),
+            )
+        self.assertEqual(score["repair_target_followthrough_score"], 0.0)
+        self.assertEqual(score["repair_target_resolution_score"], 0.0)
+
     def test_step_obligation_scope_score_detects_disabled_extraction(self):
         events = [
             {"event": "provider_response", "tool_calls": 1},

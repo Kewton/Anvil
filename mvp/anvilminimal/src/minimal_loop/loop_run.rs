@@ -28,7 +28,9 @@ use super::prompt::{ToolPromptMode, build_request_messages};
 use super::repair_progress::{
     RepairProgressVerdict, VerificationSignature, classify_repair_progress,
 };
-use super::repair_target::{RepairTarget, classify_repair_target};
+use super::repair_target::{
+    RepairFollowThrough, RepairTarget, classify_repair_follow_through, classify_repair_target,
+};
 use super::verifier_bootstrap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +55,7 @@ pub struct RunSessionOutcome {
 
 const ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD: usize = 3;
 const ARTIFACT_RECOVERY_ATTEMPT_LIMIT: usize = 3;
-const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 3;
+const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 1;
 const RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT: usize = 2;
 const MALFORMED_NATIVE_TOOL_RETRY_LIMIT: usize = 2;
 
@@ -194,6 +196,7 @@ impl RunSessionStepKind {
 struct VerifyRepairState {
     pending_signature: Option<VerificationSignature>,
     pending_target: Option<RepairTarget>,
+    changed_paths_at_failure: Vec<String>,
     no_edit_turns: usize,
 }
 
@@ -591,8 +594,12 @@ pub(crate) fn run_session_with_outcome_with_options(
                 .filter(|contract| contract.has_verify())
             {
                 if let Some(feedback) = handle_verify_repair_no_edit(
+                    &config.workspace_root,
                     config.eval_events_path.as_deref(),
+                    contract,
+                    user_prompt,
                     &mut verify_repair_state,
+                    &changed_paths,
                 )? {
                     session.messages.pop();
                     last_blocking_reason = Some("verify repair missing edit".to_string());
@@ -606,6 +613,10 @@ pub(crate) fn run_session_with_outcome_with_options(
                     user_prompt,
                     &mut verify_attempts,
                     verify_repair_state.pending_signature.as_ref(),
+                    verify_repair_state.pending_target,
+                    &verify_repair_state.changed_paths_at_failure,
+                    &changed_paths,
+                    &[],
                     true,
                 ) {
                     Ok(None) => {
@@ -635,6 +646,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                         last_blocking_reason = Some("completion verify failed".to_string());
                         verify_repair_state.pending_signature = Some(feedback.signature);
                         verify_repair_state.pending_target = Some(feedback.target);
+                        verify_repair_state.changed_paths_at_failure = changed_paths.clone();
                         verify_repair_state.no_edit_turns = 0;
                         pending_feedback = Some(feedback.feedback);
                         continue;
@@ -667,6 +679,7 @@ pub(crate) fn run_session_with_outcome_with_options(
         };
         let mut names_seen = BTreeSet::new();
         let mut batch_had_edit = false;
+        let mut batch_changed_paths = Vec::new();
         let mut batch_non_edit_tools = 0usize;
         let missing_before_batch = missing_paths(&config.workspace_root, &required_paths);
         for call in tool_calls {
@@ -701,9 +714,13 @@ pub(crate) fn run_session_with_outcome_with_options(
                         write_or_edit_seen = true;
                         if let Some(path) =
                             changed_path_from_call(&config.workspace_root, &call.arguments)
-                            && !changed_paths.contains(&path)
                         {
-                            changed_paths.push(path);
+                            if !changed_paths.contains(&path) {
+                                changed_paths.push(path.clone());
+                            }
+                            if !batch_changed_paths.contains(&path) {
+                                batch_changed_paths.push(path);
+                            }
                         }
                     }
                     result
@@ -817,8 +834,12 @@ pub(crate) fn run_session_with_outcome_with_options(
             {
                 if !batch_had_edit
                     && let Some(feedback) = handle_verify_repair_no_edit(
+                        &config.workspace_root,
                         config.eval_events_path.as_deref(),
+                        contract,
+                        user_prompt,
                         &mut verify_repair_state,
+                        &changed_paths,
                     )?
                 {
                     last_blocking_reason = Some("verify repair missing edit".to_string());
@@ -832,6 +853,10 @@ pub(crate) fn run_session_with_outcome_with_options(
                     user_prompt,
                     &mut verify_attempts,
                     verify_repair_state.pending_signature.as_ref(),
+                    verify_repair_state.pending_target,
+                    &verify_repair_state.changed_paths_at_failure,
+                    &changed_paths,
+                    &batch_changed_paths,
                     batch_had_edit,
                 ) {
                     Ok(None) => {
@@ -863,6 +888,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                         last_blocking_reason = Some("completion verify failed".to_string());
                         verify_repair_state.pending_signature = Some(feedback.signature);
                         verify_repair_state.pending_target = Some(feedback.target);
+                        verify_repair_state.changed_paths_at_failure = changed_paths.clone();
                         verify_repair_state.no_edit_turns = 0;
                         pending_feedback = Some(feedback.feedback);
                         continue;
@@ -1181,6 +1207,10 @@ fn verify_completion_contract(
     goal: &str,
     verify_attempts: &mut usize,
     previous_signature: Option<&VerificationSignature>,
+    previous_target: Option<RepairTarget>,
+    changed_paths_before: &[String],
+    changed_paths_after: &[String],
+    repair_turn_changed_paths: &[String],
     had_edit: bool,
 ) -> anyhow::Result<Option<VerifyFailureFeedback>> {
     *verify_attempts += 1;
@@ -1193,6 +1223,16 @@ fn verify_completion_contract(
     let ok = report.is_pass();
     let (signature, verdict) = classify_repair_progress(previous_signature, &report, had_edit);
     let repair_target = classify_repair_target(&report);
+    let repair_follow_through = previous_target
+        .map(|target| classify_repair_follow_through(target, repair_turn_changed_paths));
+    let repair_follow_through_label = repair_follow_through
+        .map(RepairFollowThrough::as_str)
+        .unwrap_or("");
+    let repair_failure_kind = repair_follow_through
+        .and_then(RepairFollowThrough::failure_kind)
+        .unwrap_or("");
+    let repair_target_followed = repair_follow_through.map(RepairFollowThrough::followed);
+    let previous_repair_target = previous_target.map(RepairTarget::as_str).unwrap_or("");
     let build_verifier_required = build_verifier_lifecycles
         .iter()
         .any(|lifecycle| lifecycle.requirement.required_for_completion);
@@ -1254,6 +1294,28 @@ fn verify_completion_contract(
             "repair_progress": verdict.as_str(),
         }),
     );
+    if previous_target.is_some() {
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "step_verify_repair",
+                "mode": "minimal-loop",
+                "attempt": *verify_attempts,
+                "ok": ok,
+                "repair_target": repair_target.as_str(),
+                "previous_repair_target": previous_repair_target,
+                "repair_target_followed": repair_target_followed,
+                "target_relation": repair_follow_through_label,
+                "repair_follow_through": repair_follow_through_label,
+                "failure_kind": repair_failure_kind,
+                "changed_paths_before": changed_paths_before,
+                "changed_paths_after": changed_paths_after,
+                "repair_turn_changed_paths": repair_turn_changed_paths,
+                "allowed_action": previous_target.map(RepairTarget::allowed_action).unwrap_or(""),
+                "primary_reason": eval_events::body_snippet(&report.primary_reason()),
+            }),
+        );
+    }
     for lifecycle in &build_verifier_lifecycles {
         super::build_verifier::emit_dependency_build_lifecycle(
             eval_events_path,
@@ -1290,6 +1352,18 @@ fn verify_completion_contract(
             previous_signature,
             verdict,
             repair_target,
+            repair_follow_through,
+        );
+        let recovery_paths = save_minimal_recovery_handoff(
+            root,
+            eval_events_path,
+            contract,
+            goal,
+            &stop_reason,
+            &report.primary_reason(),
+            &report,
+            changed_paths_after,
+            repair_target,
         );
         eval_events::emit(
             eval_events_path,
@@ -1307,8 +1381,24 @@ fn verify_completion_contract(
                 "repair_progress": verdict.as_str(),
                 "failure_signature": signature.label(),
                 "repair_target": repair_target.as_str(),
+                "previous_repair_target": previous_repair_target,
+                "repair_target_followed": repair_target_followed,
+                "target_relation": repair_follow_through_label,
+                "repair_follow_through": repair_follow_through_label,
+                "changed_paths_before": changed_paths_before,
+                "changed_paths_after": changed_paths_after,
+                "repair_turn_changed_paths": repair_turn_changed_paths,
                 "dependency_setup_status": dependency_setup_status,
                 "verifier_bootstrap_state": verifier_bootstrap_state.as_str(),
+                "recovery_prompt_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.prompt_path.clone())
+                    .unwrap_or_default(),
+                "recovery_ultra_plan_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.yaml_path.clone())
+                    .unwrap_or_default(),
+                "recovery_yaml_missing": recovery_paths.is_none(),
                 "build_verifier_lifecycle": build_verifier_lifecycles.clone(),
                 "build_verifier_statuses": build_verifier_observations
                     .iter()
@@ -1327,6 +1417,116 @@ fn verify_completion_contract(
         signature,
         target: repair_target,
     }))
+}
+
+#[derive(Debug, Clone)]
+struct MinimalRecoveryPaths {
+    prompt_path: String,
+    yaml_path: String,
+}
+
+fn save_minimal_recovery_handoff(
+    root: &Path,
+    eval_events_path: Option<&Path>,
+    contract: &CompletionContract,
+    goal: &str,
+    failure_kind: &str,
+    primary_reason: &str,
+    report: &crate::planner::verify::VerificationReport,
+    changed_paths: &[String],
+    repair_target: RepairTarget,
+) -> Option<MinimalRecoveryPaths> {
+    let profile = contract
+        .profile
+        .clone()
+        .unwrap_or_else(|| "generic".to_string());
+    let original_goal = contract
+        .goal
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| goal.to_string());
+    let failure_evidence = std::iter::once(primary_reason.to_string())
+        .chain(report.dependency_missing.iter().cloned())
+        .chain(
+            report
+                .command_failures
+                .iter()
+                .map(|failure| format!("{}: {}", failure.command, failure.reason)),
+        )
+        .chain(report.profile_failures.iter().cloned())
+        .collect::<Vec<_>>();
+    let handoff = crate::planner::repair::RecoveryHandoff {
+        profile: profile.clone(),
+        original_goal,
+        failed_phase: Some("minimal-loop".to_string()),
+        failed_step: Some("completion-verify".to_string()),
+        failure_kind: failure_kind.to_string(),
+        failure_evidence,
+        missing_paths: report.missing_paths.clone(),
+        missing_capabilities: contract.required_capabilities.clone(),
+        verify_commands: contract.verify_commands.clone(),
+        changed_paths: changed_paths.to_vec(),
+        repair_targets: vec![repair_target.as_str().to_string()],
+    };
+    let prompt_path =
+        match crate::planner::repair::save_ultra_recovery_prompt(root, "minimal-loop", &handoff) {
+            Ok(path) => path,
+            Err(err) => {
+                eval_events::emit(
+                    eval_events_path,
+                    json!({
+                        "event": "recovery_prompt_save_failed",
+                        "recovery_handoff_kind": failure_kind,
+                        "reason": eval_events::body_snippet(&err.to_string()),
+                        "status": "incomplete",
+                    }),
+                );
+                return None;
+            }
+        };
+    let yaml_path =
+        match crate::planner::repair::save_recovery_ultra_plan(root, "minimal-loop", &handoff) {
+            Ok(path) => path,
+            Err(err) => {
+                eval_events::emit(
+                    eval_events_path,
+                    json!({
+                        "event": "recovery_ultra_plan_save_failed",
+                        "recovery_handoff_kind": failure_kind,
+                        "recovery_prompt_path": prompt_path.display().to_string(),
+                        "reason": eval_events::body_snippet(&err.to_string()),
+                        "recovery_yaml_missing": true,
+                        "status": "incomplete",
+                    }),
+                );
+                return None;
+            }
+        };
+    let suggested_prompt_command =
+        crate::planner::repair::suggested_ultra_recovery_command(&prompt_path, &profile);
+    let suggested_yaml_command =
+        crate::planner::repair::suggested_recovery_ultra_plan_command(&yaml_path);
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "recovery_prompt_saved",
+            "recovery_handoff_kind": failure_kind,
+            "recovery_prompt_path": prompt_path.display().to_string(),
+            "recovery_ultra_plan_path": yaml_path.display().to_string(),
+            "recovery_yaml_missing": false,
+            "recovery_yaml_roundtrip_ok": true,
+            "suggested_recovery_command": suggested_prompt_command,
+            "suggested_recovery_yaml_command": suggested_yaml_command,
+            "recovery_profile": profile,
+            "local_repair_exhausted": true,
+            "failure_kind": failure_kind,
+            "status": "incomplete",
+        }),
+    );
+    Some(MinimalRecoveryPaths {
+        prompt_path: prompt_path.display().to_string(),
+        yaml_path: yaml_path.display().to_string(),
+    })
 }
 
 fn dependency_setup_status(lifecycles: &[BuildVerifierLifecycleObservation]) -> &'static str {
@@ -1373,8 +1573,12 @@ fn dependency_setup_status(lifecycles: &[BuildVerifierLifecycleObservation]) -> 
 }
 
 fn handle_verify_repair_no_edit(
+    root: &Path,
     eval_events_path: Option<&Path>,
+    contract: &CompletionContract,
+    goal: &str,
     state: &mut VerifyRepairState,
+    changed_paths: &[String],
 ) -> anyhow::Result<Option<String>> {
     let Some(signature) = state.pending_signature.as_ref() else {
         return Ok(None);
@@ -1392,6 +1596,22 @@ fn handle_verify_repair_no_edit(
         }),
     );
     if state.no_edit_turns >= VERIFY_REPAIR_NO_EDIT_LIMIT {
+        let repair_target = state.pending_target.unwrap_or(RepairTarget::Unknown);
+        let report = crate::planner::verify::VerificationReport::profile_failed(format!(
+            "verify_repair_no_change: no file changes after verifier failure {}",
+            signature.label()
+        ));
+        let recovery_paths = save_minimal_recovery_handoff(
+            root,
+            eval_events_path,
+            contract,
+            goal,
+            "verify_repair_no_change",
+            &report.primary_reason(),
+            &report,
+            changed_paths,
+            repair_target,
+        );
         eval_events::emit(
             eval_events_path,
             json!({
@@ -1399,6 +1619,21 @@ fn handle_verify_repair_no_edit(
                 "reason": "verify_repair_no_change",
                 "failure_signature": signature.label(),
                 "repair_target": state.pending_target.map(RepairTarget::as_str).unwrap_or(""),
+                "repair_target_followed": false,
+                "target_relation": "no_change",
+                "repair_follow_through": "no_change",
+                "changed_paths_before": state.changed_paths_at_failure.clone(),
+                "changed_paths_after": changed_paths,
+                "repair_turn_changed_paths": Vec::<String>::new(),
+                "recovery_prompt_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.prompt_path.clone())
+                    .unwrap_or_default(),
+                "recovery_ultra_plan_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.yaml_path.clone())
+                    .unwrap_or_default(),
+                "recovery_yaml_missing": recovery_paths.is_none(),
                 "no_edit_turns": state.no_edit_turns,
             }),
         );
@@ -1417,7 +1652,11 @@ fn terminal_verify_stop_reason(
     previous_signature: Option<&VerificationSignature>,
     verdict: RepairProgressVerdict,
     repair_target: RepairTarget,
+    repair_follow_through: Option<RepairFollowThrough>,
 ) -> String {
+    if let Some(kind) = repair_follow_through.and_then(RepairFollowThrough::failure_kind) {
+        return kind.to_string();
+    }
     if !report.dependency_missing.is_empty() {
         return "dependency_setup_missing".to_string();
     }
@@ -2415,6 +2654,7 @@ export default function Page(){
     fn verify_failure_requires_edit_after_repeated_no_change() {
         let dir = tempfile::tempdir().unwrap();
         let contract = dir.path().join("contract.json");
+        let events = dir.path().join("events.jsonl");
         std::fs::write(
             &contract,
             r#"{"required_paths":["a.py"],"verify_commands":["python3 -m py_compile a.py"],"verify_repair_cap":3}"#,
@@ -2422,6 +2662,7 @@ export default function Page(){
         .unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
+        cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 6;
         let mut fake = Fake {
             replies: vec![
@@ -2469,6 +2710,14 @@ export default function Page(){
         .unwrap_err()
         .to_string();
         assert!(err.contains("verify repair made no file changes"));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"reason\":\"verify_repair_no_change\""));
+        assert!(event_text.contains("\"repair_follow_through\":\"no_change\""));
+        assert!(event_text.contains("\"changed_paths_before\":[\"a.py\"]"));
+        assert!(event_text.contains("\"changed_paths_after\":[\"a.py\"]"));
+        assert!(event_text.contains("\"recovery_yaml_missing\":false"));
+        assert!(dir.path().join(".anvil/repairs").is_dir());
+        assert!(dir.path().join(".anvil/plans").is_dir());
     }
 
     #[test]

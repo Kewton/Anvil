@@ -47,8 +47,8 @@ const STEP_TURN_MAX_ITERATIONS: usize = 8;
 const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
 const STEP_REPAIR_MAX_TURNS: usize = 4;
 const STEP_REPAIR_MAX_FILE_CHANGING_TURNS: usize = 2;
-const STEP_REPAIR_NO_CHANGE_LIMIT: usize = 2;
-const STEP_REPAIR_MISDIRECTED_LIMIT: usize = 2;
+const STEP_REPAIR_NO_CHANGE_LIMIT: usize = 1;
+const STEP_REPAIR_TARGET_NOT_FOLLOWED_LIMIT: usize = 2;
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
 const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 1;
 
@@ -730,7 +730,7 @@ fn run_step(
     let mut repair_stop_reason = None;
     let mut terminal_repair_failure_kind: Option<&'static str> = None;
     let mut no_change_repairs = 0usize;
-    let mut misdirected_repairs = 0usize;
+    let mut target_not_followed_repairs = 0usize;
     let mut file_changing_repairs = 0usize;
     let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
     for attempt in 1..=STEP_REPAIR_MAX_TURNS {
@@ -757,6 +757,7 @@ fn run_step(
         })?;
         outcome.repair_attempts = attempt;
         repair_stop_reason = Some(format!("{:?}", repair.stop_reason));
+        let changed_paths_before_repair = context.changed_files.clone();
         let mut repair_turn_changed_paths = repair.changed_paths.clone();
         merge_changed_files(&mut context, &repair.changed_paths);
         merge_unique_strings(&mut outcome.changed_paths, &repair.changed_paths);
@@ -808,20 +809,20 @@ fn run_step(
             RepairFollowThrough::NoChange => {
                 no_change_repairs += 1;
             }
-            RepairFollowThrough::TargetMisdirected => {
-                misdirected_repairs += 1;
+            RepairFollowThrough::TargetNotFollowed | RepairFollowThrough::UnrelatedChange => {
+                target_not_followed_repairs += 1;
             }
             RepairFollowThrough::TargetMatched => {
                 no_change_repairs = 0;
-                misdirected_repairs = 0;
+                target_not_followed_repairs = 0;
             }
         }
         let repair_failure_kind = match repair_follow_through {
             RepairFollowThrough::NoChange if no_change_repairs >= STEP_REPAIR_NO_CHANGE_LIMIT => {
                 repair_follow_through.failure_kind().unwrap_or("")
             }
-            RepairFollowThrough::TargetMisdirected
-                if misdirected_repairs >= STEP_REPAIR_MISDIRECTED_LIMIT =>
+            RepairFollowThrough::TargetNotFollowed | RepairFollowThrough::UnrelatedChange
+                if target_not_followed_repairs >= STEP_REPAIR_TARGET_NOT_FOLLOWED_LIMIT =>
             {
                 repair_follow_through.failure_kind().unwrap_or("")
             }
@@ -849,10 +850,15 @@ fn run_step(
                 "repair_target": retry_target.as_str(),
                 "previous_repair_target": previous_target.as_str(),
                 "repair_target_followed": repair_target_followed,
+                "target_relation": repair_follow_through.as_str(),
                 "repair_follow_through": repair_follow_through.as_str(),
                 "failure_kind": repair_failure_kind,
                 "primary_reason": eval_events::body_snippet(&retry.primary_reason()),
                 "changed_paths": repair_turn_changed_paths.clone(),
+                "changed_paths_before": changed_paths_before_repair,
+                "changed_paths_after": context.changed_files.clone(),
+                "repair_turn_changed_paths": repair_turn_changed_paths.clone(),
+                "allowed_action": previous_target.allowed_action(),
                 "repair_stop_reason": repair_stop_reason.clone().unwrap_or_default(),
                 "dependency_setup_authority": setup_authority.as_str(),
             }),
@@ -879,8 +885,12 @@ fn run_step(
             terminal_repair_failure_kind = Some("verify_repair_no_change");
             break;
         }
-        if misdirected_repairs >= STEP_REPAIR_MISDIRECTED_LIMIT {
-            terminal_repair_failure_kind = Some("repair_target_misdirected");
+        if target_not_followed_repairs >= STEP_REPAIR_TARGET_NOT_FOLLOWED_LIMIT {
+            terminal_repair_failure_kind = Some(
+                repair_follow_through
+                    .failure_kind()
+                    .unwrap_or("repair_target_not_followed"),
+            );
             break;
         }
         if file_changing_repairs >= STEP_REPAIR_MAX_FILE_CHANGING_TURNS {
@@ -5801,7 +5811,7 @@ mod tests {
         assert!(event_text.contains("\"event\":\"deterministic_scaffold_recovery\""));
         assert!(event_text.contains("\"used_for_completion\":false"));
         assert!(event_text.contains("\"event\":\"profile_auto_repair_continuation_incomplete\""));
-        assert!(event_text.contains("\"repair_follow_through\":\"target_misdirected\""));
+        assert!(event_text.contains("\"repair_follow_through\":\"unrelated_change\""));
         assert!(event_text.contains("\"event\":\"profile_repair_complete\""));
         assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
     }
@@ -6511,6 +6521,10 @@ export default function Page(){
         assert!(event_text.contains("\"previous_repair_target\":\"missing_entrypoint\""));
         assert!(event_text.contains("\"repair_follow_through\":\"target_matched\""));
         assert!(event_text.contains("\"repair_target_followed\":true"));
+        assert!(event_text.contains("\"changed_paths_before\""));
+        assert!(event_text.contains("\"changed_paths_after\""));
+        assert!(event_text.contains("\"repair_turn_changed_paths\":[\"src/app/page.tsx\"]"));
+        assert!(event_text.contains("\"allowed_action\":\"create_missing_entrypoint_artifact\""));
     }
 
     #[test]
@@ -6594,7 +6608,157 @@ export default function Page(){
     }
 
     #[test]
+    fn saved_recovery_ultra_plan_can_drive_fixture_recovery_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let handoff = RecoveryHandoff {
+            profile: "generic".to_string(),
+            original_goal: "Create app entrypoint".to_string(),
+            failed_phase: Some("minimal-loop".to_string()),
+            failed_step: Some("completion-verify".to_string()),
+            failure_kind: "verify_repair_no_change".to_string(),
+            failure_evidence: vec!["src/app/page.tsx is missing".to_string()],
+            missing_paths: vec!["src/app/page.tsx".to_string()],
+            missing_capabilities: Vec::new(),
+            verify_commands: vec!["test -f src/app/page.tsx".to_string()],
+            changed_paths: Vec::new(),
+            repair_targets: vec!["missing_entrypoint".to_string()],
+        };
+        let recovery_path =
+            save_recovery_ultra_plan(dir.path(), "fixture-recovery", &handoff).unwrap();
+        let recovery_plan =
+            parse_ultra_plan(&std::fs::read_to_string(&recovery_path).unwrap()).unwrap();
+        assert_eq!(
+            parse_ultra_plan(&render_ultra_plan(&recovery_plan)).unwrap(),
+            recovery_plan
+        );
+        let inspect_plan =
+            serde_json::to_string(&StepPlan::single("Inspect current state")).unwrap();
+        let repair_plan = serde_json::to_string(&StepPlan {
+            goal: "Repair missing entrypoint".to_string(),
+            steps: vec![PlanStep {
+                id: "repair-entrypoint".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create src/app/page.tsx".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: Vec::new(),
+            }],
+        })
+        .unwrap();
+        let verify_plan = serde_json::to_string(&StepPlan {
+            goal: "Verify recovered entrypoint".to_string(),
+            steps: vec![PlanStep {
+                id: "verify-entrypoint".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify src/app/page.tsx exists".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["test -f src/app/page.tsx".to_string()],
+            }],
+        })
+        .unwrap();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(inspect_plan),
+            AssistantReply::text(repair_plan),
+            AssistantReply::text(verify_plan.clone()),
+            AssistantReply::text(verify_plan.clone()),
+            AssistantReply::text(verify_plan),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main>recovered</main>;}\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("verified"),
+        ]);
+        let result = run_ultra_plan(&mut planner, &mut execution, &recovery_plan, &cfg).unwrap();
+        assert_eq!(result, "ultra-plan-run complete: 3 phases");
+        assert!(dir.path().join("src/app/page.tsx").is_file());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
+    }
+
+    #[test]
     fn step_repair_target_not_followed_is_classified_and_handoff_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let plan = StepPlan {
+            goal: "Create app entrypoint\n\nRequired final artifacts:\n- src/app/page.tsx"
+                .to_string(),
+            steps: vec![PlanStep {
+                id: "entrypoint".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify and repair src/app/page.tsx if missing".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["test -f src/app/page.tsx".to_string()],
+            }],
+        };
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("initial incomplete"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/widget.tsx","content":"export function Widget(){return null;}"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("repair one done"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/sidebar.tsx","content":"export function Sidebar(){return null;}"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("repair two done"),
+        ]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repair prompt saved"), "{err}");
+        assert!(!dir.path().join("src/app/page.tsx").exists());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"repair_follow_through\":\"target_not_followed\""));
+        assert!(event_text.contains("\"reason\":\"repair_target_not_followed\""));
+        assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
+        assert!(event_text.contains("\"failure_kind\":\"repair_target_not_followed\""));
+    }
+
+    #[test]
+    fn step_repair_unrelated_change_is_classified_and_handoff_saved() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
@@ -6649,10 +6813,10 @@ export default function Page(){
         assert!(err.contains("repair prompt saved"), "{err}");
         assert!(!dir.path().join("src/app/page.tsx").exists());
         let event_text = std::fs::read_to_string(events).unwrap();
-        assert!(event_text.contains("\"repair_follow_through\":\"target_misdirected\""));
-        assert!(event_text.contains("\"reason\":\"repair_target_misdirected\""));
+        assert!(event_text.contains("\"repair_follow_through\":\"unrelated_change\""));
+        assert!(event_text.contains("\"reason\":\"repair_unrelated_change\""));
         assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
-        assert!(event_text.contains("\"failure_kind\":\"repair_target_misdirected\""));
+        assert!(event_text.contains("\"failure_kind\":\"repair_unrelated_change\""));
     }
 
     #[test]

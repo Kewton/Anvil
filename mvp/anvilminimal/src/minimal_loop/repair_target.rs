@@ -18,7 +18,8 @@ pub enum RepairTarget {
 pub enum RepairFollowThrough {
     NoChange,
     TargetMatched,
-    TargetMisdirected,
+    TargetNotFollowed,
+    UnrelatedChange,
 }
 
 impl RepairFollowThrough {
@@ -26,14 +27,16 @@ impl RepairFollowThrough {
         match self {
             Self::NoChange => "no_change",
             Self::TargetMatched => "target_matched",
-            Self::TargetMisdirected => "target_misdirected",
+            Self::TargetNotFollowed => "target_not_followed",
+            Self::UnrelatedChange => "unrelated_change",
         }
     }
 
     pub fn failure_kind(self) -> Option<&'static str> {
         match self {
             Self::NoChange => Some("verify_repair_no_change"),
-            Self::TargetMisdirected => Some("repair_target_misdirected"),
+            Self::TargetNotFollowed => Some("repair_target_not_followed"),
+            Self::UnrelatedChange => Some("repair_unrelated_change"),
             Self::TargetMatched => None,
         }
     }
@@ -91,6 +94,22 @@ impl RepairTarget {
             Self::Unknown => {
                 "Inspect the verification reason and edit the smallest relevant file set."
             }
+        }
+    }
+
+    pub fn allowed_action(self) -> &'static str {
+        match self {
+            Self::DependencySetup => "edit_setup_manifest_or_installable_dependency_artifact",
+            Self::PackageConfig => "edit_package_manifest_or_lockfile",
+            Self::FrameworkConfig => "edit_framework_configuration_or_route_boundary",
+            Self::MissingEntrypoint => "create_missing_entrypoint_artifact",
+            Self::EmptyApp | Self::CapabilityMissing | Self::Implementation => {
+                "edit_task_implementation_artifact"
+            }
+            Self::RequiredEvidenceMissing | Self::TestOrEvidence => {
+                "edit_or_create_verification_evidence"
+            }
+            Self::Unknown => "edit_smallest_relevant_workspace_artifact",
         }
     }
 }
@@ -378,8 +397,13 @@ pub fn classify_repair_follow_through(
         .any(|path| repair_target_matches_changed_path(target, path))
     {
         RepairFollowThrough::TargetMatched
+    } else if changed_paths
+        .iter()
+        .any(|path| repair_change_is_related_to_task_artifact(path))
+    {
+        RepairFollowThrough::TargetNotFollowed
     } else {
-        RepairFollowThrough::TargetMisdirected
+        RepairFollowThrough::UnrelatedChange
     }
 }
 
@@ -390,6 +414,47 @@ pub fn repair_target_followed(target: RepairTarget, changed_paths: &[String]) ->
 fn contains_any(value: &str, needles: &[&str]) -> bool {
     let lower = value.to_ascii_lowercase();
     needles.iter().any(|needle| lower.contains(needle))
+}
+
+fn repair_change_is_related_to_task_artifact(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.starts_with(".anvil/")
+        || lower.starts_with(".git/")
+        || lower.starts_with("docs/")
+        || lower.ends_with(".md")
+    {
+        return false;
+    }
+    contains_any(
+        &lower,
+        &[
+            "src/",
+            "app/",
+            "pages/",
+            "tests/",
+            "__tests__/",
+            "test",
+            "spec",
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "cargo.toml",
+            "cargo.lock",
+            "pyproject.toml",
+            "requirements.txt",
+            "tsconfig",
+            "next.config",
+            "tailwind",
+            "postcss",
+            ".rs",
+            ".py",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+        ],
+    )
 }
 
 #[cfg(test)]
@@ -449,13 +514,24 @@ mod tests {
     }
 
     #[test]
-    fn repair_follow_through_distinguishes_target_misdirected() {
+    fn repair_follow_through_distinguishes_target_not_followed() {
+        assert_eq!(
+            classify_repair_follow_through(
+                RepairTarget::MissingEntrypoint,
+                &["src/app/widget.tsx".to_string()]
+            ),
+            RepairFollowThrough::TargetNotFollowed
+        );
+    }
+
+    #[test]
+    fn repair_follow_through_distinguishes_unrelated_change() {
         assert_eq!(
             classify_repair_follow_through(
                 RepairTarget::MissingEntrypoint,
                 &["README.md".to_string()]
             ),
-            RepairFollowThrough::TargetMisdirected
+            RepairFollowThrough::UnrelatedChange
         );
     }
 

@@ -225,6 +225,37 @@ class FailureClassificationTest(unittest.TestCase):
         self.assertEqual(result["failure_kind"], "step_verify_failure")
         self.assertEqual(failure_layer_for_kind(result["failure_kind"]), "bridge")
 
+    def test_step_repair_target_not_followed_is_distinct_failure_kind(self):
+        result = classify_events(
+            [
+                {
+                    "event": "step_verify_repair",
+                    "failure_kind": "repair_target_not_followed",
+                    "previous_repair_target": "missing_entrypoint",
+                    "repair_follow_through": "target_not_followed",
+                }
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "repair_target_not_followed")
+        self.assertEqual(result["repair_target"], "missing_entrypoint")
+        self.assertEqual(result["repair_follow_through"], "target_not_followed")
+        self.assertEqual(failure_layer_for_kind(result["failure_kind"]), "runtime")
+
+    def test_step_repair_unrelated_change_is_distinct_failure_kind(self):
+        result = classify_events(
+            [
+                {
+                    "event": "step_verify_repair",
+                    "failure_kind": "repair_unrelated_change",
+                    "previous_repair_target": "missing_entrypoint",
+                    "repair_follow_through": "unrelated_change",
+                }
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "repair_unrelated_change")
+        self.assertEqual(result["repair_follow_through"], "unrelated_change")
+        self.assertEqual(failure_layer_for_kind(result["failure_kind"]), "runtime")
+
     def test_ultra_phase_execute_failure_is_runtime_not_stale_planning(self):
         result = classify_events(
             [
