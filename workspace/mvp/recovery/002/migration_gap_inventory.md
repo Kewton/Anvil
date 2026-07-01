@@ -87,16 +87,16 @@ G10 は横断 gap として扱う。runtime summary の比較可能性は RECOVE
 | id | priority | category | title | current_status |
 | --- | --- | --- | --- | --- |
 | G01 | P0 | `semantic_drift` | release gate partial が command completion / success semantics に接続されない | partial |
-| G02 | P0 | `new_release_gate_gap` | browser readiness を通常 final acceptance で実行・取得していない | open |
+| G02 | P0 | `new_release_gate_gap` | browser readiness を通常 final acceptance で実行・取得していない | partial |
 | G03 | P0 | `acceptance_bridge_gap` | browser/dev route failure が repair target / recovery UltraPlan に接続されない | open |
-| G04 | P0 | `semantic_drift` | Next.js/Tailwind dev pipeline が build verifier lifecycle に含まれていない | open |
+| G04 | P0 | `semantic_drift` | Next.js/Tailwind dev pipeline が build verifier lifecycle に含まれていない | partial |
 | G05 | P1 | `acceptance_bridge_gap` | static capability evidence が interactive behavior を過大評価する | open |
 | G06 | P1 | `semantic_drift` | verifier command policy と runtime Bash policy が一致しない | open |
 | G07 | P1 | `diagnostic_gap` | TUI/summary が partial artifact を完成品に見せる | partial |
 | G08 | P1 | `migration_missing` | source の repair handoff semantics が release gate partial/fail に横展開されていない | open |
 | G09 | P2 | `diagnostic_gap` | RECOVERY-001 の pass 判定が UAT/release evidence に十分連動していない | open |
 | G10 | P2 | `acceptance_bridge_gap` | source/MVP 比較が aggregate success に寄り、completion authority 差分を見落とす | partial |
-| G11 | P0 | `new_release_gate_gap` | browser readiness の dev server lifecycle が controller にない | open |
+| G11 | P0 | `new_release_gate_gap` | browser readiness の dev server lifecycle が controller にない | partial |
 | G12 | P1 | `diagnostic_gap` | planner verify normalization / quality warning が不安定性として gate に残らない | open |
 | G13 | P0 | `acceptance_bridge_gap` | CompletionContract / external contract が通常 TUI ultra-run に bind されていない | open |
 | G14 | P2 | `semantic_drift` | step kind の role authority が弱く、setup/verify/report と implementation の責務境界が曖昧 | open |
@@ -203,6 +203,14 @@ browser readiness が eval/release artifact として後付けされ、runtime c
 - browser unavailable は partial、HTTP 500 は fail とする。
 - probe が実行できない環境でも full success にはしない。
 
+### RECOVERY-002-B evidence
+
+- `mvp/anvilminimal/src/planner/runner.rs` の `browser_release_gate` が browser readiness evidence missing 時に Next.js dev route probe を生成し、`browser-readiness.json` と `dev_server_lifecycle` events を final acceptance/release gate に接続するようになった。
+- `status=unavailable` は `ok=false` より先に partial/unavailable として分類し、HTTP 500 は fail として分類する。`browser_unavailable:*`、`port_in_use`、`bind_denied`、`startup_timeout`、`http_500`、`tailwind_dev_pipeline_failure` を混同しない。
+- Automated evidence: `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`、`pytest mvp/anvilminimal/tests/eval` pass。
+- Targeted tests/fixtures: `planner::runner::tests::nextjs_dev_route_probe_disabled_records_lifecycle_stages`、`planner::runner::tests::plan_run_nextjs_tailwind_dev_route_failure_keeps_failure_kind`、`mvp/anvilminimal/tests/eval/fixtures/uat_002/test0701_004_nextjs_dev_route_failure.json`。
+- Manual UAT は未実施のため `pass` ではなく `partial`。
+
 ---
 
 ## G03: browser/dev route failure が repair target / recovery UltraPlan に接続されない
@@ -258,7 +266,7 @@ source の `build_repair_exhausted_report` は、repair exhaustion 時に次の 
 | --- | --- |
 | priority | P0 |
 | category | `semantic_drift` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 
@@ -295,6 +303,15 @@ Next.js の production build と dev server route の差を acceptance に組み
 - failure kind は `browser_readiness_failed:http_500` または `tailwind_dev_pipeline_failure` 等に具体化される。
 - Tailwind を使わない plain CSS app は不要な Tailwind toolchain を要求されない。
 - failure は recovery target に戻る。
+
+### RECOVERY-002-B evidence
+
+- `mvp/anvilminimal/src/planner/runner.rs` の dev route probe は `@tailwind` + `Module parse failed` / `Unexpected character` / PostCSS/Tailwind signature を `tailwind_dev_pipeline_failure` として HTTP 500 から分離する。
+- `mvp/anvilminimal/scripts/eval_lib/browser_oracle.py` と `parity_gate.py` は HTTP 500 の既存 `browser_http_500` を維持しつつ、明示的な `tailwind_dev_pipeline_failure` を優先する。
+- `mvp/anvilminimal/src/planner/profiles/nextjs.rs` の既存 test `nextjs_allows_plain_css_without_tailwind_toolchain` により plain CSS app へ Tailwind toolchain を強制しない挙動は維持されている。
+- Added fixture: `mvp/anvilminimal/tests/eval/fixtures/uat_002/test0701_004_nextjs_dev_route_failure.json` が build pass / dev route HTTP 500 / release gate failed を固定する。
+- Automated evidence: `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`、`pytest mvp/anvilminimal/tests/eval` pass。
+- release failure を recovery target に戻す G03 側の handoff は未実装のため `partial`。
 
 ---
 
@@ -599,7 +616,7 @@ source/MVP comparison が「成功率」と「plan/phase score」に寄り、com
 | --- | --- |
 | priority | P0 |
 | category | `new_release_gate_gap` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 
@@ -611,6 +628,7 @@ source/MVP comparison が「成功率」と「plan/phase score」に寄り、com
 - `/Users/maenokota/share/work/github_kewton/Anvil-develop/src/agent/loop_run/project_verifier.rs`
 - `/Users/maenokota/share/work/github_kewton/Anvil-develop/src/agent/loop_run/verifier_driver.rs`
 - `/Users/maenokota/share/work/github_kewton/Anvil-develop/src/agent/loop_run/node_request_helpers.rs`
+- `/Users/maenokota/share/work/github_kewton/Anvil-develop/src/agent/loop_run/node_runner_manifest.rs`
 
 ### MVP refs
 
@@ -637,6 +655,15 @@ browser readiness を gate scoring の入力として追加したが、入力 ev
 - port in use、bind denied、startup timeout、HTTP 500、browser unavailable を別 failure kind に分類する。
 - dev server lifecycle が未実行なら full pass にならない。
 - dev server が起動できない環境では `browser_unavailable` として partial にし、HTTP 500 と混同しない。
+
+### RECOVERY-002-B evidence
+
+- `mvp/anvilminimal/src/planner/runner.rs` に Next.js dev server lifecycle を追加した。`start`、`wait`、`probe`、`cleanup` を `dev_server_lifecycle` event として出し、probe evidence を `browser-readiness.json` に保存する。
+- Runtime unit tests では dev server 起動を無効化し、Playwright/browser/dev-server を通常 test の必須依存にしない。一方で同じ lifecycle event series と `browser_unavailable:dev_server_probe_disabled_in_tests` evidence を検証する。
+- 実 probe は `npm/pnpm/yarn run dev` のみを使い、network install や package manifest の自動変更は行わない。`node_runner_manifest.rs` の deterministic manifest completion 方針とは分離し、dev server readiness で package.json を勝手に補完しない。
+- `runtime_scoring.py` と `runtime_trace.py` は新 `dev_server_lifecycle` event を postcheck/runtime trace の readiness signal として扱う。
+- Automated evidence: `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`、`pytest mvp/anvilminimal/tests/eval` pass。
+- Manual UAT は未実施のため `pass` ではなく `partial`。
 
 ---
 

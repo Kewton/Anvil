@@ -473,7 +473,7 @@ def score_verify_contract(
     for event in postcheck_events:
         if event.get("event") == "postcheck" and int(event.get("rc") or 0) != 0:
             score -= 35.0
-        if event.get("event") == "dev_server" and event.get("ready") is False:
+        if dev_server_readiness_failed_event(event):
             score -= 35.0
     return clamp(score)
 
@@ -511,7 +511,7 @@ def score_postcheck_stability_detail(
         reasons.append("artifact_missing")
     if any(event.get("event") == "postcheck" and int(event.get("rc") or 0) != 0 for event in events):
         reasons.append("build_or_test_command_failed")
-    if any(event.get("event") == "dev_server" and event.get("ready") is False for event in events):
+    if any(dev_server_readiness_failed_event(event) for event in events):
         reasons.append("dev_server_readiness_failed")
     if contains_any(text, DEPENDENCY_MUTATION_LOG_PATTERNS):
         reasons.append("dependency_mutation")
@@ -762,9 +762,19 @@ def score_postcheck_finalization(run_dir: Path | None) -> tuple[float | str, str
     events = load_postcheck_events(run_dir)
     if any(event.get("event") == "postcheck" and int(event.get("rc") or 0) != 0 for event in events):
         return 0.0, "postcheck_failure"
-    if any(event.get("event") == "dev_server" and event.get("ready") is False for event in events):
+    if any(dev_server_readiness_failed_event(event) for event in events):
         return 0.0, "postcheck_failure"
     return 100.0, ""
+
+
+def dev_server_readiness_failed_event(event: dict[str, Any]) -> bool:
+    if event.get("event") == "dev_server" and event.get("ready") is False:
+        return True
+    return (
+        event.get("event") == "dev_server_lifecycle"
+        and event.get("stage") in {"wait", "probe"}
+        and event.get("ok") is False
+    )
 
 
 def score_ultra_runtime_friction(

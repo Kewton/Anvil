@@ -121,6 +121,61 @@ class BrowserInteractionOracleTest(unittest.TestCase):
             "browser_render_or_interaction_evidence_missing",
         )
 
+    def test_saved_browser_unavailable_is_not_browser_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "run"
+            run_dir.mkdir(parents=True)
+            (run_dir / "browser-readiness.json").write_text(
+                json.dumps(
+                    {
+                        "status": "unavailable",
+                        "ok": False,
+                        "browser_failure_kind": "port_in_use",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = evaluate_browser_oracle(
+                {
+                    "profile": "nextjs",
+                    "prompt": "Create a keyboard controlled game.",
+                },
+                root / "workdir",
+                run_dir=run_dir,
+            )
+        self.assertEqual(result["browser_success"], "")
+        self.assertEqual(result["browser_failure_kind"], "")
+        self.assertEqual(result["browser_details"]["status"], "port_in_use")
+
+    def test_saved_tailwind_dev_route_500_keeps_pipeline_failure_kind(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "run"
+            run_dir.mkdir(parents=True)
+            (run_dir / "browser-readiness.json").write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "http_status": 500,
+                        "browser_failure_kind": "tailwind_dev_pipeline_failure",
+                        "body_excerpt": "Module parse failed: Unexpected character '@' (1:0)\n@tailwind base;",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = evaluate_browser_oracle(
+                {
+                    "profile": "nextjs",
+                    "prompt": "Create a keyboard controlled game.",
+                },
+                root / "workdir",
+                run_dir=run_dir,
+            )
+        self.assertFalse(result["browser_success"])
+        self.assertEqual(result["browser_failure_kind"], "tailwind_dev_pipeline_failure")
+        self.assertEqual(result["browser_details"]["http_status"], 500)
+
     def test_saved_browser_canvas_unavailable_is_failure(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

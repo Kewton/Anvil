@@ -53,8 +53,13 @@ KNOWN_FAILURE_KINDS = {
     "source_semantic_failure",
     "static_title_only",
     "browser_http_500",
+    "tailwind_dev_pipeline_failure",
     "browser_readiness_failed",
     "browser_behavior_failure",
+    "browser_unavailable",
+    "port_in_use",
+    "bind_denied",
+    "startup_timeout",
     "missing_required_capabilities",
     "missing_required_evidence",
     "weak_verification_evidence",
@@ -113,7 +118,14 @@ BRIDGE_FAILURE_KINDS = {
     "tailwind_contract_failure",
 }
 POSTCHECK_FAILURE_KINDS = {"postcheck_failure"}
-ENVIRONMENT_FAILURE_KINDS = {"timeout", "diagnostic_skipped"}
+ENVIRONMENT_FAILURE_KINDS = {
+    "timeout",
+    "diagnostic_skipped",
+    "browser_unavailable",
+    "port_in_use",
+    "bind_denied",
+    "startup_timeout",
+}
 ACCEPTANCE_FAILURE_KINDS = {
     "artifact_failure",
     "build_failure",
@@ -123,6 +135,7 @@ ACCEPTANCE_FAILURE_KINDS = {
     "source_semantic_failure",
     "static_title_only",
     "browser_http_500",
+    "tailwind_dev_pipeline_failure",
     "browser_readiness_failed",
     "browser_behavior_failure",
 }
@@ -642,6 +655,8 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
     if "plan final contract failed" in lower:
         if "tailwind_contract_failure" in lower:
             return {"failure_kind": "tailwind_contract_failure"}
+        if "tailwind_dev_pipeline_failure" in lower:
+            return {"failure_kind": "tailwind_dev_pipeline_failure"}
         if "browser_http_500" in lower or "http_500" in lower:
             return {"failure_kind": "browser_http_500"}
         if "browser_readiness_failed" in lower:

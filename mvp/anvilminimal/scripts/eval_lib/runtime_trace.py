@@ -68,6 +68,7 @@ MVP_EVENT_STAGE: dict[str, str] = {
     "browser_oracle_summary": "acceptance_started",
     "completion_verify": "contract_loaded",
     "dependency_build_lifecycle": "dependency_boundary_checked",
+    "dev_server_lifecycle": "acceptance_started",
     "deterministic_scaffold_recovery": "scaffold_continuation_required",
     "diagnostic_skipped": "diagnostic_emitted",
     "fallback_decision": "scaffold_continuation_required",

@@ -1,5 +1,9 @@
 use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::eval_events;
@@ -53,6 +57,11 @@ const STEP_REPAIR_NO_CHANGE_LIMIT: usize = 1;
 const STEP_REPAIR_TARGET_NOT_FOLLOWED_LIMIT: usize = 2;
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
 const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 1;
+const NEXTJS_DEV_SERVER_DEFAULT_PORT: u16 = 3011;
+const NEXTJS_DEV_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(8);
+const NEXTJS_DEV_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const NEXTJS_DEV_SERVER_WAIT_INTERVAL: Duration = Duration::from_millis(250);
+const DEV_SERVER_ROUTE: &str = "/";
 
 #[derive(Debug, Clone)]
 struct RecoveryArtifactValidation {
@@ -2825,8 +2834,23 @@ enum ReleaseEvidenceKind {
     Interaction,
 }
 
+#[derive(Debug, Clone)]
+struct NextjsDevServerProbeSpec {
+    package_manager: String,
+    args: Vec<String>,
+    command_display: String,
+    port: u16,
+    route: String,
+}
+
+#[derive(Debug, Clone)]
+struct HttpProbeResult {
+    status: i64,
+    body_excerpt: String,
+}
+
 fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
-    let browser = read_release_evidence(
+    let mut browser = read_release_evidence(
         config,
         &[
             "browser-readiness.json",
@@ -2836,6 +2860,13 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
         "browser_readiness_evidence_missing",
         ReleaseEvidenceKind::BrowserReadiness,
     );
+    if matches!(
+        &browser.status,
+        ReleaseEvidenceStatus::Unavailable(reason)
+            if reason == "browser_readiness_evidence_missing"
+    ) {
+        browser = nextjs_dev_route_release_evidence(config);
+    }
     let interaction = read_release_evidence(
         config,
         &[
@@ -2898,6 +2929,809 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
         interaction_evidence_status: interaction_status,
         interaction_evidence_path: interaction.path,
     }
+}
+
+fn nextjs_dev_route_release_evidence(config: &Config) -> ReleaseEvidence {
+    let path = nextjs_dev_route_evidence_path(config);
+    let value = run_nextjs_dev_route_probe(config, &path);
+    let status = classify_release_evidence_json(ReleaseEvidenceKind::BrowserReadiness, &value);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&value) {
+        let _ = std::fs::write(&path, format!("{text}\n"));
+    }
+    ReleaseEvidence {
+        status,
+        path: path.display().to_string(),
+    }
+}
+
+fn nextjs_dev_route_evidence_path(config: &Config) -> PathBuf {
+    if let Some(events_path) = &config.eval_events_path
+        && let Some(run_dir) = events_path.parent()
+    {
+        return run_dir.join("browser-readiness.json");
+    }
+    config
+        .workspace_root
+        .join(".anvil")
+        .join("browser-readiness.json")
+}
+
+fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
+    if !dev_server_probe_runtime_enabled() {
+        let failure_kind = if cfg!(test) {
+            "browser_unavailable:dev_server_probe_disabled_in_tests"
+        } else {
+            "browser_unavailable:dev_server_probe_disabled"
+        };
+        emit_dev_server_unavailable_lifecycle(
+            config,
+            NEXTJS_DEV_SERVER_DEFAULT_PORT,
+            DEV_SERVER_ROUTE,
+            "",
+            failure_kind,
+            evidence_path,
+        );
+        return dev_server_unavailable_evidence(
+            NEXTJS_DEV_SERVER_DEFAULT_PORT,
+            DEV_SERVER_ROUTE,
+            "",
+            failure_kind,
+            "",
+        );
+    }
+
+    let spec = match load_nextjs_dev_server_probe_spec(&config.workspace_root) {
+        Ok(spec) => spec,
+        Err(failure_kind) => {
+            emit_dev_server_unavailable_lifecycle(
+                config,
+                NEXTJS_DEV_SERVER_DEFAULT_PORT,
+                DEV_SERVER_ROUTE,
+                "",
+                &failure_kind,
+                evidence_path,
+            );
+            return dev_server_unavailable_evidence(
+                NEXTJS_DEV_SERVER_DEFAULT_PORT,
+                DEV_SERVER_ROUTE,
+                "",
+                &failure_kind,
+                "",
+            );
+        }
+    };
+
+    if localhost_port_accepts_connection(spec.port) {
+        let failure_kind = "port_in_use";
+        emit_dev_server_unavailable_lifecycle(
+            config,
+            spec.port,
+            &spec.route,
+            &spec.command_display,
+            failure_kind,
+            evidence_path,
+        );
+        return dev_server_unavailable_evidence(
+            spec.port,
+            &spec.route,
+            &spec.command_display,
+            failure_kind,
+            "",
+        );
+    }
+
+    let mut command = Command::new(&spec.package_manager);
+    command
+        .args(&spec.args)
+        .current_dir(&config.workspace_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("PORT", spec.port.to_string());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            let failure_kind = dev_server_spawn_failure_kind(&err);
+            emit_dev_server_lifecycle_stage(
+                config,
+                "start",
+                false,
+                spec.port,
+                &spec.route,
+                &spec.command_display,
+                Some(&failure_kind),
+                None,
+                evidence_path,
+                None,
+            );
+            emit_dev_server_lifecycle_stage(
+                config,
+                "wait",
+                false,
+                spec.port,
+                &spec.route,
+                &spec.command_display,
+                Some(&failure_kind),
+                None,
+                evidence_path,
+                None,
+            );
+            emit_dev_server_lifecycle_stage(
+                config,
+                "probe",
+                false,
+                spec.port,
+                &spec.route,
+                &spec.command_display,
+                Some(&failure_kind),
+                None,
+                evidence_path,
+                None,
+            );
+            emit_dev_server_lifecycle_stage(
+                config,
+                "cleanup",
+                true,
+                spec.port,
+                &spec.route,
+                &spec.command_display,
+                Some(&failure_kind),
+                None,
+                evidence_path,
+                None,
+            );
+            return dev_server_unavailable_evidence(
+                spec.port,
+                &spec.route,
+                &spec.command_display,
+                &failure_kind,
+                &err.to_string(),
+            );
+        }
+    };
+
+    let pid = child.id();
+    emit_dev_server_lifecycle_stage(
+        config,
+        "start",
+        true,
+        spec.port,
+        &spec.route,
+        &spec.command_display,
+        None,
+        None,
+        evidence_path,
+        Some(pid),
+    );
+
+    let deadline = Instant::now() + NEXTJS_DEV_SERVER_READY_TIMEOUT;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                let output = child.wait_with_output().ok();
+                let output_excerpt = output
+                    .as_ref()
+                    .map(output_excerpt)
+                    .unwrap_or_else(|| "dev server exited before readiness".to_string());
+                let failure_kind = classify_dev_server_startup_failure(&output_excerpt)
+                    .unwrap_or_else(|| "browser_unavailable:dev_server_exited".to_string());
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "wait",
+                    false,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    Some(&failure_kind),
+                    None,
+                    evidence_path,
+                    Some(pid),
+                );
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "probe",
+                    false,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    Some(&failure_kind),
+                    None,
+                    evidence_path,
+                    Some(pid),
+                );
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "cleanup",
+                    true,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    Some(&failure_kind),
+                    None,
+                    evidence_path,
+                    Some(pid),
+                );
+                return dev_server_unavailable_evidence(
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    &failure_kind,
+                    &output_excerpt,
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let failure_kind = "browser_unavailable:dev_server_status_unreadable";
+                let cleanup = cleanup_dev_server_child(child);
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "wait",
+                    false,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    Some(failure_kind),
+                    None,
+                    evidence_path,
+                    Some(pid),
+                );
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "probe",
+                    false,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    Some(failure_kind),
+                    None,
+                    evidence_path,
+                    Some(pid),
+                );
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "cleanup",
+                    cleanup.ok,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    Some(failure_kind),
+                    None,
+                    evidence_path,
+                    Some(pid),
+                );
+                return dev_server_unavailable_evidence(
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    failure_kind,
+                    &format!("{} {}", err, cleanup.output_excerpt),
+                );
+            }
+        }
+
+        match http_get_local_route(spec.port, &spec.route) {
+            Ok(response) => {
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "wait",
+                    true,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    None,
+                    Some(response.status),
+                    evidence_path,
+                    Some(pid),
+                );
+                let failure_kind =
+                    classify_dev_route_failure_kind(response.status, &response.body_excerpt);
+                let probe_ok = failure_kind.is_none();
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "probe",
+                    probe_ok,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    failure_kind.as_deref(),
+                    Some(response.status),
+                    evidence_path,
+                    Some(pid),
+                );
+                let cleanup = cleanup_dev_server_child(child);
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "cleanup",
+                    cleanup.ok,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    failure_kind.as_deref(),
+                    Some(response.status),
+                    evidence_path,
+                    Some(pid),
+                );
+                if let Some(failure_kind) = failure_kind {
+                    return dev_server_failed_evidence(
+                        spec.port,
+                        &spec.route,
+                        &spec.command_display,
+                        response.status,
+                        &failure_kind,
+                        &response.body_excerpt,
+                        &cleanup.output_excerpt,
+                    );
+                }
+                return dev_server_passed_evidence(
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    response.status,
+                    &response.body_excerpt,
+                );
+            }
+            Err(_) => {
+                std::thread::sleep(NEXTJS_DEV_SERVER_WAIT_INTERVAL);
+            }
+        }
+    }
+
+    let failure_kind = "startup_timeout";
+    let cleanup = cleanup_dev_server_child(child);
+    emit_dev_server_lifecycle_stage(
+        config,
+        "wait",
+        false,
+        spec.port,
+        &spec.route,
+        &spec.command_display,
+        Some(failure_kind),
+        None,
+        evidence_path,
+        Some(pid),
+    );
+    emit_dev_server_lifecycle_stage(
+        config,
+        "probe",
+        false,
+        spec.port,
+        &spec.route,
+        &spec.command_display,
+        Some(failure_kind),
+        None,
+        evidence_path,
+        Some(pid),
+    );
+    emit_dev_server_lifecycle_stage(
+        config,
+        "cleanup",
+        cleanup.ok,
+        spec.port,
+        &spec.route,
+        &spec.command_display,
+        Some(failure_kind),
+        None,
+        evidence_path,
+        Some(pid),
+    );
+    dev_server_unavailable_evidence(
+        spec.port,
+        &spec.route,
+        &spec.command_display,
+        failure_kind,
+        &cleanup.output_excerpt,
+    )
+}
+
+fn dev_server_probe_runtime_enabled() -> bool {
+    if env_flag_is_false("ANVIL_DEV_SERVER_PROBE") {
+        return false;
+    }
+    if cfg!(test) && !env_flag_is_true("ANVIL_TEST_DEV_SERVER_PROBE") {
+        return false;
+    }
+    true
+}
+
+fn env_flag_is_false(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_flag_is_true(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn load_nextjs_dev_server_probe_spec(root: &Path) -> Result<NextjsDevServerProbeSpec, String> {
+    let manifest_path = root.join("package.json");
+    let text = std::fs::read_to_string(&manifest_path)
+        .map_err(|_| "browser_unavailable:package_json_missing".to_string())?;
+    let value = serde_json::from_str::<Value>(&text)
+        .map_err(|_| "browser_unavailable:package_json_invalid".to_string())?;
+    let script = value
+        .get("scripts")
+        .and_then(Value::as_object)
+        .and_then(|scripts| scripts.get("dev"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|script| !script.is_empty())
+        .ok_or_else(|| "browser_unavailable:dev_script_missing".to_string())?;
+    if !script_contains_next_dev(script) {
+        return Err("browser_unavailable:dev_script_not_next_dev".to_string());
+    }
+    let port = parse_next_dev_port(script).unwrap_or(NEXTJS_DEV_SERVER_DEFAULT_PORT);
+    let (package_manager, args) = package_manager_dev_command(root);
+    let command_display = std::iter::once(package_manager.as_str())
+        .chain(args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(NextjsDevServerProbeSpec {
+        package_manager,
+        args,
+        command_display,
+        port,
+        route: DEV_SERVER_ROUTE.to_string(),
+    })
+}
+
+fn script_contains_next_dev(script: &str) -> bool {
+    let lower = script.to_ascii_lowercase();
+    lower.contains("next") && lower.contains("dev")
+}
+
+fn parse_next_dev_port(script: &str) -> Option<u16> {
+    let tokens = script.split_whitespace().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if matches!(*token, "-p" | "--port") {
+            if let Some(raw) = tokens.get(index + 1)
+                && let Ok(port) = raw.parse::<u16>()
+            {
+                return Some(port);
+            }
+        }
+        if let Some(raw) = token.strip_prefix("-p")
+            && !raw.is_empty()
+            && let Ok(port) = raw.parse::<u16>()
+        {
+            return Some(port);
+        }
+        if let Some(raw) = token.strip_prefix("--port=")
+            && let Ok(port) = raw.parse::<u16>()
+        {
+            return Some(port);
+        }
+    }
+    None
+}
+
+fn package_manager_dev_command(root: &Path) -> (String, Vec<String>) {
+    if root.join("pnpm-lock.yaml").is_file() {
+        return (
+            "pnpm".to_string(),
+            vec!["run".to_string(), "dev".to_string()],
+        );
+    }
+    if root.join("yarn.lock").is_file() {
+        return ("yarn".to_string(), vec!["dev".to_string()]);
+    }
+    (
+        "npm".to_string(),
+        vec!["run".to_string(), "dev".to_string()],
+    )
+}
+
+fn localhost_port_accepts_connection(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_ok()
+}
+
+fn http_get_local_route(port: u16, route: &str) -> Result<HttpProbeResult, String> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = TcpStream::connect_timeout(&addr, NEXTJS_DEV_SERVER_CONNECT_TIMEOUT)
+        .map_err(|err| err.to_string())?;
+    let _ = stream.set_read_timeout(Some(NEXTJS_DEV_SERVER_CONNECT_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(NEXTJS_DEV_SERVER_CONNECT_TIMEOUT));
+    let path = if route.starts_with('/') {
+        route.to_string()
+    } else {
+        format!("/{route}")
+    };
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nUser-Agent: anvilminimal-dev-server-probe\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| err.to_string())?;
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                response.extend_from_slice(&buffer[..n]);
+                if response.len() >= 32_768 {
+                    break;
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+    let response_text = String::from_utf8_lossy(&response).to_string();
+    let status_line = response_text
+        .lines()
+        .next()
+        .ok_or_else(|| "empty_http_response".to_string())?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| "http_status_missing".to_string())?
+        .parse::<i64>()
+        .map_err(|_| "http_status_invalid".to_string())?;
+    let body = response_text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body)
+        .unwrap_or(&response_text);
+    Ok(HttpProbeResult {
+        status,
+        body_excerpt: eval_events::body_snippet(body),
+    })
+}
+
+fn dev_server_spawn_failure_kind(err: &std::io::Error) -> String {
+    match err.kind() {
+        std::io::ErrorKind::NotFound => "browser_unavailable:dev_server_command_missing",
+        std::io::ErrorKind::PermissionDenied => "browser_unavailable:dev_server_command_denied",
+        _ => "browser_unavailable:dev_server_spawn_failed",
+    }
+    .to_string()
+}
+
+fn classify_dev_server_startup_failure(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("eaddrinuse") || lower.contains("address already in use") {
+        return Some("port_in_use".to_string());
+    }
+    if lower.contains("eacces")
+        || lower.contains("permission denied")
+        || lower.contains("operation not permitted")
+    {
+        return Some("bind_denied".to_string());
+    }
+    if tailwind_dev_pipeline_failure(&lower) {
+        return Some("tailwind_dev_pipeline_failure".to_string());
+    }
+    None
+}
+
+fn classify_dev_route_failure_kind(status: i64, body_excerpt: &str) -> Option<String> {
+    if status < 400 {
+        return None;
+    }
+    let lower = body_excerpt.to_ascii_lowercase();
+    if tailwind_dev_pipeline_failure(&lower) {
+        return Some("tailwind_dev_pipeline_failure".to_string());
+    }
+    Some(format!("http_{status}"))
+}
+
+fn tailwind_dev_pipeline_failure(lower_text: &str) -> bool {
+    lower_text.contains("@tailwind")
+        && (lower_text.contains("module parse failed")
+            || lower_text.contains("unexpected character")
+            || lower_text.contains("postcss")
+            || lower_text.contains("tailwind"))
+}
+
+#[derive(Debug)]
+struct DevServerCleanup {
+    ok: bool,
+    output_excerpt: String,
+}
+
+fn cleanup_dev_server_child(mut child: Child) -> DevServerCleanup {
+    let _ = child.kill();
+    match child.wait_with_output() {
+        Ok(output) => DevServerCleanup {
+            ok: true,
+            output_excerpt: output_excerpt(&output),
+        },
+        Err(err) => DevServerCleanup {
+            ok: false,
+            output_excerpt: err.to_string(),
+        },
+    }
+}
+
+fn output_excerpt(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eval_events::body_snippet(&format!("{stdout}\n{stderr}"))
+}
+
+fn emit_dev_server_unavailable_lifecycle(
+    config: &Config,
+    port: u16,
+    route: &str,
+    command: &str,
+    failure_kind: &str,
+    evidence_path: &Path,
+) {
+    emit_dev_server_lifecycle_stage(
+        config,
+        "start",
+        false,
+        port,
+        route,
+        command,
+        Some(failure_kind),
+        None,
+        evidence_path,
+        None,
+    );
+    emit_dev_server_lifecycle_stage(
+        config,
+        "wait",
+        false,
+        port,
+        route,
+        command,
+        Some(failure_kind),
+        None,
+        evidence_path,
+        None,
+    );
+    emit_dev_server_lifecycle_stage(
+        config,
+        "probe",
+        false,
+        port,
+        route,
+        command,
+        Some(failure_kind),
+        None,
+        evidence_path,
+        None,
+    );
+    emit_dev_server_lifecycle_stage(
+        config,
+        "cleanup",
+        true,
+        port,
+        route,
+        command,
+        Some(failure_kind),
+        None,
+        evidence_path,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_dev_server_lifecycle_stage(
+    config: &Config,
+    stage: &str,
+    ok: bool,
+    port: u16,
+    route: &str,
+    command: &str,
+    failure_kind: Option<&str>,
+    http_status: Option<i64>,
+    evidence_path: &Path,
+    pid: Option<u32>,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "dev_server_lifecycle",
+            "profile": "nextjs",
+            "stage": stage,
+            "ok": ok,
+            "port": port,
+            "route": route,
+            "command": command,
+            "failure_kind": failure_kind.unwrap_or(""),
+            "http_status": http_status,
+            "pid": pid,
+            "evidence_path": evidence_path.display().to_string(),
+        }),
+    );
+}
+
+fn dev_server_unavailable_evidence(
+    port: u16,
+    route: &str,
+    command: &str,
+    failure_kind: &str,
+    output_excerpt: &str,
+) -> Value {
+    json!({
+        "status": "unavailable",
+        "browser_failure_kind": failure_kind,
+        "failure_kind": failure_kind,
+        "dev_server": {
+            "profile": "nextjs",
+            "port": port,
+            "route": route,
+            "command": command,
+            "failure_kind": failure_kind,
+            "output_excerpt": eval_events::body_snippet(output_excerpt),
+        }
+    })
+}
+
+fn dev_server_failed_evidence(
+    port: u16,
+    route: &str,
+    command: &str,
+    http_status: i64,
+    failure_kind: &str,
+    body_excerpt: &str,
+    output_excerpt: &str,
+) -> Value {
+    json!({
+        "status": "failed",
+        "ok": false,
+        "http_status": http_status,
+        "route_rendered": false,
+        "browser_failure_kind": failure_kind,
+        "failure_kind": failure_kind,
+        "body_excerpt": eval_events::body_snippet(body_excerpt),
+        "dev_server": {
+            "profile": "nextjs",
+            "port": port,
+            "route": route,
+            "command": command,
+            "failure_kind": failure_kind,
+            "output_excerpt": eval_events::body_snippet(output_excerpt),
+        }
+    })
+}
+
+fn dev_server_passed_evidence(
+    port: u16,
+    route: &str,
+    command: &str,
+    http_status: i64,
+    body_excerpt: &str,
+) -> Value {
+    json!({
+        "status": "ready",
+        "ok": true,
+        "http_status": http_status,
+        "route_rendered": true,
+        "dev_server": {
+            "profile": "nextjs",
+            "port": port,
+            "route": route,
+            "command": command,
+            "body_excerpt": eval_events::body_snippet(body_excerpt),
+        }
+    })
 }
 
 fn read_release_evidence(
@@ -2967,11 +3801,21 @@ fn classify_release_evidence_json(
         .get("browser_details")
         .or_else(|| value.get("details"))
         .filter(|value| value.is_object());
+    let text_status = text_field_deep(value, details, &["status"]);
+    if let Some(status) = text_status.as_deref()
+        && is_release_evidence_unavailable_status(status)
+    {
+        return ReleaseEvidenceStatus::Unavailable(evidence_unavailable_reason(
+            value, details, status,
+        ));
+    }
     if let Some(status) =
         numeric_field_deep(value, details, &["http_status", "status", "status_code"])
     {
         if status >= 400 {
-            return ReleaseEvidenceStatus::Failed(format!("http_{status}"));
+            return ReleaseEvidenceStatus::Failed(evidence_http_failure_reason(
+                value, details, status,
+            ));
         }
     }
     if let Some(success) = bool_field_deep(
@@ -2986,14 +3830,8 @@ fn classify_release_evidence_json(
     if let Some(reason) = explicit_release_evidence_failure(kind, value, details) {
         return ReleaseEvidenceStatus::Failed(reason);
     }
-    if let Some(status) = text_field_deep(value, details, &["status"]) {
-        if matches!(
-            status.as_str(),
-            "not_enabled" | "adapter_not_implemented" | "unavailable" | "skipped"
-        ) {
-            return ReleaseEvidenceStatus::Unavailable(status);
-        }
-        if matches!(status.as_str(), "failed" | "fail" | "error") {
+    if let Some(status) = text_status.as_deref() {
+        if matches!(status, "failed" | "fail" | "error") {
             return ReleaseEvidenceStatus::Failed(evidence_failure_reason(value, details));
         }
     }
@@ -3009,8 +3847,9 @@ fn classify_release_evidence_json(
     if release_evidence_has_required_detail(kind, value, details) {
         return ReleaseEvidenceStatus::Passed;
     }
-    let status_is_pass_like = text_field_deep(value, details, &["status"])
-        .is_some_and(|status| matches!(status.as_str(), "ok" | "pass" | "passed" | "ready"));
+    let status_is_pass_like = text_status
+        .as_deref()
+        .is_some_and(|status| matches!(status, "ok" | "pass" | "passed" | "ready"));
     let success_is_true = bool_field_deep(
         value,
         details,
@@ -3114,13 +3953,7 @@ fn release_evidence_has_required_detail(
 }
 
 fn evidence_failure_reason(value: &Value, details: Option<&Value>) -> String {
-    if let Some(status) =
-        numeric_field_deep(value, details, &["http_status", "status", "status_code"])
-        && status >= 400
-    {
-        return format!("http_{status}");
-    }
-    text_field_deep(
+    let text_reason = text_field_deep(
         value,
         details,
         &[
@@ -3129,8 +3962,63 @@ fn evidence_failure_reason(value: &Value, details: Option<&Value>) -> String {
             "error_kind",
             "status",
         ],
+    );
+    if text_reason
+        .as_deref()
+        .is_some_and(prefer_release_evidence_failure_kind_over_http)
+    {
+        return text_reason.unwrap();
+    }
+    if let Some(status) =
+        numeric_field_deep(value, details, &["http_status", "status", "status_code"])
+        && status >= 400
+    {
+        return format!("http_{status}");
+    }
+    text_reason.unwrap_or_else(|| "browser_check_failed".to_string())
+}
+
+fn evidence_http_failure_reason(value: &Value, details: Option<&Value>, status: i64) -> String {
+    text_field_deep(
+        value,
+        details,
+        &["browser_failure_kind", "failure_kind", "error_kind"],
     )
-    .unwrap_or_else(|| "browser_check_failed".to_string())
+    .filter(|reason| prefer_release_evidence_failure_kind_over_http(reason))
+    .unwrap_or_else(|| format!("http_{status}"))
+}
+
+fn evidence_unavailable_reason(value: &Value, details: Option<&Value>, status: &str) -> String {
+    text_field_deep(
+        value,
+        details,
+        &[
+            "browser_failure_kind",
+            "failure_kind",
+            "error_kind",
+            "reason",
+        ],
+    )
+    .filter(|reason| !reason.is_empty())
+    .unwrap_or_else(|| status.to_string())
+}
+
+fn is_release_evidence_unavailable_status(status: &str) -> bool {
+    matches!(
+        status,
+        "not_enabled" | "adapter_not_implemented" | "unavailable" | "skipped"
+    ) || status.starts_with("unavailable:")
+        || status == "browser_unavailable"
+        || status.starts_with("browser_unavailable:")
+}
+
+fn prefer_release_evidence_failure_kind_over_http(reason: &str) -> bool {
+    matches!(
+        reason,
+        "tailwind_dev_pipeline_failure"
+            | "css_dev_pipeline_failure"
+            | "nextjs_dev_pipeline_failure"
+    )
 }
 
 fn bool_field_deep(value: &Value, details: Option<&Value>, keys: &[&str]) -> Option<bool> {
@@ -6652,6 +7540,89 @@ export default function Page(){
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"release_gate_status\":\"failed\""));
         assert!(event_text.contains("\"browser_readiness_status\":\"failed:http_500\""));
+    }
+
+    #[test]
+    fn plan_run_nextjs_tailwind_dev_route_failure_keeps_failure_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":false,"http_status":500,"browser_failure_kind":"tailwind_dev_pipeline_failure","body_excerpt":"Module parse failed: Unexpected character '@' (1:0)\n> @tailwind base;"}"#,
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Create an interactive browser game\n\nRequired final artifacts:\n- package.json\n- src/app/page.tsx\n- src/app/layout.tsx\n- src/app/global.d.ts".to_string(),
+            steps: vec![PlanStep {
+                id: "app".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the interactive Next.js game app".to_string(),
+                expected_paths: vec![
+                    "package.json".to_string(),
+                    "src/app/page.tsx".to_string(),
+                    "src/app/layout.tsx".to_string(),
+                    "src/app/global.d.ts".to_string(),
+                ],
+                verify: Vec::new(),
+            }],
+        };
+        let page = interactive_game_page_source();
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: nextjs_interactive_app_tool_calls(page),
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("release gate failed"), "{err}");
+        assert!(
+            err.contains("browser_readiness_failed:tailwind_dev_pipeline_failure"),
+            "{err}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"release_gate_status\":\"failed\""));
+        assert!(
+            event_text
+                .contains("\"browser_readiness_status\":\"failed:tailwind_dev_pipeline_failure\""),
+            "{event_text}"
+        );
+    }
+
+    #[test]
+    fn nextjs_dev_route_probe_disabled_records_lifecycle_stages() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let evidence_path = nextjs_dev_route_evidence_path(&cfg);
+        let evidence = run_nextjs_dev_route_probe(&cfg, &evidence_path);
+        assert_eq!(
+            evidence.get("status").and_then(Value::as_str),
+            Some("unavailable")
+        );
+        assert_eq!(
+            classify_release_evidence_json(ReleaseEvidenceKind::BrowserReadiness, &evidence),
+            ReleaseEvidenceStatus::Unavailable(
+                "browser_unavailable:dev_server_probe_disabled_in_tests".to_string()
+            )
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"dev_server_lifecycle\""));
+        assert!(event_text.contains("\"stage\":\"start\""));
+        assert!(event_text.contains("\"stage\":\"wait\""));
+        assert!(event_text.contains("\"stage\":\"probe\""));
+        assert!(event_text.contains("\"stage\":\"cleanup\""));
+        assert!(
+            event_text.contains("browser_unavailable:dev_server_probe_disabled_in_tests"),
+            "{event_text}"
+        );
     }
 
     #[test]

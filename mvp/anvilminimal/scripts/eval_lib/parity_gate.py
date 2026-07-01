@@ -625,12 +625,22 @@ def evaluate_browser_evidence(paths: list[str]) -> dict[str, Any]:
     if status_code is None:
         status_code = int_field(details, "http_status", "status", "status_code")
     if status_code is not None and status_code >= 400:
+        failure = browser_failure_kind(value, details, status_code)
         return {
             "status": "fail",
             "path": path,
-            "failure_kind": f"browser_http_{status_code}",
+            "failure_kind": failure,
             "http_status": status_code,
-            "reason": f"http_{status_code}",
+            "reason": failure,
+        }
+    text_status = text_field(value, "status") or text_field(details, "status")
+    if browser_unavailable_status(text_status):
+        reason = browser_unavailable_reason(value, details, text_status or "unavailable")
+        return {
+            "status": "partial",
+            "path": path,
+            "reason": reason,
+            "http_status": status_code or "",
         }
     if ok is False:
         failure = browser_failure_kind(value, details, status_code)
@@ -650,16 +660,8 @@ def evaluate_browser_evidence(paths: list[str]) -> dict[str, Any]:
             "http_status": status_code or "",
             "reason": explicit_failure,
         }
-    text_status = text_field(value, "status") or text_field(details, "status")
     if browser_readiness_has_required_detail(value, details):
         return {"status": "pass", "path": path, "http_status": status_code or ""}
-    if text_status in {"not_enabled", "adapter_not_implemented", "unavailable"}:
-        return {
-            "status": "partial",
-            "path": path,
-            "reason": text_status,
-            "http_status": status_code or "",
-        }
     if ok is True or (status_code is not None and 200 <= status_code < 400) or text_status in {"ok", "pass", "passed", "ready"}:
         return {
             "status": "partial",
@@ -831,12 +833,28 @@ def browser_failure_kind(
     details: dict[str, Any],
     status_code: int | None,
 ) -> str:
-    if status_code is not None and status_code >= 400:
-        return f"browser_http_{status_code}"
-    return (
+    kind = (
         text_field(value, "browser_failure_kind", "failure_kind", "error_kind")
         or text_field(details, "browser_failure_kind", "failure_kind", "error_kind")
-        or "browser_failed"
+    )
+    if kind in {"tailwind_dev_pipeline_failure", "css_dev_pipeline_failure", "nextjs_dev_pipeline_failure"}:
+        return kind
+    if status_code is not None and status_code >= 400:
+        return f"browser_http_{status_code}"
+    return kind or "browser_failed"
+
+
+def browser_unavailable_status(status: str) -> bool:
+    return status in {"not_enabled", "adapter_not_implemented", "unavailable", "skipped"} or status.startswith(
+        ("unavailable:", "browser_unavailable:")
+    ) or status == "browser_unavailable"
+
+
+def browser_unavailable_reason(value: dict[str, Any], details: dict[str, Any], status: str) -> str:
+    return (
+        text_field(value, "browser_failure_kind", "failure_kind", "error_kind", "reason")
+        or text_field(details, "browser_failure_kind", "failure_kind", "error_kind", "reason")
+        or status
     )
 
 

@@ -19,6 +19,13 @@ class UatRegressionFixturesTest(unittest.TestCase):
         )
         return json.loads(fixture.read_text(encoding="utf-8"))
 
+    def load_test0701_fixture(self) -> dict:
+        fixture = (
+            ROOT
+            / "tests/eval/fixtures/uat_002/test0701_004_nextjs_dev_route_failure.json"
+        )
+        return json.loads(fixture.read_text(encoding="utf-8"))
+
     def test_test0630_phase_scaffold_failure_is_classified(self):
         fixture = self.load_fixture()
         classified = classify_events(fixture["events"])
@@ -79,6 +86,25 @@ class UatRegressionFixturesTest(unittest.TestCase):
         self.assertFalse(
             summarize_uat_regression_fixture(browser_fixed)["build_pass_browser_fail"]
         )
+
+    def test_test0701_fixture_detects_build_pass_dev_route_failure(self):
+        fixture = self.load_test0701_fixture()
+        summary = summarize_uat_regression_fixture(fixture)
+        expected = fixture["expected"]
+
+        self.assertTrue(summary["build_pass_browser_fail"])
+        self.assertEqual(summary["browser_http_status"], expected["browser_http_status"])
+        self.assertEqual(summary["browser_failure_kind"], expected["browser_failure_kind"])
+        stages = {
+            event.get("stage")
+            for event in fixture["events"]
+            if event.get("event") == "dev_server_lifecycle"
+        }
+        self.assertEqual(stages, set(expected["required_dev_server_lifecycle_stages"]))
+        run_stop = next(event for event in fixture["events"] if event.get("event") == "run_stop")
+        self.assertEqual(run_stop["command_completion_status"], "complete")
+        self.assertEqual(run_stop["release_gate_status"], expected["release_gate_status"])
+        self.assertNotEqual(run_stop["release_quality_completion"], "release_ready")
 
     def test_test0630_fixture_detection_is_not_prompt_string_specific(self):
         fixture = self.load_fixture()

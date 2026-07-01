@@ -234,6 +234,37 @@ class ParityGateReportTest(unittest.TestCase):
         self.assertIn("browser_readiness:browser_http_500", release_evidence_blockers(uat_equivalent))
         self.assertIn("browser_http_500", uat_equivalent["reason"])
 
+    def test_release_gate_keeps_tailwind_dev_pipeline_failure_kind(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            uat, browser, interaction, events = release_evidence_files(root)
+            browser.write_text(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "http_status": 500,
+                        "browser_failure_kind": "tailwind_dev_pipeline_failure",
+                        "body_excerpt": "Module parse failed: Unexpected character '@' (1:0)\n@tailwind base;",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = build_parity_gate_report(
+                base_report=self.base_report(),
+                gate_level="release",
+                uat_evidence_paths=[str(uat)],
+                browser_evidence_paths=[str(browser)],
+                interaction_evidence_paths=[str(interaction)],
+                tui_event_paths=[str(events)],
+            )
+        uat_equivalent = report["uat_equivalent"]
+        self.assertEqual(uat_equivalent["status"], "fail")
+        self.assertIn(
+            "browser_readiness:tailwind_dev_pipeline_failure",
+            release_evidence_blockers(uat_equivalent),
+        )
+        self.assertIn("tailwind_dev_pipeline_failure", uat_equivalent["reason"])
+
     def test_release_gate_rejects_tui_command_stop_false(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

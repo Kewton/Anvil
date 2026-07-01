@@ -1,0 +1,73 @@
+{
+  "id": "test0701_004_nextjs_dev_route_failure",
+  "description": "Next.js build passes but the dev route returns HTTP 500 from a Tailwind CSS pipeline parse failure.",
+  "build": {
+    "ok": true,
+    "command": "npm run build"
+  },
+  "browser": {
+    "ok": false,
+    "route": "/",
+    "http_status": 500,
+    "failure_kind": "tailwind_dev_pipeline_failure",
+    "body_excerpt": "Module parse failed: Unexpected character '@' (1:0)\n> @tailwind base;"
+  },
+  "events": [
+    {
+      "event": "build_verifier",
+      "ok": true,
+      "command": "npm run build"
+    },
+    {
+      "event": "dev_server_lifecycle",
+      "stage": "start",
+      "ok": true,
+      "port": 3011,
+      "route": "/"
+    },
+    {
+      "event": "dev_server_lifecycle",
+      "stage": "wait",
+      "ok": true,
+      "port": 3011,
+      "route": "/",
+      "http_status": 500
+    },
+    {
+      "event": "dev_server_lifecycle",
+      "stage": "probe",
+      "ok": false,
+      "port": 3011,
+      "route": "/",
+      "http_status": 500,
+      "failure_kind": "tailwind_dev_pipeline_failure"
+    },
+    {
+      "event": "dev_server_lifecycle",
+      "stage": "cleanup",
+      "ok": true,
+      "port": 3011,
+      "route": "/",
+      "failure_kind": "tailwind_dev_pipeline_failure"
+    },
+    {
+      "event": "run_stop",
+      "ok": false,
+      "stop_reason": "release_gate_failed",
+      "command_completion_status": "complete",
+      "final_acceptance_status": "incomplete",
+      "runtime_acceptance_status": "pass",
+      "release_gate_status": "failed",
+      "release_quality_completion": "failed",
+      "browser_readiness_status": "failed:tailwind_dev_pipeline_failure",
+      "next_action": "repair_release_gate_failure"
+    }
+  ],
+  "expected": {
+    "build_pass_browser_fail": true,
+    "browser_http_status": 500,
+    "browser_failure_kind": "tailwind_dev_pipeline_failure",
+    "release_gate_status": "failed",
+    "required_dev_server_lifecycle_stages": ["start", "wait", "probe", "cleanup"]
+  }
+}

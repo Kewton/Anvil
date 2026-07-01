@@ -119,10 +119,17 @@ def normalize_browser_evidence(
     )
     if http_status is not None and http_status >= 400:
         return browser_fail(
-            failure_kind=f"browser_http_{http_status}",
+            failure_kind=browser_failure_kind(evidence, details, http_status=http_status),
             evidence_path=evidence_path,
             workdir=workdir,
             status="failed",
+            http_status=http_status,
+        )
+    if browser_unavailable_status(status_value):
+        return browser_unavailable(
+            status=browser_unavailable_reason(evidence, details, status_value or "unavailable"),
+            evidence_path=evidence_path,
+            workdir=workdir,
             http_status=http_status,
         )
     if success is False:
@@ -144,13 +151,6 @@ def normalize_browser_evidence(
         )
     if saved_browser_evidence_has_required_details(evidence, details):
         return browser_pass(evidence_path=evidence_path, workdir=workdir, http_status=http_status)
-    if status_value in {"not_enabled", "adapter_not_implemented", "unavailable"}:
-        return browser_unavailable(
-            status=status_value,
-            evidence_path=evidence_path,
-            workdir=workdir,
-            http_status=http_status,
-        )
     if (
         success is True
         or (http_status is not None and 200 <= http_status < 400)
@@ -177,27 +177,33 @@ def browser_result_from_postcheck(postcheck: dict[str, Any], *, workdir: Path) -
     events = load_postcheck_events(Path(events_path))
     dev_events = [event for event in events if event.get("event") == "dev_server"]
     if not dev_events:
+        dev_events = [
+            event
+            for event in events
+            if event.get("event") == "dev_server_lifecycle" and event.get("stage") in {"wait", "probe"}
+        ]
+    if not dev_events:
         return None
     event = dev_events[-1]
-    status = int_value(event.get("status"))
+    status = int_value(event.get("status")) or int_value(event.get("http_status"))
     if status is not None and status >= 400:
         return browser_fail(
-            failure_kind=f"browser_http_{status}",
+            failure_kind=browser_failure_kind(event, {}, http_status=status),
             evidence_path=None,
             workdir=workdir,
             status="failed",
             http_status=status,
             source="postcheck_dev_server",
         )
-    if event.get("ready") is False:
+    if event.get("ready") is False or event.get("ok") is False:
         return browser_unavailable(
-            status="dev_server_readiness_unavailable",
+            status=text_field(event, "failure_kind") or "dev_server_readiness_unavailable",
             evidence_path=None,
             workdir=workdir,
             http_status=status,
             source="postcheck_dev_server",
         )
-    if event.get("ready") is True:
+    if event.get("ready") is True or event.get("ok") is True:
         return browser_unavailable(
             status="browser_render_or_interaction_evidence_missing",
             evidence_path=None,
@@ -270,15 +276,31 @@ def browser_failure_kind(
     *,
     http_status: int | None,
 ) -> str:
-    if http_status is not None and http_status >= 400:
-        return f"browser_http_{http_status}"
     kind = text_field(evidence, "browser_failure_kind", "failure_kind", "error_kind") or text_field(
         details,
         "browser_failure_kind",
         "failure_kind",
         "error_kind",
     )
+    if kind in {"tailwind_dev_pipeline_failure", "css_dev_pipeline_failure", "nextjs_dev_pipeline_failure"}:
+        return kind
+    if http_status is not None and http_status >= 400:
+        return f"browser_http_{http_status}"
     return kind or "browser_behavior_failure"
+
+
+def browser_unavailable_status(status: str) -> bool:
+    return status in {"not_enabled", "adapter_not_implemented", "unavailable", "skipped"} or status.startswith(
+        ("unavailable:", "browser_unavailable:")
+    ) or status == "browser_unavailable"
+
+
+def browser_unavailable_reason(evidence: dict[str, Any], details: dict[str, Any], status: str) -> str:
+    return (
+        text_field(evidence, "browser_failure_kind", "failure_kind", "error_kind", "reason")
+        or text_field(details, "browser_failure_kind", "failure_kind", "error_kind", "reason")
+        or status
+    )
 
 
 def saved_browser_evidence_has_required_details(
