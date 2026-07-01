@@ -113,6 +113,8 @@ def score_runtime_health(
         "final_acceptance_repair_failed",
         "final_acceptance_repair_exhausted",
         "ultra_plan_complete",
+        "tui_command_stop",
+        "run_stop",
         "browser_oracle_summary",
     }
     has_runtime_events = any(event.get("event") in runtime_event_names for event in events)
@@ -689,6 +691,15 @@ def score_finalization_details(
     elif any(event.get("browser_success") == "" for event in browser_events):
         step = min(step, 80.0)
         reasons.append("browser_evidence_unavailable")
+    release_state = latest_release_completion_state(events)
+    release_gate_status = str(release_state.get("release_gate_status", ""))
+    final_acceptance_status = str(release_state.get("final_acceptance_status", ""))
+    if release_gate_status == "failed":
+        step = min(step, 0.0)
+        reasons.append("release_gate_failed")
+    elif release_gate_status == "partial" or final_acceptance_status == "partial":
+        step = min(step, 65.0)
+        reasons.append("release_gate_partial")
     step = clamp(step)
 
     plan: float | str = ""
@@ -701,6 +712,10 @@ def score_finalization_details(
             reasons.append("plan_final_contract_failure")
         elif "required_artifacts_satisfied" in stop_reason and not success:
             plan = max(plan, 50.0)
+        if release_gate_status == "failed":
+            plan = min(plan, 0.0)
+        elif release_gate_status == "partial" or final_acceptance_status == "partial":
+            plan = min(plan, 65.0)
         deferred = 100.0
         if "deferred_verify_requirement_pending" in stop_reason:
             deferred = 20.0
@@ -725,6 +740,20 @@ def score_finalization_details(
         "deferred_verify_finalization_score": round(deferred, 1) if isinstance(deferred, (int, float)) else "",
         "postcheck_finalization_score": round(postcheck, 1) if isinstance(postcheck, (int, float)) else "",
     }
+
+
+def latest_release_completion_state(events: list[dict[str, Any]]) -> dict[str, Any]:
+    for event in reversed(events):
+        if event.get("event") not in {
+            "run_stop",
+            "tui_command_stop",
+            "ultra_final_acceptance",
+            "plan_final_contract",
+        }:
+            continue
+        if event.get("release_gate_status") or event.get("final_acceptance_status"):
+            return event
+    return {}
 
 
 def score_postcheck_finalization(run_dir: Path | None) -> tuple[float | str, str]:

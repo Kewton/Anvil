@@ -137,6 +137,9 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "process_failure",
         ),
     };
+    let completion_snapshot =
+        eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
+    let completion = eval_events::project_completion(ok, &completion_snapshot);
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -146,20 +149,30 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "action": format!("{:?}", config.action),
             "stop_reason": stop_reason,
             "failure_kind": failure_kind,
+            "completion_status": &completion.status,
+            "process_completion_state": &completion.command_completion,
+            "command_completion_state": &completion.command_completion,
+            "runtime_acceptance_status": &completion.runtime_acceptance,
+            "final_acceptance_status": &completion.final_acceptance,
+            "release_gate_status": &completion.release_gate,
+            "release_gate_reasons": &completion.release_gate_reasons,
+            "browser_readiness_status": &completion.browser_readiness,
+            "browser_readiness_evidence_path": &completion.browser_readiness_evidence_path,
+            "interaction_evidence_status": &completion.interaction_evidence,
+            "interaction_evidence_path": &completion.interaction_evidence_path,
+            "release_quality_completion": &completion.release_quality_completion,
+            "next_action": &completion.next_action,
         }),
     );
-    let summary = if ok {
-        format!(
-            "Status: complete\nAction: {:?}\nStop reason: {}",
-            config.action, stop_reason
-        )
-    } else {
-        format!(
-            "Status: incomplete\nAction: {:?}\nStop reason: {}\nFailure kind: {}",
-            config.action, stop_reason, failure_kind
-        )
-    };
-    eval_events::append_run_summary(config.eval_events_path.as_deref(), &summary);
+    eval_events::append_completion_summary(
+        config.eval_events_path.as_deref(),
+        "process",
+        Some(&format!("{:?}", config.action)),
+        None,
+        &stop_reason,
+        failure_kind,
+        &completion,
+    );
 }
 
 #[cfg(test)]
@@ -168,6 +181,7 @@ mod tests {
 
     use super::*;
     use crate::config::{Action, Provider};
+    use serde_json::json;
 
     fn config(root: PathBuf) -> Config {
         Config {
@@ -214,6 +228,8 @@ mod tests {
         assert!(summary.contains("Status: running"));
         assert!(summary.contains("Action: Repl"));
         assert!(summary.contains("Status: complete"));
+        assert!(summary.contains("Command completion: completed"));
+        assert!(summary.contains("Final acceptance: not_checked"));
         assert!(summary.contains("Stop reason: completed"));
     }
 
@@ -230,7 +246,86 @@ mod tests {
 
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
         assert!(summary.contains("Status: incomplete"));
+        assert!(summary.contains("Command completion: failed"));
         assert!(summary.contains("Stop reason: boom"));
         assert!(summary.contains("Failure kind: process_failure"));
+    }
+
+    #[test]
+    fn run_lifecycle_does_not_mask_partial_release_gate_as_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/test-run/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+
+        emit_run_start(&cfg);
+        eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_passed": true,
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "partial",
+                "release_gate_status": "partial",
+                "release_gate_reasons": ["browser_readiness_or_interaction_evidence_required:browser_readiness_evidence_missing"],
+                "browser_readiness_status": "unavailable:browser_readiness_evidence_missing",
+                "interaction_evidence_status": "unavailable:interaction_evidence_missing",
+            }),
+        );
+        let result: anyhow::Result<()> = Ok(());
+        emit_run_stop(&cfg, &result);
+
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"completion_status\":\"complete_with_partial_release_gate\"")
+        );
+        assert!(event_text.contains("\"release_gate_status\":\"partial\""));
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains("Status: complete_with_partial_release_gate"));
+        assert!(summary.contains("Command completion: completed"));
+        assert!(summary.contains("Runtime acceptance: pass"));
+        assert!(summary.contains("Final acceptance: partial"));
+        assert!(summary.contains("Release gate: partial"));
+        assert!(
+            summary.contains(
+                "Next action: collect_missing_release_evidence_or_continue_release_recovery"
+            ),
+            "{summary}"
+        );
+        assert!(!summary.contains("\nStatus: complete\nAction: Repl\nStop reason: completed"));
+    }
+
+    #[test]
+    fn run_lifecycle_does_not_mask_browser_http_500_release_failure_as_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/test-run/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+
+        emit_run_start(&cfg);
+        eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_passed": true,
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "incomplete",
+                "release_gate_status": "failed",
+                "release_gate_reasons": ["browser_readiness_failed:http_500"],
+                "browser_readiness_status": "failed:http_500",
+                "interaction_evidence_status": "not_checked",
+            }),
+        );
+        let result: anyhow::Result<()> = Ok(());
+        emit_run_stop(&cfg, &result);
+
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"completion_status\":\"incomplete_release_gate_failed\""));
+        assert!(event_text.contains("\"browser_readiness_status\":\"failed:http_500\""));
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains("Status: incomplete_release_gate_failed"));
+        assert!(summary.contains("Release gate: failed"));
+        assert!(summary.contains("- browser_readiness_failed:http_500"));
+        assert!(!summary.contains("\nStatus: complete\nAction: Repl\nStop reason: completed"));
     }
 }

@@ -1303,6 +1303,11 @@ fn verify_plan_final_contract(
     let ok =
         missing_final_artifacts.is_empty() && external_ok && runtime_ok && !release_gate_failed;
     let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
+    let runtime_acceptance_status =
+        runtime_acceptance_status(runtime_ok, runtime_acceptance.as_ref());
+    let release_quality_completion =
+        release_quality_completion_status(&release_gate, final_acceptance_status);
+    let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
     let primary_reason = if !missing_final_artifacts.is_empty() {
         format!(
             "missing final artifacts: {}",
@@ -1317,13 +1322,6 @@ fn verify_plan_final_contract(
     } else {
         "ok".to_string()
     };
-    if release_gate.status != "not_applicable"
-        && runtime_ok
-        && missing_final_artifacts.is_empty()
-        && external_ok
-    {
-        append_release_gate_summary(config, &release_gate);
-    }
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -1371,13 +1369,17 @@ fn verify_plan_final_contract(
                 .as_ref()
                 .map(|report| report.inconclusive)
                 .unwrap_or(false),
+            "runtime_acceptance_passed": runtime_ok,
+            "runtime_acceptance_status": runtime_acceptance_status,
             "final_acceptance_status": final_acceptance_status,
+            "release_quality_completion": release_quality_completion,
             "release_gate_status": release_gate.status.clone(),
             "release_gate_reasons": release_gate.reasons.clone(),
             "browser_readiness_status": release_gate.browser_readiness_status.clone(),
             "browser_readiness_evidence_path": release_gate.browser_readiness_evidence_path.clone(),
             "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
+            "next_action": next_action,
             "ok": ok,
             "primary_reason": eval_events::body_snippet(&primary_reason),
         }),
@@ -2557,9 +2559,10 @@ fn ultra_final_acceptance_report(
         Some(&acceptance),
     );
     let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
-    if release_gate.status != "not_applicable" && acceptance.passed && missing.is_empty() {
-        append_release_gate_summary(config, &release_gate);
-    }
+    let runtime_acceptance_status = runtime_acceptance_status(acceptance.passed, Some(&acceptance));
+    let release_quality_completion =
+        release_quality_completion_status(&release_gate, final_acceptance_status);
+    let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -2570,8 +2573,10 @@ fn ultra_final_acceptance_report(
             "required_evidence": required_evidence.clone(),
             "required_obligations": required_obligations.clone(),
             "runtime_acceptance_passed": acceptance.passed,
+            "runtime_acceptance_status": runtime_acceptance_status,
             "runtime_acceptance_inconclusive": acceptance.inconclusive,
             "final_acceptance_status": final_acceptance_status,
+            "release_quality_completion": release_quality_completion,
             "missing_capabilities": acceptance.missing_capabilities.clone(),
             "missing_evidence": acceptance.missing_evidence.clone(),
             "missing_obligations": acceptance.missing_obligations.clone(),
@@ -2586,6 +2591,7 @@ fn ultra_final_acceptance_report(
             "browser_readiness_evidence_path": release_gate.browser_readiness_evidence_path.clone(),
             "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
+            "next_action": next_action,
             "primary_reason": eval_events::body_snippet(&acceptance.primary_reason),
         }),
     );
@@ -3167,36 +3173,49 @@ fn text_field(value: &Value, keys: &[&str]) -> Option<String> {
         .map(|text| text.trim().to_ascii_lowercase())
 }
 
-fn append_release_gate_summary(config: &Config, release_gate: &ReleaseGateSummary) {
-    eval_events::append_run_summary(
-        config.eval_events_path.as_deref(),
-        &format!(
-            "Final acceptance: {}\nRelease gate: {}\nReasons:\n{}\nBrowser readiness: {}\nBrowser readiness evidence: {}\nInteraction evidence: {}\nInteraction evidence path: {}",
-            release_gate_final_acceptance_status(release_gate),
-            release_gate.status,
-            render_prompt_bullets(&release_gate.reasons),
-            release_gate.browser_readiness_status,
-            if release_gate.browser_readiness_evidence_path.is_empty() {
-                "missing"
-            } else {
-                release_gate.browser_readiness_evidence_path.as_str()
-            },
-            release_gate.interaction_evidence_status,
-            if release_gate.interaction_evidence_path.is_empty() {
-                "missing"
-            } else {
-                release_gate.interaction_evidence_path.as_str()
-            },
-        ),
-    );
-}
-
 fn release_gate_final_acceptance_status(release_gate: &ReleaseGateSummary) -> &'static str {
     match release_gate.status.as_str() {
         "pass" | "not_applicable" => "full_success",
         "partial" => "partial",
         "failed" => "incomplete",
         _ => "incomplete",
+    }
+}
+
+fn runtime_acceptance_status(
+    runtime_ok: bool,
+    report: Option<&crate::minimal_loop::evidence::RuntimeAcceptanceReport>,
+) -> &'static str {
+    match report {
+        Some(report) if report.inconclusive => "inconclusive",
+        Some(_) if runtime_ok => "pass",
+        Some(_) => "failed",
+        None => "not_checked",
+    }
+}
+
+fn release_quality_completion_status(
+    release_gate: &ReleaseGateSummary,
+    final_acceptance_status: &str,
+) -> &'static str {
+    match release_gate.status.as_str() {
+        "pass" | "not_applicable" => "release_ready",
+        "partial" => "partial",
+        "failed" => "failed",
+        _ if final_acceptance_status == "partial" => "partial",
+        _ => "failed",
+    }
+}
+
+fn release_gate_next_action(
+    release_gate: &ReleaseGateSummary,
+    final_acceptance_status: &str,
+) -> &'static str {
+    match release_gate.status.as_str() {
+        "partial" => "collect_missing_release_evidence_or_continue_release_recovery",
+        "failed" => "repair_release_gate_failure",
+        _ if final_acceptance_status == "partial" => "collect_missing_final_acceptance_evidence",
+        _ => "none",
     }
 }
 

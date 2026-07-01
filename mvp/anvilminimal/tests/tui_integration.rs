@@ -348,6 +348,58 @@ fn tui_slash_failure_appends_to_existing_partial_summary() {
 }
 
 #[test]
+fn tui_slash_success_with_partial_release_gate_is_not_complete_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    anvilminimal::eval_events::emit(
+        cfg.eval_events_path.as_deref(),
+        json!({
+            "event": "ultra_final_acceptance",
+            "runtime_acceptance_passed": true,
+            "runtime_acceptance_status": "pass",
+            "final_acceptance_status": "partial",
+            "release_gate_status": "partial",
+            "release_gate_reasons": ["browser_readiness_or_interaction_evidence_required:browser_readiness_evidence_missing"],
+            "browser_readiness_status": "unavailable:browser_readiness_evidence_missing",
+            "interaction_evidence_status": "unavailable:interaction_evidence_missing",
+        }),
+    );
+    let plan_json = r#"{"goal":"test","steps":[{"id":"s1","kind":"report","instruction":"say done","expected_paths":[],"verify":[],"expected_result":"pass"}]}"#;
+    let mut planner = FakeClient::new("planner", vec![AssistantReply::text(plan_json)]);
+    let mut execution = FakeClient::new("exec", Vec::new());
+    let ui = FakeUi::default();
+    let output = anvilminimal::tui::slash::handle_command(
+        "/plan-steps test",
+        &cfg,
+        &mut planner,
+        &mut execution,
+        &ui,
+    )
+    .unwrap();
+    assert!(output.contains("Command completion: completed"));
+    assert!(output.contains("Runtime acceptance: pass"));
+    assert!(output.contains("Final acceptance: partial"));
+    assert!(output.contains("Release gate: partial"));
+    assert!(
+        output
+            .contains("Next action: collect_missing_release_evidence_or_continue_release_recovery")
+    );
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    assert!(events.contains("\"event\":\"tui_command_stop\""));
+    assert!(events.contains("\"completion_status\":\"complete_with_partial_release_gate\""));
+    assert!(events.contains("\"release_gate_status\":\"partial\""));
+    let summary =
+        std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
+    assert!(summary.contains("Status: complete_with_partial_release_gate"));
+    assert!(summary.contains("Command completion: completed"));
+    assert!(summary.contains("Final acceptance: partial"));
+    assert!(summary.contains("Release gate: partial"));
+    assert!(!summary.contains("\nStatus: complete\nCommand completion: completed"));
+}
+
+#[test]
 fn plain_renderer_keeps_raw_output() {
     let renderer = anvilminimal::tui::markdown::PlainRenderer;
     renderer

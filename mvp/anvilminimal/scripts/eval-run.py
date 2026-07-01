@@ -1040,8 +1040,29 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "acceptance_failure_kind": acceptance.get("acceptance_failure_kind", ""),
             "acceptance_failure_reasons": acceptance.get("acceptance_failure_reasons", ""),
             "acceptance_false_positive": acceptance.get("acceptance_false_positive", ""),
-            "release_gate_status": acceptance.get("release_gate_status", ""),
-            "release_gate_reasons": acceptance.get("release_gate_reasons", ""),
+            "command_completion_state": completion_observability.get(
+                "command_completion_state",
+                "completed" if result.rc == 0 else "failed",
+            ),
+            "final_acceptance_status": completion_observability.get(
+                "final_acceptance_status", ""
+            ),
+            "runtime_acceptance_status": completion_observability.get(
+                "runtime_acceptance_status", ""
+            ),
+            "release_gate_status": completion_observability.get(
+                "release_gate_status", acceptance.get("release_gate_status", "")
+            ),
+            "release_gate_reasons": completion_observability.get(
+                "release_gate_reasons", acceptance.get("release_gate_reasons", "")
+            ),
+            "browser_readiness_status": completion_observability.get(
+                "browser_readiness_status", ""
+            ),
+            "interaction_evidence_status": completion_observability.get(
+                "interaction_evidence_status", ""
+            ),
+            "next_action": completion_observability.get("next_action", ""),
             "oracle_gap_kind": acceptance.get("oracle_gap_kind", ""),
             "acceptance_oracle_version": acceptance.get("acceptance_oracle_version", ""),
             "queue_wait_sec": 0.0,
@@ -1274,41 +1295,84 @@ def summarize_completion_observability(events: list[dict]) -> dict[str, object]:
     completion = [
         event for event in events if event.get("event") == "completion_verify"
     ]
-    if not completion:
+    completion_state = latest_completion_state_event(events)
+    if not completion and not completion_state:
         return {}
-    last = completion[-1]
-    out: dict[str, object] = {
-        "completion_verify_count": len(completion),
-    }
-    if last.get("profile"):
-        out["completion_profile"] = last.get("profile", "")
-    if last.get("deferred_verify_requirements"):
-        out["deferred_verify_requirements"] = last.get("deferred_verify_requirements", [])
-    if last.get("profile_failures"):
-        out["profile_failures"] = last.get("profile_failures", [])
-    required_capabilities = last.get("required_capabilities", []) or []
-    missing_capabilities = last.get("missing_capabilities", []) or []
-    required_evidence = last.get("required_evidence", []) or []
-    missing_evidence = last.get("missing_evidence", []) or []
-    weak_evidence = last.get("weak_evidence", []) or []
-    out["required_capability_count"] = len(required_capabilities)
-    out["missing_capability_count"] = len(missing_capabilities)
-    out["required_evidence_count"] = len(required_evidence)
-    out["missing_evidence_count"] = len(missing_evidence)
-    out["weak_evidence_count"] = len(weak_evidence)
-    out["runtime_acceptance_primary_reason"] = last.get("runtime_acceptance_primary_reason", "")
-    out["runtime_acceptance_passed"] = last.get("runtime_acceptance_passed", "")
-    if required_capabilities:
-        out["required_capabilities"] = required_capabilities
-    if missing_capabilities:
-        out["missing_capabilities"] = missing_capabilities
-    if required_evidence:
-        out["required_evidence"] = required_evidence
-    if missing_evidence:
-        out["missing_evidence"] = missing_evidence
-    if weak_evidence:
-        out["weak_evidence"] = weak_evidence
+    out: dict[str, object] = {}
+    if completion:
+        last = completion[-1]
+        out["completion_verify_count"] = len(completion)
+        if last.get("profile"):
+            out["completion_profile"] = last.get("profile", "")
+        if last.get("deferred_verify_requirements"):
+            out["deferred_verify_requirements"] = last.get("deferred_verify_requirements", [])
+        if last.get("profile_failures"):
+            out["profile_failures"] = last.get("profile_failures", [])
+        required_capabilities = last.get("required_capabilities", []) or []
+        missing_capabilities = last.get("missing_capabilities", []) or []
+        required_evidence = last.get("required_evidence", []) or []
+        missing_evidence = last.get("missing_evidence", []) or []
+        weak_evidence = last.get("weak_evidence", []) or []
+        out["required_capability_count"] = len(required_capabilities)
+        out["missing_capability_count"] = len(missing_capabilities)
+        out["required_evidence_count"] = len(required_evidence)
+        out["missing_evidence_count"] = len(missing_evidence)
+        out["weak_evidence_count"] = len(weak_evidence)
+        out["runtime_acceptance_primary_reason"] = last.get("runtime_acceptance_primary_reason", "")
+        out["runtime_acceptance_passed"] = last.get("runtime_acceptance_passed", "")
+        if required_capabilities:
+            out["required_capabilities"] = required_capabilities
+        if missing_capabilities:
+            out["missing_capabilities"] = missing_capabilities
+        if required_evidence:
+            out["required_evidence"] = required_evidence
+        if missing_evidence:
+            out["missing_evidence"] = missing_evidence
+        if weak_evidence:
+            out["weak_evidence"] = weak_evidence
+    if completion_state:
+        out["command_completion_state"] = completion_state.get("command_completion_state", "")
+        out["final_acceptance_status"] = completion_state.get("final_acceptance_status", "")
+        out["runtime_acceptance_status"] = completion_state.get(
+            "runtime_acceptance_status",
+            runtime_acceptance_status_from_event(completion_state),
+        )
+        out["release_gate_status"] = completion_state.get("release_gate_status", "")
+        out["release_gate_reasons"] = completion_state.get("release_gate_reasons", [])
+        out["browser_readiness_status"] = completion_state.get("browser_readiness_status", "")
+        out["interaction_evidence_status"] = completion_state.get("interaction_evidence_status", "")
+        out["next_action"] = completion_state.get("next_action", "")
     return out
+
+
+def latest_completion_state_event(events: list[dict]) -> dict[str, object]:
+    for event in reversed(events):
+        if event.get("event") not in {
+            "run_stop",
+            "tui_command_stop",
+            "ultra_final_acceptance",
+            "plan_final_contract",
+        }:
+            continue
+        if any(
+            key in event
+            for key in (
+                "final_acceptance_status",
+                "release_gate_status",
+                "runtime_acceptance_status",
+                "runtime_acceptance_passed",
+            )
+        ):
+            return event
+    return {}
+
+
+def runtime_acceptance_status_from_event(event: dict[str, object]) -> str:
+    if event.get("runtime_acceptance_passed") is True:
+        return "pass"
+    if event.get("runtime_acceptance_passed") is False:
+        return "failed"
+    return ""
 
 
 def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:

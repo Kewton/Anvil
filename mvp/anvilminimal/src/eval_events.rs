@@ -96,6 +96,340 @@ pub fn append_run_summary(path: Option<&Path>, text: &str) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionSnapshot {
+    pub runtime_acceptance_status: String,
+    pub final_acceptance_status: String,
+    pub release_gate_status: String,
+    pub release_gate_reasons: Vec<String>,
+    pub browser_readiness_status: String,
+    pub browser_readiness_evidence_path: String,
+    pub interaction_evidence_status: String,
+    pub interaction_evidence_path: String,
+}
+
+impl CompletionSnapshot {
+    pub fn empty() -> Self {
+        Self {
+            runtime_acceptance_status: "not_checked".to_string(),
+            final_acceptance_status: "not_checked".to_string(),
+            release_gate_status: "not_applicable".to_string(),
+            release_gate_reasons: Vec::new(),
+            browser_readiness_status: "not_applicable".to_string(),
+            browser_readiness_evidence_path: String::new(),
+            interaction_evidence_status: "not_applicable".to_string(),
+            interaction_evidence_path: String::new(),
+        }
+    }
+
+    pub fn has_release_signal(&self) -> bool {
+        self.final_acceptance_status != "not_checked"
+            || !matches!(
+                self.release_gate_status.as_str(),
+                "" | "not_applicable" | "not_checked"
+            )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionProjection {
+    pub status: String,
+    pub command_completion: String,
+    pub runtime_acceptance: String,
+    pub final_acceptance: String,
+    pub release_gate: String,
+    pub release_gate_reasons: Vec<String>,
+    pub browser_readiness: String,
+    pub browser_readiness_evidence_path: String,
+    pub interaction_evidence: String,
+    pub interaction_evidence_path: String,
+    pub release_quality_completion: String,
+    pub next_action: String,
+}
+
+pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
+    let Some(path) = path else {
+        return CompletionSnapshot::empty();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return CompletionSnapshot::empty();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|event| snapshot_from_completion_event(&event))
+        .last()
+        .unwrap_or_else(CompletionSnapshot::empty)
+}
+
+pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> CompletionProjection {
+    let command_completion = if ok { "completed" } else { "failed" }.to_string();
+    let release_gate = if snapshot.release_gate_status.is_empty() {
+        "not_applicable".to_string()
+    } else {
+        snapshot.release_gate_status.clone()
+    };
+    let final_acceptance = if snapshot.final_acceptance_status.is_empty() {
+        "not_checked".to_string()
+    } else {
+        snapshot.final_acceptance_status.clone()
+    };
+    let runtime_acceptance = if snapshot.runtime_acceptance_status.is_empty() {
+        "not_checked".to_string()
+    } else {
+        snapshot.runtime_acceptance_status.clone()
+    };
+    let release_quality_completion = release_quality_completion(&release_gate, &final_acceptance);
+    let status = terminal_status(ok, &release_gate, &final_acceptance);
+    let next_action = next_action(ok, &release_gate, &final_acceptance);
+    CompletionProjection {
+        status,
+        command_completion,
+        runtime_acceptance,
+        final_acceptance,
+        release_gate,
+        release_gate_reasons: snapshot.release_gate_reasons.clone(),
+        browser_readiness: snapshot.browser_readiness_status.clone(),
+        browser_readiness_evidence_path: snapshot.browser_readiness_evidence_path.clone(),
+        interaction_evidence: snapshot.interaction_evidence_status.clone(),
+        interaction_evidence_path: snapshot.interaction_evidence_path.clone(),
+        release_quality_completion,
+        next_action,
+    }
+}
+
+pub fn append_completion_summary(
+    path: Option<&Path>,
+    lifecycle_stage: &str,
+    action: Option<&str>,
+    command: Option<&str>,
+    stop_reason: &str,
+    failure_kind: &str,
+    projection: &CompletionProjection,
+) {
+    append_run_summary(
+        path,
+        &render_completion_summary(
+            lifecycle_stage,
+            action,
+            command,
+            stop_reason,
+            failure_kind,
+            projection,
+        ),
+    );
+}
+
+pub fn render_tui_completion_output(output: &str, projection: &CompletionProjection) -> String {
+    if projection.release_gate == "not_applicable"
+        && projection.final_acceptance == "not_checked"
+        && projection.runtime_acceptance == "not_checked"
+    {
+        return output.to_string();
+    }
+    format!(
+        "{}\n\nCommand completion: {}\nRuntime acceptance: {}\nFinal acceptance: {}\nRelease gate: {}\nNext action: {}",
+        output,
+        projection.command_completion,
+        projection.runtime_acceptance,
+        projection.final_acceptance,
+        projection.release_gate,
+        projection.next_action
+    )
+}
+
+fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
+    let name = event.get("event")?.as_str()?;
+    if !matches!(
+        name,
+        "plan_final_contract" | "ultra_final_acceptance" | "tui_command_stop" | "run_stop"
+    ) {
+        return None;
+    }
+    if !has_completion_fields(event) {
+        return None;
+    }
+    Some(CompletionSnapshot {
+        runtime_acceptance_status: event
+            .get("runtime_acceptance_status")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| runtime_acceptance_status_from_bool(event))
+            .unwrap_or_else(|| "not_checked".to_string()),
+        final_acceptance_status: event
+            .get("final_acceptance_status")
+            .and_then(Value::as_str)
+            .unwrap_or("not_checked")
+            .to_string(),
+        release_gate_status: event
+            .get("release_gate_status")
+            .and_then(Value::as_str)
+            .unwrap_or("not_applicable")
+            .to_string(),
+        release_gate_reasons: event
+            .get("release_gate_reasons")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        browser_readiness_status: event
+            .get("browser_readiness_status")
+            .and_then(Value::as_str)
+            .unwrap_or("not_applicable")
+            .to_string(),
+        browser_readiness_evidence_path: event
+            .get("browser_readiness_evidence_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        interaction_evidence_status: event
+            .get("interaction_evidence_status")
+            .and_then(Value::as_str)
+            .unwrap_or("not_applicable")
+            .to_string(),
+        interaction_evidence_path: event
+            .get("interaction_evidence_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn has_completion_fields(event: &Value) -> bool {
+    event.get("final_acceptance_status").is_some()
+        || event.get("release_gate_status").is_some()
+        || event.get("runtime_acceptance_status").is_some()
+        || event.get("runtime_acceptance_passed").is_some()
+}
+
+fn runtime_acceptance_status_from_bool(event: &Value) -> Option<String> {
+    event
+        .get("runtime_acceptance_passed")
+        .and_then(Value::as_bool)
+        .map(|passed| {
+            if passed {
+                "pass".to_string()
+            } else {
+                "failed".to_string()
+            }
+        })
+}
+
+fn terminal_status(ok: bool, release_gate: &str, final_acceptance: &str) -> String {
+    if !ok {
+        return "incomplete".to_string();
+    }
+    match release_gate {
+        "partial" => "complete_with_partial_release_gate".to_string(),
+        "failed" => "incomplete_release_gate_failed".to_string(),
+        "pass" | "not_applicable" | "not_checked" | "" => match final_acceptance {
+            "partial" => "complete_with_partial_release_gate".to_string(),
+            "incomplete" | "failed" => "incomplete".to_string(),
+            _ => "complete".to_string(),
+        },
+        _ => "incomplete".to_string(),
+    }
+}
+
+fn release_quality_completion(release_gate: &str, final_acceptance: &str) -> String {
+    match release_gate {
+        "pass" | "not_applicable" => "release_ready".to_string(),
+        "partial" => "partial".to_string(),
+        "failed" => "failed".to_string(),
+        _ if final_acceptance == "partial" => "partial".to_string(),
+        _ if matches!(final_acceptance, "incomplete" | "failed") => "failed".to_string(),
+        _ => "not_checked".to_string(),
+    }
+}
+
+fn next_action(ok: bool, release_gate: &str, final_acceptance: &str) -> String {
+    if !ok {
+        return "fix_command_failure".to_string();
+    }
+    match release_gate {
+        "partial" => "collect_missing_release_evidence_or_continue_release_recovery".to_string(),
+        "failed" => "repair_release_gate_failure".to_string(),
+        _ if final_acceptance == "partial" => {
+            "collect_missing_final_acceptance_evidence".to_string()
+        }
+        _ if matches!(final_acceptance, "incomplete" | "failed") => {
+            "repair_final_acceptance_failure".to_string()
+        }
+        _ => "none".to_string(),
+    }
+}
+
+fn render_completion_summary(
+    lifecycle_stage: &str,
+    action: Option<&str>,
+    command: Option<&str>,
+    stop_reason: &str,
+    failure_kind: &str,
+    projection: &CompletionProjection,
+) -> String {
+    let mut lines = vec![
+        format!("Status: {}", projection.status),
+        format!("Lifecycle: {lifecycle_stage}"),
+    ];
+    if let Some(action) = action {
+        lines.push(format!("Action: {action}"));
+    }
+    if let Some(command) = command {
+        lines.push(format!("Command: {command}"));
+    }
+    lines.extend([
+        format!("Command completion: {}", projection.command_completion),
+        format!("Runtime acceptance: {}", projection.runtime_acceptance),
+        format!("Final acceptance: {}", projection.final_acceptance),
+        format!("Release gate: {}", projection.release_gate),
+        format!(
+            "Release quality completion: {}",
+            projection.release_quality_completion
+        ),
+        "Release gate reasons:".to_string(),
+        render_summary_bullets(&projection.release_gate_reasons),
+        format!("Browser readiness: {}", projection.browser_readiness),
+        format!(
+            "Browser readiness evidence: {}",
+            missing_if_empty(&projection.browser_readiness_evidence_path)
+        ),
+        format!("Interaction evidence: {}", projection.interaction_evidence),
+        format!(
+            "Interaction evidence path: {}",
+            missing_if_empty(&projection.interaction_evidence_path)
+        ),
+        format!("Next action: {}", projection.next_action),
+        format!("Stop reason: {stop_reason}"),
+    ]);
+    if !failure_kind.is_empty() {
+        lines.push(format!("Failure kind: {failure_kind}"));
+    }
+    if lifecycle_stage == "tui_command" && projection.command_completion == "failed" {
+        lines.push(format!("TUI command failed: {stop_reason}"));
+    }
+    lines.join("\n")
+}
+
+fn render_summary_bullets(items: &[String]) -> String {
+    if items.is_empty() {
+        "- none".to_string()
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn missing_if_empty(value: &str) -> &str {
+    if value.is_empty() { "missing" } else { value }
+}
+
 pub fn argument_shape(arguments: &Value) -> Value {
     match arguments {
         Value::Object(map) => {

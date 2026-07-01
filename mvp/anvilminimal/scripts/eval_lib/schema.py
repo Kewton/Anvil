@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-EVAL_SCHEMA_VERSION = "eval-summary-v3-failure-gate"
+EVAL_SCHEMA_VERSION = "eval-summary-v4-completion-authority"
 NOT_AVAILABLE = "not_available"
 
 

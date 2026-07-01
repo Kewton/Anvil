@@ -90,11 +90,15 @@ pub fn handle_command(
         ),
         other => bail!("unknown slash command: {other}"),
     })();
-    emit_tui_command_stop(&config, &parsed.command, &result);
-    result
+    let completion = emit_tui_command_stop(&config, &parsed.command, &result);
+    result.map(|output| crate::eval_events::render_tui_completion_output(&output, &completion))
 }
 
-fn emit_tui_command_stop(config: &Config, command: &str, result: &anyhow::Result<String>) {
+fn emit_tui_command_stop(
+    config: &Config,
+    command: &str,
+    result: &anyhow::Result<String>,
+) -> crate::eval_events::CompletionProjection {
     let (ok, failure_kind, stop_reason) = match result {
         Ok(_) => (true, "", "completed".to_string()),
         Err(err) => (
@@ -103,6 +107,9 @@ fn emit_tui_command_stop(config: &Config, command: &str, result: &anyhow::Result
             crate::eval_events::body_snippet(&err.to_string()),
         ),
     };
+    let completion_snapshot =
+        crate::eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
+    let completion = crate::eval_events::project_completion(ok, &completion_snapshot);
     crate::eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -112,7 +119,28 @@ fn emit_tui_command_stop(config: &Config, command: &str, result: &anyhow::Result
             "ok": ok,
             "failure_kind": failure_kind,
             "stop_reason": stop_reason,
+            "completion_status": &completion.status,
+            "command_completion_state": &completion.command_completion,
+            "runtime_acceptance_status": &completion.runtime_acceptance,
+            "final_acceptance_status": &completion.final_acceptance,
+            "release_gate_status": &completion.release_gate,
+            "release_gate_reasons": &completion.release_gate_reasons,
+            "browser_readiness_status": &completion.browser_readiness,
+            "browser_readiness_evidence_path": &completion.browser_readiness_evidence_path,
+            "interaction_evidence_status": &completion.interaction_evidence,
+            "interaction_evidence_path": &completion.interaction_evidence_path,
+            "release_quality_completion": &completion.release_quality_completion,
+            "next_action": &completion.next_action,
         }),
+    );
+    crate::eval_events::append_completion_summary(
+        config.eval_events_path.as_deref(),
+        "tui_command",
+        None,
+        Some(command),
+        &stop_reason,
+        failure_kind,
+        &completion,
     );
     if !ok {
         crate::eval_events::emit(
@@ -124,11 +152,8 @@ fn emit_tui_command_stop(config: &Config, command: &str, result: &anyhow::Result
                 "primary_reason": stop_reason,
             }),
         );
-        crate::eval_events::append_run_summary(
-            config.eval_events_path.as_deref(),
-            &format!("TUI command failed: {stop_reason}"),
-        );
     }
+    completion
 }
 
 pub fn parse_profile_style(args: &[String], config: &Config) -> (String, String, Vec<String>) {

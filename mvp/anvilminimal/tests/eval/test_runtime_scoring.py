@@ -107,6 +107,36 @@ class RuntimeScoringTest(unittest.TestCase):
         self.assertNotEqual(score["runtime_friction_score"], "")
         self.assertNotEqual(score["ultra_runtime_health_score"], "")
 
+    def test_release_gate_partial_reduces_finalization_without_phase_failure(self):
+        events = [
+            {"event": "ultra_phase_start", "phase_id": "game", "total_phases": 1},
+            {"event": "ultra_phase_scaffold_complete", "phase_id": "game", "total_phases": 1},
+            {"event": "ultra_phase_execute_complete", "phase_id": "game", "total_phases": 1},
+            {"event": "ultra_phase_profile_check", "phase_id": "game", "total_phases": 1, "ok": True},
+            {"event": "ultra_phase_complete", "phase_id": "game", "total_phases": 1},
+            {"event": "ultra_plan_complete", "total_phases": 1, "ok": True},
+            {
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_passed": True,
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "partial",
+                "release_gate_status": "partial",
+                "browser_readiness_status": "unavailable:browser_readiness_evidence_missing",
+                "interaction_evidence_status": "unavailable:interaction_evidence_missing",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="ultra-plan-run",
+                success=True,
+                scenario={},
+                workdir=Path(td),
+            )
+        self.assertEqual(score["phase_completion_score"], 100.0)
+        self.assertLess(score["finalization_score"], 100.0)
+        self.assertIn("release_gate_partial", score["finalization_reason"])
+
     def test_prompt_contract_score_uses_boolean_event_without_prompt_body(self):
         events = [
             {
