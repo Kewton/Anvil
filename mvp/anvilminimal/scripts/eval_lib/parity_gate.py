@@ -741,15 +741,45 @@ def evaluate_tui_evidence(paths: list[str]) -> dict[str, Any]:
                 "reason": "evidence_invalid",
                 "error": str(err),
             }
+        if not events:
+            return {
+                "status": "fail",
+                "path": raw,
+                "failure_kind": "silent_exit",
+                "reason": "tui_events_empty",
+            }
+        run_stop = next((event for event in reversed(events) if event.get("event") == "run_stop"), None)
+        if run_stop is None:
+            return {
+                "status": "fail",
+                "path": raw,
+                "failure_kind": "silent_exit",
+                "reason": "run_stop_missing",
+            }
+        if run_stop.get("ok") is not True:
+            return {
+                "status": "fail",
+                "path": raw,
+                "failure_kind": run_stop.get("failure_kind") or "process_failure",
+                "reason": run_stop.get("stop_reason") or run_stop.get("failure_kind") or "process_failure",
+            }
+        if not run_stop.get("stop_reason"):
+            return {
+                "status": "fail",
+                "path": raw,
+                "failure_kind": "silent_exit",
+                "reason": "run_stop_reason_missing",
+            }
         stop = next((event for event in reversed(events) if event.get("event") == "tui_command_stop"), None)
         if stop is None:
             return {
-                "status": "partial",
+                "status": "fail",
                 "path": raw,
+                "failure_kind": "silent_exit",
                 "reason": "tui_command_stop_missing",
             }
         if stop.get("ok") is True:
-            return {"status": "pass", "path": raw}
+            return {"status": "pass", "path": raw, "stop_reason": run_stop.get("stop_reason")}
         return {
             "status": "fail",
             "path": raw,

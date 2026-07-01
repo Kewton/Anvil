@@ -193,7 +193,14 @@ class ParityGateReportTest(unittest.TestCase):
                 encoding="utf-8",
             )
             events.write_text(
-                json.dumps({"event": "tui_command_stop", "ok": True}) + "\n",
+                "\n".join(
+                    [
+                        json.dumps({"event": "run_start", "action": "Repl"}),
+                        json.dumps({"event": "tui_command_stop", "ok": True}),
+                        json.dumps({"event": "run_stop", "ok": True, "stop_reason": "completed"}),
+                    ]
+                )
+                + "\n",
                 encoding="utf-8",
             )
             report = build_parity_gate_report(
@@ -232,13 +239,19 @@ class ParityGateReportTest(unittest.TestCase):
             root = Path(td)
             uat, browser, interaction, events = release_evidence_files(root)
             events.write_text(
-                json.dumps(
-                    {
-                        "event": "tui_command_stop",
-                        "ok": False,
-                        "failure_kind": "tui_command_failed",
-                        "primary_reason": "dependency_setup_missing",
-                    }
+                "\n".join(
+                    [
+                        json.dumps({"event": "run_start", "action": "Repl"}),
+                        json.dumps(
+                            {
+                                "event": "tui_command_stop",
+                                "ok": False,
+                                "failure_kind": "tui_command_failed",
+                                "primary_reason": "dependency_setup_missing",
+                            }
+                        ),
+                        json.dumps({"event": "run_stop", "ok": True, "stop_reason": "completed"}),
+                    ]
                 )
                 + "\n",
                 encoding="utf-8",
@@ -254,6 +267,36 @@ class ParityGateReportTest(unittest.TestCase):
         uat_equivalent = report["uat_equivalent"]
         self.assertEqual(uat_equivalent["status"], "fail")
         self.assertIn("tui:tui_command_failed", release_evidence_blockers(uat_equivalent))
+
+    def test_release_gate_rejects_silent_tui_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            uat, browser, interaction, events = release_evidence_files(root)
+            events.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"event": "run_start", "action": "Repl"}),
+                        json.dumps({"event": "run_stop", "ok": True, "stop_reason": "completed"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = build_parity_gate_report(
+                base_report=self.base_report(),
+                gate_level="release",
+                uat_evidence_paths=[str(uat)],
+                browser_evidence_paths=[str(browser)],
+                interaction_evidence_paths=[str(interaction)],
+                tui_event_paths=[str(events)],
+            )
+        uat_equivalent = report["uat_equivalent"]
+        self.assertEqual(uat_equivalent["status"], "fail")
+        self.assertIn("tui:silent_exit", release_evidence_blockers(uat_equivalent))
+        self.assertEqual(
+            uat_equivalent["evidence_results"]["tui"]["reason"],
+            "tui_command_stop_missing",
+        )
 
     def test_release_gate_rejects_malformed_evidence_json(self):
         with tempfile.TemporaryDirectory() as td:
@@ -366,7 +409,14 @@ def release_evidence_files(root: Path):
         encoding="utf-8",
     )
     events.write_text(
-        json.dumps({"event": "tui_command_stop", "ok": True}) + "\n",
+        "\n".join(
+            [
+                json.dumps({"event": "run_start", "action": "Repl"}),
+                json.dumps({"event": "tui_command_stop", "ok": True}),
+                json.dumps({"event": "run_stop", "ok": True, "stop_reason": "completed"}),
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
     return uat, browser, interaction, events

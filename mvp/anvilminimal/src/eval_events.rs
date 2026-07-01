@@ -17,9 +17,6 @@ pub fn path_from_env_or_default(root: &Path) -> Option<PathBuf> {
     if let Some(path) = path_from_env() {
         return Some(path);
     }
-    if std::env::var_os("ANVIL_NO_RUN_LOG").is_some_and(|value| value == "1" || value == "true") {
-        return None;
-    }
     Some(default_run_events_path(root))
 }
 

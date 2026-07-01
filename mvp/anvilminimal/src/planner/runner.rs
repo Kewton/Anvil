@@ -54,6 +54,99 @@ const STEP_REPAIR_TARGET_NOT_FOLLOWED_LIMIT: usize = 2;
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
 const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 1;
 
+#[derive(Debug, Clone)]
+struct RecoveryArtifactValidation {
+    prompt_exists: bool,
+    prompt_parse_ok: bool,
+    prompt_parse_error: Option<String>,
+    yaml_exists: bool,
+    yaml_parse_ok: bool,
+    yaml_parse_error: Option<String>,
+}
+
+impl RecoveryArtifactValidation {
+    fn prompt_command_available(&self) -> bool {
+        self.prompt_exists && self.prompt_parse_ok
+    }
+
+    fn yaml_command_available(&self) -> bool {
+        self.yaml_exists && self.yaml_parse_ok
+    }
+
+    fn command_targets_valid(&self) -> bool {
+        self.prompt_command_available() && self.yaml_command_available()
+    }
+}
+
+fn validate_recovery_artifacts(
+    prompt_path: &Path,
+    recovery_plan_path: Option<&Path>,
+) -> RecoveryArtifactValidation {
+    let prompt_result = validate_recovery_prompt(prompt_path);
+    let (yaml_exists, yaml_parse_ok, yaml_parse_error) = match recovery_plan_path {
+        Some(path) => {
+            let exists = path.is_file();
+            match validate_recovery_yaml(path) {
+                Ok(()) => (exists, true, None),
+                Err(err) => (exists, false, Some(err)),
+            }
+        }
+        None => (false, false, Some("recovery_yaml_missing".to_string())),
+    };
+    RecoveryArtifactValidation {
+        prompt_exists: prompt_path.is_file(),
+        prompt_parse_ok: prompt_result.is_ok(),
+        prompt_parse_error: prompt_result.err(),
+        yaml_exists,
+        yaml_parse_ok,
+        yaml_parse_error,
+    }
+}
+
+fn validate_recovery_prompt(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("recovery_prompt_missing".to_string());
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("recovery_prompt_unreadable: {}", err))?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("recovery_prompt_empty".to_string());
+    }
+    if trimmed.contains("Required recovery action:")
+        && (trimmed.contains("Failure evidence:") || trimmed.contains("Primary failure:"))
+    {
+        return Ok(());
+    }
+    Err("recovery_prompt_missing_recovery_sections".to_string())
+}
+
+fn validate_recovery_yaml(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("recovery_yaml_missing".to_string());
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("recovery_yaml_unreadable: {}", err))?;
+    let parsed =
+        parse_ultra_plan(&text).map_err(|err| format!("recovery_yaml_parse_failed: {}", err))?;
+    let rendered = render_ultra_plan(&parsed);
+    let reparsed = parse_ultra_plan(&rendered)
+        .map_err(|err| format!("recovery_yaml_roundtrip_parse_failed: {}", err))?;
+    if reparsed != parsed {
+        return Err("recovery_yaml_roundtrip_mismatch".to_string());
+    }
+    Ok(())
+}
+
+fn recovery_artifact_check_summary(validation: &RecoveryArtifactValidation) -> String {
+    format!(
+        "Recovery artifact check: prompt_parse_ok={}, yaml_parse_ok={}, command_targets_valid={}",
+        validation.prompt_parse_ok,
+        validation.yaml_parse_ok,
+        validation.command_targets_valid()
+    )
+}
+
 pub fn generate_step_plan(
     client: &mut dyn ChatClient,
     goal: &str,
@@ -971,9 +1064,18 @@ fn run_step(
                 None
             }
         };
-    let suggested_command = suggested_ultra_recovery_command(&repair_report_path, &config.profile);
+    let validation =
+        validate_recovery_artifacts(&repair_report_path, recovery_plan_path.as_deref());
+    let raw_suggested_command =
+        suggested_ultra_recovery_command(&repair_report_path, &config.profile);
+    let suggested_command = if validation.prompt_command_available() {
+        raw_suggested_command
+    } else {
+        String::new()
+    };
     let suggested_yaml_command = recovery_plan_path
         .as_ref()
+        .filter(|_| validation.yaml_command_available())
         .map(|path| suggested_recovery_ultra_plan_command(path));
     eval_events::emit(
         config.eval_events_path.as_deref(),
@@ -987,7 +1089,14 @@ fn run_step(
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
             "recovery_yaml_missing": recovery_plan_path.is_none(),
-            "suggested_recovery_command": suggested_command,
+            "recovery_prompt_exists": validation.prompt_exists,
+            "recovery_prompt_parse_ok": validation.prompt_parse_ok,
+            "recovery_prompt_parse_error": validation.prompt_parse_error.as_deref().unwrap_or_default(),
+            "recovery_yaml_exists": validation.yaml_exists,
+            "recovery_yaml_parse_ok": validation.yaml_parse_ok,
+            "recovery_yaml_parse_error": validation.yaml_parse_error.as_deref().unwrap_or_default(),
+            "recovery_command_targets_valid": validation.command_targets_valid(),
+            "suggested_recovery_command": suggested_command.clone(),
             "suggested_recovery_yaml_command": suggested_yaml_command.clone().unwrap_or_default(),
             "recovery_profile": config.profile,
             "local_repair_exhausted": true,
@@ -997,24 +1106,50 @@ fn run_step(
     );
     let yaml_summary = recovery_plan_path
         .as_ref()
-        .map(|path| format!("Recovery UltraPlan YAML saved: {}", path.display()))
+        .map(|path| {
+            if validation.yaml_parse_ok {
+                format!("Recovery UltraPlan YAML saved: {}", path.display())
+            } else {
+                format!(
+                    "Recovery UltraPlan YAML invalid: {} ({})",
+                    path.display(),
+                    validation
+                        .yaml_parse_error
+                        .as_deref()
+                        .unwrap_or("recovery_yaml_invalid")
+                )
+            }
+        })
         .unwrap_or_else(|| {
             "Recovery UltraPlan YAML missing: failed to save valid recovery plan".to_string()
         });
+    let prompt_command_summary = if validation.prompt_command_available() {
+        format!("Suggested prompt command: {suggested_command}")
+    } else {
+        format!(
+            "Suggested prompt command: unavailable because recovery prompt validation failed ({})",
+            validation
+                .prompt_parse_error
+                .as_deref()
+                .unwrap_or("recovery_prompt_invalid")
+        )
+    };
     let yaml_command_summary = suggested_yaml_command
         .as_ref()
         .map(|command| format!("Suggested YAML command: {command}"))
         .unwrap_or_else(|| {
             "Suggested YAML command: unavailable because recovery YAML is missing".to_string()
         });
+    let artifact_check_summary = recovery_artifact_check_summary(&validation);
     eval_events::write_run_summary(
         config.eval_events_path.as_deref(),
         &format!(
-            "Status: incomplete\n{}\n{}\nRecovery prompt saved: {}\nSuggested prompt command: {}\nFailure: {}",
+            "Status: incomplete\n{}\n{}\nRecovery prompt saved: {}\n{}\n{}\nFailure: {}",
             yaml_summary,
             yaml_command_summary,
             repair_report_path.display(),
-            suggested_command,
+            prompt_command_summary,
+            artifact_check_summary,
             current_report.primary_reason()
         ),
     );
@@ -1029,13 +1164,19 @@ fn run_step(
             )
         })
         .unwrap_or_else(|| "; incomplete; recovery YAML missing".to_string());
+    let prompt_message = if validation.prompt_command_available() {
+        format!("suggested command: {suggested_command}")
+    } else {
+        "suggested command unavailable because recovery prompt validation failed".to_string()
+    };
     let message = format!(
-        "step {} failed verification after bounded repair: {}; repair prompt saved: {}; suggested command: {}{}",
+        "step {} failed verification after bounded repair: {}; repair prompt saved: {}; {}; {}; {}",
         step.id,
         current_report.primary_reason(),
         repair_report_path.display(),
-        suggested_ultra_recovery_command(&repair_report_path, &config.profile),
-        yaml_message
+        prompt_message,
+        yaml_message.trim_start_matches("; "),
+        artifact_check_summary
     );
     outcome.primary_failure = Some(current_report.primary_reason());
     outcome.stop_reason = Some(final_failure_kind.to_string());
@@ -3151,7 +3292,6 @@ fn save_ultra_phase_recovery_handoff(
             return Some(format!("; recovery prompt save failed: {err}"));
         }
     };
-    let prompt_command = suggested_ultra_recovery_command(&path, &plan.profile);
     let recovery_plan = match save_recovery_ultra_plan(&config.workspace_root, &scope, &handoff) {
         Ok(path) => Some(path),
         Err(err) => {
@@ -3169,8 +3309,16 @@ fn save_ultra_phase_recovery_handoff(
             None
         }
     };
+    let validation = validate_recovery_artifacts(&path, recovery_plan.as_deref());
+    let raw_prompt_command = suggested_ultra_recovery_command(&path, &plan.profile);
+    let prompt_command = if validation.prompt_command_available() {
+        raw_prompt_command
+    } else {
+        String::new()
+    };
     let recovery_plan_command = recovery_plan
         .as_ref()
+        .filter(|_| validation.yaml_command_available())
         .map(|path| suggested_recovery_ultra_plan_command(path));
     let (completed_phases, pending_phases) = ultra_phase_status(plan, phase);
     eval_events::emit(
@@ -3185,7 +3333,14 @@ fn save_ultra_phase_recovery_handoff(
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
             "recovery_yaml_missing": recovery_plan.is_none(),
-            "suggested_recovery_command": prompt_command,
+            "recovery_prompt_exists": validation.prompt_exists,
+            "recovery_prompt_parse_ok": validation.prompt_parse_ok,
+            "recovery_prompt_parse_error": validation.prompt_parse_error.as_deref().unwrap_or_default(),
+            "recovery_yaml_exists": validation.yaml_exists,
+            "recovery_yaml_parse_ok": validation.yaml_parse_ok,
+            "recovery_yaml_parse_error": validation.yaml_parse_error.as_deref().unwrap_or_default(),
+            "recovery_command_targets_valid": validation.command_targets_valid(),
+            "suggested_recovery_command": prompt_command.clone(),
             "suggested_recovery_yaml_command": recovery_plan_command.clone().unwrap_or_default(),
             "recovery_profile": plan.profile,
             "local_repair_exhausted": true,
@@ -3207,22 +3362,52 @@ fn save_ultra_phase_recovery_handoff(
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
             "recovery_yaml_missing": recovery_plan.is_none(),
-            "suggested_recovery_command": prompt_command,
+            "recovery_prompt_exists": validation.prompt_exists,
+            "recovery_prompt_parse_ok": validation.prompt_parse_ok,
+            "recovery_yaml_exists": validation.yaml_exists,
+            "recovery_yaml_parse_ok": validation.yaml_parse_ok,
+            "recovery_command_targets_valid": validation.command_targets_valid(),
+            "suggested_recovery_command": prompt_command.clone(),
             "suggested_recovery_yaml_command": recovery_plan_command.clone().unwrap_or_default(),
         }),
     );
     let recovery_yaml_summary = recovery_plan
         .as_ref()
-        .map(|path| format!("Recovery UltraPlan YAML saved: {}", path.display()))
+        .map(|path| {
+            if validation.yaml_parse_ok {
+                format!("Recovery UltraPlan YAML saved: {}", path.display())
+            } else {
+                format!(
+                    "Recovery UltraPlan YAML invalid: {} ({})",
+                    path.display(),
+                    validation
+                        .yaml_parse_error
+                        .as_deref()
+                        .unwrap_or("recovery_yaml_invalid")
+                )
+            }
+        })
         .unwrap_or_else(|| {
             "Recovery UltraPlan YAML missing: failed to save valid recovery plan".to_string()
         });
+    let prompt_command_summary = if validation.prompt_command_available() {
+        format!("Suggested prompt command: {prompt_command}")
+    } else {
+        format!(
+            "Suggested prompt command: unavailable because recovery prompt validation failed ({})",
+            validation
+                .prompt_parse_error
+                .as_deref()
+                .unwrap_or("recovery_prompt_invalid")
+        )
+    };
     let recovery_yaml_command_summary = recovery_plan_command
         .as_ref()
         .map(|command| format!("Suggested YAML command: {command}"))
         .unwrap_or_else(|| {
             "Suggested YAML command: unavailable because recovery YAML is missing".to_string()
         });
+    let artifact_check_summary = recovery_artifact_check_summary(&validation);
     eval_events::write_run_summary(
         config.eval_events_path.as_deref(),
         &render_ultra_partial_run_summary(UltraPartialRunSummary {
@@ -3233,8 +3418,9 @@ fn save_ultra_phase_recovery_handoff(
             reason,
             recovery_prompt_path: &path.display().to_string(),
             recovery_yaml_summary: &recovery_yaml_summary,
-            prompt_command: &prompt_command,
+            prompt_command_summary: &prompt_command_summary,
             recovery_yaml_command_summary: &recovery_yaml_command_summary,
+            recovery_artifact_check: &artifact_check_summary,
         }),
     );
     let recovery_yaml_message = recovery_plan
@@ -3248,11 +3434,17 @@ fn save_ultra_phase_recovery_handoff(
             )
         })
         .unwrap_or_else(|| "; incomplete; recovery YAML missing".to_string());
+    let prompt_message = if validation.prompt_command_available() {
+        format!("suggested command: {prompt_command}")
+    } else {
+        "suggested command unavailable because recovery prompt validation failed".to_string()
+    };
     Some(format!(
-        "; repair prompt saved: {}; suggested command: {}{}",
+        "; repair prompt saved: {}; {}; {}; {}",
         path.display(),
-        prompt_command,
-        recovery_yaml_message
+        prompt_message,
+        recovery_yaml_message.trim_start_matches("; "),
+        artifact_check_summary
     ))
 }
 
@@ -3264,8 +3456,9 @@ struct UltraPartialRunSummary<'a> {
     reason: &'a str,
     recovery_prompt_path: &'a str,
     recovery_yaml_summary: &'a str,
-    prompt_command: &'a str,
+    prompt_command_summary: &'a str,
     recovery_yaml_command_summary: &'a str,
+    recovery_artifact_check: &'a str,
 }
 
 fn render_ultra_partial_run_summary(summary: UltraPartialRunSummary<'_>) -> String {
@@ -3274,7 +3467,7 @@ fn render_ultra_partial_run_summary(summary: UltraPartialRunSummary<'_>) -> Stri
 Completed phases:\n{}\n\n\
 Failed phase:\n- {} ({})\n\n\
 Pending phases:\n{}\n\n\
-Recovery next action:\n- {}\n- Recovery prompt saved: {}\n- Suggested prompt command: {}\n- {}\n\n\
+Recovery next action:\n- {}\n- Recovery prompt saved: {}\n- {}\n- {}\n- {}\n\n\
 Failure:\n{}",
         render_summary_bullets(summary.completed_phases),
         summary.failed_phase,
@@ -3282,8 +3475,9 @@ Failure:\n{}",
         render_summary_bullets(summary.pending_phases),
         summary.recovery_yaml_summary,
         summary.recovery_prompt_path,
-        summary.prompt_command,
+        summary.prompt_command_summary,
         summary.recovery_yaml_command_summary,
+        summary.recovery_artifact_check,
         summary.reason,
     )
 }
@@ -5667,6 +5861,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("ultra final acceptance repair failed"));
+        assert!(err.contains("Recovery artifact check"));
         let repairs_dir = dir.path().join(".anvil/repairs");
         assert!(repairs_dir.is_dir());
         assert!(std::fs::read_dir(&repairs_dir).unwrap().next().is_some());
@@ -5683,6 +5878,9 @@ mod tests {
         assert!(event_text.contains("final_acceptance_repair_failed"));
         assert!(event_text.contains("recovery_prompt_saved"));
         assert!(event_text.contains("recovery_ultra_plan_path"));
+        assert!(event_text.contains("\"recovery_prompt_parse_ok\":true"));
+        assert!(event_text.contains("\"recovery_yaml_parse_ok\":true"));
+        assert!(event_text.contains("\"recovery_command_targets_valid\":true"));
         assert!(event_text.contains("suggested_recovery_yaml_command"));
         assert!(event_text.contains("suggested_recovery_command"));
         let summary = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
@@ -5693,6 +5891,7 @@ mod tests {
         assert!(summary.contains("Recovery next action:"));
         assert!(summary.contains("Recovery UltraPlan YAML saved:"));
         assert!(summary.contains("Suggested YAML command:"));
+        assert!(summary.contains("Recovery artifact check:"));
     }
 
     #[test]
@@ -5730,6 +5929,7 @@ mod tests {
         assert!(err.contains("phase scaffold failed"), "{err}");
         assert!(err.contains("incomplete"), "{err}");
         assert!(err.contains("recovery YAML saved"), "{err}");
+        assert!(err.contains("Recovery artifact check"), "{err}");
         assert!(
             err.contains("/run-ultra-plan .anvil/plans/recovery-ultra-plan-"),
             "{err}"
@@ -5761,6 +5961,9 @@ mod tests {
         assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
         assert!(event_text.contains("\"status\":\"incomplete\""));
         assert!(event_text.contains("\"recovery_yaml_missing\":false"));
+        assert!(event_text.contains("\"recovery_prompt_parse_ok\":true"));
+        assert!(event_text.contains("\"recovery_yaml_parse_ok\":true"));
+        assert!(event_text.contains("\"recovery_command_targets_valid\":true"));
         assert!(event_text.contains("\"recovery_ultra_plan_path\""));
         assert!(event_text.contains("\"suggested_recovery_yaml_command\""));
         let summary = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
@@ -5771,6 +5974,7 @@ mod tests {
         assert!(summary.contains("Recovery next action:"));
         assert!(summary.contains("Recovery UltraPlan YAML saved:"));
         assert!(summary.contains("Suggested YAML command:"));
+        assert!(summary.contains("Recovery artifact check:"));
     }
 
     #[test]

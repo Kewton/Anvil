@@ -87,7 +87,7 @@ REC の状態は以下で管理する。
 | REC-007 | P1 | pass | 実装レベルの受入条件は normalized trace diff / parity report / eval pytest で確認済み。release-level failed gates は report の `failed_gate_ids` として扱う。 | none。code reference だけの pass と trace 欠損 gate の pass 扱いは schema/gate で禁止済み。 |
 | REC-008 | P2 | pass | provider probe metadata / summary、provider-specific args shape observation、tool args recovery classification。 | live provider smoke は credentials/network がある release/targeted gate で再確認する。 |
 | REC-009 | P2 | pass | verify normalization fixture、original/normalized verify event、runtime verify policy rejection fixture、provider retry vs deterministic normalization summary。 | none。safe split は planner normalization 専用に留め、runtime verify policy は shell control syntax を拒否する。 |
-| REC-010 | P2 | open | manual TUI run events、summary、recovery `.md` / `.yaml` parse check、release evidence registration。 | silent exit、summary 欠損、recovery artifact path だけで内容未確認。 |
+| REC-010 | P2 | pass | TUI/manual run lifecycle summary、recovery `.md` / `.yaml` parse check event、silent exit release gate fixture、trace manifest registration を確認済み。 | none。manual live UAT は次 release evidence run で具体 run-id を登録する。 |
 
 ## 達成確認マトリクス
 
@@ -764,12 +764,12 @@ source では verifier policy と setup boundary が明確に分かれる。MVP 
 
 ### 現状
 
-TUI/manual run events と summary は改善済み。UAT では incomplete と recovery handoff は確認できた。
+REC-010 で通常 run の `run_start` / `run_stop` と `summary.md` を成功・失敗の両方で残すようにした。Recovery handoff では failed phase、pending phase、recovery `.md`、recovery `.yaml`、suggested command に加え、command target artifact の検証結果を event/summary/screen message に残す。
 
 ### 問題点
 
-- manual UAT trace が gate manifest に十分登録されていない。
-- TUI の表示が「未完了」「partial artifact」「recovery next action」をどれだけ明確に出すかは継続検証が必要。
+- manual UAT trace は gate manifest に登録済みだが、具体 release run-id の evidence path は次の manual UAT 実行時に更新する必要がある。
+- TUI 表示の視認性は fixture ではなく live UAT で継続確認する。
 
 ### 根本原因
 
@@ -782,6 +782,22 @@ TUI/manual run events と summary は改善済み。UAT では incomplete と re
 - silent exit は gate failure。
 - recovery command が提示された場合、対象 `.md` / `.yaml` が存在し parse 可能であることを fixture で確認する。
 - manual UAT trace を `source_mvp_trace_manifest.md` または対応する release evidence report に登録する。
+
+### 実装結果
+
+| 項目 | 内容 |
+| --- | --- |
+| status | pass |
+| 実施日 | 2026-07-01 |
+| 実施 step | RECOVERY-001-H / REC-010 |
+| 実装概要 | `mvp/anvilminimal/src/lib.rs` の process lifecycle で `run_start` 時に `summary.md` を作成し、`run_stop` 時に complete/incomplete と stop reason を append するようにした。`mvp/anvilminimal/src/planner/runner.rs` では recovery command を提示する前に recovery prompt `.md` の readable/section check と recovery UltraPlan `.yaml` の parse/roundtrip check を行い、`recovery_prompt_saved` / `ultra_partial_artifact_summary` event と summary/screen message に `recovery_prompt_parse_ok`、`recovery_yaml_parse_ok`、`recovery_command_targets_valid` を残す。`mvp/anvilminimal/scripts/eval_lib/parity_gate.py` では empty events、missing `run_stop`、missing stop reason、missing `tui_command_stop` を `silent_exit` failure にした。 |
+| source parity 判断 | source は actor loop/minimal step runner の停止理由と repair handoff を画面・report に明示する。MVP は full source task/recovery graph は移植せず、通常 run event/summary、bounded recovery handoff、release gate evidence として薄く写像した。 |
+| 証跡 | `mvp/anvilminimal/src/lib.rs` unit tests: `run_lifecycle_writes_events_and_summary_for_tui_exit`、`run_lifecycle_records_incomplete_stop_reason`。`mvp/anvilminimal/src/planner/runner.rs` unit tests: `ultra_final_acceptance_repair_failure_saves_recovery_handoff`、`ultra_phase_scaffold_failure_saves_recovery_yaml_and_incomplete_handoff` で recovery prompt/yaml parse flags、summary の `Recovery artifact check`、screen message を確認。`mvp/anvilminimal/tests/eval/test_parity_gate_report.py`: `test_release_gate_rejects_silent_tui_exit` と release TUI evidence fixture。`workspace/mvp/eval/022/source_mvp_trace_manifest.md`: manual UAT / TUI run evidence registration section。 |
+| 通過した確認 | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` 通過。`pytest -q mvp/anvilminimal/tests/eval` は 214 passed, 1 skipped, 65 subtests passed。 |
+| 未確認事項 | live manual UAT の具体 run-id と browser/release evidence report への実 path 登録は未実施。REC-010 の実装受入条件は unit/eval fixture と trace manifest registration で確認済みとし、release-level UAT run は次の full release gate で更新する。 |
+| blocking condition | none |
+| 次の確認タイミング | manual UAT 実行後 / release gate report 生成時 / source-MVP trace diff 再生成時 |
+| rollback 判断 | rollback 不要。残リスクは live TUI 視認性と環境依存の manual UAT evidence 更新で、silent exit gate と artifact parse flags により failure を隠さない形で管理する。 |
 
 ## 対象外または慎重扱い
 

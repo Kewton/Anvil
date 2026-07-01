@@ -115,6 +115,24 @@ gate への影響:
 - G-S12 は trace 上は観測されたが、browser readiness HTTP 500 と interaction canvas unavailable により release gate では `fail`。
 - G-S16 は normalized trace 未観測かつ manual TUI evidence が `tui_command_failed` のため `fail`。
 
+## 4.2 Manual UAT / TUI Run Evidence Registration
+
+REC-010 で、通常 TUI/manual run の release evidence は以下の artifact として登録する。
+
+| Artifact | 必須内容 | gate |
+| --- | --- | --- |
+| `.anvil/runs/<run-id>/events.jsonl` | `run_start`、`run_stop.ok`、`run_stop.stop_reason`、manual slash command を評価する場合は `tui_command_stop` | G-S16 |
+| `.anvil/runs/<run-id>/summary.md` | `Status`、`Action`、`Stop reason`。recovery handoff 時は failed phase、pending phase、recovery `.md`、recovery `.yaml`、suggested command | G-S16 / release evidence |
+| recovery `.md` | readable recovery prompt/report with recovery action sections | REC-010 recovery command target check |
+| recovery `.yaml` | parseable UltraPlan YAML with render/parse roundtrip | REC-010 recovery command target check |
+
+Release gate behavior:
+
+- Empty TUI event files, missing `run_stop`, missing `run_stop.stop_reason`, or missing `tui_command_stop` are `silent_exit` failures, not partial pass.
+- `tui_command_stop.ok=false` remains a concrete TUI failure.
+- `recovery_prompt_saved` and `ultra_partial_artifact_summary` events include `recovery_prompt_parse_ok`, `recovery_yaml_parse_ok`, and `recovery_command_targets_valid` when recovery commands are shown.
+- Release evidence reports must pass the TUI event path through `tui_run_event_paths`; the adjacent `summary.md` remains the human-readable handoff artifact.
+
 ## 5. Source Code References Used For Trace Planning
 
 | Stage | Source refs |
