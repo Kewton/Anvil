@@ -1196,6 +1196,18 @@ fn verify_plan_final_contract(
                 .as_ref()
                 .map(|report| report.weak_evidence.clone())
                 .unwrap_or_default(),
+            "artifact_obligations": runtime_acceptance
+                .as_ref()
+                .map(|report| report.artifact_obligations.clone())
+                .unwrap_or_default(),
+            "capability_evidence_bindings": runtime_acceptance
+                .as_ref()
+                .map(|report| report.capability_evidence_bindings.clone())
+                .unwrap_or_default(),
+            "obligation_repair_targets": runtime_acceptance
+                .as_ref()
+                .map(|report| report.obligation_repair_targets.clone())
+                .unwrap_or_default(),
             "inconclusive_reasons": runtime_acceptance
                 .as_ref()
                 .map(|report| report.inconclusive_reasons.clone())
@@ -1860,6 +1872,21 @@ pub fn run_ultra_plan_with_ui(
                     &profile_report,
                 )?
             {
+                let auto_repair_target = classify_repair_target(&profile_report);
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "deterministic_scaffold_recovery",
+                        "lifecycle_stage": "profile_auto_repair",
+                        "phase_id": phase.id,
+                        "fallback_kind": "nextjs_profile_auto_repair",
+                        "repair_target": auto_repair_target.as_str(),
+                        "original_failure": eval_events::body_snippet(&profile_report.primary_reason()),
+                        "used_for_completion": false,
+                        "requires_continuation": true,
+                        "summary": "deterministic profile repair materialized recovery scaffold; final success still requires implementation continuation and acceptance verification",
+                    }),
+                );
                 let expected_paths =
                     profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
                 let continuation_prompt = profile_auto_repair_continuation_prompt(
@@ -1940,7 +1967,12 @@ pub fn run_ultra_plan_with_ui(
                     }),
                 );
                 let retry = verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
-                if retry.is_pass() {
+                let continuation_followed = classify_repair_follow_through(
+                    auto_repair_target,
+                    &continuation_outcome.changed_paths,
+                )
+                .followed();
+                if retry.is_pass() && continuation_followed {
                     emit_ultra_phase_event(
                         config,
                         "ultra_phase_profile_check",
@@ -1964,6 +1996,25 @@ pub fn run_ultra_plan_with_ui(
                         None,
                     );
                     continue;
+                }
+                if retry.is_pass() {
+                    let follow_through = classify_repair_follow_through(
+                        auto_repair_target,
+                        &continuation_outcome.changed_paths,
+                    );
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "profile_auto_repair_continuation_incomplete",
+                            "phase_id": phase.id,
+                            "shared_execution_session": true,
+                            "reason": "deterministic_fallback_without_targeted_implementation_continuation",
+                            "repair_target": auto_repair_target.as_str(),
+                            "repair_follow_through": follow_through.as_str(),
+                            "changed_path_count": continuation_outcome.changed_paths.len(),
+                            "used_for_completion": false,
+                        }),
+                    );
                 }
             }
             if final_phase
@@ -2367,6 +2418,8 @@ fn ultra_final_acceptance_report(
             "missing_obligations": acceptance.missing_obligations.clone(),
             "weak_evidence": acceptance.weak_evidence.clone(),
             "artifact_obligations": acceptance.artifact_obligations.clone(),
+            "capability_evidence_bindings": acceptance.capability_evidence_bindings.clone(),
+            "obligation_repair_targets": acceptance.obligation_repair_targets.clone(),
             "inconclusive_reasons": acceptance.inconclusive_reasons.clone(),
             "release_gate_status": release_gate.status.clone(),
             "release_gate_reasons": release_gate.reasons.clone(),
@@ -2382,7 +2435,13 @@ fn ultra_final_acceptance_report(
         report.push_missing_path(path);
     }
     if !acceptance.passed {
-        report.push_profile_failure(acceptance.primary_reason);
+        report.push_profile_failure(acceptance.primary_reason.clone());
+        for target in &acceptance.obligation_repair_targets {
+            report.push_profile_failure(format!(
+                "missing_required_obligation_target:{}:{}",
+                target.obligation, target.target_path
+            ));
+        }
     }
     if release_gate.status == "failed" {
         report.push_profile_failure(format!(
@@ -4311,7 +4370,22 @@ fn final_acceptance_repair_expected_paths(
         merge_unique_strings(&mut expected, &contract.required_paths);
     }
     merge_unique_strings(&mut expected, &report.missing_paths);
+    merge_unique_strings(&mut expected, &obligation_repair_target_paths(report));
     Ok(expected)
+}
+
+fn obligation_repair_target_paths(report: &VerificationReport) -> Vec<String> {
+    report
+        .profile_failures
+        .iter()
+        .filter_map(|failure| {
+            failure
+                .strip_prefix("missing_required_obligation_target:")
+                .and_then(|rest| rest.split_once(':'))
+                .map(|(_, path)| path.trim().to_string())
+                .filter(|path| !path.is_empty())
+        })
+        .collect()
 }
 
 fn final_acceptance_repair_prompt(
@@ -5571,6 +5645,15 @@ mod tests {
                 prompt_tokens: None,
                 completion_tokens: None,
             },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"package.json","content":good_package}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
             AssistantReply::text("continuation complete"),
         ]);
         let plan = UltraPlan {
@@ -5619,6 +5702,108 @@ mod tests {
             execution.messages.len() >= 3,
             "expected initial phase, follow-up phase, and repair prompts: {prompts:#?}"
         );
+    }
+
+    #[test]
+    fn deterministic_profile_fallback_requires_targeted_continuation_before_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let scaffold_plan = generated_nextjs_fixture_plan_json_with_kind(
+            "Scaffold interactive app",
+            "check_scaffold.py",
+            "setup",
+        );
+        let finish_plan = generated_nextjs_fixture_plan_json_with_kind(
+            "Create interactive app",
+            "check_finish.py",
+            "setup",
+        );
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(scaffold_plan),
+            AssistantReply::text(finish_plan.clone()),
+            AssistantReply::text(finish_plan),
+        ]);
+        let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let bad_package =
+            r#"{"dependencies":{},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let mut first_phase_calls =
+            nextjs_interactive_app_tool_calls(interactive_game_page_source());
+        first_phase_calls.push(crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({"path":"package.json","content":package}),
+        ));
+        first_phase_calls.push(crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({"path":"check_scaffold.py","content":"x = 1\n"}),
+        ));
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: first_phase_calls,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"package.json","content":bad_package}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"check_finish.py","content":"x = 2\n"}),
+                    ),
+                ],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"README.md","content":"# Recovery note\nThe scaffold exists but implementation still needs task-specific gameplay."}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"package.json","content":package}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "scaffold".to_string(),
+                    prompt: "Scaffold the app".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "finish".to_string(),
+                    prompt: "Finish the interactive app".to_string(),
+                },
+            ],
+        };
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"deterministic_scaffold_recovery\""));
+        assert!(event_text.contains("\"used_for_completion\":false"));
+        assert!(event_text.contains("\"event\":\"profile_auto_repair_continuation_incomplete\""));
+        assert!(event_text.contains("\"repair_follow_through\":\"target_misdirected\""));
+        assert!(event_text.contains("\"event\":\"profile_repair_complete\""));
+        assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
     }
 
     #[test]
@@ -5844,6 +6029,8 @@ mod tests {
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"required_obligations\":[\"implementation\"]"));
         assert!(event_text.contains("\"missing_obligations\":[\"implementation\"]"));
+        assert!(event_text.contains("\"obligation_repair_targets\""));
+        assert!(event_text.contains("\"target_path\":\"src/app/page.tsx\""));
     }
 
     #[test]
@@ -5888,6 +6075,8 @@ mod tests {
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"runtime_acceptance_inconclusive\":false"));
         assert!(event_text.contains("\"missing_evidence\""));
+        assert!(event_text.contains("\"capability_evidence_bindings\""));
+        assert!(event_text.contains("\"artifact_paths\":[\"src/app/page.tsx\"]"));
         assert!(event_text.contains("\"step_prompt_contract\""));
         assert!(event_text.contains("\"has_required_final_evidence\":true"));
         assert!(event_text.contains("\"visible_interactive_surface_evidence\""));

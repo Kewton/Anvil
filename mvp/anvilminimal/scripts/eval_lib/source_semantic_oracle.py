@@ -70,6 +70,8 @@ CAPABILITY_PATTERNS = {
         "invader",
         "alien",
         "obstacle",
+        "hazard",
+        "target",
         "wave",
         "spawn",
         "challenge",
@@ -156,6 +158,7 @@ def evaluate_source_semantics(
     missing = [capability for capability, ok in capability_results.items() if not ok]
     static_title = detects_static_title_only(text, contract)
     placeholder_tokens = detects_placeholder_tokens(text, contract)
+    forbidden_minimal_output = detects_forbidden_minimal_output(corpus, text, contract)
     connection = interactive_connection_evidence(text, contract)
     hit_count = len(required) - len(missing)
     score = round(100.0 * hit_count / max(1, len(required)), 1)
@@ -166,13 +169,20 @@ def evaluate_source_semantics(
     elif static_title:
         score = min(score, 35.0)
         failure_kind = "static_title_only"
+    elif forbidden_minimal_output:
+        score = min(score, 35.0)
+        failure_kind = forbidden_minimal_output
     elif connection.get("applicable") and not connection.get("connected"):
         score = min(score, float(connection.get("score_cap", 55.0)))
         failure_kind = str(connection.get("failure_kind", "interactive_connection_missing"))
     elif missing:
         failure_kind = "missing_required_capabilities"
-    success = not missing and not static_title and not placeholder_tokens and not (
-        connection.get("applicable") and not connection.get("connected")
+    success = (
+        not missing
+        and not static_title
+        and not placeholder_tokens
+        and not forbidden_minimal_output
+        and not (connection.get("applicable") and not connection.get("connected"))
     )
     return {
         "source_semantic_success": success,
@@ -186,6 +196,7 @@ def evaluate_source_semantics(
             "missing_capabilities": missing,
             "static_title_only": static_title,
             "placeholder_tokens": placeholder_tokens,
+            "forbidden_minimal_output": forbidden_minimal_output,
             "interactive_connection": connection,
         },
     }
@@ -346,6 +357,86 @@ def detects_static_title_only(text: str, contract: AcceptanceContract) -> bool:
         ]
     )
     return has_title_like_output and not has_interaction
+
+
+def detects_forbidden_minimal_output(
+    corpus: list[tuple[str, str]],
+    text: str,
+    contract: AcceptanceContract,
+) -> str:
+    if contract.category not in {"interactive-game", "interactive-web-app"}:
+        return ""
+    forbidden = set(contract.forbidden_minimal_outputs)
+    if not corpus:
+        return "empty_output" if "empty_output" in forbidden else ""
+    paths = [path.lower() for path, _ in corpus]
+    suffixes = [Path(path).suffix.lower() for path in paths]
+    if "docs_only" in forbidden and suffixes and all(suffix == ".md" for suffix in suffixes):
+        return "docs_only"
+    if "style_only" in forbidden and suffixes and all(
+        suffix in {".css", ".scss", ".sass", ".less"} for suffix in suffixes
+    ):
+        return "style_only"
+    if "manifest_only" in forbidden and paths and all(is_manifest_or_config_path(path) for path in paths):
+        return "manifest_only"
+    source_paths = [
+        path
+        for path, suffix in zip(paths, suffixes)
+        if suffix in {".js", ".jsx", ".ts", ".tsx", ".html"}
+        and not is_manifest_or_config_path(path)
+    ]
+    if "scaffold_only" in forbidden and source_paths and not has_interactive_structure(text):
+        has_scaffold_shape = any(
+            marker in text
+            for marker in [
+                "export default function",
+                "children",
+                "<html",
+                "<body",
+                "metadata",
+                "return null",
+                "coming soon",
+            ]
+        )
+        if has_scaffold_shape:
+            return "scaffold_only"
+    return ""
+
+
+def is_manifest_or_config_path(path: str) -> bool:
+    name = Path(path).name.lower()
+    return name in {
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lockb",
+        "tsconfig.json",
+        "next.config.js",
+        "next.config.mjs",
+        "next.config.ts",
+        "postcss.config.js",
+        "tailwind.config.js",
+        "tailwind.config.ts",
+    }
+
+
+def has_interactive_structure(text: str) -> bool:
+    return any(
+        pattern in text
+        for pattern in [
+            "usestate",
+            "usereducer",
+            "useeffect",
+            "addeventlistener",
+            "onkeydown",
+            "onclick",
+            "requestanimationframe",
+            "setinterval",
+            "canvas",
+            "getcontext(",
+        ]
+    )
 
 
 def detects_placeholder_tokens(text: str, contract: AcceptanceContract) -> bool:

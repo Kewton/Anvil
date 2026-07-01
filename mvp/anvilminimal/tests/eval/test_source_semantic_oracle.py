@@ -72,6 +72,29 @@ export default function Page() {
         self.assertTrue(result["source_semantic_success"], result)
         self.assertEqual(result["source_semantic_score"], 100.0)
 
+    def test_interactive_minimal_outputs_fail_with_precise_kind(self):
+        cases = [
+            ("docs_only", "README.md", "# Game\nUse arrow keys.\n"),
+            ("style_only", "src/app/globals.css", "body { color: white; }\n"),
+            ("manifest_only", "package.json", '{"scripts":{"build":"next build"}}\n'),
+            (
+                "scaffold_only",
+                "src/app/page.tsx",
+                "export default function Page(){ return null; }\n",
+            ),
+        ]
+        for expected_kind, rel_path, content in cases:
+            with self.subTest(expected_kind=expected_kind):
+                with tempfile.TemporaryDirectory() as td:
+                    workdir = Path(td)
+                    target = workdir / rel_path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(content, encoding="utf-8")
+                    scenario = {**SCENARIO, "expected_artifacts": [rel_path]}
+                    result = evaluate_source_semantics(scenario, workdir)
+                self.assertFalse(result["source_semantic_success"], result)
+                self.assertEqual(result["source_semantic_failure_kind"], expected_kind, result)
+
     def test_acceptance_oracle_fixtures_match_expected_outcomes(self):
         fixture_root = ROOT / "eval/fixtures/acceptance_oracle"
         for fixture in [

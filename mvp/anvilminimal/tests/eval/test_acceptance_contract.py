@@ -22,6 +22,10 @@ class AcceptanceContractTest(unittest.TestCase):
         self.assertIn("implementation", contract.required_obligations)
         self.assertIn("acceptance_evidence", contract.required_obligations)
         self.assertIn("static_title_only", contract.forbidden_minimal_outputs)
+        self.assertIn("scaffold_only", contract.forbidden_minimal_outputs)
+        self.assertIn("style_only", contract.forbidden_minimal_outputs)
+        self.assertIn("docs_only", contract.forbidden_minimal_outputs)
+        self.assertIn("manifest_only", contract.forbidden_minimal_outputs)
         self.assertEqual(contract.runtime["port"], 3011)
 
     def test_infers_interactive_game_from_japanese_prompt_without_scenario_id(self):

@@ -492,6 +492,18 @@ mod tests {
     }
 
     #[test]
+    fn classifies_missing_implementation_obligation_target_as_entrypoint() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "missing_required_obligation_target:implementation:src/app/page.tsx",
+        );
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::MissingEntrypoint
+        );
+    }
+
+    #[test]
     fn classifies_capability_missing() {
         let mut report = VerificationReport::pass();
         report.push_profile_failure("missing_required_capabilities:player_control");

@@ -171,7 +171,14 @@ def default_obligations(category: str) -> list[str]:
 
 def default_forbidden_outputs(category: str) -> list[str]:
     if category in {"interactive-game", "interactive-web-app"}:
-        return ["static_title_only"]
+        return [
+            "empty_output",
+            "scaffold_only",
+            "static_title_only",
+            "style_only",
+            "docs_only",
+            "manifest_only",
+        ]
     return []
 
 

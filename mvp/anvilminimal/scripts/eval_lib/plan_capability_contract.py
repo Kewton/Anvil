@@ -51,10 +51,10 @@ CAPABILITY_RULES: tuple[CapabilityRule, ...] = (
     ),
     CapabilityRule(
         name="adversary_entity",
-        prompt=(r"\benem(?:y|ies)\b", r"\binvaders?\b", r"\balien", r"\bwave\b", r"\bchallenge\b", r"敵"),
-        plan=(r"\benem(?:y|ies)\b", r"\binvader", r"\balien", r"\bwave\b", r"\bspawn", r"\bchallenge\b", r"敵"),
-        source=(r"\benem(?:y|ies)\b", r"\binvader", r"\balien", r"\bwave\b", r"\bspawn", r"setenem", r"敵"),
-        verify=(r"\benem(?:y|ies)\b", r"\binvader", r"\balien", r"\bwave\b", r"\bspawn", r"\bchallenge\b"),
+        prompt=(r"\benem(?:y|ies)\b", r"\binvaders?\b", r"\balien", r"\bhazard", r"\btarget", r"\bwave\b", r"\bchallenge\b", r"敵"),
+        plan=(r"\benem(?:y|ies)\b", r"\binvader", r"\balien", r"\bhazard", r"\btarget", r"\bwave\b", r"\bspawn", r"\bchallenge\b", r"敵"),
+        source=(r"\benem(?:y|ies)\b", r"\binvader", r"\balien", r"\bhazard", r"\btarget", r"\bwave\b", r"\bspawn", r"setenem", r"sethazard", r"敵"),
+        verify=(r"\benem(?:y|ies)\b", r"\binvader", r"\balien", r"\bhazard", r"\btarget", r"\bwave\b", r"\bspawn", r"\bchallenge\b"),
         acceptance_capabilities=("adversary_or_challenge",),
     ),
     CapabilityRule(

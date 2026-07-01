@@ -80,8 +80,8 @@ REC の状態は以下で管理する。
 | --- | --- | --- | --- | --- |
 | REC-001 | P0 | partial | manual UAT、full eval、anvildev same-condition trace。 | release-level evidence 未実施。unit/eval では setup authority selected / attempted / passed/failed / rerun taxonomy を確認済み。 |
 | REC-002 | P0 | partial | browser readiness evidence、manual UAT、full eval、anvildev same-condition trace。 | release-level evidence 未実施。unit/eval では Tailwind installed evidence、plain CSS pass、browser HTTP 500 fail を確認済み。 |
-| REC-003 | P1 | open | interactive app/game fallback fixture、capability evidence、smoke quality check。 | title-only / style-only / docs-only app を success 扱い、fallback-only completion。 |
-| REC-004 | P1 | open | obligation-to-artifact binding fixture、missing obligation repair target event。 | required obligation と artifact evidence の対応不明、missing obligation が repair target に落ちない。 |
+| REC-003 | P1 | partial | manual UAT、source/MVP trace diff、browser/interaction evidence。 | unit/eval では empty/scaffold/title/style/docs/manifest-only rejection、fallback event、fallback-only non-completion を確認済み。 |
+| REC-004 | P1 | partial | source/MVP trace diff、unsupported source obligation の deferred/intentionally_different 整理。 | unit/eval では obligation-to-artifact binding、missing implementation repair target、plan/ultra event 伝播を確認済み。 |
 | REC-005 | P1 | open | repair target follow-through fixture、no-change / target-not-followed classification、recovery YAML roundtrip。 | no-change repair の retry 継続、target 無関係変更の success、handoff 保存だけの success。 |
 | REC-006 | P1 | open | final acceptance fixture、browser/interaction evidence content、release gate report。 | build-only / path-only / browser unavailable の full pass 扱い。 |
 | REC-007 | P1 | open | MVP/anvildev same-condition normalized trace diff、G-S01〜G-S16 status update。 | code reference だけで parity pass、trace 欠損 gate の pass 扱い。 |
@@ -329,6 +329,22 @@ source は acceptance だけでなく、fallback/recovery に具体的な playab
 - deterministic fallback を使った場合は、fallback 使用を event/summary に残し、通常生成の成功と区別する。
 - fallback は completion ではなく continuation target として扱う。fallback だけで final success にしない。
 
+### 実装結果
+
+| 項目 | 内容 |
+| --- | --- |
+| status | partial |
+| 実施日 | 2026-07-01 |
+| 実施 step | RECOVERY-001-B |
+| 実装概要 | Next.js deterministic profile fallback を Space Invaders 固有名から generic interactive challenge scaffold へ寄せ、fallback 使用時に `deterministic_scaffold_recovery` event を出すようにした。auto repair 後の continuation が repair target に沿わない場合は `profile_auto_repair_continuation_incomplete` として完了扱いせず、bounded profile repair へ戻す。eval contract/source semantic oracle では interactive app/game の `empty_output` / `scaffold_only` / `static_title_only` / `style_only` / `docs_only` / `manifest_only` を forbidden minimal output として扱う。 |
+| source parity 判断 | source と差分あり。source の playable fallback/smoke pipeline は丸ごと移植せず、MVP の profile auto repair、RuntimeAcceptanceReport、eval oracle へ薄く写像した。 |
+| 証跡 | `mvp/anvilminimal/src/planner/runner.rs` unit test `deterministic_profile_fallback_requires_targeted_continuation_before_success`。`mvp/anvilminimal/src/minimal_loop/evidence.rs` unit tests: title/scaffold/style/docs-only rejection、generic interactive capability evidence。`mvp/anvilminimal/tests/eval/test_source_semantic_oracle.py` minimal output negative cases。 |
+| 通過した確認 | unit / fixture / targeted eval / full eval。`cargo test --manifest-path mvp/anvilminimal/Cargo.toml`、`pytest mvp/anvilminimal/tests/eval` 通過。 |
+| 未確認事項 | manual UAT、browser/interaction evidence、source/MVP normalized trace diff は未実施。source の smoke-test.mjs 相当は今回 deterministic source semantic / runtime acceptance evidence で代替し、実ブラウザ smoke は REC-006/REC-010 側に残る。 |
+| blocking condition | release-level browser/UAT evidence と source/MVP trace diff 未実施。 |
+| 次の確認タイミング | manual UAT 後 / REC-006 browser gate 後 / REC-007 trace diff 後 |
+| rollback 判断 | rollback 不要 |
+
 ---
 
 ## REC-004: TaskContract-lite obligation recovery
@@ -379,6 +395,22 @@ full TaskContract を避ける方針は妥当だが、TaskContract が担って�
 - source/MVP trace diff で task contract stage の差分が説明できる。
 - `TaskContract-lite` が扱わない source obligation は `intentionally_different` または `deferred` として記録し、暗黙に pass しない。
 - artifact identity が曖昧な場合は success ではなく target discovery / repair planning に落ちる。
+
+### 実装結果
+
+| 項目 | 内容 |
+| --- | --- |
+| status | partial |
+| 実施日 | 2026-07-01 |
+| 実施 step | RECOVERY-001-B |
+| 実装概要 | `RuntimeAcceptanceReport` に `capability_evidence_bindings` と `obligation_repair_targets` を追加し、required capability ごとに required/satisfied/missing evidence と artifact paths を出すようにした。missing implementation obligation は `src/app/page.tsx` などの concrete target path へ写像し、completion / plan final contract / ultra final acceptance event と repair prompt expected paths へ伝播する。 |
+| source parity 判断 | source と差分あり。full TaskContract graph は移植せず、MVP の CompletionContract / RuntimeAcceptanceReport / RepairTarget へ obligation tracking を薄く写像した。 |
+| 証跡 | `mvp/anvilminimal/src/minimal_loop/evidence.rs` unit tests: `required_capability_maps_to_expected_artifact_evidence`, `missing_capability_binding_points_at_partial_artifact_evidence`, explicit implementation obligation repair target。`mvp/anvilminimal/src/minimal_loop/repair_target.rs` unit test: missing implementation obligation target classification。`mvp/anvilminimal/src/planner/runner.rs` plan final contract event assertions for `capability_evidence_bindings` / `obligation_repair_targets`。 |
+| 通過した確認 | unit / fixture / targeted eval / full eval。`cargo test --manifest-path mvp/anvilminimal/Cargo.toml`、`pytest mvp/anvilminimal/tests/eval` 通過。 |
+| 未確認事項 | source/MVP trace diff は未実施。source の ArtifactRole/RecoveryTargetHint 全体、docs/data/research の詳細 obligation は今回対象外で deferred。 |
+| blocking condition | source/MVP trace diff と unsupported source obligation の明示的 deferred/intentionally_different 整理が未実施。 |
+| 次の確認タイミング | REC-007 trace diff 後 / full recovery status 更新時 |
+| rollback 判断 | rollback 不要 |
 
 ---
 

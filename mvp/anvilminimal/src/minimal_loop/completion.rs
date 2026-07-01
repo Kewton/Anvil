@@ -357,6 +357,12 @@ impl CompletionContract {
                     acceptance.missing_obligations.join(",")
                 ));
             }
+            for target in &acceptance.obligation_repair_targets {
+                report.push_profile_failure(format!(
+                    "missing_required_obligation_target:{}:{}",
+                    target.obligation, target.target_path
+                ));
+            }
             if !acceptance.inconclusive_reasons.is_empty() {
                 report.push_profile_failure(format!(
                     "inconclusive_acceptance:{}",

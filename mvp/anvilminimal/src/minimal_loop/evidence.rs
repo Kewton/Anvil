@@ -13,6 +13,8 @@ pub struct RuntimeAcceptanceReport {
     pub weak_evidence: Vec<String>,
     pub inconclusive_reasons: Vec<String>,
     pub artifact_obligations: Vec<ArtifactObligationEvidence>,
+    pub capability_evidence_bindings: Vec<CapabilityEvidenceBinding>,
+    pub obligation_repair_targets: Vec<ObligationRepairTarget>,
     pub primary_reason: String,
 }
 
@@ -23,6 +25,23 @@ pub struct ArtifactObligationEvidence {
     pub evidence: Vec<String>,
     pub satisfies_implementation: bool,
     pub required_capabilities_supported: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CapabilityEvidenceBinding {
+    pub capability: String,
+    pub required_evidence: Vec<String>,
+    pub satisfied_evidence: Vec<String>,
+    pub missing_evidence: Vec<String>,
+    pub artifact_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ObligationRepairTarget {
+    pub obligation: String,
+    pub target_role: String,
+    pub target_path: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +282,17 @@ pub fn verify_runtime_acceptance(
     collect_weak_obligation_evidence(&artifact_obligations, &required, &mut weak_evidence);
     let missing_obligations =
         missing_required_obligations(required_obligations, &artifact_obligations, &workspace);
+    let capability_evidence_bindings = capability_evidence_bindings(
+        required_capabilities,
+        &artifact_obligations,
+        &missing_evidence,
+    );
+    let obligation_repair_targets = obligation_repair_targets(
+        required_paths,
+        &artifact_obligations,
+        &workspace,
+        &missing_obligations,
+    );
     let inconclusive = !inconclusive_reasons.is_empty();
     let passed = missing_capabilities.is_empty()
         && missing_evidence.is_empty()
@@ -291,6 +321,8 @@ pub fn verify_runtime_acceptance(
         weak_evidence,
         inconclusive_reasons,
         artifact_obligations,
+        capability_evidence_bindings,
+        obligation_repair_targets,
         primary_reason,
     }
 }
@@ -334,6 +366,217 @@ pub fn artifact_obligation_evidence(
         });
     }
     out
+}
+
+fn capability_evidence_bindings(
+    required_capabilities: &[String],
+    artifact_obligations: &[ArtifactObligationEvidence],
+    missing_evidence: &[String],
+) -> Vec<CapabilityEvidenceBinding> {
+    let missing_set = missing_evidence.iter().cloned().collect::<BTreeSet<_>>();
+    let mut bindings = Vec::new();
+    for capability in required_capabilities {
+        let capability = capability.trim();
+        if capability.is_empty() {
+            continue;
+        }
+        let required_evidence = evidence_kinds_for_capability(capability)
+            .into_iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect::<Vec<_>>();
+        if required_evidence.is_empty() {
+            continue;
+        }
+        let required_set = required_evidence.iter().cloned().collect::<BTreeSet<_>>();
+        let satisfied_evidence = required_evidence
+            .iter()
+            .filter(|evidence| !missing_set.contains(*evidence))
+            .cloned()
+            .collect::<Vec<_>>();
+        let capability_missing_evidence = required_evidence
+            .iter()
+            .filter(|evidence| missing_set.contains(*evidence))
+            .cloned()
+            .collect::<Vec<_>>();
+        let artifact_paths = artifact_obligations
+            .iter()
+            .filter(|artifact| {
+                artifact
+                    .required_capabilities_supported
+                    .iter()
+                    .any(|supported| supported == capability)
+                    || artifact
+                        .evidence
+                        .iter()
+                        .any(|evidence| required_set.contains(evidence))
+                    || (artifact.role == "scaffold"
+                        && looks_like_implementation_path(&artifact.path))
+            })
+            .map(|artifact| artifact.path.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        bindings.push(CapabilityEvidenceBinding {
+            capability: capability.to_string(),
+            required_evidence,
+            satisfied_evidence,
+            missing_evidence: capability_missing_evidence,
+            artifact_paths,
+        });
+    }
+    bindings
+}
+
+fn obligation_repair_targets(
+    required_paths: &[String],
+    artifact_obligations: &[ArtifactObligationEvidence],
+    workspace: &WorkspaceEvidence,
+    missing_obligations: &[String],
+) -> Vec<ObligationRepairTarget> {
+    missing_obligations
+        .iter()
+        .filter_map(|obligation| {
+            let obligation = obligation.trim();
+            if obligation.is_empty() {
+                return None;
+            }
+            let (target_role, target_path, reason) = match obligation {
+                "setup" => (
+                    "setup",
+                    setup_repair_path(required_paths, workspace),
+                    "missing setup obligation; create or repair the project manifest",
+                ),
+                "scaffold" => (
+                    "scaffold",
+                    implementation_repair_path(required_paths, artifact_obligations, workspace),
+                    "missing scaffold obligation; create the framework entrypoint shell",
+                ),
+                "implementation" => (
+                    "implementation",
+                    implementation_repair_path(required_paths, artifact_obligations, workspace),
+                    "missing implementation obligation; replace setup/scaffold/style/docs-only output with executable source",
+                ),
+                "verification" => (
+                    "verification",
+                    verification_repair_path(required_paths, artifact_obligations, workspace),
+                    "missing verification obligation; add a deterministic test or smoke artifact",
+                ),
+                "acceptance_evidence" => (
+                    "acceptance_evidence",
+                    "README.md".to_string(),
+                    "missing acceptance evidence obligation; add task-specific acceptance notes",
+                ),
+                _ => return None,
+            };
+            Some(ObligationRepairTarget {
+                obligation: obligation.to_string(),
+                target_role: target_role.to_string(),
+                target_path,
+                reason: reason.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn setup_repair_path(required_paths: &[String], workspace: &WorkspaceEvidence) -> String {
+    required_paths
+        .iter()
+        .find(|path| looks_like_setup_path(&path.to_ascii_lowercase()))
+        .cloned()
+        .unwrap_or_else(|| {
+            if workspace.cargo_toml {
+                "Cargo.toml".to_string()
+            } else {
+                "package.json".to_string()
+            }
+        })
+}
+
+fn implementation_repair_path(
+    required_paths: &[String],
+    artifact_obligations: &[ArtifactObligationEvidence],
+    workspace: &WorkspaceEvidence,
+) -> String {
+    artifact_obligations
+        .iter()
+        .find(|artifact| {
+            matches!(
+                artifact.role.as_str(),
+                "scaffold" | "style" | "acceptance_evidence"
+            ) && looks_like_implementation_path(&artifact.path)
+        })
+        .map(|artifact| artifact.path.clone())
+        .or_else(|| {
+            required_paths
+                .iter()
+                .find(|path| looks_like_implementation_path(path))
+                .cloned()
+        })
+        .or_else(|| {
+            workspace
+                .source_files
+                .iter()
+                .find(|file| looks_like_implementation_path(&file.rel))
+                .map(|file| file.rel.clone())
+        })
+        .unwrap_or_else(|| {
+            if workspace.package_json.is_some() {
+                "src/app/page.tsx".to_string()
+            } else if workspace.cargo_toml {
+                "src/main.rs".to_string()
+            } else {
+                "src/main.rs".to_string()
+            }
+        })
+}
+
+fn verification_repair_path(
+    required_paths: &[String],
+    artifact_obligations: &[ArtifactObligationEvidence],
+    workspace: &WorkspaceEvidence,
+) -> String {
+    required_paths
+        .iter()
+        .find(|path| looks_like_test_file(path))
+        .cloned()
+        .unwrap_or_else(|| {
+            let implementation_path =
+                implementation_repair_path(required_paths, artifact_obligations, workspace);
+            let stem = implementation_path
+                .rsplit('/')
+                .next()
+                .unwrap_or("main")
+                .rsplit_once('.')
+                .map_or(
+                    "main",
+                    |(stem, _)| if stem.is_empty() { "main" } else { stem },
+                );
+            if implementation_path.ends_with(".tsx") || implementation_path.ends_with(".ts") {
+                format!("tests/{stem}.test.ts")
+            } else if implementation_path.ends_with(".jsx") || implementation_path.ends_with(".js")
+            {
+                format!("tests/{stem}.test.js")
+            } else if implementation_path.ends_with(".rs") {
+                format!("tests/{stem}.rs")
+            } else {
+                format!("tests/test_{stem}.py")
+            }
+        })
+}
+
+fn looks_like_implementation_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if looks_like_setup_path(&lower)
+        || looks_like_style_path(&lower)
+        || looks_like_test_file(&lower)
+        || lower.ends_with(".md")
+        || lower.ends_with(".d.ts")
+        || lower.ends_with("layout.tsx")
+        || lower.ends_with("layout.jsx")
+    {
+        return false;
+    }
+    looks_like_source_or_test(&lower)
 }
 
 fn evidence_kinds_for_capability(capability: &str) -> Vec<EvidenceKind> {
@@ -1355,6 +1598,19 @@ mod tests {
                 .primary_reason
                 .contains("missing_required_obligations")
         );
+        assert_eq!(report.obligation_repair_targets.len(), 1);
+        assert_eq!(
+            report.obligation_repair_targets[0].obligation,
+            "implementation"
+        );
+        assert_eq!(
+            report.obligation_repair_targets[0].target_role,
+            "implementation"
+        );
+        assert_eq!(
+            report.obligation_repair_targets[0].target_path,
+            "src/app/page.tsx"
+        );
     }
 
     #[test]
@@ -1571,6 +1827,69 @@ export default function Page(){
             report.artifact_obligations[0]
                 .required_capabilities_supported
                 .contains(&"player_control".to_string())
+        );
+        let binding = report
+            .capability_evidence_bindings
+            .iter()
+            .find(|binding| binding.capability == "player_control")
+            .expect("player_control binding");
+        assert!(
+            binding
+                .artifact_paths
+                .contains(&"src/app/page.tsx".to_string())
+        );
+        assert!(
+            binding
+                .required_evidence
+                .contains(&"visible_interactive_surface_evidence".to_string())
+        );
+        assert!(binding.missing_evidence.is_empty());
+    }
+
+    #[test]
+    fn missing_capability_binding_points_at_partial_artifact_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  return <main><button onClick={() => setScore(score + 1)}>Add</button><p>score {score}</p></main>;
+}
+"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["adversary_or_challenge".to_string()],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(!report.passed);
+        let binding = report
+            .capability_evidence_bindings
+            .iter()
+            .find(|binding| binding.capability == "adversary_or_challenge")
+            .expect("adversary binding");
+        assert!(
+            binding
+                .artifact_paths
+                .contains(&"src/app/page.tsx".to_string())
+        );
+        assert!(
+            binding
+                .missing_evidence
+                .contains(&"challenge_or_adversary_evidence".to_string())
+        );
+        assert!(
+            binding
+                .satisfied_evidence
+                .contains(&"implementation_artifact".to_string())
         );
     }
 
