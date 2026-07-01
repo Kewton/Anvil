@@ -84,7 +84,7 @@ REC の状態は以下で管理する。
 | REC-004 | P1 | partial | source/MVP trace diff、unsupported source obligation の deferred/intentionally_different 整理。 | unit/eval では obligation-to-artifact binding、missing implementation repair target、plan/ultra event 伝播を確認済み。 |
 | REC-005 | P1 | pass | 実装レベルの受入条件は unit/fixture/eval/YAML roundtrip で確認済み。release-level manual/TUI evidence は REC-010 で扱う。 | none。source full `RepairJob` は移植せず、MVP の薄い lifecycle 写像として管理する。 |
 | REC-006 | P1 | pass | 実装レベルの受入条件は unit/fixture/eval で確認済み。live browser/manual UAT evidence は REC-010 で扱う。 | none。browser/Playwright は通常 unit test 必須にせず、保存済み evidence content gate として管理する。 |
-| REC-007 | P1 | open | MVP/anvildev same-condition normalized trace diff、G-S01〜G-S16 status update。 | code reference だけで parity pass、trace 欠損 gate の pass 扱い。 |
+| REC-007 | P1 | pass | 実装レベルの受入条件は normalized trace diff / parity report / eval pytest で確認済み。release-level failed gates は report の `failed_gate_ids` として扱う。 | none。code reference だけの pass と trace 欠損 gate の pass 扱いは schema/gate で禁止済み。 |
 | REC-008 | P2 | open | provider probe summary、skip reason、provider-specific args shape observation。 | fake fixture のみで provider-sensitive fix を完了扱い、unsafe args recovery。 |
 | REC-009 | P2 | open | verify normalization fixture、original/normalized verify event、runtime Bash policy rejection fixture。 | shell control syntax 許可、setup/build ordering 違反の success、normalization event 欠損。 |
 | REC-010 | P2 | open | manual TUI run events、summary、recovery `.md` / `.yaml` parse check、release evidence registration。 | silent exit、summary 欠損、recovery artifact path だけで内容未確認。 |
@@ -591,6 +591,22 @@ normalized trace writer はあるが、gate matrix では全 G-S01〜G-S16 が `
 - release gate では browser/interaction/TUI evidence content を含める。
 - trace には raw prompt、API key、provider raw response body を保存しない。
 - source trace が取得できない場合は code reference だけで pass にしない。
+
+### 実装結果
+
+| 項目 | 内容 |
+| --- | --- |
+| status | pass |
+| 実施日 | 2026-07-01 |
+| 実施 step | RECOVERY-001-E |
+| 実装概要 | `runtime_trace.py` の normalized stage mapping と `compare_trace_reports` を拡張し、source/MVP same-condition trace diff が G-S01〜G-S16 の各 gate を `pass` / `fail` / `intentionally_different` のいずれかへ解決するようにした。`parity_gate.py` と `eval-preflight.py` に source/MVP trace report / precomputed diff 入力を追加し、comparative/release gate では `partial_gate_ids` を通過不能にした。 |
+| source parity 判断 | source と差分あり。0229 normalized diff では G-S02/G-S03/G-S08/G-S14 は pass、G-S01/G-S04/G-S05/G-S06/G-S07/G-S09/G-S10/G-S11/G-S13/G-S15 は source trace 側未観測で fail、G-S12 は browser/interaction evidence failure で release fail、G-S16 は trace 未観測かつ TUI evidence failure で fail。 |
+| 証跡 | `workspace/mvp/eval/022/runtime-semantics-trace-diff.json`、`workspace/mvp/eval/022/parity_gate_report.json`、`workspace/mvp/eval/022/runtime_semantics_gate_matrix.md`、`workspace/mvp/eval/022/source_mvp_trace_manifest.md`、source trace `/private/tmp/anvilminimal-eval-0229-anvildev-net-timeout/runtime-semantics-trace-report.json`、MVP trace `/private/tmp/anvilminimal-eval-0229-mvp-net-timeout/runtime-semantics-trace-report.json`。 |
+| 通過した確認 | fixture / eval tooling / anvildev comparison report。`pytest -q mvp/anvilminimal/tests/eval/test_runtime_semantics_trace.py mvp/anvilminimal/tests/eval/test_parity_gate_report.py mvp/anvilminimal/tests/eval/test_eval_cli_contract.py` 通過。`pytest mvp/anvilminimal/tests/eval` 通過。 |
+| 未確認事項 | live 再計測は実施せず、既存 0229 run root を新 normalizer で再生成した。browser/interaction/TUI の内容は保存済み evidence を読み、HTTP 500 / canvas unavailable / TUI failure として release fail に反映済み。 |
+| blocking condition | none。REC-007 の gate 機構は完了。残る release failure は各 gate の `failed_gate_ids` と後続 REC-010/manual UAT の対象。 |
+| 次の確認タイミング | full eval 後 / REC-010 manual UAT 後 / release gate 判定時 |
+| rollback 判断 | rollback 不要 |
 
 ---
 

@@ -13,6 +13,13 @@ from .run_summary import read_summary
 
 
 TRACE_REPORT_VERSION = "1"
+REQUIRED_GATE_IDS = [f"G-S{index:02d}" for index in range(1, 17)]
+FAILURE_STAGES = {
+    "verify_failed",
+    "repair_exhausted",
+    "acceptance_failed",
+    "diagnostic_emitted",
+}
 
 STAGE_TO_GATE_IDS: dict[str, list[str]] = {
     "request_understood": ["G-S01"],
@@ -58,26 +65,51 @@ SOURCE_EVENT_STAGE: dict[str, str] = {
 
 MVP_EVENT_STAGE: dict[str, str] = {
     "acceptance_summary": "acceptance_started",
+    "browser_oracle_summary": "acceptance_started",
     "completion_verify": "contract_loaded",
     "dependency_build_lifecycle": "dependency_boundary_checked",
+    "deterministic_scaffold_recovery": "scaffold_continuation_required",
     "diagnostic_skipped": "diagnostic_emitted",
     "fallback_decision": "scaffold_continuation_required",
+    "final_acceptance_repair_complete": "repair_attempted",
+    "final_acceptance_repair_exhausted": "repair_exhausted",
+    "final_acceptance_repair_failed": "repair_attempted",
+    "final_acceptance_repair_start": "repair_attempted",
     "plan_capability_contract_evaluated": "contract_loaded",
+    "plan_final_contract": "contract_loaded",
     "plan_run_missed_predictive_signal": "diagnostic_emitted",
     "plan_run_readiness_evaluated": "plan_linted",
     "plan_score": "plan_generated",
     "plan_verify_coverage_evaluated": "verify_started",
+    "phase_verification_result": "verify_started",
     "planner_error": "plan_linted",
+    "planner_parse_error": "plan_linted",
+    "planner_quality_retry_degraded": "plan_linted",
+    "planner_quality_retry_exhausted": "plan_linted",
     "planner_quality_issue": "plan_linted",
     "planner_quality_retry": "plan_linted",
+    "planner_quality_warning": "plan_linted",
     "planner_raw_output_shape": "plan_generated",
+    "planner_verify_command_normalized": "plan_linted",
     "postcheck_summary": "acceptance_started",
     "provider_error": "provider_observed",
     "provider_probe": "provider_observed",
+    "provider_request": "provider_observed",
     "provider_response": "provider_observed",
+    "provider_parse_error": "provider_observed",
+    "provider_retry": "provider_observed",
+    "profile_auto_repair_continuation_complete": "repair_attempted",
+    "profile_auto_repair_continuation_incomplete": "repair_attempted",
+    "profile_auto_repair_continuation_start": "repair_attempted",
+    "profile_repair_complete": "repair_attempted",
+    "profile_repair_start": "repair_attempted",
     "recovery_prompt_saved": "recovery_handoff_saved",
     "run_start": "request_understood",
+    "run_stop": "diagnostic_emitted",
     "scheduler_diagnostics": "diagnostic_emitted",
+    "step_capability_evidence_check": "acceptance_started",
+    "step_obligation_scope": "contract_loaded",
+    "step_prompt_contract": "step_prompt_built",
     "step_prompt_built": "step_prompt_built",
     "step_verify_failure": "verify_failed",
     "step_verify_repair": "repair_attempted",
@@ -88,6 +120,7 @@ MVP_EVENT_STAGE: dict[str, str] = {
     "ultra_context_initialized": "phase_context_attached",
     "ultra_phase_complete": "acceptance_passed",
     "ultra_phase_context_attached": "phase_context_attached",
+    "ultra_phase_context_updated": "phase_context_attached",
     "ultra_phase_execute_complete": "tool_executed",
     "ultra_phase_failed": "verify_failed",
     "ultra_phase_plan_validated": "plan_linted",
@@ -98,7 +131,15 @@ MVP_EVENT_STAGE: dict[str, str] = {
     "ultra_plan_generation_failed": "plan_linted",
     "ultra_plan_generation_metadata_normalized": "plan_generated",
     "ultra_plan_generation_retry": "plan_linted",
+    "ultra_plan_generation_succeeded": "plan_generated",
     "ultra_plan_generation_tool_call_rejected": "plan_linted",
+    "ultra_plan_raw_output_shape": "plan_generated",
+    "ultra_final_acceptance": "acceptance_started",
+    "ultra_final_acceptance_failed": "acceptance_failed",
+    "ultra_partial_artifact_summary": "diagnostic_emitted",
+    "ultra_plan_complete": "acceptance_passed",
+    "tui_command_start": "manual_tui_trace_recorded",
+    "tui_command_stop": "manual_tui_trace_recorded",
     "verify_repair_progress": "repair_attempted",
     "verify_repair_turn": "repair_attempted",
 }
@@ -280,6 +321,18 @@ def stage_for_event(event: dict[str, Any]) -> str:
             return "acceptance_failed"
         if event_bool(event.get("runtime_acceptance_passed")):
             return "acceptance_passed"
+    if name == "browser_oracle_summary":
+        if event_false(event.get("browser_success")) or event_false(event.get("ok")):
+            return "acceptance_failed"
+        if event_bool(event.get("browser_success")) or event_bool(event.get("ok")):
+            return "acceptance_passed"
+    if name in {"ultra_final_acceptance", "phase_verification_result"}:
+        if event_false(event.get("ok")):
+            return "acceptance_failed" if name == "ultra_final_acceptance" else "verify_failed"
+        if event_bool(event.get("ok")):
+            return "acceptance_passed" if name == "ultra_final_acceptance" else "verify_started"
+    if name == "run_stop" and event_false(event.get("ok")):
+        return "diagnostic_emitted"
     if name == "dependency_build_lifecycle":
         if event_bool(event.get("setup_attempted")):
             return "dependency_setup_attempted"
@@ -522,15 +575,266 @@ def compare_trace_reports(source: dict[str, Any], mvp: dict[str, Any]) -> dict[s
     mvp_stages = set((mvp.get("stage_counts", {}) or {}).keys())
     source_gates = set((source.get("gate_counts", {}) or {}).keys())
     mvp_gates = set((mvp.get("gate_counts", {}) or {}).keys())
+    source_available = trace_report_available(source)
+    mvp_available = trace_report_available(mvp)
+    condition = same_condition_status(source, mvp)
+    gate_results = build_gate_results(
+        source,
+        mvp,
+        source_available=source_available,
+        mvp_available=mvp_available,
+        same_condition=condition,
+    )
+    gate_status_counts = Counter(str(item["status"]) for item in gate_results)
+    missing_stages = sorted(source_stages - mvp_stages)
+    extra_stages = sorted(mvp_stages - source_stages)
     return {
         "schema_version": TRACE_REPORT_VERSION,
+        "status": "compared"
+        if source_available and mvp_available and condition["status"] == "match"
+        else trace_diff_status(
+            source_available=source_available,
+            mvp_available=mvp_available,
+            same_condition=condition,
+        ),
         "source_trace_id": source.get("trace_id", ""),
         "mvp_trace_id": mvp.get("trace_id", ""),
-        "missing_stages_in_mvp": sorted(source_stages - mvp_stages),
-        "extra_stages_in_mvp": sorted(mvp_stages - source_stages),
+        "source_trace_available": source_available,
+        "mvp_trace_available": mvp_available,
+        "same_condition": condition,
+        "missing_stages_in_mvp": missing_stages,
+        "extra_stages_in_mvp": extra_stages,
         "missing_gate_ids_in_mvp": sorted(source_gates - mvp_gates),
         "extra_gate_ids_in_mvp": sorted(mvp_gates - source_gates),
+        "gate_results": gate_results,
+        "gate_status_counts": dict(sorted(gate_status_counts.items())),
+        "passed_gate_ids": sorted(
+            item["gate_id"] for item in gate_results if item["status"] == "pass"
+        ),
+        "failed_gate_ids": sorted(
+            item["gate_id"] for item in gate_results if item["status"] == "fail"
+        ),
+        "intentionally_different_gate_ids": sorted(
+            item["gate_id"]
+            for item in gate_results
+            if item["status"] == "intentionally_different"
+        ),
+        "partial_gate_ids": [],
+        "regressions": trace_regressions(
+            source,
+            mvp,
+            missing_stages=missing_stages,
+            gate_results=gate_results,
+        ),
+        "correct_failure_detection": trace_correct_failure_detection(
+            source,
+            mvp,
+            extra_stages=extra_stages,
+        ),
     }
+
+
+def trace_report_available(report: dict[str, Any]) -> bool:
+    if not isinstance(report, dict) or not report:
+        return False
+    count = int_or_none(report.get("normalized_event_count"))
+    if count is not None and count > 0:
+        return True
+    return bool(report.get("stage_counts") or report.get("gate_counts"))
+
+
+def same_condition_status(source: dict[str, Any], mvp: dict[str, Any]) -> dict[str, Any]:
+    source_signature = condition_signature(source)
+    mvp_signature = condition_signature(mvp)
+    if not source_signature or not mvp_signature:
+        return {
+            "status": "unknown",
+            "source_signature_count": len(source_signature),
+            "mvp_signature_count": len(mvp_signature),
+            "reason": "manifest_rows_missing",
+        }
+    source_set = {json.dumps(item, sort_keys=True) for item in source_signature}
+    mvp_set = {json.dumps(item, sort_keys=True) for item in mvp_signature}
+    missing = sorted(json.loads(item) for item in source_set - mvp_set)
+    extra = sorted(json.loads(item) for item in mvp_set - source_set)
+    return {
+        "status": "match" if not missing and not extra else "mismatch",
+        "source_signature_count": len(source_signature),
+        "mvp_signature_count": len(mvp_signature),
+        "missing_in_mvp": missing[:20],
+        "extra_in_mvp": extra[:20],
+    }
+
+
+def condition_signature(report: dict[str, Any]) -> list[dict[str, str]]:
+    rows = report.get("manifest_rows", []) or []
+    signature: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        signature.append(
+            {
+                "suite": str(row.get("suite", "")),
+                "scenario": str(row.get("scenario", "")),
+                "mode": str(row.get("mode", "")),
+                "provider_model_pair": str(row.get("provider_model_pair", "")),
+            }
+        )
+    return sorted(signature, key=lambda item: tuple(item.values()))
+
+
+def trace_diff_status(
+    *,
+    source_available: bool,
+    mvp_available: bool,
+    same_condition: dict[str, Any],
+) -> str:
+    if not source_available and not mvp_available:
+        return "missing_source_and_mvp_trace"
+    if not source_available:
+        return "missing_source_trace"
+    if not mvp_available:
+        return "missing_mvp_trace"
+    if same_condition.get("status") == "mismatch":
+        return "same_condition_mismatch"
+    if same_condition.get("status") == "unknown":
+        return "same_condition_unknown"
+    return "compared"
+
+
+def build_gate_results(
+    source: dict[str, Any],
+    mvp: dict[str, Any],
+    *,
+    source_available: bool,
+    mvp_available: bool,
+    same_condition: dict[str, Any],
+) -> list[dict[str, Any]]:
+    source_counts = source.get("gate_counts", {}) or {}
+    mvp_counts = mvp.get("gate_counts", {}) or {}
+    source_stage_counts = source.get("stage_counts", {}) or {}
+    mvp_stage_counts = mvp.get("stage_counts", {}) or {}
+    stage_by_gate = stages_by_gate()
+    results: list[dict[str, Any]] = []
+    for gate_id in REQUIRED_GATE_IDS:
+        source_count = int_or_zero(source_counts.get(gate_id))
+        mvp_count = int_or_zero(mvp_counts.get(gate_id))
+        stages = stage_by_gate.get(gate_id, [])
+        source_stages = [stage for stage in stages if int_or_zero(source_stage_counts.get(stage))]
+        mvp_stages = [stage for stage in stages if int_or_zero(mvp_stage_counts.get(stage))]
+        status = "pass"
+        reason = "source_and_mvp_gate_observed"
+        if not source_available:
+            status = "fail"
+            reason = "source_trace_missing"
+        elif not mvp_available:
+            status = "fail"
+            reason = "mvp_trace_missing"
+        elif same_condition.get("status") == "mismatch":
+            status = "fail"
+            reason = "same_condition_mismatch"
+        elif same_condition.get("status") == "unknown":
+            status = "fail"
+            reason = "same_condition_unknown"
+        elif source_count > 0 and mvp_count > 0:
+            status = "pass"
+            reason = "source_and_mvp_gate_observed"
+        elif source_count > 0:
+            status = "fail"
+            reason = "missing_gate_in_mvp_trace"
+        elif mvp_count > 0:
+            status = "fail"
+            reason = "source_gate_not_observed_in_trace"
+        else:
+            status = "fail"
+            reason = "gate_not_observed_in_trace"
+        results.append(
+            {
+                "gate_id": gate_id,
+                "status": status,
+                "reason": reason,
+                "source_event_count": source_count,
+                "mvp_event_count": mvp_count,
+                "source_stages": source_stages,
+                "mvp_stages": mvp_stages,
+            }
+        )
+    return results
+
+
+def stages_by_gate() -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {gate_id: [] for gate_id in REQUIRED_GATE_IDS}
+    for stage, gate_ids in STAGE_TO_GATE_IDS.items():
+        for gate_id in gate_ids:
+            out.setdefault(gate_id, []).append(stage)
+    return {gate_id: sorted(set(stages)) for gate_id, stages in out.items()}
+
+
+def trace_regressions(
+    source: dict[str, Any],
+    mvp: dict[str, Any],
+    *,
+    missing_stages: list[str],
+    gate_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    source_counts = source.get("stage_counts", {}) or {}
+    mvp_counts = mvp.get("stage_counts", {}) or {}
+    regressions: list[dict[str, Any]] = []
+    for stage in missing_stages:
+        regressions.append(
+            {
+                "kind": "missing_stage_in_mvp_trace",
+                "stage": stage,
+                "source": int_or_zero(source_counts.get(stage)),
+                "mvp": int_or_zero(mvp_counts.get(stage)),
+            }
+        )
+    for item in gate_results:
+        if item["status"] == "fail" and item["reason"] == "missing_gate_in_mvp_trace":
+            regressions.append(
+                {
+                    "kind": "missing_gate_in_mvp_trace",
+                    "gate_id": item["gate_id"],
+                    "source": item["source_event_count"],
+                    "mvp": item["mvp_event_count"],
+                }
+            )
+    return regressions
+
+
+def trace_correct_failure_detection(
+    source: dict[str, Any],
+    mvp: dict[str, Any],
+    *,
+    extra_stages: list[str],
+) -> list[dict[str, Any]]:
+    source_counts = source.get("stage_counts", {}) or {}
+    mvp_counts = mvp.get("stage_counts", {}) or {}
+    detections: list[dict[str, Any]] = []
+    for stage in extra_stages:
+        if stage not in FAILURE_STAGES:
+            continue
+        detections.append(
+            {
+                "kind": "mvp_extra_failure_detection_stage",
+                "stage": stage,
+                "source": int_or_zero(source_counts.get(stage)),
+                "mvp": int_or_zero(mvp_counts.get(stage)),
+            }
+        )
+    return detections
+
+
+def int_or_zero(value: Any) -> int:
+    parsed = int_or_none(value)
+    return parsed if parsed is not None else 0
+
+
+def int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def redacted_command(path: Path) -> str:

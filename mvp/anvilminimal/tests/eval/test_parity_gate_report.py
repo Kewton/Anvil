@@ -42,8 +42,14 @@ class ParityGateReportTest(unittest.TestCase):
             ],
         }
 
-    def test_valid_report_allows_known_partial_and_failed_partition(self):
-        self.assertEqual(validate_parity_gate_report(self.base_report()), [])
+    def test_local_report_allows_known_partial_and_failed_partition(self):
+        report = self.base_report()
+        report["gate_level"] = "local"
+        self.assertEqual(validate_parity_gate_report(report), [])
+
+    def test_comparative_report_rejects_unresolved_partial_gates(self):
+        errors = validate_parity_gate_report(self.base_report())
+        self.assertTrue(any("partial gate ids unresolved" in error for error in errors))
 
     def test_report_rejects_missing_gate_partition(self):
         report = self.base_report()
@@ -105,6 +111,63 @@ class ParityGateReportTest(unittest.TestCase):
             "intentional_difference",
         )
         self.assertFalse(any("anvildev parity threshold failed" in item for item in report["errors"]))
+        self.assertEqual(validate_parity_gate_report(report), [])
+
+    def test_comparative_report_includes_trace_diff_and_resolves_gate_partition(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source_trace = root / "source-trace.json"
+            mvp_trace = root / "mvp-trace.json"
+            rows = [
+                {
+                    "suite": "s",
+                    "scenario": "case",
+                    "mode": "minimal-loop",
+                    "provider_model_pair": "openai:gpt planner=gemini:flash",
+                }
+            ]
+            source_trace.write_text(
+                json.dumps(
+                    {
+                        "trace_id": "source",
+                        "normalized_event_count": 2,
+                        "manifest_rows": rows,
+                        "stage_counts": {"plan_generated": 1, "verify_started": 1},
+                        "gate_counts": {"G-S03": 1, "G-S08": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            mvp_trace.write_text(
+                json.dumps(
+                    {
+                        "trace_id": "mvp",
+                        "normalized_event_count": 1,
+                        "manifest_rows": rows,
+                        "stage_counts": {"plan_generated": 1},
+                        "gate_counts": {"G-S03": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = build_parity_gate_report(
+                gate_level="comparative",
+                source_trace_report_path=str(source_trace),
+                mvp_trace_report_path=str(mvp_trace),
+            )
+        self.assertEqual(report["normalized_trace_diff"]["status"], "compared")
+        self.assertEqual(report["partial_gate_ids"], [])
+        self.assertIn("G-S03", report["passed_gate_ids"])
+        self.assertIn("G-S08", report["failed_gate_ids"])
+        self.assertEqual(validate_parity_gate_report(report), [])
+
+    def test_comparative_report_fails_all_gates_when_trace_diff_missing(self):
+        report = build_parity_gate_report(gate_level="comparative")
+        self.assertEqual(report["partial_gate_ids"], [])
+        self.assertEqual(set(report["failed_gate_ids"]), REQUIRED_GATE_IDS)
+        self.assertTrue(
+            any("normalized trace diff" in item for item in report["errors"])
+        )
         self.assertEqual(validate_parity_gate_report(report), [])
 
     def test_release_gate_pass_requires_browser_interaction_and_tui_evidence(self):

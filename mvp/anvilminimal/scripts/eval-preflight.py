@@ -52,6 +52,9 @@ def main() -> int:
     )
     parser.add_argument("--mvp-summary", help="MVP summary.eval.tsv for parity comparison.")
     parser.add_argument("--anvildev-summary", help="anvildev --engine minimal summary.eval.tsv for parity comparison.")
+    parser.add_argument("--source-trace-report", help="source anvildev runtime-semantics-trace-report.json.")
+    parser.add_argument("--mvp-trace-report", help="MVP runtime-semantics-trace-report.json.")
+    parser.add_argument("--trace-diff", help="Precomputed runtime-semantics-trace-diff.json.")
     parser.add_argument(
         "--intentional-difference-evidence",
         action="append",
@@ -172,6 +175,9 @@ def parity_gate_status(args: argparse.Namespace, run_root: Path) -> dict:
             args.write_parity_gate_report,
             args.mvp_summary,
             args.anvildev_summary,
+            args.source_trace_report,
+            args.mvp_trace_report,
+            args.trace_diff,
             args.gate_level != "local",
             args.uat_evidence,
             args.browser_evidence,
@@ -189,6 +195,9 @@ def parity_gate_status(args: argparse.Namespace, run_root: Path) -> dict:
         gate_level=args.gate_level,
         mvp_summary_path=args.mvp_summary,
         anvildev_summary_path=args.anvildev_summary,
+        source_trace_report_path=args.source_trace_report,
+        mvp_trace_report_path=args.mvp_trace_report,
+        trace_diff_path=args.trace_diff,
         uat_evidence_paths=args.uat_evidence,
         browser_evidence_paths=args.browser_evidence,
         interaction_evidence_paths=args.interaction_evidence,

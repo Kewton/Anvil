@@ -188,9 +188,13 @@ class EvalCliContractTest(unittest.TestCase):
             run_root = td_path / "preflight"
             mvp = td_path / "mvp.summary.eval.tsv"
             source = td_path / "source.summary.eval.tsv"
+            mvp_trace = td_path / "mvp.trace.json"
+            source_trace = td_path / "source.trace.json"
             report = td_path / "parity_gate_report.json"
             write_summary(mvp, [summary_row(True), summary_row(True)])
             write_summary(source, [summary_row(True), summary_row(True)])
+            write_trace_report(mvp_trace, "mvp")
+            write_trace_report(source_trace, "source")
             result = subprocess.run(
                 [
                     sys.executable,
@@ -212,6 +216,10 @@ class EvalCliContractTest(unittest.TestCase):
                     str(mvp),
                     "--anvildev-summary",
                     str(source),
+                    "--mvp-trace-report",
+                    str(mvp_trace),
+                    "--source-trace-report",
+                    str(source_trace),
                     "--write-parity-gate-report",
                     str(report),
                     "--run-root",
@@ -283,6 +291,30 @@ def summary_row(success: bool):
         }
     )
     return row
+
+
+def write_trace_report(path: Path, trace_id: str):
+    rows = [
+        {
+            "suite": "s",
+            "scenario": "case",
+            "mode": "minimal-loop",
+            "provider_model_pair": "openai:gpt planner=gemini:flash",
+        }
+    ]
+    gate_counts = {f"G-S{index:02d}": 1 for index in range(1, 17)}
+    path.write_text(
+        json.dumps(
+            {
+                "trace_id": trace_id,
+                "normalized_event_count": len(gate_counts),
+                "manifest_rows": rows,
+                "stage_counts": {"plan_generated": 1},
+                "gate_counts": gate_counts,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

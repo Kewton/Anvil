@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .failure_classification import blank_failure_kind_gate_violations
+from .runtime_trace import compare_trace_reports
 from .run_summary import read_summary
 
 
@@ -56,6 +57,42 @@ def validate_parity_gate_report(report: dict[str, Any]) -> list[str]:
             errors.append("blank failure kind count must be listed in report errors")
 
     gate_level = str(report.get("gate_level", ""))
+    partial = set(str(item) for item in report.get("partial_gate_ids", []) or [])
+    if gate_level in {"comparative", "release"} and partial:
+        errors.append(
+            "comparative/release gate cannot leave partial gate ids unresolved: "
+            + str(sorted(partial))
+        )
+    gate_statuses = report.get("gate_statuses", []) or []
+    allowed_gate_statuses = {"pass", "fail", "intentionally_different"}
+    if gate_level not in {"comparative", "release"}:
+        allowed_gate_statuses.add("partial")
+    for item in gate_statuses:
+        if not isinstance(item, dict):
+            errors.append("gate_statuses entries must be objects")
+            continue
+        status = str(item.get("status", ""))
+        if status not in allowed_gate_statuses:
+            errors.append(
+                "gate_statuses entries must resolve to pass/fail/intentionally_different"
+            )
+            break
+    trace_diff = report.get("normalized_trace_diff", {}) or {}
+    if gate_level in {"comparative", "release"}:
+        if not trace_diff:
+            report_errors = report.get("errors", []) or []
+            joined = "\n".join(str(item) for item in report_errors)
+            if "normalized trace" not in joined:
+                errors.append("comparative/release gate requires normalized trace diff evidence")
+        elif trace_diff.get("partial_gate_ids"):
+            errors.append("normalized trace diff cannot contain partial gate ids")
+        for item in trace_diff.get("gate_results", []) or []:
+            status = str(item.get("status", ""))
+            if status not in {"pass", "fail", "intentionally_different"}:
+                errors.append(
+                    "normalized trace diff gate results must resolve to pass/fail/intentionally_different"
+                )
+                break
     comparison = report.get("anvildev_comparison", {}) or {}
     if gate_level in {"comparative", "release"}:
         if comparison.get("status") == "missing_current_same_condition_trace":
@@ -99,6 +136,9 @@ def build_parity_gate_report(
     gate_level: str = "local",
     mvp_summary_path: str | None = None,
     anvildev_summary_path: str | None = None,
+    source_trace_report_path: str | None = None,
+    mvp_trace_report_path: str | None = None,
+    trace_diff_path: str | None = None,
     uat_evidence_paths: list[str] | None = None,
     browser_evidence_paths: list[str] | None = None,
     interaction_evidence_paths: list[str] | None = None,
@@ -141,6 +181,18 @@ def build_parity_gate_report(
             report["errors"],
             "comparative gate cannot pass because latest same-condition anvildev trace is missing.",
         )
+    report["normalized_trace_diff"] = normalized_trace_diff(
+        source_trace_report_path=source_trace_report_path,
+        mvp_trace_report_path=mvp_trace_report_path,
+        trace_diff_path=trace_diff_path,
+    )
+    if gate_level in {"comparative", "release"} and not trace_diff_is_usable(
+        report["normalized_trace_diff"]
+    ):
+        append_unique(
+            report["errors"],
+            "comparative gate cannot pass because normalized trace diff evidence is missing or incomplete.",
+        )
     report["uat_equivalent"] = release_gate_evidence(
         existing=report.get("uat_equivalent", {}) or {},
         gate_level=gate_level,
@@ -164,6 +216,12 @@ def build_parity_gate_report(
             report["errors"],
             "anvildev parity threshold failed: MVP is at least 10pp below source without intentional evidence.",
         )
+    finalize_gate_partition(report, gate_level=gate_level)
+    if gate_level in {"comparative", "release"} and report.get("failed_gate_ids"):
+        append_unique(
+            report["errors"],
+            "runtime semantics gates failed: " + ", ".join(report["failed_gate_ids"]),
+        )
     return report
 
 
@@ -180,6 +238,185 @@ def minimal_parity_gate_report() -> dict[str, Any]:
         "errors": [],
         "warnings": [],
     }
+
+
+def normalized_trace_diff(
+    *,
+    source_trace_report_path: str | None,
+    mvp_trace_report_path: str | None,
+    trace_diff_path: str | None,
+) -> dict[str, Any]:
+    if trace_diff_path:
+        diff = read_json_path(trace_diff_path, {})
+        if isinstance(diff, dict):
+            diff.setdefault("trace_diff_path", trace_diff_path)
+            return diff
+        return {"schema_version": "1", "status": "invalid_trace_diff", "trace_diff_path": trace_diff_path}
+    if source_trace_report_path and mvp_trace_report_path:
+        source = read_json_path(source_trace_report_path, {})
+        mvp = read_json_path(mvp_trace_report_path, {})
+        diff = compare_trace_reports(
+            source if isinstance(source, dict) else {},
+            mvp if isinstance(mvp, dict) else {},
+        )
+        diff["source_trace_report_path"] = source_trace_report_path
+        diff["mvp_trace_report_path"] = mvp_trace_report_path
+        return diff
+    return {
+        "schema_version": "1",
+        "status": "missing_trace_diff",
+        "required_next_trace": "Generate source and MVP runtime-semantics-trace-report.json and compare them with eval-trace.py.",
+        "partial_gate_ids": [],
+        "passed_gate_ids": [],
+        "failed_gate_ids": sorted(REQUIRED_GATE_IDS),
+        "intentionally_different_gate_ids": [],
+        "gate_results": [
+            {
+                "gate_id": gate_id,
+                "status": "fail",
+                "reason": "normalized_trace_diff_missing",
+                "source_event_count": 0,
+                "mvp_event_count": 0,
+            }
+            for gate_id in sorted(REQUIRED_GATE_IDS)
+        ],
+    }
+
+
+def trace_diff_is_usable(diff: dict[str, Any]) -> bool:
+    if not isinstance(diff, dict) or not diff:
+        return False
+    if diff.get("status") != "compared":
+        return False
+    results = diff.get("gate_results", []) or []
+    if not results:
+        return False
+    statuses = {str(item.get("status", "")) for item in results if isinstance(item, dict)}
+    return bool(statuses) and statuses.issubset({"pass", "fail", "intentionally_different"})
+
+
+def finalize_gate_partition(report: dict[str, Any], *, gate_level: str) -> None:
+    if gate_level not in {"comparative", "release"}:
+        report["gate_statuses"] = existing_gate_statuses(report)
+        return
+    statuses = gate_statuses_from_trace_diff(report.get("normalized_trace_diff", {}) or {})
+    if not statuses:
+        statuses = {
+            gate_id: {
+                "gate_id": gate_id,
+                "status": "fail",
+                "reason": "normalized_trace_diff_missing",
+            }
+            for gate_id in sorted(REQUIRED_GATE_IDS)
+        }
+    apply_report_blockers_to_gate_statuses(report, statuses, gate_level=gate_level)
+    ordered = [statuses[gate_id] for gate_id in sorted(REQUIRED_GATE_IDS)]
+    report["gate_statuses"] = ordered
+    report["passed_gate_ids"] = [
+        item["gate_id"] for item in ordered if item["status"] == "pass"
+    ]
+    report["failed_gate_ids"] = [
+        item["gate_id"] for item in ordered if item["status"] == "fail"
+    ]
+    report["intentionally_different_gate_ids"] = [
+        item["gate_id"]
+        for item in ordered
+        if item["status"] == "intentionally_different"
+    ]
+    report["partial_gate_ids"] = []
+
+
+def existing_gate_statuses(report: dict[str, Any]) -> list[dict[str, str]]:
+    statuses: list[dict[str, str]] = []
+    for field, status in (
+        ("passed_gate_ids", "pass"),
+        ("failed_gate_ids", "fail"),
+        ("intentionally_different_gate_ids", "intentionally_different"),
+    ):
+        for gate_id in report.get(field, []) or []:
+            statuses.append({"gate_id": str(gate_id), "status": status, "reason": field})
+    for gate_id in report.get("partial_gate_ids", []) or []:
+        statuses.append({"gate_id": str(gate_id), "status": "partial", "reason": "partial_gate_ids"})
+    return sorted(statuses, key=lambda item: item["gate_id"])
+
+
+def gate_statuses_from_trace_diff(diff: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    statuses: dict[str, dict[str, Any]] = {}
+    for item in diff.get("gate_results", []) or []:
+        if not isinstance(item, dict):
+            continue
+        gate_id = str(item.get("gate_id", ""))
+        if gate_id not in REQUIRED_GATE_IDS:
+            continue
+        status = str(item.get("status", ""))
+        if status not in {"pass", "fail", "intentionally_different"}:
+            status = "fail"
+        statuses[gate_id] = {
+            "gate_id": gate_id,
+            "status": status,
+            "reason": str(item.get("reason", "")) or "trace_diff",
+            "source_event_count": item.get("source_event_count", 0),
+            "mvp_event_count": item.get("mvp_event_count", 0),
+        }
+    for gate_id in REQUIRED_GATE_IDS:
+        statuses.setdefault(
+            gate_id,
+            {
+                "gate_id": gate_id,
+                "status": "fail",
+                "reason": "gate_missing_from_trace_diff",
+            },
+        )
+    return statuses
+
+
+def apply_report_blockers_to_gate_statuses(
+    report: dict[str, Any],
+    statuses: dict[str, dict[str, Any]],
+    *,
+    gate_level: str,
+) -> None:
+    if int_or_none(report.get("failure_kind_blank_count")) not in {None, 0}:
+        force_gate_failure(statuses, "G-S14", "failure_kind_blank_count_nonzero")
+    diff = report.get("normalized_trace_diff", {}) or {}
+    if diff.get("status") != "compared":
+        for gate_id in REQUIRED_GATE_IDS:
+            force_gate_failure(statuses, gate_id, str(diff.get("status") or "trace_diff_missing"))
+    if gate_level == "release":
+        uat = report.get("uat_equivalent", {}) or {}
+        results = uat.get("evidence_results", {}) or {}
+        browser = results.get("browser_readiness", {}) or {}
+        interaction = results.get("interaction", {}) or {}
+        tui = results.get("tui", {}) or {}
+        if evidence_not_pass(browser) or evidence_not_pass(interaction):
+            force_gate_failure(statuses, "G-S12", "release_browser_or_interaction_evidence_not_pass")
+        if evidence_not_pass(tui):
+            force_gate_failure(statuses, "G-S16", "release_tui_evidence_not_pass")
+
+
+def force_gate_failure(
+    statuses: dict[str, dict[str, Any]],
+    gate_id: str,
+    reason: str,
+) -> None:
+    current = statuses.get(gate_id, {"gate_id": gate_id})
+    current["status"] = "fail"
+    reasons = [part for part in str(current.get("reason", "")).split(";") if part]
+    if reason not in reasons:
+        reasons.append(reason)
+    current["reason"] = ";".join(reasons)
+    statuses[gate_id] = current
+
+
+def evidence_not_pass(value: dict[str, Any]) -> bool:
+    return str(value.get("status", "")) != "pass"
+
+
+def read_json_path(path: str, default: Any) -> Any:
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return default
 
 
 def compare_mvp_to_anvildev(
@@ -462,11 +699,18 @@ def evaluate_interaction_evidence(paths: list[str]) -> dict[str, Any]:
             "reason": "interaction_detail_missing",
         }
     if ok is False:
+        reason = text_field(value, "reason")
+        if reason in {"canvas_not_available", "canvas_unavailable"}:
+            failure_kind = "canvas_unavailable"
+        elif reason in {"interactive_surface_missing", "interaction_surface_missing"}:
+            failure_kind = "interactive_surface_missing"
+        else:
+            failure_kind = text_field(value, "failure_kind", "error_kind") or "interaction_failed"
         return {
             "status": "fail",
             "path": path,
-            "failure_kind": text_field(value, "failure_kind", "error_kind") or "interaction_failed",
-            "reason": text_field(value, "reason") or "interaction_failed",
+            "failure_kind": failure_kind,
+            "reason": reason or "interaction_failed",
         }
     if value.get("skipped") is True:
         return {

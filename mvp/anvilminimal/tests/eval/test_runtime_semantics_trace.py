@@ -134,19 +134,114 @@ class RuntimeSemanticsTraceTest(unittest.TestCase):
         self.assertNotIn("sk-testsecret123456", manifest)
 
     def test_compare_reports_returns_stage_and_gate_diff(self):
+        rows = [
+            {
+                "suite": "s",
+                "scenario": "case",
+                "mode": "minimal-loop",
+                "provider_model_pair": "openai:gpt planner=gemini:flash",
+            }
+        ]
         source = {
             "trace_id": "source",
+            "manifest_rows": rows,
             "stage_counts": {"plan_generated": 1, "verify_started": 1},
             "gate_counts": {"G-S03": 1, "G-S08": 1},
         }
         mvp = {
             "trace_id": "mvp",
+            "manifest_rows": rows,
             "stage_counts": {"plan_generated": 1},
             "gate_counts": {"G-S03": 1},
         }
         diff = compare_trace_reports(source, mvp)
         self.assertEqual(diff["missing_stages_in_mvp"], ["verify_started"])
         self.assertEqual(diff["missing_gate_ids_in_mvp"], ["G-S08"])
+        self.assertEqual(diff["partial_gate_ids"], [])
+        by_gate = {item["gate_id"]: item for item in diff["gate_results"]}
+        self.assertEqual(by_gate["G-S03"]["status"], "pass")
+        self.assertEqual(by_gate["G-S08"]["reason"], "missing_gate_in_mvp_trace")
+
+    def test_compare_reports_resolves_all_gates_without_partial(self):
+        rows = [
+            {
+                "suite": "s",
+                "scenario": "case",
+                "mode": "minimal-loop",
+                "provider_model_pair": "openai:gpt planner=gemini:flash",
+            }
+        ]
+        source = {
+            "trace_id": "source",
+            "normalized_event_count": 2,
+            "manifest_rows": rows,
+            "stage_counts": {"plan_generated": 1, "verify_started": 1},
+            "gate_counts": {"G-S03": 1, "G-S08": 1},
+        }
+        mvp = {
+            "trace_id": "mvp",
+            "normalized_event_count": 1,
+            "manifest_rows": rows,
+            "stage_counts": {"plan_generated": 1},
+            "gate_counts": {"G-S03": 1},
+        }
+        diff = compare_trace_reports(source, mvp)
+        self.assertEqual(diff["status"], "compared")
+        self.assertEqual(diff["passed_gate_ids"], ["G-S03"])
+        self.assertIn("G-S08", diff["failed_gate_ids"])
+        self.assertEqual(diff["partial_gate_ids"], [])
+        statuses = {item["status"] for item in diff["gate_results"]}
+        self.assertLessEqual(statuses, {"pass", "fail", "intentionally_different"})
+
+    def test_compare_reports_fails_same_condition_mismatch(self):
+        source = {
+            "trace_id": "source",
+            "normalized_event_count": 1,
+            "manifest_rows": [
+                {
+                    "suite": "s",
+                    "scenario": "case-a",
+                    "mode": "minimal-loop",
+                    "provider_model_pair": "openai:gpt planner=gemini:flash",
+                }
+            ],
+            "stage_counts": {"plan_generated": 1},
+            "gate_counts": {"G-S03": 1},
+        }
+        mvp = {
+            "trace_id": "mvp",
+            "normalized_event_count": 1,
+            "manifest_rows": [
+                {
+                    "suite": "s",
+                    "scenario": "case-b",
+                    "mode": "minimal-loop",
+                    "provider_model_pair": "openai:gpt planner=gemini:flash",
+                }
+            ],
+            "stage_counts": {"plan_generated": 1},
+            "gate_counts": {"G-S03": 1},
+        }
+        diff = compare_trace_reports(source, mvp)
+        self.assertEqual(diff["status"], "same_condition_mismatch")
+        self.assertTrue(all(item["status"] == "fail" for item in diff["gate_results"]))
+
+    def test_compare_reports_fails_when_same_condition_signature_missing(self):
+        source = {
+            "trace_id": "source",
+            "normalized_event_count": 1,
+            "stage_counts": {"plan_generated": 1},
+            "gate_counts": {"G-S03": 1},
+        }
+        mvp = {
+            "trace_id": "mvp",
+            "normalized_event_count": 1,
+            "stage_counts": {"plan_generated": 1},
+            "gate_counts": {"G-S03": 1},
+        }
+        diff = compare_trace_reports(source, mvp)
+        self.assertEqual(diff["status"], "same_condition_unknown")
+        self.assertTrue(all(item["status"] == "fail" for item in diff["gate_results"]))
 
 
 if __name__ == "__main__":

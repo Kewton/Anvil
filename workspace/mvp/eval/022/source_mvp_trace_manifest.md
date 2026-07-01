@@ -17,10 +17,28 @@
 
 | trace_id | subject | run_root | summary | suite | modes | result | known gaps |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| `mvp-0229-net-timeout` | MVP anvilminimal | `/private/tmp/anvilminimal-eval-0229-mvp-net-timeout` | `/private/tmp/anvilminimal-eval-0229-mvp-net-timeout/summary.eval.tsv` | `mvp-smoke` | all 4 modes | 36/48 success | release browser evidence failed; G-S12 downgraded by browser/interaction content |
 | `mvp-0219-smoke` | MVP anvilminimal | `/private/tmp/anvilminimal-eval-0219-mvp-smoke` | `/private/tmp/anvilminimal-eval-0219-mvp-smoke/summary.eval.tsv` | `mvp-smoke` | all 4 modes | 38/48 success | `failure_kind` blank 10 rows, source same-condition comparison missing |
 | `mvp-0219-provider-smoke` | MVP anvilminimal | `/private/tmp/anvilminimal-eval-0219-provider-smoke` | `/private/tmp/anvilminimal-eval-0219-provider-smoke/summary.eval.tsv` | `mvp-provider-smoke` | all 4 modes | 19/24 success | `failure_kind` blank 5 rows, provider drift still planning-visible |
 
 ### Current MVP Summary
+
+`mvp-0229-net-timeout`:
+
+| Mode | Success |
+| --- | ---: |
+| minimal-loop | 9/12 |
+| step-plan | 12/12 |
+| plan-run | 9/12 |
+| ultra-plan-run | 6/12 |
+
+Failure layer:
+
+| Layer | Count |
+| --- | ---: |
+| runtime | 4 |
+| bridge | 5 |
+| planning | 3 |
 
 `mvp-0219-smoke`:
 
@@ -63,11 +81,12 @@ Failure layer:
 
 ## 4. Source Trace Status
 
-現時点で、0219 の MVP run と同条件の最新 `anvildev --engine minimal` trace はこの manifest には未登録である。したがって、G-S01〜G-S16 のうち source trace を必須とする gate は `partial` 以下とする。
+REC-007 で、0229 の MVP run と同条件の `anvildev --engine minimal` trace を登録した。
+source trace が観測していない gate は code reference だけでは pass にせず、normalized diff で `fail` とする。
 
 | trace_id | subject | status | note |
 | --- | --- | --- | --- |
-| `source-current-same-condition` | source anvildev | missing | 同一 suite / provider profile / modes / run count の最新 trace が必要 |
+| `source-0229-net-timeout` | source anvildev | registered | `/private/tmp/anvilminimal-eval-0229-anvildev-net-timeout/runtime-semantics-trace-report.json` |
 | `source-code-reference` | source anvildev | partial | source code references は確認済みだが、trace 証跡ではない |
 
 ## 4.1 Trace Writer Status
@@ -81,7 +100,7 @@ Failure layer:
 | `runtime-semantics-normalized-events.jsonl` | raw event を normalized lifecycle stage / gate ids へ写像した JSONL |
 | `runtime-semantics-trace-report.json` | subject、binary kind、stage counts、gate counts、silent exit count、known gaps |
 | `runtime-semantics-trace-manifest.md` | 再実行可能な redacted command と run ごとの trace 状態 |
-| `runtime-semantics-trace-diff.json` | source/MVP trace report の stage/gate 差分 |
+| `runtime-semantics-trace-diff.json` | source/MVP trace report の stage/gate 差分。REC-007 では `workspace/mvp/eval/022/runtime-semantics-trace-diff.json` に保存 |
 
 redaction:
 
@@ -91,8 +110,10 @@ redaction:
 
 gate への影響:
 
-- G-S05/G-S06/G-S14/G-S16 は normalized trace writer の実装により evidence を追加できる状態になった。
-- ただし source same-condition trace と manual TUI trace が未登録のため、該当 gate は `partial` のままとする。
+- G-S02/G-S03/G-S08/G-S14 は source/MVP trace の両方に観測され `pass`。
+- G-S01/G-S04/G-S05/G-S06/G-S07/G-S09/G-S10/G-S11/G-S13/G-S15 は source trace 側の normalized gate 未観測により `fail`。
+- G-S12 は trace 上は観測されたが、browser readiness HTTP 500 と interaction canvas unavailable により release gate では `fail`。
+- G-S16 は normalized trace 未観測かつ manual TUI evidence が `tui_command_failed` のため `fail`。
 
 ## 5. Source Code References Used For Trace Planning
 
@@ -130,10 +151,10 @@ gate への影響:
 
 | Gap | Impact | Gate ids |
 | --- | --- | --- |
-| latest same-condition `anvildev` trace missing | source parity cannot be pass | G-S01〜G-S16 |
-| manual TUI UAT trace missing for latest state | TUI observability cannot pass | G-S16 |
-| browser readiness / interaction evidence missing | release gate cannot pass | G-S12 |
-| latest trace diff not attached for source/MVP same-condition run | comparative gate cannot pass | G-S01〜G-S16 |
+| source trace lacks normalized lifecycle gates for request/phase/tool/dependency/repair/scaffold/recovery/provider | code reference only cannot pass these gates | G-S01, G-S04, G-S05, G-S06, G-S07, G-S09, G-S10, G-S11, G-S13, G-S15 |
+| browser readiness / interaction evidence failed | release gate cannot pass | G-S12 |
+| manual TUI UAT trace failed and same-condition normalized trace lacks G-S16 | TUI observability cannot pass | G-S16 |
+| latest trace diff attached | comparative gate can resolve pass/fail without `partial` | G-S01〜G-S16 |
 
 ## 8. Required Next Trace Commands
 
