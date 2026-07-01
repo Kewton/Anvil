@@ -101,6 +101,12 @@ pub struct CompletionSnapshot {
     pub runtime_acceptance_status: String,
     pub final_acceptance_status: String,
     pub release_gate_status: String,
+    pub completion_contract_verification_enabled: bool,
+    pub completion_contract_path_merge_enabled: bool,
+    pub completion_contract_path: String,
+    pub completion_contract_generated: bool,
+    pub external_contract_checked: bool,
+    pub external_contract_ok: bool,
     pub release_gate_reasons: Vec<String>,
     pub browser_readiness_status: String,
     pub browser_readiness_evidence_path: String,
@@ -118,6 +124,12 @@ impl CompletionSnapshot {
             runtime_acceptance_status: "not_checked".to_string(),
             final_acceptance_status: "not_checked".to_string(),
             release_gate_status: "not_applicable".to_string(),
+            completion_contract_verification_enabled: false,
+            completion_contract_path_merge_enabled: false,
+            completion_contract_path: String::new(),
+            completion_contract_generated: false,
+            external_contract_checked: false,
+            external_contract_ok: false,
             release_gate_reasons: Vec::new(),
             browser_readiness_status: "not_applicable".to_string(),
             browser_readiness_evidence_path: String::new(),
@@ -146,6 +158,12 @@ pub struct CompletionProjection {
     pub runtime_acceptance: String,
     pub final_acceptance: String,
     pub release_gate: String,
+    pub completion_contract_verification_enabled: bool,
+    pub completion_contract_path_merge_enabled: bool,
+    pub completion_contract_path: String,
+    pub completion_contract_generated: bool,
+    pub external_contract_checked: bool,
+    pub external_contract_ok: bool,
     pub release_gate_reasons: Vec<String>,
     pub browser_readiness: String,
     pub browser_readiness_evidence_path: String,
@@ -199,6 +217,12 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         runtime_acceptance,
         final_acceptance,
         release_gate,
+        completion_contract_verification_enabled: snapshot.completion_contract_verification_enabled,
+        completion_contract_path_merge_enabled: snapshot.completion_contract_path_merge_enabled,
+        completion_contract_path: snapshot.completion_contract_path.clone(),
+        completion_contract_generated: snapshot.completion_contract_generated,
+        external_contract_checked: snapshot.external_contract_checked,
+        external_contract_ok: snapshot.external_contract_ok,
         release_gate_reasons: snapshot.release_gate_reasons.clone(),
         browser_readiness: snapshot.browser_readiness_status.clone(),
         browser_readiness_evidence_path: snapshot.browser_readiness_evidence_path.clone(),
@@ -243,12 +267,14 @@ pub fn render_tui_completion_output(output: &str, projection: &CompletionProject
         return output.to_string();
     }
     let mut output = format!(
-        "{}\n\nCommand completion: {}\nRuntime acceptance: {}\nFinal acceptance: {}\nRelease gate: {}\nNext action: {}",
+        "{}\n\nCommand completion: {}\nRuntime acceptance: {}\nFinal acceptance: {}\nRelease gate: {}\ncompletion_contract_verification_enabled={}\nexternal_contract_checked={}\nNext action: {}",
         output,
         projection.command_completion,
         projection.runtime_acceptance,
         projection.final_acceptance,
         projection.release_gate,
+        projection.completion_contract_verification_enabled,
+        projection.external_contract_checked,
         projection.next_action
     );
     if !projection.recovery_ultra_plan_path.is_empty()
@@ -301,6 +327,31 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_str)
             .unwrap_or("not_applicable")
             .to_string(),
+        completion_contract_verification_enabled: event
+            .get("completion_contract_verification_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        completion_contract_path_merge_enabled: event
+            .get("completion_contract_path_merge_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        completion_contract_path: event
+            .get("completion_contract_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        completion_contract_generated: event
+            .get("completion_contract_generated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        external_contract_checked: event
+            .get("external_contract_checked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        external_contract_ok: event
+            .get("external_contract_ok")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         release_gate_reasons: event
             .get("release_gate_reasons")
             .and_then(Value::as_array)
@@ -442,6 +493,27 @@ fn render_completion_summary(
         format!("Runtime acceptance: {}", projection.runtime_acceptance),
         format!("Final acceptance: {}", projection.final_acceptance),
         format!("Release gate: {}", projection.release_gate),
+        format!(
+            "completion_contract_verification_enabled={}",
+            projection.completion_contract_verification_enabled
+        ),
+        format!(
+            "completion_contract_path_merge_enabled={}",
+            projection.completion_contract_path_merge_enabled
+        ),
+        format!(
+            "completion_contract_path={}",
+            missing_if_empty(&projection.completion_contract_path)
+        ),
+        format!(
+            "completion_contract_generated={}",
+            projection.completion_contract_generated
+        ),
+        format!(
+            "external_contract_checked={}",
+            projection.external_contract_checked
+        ),
+        format!("external_contract_ok={}", projection.external_contract_ok),
         format!(
             "Release quality completion: {}",
             projection.release_quality_completion
@@ -701,5 +773,43 @@ mod tests {
         assert!(summary.contains("---\n\nTUI command failed: phase failed"));
         assert!(summary.contains("<redacted>"));
         assert!(!summary.contains("sk-test"));
+    }
+
+    #[test]
+    fn completion_projection_renders_contract_binding_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "partial",
+                "release_gate_status": "partial",
+                "completion_contract_verification_enabled": true,
+                "completion_contract_path_merge_enabled": true,
+                "completion_contract_path": ".anvil/runs/test/completion-contract-ultra-plan-run.json",
+                "completion_contract_generated": true,
+                "external_contract_checked": true,
+                "external_contract_ok": true,
+            }),
+        );
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(true, &snapshot);
+        let tui = render_tui_completion_output("done", &projection);
+        assert!(tui.contains("completion_contract_verification_enabled=true"));
+        assert!(tui.contains("external_contract_checked=true"));
+        let summary = render_completion_summary(
+            "tui_command",
+            None,
+            Some("/ultra-plan-run"),
+            "completed",
+            "",
+            &projection,
+        );
+        assert!(summary.contains("completion_contract_verification_enabled=true"));
+        assert!(summary.contains("completion_contract_path_merge_enabled=true"));
+        assert!(summary.contains("external_contract_checked=true"));
+        assert!(summary.contains("external_contract_ok=true"));
     }
 }

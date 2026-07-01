@@ -90,7 +90,7 @@ G10 は横断 gap として扱う。runtime summary の比較可能性は RECOVE
 | G02 | P0 | `new_release_gate_gap` | browser readiness を通常 final acceptance で実行・取得していない | partial |
 | G03 | P0 | `acceptance_bridge_gap` | browser/dev route failure が repair target / recovery UltraPlan に接続されない | partial |
 | G04 | P0 | `semantic_drift` | Next.js/Tailwind dev pipeline が build verifier lifecycle に含まれていない | partial |
-| G05 | P1 | `acceptance_bridge_gap` | static capability evidence が interactive behavior を過大評価する | open |
+| G05 | P1 | `acceptance_bridge_gap` | static capability evidence が interactive behavior を過大評価する | partial |
 | G06 | P1 | `semantic_drift` | verifier command policy と runtime Bash policy が一致しない | open |
 | G07 | P1 | `diagnostic_gap` | TUI/summary が partial artifact を完成品に見せる | partial |
 | G08 | P1 | `migration_missing` | source の repair handoff semantics が release gate partial/fail に横展開されていない | partial |
@@ -98,8 +98,8 @@ G10 は横断 gap として扱う。runtime summary の比較可能性は RECOVE
 | G10 | P2 | `acceptance_bridge_gap` | source/MVP 比較が aggregate success に寄り、completion authority 差分を見落とす | partial |
 | G11 | P0 | `new_release_gate_gap` | browser readiness の dev server lifecycle が controller にない | partial |
 | G12 | P1 | `diagnostic_gap` | planner verify normalization / quality warning が不安定性として gate に残らない | open |
-| G13 | P0 | `acceptance_bridge_gap` | CompletionContract / external contract が通常 TUI ultra-run に bind されていない | open |
-| G14 | P2 | `semantic_drift` | step kind の role authority が弱く、setup/verify/report と implementation の責務境界が曖昧 | open |
+| G13 | P0 | `acceptance_bridge_gap` | CompletionContract / external contract が通常 TUI ultra-run に bind されていない | partial |
+| G14 | P2 | `semantic_drift` | step kind の role authority が弱く、setup/verify/report と implementation の責務境界が曖昧 | partial |
 
 ---
 
@@ -331,7 +331,7 @@ Next.js の production build と dev server route の差を acceptance に組み
 | --- | --- |
 | priority | P1 |
 | category | `acceptance_bridge_gap` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 
@@ -369,6 +369,21 @@ keyword/static evidence を completion authority として扱っており、inte
 - interactive game task では、state transition evidence、input-to-state-change evidence、challenge progression evidence、failure/win condition evidence を要求する。
 - browser/interaction evidence がない場合は full pass にしない。
 - static source evidence は `partial` までで、release-grade pass は browser/interaction evidence を必要とする。
+
+### RECOVERY-002-D status / evidence
+
+- status: `partial`
+- implemented:
+  - `mvp/anvilminimal/src/minimal_loop/evidence.rs` の `failure_or_collision_evidence` を lexical token だけでは満たさず、`setGameState("gameover")` 等の failure transition または `setLives` / `setHealth` 等の damage mutation を要求するように変更。
+  - `restart_or_recoverable_state_evidence` も start/restart/reset token に加えて、実際の state transition / reset function / dispatch と user input handler を要求するように変更。
+  - `capability_evidence_bindings` から scaffold path fallback を外し、static/scaffold evidence を implementation capability binding として扱わないように変更。
+- automated evidence:
+  - `cargo test --manifest-path mvp/anvilminimal/Cargo.toml minimal_loop::evidence::tests::unreachable_game_state_literals_do_not_satisfy_release_grade_game_evidence`
+  - `cargo test --manifest-path mvp/anvilminimal/Cargo.toml minimal_loop::evidence::tests::interactive_game_source_satisfies_generic_capability_evidence`
+  - `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`
+  - `pytest mvp/anvilminimal/tests/eval`
+- residual risk:
+  - browser/interaction evidence による release-grade full pass の最終確認は G02/G11 と RECOVERY-002-F の comparative release evidence で継続確認する。
 
 ---
 
@@ -739,7 +754,7 @@ planner output quality と runtime success を分ける設計は入ったが、p
 | --- | --- |
 | priority | P0 |
 | category | `acceptance_bridge_gap` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 
@@ -777,6 +792,23 @@ contract を「評価指標・prompt 補助」として扱い、通常実行の 
 - `external_contract_checked=false` のまま final full pass にならない。
 - contract paths/capabilities/evidence が plan/phase/step/final acceptance へ同一 run-id で紐づく。
 
+### RECOVERY-002-D status / evidence
+
+- status: `partial`
+- implemented:
+  - `mvp/anvilminimal/src/planner/runner.rs` に `completion_contract_bound` lifecycle を追加し、明示 `CompletionContract` がない interactive app/game では run dir に `completion-contract-<scope>.json` を生成・保存して plan-run / ultra-plan-run final acceptance に bind する。
+  - `plan_final_contract` / `ultra_final_acceptance` events に `completion_contract_verification_enabled`、`completion_contract_path_merge_enabled`、`completion_contract_path`、`completion_contract_generated`、`external_contract_checked`、`external_contract_required`、`external_contract_ok` を追加。
+  - `mvp/anvilminimal/src/eval_events.rs` と `mvp/anvilminimal/src/tui/slash.rs` に contract fields を projection / TUI stop / summary 出力へ接続し、`completion_contract_verification_enabled=true` と `external_contract_checked=true` を TUI/summary で確認可能にした。
+  - `mvp/anvilminimal/src/minimal_loop/completion.rs` の `CompletionContract` / `DeferredVerifyRequirement` を `Serialize` 可能にし、生成 contract の保存に対応。
+- automated evidence:
+  - `cargo test --manifest-path mvp/anvilminimal/Cargo.toml planner::runner::tests::ultra_final_acceptance_binds_generated_completion_contract`
+  - `cargo test --manifest-path mvp/anvilminimal/Cargo.toml eval_events::tests::completion_projection_renders_contract_binding_state`
+  - `cargo test --manifest-path mvp/anvilminimal/Cargo.toml planner::runner::tests::plan_run_nextjs_game_scaffold_only_fails_inferred_capabilities`
+  - `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`
+  - `pytest mvp/anvilminimal/tests/eval`
+- residual risk:
+  - step-level `step_obligation_scope` は deliberate に `plan-run-step` side effect を無効化したまま維持する。通常 run の authoritative check は run/final acceptance level の `completion_contract_bound` / final contract event で確認する。
+
 ---
 
 ## G14: step kind の role authority が弱く、setup/verify/report と implementation の責務境界が曖昧
@@ -785,7 +817,7 @@ contract を「評価指標・prompt 補助」として扱い、通常実行の 
 | --- | --- |
 | priority | P2 |
 | category | `semantic_drift` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 
@@ -823,6 +855,21 @@ TaskContract-lite の role を小さく保つ方針は妥当だが、role を「
 - implementation role の artifact と capability evidence の対応が必要になる。
 - expected path ownership warning は role authority と合わせて評価される。
 - role authority の不足は planner_quality_warning ではなく acceptance/contract issue として集計される。
+
+### RECOVERY-002-D status / evidence
+
+- status: `partial`
+- implemented:
+  - `mvp/anvilminimal/src/minimal_loop/evidence.rs` の artifact role authority を維持し、setup/scaffold/style/verification/acceptance_evidence は `satisfies_implementation=false` として implementation obligation を直接満たさない。
+  - capability binding の scaffold fallback を削除し、scaffold path が implementation capability の bind target に見えないようにした。
+  - verification artifact と report artifact だけでは `implementation_artifact` / `implementation` obligation を満たせない fixture を追加。
+- automated evidence:
+  - `cargo test --manifest-path mvp/anvilminimal/Cargo.toml minimal_loop::evidence::tests::verification_and_report_artifacts_do_not_satisfy_implementation_obligation`
+  - `cargo test --manifest-path mvp/anvilminimal/Cargo.toml planner::runner::tests::plan_run_nextjs_game_scaffold_only_fails_inferred_capabilities`
+  - `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`
+  - `pytest mvp/anvilminimal/tests/eval`
+- residual risk:
+  - expected path ownership warning と planner quality warning の集計連動は G12 側で継続管理する。
 
 ## Cross-Cutting Root Cause
 

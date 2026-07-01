@@ -89,6 +89,14 @@ impl ReleaseRecoveryHandoffSummary {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BoundCompletionContract {
+    contract: CompletionContract,
+    path: String,
+    generated: bool,
+    required: bool,
+}
+
 impl RecoveryArtifactValidation {
     fn prompt_command_available(&self) -> bool {
         self.prompt_exists && self.prompt_parse_ok
@@ -679,11 +687,24 @@ fn run_step_plan_with_session_with_ui(
         ));
     }
     let required_final_artifacts = required_final_artifacts(plan, &config.workspace_root);
-    let external_contract = CompletionContract::load_for_config(config)
-        .map_err(|err| StepPlanRunError::from_error(err.to_string(), outcome.clone()))?;
     let mut final_required_capabilities =
         inferred_required_capabilities(&config.profile, &plan.goal);
-    if let Some(contract) = external_contract.as_ref() {
+    let final_required_obligations =
+        inferred_required_obligations(&config.profile, &plan.goal, &final_required_capabilities);
+    let initial_required_evidence =
+        inferred_required_evidence(&config.profile, &plan.goal, &final_required_capabilities);
+    let bound_contract = bind_completion_contract_for_acceptance(
+        config,
+        "plan-run",
+        &config.profile,
+        &plan.goal,
+        &required_final_artifacts,
+        &final_required_capabilities,
+        &initial_required_evidence,
+        &final_required_obligations,
+    )
+    .map_err(|err| StepPlanRunError::from_error(err.to_string(), outcome.clone()))?;
+    if let Some(contract) = bound_contract.as_ref().map(|bound| &bound.contract) {
         merge_unique_strings(
             &mut final_required_capabilities,
             &contract.required_capabilities,
@@ -691,7 +712,11 @@ fn run_step_plan_with_session_with_ui(
     }
     let mut final_required_evidence =
         inferred_required_evidence(&config.profile, &plan.goal, &final_required_capabilities);
-    if let Some(contract) = external_contract.as_ref() {
+    if let Some(contract) = bound_contract.as_ref().map(|bound| &bound.contract) {
+        merge_unique_strings(
+            &mut final_required_capabilities,
+            &contract.required_capabilities,
+        );
         merge_unique_strings(&mut final_required_evidence, &contract.required_evidence);
     }
     let mut prior_expected_paths = Vec::new();
@@ -727,7 +752,12 @@ fn run_step_plan_with_session_with_ui(
         merge_unique_strings(&mut prior_expected_paths, &step.expected_paths);
     }
     if verify_final_contract {
-        if let Err(err) = verify_plan_final_contract(plan, &required_final_artifacts, config) {
+        if let Err(err) = verify_plan_final_contract(
+            plan,
+            &required_final_artifacts,
+            config,
+            bound_contract.as_ref(),
+        ) {
             return Err(StepPlanRunError::from_error(err.to_string(), outcome));
         }
     }
@@ -1261,21 +1291,188 @@ fn required_final_artifacts(plan: &StepPlan, root: &Path) -> Vec<String> {
     out
 }
 
+fn bind_completion_contract_for_acceptance(
+    config: &Config,
+    scope: &str,
+    profile: &str,
+    goal: &str,
+    required_paths: &[String],
+    required_capabilities: &[String],
+    required_evidence: &[String],
+    required_obligations: &[String],
+) -> anyhow::Result<Option<BoundCompletionContract>> {
+    let required = completion_contract_required(profile, goal, required_capabilities);
+    if let Some(contract) = CompletionContract::load_for_config(config)? {
+        let path = explicit_completion_contract_path(config)
+            .map(|path| display_path_for_event(&config.workspace_root, &path))
+            .unwrap_or_else(|| "<inline-config>".to_string());
+        let bound = BoundCompletionContract {
+            contract,
+            path,
+            generated: false,
+            required,
+        };
+        emit_completion_contract_bound(config, scope, &bound);
+        return Ok(Some(bound));
+    }
+    if !required {
+        return Ok(None);
+    }
+    let contract = CompletionContract {
+        required_paths: required_paths.to_vec(),
+        verify_commands: Vec::new(),
+        profile: None,
+        goal: Some(goal.to_string()),
+        required_capabilities: required_capabilities.to_vec(),
+        deterministic_oracles: Vec::new(),
+        required_evidence: required_evidence.to_vec(),
+        required_obligations: required_obligations.to_vec(),
+        deferred_verify_requirements: Vec::new(),
+        verify_repair_cap: 2,
+    }
+    .validate(&config.workspace_root)?;
+    let path = generated_completion_contract_path(config, scope);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(&contract)?;
+    std::fs::write(&path, format!("{text}\n"))?;
+    let bound = BoundCompletionContract {
+        contract,
+        path: display_path_for_event(&config.workspace_root, &path),
+        generated: true,
+        required,
+    };
+    emit_completion_contract_bound(config, scope, &bound);
+    Ok(Some(bound))
+}
+
+fn completion_contract_required(
+    profile: &str,
+    goal: &str,
+    required_capabilities: &[String],
+) -> bool {
+    let profile = profile.to_ascii_lowercase();
+    let goal = goal.to_ascii_lowercase();
+    let web_or_app_profile = matches!(
+        profile.as_str(),
+        "nextjs" | "next-js" | "next.js" | "vite" | "react" | "web"
+    ) || profile.contains("next");
+    let interactive_goal = [
+        "interactive",
+        "app",
+        "game",
+        "playable",
+        "browser",
+        "canvas",
+        "keyboard",
+        "player",
+        "enemy",
+        "collision",
+        "ゲーム",
+    ]
+    .iter()
+    .any(|needle| goal.contains(needle));
+    let interactive_capability = required_capabilities.iter().any(|capability| {
+        matches!(
+            capability.as_str(),
+            "stateful_interaction"
+                | "start_or_restart_flow"
+                | "player_control"
+                | "adversary_or_challenge"
+                | "progression_or_score"
+                | "failure_or_collision_rule"
+                | "browser_interaction"
+                | "playable_ui"
+        )
+    });
+    interactive_capability || (web_or_app_profile && interactive_goal)
+}
+
+fn explicit_completion_contract_path(config: &Config) -> Option<PathBuf> {
+    config
+        .completion_contract_path
+        .clone()
+        .or_else(|| std::env::var_os("ANVIL_COMPLETION_CONTRACT").map(PathBuf::from))
+}
+
+fn generated_completion_contract_path(config: &Config, scope: &str) -> PathBuf {
+    let filename = format!(
+        "completion-contract-{}.json",
+        scope
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+            .collect::<String>()
+    );
+    if let Some(parent) = config
+        .eval_events_path
+        .as_ref()
+        .and_then(|path| path.parent())
+    {
+        return parent.join(filename);
+    }
+    config.workspace_root.join(".anvil").join(filename)
+}
+
+fn display_path_for_event(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn emit_completion_contract_bound(config: &Config, scope: &str, bound: &BoundCompletionContract) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "completion_contract_bound",
+            "session_scope": scope,
+            "completion_contract_verification_enabled": true,
+            "completion_contract_path_merge_enabled": true,
+            "external_contract_checked": true,
+            "external_contract_required": bound.required,
+            "completion_contract_generated": bound.generated,
+            "completion_contract_path": bound.path,
+            "required_paths": bound.contract.required_paths.clone(),
+            "required_capabilities": bound.contract.required_capabilities.clone(),
+            "required_evidence": bound.contract.required_evidence.clone(),
+            "required_obligations": bound.contract.required_obligations.clone(),
+        }),
+    );
+}
+
 fn verify_plan_final_contract(
     plan: &StepPlan,
     required_final_artifacts: &[String],
     config: &Config,
+    bound_contract: Option<&BoundCompletionContract>,
 ) -> anyhow::Result<()> {
-    let external_contract = CompletionContract::load_for_config(config)?;
     let mut required_paths = required_final_artifacts.to_vec();
     let mut required_capabilities = inferred_required_capabilities(&config.profile, &plan.goal);
     let mut required_evidence =
         inferred_required_evidence(&config.profile, &plan.goal, &required_capabilities);
     let mut required_obligations =
         inferred_required_obligations(&config.profile, &plan.goal, &required_capabilities);
+    let owned_bound_contract;
+    let bound_contract = if let Some(bound_contract) = bound_contract {
+        Some(bound_contract)
+    } else {
+        owned_bound_contract = bind_completion_contract_for_acceptance(
+            config,
+            "plan-run",
+            &config.profile,
+            &plan.goal,
+            &required_paths,
+            &required_capabilities,
+            &required_evidence,
+            &required_obligations,
+        )?;
+        owned_bound_contract.as_ref()
+    };
     let mut verify_commands = Vec::new();
     let mut deferred_commands = Vec::new();
-    if let Some(contract) = external_contract.as_ref() {
+    if let Some(bound) = bound_contract {
+        let contract = &bound.contract;
         merge_unique_strings(&mut required_paths, &contract.required_paths);
         merge_unique_strings(&mut required_capabilities, &contract.required_capabilities);
         merge_unique_strings(&mut required_evidence, &contract.required_evidence);
@@ -1293,9 +1490,11 @@ fn verify_plan_final_contract(
         &inferred_required_evidence(&config.profile, &plan.goal, &required_capabilities),
     );
     let missing_final_artifacts = missing_final_artifacts(&config.workspace_root, &required_paths);
-    let external_report = external_contract
-        .as_ref()
-        .map(|contract| contract.verify_with_goal(&config.workspace_root, &plan.goal));
+    let external_report = bound_contract.map(|bound| {
+        bound
+            .contract
+            .verify_with_goal(&config.workspace_root, &plan.goal)
+    });
     let runtime_acceptance_required = !required_capabilities.is_empty()
         || !required_evidence.is_empty()
         || !required_obligations.is_empty();
@@ -1318,9 +1517,15 @@ fn verify_plan_final_contract(
         &required_capabilities,
         runtime_acceptance.as_ref(),
     );
-    let external_ok = external_report
-        .as_ref()
-        .is_none_or(|report| report.is_pass());
+    let contract_required =
+        completion_contract_required(&config.profile, &plan.goal, &required_capabilities)
+            || bound_contract.is_some_and(|bound| bound.required);
+    let external_contract_checked = bound_contract.is_some();
+    let contract_binding_missing = contract_required && !external_contract_checked;
+    let external_ok = !contract_binding_missing
+        && external_report
+            .as_ref()
+            .is_none_or(|report| report.is_pass());
     let runtime_ok = runtime_acceptance
         .as_ref()
         .is_none_or(|report| report.passed);
@@ -1338,6 +1543,8 @@ fn verify_plan_final_contract(
             "missing final artifacts: {}",
             missing_final_artifacts.join(", ")
         )
+    } else if contract_binding_missing {
+        "completion contract binding required but missing".to_string()
     } else if let Some(report) = runtime_acceptance.as_ref().filter(|report| !report.passed) {
         report.primary_reason.clone()
     } else if let Some(report) = external_report.as_ref().filter(|report| !report.is_pass()) {
@@ -1381,7 +1588,16 @@ fn verify_plan_final_contract(
             "event": "plan_final_contract",
             "required_final_artifacts": required_paths,
             "missing_final_artifacts": missing_final_artifacts,
-            "external_contract_checked": external_contract.is_some(),
+            "completion_contract_verification_enabled": external_contract_checked,
+            "completion_contract_path_merge_enabled": external_contract_checked,
+            "completion_contract_path": bound_contract
+                .map(|bound| bound.path.clone())
+                .unwrap_or_default(),
+            "completion_contract_generated": bound_contract
+                .map(|bound| bound.generated)
+                .unwrap_or(false),
+            "external_contract_checked": external_contract_checked,
+            "external_contract_required": contract_required,
             "external_contract_ok": external_ok,
             "required_capabilities": required_capabilities,
             "required_evidence": required_evidence,
@@ -2594,7 +2810,6 @@ fn ultra_final_acceptance_report(
     plan: &UltraPlan,
     config: &Config,
 ) -> anyhow::Result<VerificationReport> {
-    let external_contract = CompletionContract::load_for_config(config)?;
     let mut required_paths =
         profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
     let mut required_capabilities = inferred_required_capabilities(&plan.profile, &plan.goal);
@@ -2602,9 +2817,19 @@ fn ultra_final_acceptance_report(
         inferred_required_obligations(&plan.profile, &plan.goal, &required_capabilities);
     let mut required_evidence =
         inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities);
+    let bound_contract = bind_completion_contract_for_acceptance(
+        config,
+        "ultra-plan-run",
+        &plan.profile,
+        &plan.goal,
+        &required_paths,
+        &required_capabilities,
+        &required_evidence,
+        &required_obligations,
+    )?;
     let mut deferred_commands = Vec::new();
     let mut verify_commands = Vec::new();
-    if let Some(contract) = external_contract.as_ref() {
+    if let Some(contract) = bound_contract.as_ref().map(|bound| &bound.contract) {
         merge_unique_strings(&mut required_paths, &contract.required_paths);
         merge_unique_strings(&mut required_capabilities, &contract.required_capabilities);
         merge_unique_strings(&mut required_evidence, &contract.required_evidence);
@@ -2632,6 +2857,20 @@ fn ultra_final_acceptance_report(
         &deferred_commands,
         &release_evidence_extra_dirs(config),
     );
+    let external_report = bound_contract.as_ref().map(|bound| {
+        bound
+            .contract
+            .verify_with_goal(&config.workspace_root, &plan.goal)
+    });
+    let contract_required =
+        completion_contract_required(&plan.profile, &plan.goal, &required_capabilities)
+            || bound_contract.as_ref().is_some_and(|bound| bound.required);
+    let external_contract_checked = bound_contract.is_some();
+    let contract_binding_missing = contract_required && !external_contract_checked;
+    let external_ok = !contract_binding_missing
+        && external_report
+            .as_ref()
+            .is_none_or(|report| report.is_pass());
     let release_gate = final_acceptance_release_gate(
         config,
         &plan.profile,
@@ -2646,14 +2885,19 @@ fn ultra_final_acceptance_report(
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
     let primary_reason = if !missing.is_empty() {
         format!("missing final artifacts: {}", missing.join(", "))
+    } else if contract_binding_missing {
+        "completion contract binding required but missing".to_string()
     } else if !acceptance.passed {
         acceptance.primary_reason.clone()
+    } else if let Some(report) = external_report.as_ref().filter(|report| !report.is_pass()) {
+        report.primary_reason()
     } else if matches!(release_gate.status.as_str(), "partial" | "failed") {
         release_gate.reasons.join("; ")
     } else {
         acceptance.primary_reason.clone()
     };
     let recovery_handoff = if acceptance.passed
+        && external_ok
         && (matches!(release_gate.status.as_str(), "partial" | "failed")
             || final_acceptance_status == "partial")
     {
@@ -2689,6 +2933,19 @@ fn ultra_final_acceptance_report(
             "event": "ultra_final_acceptance",
             "required_paths": required_paths.clone(),
             "missing_paths": missing.clone(),
+            "completion_contract_verification_enabled": external_contract_checked,
+            "completion_contract_path_merge_enabled": external_contract_checked,
+            "completion_contract_path": bound_contract
+                .as_ref()
+                .map(|bound| bound.path.clone())
+                .unwrap_or_default(),
+            "completion_contract_generated": bound_contract
+                .as_ref()
+                .map(|bound| bound.generated)
+                .unwrap_or(false),
+            "external_contract_checked": external_contract_checked,
+            "external_contract_required": contract_required,
+            "external_contract_ok": external_ok,
             "required_capabilities": required_capabilities.clone(),
             "required_evidence": required_evidence.clone(),
             "required_obligations": required_obligations.clone(),
@@ -2755,6 +3012,15 @@ fn ultra_final_acceptance_report(
                 target.obligation, target.target_path
             ));
         }
+    }
+    if contract_binding_missing {
+        report.push_profile_failure("completion contract binding required but missing".to_string());
+    }
+    if let Some(external_report) = external_report.filter(|report| !report.is_pass()) {
+        report.push_profile_failure(format!(
+            "external contract failed: {}",
+            external_report.primary_reason()
+        ));
     }
     if release_gate.status == "failed" {
         report.push_profile_failure(format!(
@@ -7887,7 +8153,13 @@ mod tests {
         assert!(event_text.contains("\"runtime_acceptance_inconclusive\":false"));
         assert!(event_text.contains("\"missing_evidence\""));
         assert!(event_text.contains("\"capability_evidence_bindings\""));
-        assert!(event_text.contains("\"artifact_paths\":[\"src/app/page.tsx\"]"));
+        assert!(event_text.contains("\"role\":\"scaffold\""));
+        assert!(event_text.contains("\"artifact_paths\":[]"));
+        assert!(event_text.contains("\"event\":\"completion_contract_bound\""));
+        assert!(event_text.contains("\"session_scope\":\"plan-run\""));
+        assert!(event_text.contains("\"completion_contract_verification_enabled\":true"));
+        assert!(event_text.contains("\"external_contract_checked\":true"));
+        assert!(event_text.contains("\"completion_contract_generated\":true"));
         assert!(event_text.contains("\"step_prompt_contract\""));
         assert!(event_text.contains("\"has_required_final_evidence\":true"));
         assert!(event_text.contains("\"visible_interactive_surface_evidence\""));
@@ -7967,8 +8239,15 @@ export default function Page(){
       setGameState("playing");
       setScore((value) => value + 1);
     };
+    const frame = requestAnimationFrame(() => {
+      const collision = true;
+      if (collision) setGameState("gameover");
+    });
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
   }, []);
   return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button><canvas /><p>enemy bullet collision score {score} {gameState}</p></main>;
 }
@@ -8487,6 +8766,74 @@ export default function Page(){
             .to_string();
         assert!(err.contains("plan final contract failed"));
         assert!(err.contains("missing_required_evidence"));
+    }
+
+    #[test]
+    fn ultra_final_acceptance_binds_generated_completion_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"latest","react":"latest","react-dom":"latest"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  const [gameState, setGameState] = useState("ready");
+  const enemies = [{ x: 10, y: 20 }];
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") {
+        setGameState("playing");
+        setScore((value) => value + 1);
+      }
+    };
+    const frame = requestAnimationFrame(() => {
+      const collision = enemies.some((enemy) => enemy.x > 0);
+      if (collision) setGameState("gameover");
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button><canvas /><p>score {score} enemy collision {gameState}</p></main>;
+}
+"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Build an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Final acceptance".to_string(),
+            }],
+        };
+        let _report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"completion_contract_bound\""));
+        assert!(event_text.contains("\"session_scope\":\"ultra-plan-run\""));
+        assert!(event_text.contains("\"event\":\"ultra_final_acceptance\""));
+        assert!(event_text.contains("\"completion_contract_verification_enabled\":true"));
+        assert!(event_text.contains("\"external_contract_checked\":true"));
+        assert!(event_text.contains("\"completion_contract_generated\":true"));
+        assert!(
+            dir.path()
+                .join("completion-contract-ultra-plan-run.json")
+                .is_file()
+        );
     }
 
     #[test]

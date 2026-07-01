@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod cli;
 pub mod config;
 pub mod eval_events;
@@ -155,6 +157,12 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "runtime_acceptance_status": &completion.runtime_acceptance,
             "final_acceptance_status": &completion.final_acceptance,
             "release_gate_status": &completion.release_gate,
+            "completion_contract_verification_enabled": completion.completion_contract_verification_enabled,
+            "completion_contract_path_merge_enabled": completion.completion_contract_path_merge_enabled,
+            "completion_contract_path": &completion.completion_contract_path,
+            "completion_contract_generated": completion.completion_contract_generated,
+            "external_contract_checked": completion.external_contract_checked,
+            "external_contract_ok": completion.external_contract_ok,
             "release_gate_reasons": &completion.release_gate_reasons,
             "browser_readiness_status": &completion.browser_readiness,
             "browser_readiness_evidence_path": &completion.browser_readiness_evidence_path,

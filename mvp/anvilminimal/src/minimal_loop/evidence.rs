@@ -813,8 +813,6 @@ fn capability_evidence_bindings(
                         .evidence
                         .iter()
                         .any(|evidence| required_set.contains(evidence))
-                    || (artifact.role == "scaffold"
-                        && looks_like_implementation_path(&artifact.path))
             })
             .map(|artifact| artifact.path.clone())
             .collect::<BTreeSet<_>>()
@@ -1754,7 +1752,7 @@ fn source_file_has_score_or_progression(file: &SourceFile) -> bool {
 
 fn source_file_has_failure_or_collision(file: &SourceFile) -> bool {
     let lower = file.content.to_ascii_lowercase();
-    [
+    let has_failure_token = [
         "collision",
         "collide",
         "hit",
@@ -1773,7 +1771,50 @@ fn source_file_has_failure_or_collision(file: &SourceFile) -> bool {
         "当たり",
     ]
     .iter()
-    .any(|needle| lower.contains(needle))
+    .any(|needle| lower.contains(needle));
+    if !has_failure_token {
+        return false;
+    }
+    let failure_state_transition = [
+        "setgamestate(\"gameover\"",
+        "setgamestate('gameover'",
+        "setgamestate(`gameover`",
+        "setgamestate(\"game over\"",
+        "setgamestate('game over'",
+        "setgamestate(\"lost\"",
+        "setgamestate('lost'",
+        "setstatus(\"gameover\"",
+        "setstatus('gameover'",
+        "setstatus(\"lost\"",
+        "setstatus('lost'",
+        "setscreen(\"gameover\"",
+        "setscreen('gameover'",
+        "setmode(\"gameover\"",
+        "setmode('gameover'",
+        "dispatch({type:\"gameover\"",
+        "dispatch({ type: \"gameover\"",
+        "dispatch({type:'gameover'",
+        "dispatch({ type: 'gameover'",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let damage_or_life_mutation = [
+        "setlives(",
+        "setlife(",
+        "sethealth(",
+        "sethp(",
+        "lives -",
+        "life -",
+        "health -",
+        "hp -",
+        "lives--",
+        "health--",
+        "damageplayer(",
+        "takedamage(",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    failure_state_transition || damage_or_life_mutation
 }
 
 fn source_file_has_restart_or_recoverable_state(file: &SourceFile) -> bool {
@@ -1793,7 +1834,20 @@ fn source_file_has_restart_or_recoverable_state(file: &SourceFile) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle));
-    has_recoverable_state && source_file_has_user_input_handler(file)
+    let has_recoverable_transition = [
+        "setgamestate(",
+        "setstatus(",
+        "setscreen(",
+        "setmode(",
+        "dispatch(",
+        "resetgame(",
+        "restartgame(",
+        "startgame(",
+        "newgame(",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    has_recoverable_state && has_recoverable_transition && source_file_has_user_input_handler(file)
 }
 
 #[cfg(test)]
@@ -2126,6 +2180,114 @@ mod tests {
             report
                 .missing_evidence
                 .contains(&"restart_or_recoverable_state_evidence".to_string())
+        );
+    }
+
+    #[test]
+    fn unreachable_game_state_literals_do_not_satisfy_release_grade_game_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+type GameState = "playing" | "gameover" | "win";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  const [gameState, setGameState] = useState<GameState>("playing");
+  const enemies = [{ x: 10, y: 20 }];
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") setScore((value) => value + 1);
+    };
+    const frame = requestAnimationFrame(() => {
+      const collision = enemies.some((enemy) => enemy.x > 0);
+      if (collision) setScore((value) => value + 10);
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+  return <main><canvas /><p>score {score}</p><p>{gameState}</p><button>Restart</button></main>;
+}
+"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[
+                "stateful_interaction".to_string(),
+                "start_or_restart_flow".to_string(),
+                "player_control".to_string(),
+                "adversary_or_challenge".to_string(),
+                "progression_or_score".to_string(),
+                "failure_or_collision_rule".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(!report.passed);
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"failure_or_collision_evidence".to_string())
+        );
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"restart_or_recoverable_state_evidence".to_string())
+        );
+    }
+
+    #[test]
+    fn verification_and_report_artifacts_do_not_satisfy_implementation_obligation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.test.tsx"),
+            r#"import { expect, test } from "vitest";
+test("documents intended gameplay", () => {
+  const page = "canvas button score enemy gameover";
+  expect(page).toContain("score");
+});
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("README.md"),
+            "Report: the game should have canvas controls, enemies, score, and restart.\n",
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.test.tsx".to_string(), "README.md".to_string()],
+            &[],
+            &["player_control".to_string()],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(!report.passed);
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"implementation_artifact".to_string())
+        );
+        assert!(
+            report
+                .missing_obligations
+                .contains(&"implementation".to_string())
+        );
+        assert!(
+            report
+                .artifact_obligations
+                .iter()
+                .all(|artifact| !artifact.satisfies_implementation)
         );
     }
 

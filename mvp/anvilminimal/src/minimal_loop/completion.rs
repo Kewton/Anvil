@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::eval_events;
@@ -17,7 +17,7 @@ use crate::tools::path_guard::{
     resolve_existing, resolve_optional_existing, validate_workspace_relative,
 };
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CompletionContract {
     #[serde(default)]
     pub required_paths: Vec<String>,
@@ -41,7 +41,7 @@ pub struct CompletionContract {
     pub verify_repair_cap: usize,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DeferredVerifyRequirement {
     pub command: String,
     #[serde(default)]

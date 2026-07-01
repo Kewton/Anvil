@@ -2235,12 +2235,16 @@ mod tests {
 import { useEffect, useState } from "react";
 export default function Page(){
   const [score,setScore] = useState(0);
+  const [gameState,setGameState] = useState("playing");
   const enemies = [{ x: 1, y: 2 }];
   useEffect(() => {
     const onKeyDown = () => setScore((value) => value + 1);
     const frame = requestAnimationFrame(() => {
       const collision = enemies.some((enemy) => enemy.x > 0);
-      if (collision) setScore((value) => value + 10);
+      if (collision) {
+        setScore((value) => value + 10);
+        setGameState("gameover");
+      }
     });
     window.addEventListener("keydown", onKeyDown);
     return () => {
@@ -2248,7 +2252,7 @@ export default function Page(){
       window.removeEventListener("keydown", onKeyDown);
     };
   }, []);
-  return <main tabIndex={0} onKeyDown={() => setScore(score + 1)}><canvas /><p>enemy collision score {score}</p></main>;
+  return <main tabIndex={0} onKeyDown={() => setScore(score + 1)}><canvas /><p>enemy collision score {score} {gameState}</p></main>;
 }
 "#;
         let mut fake = Fake {
