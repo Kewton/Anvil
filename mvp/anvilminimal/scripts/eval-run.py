@@ -276,6 +276,47 @@ def summarize_provider_probe_results(paths: list[Path]) -> dict:
         "failed": failed,
         "skipped": skipped,
         "events": events,
+        **provider_probe_observation_summary(events),
+    }
+
+
+def provider_probe_observation_summary(events: list[dict]) -> dict:
+    probes_by_provider: dict[str, list[str]] = {}
+    classifications: list[dict] = []
+    for event in events:
+        provider = str(event.get("provider", "")).strip()
+        probe = str(event.get("probe", "")).strip()
+        if provider and probe:
+            probes_by_provider.setdefault(provider, [])
+            if probe not in probes_by_provider[provider]:
+                probes_by_provider[provider].append(probe)
+        if probe == "tool_args_recovery_classification":
+            classifications.append(
+                {
+                    "provider": provider,
+                    "status": str(event.get("status", "")),
+                    "recoverable_tool_args": str(event.get("recoverable_tool_args", "")),
+                    "unsafe_tool_args": str(event.get("unsafe_tool_args", "")),
+                    "unsafe_error_kind": str(event.get("unsafe_error_kind", "")),
+                    "arguments_shape": str(event.get("arguments_shape", "")),
+                }
+            )
+    return {
+        "probes_by_provider": {
+            provider: sorted(probes)
+            for provider, probes in sorted(probes_by_provider.items())
+        },
+        "tool_args_recovery_classifications": classifications,
+        "recoverable_tool_args_classified": sum(
+            1
+            for item in classifications
+            if item.get("recoverable_tool_args") == "recovered_and_executed"
+        ),
+        "unsafe_tool_args_rejected": sum(
+            1
+            for item in classifications
+            if item.get("unsafe_tool_args") == "rejected_nonrecoverable"
+        ),
     }
 
 

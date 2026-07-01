@@ -85,7 +85,7 @@ REC の状態は以下で管理する。
 | REC-005 | P1 | pass | 実装レベルの受入条件は unit/fixture/eval/YAML roundtrip で確認済み。release-level manual/TUI evidence は REC-010 で扱う。 | none。source full `RepairJob` は移植せず、MVP の薄い lifecycle 写像として管理する。 |
 | REC-006 | P1 | pass | 実装レベルの受入条件は unit/fixture/eval で確認済み。live browser/manual UAT evidence は REC-010 で扱う。 | none。browser/Playwright は通常 unit test 必須にせず、保存済み evidence content gate として管理する。 |
 | REC-007 | P1 | pass | 実装レベルの受入条件は normalized trace diff / parity report / eval pytest で確認済み。release-level failed gates は report の `failed_gate_ids` として扱う。 | none。code reference だけの pass と trace 欠損 gate の pass 扱いは schema/gate で禁止済み。 |
-| REC-008 | P2 | open | provider probe summary、skip reason、provider-specific args shape observation。 | fake fixture のみで provider-sensitive fix を完了扱い、unsafe args recovery。 |
+| REC-008 | P2 | pass | provider probe metadata / summary、provider-specific args shape observation、tool args recovery classification。 | live provider smoke は credentials/network がある release/targeted gate で再確認する。 |
 | REC-009 | P2 | open | verify normalization fixture、original/normalized verify event、runtime Bash policy rejection fixture。 | shell control syntax 許可、setup/build ordering 違反の success、normalization event 欠損。 |
 | REC-010 | P2 | open | manual TUI run events、summary、recovery `.md` / `.yaml` parse check、release evidence registration。 | silent exit、summary 欠損、recovery artifact path だけで内容未確認。 |
 
@@ -637,7 +637,7 @@ normalized trace writer はあるが、gate matrix では全 G-S01〜G-S16 が `
 
 ### 現状
 
-MVP は provider parser fixture と tool args recovery を持つ。だが live probe は任意で、source/MVP の同条件 provider trace は gate pass まで揃っていない。
+MVP は provider parser fixture と tool args recovery を持つ。REC-008 では、OpenAI/Gemini/Ollama の provider probe metadata を suite に明示し、provider probe JSONL summary に provider 別の観測結果と tool args recovery classification を保存するようにした。live probe は API key がある場合だけ実行し、API key が無い場合は skip event として扱い、通常 test failure にはしない。
 
 ### 問題点
 
@@ -656,6 +656,22 @@ provider-specific instability は runtime success と混同すべきではない
 - provider-sensitive 修正では provider probe 要否を必須記載する。
 - unsafe path/workspace confinement 違反は recovery せず拒否する。
 - recoverable tool args と unsafe tool args の分類を provider 別に記録する。
+
+### 実装結果
+
+| 項目 | 内容 |
+| --- | --- |
+| status | pass |
+| 実施日 | 2026-07-01 |
+| 実施 step | RECOVERY-001-F / REC-008 |
+| 実装概要 | `mvp-provider-smoke.yaml` に provider-sensitive fix 用の probe requirement を残し、OpenAI tool args shape、Gemini function calling/schema、Ollama XML fallback/tool-like output に加えて、provider 別 `tool_args_recovery_classification` を記録するようにした。`eval-run.py` は provider probe JSONL を runtime success ではなく separate summary として集計し、provider ごとの observed probes、recoverable args、unsafe args rejection を `provider_probe_summary.json` に残す。`live_provider.rs` は live probe を `ANVIL_PROVIDER_PROBE=1` かつ API key ありの時だけ実行し、fixture では recoverable alias args が実行でき、`../secret.txt` のような unsafe path は `path_confinement_error` かつ non-recoverable として拒否されることを provider 別に確認する。 |
+| source parity 判断 | source と差分あり。source は Ollama native tools / XML fallback を runtime loop 内で扱うが、MVP は OpenAI/Gemini/Ollama を薄い provider 実装と probe gate に分ける。provider probe は runtime success ではなく、prompt/tool-call/provider-sensitive fix の不確実性を下げる gate として扱う。 |
+| 証跡 | `mvp/anvilminimal/tests/live_provider.rs`: OpenAI/Gemini live probe skip/live execution guard、Ollama XML fallback probe、provider 別 recoverable/unsafe tool args classification。`mvp/anvilminimal/eval/suites/mvp-provider-smoke.yaml`: `required_for_prompt_sensitive_fix: true` と provider 別 observes/classifies metadata。`mvp/anvilminimal/scripts/eval-run.py`: provider probe summary の `probes_by_provider` / `tool_args_recovery_classifications` / `unsafe_tool_args_rejected` / `recoverable_tool_args_classified`。`mvp/anvilminimal/tests/eval/test_eval_cli_contract.py`: provider suite metadata と summary roundtrip。 |
+| 通過した確認 | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml --test live_provider provider_probe -- --nocapture` は 5 passed。`pytest -q mvp/anvilminimal/tests/eval/test_eval_cli_contract.py` は 6 passed。`pytest -q mvp/anvilminimal/tests/eval` は 212 passed, 1 skipped, 65 subtests passed。`cargo test --manifest-path mvp/anvilminimal/Cargo.toml` は通過。 |
+| 未確認事項 | 実 API/network を使う OpenAI/Gemini live provider smoke はこの作業では実行していない。API key がある release/targeted provider probe では、実レスポンスの tool args shape / function schema を再観測する。 |
+| blocking condition | none |
+| 次の確認タイミング | provider-sensitive prompt/tool-call 修正後 / release provider smoke 後 / source/MVP same-condition eval 再計測時 |
+| rollback 判断 | rollback 不要。残リスクは provider 実サービスの schema drift で、通常 unit test では必須にせず provider probe summary と skip/fail classification で管理する。 |
 
 ---
 

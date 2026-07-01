@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anvilminimal::config::{Action, Config, Provider, load_api_key};
+use anvilminimal::mode::ExecutionMode;
 use anvilminimal::providers::ChatClient;
 use anvilminimal::providers::gemini::GeminiClient;
 use anvilminimal::providers::gemini_function_calling::{
@@ -13,8 +14,11 @@ use anvilminimal::providers::ollama::parse_chat_response;
 use anvilminimal::providers::openai::{
     OpenAiClient, build_response_request, parse_openai_response,
 };
-use anvilminimal::state::ConversationMessage;
-use anvilminimal::tools::registry::ToolRegistry;
+use anvilminimal::state::{ConversationMessage, ToolCall};
+use anvilminimal::tools::registry::{
+    ToolContext, ToolRegistry, recoverable_tool_error, tool_error_kind,
+};
+use anvilminimal::tools::workspace_policy::WorkspacePolicy;
 use serde_json::{Value, json};
 
 static PROVIDER_PROBE_EVENT_LOCK: Mutex<()> = Mutex::new(());
@@ -261,6 +265,54 @@ fn provider_probe_ollama_xml_fallback_tool_like_output() {
 }
 
 #[test]
+fn provider_probe_tool_args_recovery_classification_by_provider() {
+    let registry = ToolRegistry::default();
+    for provider in ["openai", "gemini", "ollama"] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let context = ToolContext {
+            root: temp.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+        };
+
+        let recoverable = provider_write_call(provider, "provider-probe.txt", "ok")
+            .unwrap_or_else(|err| panic!("{provider} recoverable fixture parse failed: {err}"));
+        registry
+            .execute(&recoverable.name, &recoverable.arguments, &context)
+            .unwrap_or_else(|err| panic!("{provider} recoverable args were not executable: {err}"));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("provider-probe.txt")).unwrap(),
+            "ok"
+        );
+
+        let unsafe_call = provider_write_call(provider, "../secret.txt", "no")
+            .unwrap_or_else(|err| panic!("{provider} unsafe fixture parse failed: {err}"));
+        let err = registry
+            .execute(&unsafe_call.name, &unsafe_call.arguments, &context)
+            .expect_err("unsafe provider args must be rejected");
+        let unsafe_error_kind = tool_error_kind(&err);
+        assert_eq!(unsafe_error_kind, "path_confinement_error");
+        assert!(
+            !recoverable_tool_error(&err),
+            "unsafe path confinement errors must not be recoverable"
+        );
+
+        record_provider_probe(json!({
+            "provider": provider,
+            "probe": "tool_args_recovery_classification",
+            "status": "passed",
+            "recoverable_tool_args": "recovered_and_executed",
+            "unsafe_tool_args": "rejected_nonrecoverable",
+            "unsafe_error_kind": unsafe_error_kind,
+            "arguments_shape": "object_recovered",
+        }));
+    }
+}
+
+#[test]
 #[ignore]
 fn live_openai_request_shape_uses_smoke_model() {
     if std::env::var("ANVIL_LIVE_PROVIDER_TESTS").ok().as_deref() != Some("1") {
@@ -454,6 +506,54 @@ fn record_provider_probe(mut value: Value) {
     {
         let _ = writeln!(file, "{}", value);
     }
+}
+
+fn provider_write_call(provider: &str, path: &str, content: &str) -> anyhow::Result<ToolCall> {
+    let aliased = json!({"file": path, "body": content});
+    let reply = match provider {
+        "openai" => {
+            let body = json!({
+                "output": [{
+                    "type": "function_call",
+                    "name": "Write",
+                    "call_id": "provider-probe-write",
+                    "arguments": aliased.to_string(),
+                }]
+            })
+            .to_string();
+            parse_openai_response(&body)?
+        }
+        "gemini" => {
+            let body = json!({
+                "output": [{
+                    "type": "function_call",
+                    "name": "Write",
+                    "call_id": "provider-probe-write",
+                    "arguments": aliased.to_string(),
+                }]
+            })
+            .to_string();
+            parse_interactions_response(&body)?
+        }
+        "ollama" => {
+            let body = json!({
+                "message": {
+                    "content": format!(
+                        "<function_call>{}</function_call>",
+                        json!({"name": "Write", "arguments": aliased})
+                    )
+                }
+            })
+            .to_string();
+            parse_chat_response(&body, &["Write".to_string()], true)?
+        }
+        other => anyhow::bail!("unknown provider fixture: {other}"),
+    };
+    reply
+        .tool_calls
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("{provider} fixture returned no tool call"))
 }
 
 fn smoke_config(tmp_root: &Path, key_root: PathBuf, provider: Provider) -> Config {

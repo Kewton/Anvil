@@ -113,6 +113,12 @@ class EvalCliContractTest(unittest.TestCase):
             {item["provider"] for item in probe["probes"]},
             {"openai", "gemini", "ollama"},
         )
+        for item in probe["probes"]:
+            self.assertIn("tool_args_recovery_classification", item["observes"])
+            self.assertEqual(
+                item["classifies"],
+                ["recoverable_tool_args", "unsafe_tool_args"],
+            )
 
     def test_provider_probe_results_are_recorded_in_dry_run_summary(self):
         with tempfile.TemporaryDirectory() as td:
@@ -137,6 +143,18 @@ class EvalCliContractTest(unittest.TestCase):
                                 "probe": "function_calling_schema",
                                 "status": "skipped",
                                 "reason": "missing_gemini_api_key",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "event": "provider_probe",
+                                "provider": "openai",
+                                "probe": "tool_args_recovery_classification",
+                                "status": "passed",
+                                "recoverable_tool_args": "recovered_and_executed",
+                                "unsafe_tool_args": "rejected_nonrecoverable",
+                                "unsafe_error_kind": "path_confinement_error",
+                                "arguments_shape": "object_recovered",
                             }
                         ),
                     ]
@@ -175,12 +193,22 @@ class EvalCliContractTest(unittest.TestCase):
                 (run_root / "provider_probe_summary.json").read_text(encoding="utf-8")
             )
         self.assertIn("provider_probe_status", summary)
-        self.assertIn("\tpassed\t1\t0\t1\t", summary)
+        self.assertIn("\tpassed\t2\t0\t1\t", summary)
         self.assertIn('"event": "provider_probe"', events)
         self.assertIn('"provider": "openai"', events)
         self.assertEqual(provider_summary["status"], "passed")
-        self.assertEqual(provider_summary["passed"], 1)
+        self.assertEqual(provider_summary["passed"], 2)
         self.assertEqual(provider_summary["skipped"], 1)
+        self.assertEqual(
+            provider_summary["probes_by_provider"]["openai"],
+            ["tool_args_recovery_classification", "tool_args_shape"],
+        )
+        self.assertEqual(provider_summary["unsafe_tool_args_rejected"], 1)
+        self.assertEqual(provider_summary["recoverable_tool_args_classified"], 1)
+        self.assertEqual(
+            provider_summary["tool_args_recovery_classifications"][0]["unsafe_error_kind"],
+            "path_confinement_error",
+        )
 
     def test_eval_preflight_writes_comparative_parity_gate_report(self):
         with tempfile.TemporaryDirectory() as td:
