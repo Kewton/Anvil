@@ -364,6 +364,10 @@ fn tui_slash_success_with_partial_release_gate_is_not_complete_only() {
             "release_gate_reasons": ["browser_readiness_or_interaction_evidence_required:browser_readiness_evidence_missing"],
             "browser_readiness_status": "unavailable:browser_readiness_evidence_missing",
             "interaction_evidence_status": "unavailable:interaction_evidence_missing",
+            "recovery_prompt_path": ".anvil/repairs/repair-release.yaml.md",
+            "recovery_ultra_plan_path": ".anvil/plans/recovery-ultra-plan-release.yaml",
+            "suggested_recovery_command": "/ultra-plan-run --profile nextjs \"$(cat .anvil/repairs/repair-release.yaml.md)\"",
+            "suggested_recovery_yaml_command": "/run-ultra-plan .anvil/plans/recovery-ultra-plan-release.yaml",
         }),
     );
     let plan_json = r#"{"goal":"test","steps":[{"id":"s1","kind":"report","instruction":"say done","expected_paths":[],"verify":[],"expected_result":"pass"}]}"#;
@@ -386,6 +390,10 @@ fn tui_slash_success_with_partial_release_gate_is_not_complete_only() {
         output
             .contains("Next action: collect_missing_release_evidence_or_continue_release_recovery")
     );
+    assert!(output.contains("Recovery UltraPlan: .anvil/plans/recovery-ultra-plan-release.yaml"));
+    assert!(output.contains(
+        "Suggested recovery command: /run-ultra-plan .anvil/plans/recovery-ultra-plan-release.yaml"
+    ));
     let events = std::fs::read_to_string(&events_path).unwrap();
     assert!(events.contains("\"event\":\"tui_command_stop\""));
     assert!(events.contains("\"completion_status\":\"complete_with_partial_release_gate\""));
@@ -396,6 +404,10 @@ fn tui_slash_success_with_partial_release_gate_is_not_complete_only() {
     assert!(summary.contains("Command completion: completed"));
     assert!(summary.contains("Final acceptance: partial"));
     assert!(summary.contains("Release gate: partial"));
+    assert!(summary.contains("Recovery handoff:"));
+    assert!(summary.contains(
+        "Suggested YAML command: /run-ultra-plan .anvil/plans/recovery-ultra-plan-release.yaml"
+    ));
     assert!(!summary.contains("\nStatus: complete\nCommand completion: completed"));
 }
 

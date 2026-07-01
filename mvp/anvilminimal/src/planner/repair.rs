@@ -164,14 +164,14 @@ pub fn build_recovery_ultra_plan(handoff: &RecoveryHandoff) -> UltraPlan {
             UltraPhase {
                 id: "inspect-current-state".to_string(),
                 prompt: format!(
-                    "Inspect the current workspace before changing files. Original goal: {}. Failed phase: {failed_phase}. Failed step: {failed_step}. Failure kind: {}. Preserve useful existing artifacts and identify the smallest remaining implementation gap.",
+                    "Inspect the current workspace before changing files. Original goal: {}. Failed acceptance layer or phase: {failed_phase}. Failed step: {failed_step}. Failure kind: {}. Preserve useful existing artifacts and identify the smallest remaining implementation gap.",
                     handoff.original_goal, handoff.failure_kind
                 ),
             },
             UltraPhase {
                 id: format!("repair-{}", recovery_plan_phase_token(failed_phase)),
                 prompt: format!(
-                    "Repair the incomplete work for the failed phase without restarting from scratch.\nOriginal goal: {}\nFailed phase: {failed_phase}\nFailed step: {failed_step}\nMissing capability or artifact signals:\n{}\nFailure evidence:\n{}\nRepair targets:\n{}\nCreate or update the task-specific implementation artifacts needed to satisfy the original goal. Do not treat scaffold-only, setup-only, style-only, or build-only output as complete.",
+                    "Repair the incomplete work for the failed phase without restarting from scratch.\nOriginal goal: {}\nFailed acceptance layer or phase: {failed_phase}\nFailed step: {failed_step}\nMissing capability or artifact signals:\n{}\nFailure evidence:\n{}\nRepair targets:\n{}\nCreate or update the task-specific implementation artifacts needed to satisfy the original goal. Do not treat scaffold-only, setup-only, style-only, or build-only output as complete.",
                     handoff.original_goal,
                     list_or_none(&missing_signals),
                     list_or_none(&redacted_list(&handoff.failure_evidence)),
@@ -181,7 +181,7 @@ pub fn build_recovery_ultra_plan(handoff: &RecoveryHandoff) -> UltraPlan {
             UltraPhase {
                 id: "verify-recovery".to_string(),
                 prompt: format!(
-                    "Verify the recovered output with deterministic checks and repair only targeted failures.\nOriginal goal: {}\nFailed phase: {failed_phase}\nVerify preference:\n{}\nExpected recovery result: runnable task-specific output, not only a saved plan or diagnostic report.",
+                    "Verify the recovered output with deterministic checks and repair only targeted failures.\nOriginal goal: {}\nFailed acceptance layer or phase: {failed_phase}\nPreferred verify/browser check:\n{}\nVerify preference: use the preferred checks above.\nExpected recovery result: runnable task-specific output, not only a saved plan or diagnostic report.",
                     handoff.original_goal,
                     list_or_none(&verify_preference),
                 ),
@@ -529,6 +529,8 @@ mod tests {
         assert!(text.contains("Build an interactive web game"));
         assert!(text.contains("web-audio-synth-and-ui"));
         assert!(text.contains("interactive_ui"));
+        assert!(text.contains("Failed acceptance layer or phase"));
+        assert!(text.contains("Preferred verify/browser check"));
         assert!(text.contains("Verify preference"));
         let parsed = parse_ultra_plan(&text).unwrap();
         assert_eq!(parsed, build_recovery_ultra_plan(&handoff));

@@ -73,6 +73,22 @@ struct RecoveryArtifactValidation {
     yaml_parse_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ReleaseRecoveryHandoffSummary {
+    recovery_handoff_kind: String,
+    acceptance_layer: String,
+    recovery_prompt_path: String,
+    recovery_ultra_plan_path: String,
+    suggested_recovery_command: String,
+    suggested_recovery_yaml_command: String,
+}
+
+impl ReleaseRecoveryHandoffSummary {
+    fn has_artifact(&self) -> bool {
+        !self.recovery_prompt_path.is_empty() || !self.recovery_ultra_plan_path.is_empty()
+    }
+}
+
 impl RecoveryArtifactValidation {
     fn prompt_command_available(&self) -> bool {
         self.prompt_exists && self.prompt_parse_ok
@@ -1331,6 +1347,34 @@ fn verify_plan_final_contract(
     } else {
         "ok".to_string()
     };
+    let recovery_handoff = if !ok || release_recovery_needed(&release_gate, final_acceptance_status)
+    {
+        let acceptance_layer =
+            release_recovery_acceptance_layer(&release_gate, final_acceptance_status);
+        let failure_kind =
+            release_recovery_failure_kind(&release_gate, final_acceptance_status, &primary_reason);
+        let scope = format!("release-{}", recovery_scope_token(acceptance_layer));
+        save_release_recovery_handoff(
+            config,
+            &config.profile,
+            &plan.goal,
+            &scope,
+            acceptance_layer,
+            &failure_kind,
+            release_recovery_failure_evidence(
+                &release_gate,
+                final_acceptance_status,
+                &primary_reason,
+                runtime_acceptance.as_ref(),
+            ),
+            missing_final_artifacts.clone(),
+            release_recovery_missing_capabilities(runtime_acceptance.as_ref()),
+            release_recovery_repair_targets(&release_gate, runtime_acceptance.as_ref()),
+            release_recovery_verify_commands(&config.profile, &release_gate),
+        )
+    } else {
+        None
+    };
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -1389,6 +1433,34 @@ fn verify_plan_final_contract(
             "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "next_action": next_action,
+            "recovery_handoff_kind": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.recovery_handoff_kind.as_str())
+                .unwrap_or_default(),
+            "acceptance_layer": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.acceptance_layer.as_str())
+                .unwrap_or_default(),
+            "recovery_prompt_path": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.recovery_prompt_path.as_str())
+                .unwrap_or_default(),
+            "recovery_ultra_plan_path": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.recovery_ultra_plan_path.as_str())
+                .unwrap_or_default(),
+            "suggested_recovery_command": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.suggested_recovery_command.as_str())
+                .unwrap_or_default(),
+            "suggested_recovery_yaml_command": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.suggested_recovery_yaml_command.as_str())
+                .unwrap_or_default(),
+            "recovery_handoff_saved": recovery_handoff
+                .as_ref()
+                .is_some_and(ReleaseRecoveryHandoffSummary::has_artifact),
+            "handoff_saved_not_success": recovery_handoff.is_some(),
             "ok": ok,
             "primary_reason": eval_events::body_snippet(&primary_reason),
         }),
@@ -2572,6 +2644,45 @@ fn ultra_final_acceptance_report(
     let release_quality_completion =
         release_quality_completion_status(&release_gate, final_acceptance_status);
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
+    let primary_reason = if !missing.is_empty() {
+        format!("missing final artifacts: {}", missing.join(", "))
+    } else if !acceptance.passed {
+        acceptance.primary_reason.clone()
+    } else if matches!(release_gate.status.as_str(), "partial" | "failed") {
+        release_gate.reasons.join("; ")
+    } else {
+        acceptance.primary_reason.clone()
+    };
+    let recovery_handoff = if acceptance.passed
+        && (matches!(release_gate.status.as_str(), "partial" | "failed")
+            || final_acceptance_status == "partial")
+    {
+        let acceptance_layer =
+            release_recovery_acceptance_layer(&release_gate, final_acceptance_status);
+        let failure_kind =
+            release_recovery_failure_kind(&release_gate, final_acceptance_status, &primary_reason);
+        let scope = format!("release-{}", recovery_scope_token(acceptance_layer));
+        save_release_recovery_handoff(
+            config,
+            &plan.profile,
+            &plan.goal,
+            &scope,
+            acceptance_layer,
+            &failure_kind,
+            release_recovery_failure_evidence(
+                &release_gate,
+                final_acceptance_status,
+                &primary_reason,
+                Some(&acceptance),
+            ),
+            missing.clone(),
+            release_recovery_missing_capabilities(Some(&acceptance)),
+            release_recovery_repair_targets(&release_gate, Some(&acceptance)),
+            release_recovery_verify_commands(&plan.profile, &release_gate),
+        )
+    } else {
+        None
+    };
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -2601,7 +2712,35 @@ fn ultra_final_acceptance_report(
             "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "next_action": next_action,
-            "primary_reason": eval_events::body_snippet(&acceptance.primary_reason),
+            "recovery_handoff_kind": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.recovery_handoff_kind.as_str())
+                .unwrap_or_default(),
+            "acceptance_layer": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.acceptance_layer.as_str())
+                .unwrap_or_default(),
+            "recovery_prompt_path": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.recovery_prompt_path.as_str())
+                .unwrap_or_default(),
+            "recovery_ultra_plan_path": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.recovery_ultra_plan_path.as_str())
+                .unwrap_or_default(),
+            "suggested_recovery_command": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.suggested_recovery_command.as_str())
+                .unwrap_or_default(),
+            "suggested_recovery_yaml_command": recovery_handoff
+                .as_ref()
+                .map(|handoff| handoff.suggested_recovery_yaml_command.as_str())
+                .unwrap_or_default(),
+            "recovery_handoff_saved": recovery_handoff
+                .as_ref()
+                .is_some_and(ReleaseRecoveryHandoffSummary::has_artifact),
+            "handoff_saved_not_success": recovery_handoff.is_some(),
+            "primary_reason": eval_events::body_snippet(&primary_reason),
         }),
     );
     let mut report = VerificationReport::pass();
@@ -4107,6 +4246,235 @@ fn release_gate_next_action(
     }
 }
 
+fn release_recovery_needed(
+    release_gate: &ReleaseGateSummary,
+    final_acceptance_status: &str,
+) -> bool {
+    matches!(release_gate.status.as_str(), "partial" | "failed")
+        || matches!(final_acceptance_status, "partial" | "failed" | "incomplete")
+}
+
+fn release_recovery_acceptance_layer(
+    release_gate: &ReleaseGateSummary,
+    final_acceptance_status: &str,
+) -> &'static str {
+    match release_gate.status.as_str() {
+        "partial" | "failed" => "release_gate",
+        _ if final_acceptance_status == "partial" => "final_acceptance_partial",
+        _ => "final_acceptance",
+    }
+}
+
+fn release_recovery_failure_kind(
+    release_gate: &ReleaseGateSummary,
+    final_acceptance_status: &str,
+    primary_reason: &str,
+) -> String {
+    if release_gate.status == "partial" {
+        if release_gate
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("browser_readiness_or_interaction_evidence_required"))
+            || release_gate
+                .browser_readiness_status
+                .starts_with("unavailable:")
+            || release_gate
+                .browser_readiness_status
+                .contains("browser_readiness_evidence_missing")
+            || release_gate
+                .browser_readiness_status
+                .contains("browser_render_evidence_missing")
+        {
+            return "browser_readiness_missing".to_string();
+        }
+        if release_gate
+            .interaction_evidence_status
+            .contains("interaction_evidence_missing")
+        {
+            return "browser_interaction_evidence_missing".to_string();
+        }
+        return "release_gate_partial".to_string();
+    }
+    if release_gate.status == "failed" {
+        if release_gate
+            .browser_readiness_status
+            .contains("tailwind_dev_pipeline_failure")
+        {
+            return "tailwind_dev_pipeline_failure".to_string();
+        }
+        if release_gate.browser_readiness_status.starts_with("failed:")
+            || release_gate
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("browser_readiness_failed"))
+        {
+            return "browser_readiness_failed".to_string();
+        }
+        if release_gate
+            .interaction_evidence_status
+            .starts_with("failed:")
+            || release_gate
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("browser_interaction_failed"))
+        {
+            return "browser_interaction_failed".to_string();
+        }
+        return "release_gate_failed".to_string();
+    }
+    if final_acceptance_status == "partial" {
+        "final_acceptance_partial".to_string()
+    } else if primary_reason == "ok" {
+        "final_acceptance_recovery_required".to_string()
+    } else {
+        "final_acceptance_failed".to_string()
+    }
+}
+
+fn release_recovery_failure_evidence(
+    release_gate: &ReleaseGateSummary,
+    final_acceptance_status: &str,
+    primary_reason: &str,
+    runtime_acceptance: Option<&crate::minimal_loop::evidence::RuntimeAcceptanceReport>,
+) -> Vec<String> {
+    let mut evidence = Vec::new();
+    evidence.push(format!(
+        "failed acceptance layer: {}",
+        release_recovery_acceptance_layer(release_gate, final_acceptance_status)
+    ));
+    evidence.push(format!(
+        "final acceptance status: {final_acceptance_status}"
+    ));
+    evidence.push(format!("release gate status: {}", release_gate.status));
+    if primary_reason != "ok" {
+        evidence.push(format!("primary reason: {primary_reason}"));
+    }
+    evidence.extend(
+        release_gate
+            .reasons
+            .iter()
+            .map(|reason| format!("release gate reason: {reason}")),
+    );
+    evidence.push(format!(
+        "browser readiness: {}",
+        release_gate.browser_readiness_status
+    ));
+    if !release_gate.browser_readiness_evidence_path.is_empty() {
+        evidence.push(format!(
+            "browser readiness evidence: {}",
+            release_gate.browser_readiness_evidence_path
+        ));
+    }
+    evidence.push(format!(
+        "interaction evidence: {}",
+        release_gate.interaction_evidence_status
+    ));
+    if !release_gate.interaction_evidence_path.is_empty() {
+        evidence.push(format!(
+            "interaction evidence path: {}",
+            release_gate.interaction_evidence_path
+        ));
+    }
+    if let Some(report) = runtime_acceptance {
+        evidence.extend(
+            report
+                .missing_evidence
+                .iter()
+                .map(|item| format!("missing runtime evidence: {item}")),
+        );
+        evidence.extend(
+            report
+                .missing_obligations
+                .iter()
+                .map(|item| format!("missing runtime obligation: {item}")),
+        );
+        evidence.extend(
+            report
+                .inconclusive_reasons
+                .iter()
+                .map(|item| format!("runtime acceptance inconclusive: {item}")),
+        );
+    }
+    dedup_strings(evidence)
+}
+
+fn release_recovery_missing_capabilities(
+    runtime_acceptance: Option<&crate::minimal_loop::evidence::RuntimeAcceptanceReport>,
+) -> Vec<String> {
+    runtime_acceptance
+        .map(|report| report.missing_capabilities.clone())
+        .unwrap_or_default()
+}
+
+fn release_recovery_repair_targets(
+    release_gate: &ReleaseGateSummary,
+    runtime_acceptance: Option<&crate::minimal_loop::evidence::RuntimeAcceptanceReport>,
+) -> Vec<String> {
+    let mut targets = Vec::new();
+    let browser_status = release_gate.browser_readiness_status.to_ascii_lowercase();
+    let interaction_status = release_gate
+        .interaction_evidence_status
+        .to_ascii_lowercase();
+    if browser_status.contains("tailwind_dev_pipeline_failure")
+        || browser_status.contains("css")
+        || browser_status.contains("http_500")
+    {
+        targets.push("framework_config".to_string());
+    }
+    if browser_status.starts_with("unavailable:")
+        || browser_status.contains("evidence_missing")
+        || interaction_status.starts_with("unavailable:")
+        || interaction_status.contains("evidence_missing")
+    {
+        targets.push("required_evidence_missing".to_string());
+    }
+    if browser_status.starts_with("failed:") || interaction_status.starts_with("failed:") {
+        targets.push("test_or_evidence".to_string());
+    }
+    if let Some(report) = runtime_acceptance {
+        targets.extend(
+            report
+                .obligation_repair_targets
+                .iter()
+                .map(|target| format!("{}:{}", target.obligation, target.target_path)),
+        );
+    }
+    if targets.is_empty() {
+        targets.push("release_acceptance".to_string());
+    }
+    dedup_strings(targets)
+}
+
+fn release_recovery_verify_commands(
+    profile: &str,
+    release_gate: &ReleaseGateSummary,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    if matches!(profile, "nextjs" | "next-js" | "next.js") {
+        commands.push("npm run build".to_string());
+        commands.push("start dev server with npm run dev and wait for readiness".to_string());
+        commands.push("probe browser route GET / and record HTTP status".to_string());
+        commands.push("write browser-readiness.json with route_rendered/http_status".to_string());
+        commands
+            .push("collect interaction-evidence.json for required browser interaction".to_string());
+    } else {
+        commands.push("rerun deterministic acceptance checks for the original goal".to_string());
+    }
+    if release_gate.status == "partial" {
+        commands.push("do not claim release_ready until release gate evidence passes".to_string());
+    }
+    dedup_strings(commands)
+}
+
+fn dedup_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    values
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
 fn emit_ultra_phase_event(
     config: &Config,
     event: &str,
@@ -4353,6 +4721,149 @@ fn save_ultra_phase_recovery_handoff(
         recovery_yaml_message.trim_start_matches("; "),
         artifact_check_summary
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_release_recovery_handoff(
+    config: &Config,
+    profile: &str,
+    original_goal: &str,
+    scope: &str,
+    acceptance_layer: &str,
+    failure_kind: &str,
+    failure_evidence: Vec<String>,
+    missing_paths: Vec<String>,
+    missing_capabilities: Vec<String>,
+    repair_targets: Vec<String>,
+    verify_commands: Vec<String>,
+) -> Option<ReleaseRecoveryHandoffSummary> {
+    let handoff = RecoveryHandoff {
+        profile: profile.to_string(),
+        original_goal: original_goal.to_string(),
+        failed_phase: Some(acceptance_layer.to_string()),
+        failed_step: None,
+        failure_kind: failure_kind.to_string(),
+        failure_evidence,
+        missing_paths,
+        missing_capabilities,
+        verify_commands,
+        changed_paths: Vec::new(),
+        repair_targets,
+    };
+    let path = match save_ultra_recovery_prompt(&config.workspace_root, scope, &handoff) {
+        Ok(path) => path,
+        Err(err) => {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "recovery_prompt_save_failed",
+                    "recovery_handoff_kind": failure_kind,
+                    "acceptance_layer": acceptance_layer,
+                    "reason": eval_events::body_snippet(&err.to_string()),
+                    "status": "incomplete",
+                }),
+            );
+            return None;
+        }
+    };
+    let recovery_plan = match save_recovery_ultra_plan(&config.workspace_root, scope, &handoff) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "recovery_ultra_plan_save_failed",
+                    "recovery_handoff_kind": failure_kind,
+                    "acceptance_layer": acceptance_layer,
+                    "recovery_prompt_path": path.display().to_string(),
+                    "reason": eval_events::body_snippet(&err.to_string()),
+                    "recovery_yaml_missing": true,
+                    "status": "incomplete",
+                }),
+            );
+            None
+        }
+    };
+    let validation = validate_recovery_artifacts(&path, recovery_plan.as_deref());
+    let raw_prompt_command = suggested_ultra_recovery_command(&path, profile);
+    let prompt_command = if validation.prompt_command_available() {
+        raw_prompt_command
+    } else {
+        String::new()
+    };
+    let recovery_plan_command = recovery_plan
+        .as_ref()
+        .filter(|_| validation.yaml_command_available())
+        .map(|path| suggested_recovery_ultra_plan_command(path));
+    let summary = ReleaseRecoveryHandoffSummary {
+        recovery_handoff_kind: failure_kind.to_string(),
+        acceptance_layer: acceptance_layer.to_string(),
+        recovery_prompt_path: path.display().to_string(),
+        recovery_ultra_plan_path: recovery_plan
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        suggested_recovery_command: prompt_command.clone(),
+        suggested_recovery_yaml_command: recovery_plan_command.clone().unwrap_or_default(),
+    };
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "recovery_prompt_saved",
+            "recovery_handoff_kind": failure_kind,
+            "acceptance_layer": acceptance_layer,
+            "recovery_scope": scope,
+            "recovery_prompt_path": &summary.recovery_prompt_path,
+            "recovery_ultra_plan_path": &summary.recovery_ultra_plan_path,
+            "recovery_yaml_missing": recovery_plan.is_none(),
+            "recovery_prompt_exists": validation.prompt_exists,
+            "recovery_prompt_parse_ok": validation.prompt_parse_ok,
+            "recovery_prompt_parse_error": validation.prompt_parse_error.as_deref().unwrap_or_default(),
+            "recovery_yaml_exists": validation.yaml_exists,
+            "recovery_yaml_parse_ok": validation.yaml_parse_ok,
+            "recovery_yaml_parse_error": validation.yaml_parse_error.as_deref().unwrap_or_default(),
+            "recovery_command_targets_valid": validation.command_targets_valid(),
+            "suggested_recovery_command": &summary.suggested_recovery_command,
+            "suggested_recovery_yaml_command": &summary.suggested_recovery_yaml_command,
+            "recovery_profile": profile,
+            "release_acceptance_handoff": true,
+            "handoff_saved_not_success": true,
+            "status": "incomplete",
+        }),
+    );
+    eval_events::append_run_summary(
+        config.eval_events_path.as_deref(),
+        &render_release_recovery_handoff_summary(&summary, &validation),
+    );
+    Some(summary)
+}
+
+fn render_release_recovery_handoff_summary(
+    summary: &ReleaseRecoveryHandoffSummary,
+    validation: &RecoveryArtifactValidation,
+) -> String {
+    format!(
+        "Recovery next action:\n\
+- Status: incomplete_release_acceptance\n\
+- Failed acceptance layer: {}\n\
+- Recovery handoff kind: {}\n\
+- Recovery prompt saved: {}\n\
+- Recovery UltraPlan YAML saved: {}\n\
+- Suggested prompt command: {}\n\
+- Suggested YAML command: {}\n\
+- Recovery artifact check: {}",
+        summary.acceptance_layer,
+        summary.recovery_handoff_kind,
+        missing_if_empty(&summary.recovery_prompt_path),
+        missing_if_empty(&summary.recovery_ultra_plan_path),
+        missing_if_empty(&summary.suggested_recovery_command),
+        missing_if_empty(&summary.suggested_recovery_yaml_command),
+        recovery_artifact_check_summary(validation),
+    )
+}
+
+fn missing_if_empty(value: &str) -> &str {
+    if value.is_empty() { "missing" } else { value }
 }
 
 struct UltraPartialRunSummary<'a> {
@@ -6671,7 +7182,10 @@ mod tests {
         assert!(event_text.contains("final_acceptance_repair_start"));
         assert!(event_text.contains("final_acceptance_repair_complete"));
         assert!(event_text.contains("ultra_plan_complete"));
-        assert!(!event_text.contains("recovery_prompt_saved"));
+        assert!(event_text.contains("\"release_gate_status\":\"partial\""));
+        assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
+        assert!(event_text.contains("\"handoff_saved_not_success\":true"));
+        assert!(event_text.contains("\"recovery_handoff_saved\":true"));
         let repair_prompt = execution
             .messages
             .iter()
@@ -7494,6 +8008,17 @@ export default function Page(){
             event_text.contains("browser_readiness_or_interaction_evidence_required"),
             "{event_text}"
         );
+        assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
+        assert!(event_text.contains("\"recovery_handoff_kind\":\"browser_readiness_missing\""));
+        assert!(event_text.contains("\"acceptance_layer\":\"release_gate\""));
+        assert!(event_text.contains("\"suggested_recovery_yaml_command\""));
+        assert!(event_text.contains("\"handoff_saved_not_success\":true"));
+        let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
+        assert_eq!(recovery_plan.goal, plan.goal);
+        let recovery_text = render_ultra_plan(&recovery_plan);
+        assert!(recovery_text.contains("Failed acceptance layer or phase"));
+        assert!(recovery_text.contains("browser_readiness_missing"));
+        assert!(recovery_text.contains("Preferred verify/browser check"));
     }
 
     #[test]
@@ -7540,6 +8065,16 @@ export default function Page(){
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"release_gate_status\":\"failed\""));
         assert!(event_text.contains("\"browser_readiness_status\":\"failed:http_500\""));
+        assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
+        assert!(event_text.contains("\"recovery_handoff_kind\":\"browser_readiness_failed\""));
+        assert!(event_text.contains("\"acceptance_layer\":\"release_gate\""));
+        assert!(event_text.contains("\"recovery_handoff_saved\":true"));
+        let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
+        assert_eq!(recovery_plan.goal, plan.goal);
+        let recovery_text = render_ultra_plan(&recovery_plan);
+        assert!(recovery_text.contains("release gate reason"));
+        assert!(recovery_text.contains("browser readiness"));
+        assert!(recovery_text.contains("Preferred verify/browser check"));
     }
 
     #[test]

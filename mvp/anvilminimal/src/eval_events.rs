@@ -106,6 +106,10 @@ pub struct CompletionSnapshot {
     pub browser_readiness_evidence_path: String,
     pub interaction_evidence_status: String,
     pub interaction_evidence_path: String,
+    pub recovery_prompt_path: String,
+    pub recovery_ultra_plan_path: String,
+    pub suggested_recovery_command: String,
+    pub suggested_recovery_yaml_command: String,
 }
 
 impl CompletionSnapshot {
@@ -119,6 +123,10 @@ impl CompletionSnapshot {
             browser_readiness_evidence_path: String::new(),
             interaction_evidence_status: "not_applicable".to_string(),
             interaction_evidence_path: String::new(),
+            recovery_prompt_path: String::new(),
+            recovery_ultra_plan_path: String::new(),
+            suggested_recovery_command: String::new(),
+            suggested_recovery_yaml_command: String::new(),
         }
     }
 
@@ -145,6 +153,10 @@ pub struct CompletionProjection {
     pub interaction_evidence_path: String,
     pub release_quality_completion: String,
     pub next_action: String,
+    pub recovery_prompt_path: String,
+    pub recovery_ultra_plan_path: String,
+    pub suggested_recovery_command: String,
+    pub suggested_recovery_yaml_command: String,
 }
 
 pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
@@ -194,6 +206,10 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         interaction_evidence_path: snapshot.interaction_evidence_path.clone(),
         release_quality_completion,
         next_action,
+        recovery_prompt_path: snapshot.recovery_prompt_path.clone(),
+        recovery_ultra_plan_path: snapshot.recovery_ultra_plan_path.clone(),
+        suggested_recovery_command: snapshot.suggested_recovery_command.clone(),
+        suggested_recovery_yaml_command: snapshot.suggested_recovery_yaml_command.clone(),
     }
 }
 
@@ -226,7 +242,7 @@ pub fn render_tui_completion_output(output: &str, projection: &CompletionProject
     {
         return output.to_string();
     }
-    format!(
+    let mut output = format!(
         "{}\n\nCommand completion: {}\nRuntime acceptance: {}\nFinal acceptance: {}\nRelease gate: {}\nNext action: {}",
         output,
         projection.command_completion,
@@ -234,7 +250,27 @@ pub fn render_tui_completion_output(output: &str, projection: &CompletionProject
         projection.final_acceptance,
         projection.release_gate,
         projection.next_action
-    )
+    );
+    if !projection.recovery_ultra_plan_path.is_empty()
+        || !projection.suggested_recovery_yaml_command.is_empty()
+    {
+        output.push_str("\nRecovery UltraPlan: ");
+        output.push_str(missing_if_empty(&projection.recovery_ultra_plan_path));
+        if !projection.suggested_recovery_yaml_command.is_empty() {
+            output.push_str("\nSuggested recovery command: ");
+            output.push_str(&projection.suggested_recovery_yaml_command);
+        }
+    } else if !projection.recovery_prompt_path.is_empty()
+        || !projection.suggested_recovery_command.is_empty()
+    {
+        output.push_str("\nRecovery prompt: ");
+        output.push_str(missing_if_empty(&projection.recovery_prompt_path));
+        if !projection.suggested_recovery_command.is_empty() {
+            output.push_str("\nSuggested recovery command: ");
+            output.push_str(&projection.suggested_recovery_command);
+        }
+    }
+    output
 }
 
 fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
@@ -293,6 +329,26 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .to_string(),
         interaction_evidence_path: event
             .get("interaction_evidence_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        recovery_prompt_path: event
+            .get("recovery_prompt_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        recovery_ultra_plan_path: event
+            .get("recovery_ultra_plan_path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        suggested_recovery_command: event
+            .get("suggested_recovery_command")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        suggested_recovery_yaml_command: event
+            .get("suggested_recovery_yaml_command")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
@@ -405,6 +461,31 @@ fn render_completion_summary(
         format!("Next action: {}", projection.next_action),
         format!("Stop reason: {stop_reason}"),
     ]);
+    if !projection.recovery_prompt_path.is_empty()
+        || !projection.recovery_ultra_plan_path.is_empty()
+        || !projection.suggested_recovery_command.is_empty()
+        || !projection.suggested_recovery_yaml_command.is_empty()
+    {
+        lines.extend([
+            "Recovery handoff:".to_string(),
+            format!(
+                "- Recovery prompt: {}",
+                missing_if_empty(&projection.recovery_prompt_path)
+            ),
+            format!(
+                "- Recovery UltraPlan YAML: {}",
+                missing_if_empty(&projection.recovery_ultra_plan_path)
+            ),
+            format!(
+                "- Suggested prompt command: {}",
+                missing_if_empty(&projection.suggested_recovery_command)
+            ),
+            format!(
+                "- Suggested YAML command: {}",
+                missing_if_empty(&projection.suggested_recovery_yaml_command)
+            ),
+        ]);
+    }
     if !failure_kind.is_empty() {
         lines.push(format!("Failure kind: {failure_kind}"));
     }

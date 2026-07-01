@@ -162,6 +162,10 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "interaction_evidence_path": &completion.interaction_evidence_path,
             "release_quality_completion": &completion.release_quality_completion,
             "next_action": &completion.next_action,
+            "recovery_prompt_path": &completion.recovery_prompt_path,
+            "recovery_ultra_plan_path": &completion.recovery_ultra_plan_path,
+            "suggested_recovery_command": &completion.suggested_recovery_command,
+            "suggested_recovery_yaml_command": &completion.suggested_recovery_yaml_command,
         }),
     );
     eval_events::append_completion_summary(

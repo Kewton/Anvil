@@ -143,7 +143,9 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
             &[
                 "tsconfig",
                 "tailwind",
+                "tailwind_dev_pipeline_failure",
                 "css",
+                "http_500",
                 "layout",
                 "use client",
                 "global.d.ts",
@@ -210,6 +212,11 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
                 "weak_verification_evidence",
                 "inconclusive_acceptance",
                 "required evidence missing",
+                "release gate partial",
+                "browser_readiness_missing",
+                "browser_readiness_evidence_missing",
+                "browser_readiness_or_interaction_evidence_required",
+                "interaction_evidence_missing",
             ],
         )
     }) {
@@ -223,6 +230,9 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
                 "non_zero_test",
                 "test_artifact",
                 "bound_verify_command",
+                "release gate failed",
+                "browser_readiness_failed",
+                "browser_interaction_failed",
             ],
         )
     }) {
@@ -486,6 +496,30 @@ mod tests {
         assert_eq!(
             classify_repair_target(&report),
             RepairTarget::RequiredEvidenceMissing
+        );
+    }
+
+    #[test]
+    fn release_gate_missing_browser_evidence_targets_required_evidence() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "release gate partial: browser_readiness_or_interaction_evidence_required:browser_readiness_evidence_missing",
+        );
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::RequiredEvidenceMissing
+        );
+    }
+
+    #[test]
+    fn tailwind_dev_route_failure_targets_framework_config() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "release gate failed: browser_readiness_failed:tailwind_dev_pipeline_failure",
+        );
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::FrameworkConfig
         );
     }
 

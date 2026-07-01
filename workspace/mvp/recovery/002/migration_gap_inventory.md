@@ -88,12 +88,12 @@ G10 は横断 gap として扱う。runtime summary の比較可能性は RECOVE
 | --- | --- | --- | --- | --- |
 | G01 | P0 | `semantic_drift` | release gate partial が command completion / success semantics に接続されない | partial |
 | G02 | P0 | `new_release_gate_gap` | browser readiness を通常 final acceptance で実行・取得していない | partial |
-| G03 | P0 | `acceptance_bridge_gap` | browser/dev route failure が repair target / recovery UltraPlan に接続されない | open |
+| G03 | P0 | `acceptance_bridge_gap` | browser/dev route failure が repair target / recovery UltraPlan に接続されない | partial |
 | G04 | P0 | `semantic_drift` | Next.js/Tailwind dev pipeline が build verifier lifecycle に含まれていない | partial |
 | G05 | P1 | `acceptance_bridge_gap` | static capability evidence が interactive behavior を過大評価する | open |
 | G06 | P1 | `semantic_drift` | verifier command policy と runtime Bash policy が一致しない | open |
 | G07 | P1 | `diagnostic_gap` | TUI/summary が partial artifact を完成品に見せる | partial |
-| G08 | P1 | `migration_missing` | source の repair handoff semantics が release gate partial/fail に横展開されていない | open |
+| G08 | P1 | `migration_missing` | source の repair handoff semantics が release gate partial/fail に横展開されていない | partial |
 | G09 | P2 | `diagnostic_gap` | RECOVERY-001 の pass 判定が UAT/release evidence に十分連動していない | open |
 | G10 | P2 | `acceptance_bridge_gap` | source/MVP 比較が aggregate success に寄り、completion authority 差分を見落とす | partial |
 | G11 | P0 | `new_release_gate_gap` | browser readiness の dev server lifecycle が controller にない | partial |
@@ -219,7 +219,7 @@ browser readiness が eval/release artifact として後付けされ、runtime c
 | --- | --- |
 | priority | P0 |
 | category | `acceptance_bridge_gap` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 
@@ -257,6 +257,16 @@ source の `build_repair_exhausted_report` は、repair exhaustion 時に次の 
 - suggested command が TUI/summary に出る。
 - recovery YAML は original goal、failure evidence、failed acceptance layer、repair target、preferred verify/browser check を含む。
 - recovery artifact の保存だけで success にはしない。
+
+### RECOVERY-002-C evidence
+
+- `mvp/anvilminimal/src/planner/runner.rs` に release acceptance 用の `save_release_recovery_handoff` を追加し、release gate partial/fail、browser readiness missing/fail、plan final contract failure を `.anvil/repairs/repair-*.md` と `.anvil/plans/recovery-ultra-plan-*.yaml` 保存へ接続した。
+- `recovery_prompt_saved` event は `release_acceptance_handoff=true`、`handoff_saved_not_success=true`、`acceptance_layer`、`recovery_prompt_path`、`recovery_ultra_plan_path`、`suggested_recovery_command`、`suggested_recovery_yaml_command` を出す。保存は handoff であり、final/release success へ丸めない。
+- `mvp/anvilminimal/src/planner/repair.rs` の recovery UltraPlan 生成は `render_ultra_plan` / `parse_ultra_plan` roundtrip を維持し、original goal、failure evidence、`Failed acceptance layer or phase`、repair target、`Preferred verify/browser check` を prompt に含める。
+- `mvp/anvilminimal/src/minimal_loop/repair_target.rs` は `browser_readiness_evidence_missing` / `interaction_evidence_missing` を required evidence、HTTP 500/browser failure を test/evidence、Tailwind dev pipeline failure を framework config repair target に分類する。
+- Targeted tests: `planner::runner::tests::plan_run_nextjs_interactive_app_records_partial_release_gate`、`planner::runner::tests::plan_run_nextjs_browser_http_500_fails_final_contract`、`planner::runner::tests::ultra_final_acceptance_repair_failure_saves_recovery_handoff`、`minimal_loop::repair_target::tests::release_gate_missing_browser_evidence_targets_required_evidence`、`minimal_loop::repair_target::tests::tailwind_dev_route_failure_targets_framework_config`。
+- Automated evidence: `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` pass、`pytest mvp/anvilminimal/tests/eval` pass。
+- Manual UAT は未実施のため `pass` ではなく `partial`。
 
 ---
 
@@ -311,7 +321,7 @@ Next.js の production build と dev server route の差を acceptance に組み
 - `mvp/anvilminimal/src/planner/profiles/nextjs.rs` の既存 test `nextjs_allows_plain_css_without_tailwind_toolchain` により plain CSS app へ Tailwind toolchain を強制しない挙動は維持されている。
 - Added fixture: `mvp/anvilminimal/tests/eval/fixtures/uat_002/test0701_004_nextjs_dev_route_failure.json` が build pass / dev route HTTP 500 / release gate failed を固定する。
 - Automated evidence: `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`、`pytest mvp/anvilminimal/tests/eval` pass。
-- release failure を recovery target に戻す G03 側の handoff は未実装のため `partial`。
+- release failure を recovery target に戻す handoff は RECOVERY-002-C で G03/G08 に接続済み。manual UAT は未実施のため G04 は引き続き `partial`。
 
 ---
 
@@ -478,6 +488,7 @@ phase failure では recovery artifacts が保存されるようになったが�
 - `/Users/maenokota/share/work/github_kewton/Anvil-develop/src/agent/minimal_step_runner/repair.rs`
 - `/Users/maenokota/share/work/github_kewton/Anvil-develop/src/agent/loop_run/repair_lifecycle.rs`
 - `/Users/maenokota/share/work/github_kewton/Anvil-develop/src/agent/loop_run/verifier_repair_targeting.rs`
+- `/Users/maenokota/share/work/github_kewton/Anvil-develop/src/agent/loop_run/verifier_driver.rs`
 
 ### MVP refs
 
@@ -502,6 +513,15 @@ source の repair exhausted report は、失敗を次の explicit `/ultra-plan-r
 - release gate reason、browser error、missing evidence、missing behavior が recovery prompt に含まれる。
 - suggested command が summary/TUI に出る。
 - handoff 保存だけで success にはしない。
+
+### RECOVERY-002-C evidence
+
+- source の repair exhausted handoff semantics に合わせ、MVP の final/release acceptance failure でも次アクション用 artifact を保存する。release gate partial/fail は `failed_phase=release_gate` 相当の `RecoveryHandoff` として recovery prompt/YAML に変換される。
+- `mvp/anvilminimal/src/eval_events.rs`、`mvp/anvilminimal/src/lib.rs`、`mvp/anvilminimal/src/tui/slash.rs` に recovery handoff fields を追加し、TUI と `.anvil/runs/<run-id>/summary.md` に recovery prompt、Recovery UltraPlan YAML、suggested command を出す。
+- `mvp/anvilminimal/tests/tui_integration.rs` の partial release gate fixture は、`complete` 単独表示を避けつつ `Recovery handoff` / `Suggested YAML command` が summary に残ることを固定する。
+- bounded final acceptance repair は自動再帰実行にせず、修復成功後でも release gate partial なら handoff を保存する。artifact 保存自体は `handoff_saved_not_success=true` として event に残り、release-quality success にはしない。
+- Automated evidence: `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` pass、`pytest mvp/anvilminimal/tests/eval` pass。
+- Manual UAT は未実施のため `pass` ではなく `partial`。
 
 ---
 
