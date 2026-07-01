@@ -73,14 +73,18 @@ class ParityGateReportTest(unittest.TestCase):
 
     def test_comparison_threshold_fail_requires_report_error_or_intentional_evidence(self):
         with tempfile.TemporaryDirectory() as td:
-            mvp = Path(td) / "mvp.tsv"
-            source = Path(td) / "source.tsv"
+            root = Path(td)
+            mvp = root / "mvp.tsv"
+            source = root / "source.tsv"
+            trace = root / "trace.json"
+            trace.write_text(json.dumps(pass_trace_diff()), encoding="utf-8")
             write_summary(mvp, [summary_row(success=False), summary_row(success=False)])
             write_summary(source, [summary_row(success=True), summary_row(success=True)])
             report = build_parity_gate_report(
                 gate_level="comparative",
                 mvp_summary_path=str(mvp),
                 anvildev_summary_path=str(source),
+                trace_diff_path=str(trace),
             )
         self.assertEqual(report["anvildev_comparison"]["threshold"]["status"], "fail")
         self.assertTrue(any("anvildev parity threshold failed" in item for item in report["errors"]))
@@ -112,6 +116,135 @@ class ParityGateReportTest(unittest.TestCase):
         )
         self.assertFalse(any("anvildev parity threshold failed" in item for item in report["errors"]))
         self.assertEqual(validate_parity_gate_report(report), [])
+
+    def test_comparative_report_includes_completion_authority_release_and_recovery_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mvp = root / "mvp.tsv"
+            source = root / "source.tsv"
+            trace = root / "trace.json"
+            trace.write_text(json.dumps(pass_trace_diff()), encoding="utf-8")
+            write_summary(
+                mvp,
+                [
+                    summary_row(
+                        success=True,
+                        command_completion_state="completed",
+                        final_acceptance_status="partial",
+                        release_gate_status="partial",
+                        browser_readiness_status="unavailable:browser_readiness_evidence_missing",
+                        recovery_prompt_path=".anvil/repairs/repair-1.md",
+                        recovery_ultra_plan_path=".anvil/plans/recovery-ultra-plan-1.yaml",
+                    )
+                ],
+            )
+            write_summary(
+                source,
+                [
+                    summary_row(
+                        success=True,
+                        command_completion_state="completed",
+                        final_acceptance_status="pass",
+                        release_gate_status="pass",
+                        browser_readiness_status="ready",
+                    )
+                ],
+            )
+            report = build_parity_gate_report(
+                gate_level="comparative",
+                mvp_summary_path=str(mvp),
+                anvildev_summary_path=str(source),
+                trace_diff_path=str(trace),
+            )
+        comparison = report["anvildev_comparison"]
+        self.assertEqual(comparison["release_quality_status"], "fail")
+        self.assertEqual(comparison["mvp"]["command_completion_state_counts"]["completed"], 1)
+        self.assertEqual(comparison["mvp"]["final_acceptance_status_counts"]["partial"], 1)
+        self.assertEqual(comparison["mvp"]["release_gate_status_counts"]["partial"], 1)
+        self.assertEqual(
+            comparison["mvp"]["browser_readiness_status_counts"][
+                "unavailable:browser_readiness_evidence_missing"
+            ],
+            1,
+        )
+        self.assertEqual(
+            comparison["mvp"]["recovery_artifact_presence_counts"][
+                "prompt_and_recovery_ultra_plan"
+            ],
+            1,
+        )
+        self.assertEqual(
+            comparison["mvp"]["completion_authority_reason_counts"][
+                "release_gate_partial"
+            ],
+            1,
+        )
+        self.assertIn(
+            "release_gate_status_counts",
+            comparison["completion_authority_comparison"]["fields"],
+        )
+        self.assertTrue(
+            any(
+                item["key"] == "partial" and item["delta"] == 1
+                for item in comparison["completion_authority_comparison"]["deltas"][
+                    "release_gate_status_counts"
+                ]
+            )
+        )
+        self.assertIn(
+            "release-quality comparison is not pass",
+            "\n".join(report["warnings"]),
+        )
+        self.assertEqual(report["recovery_item_status"]["status"], "implementation_pass")
+        self.assertFalse(report["recovery_item_status"]["release_pass"])
+
+    def test_release_report_requires_release_quality_for_recovery_release_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mvp = root / "mvp.tsv"
+            source = root / "source.tsv"
+            uat, browser, interaction, events = release_evidence_files(root)
+            trace = root / "trace.json"
+            trace.write_text(json.dumps(pass_trace_diff()), encoding="utf-8")
+            write_summary(
+                mvp,
+                [
+                    summary_row(
+                        success=True,
+                        final_acceptance_status="partial",
+                        release_gate_status="partial",
+                    )
+                ],
+            )
+            write_summary(
+                source,
+                [
+                    summary_row(
+                        success=True,
+                        final_acceptance_status="pass",
+                        release_gate_status="pass",
+                    )
+                ],
+            )
+            report = build_parity_gate_report(
+                gate_level="release",
+                mvp_summary_path=str(mvp),
+                anvildev_summary_path=str(source),
+                trace_diff_path=str(trace),
+                uat_evidence_paths=[str(uat)],
+                browser_evidence_paths=[str(browser)],
+                interaction_evidence_paths=[str(interaction)],
+                tui_event_paths=[str(events)],
+            )
+        self.assertEqual(report["anvildev_comparison"]["release_quality_status"], "fail")
+        self.assertTrue(
+            any("release-quality comparison is not pass" in item for item in report["errors"])
+        )
+        self.assertEqual(report["recovery_item_status"]["status"], "implementation_pass")
+        self.assertIn(
+            "release_quality_status:fail",
+            report["recovery_item_status"]["release_blockers"],
+        )
 
     def test_comparative_report_includes_trace_diff_and_resolves_gate_partition(self):
         with tempfile.TemporaryDirectory() as td:
@@ -405,6 +538,12 @@ def summary_row(
     failure_layer: str = "",
     acceptance_success: str = "",
     acceptance_false_positive: bool = False,
+    command_completion_state: str = "",
+    final_acceptance_status: str = "",
+    release_gate_status: str = "",
+    browser_readiness_status: str = "",
+    recovery_prompt_path: str = "",
+    recovery_ultra_plan_path: str = "",
 ):
     row = {key: "" for key in SUMMARY_HEADER}
     if not success and not failure_kind:
@@ -423,6 +562,12 @@ def summary_row(
             "failure_layer": failure_layer,
             "acceptance_success": acceptance_success,
             "acceptance_false_positive": str(acceptance_false_positive).lower(),
+            "command_completion_state": command_completion_state,
+            "final_acceptance_status": final_acceptance_status,
+            "release_gate_status": release_gate_status,
+            "browser_readiness_status": browser_readiness_status,
+            "recovery_prompt_path": recovery_prompt_path,
+            "recovery_ultra_plan_path": recovery_ultra_plan_path,
         }
     )
     return row
@@ -451,6 +596,23 @@ def release_evidence_files(root: Path):
         encoding="utf-8",
     )
     return uat, browser, interaction, events
+
+
+def pass_trace_diff():
+    return {
+        "schema_version": "1",
+        "status": "compared",
+        "gate_results": [
+            {
+                "gate_id": gate_id,
+                "status": "pass",
+                "reason": "fixture_pass",
+                "source_event_count": 1,
+                "mvp_event_count": 1,
+            }
+            for gate_id in sorted(REQUIRED_GATE_IDS)
+        ],
+    }
 
 
 if __name__ == "__main__":

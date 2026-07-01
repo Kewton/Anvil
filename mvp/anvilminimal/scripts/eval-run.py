@@ -1063,6 +1063,24 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
                 "interaction_evidence_status", ""
             ),
             "next_action": completion_observability.get("next_action", ""),
+            "completion_authority_reason": completion_observability.get(
+                "completion_authority_reason", ""
+            ),
+            "recovery_prompt_path": completion_observability.get(
+                "recovery_prompt_path", ""
+            ),
+            "recovery_ultra_plan_path": completion_observability.get(
+                "recovery_ultra_plan_path", ""
+            ),
+            "recovery_artifact_presence": completion_observability.get(
+                "recovery_artifact_presence", ""
+            ),
+            "suggested_recovery_command": completion_observability.get(
+                "suggested_recovery_command", ""
+            ),
+            "suggested_recovery_yaml_command": completion_observability.get(
+                "suggested_recovery_yaml_command", ""
+            ),
             "oracle_gap_kind": acceptance.get("oracle_gap_kind", ""),
             "acceptance_oracle_version": acceptance.get("acceptance_oracle_version", ""),
             "queue_wait_sec": 0.0,
@@ -1343,6 +1361,17 @@ def summarize_completion_observability(events: list[dict]) -> dict[str, object]:
         out["browser_readiness_status"] = completion_state.get("browser_readiness_status", "")
         out["interaction_evidence_status"] = completion_state.get("interaction_evidence_status", "")
         out["next_action"] = completion_state.get("next_action", "")
+        out["recovery_prompt_path"] = completion_state.get("recovery_prompt_path", "")
+        out["recovery_ultra_plan_path"] = completion_state.get("recovery_ultra_plan_path", "")
+        out["suggested_recovery_command"] = completion_state.get("suggested_recovery_command", "")
+        out["suggested_recovery_yaml_command"] = completion_state.get(
+            "suggested_recovery_yaml_command", ""
+        )
+        out["recovery_artifact_presence"] = recovery_artifact_presence(
+            out["recovery_prompt_path"],
+            out["recovery_ultra_plan_path"],
+        )
+        out["completion_authority_reason"] = completion_authority_reason(out)
     return out
 
 
@@ -1374,6 +1403,62 @@ def runtime_acceptance_status_from_event(event: dict[str, object]) -> str:
     if event.get("runtime_acceptance_passed") is False:
         return "failed"
     return ""
+
+
+def recovery_artifact_presence(prompt_path: object, ultra_plan_path: object) -> str:
+    has_prompt = bool(str(prompt_path or "").strip())
+    has_ultra_plan = bool(str(ultra_plan_path or "").strip())
+    if has_prompt and has_ultra_plan:
+        return "prompt_and_recovery_ultra_plan"
+    if has_ultra_plan:
+        return "recovery_ultra_plan"
+    if has_prompt:
+        return "prompt_only"
+    return "none"
+
+
+def completion_authority_reason(state: dict[str, object]) -> str:
+    command = str(state.get("command_completion_state", "") or "").strip().lower()
+    final = str(state.get("final_acceptance_status", "") or "").strip().lower()
+    release = str(state.get("release_gate_status", "") or "").strip().lower()
+    browser = str(state.get("browser_readiness_status", "") or "").strip().lower()
+    interaction = str(state.get("interaction_evidence_status", "") or "").strip().lower()
+    recovery = str(state.get("recovery_artifact_presence", "") or "").strip().lower()
+    if command == "failed":
+        return "command_failed"
+    if release in {"failed", "fail"}:
+        return "release_gate_failed"
+    if release == "partial":
+        return "release_gate_partial"
+    if final in {"failed", "fail", "incomplete"}:
+        return "final_acceptance_failed"
+    if final == "partial":
+        return "final_acceptance_partial"
+    if browser_unavailable_status(browser):
+        return "browser_readiness_unavailable"
+    if interaction_unavailable_status(interaction):
+        return "interaction_evidence_unavailable"
+    if recovery not in {"", "none"}:
+        return "recovery_handoff_saved"
+    if release == "pass" and final in {"pass", "passed"}:
+        return "release_quality_pass"
+    if release in {"not_applicable", "not_checked", ""} and final in {"pass", "passed"}:
+        return "final_acceptance_pass_without_release_gate"
+    if command == "completed":
+        return "process_completion_only"
+    return ""
+
+
+def browser_unavailable_status(status: str) -> bool:
+    return status in {"unavailable", "not_enabled", "adapter_not_implemented", "skipped"} or status.startswith(
+        ("unavailable:", "browser_unavailable:")
+    )
+
+
+def interaction_unavailable_status(status: str) -> bool:
+    return status in {"unavailable", "not_enabled", "adapter_not_implemented", "skipped"} or status.startswith(
+        ("unavailable:", "interaction_unavailable:")
+    )
 
 
 def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:

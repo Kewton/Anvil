@@ -123,6 +123,13 @@ def validate_parity_gate_report(report: dict[str, Any]) -> list[str]:
                 "release gate cannot pass with failing or invalid UAT evidence: "
                 + ", ".join(blockers)
             )
+    recovery = report.get("recovery_item_status", {}) or {}
+    if recovery:
+        status = str(recovery.get("status", ""))
+        if status not in {"open", "partial", "implementation_pass", "release_pass"}:
+            errors.append("recovery_item_status.status has unknown value")
+        if status == "release_pass" and gate_level != "release":
+            errors.append("recovery item cannot be release_pass outside release gate")
     return errors
 
 
@@ -170,6 +177,16 @@ def build_parity_gate_report(
             warn_delta_pp=warn_delta_pp,
             fail_delta_pp=fail_delta_pp,
         )
+        comparison = report["anvildev_comparison"]
+        if comparison.get("release_quality_status") != "pass":
+            message = (
+                "release-quality comparison is not pass because MVP has release gate "
+                "partial/fail or final acceptance partial/fail evidence."
+            )
+            if gate_level == "release":
+                append_unique(report["errors"], message)
+            else:
+                append_unique(report["warnings"], message)
     elif gate_level in {"comparative", "release"}:
         report["anvildev_comparison"] = {
             "status": "missing_current_same_condition_trace",
@@ -216,6 +233,7 @@ def build_parity_gate_report(
             report["errors"],
             "anvildev parity threshold failed: MVP is at least 10pp below source without intentional evidence.",
         )
+    report["recovery_item_status"] = recovery_item_status(report, gate_level=gate_level)
     finalize_gate_partition(report, gate_level=gate_level)
     if gate_level in {"comparative", "release"} and report.get("failed_gate_ids"):
         append_unique(
@@ -456,6 +474,22 @@ def compare_mvp_to_anvildev(
         and false_positive_delta < 0
         and (acceptance_delta is None or acceptance_delta >= 0)
     )
+    release_quality_delta = none_delta(
+        mvp["release_quality_pass_rate"],
+        source["release_quality_pass_rate"],
+    )
+    success_delta_classification = classify_success_delta(
+        success_rate_delta_pp=delta,
+        correct_failure_detection=correct_failure_detection,
+        mvp_release_blockers=mvp["release_quality_blocker_count"],
+        source_release_blockers=source["release_quality_blocker_count"],
+    )
+    completion_authority_comparison = compare_completion_authority(mvp, source)
+    release_quality_status = "pass"
+    if mvp["release_quality_blocker_count"] > 0:
+        release_quality_status = "fail"
+    elif release_quality_delta is not None and release_quality_delta < 0:
+        release_quality_status = "warn"
     return {
         "status": "compared",
         "mvp_summary_path": mvp_summary_path,
@@ -464,10 +498,14 @@ def compare_mvp_to_anvildev(
         "anvildev": source,
         "success_rate_delta_pp": delta,
         "acceptance_success_rate_delta_pp": acceptance_delta,
+        "release_quality_pass_rate_delta_pp": release_quality_delta,
         "acceptance_false_positive_delta": false_positive_delta,
         "stage_regressions": stage_regressions,
         "failure_kind_regressions": failure_kind_regressions,
         "correct_failure_detection": correct_failure_detection,
+        "success_delta_classification": success_delta_classification,
+        "release_quality_status": release_quality_status,
+        "completion_authority_comparison": completion_authority_comparison,
         "threshold": {
             "warn_delta_pp": warn_delta_pp,
             "fail_delta_pp": fail_delta_pp,
@@ -479,6 +517,8 @@ def compare_mvp_to_anvildev(
 
 def summary_snapshot(path: str) -> dict[str, Any]:
     rows = read_summary_path(path)
+    release_quality_pass_count = sum(1 for row in rows if release_quality_pass(row))
+    release_quality_blocker_count = sum(1 for row in rows if release_quality_blocked(row))
     return {
         "summary_path": path,
         "total": len(rows),
@@ -499,7 +539,189 @@ def summary_snapshot(path: str) -> dict[str, Any]:
         "release_gate_status_counts": counts(
             normalize_blank(row.get("release_gate_status")) for row in rows
         ),
+        "final_acceptance_status_counts": counts(
+            normalize_blank(row.get("final_acceptance_status")) for row in rows
+        ),
+        "command_completion_state_counts": counts(
+            normalize_blank(row.get("command_completion_state")) for row in rows
+        ),
+        "browser_readiness_status_counts": counts(
+            normalize_blank(row.get("browser_readiness_status")) for row in rows
+        ),
+        "recovery_artifact_presence_counts": counts(
+            recovery_artifact_presence_for_row(row) for row in rows
+        ),
+        "completion_authority_reason_counts": counts(
+            completion_authority_reason_for_row(row) for row in rows
+        ),
+        "release_quality_pass_count": release_quality_pass_count,
+        "release_quality_blocker_count": release_quality_blocker_count,
+        "release_quality_pass_rate": percent(release_quality_pass_count, len(rows)),
         "blank_failure_kind_count": blank_failure_kind_count(rows),
+    }
+
+
+def release_quality_pass(row: dict[str, str]) -> bool:
+    return normalize_status(row.get("release_gate_status")) == "pass" and normalize_status(
+        row.get("final_acceptance_status")
+    ) in {"pass", "passed"}
+
+
+def release_quality_blocked(row: dict[str, str]) -> bool:
+    release = normalize_status(row.get("release_gate_status"))
+    final = normalize_status(row.get("final_acceptance_status"))
+    browser = normalize_status(row.get("browser_readiness_status"))
+    if release in {"partial", "failed", "fail"}:
+        return True
+    if final in {"partial", "failed", "fail", "incomplete"}:
+        return True
+    if browser.startswith("unavailable:") or browser.startswith("browser_unavailable:"):
+        return True
+    return False
+
+
+def recovery_artifact_presence_for_row(row: dict[str, str]) -> str:
+    explicit = normalize_blank(row.get("recovery_artifact_presence"))
+    if explicit:
+        return explicit
+    has_prompt = bool(normalize_blank(row.get("recovery_prompt_path")))
+    has_ultra = bool(normalize_blank(row.get("recovery_ultra_plan_path")))
+    if has_prompt and has_ultra:
+        return "prompt_and_recovery_ultra_plan"
+    if has_ultra:
+        return "recovery_ultra_plan"
+    if has_prompt:
+        return "prompt_only"
+    return "none"
+
+
+def completion_authority_reason_for_row(row: dict[str, str]) -> str:
+    explicit = normalize_blank(row.get("completion_authority_reason"))
+    if explicit:
+        return explicit
+    command = normalize_status(row.get("command_completion_state"))
+    release = normalize_status(row.get("release_gate_status"))
+    final = normalize_status(row.get("final_acceptance_status"))
+    browser = normalize_status(row.get("browser_readiness_status"))
+    interaction = normalize_status(row.get("interaction_evidence_status"))
+    recovery = recovery_artifact_presence_for_row(row)
+    if command == "failed":
+        return "command_failed"
+    if release in {"failed", "fail"}:
+        return "release_gate_failed"
+    if release == "partial":
+        return "release_gate_partial"
+    if final in {"failed", "fail", "incomplete"}:
+        return "final_acceptance_failed"
+    if final == "partial":
+        return "final_acceptance_partial"
+    if browser.startswith("unavailable:") or browser.startswith("browser_unavailable:"):
+        return "browser_readiness_unavailable"
+    if interaction.startswith("unavailable:") or interaction.startswith("interaction_unavailable:"):
+        return "interaction_evidence_unavailable"
+    if recovery not in {"", "none"}:
+        return "recovery_handoff_saved"
+    if release_quality_pass(row):
+        return "release_quality_pass"
+    if command == "completed":
+        return "process_completion_only"
+    return ""
+
+
+def classify_success_delta(
+    *,
+    success_rate_delta_pp: float,
+    correct_failure_detection: bool,
+    mvp_release_blockers: int,
+    source_release_blockers: int,
+) -> str:
+    if success_rate_delta_pp < 0 and correct_failure_detection:
+        return "correct_failure_detection"
+    if mvp_release_blockers > source_release_blockers:
+        return "release_quality_blocker_detected"
+    if success_rate_delta_pp < 0:
+        return "simple_regression"
+    return "no_success_regression"
+
+
+def compare_completion_authority(
+    mvp: dict[str, Any],
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    fields = [
+        "command_completion_state_counts",
+        "final_acceptance_status_counts",
+        "release_gate_status_counts",
+        "browser_readiness_status_counts",
+        "recovery_artifact_presence_counts",
+        "completion_authority_reason_counts",
+        "failure_layer_counts",
+    ]
+    return {
+        "fields": fields,
+        "deltas": {
+            field: count_deltas(
+                mvp.get(field, {}) if isinstance(mvp.get(field), dict) else {},
+                source.get(field, {}) if isinstance(source.get(field), dict) else {},
+            )
+            for field in fields
+        },
+    }
+
+
+def count_deltas(current: dict[str, int], baseline: dict[str, int]) -> list[dict[str, Any]]:
+    keys = sorted(set(current).union(baseline))
+    return [
+        {
+            "key": key,
+            "mvp": int(current.get(key, 0)),
+            "anvildev": int(baseline.get(key, 0)),
+            "delta": int(current.get(key, 0)) - int(baseline.get(key, 0)),
+        }
+        for key in keys
+        if int(current.get(key, 0)) != int(baseline.get(key, 0))
+    ]
+
+
+def recovery_item_status(report: dict[str, Any], *, gate_level: str) -> dict[str, Any]:
+    errors = list(report.get("errors", []) or [])
+    comparison = report.get("anvildev_comparison", {}) or {}
+    uat = report.get("uat_equivalent", {}) or {}
+    implementation_blockers = [
+        error
+        for error in errors
+        if "release-grade UAT" not in error
+        and "release-quality comparison" not in error
+        and "runtime semantics gates failed" not in error
+    ]
+    release_blockers: list[str] = []
+    if gate_level != "release":
+        release_blockers.append("release_gate_not_run")
+    if uat.get("status") != "pass":
+        release_blockers.append(f"uat_equivalent:{uat.get('status') or 'missing'}")
+    if comparison.get("release_quality_status") not in {"", None, "pass"}:
+        release_blockers.append(
+            f"release_quality_status:{comparison.get('release_quality_status')}"
+        )
+    if report.get("failed_gate_ids"):
+        release_blockers.append("runtime_semantics_gate_failed")
+    if implementation_blockers:
+        status = "open"
+    elif release_blockers:
+        status = "implementation_pass"
+    else:
+        status = "release_pass"
+    return {
+        "status": status,
+        "implementation_pass": not implementation_blockers,
+        "release_pass": status == "release_pass",
+        "implementation_blockers": implementation_blockers,
+        "release_blockers": release_blockers,
+        "reopen_rules": [
+            "HTTP 500 browser readiness evidence reopens affected REC/Gxx to partial/open.",
+            "release_gate_status=partial or failed prevents release_pass even when process success is high.",
+            "missing recovery handoff for release gate partial/fail prevents release_pass.",
+        ],
     }
 
 
@@ -990,6 +1212,10 @@ def regressions(current: dict[str, int], baseline: dict[str, int]) -> list[dict[
 def normalize_blank(value: Any) -> str:
     text = str(value or "").strip()
     return text
+
+
+def normalize_status(value: Any) -> str:
+    return normalize_blank(value).lower()
 
 
 def none_delta(current: float | None, baseline: float | None) -> float | None:

@@ -94,7 +94,7 @@ G10 は横断 gap として扱う。runtime summary の比較可能性は RECOVE
 | G06 | P1 | `semantic_drift` | verifier command policy と runtime Bash policy が一致しない | partial |
 | G07 | P1 | `diagnostic_gap` | TUI/summary が partial artifact を完成品に見せる | partial |
 | G08 | P1 | `migration_missing` | source の repair handoff semantics が release gate partial/fail に横展開されていない | partial |
-| G09 | P2 | `diagnostic_gap` | RECOVERY-001 の pass 判定が UAT/release evidence に十分連動していない | open |
+| G09 | P2 | `diagnostic_gap` | RECOVERY-001 の pass 判定が UAT/release evidence に十分連動していない | partial |
 | G10 | P2 | `acceptance_bridge_gap` | source/MVP 比較が aggregate success に寄り、completion authority 差分を見落とす | partial |
 | G11 | P0 | `new_release_gate_gap` | browser readiness の dev server lifecycle が controller にない | partial |
 | G12 | P1 | `diagnostic_gap` | planner verify normalization / quality warning が不安定性として gate に残らない | partial |
@@ -553,7 +553,7 @@ source の repair exhausted report は、失敗を次の explicit `/ultra-plan-r
 | --- | --- |
 | priority | P2 |
 | category | `diagnostic_gap` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 
@@ -588,6 +588,14 @@ recovery の pass 判定が implementation-level に寄り、release-level UAT e
 - UAT で HTTP 500 / release gate partial が出た場合、該当 REC は自動的に partial/open へ戻る。
 - pass の証跡に browser/interaction evidence content が必要な REC を明示する。
 
+### RECOVERY-002-F status / evidence
+
+- `mvp/anvilminimal/scripts/eval_lib/parity_gate.py` が `recovery_item_status` を出力し、`implementation_pass` と `release_pass` を分離する。release gate を明示 opt-in で実行していない場合、または UAT/browser/interaction/TUI evidence が不足・失敗している場合は `release_pass` にしない。
+- `workspace/mvp/recovery/002/README.md` に REC/Gxx reopen 運用を追記した。HTTP 500、`release_gate_status=partial|failed`、`final_acceptance_status=partial|failed|incomplete`、missing recovery handoff は該当 item を `partial` または `open` に戻す根拠として扱う。
+- summary TSV に `recovery_prompt_path`、`recovery_ultra_plan_path`、`recovery_artifact_presence`、`completion_authority_reason` を追加し、implementation evidence と release evidence を別々に記録できるようにした。
+- fixtures: `test_comparative_report_includes_completion_authority_release_and_recovery_fields`、`test_release_report_requires_release_quality_for_recovery_release_pass`。
+- Manual UAT / actual anvildev same-condition comparison は未実施のため `pass` ではなく `partial`。
+
 ---
 
 ## G10: source/MVP 比較が aggregate success に寄り、completion authority 差分を見落とす
@@ -596,7 +604,7 @@ recovery の pass 判定が implementation-level に寄り、release-level UAT e
 | --- | --- |
 | priority | P2 |
 | category | `acceptance_bridge_gap` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 
@@ -649,6 +657,14 @@ source/MVP comparison が「成功率」と「plan/phase score」に寄り、com
   - completion authority reason
 - aggregate success が高くても release gate failed/partial なら release-quality comparison は pass にしない。
 - manual UAT scenario を eval の gate fixture として登録する。
+
+### RECOVERY-002-F status / evidence
+
+- `mvp/anvilminimal/scripts/eval_lib/parity_gate.py` の `summary_snapshot` が command completion、final acceptance、release gate、browser readiness、recovery artifact presence、failure layer、completion authority reason を集計する。
+- `compare_mvp_to_anvildev` が `completion_authority_comparison` と `release_quality_status` を出力し、aggregate success が高くても release gate partial/fail や final acceptance partial/fail があれば release-quality pass に丸めない。
+- `success_delta_classification` で `correct_failure_detection` / `release_quality_blocker_detected` / `simple_regression` を分け、正しい failure detection による成功率低下と単純 regression を report 上で区別する。
+- comparative/release gate は `build_parity_gate_report(... gate_level="comparative"|"release")` の明示 opt-in のまま維持し、normal unit test に browser/anvildev/network/API key を要求しない。
+- Actual MVP vs `anvildev --engine minimal` rerun は未実施のため、existing fixture/report operation evidence に基づく `partial`。
 
 ---
 
