@@ -83,7 +83,7 @@ REC の状態は以下で管理する。
 | REC-003 | P1 | partial | manual UAT、source/MVP trace diff、browser/interaction evidence。 | unit/eval では empty/scaffold/title/style/docs/manifest-only rejection、fallback event、fallback-only non-completion を確認済み。 |
 | REC-004 | P1 | partial | source/MVP trace diff、unsupported source obligation の deferred/intentionally_different 整理。 | unit/eval では obligation-to-artifact binding、missing implementation repair target、plan/ultra event 伝播を確認済み。 |
 | REC-005 | P1 | pass | 実装レベルの受入条件は unit/fixture/eval/YAML roundtrip で確認済み。release-level manual/TUI evidence は REC-010 で扱う。 | none。source full `RepairJob` は移植せず、MVP の薄い lifecycle 写像として管理する。 |
-| REC-006 | P1 | open | final acceptance fixture、browser/interaction evidence content、release gate report。 | build-only / path-only / browser unavailable の full pass 扱い。 |
+| REC-006 | P1 | pass | 実装レベルの受入条件は unit/fixture/eval で確認済み。live browser/manual UAT evidence は REC-010 で扱う。 | none。browser/Playwright は通常 unit test 必須にせず、保存済み evidence content gate として管理する。 |
 | REC-007 | P1 | open | MVP/anvildev same-condition normalized trace diff、G-S01〜G-S16 status update。 | code reference だけで parity pass、trace 欠損 gate の pass 扱い。 |
 | REC-008 | P2 | open | provider probe summary、skip reason、provider-specific args shape observation。 | fake fixture のみで provider-sensitive fix を完了扱い、unsafe args recovery。 |
 | REC-009 | P2 | open | verify normalization fixture、original/normalized verify event、runtime Bash policy rejection fixture。 | shell control syntax 許可、setup/build ordering 違反の success、normalization event 欠損。 |
@@ -527,6 +527,22 @@ source は build/verifier と dev script contract に寄っており、browser-l
 - TUI summary に full success / partial / incomplete が区別して表示される。
 - browser evidence JSON が壊れている、`ok=false`、HTTP 4xx/5xx、canvas/interactive surface missing の場合は full pass にしない。
 - browser check を実行できない環境では release full pass ではなく partial に固定する。
+
+### 実装結果
+
+| 項目 | 内容 |
+| --- | --- |
+| status | pass |
+| 実施日 | 2026-07-01 |
+| 実施 step | RECOVERY-001-D / REC-006 |
+| 実装概要 | 通常 plan-run / ultra-plan-run の final acceptance に browser/interaction evidence content gate を接続した。Next.js interactive app/game では static capability evidence と route render / basic interaction evidence の両方を確認し、browser unavailable は `partial`、HTTP 4xx/5xx・`ok=false`・malformed JSON・canvas unavailable・interactive surface missing は full success 不可にした。TUI/run summary には `Final acceptance: full_success` / `partial` / `incomplete` を出し、event には `final_acceptance_status`、browser readiness status、interaction evidence status を残す。 |
+| source parity 判断 | intentionally different。source は build/verifier と deterministic completion authority に寄るが、MVP では release-grade acceptance として browser/interaction evidence gate を追加する。runtime に LLM judge は入れず、保存済み JSON evidence と source/static evidence の deterministic 判定に限定した。 |
+| 証跡 | `mvp/anvilminimal/src/minimal_loop/evidence.rs` unit tests: browser unavailable inconclusive、route+interaction evidence pass、HTTP 500 fail、canvas unavailable fail。`mvp/anvilminimal/src/planner/runner.rs` unit tests: partial release gate、HTTP 500 failure、browser ready without interaction partial、browser+interaction pass、browser ok without render detail partial、canvas unavailable failure。`mvp/anvilminimal/tests/eval/test_browser_interaction_oracle.py`: adapter unavailable、HTTP 500、ready route without render unavailable、saved evidence pass、ok-only unavailable、canvas unavailable failure。`mvp/anvilminimal/tests/eval/test_parity_gate_report.py`: release evidence content validation、malformed JSON rejection、ok-only partial、canvas unavailable blocker。 |
+| 通過した確認 | unit / fixture / targeted eval / full eval。`cargo test --manifest-path mvp/anvilminimal/Cargo.toml --quiet` は 414 passed。`pytest -q mvp/anvilminimal/tests/eval` は 206 passed, 1 skipped, 65 subtests passed。 |
+| 未確認事項 | live Playwright/browser UAT と source/MVP same-condition trace diff は未実施。browser を通常 unit test 必須依存にしない制約に従い、REC-006 では保存済み evidence JSON の内容 gate で確認した。manual live evidence は REC-010、source trace diff は REC-007 で扱う。 |
+| blocking condition | none |
+| 次の確認タイミング | REC-007 source/MVP trace diff 後 / REC-010 manual TUI browser UAT 後 / release gate 判定時 |
+| rollback 判断 | rollback 不要。残リスクは live browser 実行環境依存で、通常 test では adapter unavailable を partial として扱い、release gate で evidence content を必須化することで管理する。 |
 
 ---
 

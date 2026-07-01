@@ -124,8 +124,11 @@ class ParityGateReportTest(unittest.TestCase):
             interaction = root / "interaction.json"
             events = root / "events.jsonl"
             uat.write_text("manual UAT evidence", encoding="utf-8")
-            browser.write_text(json.dumps({"ok": True, "http_status": 200}), encoding="utf-8")
-            interaction.write_text(json.dumps({"ok": True}), encoding="utf-8")
+            browser.write_text(json.dumps({"ok": True, "http_status": 200, "route_rendered": True}), encoding="utf-8")
+            interaction.write_text(
+                json.dumps({"ok": True, "interaction_performed": True, "state_changed": True}),
+                encoding="utf-8",
+            )
             events.write_text(
                 json.dumps({"event": "tui_command_stop", "ok": True}) + "\n",
                 encoding="utf-8",
@@ -210,6 +213,53 @@ class ParityGateReportTest(unittest.TestCase):
             "evidence_invalid",
         )
 
+    def test_release_gate_treats_browser_ok_without_render_detail_as_partial(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            uat, browser, interaction, events = release_evidence_files(root)
+            browser.write_text(json.dumps({"ok": True, "http_status": 200}), encoding="utf-8")
+            report = build_parity_gate_report(
+                base_report=self.base_report(),
+                gate_level="release",
+                uat_evidence_paths=[str(uat)],
+                browser_evidence_paths=[str(browser)],
+                interaction_evidence_paths=[str(interaction)],
+                tui_event_paths=[str(events)],
+            )
+        uat_equivalent = report["uat_equivalent"]
+        self.assertEqual(uat_equivalent["status"], "partial")
+        self.assertIn(
+            "browser_readiness:browser_render_evidence_missing",
+            release_evidence_gaps(uat_equivalent),
+        )
+
+    def test_release_gate_rejects_canvas_unavailable_interaction_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            uat, browser, interaction, events = release_evidence_files(root)
+            interaction.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "interaction_performed": True,
+                        "state_changed": True,
+                        "canvas_found": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = build_parity_gate_report(
+                base_report=self.base_report(),
+                gate_level="release",
+                uat_evidence_paths=[str(uat)],
+                browser_evidence_paths=[str(browser)],
+                interaction_evidence_paths=[str(interaction)],
+                tui_event_paths=[str(events)],
+            )
+        uat_equivalent = report["uat_equivalent"]
+        self.assertEqual(uat_equivalent["status"], "fail")
+        self.assertIn("interaction:canvas_unavailable", release_evidence_blockers(uat_equivalent))
+
 
 def summary_row(
     *,
@@ -247,8 +297,11 @@ def release_evidence_files(root: Path):
     interaction = root / "interaction.json"
     events = root / "events.jsonl"
     uat.write_text("manual UAT evidence", encoding="utf-8")
-    browser.write_text(json.dumps({"ok": True, "http_status": 200}), encoding="utf-8")
-    interaction.write_text(json.dumps({"ok": True}), encoding="utf-8")
+    browser.write_text(json.dumps({"ok": True, "http_status": 200, "route_rendered": True}), encoding="utf-8")
+    interaction.write_text(
+        json.dumps({"ok": True, "interaction_performed": True, "state_changed": True}),
+        encoding="utf-8",
+    )
     events.write_text(
         json.dumps({"event": "tui_command_stop", "ok": True}) + "\n",
         encoding="utf-8",

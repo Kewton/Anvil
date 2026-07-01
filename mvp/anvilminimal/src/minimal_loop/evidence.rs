@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeAcceptanceReport {
@@ -15,6 +16,10 @@ pub struct RuntimeAcceptanceReport {
     pub artifact_obligations: Vec<ArtifactObligationEvidence>,
     pub capability_evidence_bindings: Vec<CapabilityEvidenceBinding>,
     pub obligation_repair_targets: Vec<ObligationRepairTarget>,
+    pub browser_readiness_status: String,
+    pub browser_readiness_evidence_path: String,
+    pub interaction_evidence_status: String,
+    pub interaction_evidence_path: String,
     pub primary_reason: String,
 }
 
@@ -42,6 +47,14 @@ pub struct ObligationRepairTarget {
     pub target_role: String,
     pub target_path: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct BrowserInteractionEvidence {
+    pub browser_readiness_status: String,
+    pub browser_readiness_evidence_path: String,
+    pub interaction_evidence_status: String,
+    pub interaction_evidence_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +144,364 @@ struct SourceFile {
     content: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserEvidenceKind {
+    BrowserReadiness,
+    Interaction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BrowserEvidenceStatus {
+    Passed,
+    Failed(String),
+    Unavailable(String),
+}
+
+impl BrowserEvidenceStatus {
+    fn as_status(&self) -> String {
+        match self {
+            Self::Passed => "passed".to_string(),
+            Self::Failed(reason) => format!("failed:{reason}"),
+            Self::Unavailable(reason) => format!("unavailable:{reason}"),
+        }
+    }
+}
+
+pub fn browser_interaction_evidence_for_dirs(
+    root: &Path,
+    extra_dirs: &[PathBuf],
+) -> BrowserInteractionEvidence {
+    let browser = read_browser_evidence(
+        root,
+        extra_dirs,
+        &[
+            "browser-readiness.json",
+            "browser.json",
+            "browser-readiness-evidence.json",
+        ],
+        BrowserEvidenceKind::BrowserReadiness,
+        "browser_readiness_evidence_missing",
+    );
+    let interaction = read_browser_evidence(
+        root,
+        extra_dirs,
+        &[
+            "interaction-evidence.json",
+            "interaction.json",
+            "browser-interaction.json",
+        ],
+        BrowserEvidenceKind::Interaction,
+        "interaction_evidence_missing",
+    );
+    BrowserInteractionEvidence {
+        browser_readiness_status: browser.0.as_status(),
+        browser_readiness_evidence_path: browser.1,
+        interaction_evidence_status: interaction.0.as_status(),
+        interaction_evidence_path: interaction.1,
+    }
+}
+
+fn read_browser_evidence(
+    root: &Path,
+    extra_dirs: &[PathBuf],
+    names: &[&str],
+    kind: BrowserEvidenceKind,
+    missing_reason: &'static str,
+) -> (BrowserEvidenceStatus, String) {
+    for path in browser_evidence_candidate_paths(root, extra_dirs, names) {
+        if !path.is_file() {
+            continue;
+        }
+        let display = path.display().to_string();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return (
+                BrowserEvidenceStatus::Failed("evidence_unreadable".to_string()),
+                display,
+            );
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            return (
+                BrowserEvidenceStatus::Failed("evidence_invalid_json".to_string()),
+                display,
+            );
+        };
+        if !value.is_object() {
+            return (
+                BrowserEvidenceStatus::Failed("evidence_invalid_json".to_string()),
+                display,
+            );
+        }
+        return (classify_browser_evidence_json(kind, &value), display);
+    }
+    (
+        BrowserEvidenceStatus::Unavailable(missing_reason.to_string()),
+        String::new(),
+    )
+}
+
+fn browser_evidence_candidate_paths(
+    root: &Path,
+    extra_dirs: &[PathBuf],
+    names: &[&str],
+) -> Vec<PathBuf> {
+    let mut dirs = extra_dirs.to_vec();
+    dirs.push(root.join(".anvil"));
+    dirs.push(root.to_path_buf());
+    let mut out = Vec::new();
+    for dir in dirs {
+        for name in names {
+            let path = dir.join(name);
+            if !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn classify_browser_evidence_json(
+    kind: BrowserEvidenceKind,
+    value: &Value,
+) -> BrowserEvidenceStatus {
+    let details = value
+        .get("browser_details")
+        .or_else(|| value.get("details"))
+        .filter(|value| value.is_object());
+    if let Some(status) =
+        numeric_field_deep(value, details, &["http_status", "status", "status_code"])
+        && status >= 400
+    {
+        return BrowserEvidenceStatus::Failed(format!("http_{status}"));
+    }
+    if let Some(success) = bool_field_deep(
+        value,
+        details,
+        &["ok", "success", "browser_success", "interaction_success"],
+    ) && !success
+    {
+        return BrowserEvidenceStatus::Failed(browser_evidence_failure_reason(value, details));
+    }
+    if let Some(reason) = explicit_browser_evidence_failure(kind, value, details) {
+        return BrowserEvidenceStatus::Failed(reason);
+    }
+    if let Some(status) = text_field_deep(value, details, &["status"]) {
+        if matches!(
+            status.as_str(),
+            "not_enabled" | "adapter_not_implemented" | "unavailable" | "skipped"
+        ) {
+            return BrowserEvidenceStatus::Unavailable(status);
+        }
+        if matches!(status.as_str(), "failed" | "fail" | "error") {
+            return BrowserEvidenceStatus::Failed(browser_evidence_failure_reason(value, details));
+        }
+    }
+    if let Some(kind_value) = text_field_deep(
+        value,
+        details,
+        &["browser_failure_kind", "failure_kind", "error_kind"],
+    ) && !kind_value.is_empty()
+    {
+        return BrowserEvidenceStatus::Failed(kind_value);
+    }
+    if browser_evidence_has_required_detail(kind, value, details) {
+        return BrowserEvidenceStatus::Passed;
+    }
+    let success_like = bool_field_deep(
+        value,
+        details,
+        &["ok", "success", "browser_success", "interaction_success"],
+    ) == Some(true)
+        || text_field_deep(value, details, &["status"])
+            .is_some_and(|status| matches!(status.as_str(), "ok" | "pass" | "passed" | "ready"))
+        || numeric_field_deep(value, details, &["http_status", "status", "status_code"])
+            .is_some_and(|status| (200..400).contains(&status));
+    if success_like {
+        return BrowserEvidenceStatus::Unavailable(
+            match kind {
+                BrowserEvidenceKind::BrowserReadiness => "browser_render_evidence_missing",
+                BrowserEvidenceKind::Interaction => "interaction_detail_missing",
+            }
+            .to_string(),
+        );
+    }
+    BrowserEvidenceStatus::Unavailable("evidence_inconclusive".to_string())
+}
+
+fn explicit_browser_evidence_failure(
+    kind: BrowserEvidenceKind,
+    value: &Value,
+    details: Option<&Value>,
+) -> Option<String> {
+    match kind {
+        BrowserEvidenceKind::BrowserReadiness => {
+            if bool_field_deep(
+                value,
+                details,
+                &["route_rendered", "rendered", "page_loaded", "dom_ready"],
+            ) == Some(false)
+            {
+                return Some("browser_route_not_rendered".to_string());
+            }
+        }
+        BrowserEvidenceKind::Interaction => {
+            if bool_field_deep(value, details, &["canvas_found", "canvas_available"]) == Some(false)
+            {
+                return Some("canvas_unavailable".to_string());
+            }
+            if bool_field_deep(
+                value,
+                details,
+                &["interactive_surface", "interaction_surface"],
+            ) == Some(false)
+            {
+                return Some("interactive_surface_missing".to_string());
+            }
+            if bool_field_deep(
+                value,
+                details,
+                &[
+                    "input_event_observed",
+                    "keyboard_event_observed",
+                    "pointer_event_observed",
+                ],
+            ) == Some(false)
+            {
+                return Some("input_event_missing".to_string());
+            }
+            if bool_field_deep(value, details, &["state_changed", "visible_state_changed"])
+                == Some(false)
+            {
+                return Some("interaction_state_change_missing".to_string());
+            }
+        }
+    }
+    None
+}
+
+fn browser_evidence_has_required_detail(
+    kind: BrowserEvidenceKind,
+    value: &Value,
+    details: Option<&Value>,
+) -> bool {
+    match kind {
+        BrowserEvidenceKind::BrowserReadiness => {
+            bool_field_deep(
+                value,
+                details,
+                &["route_rendered", "rendered", "page_loaded", "dom_ready"],
+            ) == Some(true)
+        }
+        BrowserEvidenceKind::Interaction => {
+            bool_field_deep(
+                value,
+                details,
+                &[
+                    "interaction_performed",
+                    "basic_interaction",
+                    "interaction_success",
+                    "input_event_observed",
+                    "keyboard_event_observed",
+                    "pointer_event_observed",
+                    "state_changed",
+                    "visible_state_changed",
+                ],
+            ) == Some(true)
+        }
+    }
+}
+
+fn browser_evidence_failure_reason(value: &Value, details: Option<&Value>) -> String {
+    if let Some(status) =
+        numeric_field_deep(value, details, &["http_status", "status", "status_code"])
+        && status >= 400
+    {
+        return format!("http_{status}");
+    }
+    text_field_deep(
+        value,
+        details,
+        &[
+            "browser_failure_kind",
+            "failure_kind",
+            "error_kind",
+            "status",
+        ],
+    )
+    .unwrap_or_else(|| "browser_check_failed".to_string())
+}
+
+fn record_browser_acceptance_evidence(
+    evidence: &BrowserInteractionEvidence,
+    missing_evidence: &mut Vec<String>,
+    inconclusive_reasons: &mut Vec<String>,
+) {
+    record_browser_status(
+        "browser_readiness",
+        &evidence.browser_readiness_status,
+        missing_evidence,
+        inconclusive_reasons,
+    );
+    record_browser_status(
+        "browser_interaction",
+        &evidence.interaction_evidence_status,
+        missing_evidence,
+        inconclusive_reasons,
+    );
+}
+
+fn record_browser_status(
+    label: &str,
+    status: &str,
+    missing_evidence: &mut Vec<String>,
+    inconclusive_reasons: &mut Vec<String>,
+) {
+    if let Some(reason) = status.strip_prefix("failed:") {
+        missing_evidence.push(format!("{label}_failed:{reason}"));
+    } else if let Some(reason) = status.strip_prefix("unavailable:") {
+        inconclusive_reasons.push(format!("{label}_unavailable:{reason}"));
+    }
+}
+
+fn bool_field_deep(value: &Value, details: Option<&Value>, keys: &[&str]) -> Option<bool> {
+    bool_field(value, keys).or_else(|| details.and_then(|details| bool_field(details, keys)))
+}
+
+fn bool_field(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_bool))
+}
+
+fn numeric_field_deep(value: &Value, details: Option<&Value>, keys: &[&str]) -> Option<i64> {
+    numeric_field(value, keys).or_else(|| details.and_then(|details| numeric_field(details, keys)))
+}
+
+fn numeric_field(value: &Value, keys: &[&str]) -> Option<i64> {
+    for key in keys {
+        let Some(raw) = value.get(*key) else {
+            continue;
+        };
+        if let Some(number) = raw.as_i64() {
+            return Some(number);
+        }
+        if let Some(text) = raw.as_str()
+            && let Ok(number) = text.parse::<i64>()
+        {
+            return Some(number);
+        }
+    }
+    None
+}
+
+fn text_field_deep(value: &Value, details: Option<&Value>, keys: &[&str]) -> Option<String> {
+    text_field(value, keys).or_else(|| details.and_then(|details| text_field(details, keys)))
+}
+
+fn text_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(|text| text.trim().to_ascii_lowercase())
+}
+
 pub fn required_evidence_for_capability(capability: &str) -> Vec<String> {
     evidence_kinds_for_capability(capability)
         .into_iter()
@@ -146,6 +517,28 @@ pub fn verify_runtime_acceptance(
     required_evidence: &[String],
     required_obligations: &[String],
     deferred_verify_requirements: &[String],
+) -> RuntimeAcceptanceReport {
+    verify_runtime_acceptance_with_browser_dirs(
+        root,
+        required_paths,
+        verify_commands,
+        required_capabilities,
+        required_evidence,
+        required_obligations,
+        deferred_verify_requirements,
+        &[],
+    )
+}
+
+pub fn verify_runtime_acceptance_with_browser_dirs(
+    root: &Path,
+    required_paths: &[String],
+    verify_commands: &[String],
+    required_capabilities: &[String],
+    required_evidence: &[String],
+    required_obligations: &[String],
+    deferred_verify_requirements: &[String],
+    browser_evidence_dirs: &[PathBuf],
 ) -> RuntimeAcceptanceReport {
     if required_capabilities.is_empty()
         && required_evidence.is_empty()
@@ -182,11 +575,17 @@ pub fn verify_runtime_acceptance(
     let mut missing_evidence = Vec::new();
     let mut weak_evidence = Vec::new();
     let mut inconclusive_reasons = Vec::new();
-    if required_capabilities
+    let browser_required = required_capabilities
         .iter()
-        .any(|capability| capability.trim() == "browser_interaction")
-    {
-        inconclusive_reasons.push("browser_required_but_not_available".to_string());
+        .any(|capability| capability.trim() == "browser_interaction");
+    let browser_interaction = browser_required
+        .then(|| browser_interaction_evidence_for_dirs(root, browser_evidence_dirs));
+    if let Some(evidence) = &browser_interaction {
+        record_browser_acceptance_evidence(
+            evidence,
+            &mut missing_evidence,
+            &mut inconclusive_reasons,
+        );
     }
     for evidence in &required {
         match evidence.as_str() {
@@ -311,6 +710,7 @@ pub fn verify_runtime_acceptance(
     } else {
         "pass".to_string()
     };
+    let browser_interaction = browser_interaction.unwrap_or_default();
 
     RuntimeAcceptanceReport {
         passed,
@@ -323,6 +723,10 @@ pub fn verify_runtime_acceptance(
         artifact_obligations,
         capability_evidence_bindings,
         obligation_repair_targets,
+        browser_readiness_status: browser_interaction.browser_readiness_status,
+        browser_readiness_evidence_path: browser_interaction.browser_readiness_evidence_path,
+        interaction_evidence_status: browser_interaction.interaction_evidence_status,
+        interaction_evidence_path: browser_interaction.interaction_evidence_path,
         primary_reason,
     }
 }
@@ -1900,7 +2304,11 @@ export default function Page(){
         std::fs::write(
             dir.path().join("src/app/page.tsx"),
             r#""use client";
-export default function Page(){ return <button onClick={() => alert("ok")}>Go</button>; }
+import { useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  return <main><button onClick={() => setScore(score + 1)}>Go</button><p>score {score}</p></main>;
+}
 "#,
         )
         .unwrap();
@@ -1915,10 +2323,132 @@ export default function Page(){ return <button onClick={() => alert("ok")}>Go</b
         );
         assert!(!report.passed);
         assert!(report.inconclusive);
+        assert!(report.inconclusive_reasons.contains(
+            &"browser_readiness_unavailable:browser_readiness_evidence_missing".to_string()
+        ));
+        assert!(
+            report.inconclusive_reasons.contains(
+                &"browser_interaction_unavailable:interaction_evidence_missing".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn browser_interaction_requires_render_and_interaction_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  return <main><button onClick={() => setScore(score + 1)}>Go</button><p>score {score}</p></main>;
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":true,"http_status":200,"route_rendered":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("interaction-evidence.json"),
+            r#"{"ok":true,"interaction_performed":true,"input_event_observed":true,"state_changed":true}"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["browser_interaction".to_string()],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(report.passed, "{report:?}");
+        assert_eq!(report.browser_readiness_status, "passed");
+        assert_eq!(report.interaction_evidence_status, "passed");
+    }
+
+    #[test]
+    fn browser_http_500_fails_runtime_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+export default function Page(){ return <button onClick={() => alert("ok")}>Go</button>; }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":false,"http_status":500,"failure_kind":"browser_http_500"}"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["browser_interaction".to_string()],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!report.passed);
         assert!(
             report
-                .inconclusive_reasons
-                .contains(&"browser_required_but_not_available".to_string())
+                .missing_evidence
+                .contains(&"browser_readiness_failed:http_500".to_string())
+        );
+        assert_eq!(report.browser_readiness_status, "failed:http_500");
+    }
+
+    #[test]
+    fn canvas_unavailable_fails_runtime_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  return <main><canvas /><button onClick={() => setScore(score + 1)}>Go</button><p>score {score}</p></main>;
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":true,"http_status":200,"route_rendered":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("interaction-evidence.json"),
+            r#"{"ok":true,"interaction_performed":true,"canvas_found":false}"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["browser_interaction".to_string()],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!report.passed);
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"browser_interaction_failed:canvas_unavailable".to_string())
+        );
+        assert_eq!(
+            report.interaction_evidence_status,
+            "failed:canvas_unavailable"
         );
     }
 

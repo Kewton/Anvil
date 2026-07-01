@@ -75,7 +75,16 @@ class BrowserInteractionOracleTest(unittest.TestCase):
             run_dir = root / "run"
             run_dir.mkdir(parents=True)
             (run_dir / "browser-readiness.json").write_text(
-                json.dumps({"ok": True, "http_status": 200}),
+                json.dumps(
+                    {
+                        "ok": True,
+                        "http_status": 200,
+                        "route_rendered": True,
+                        "interaction_performed": True,
+                        "input_event_observed": True,
+                        "state_changed": True,
+                    }
+                ),
                 encoding="utf-8",
             )
             result = evaluate_browser_oracle(
@@ -88,6 +97,57 @@ class BrowserInteractionOracleTest(unittest.TestCase):
             )
         self.assertTrue(result["browser_success"])
         self.assertEqual(result["browser_details"]["status"], "passed")
+
+    def test_saved_browser_ok_without_render_or_interaction_detail_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "run"
+            run_dir.mkdir(parents=True)
+            (run_dir / "browser-readiness.json").write_text(
+                json.dumps({"ok": True, "http_status": 200}),
+                encoding="utf-8",
+            )
+            result = evaluate_browser_oracle(
+                {
+                    "profile": "nextjs",
+                    "prompt": "Create a keyboard controlled game.",
+                },
+                root / "workdir",
+                run_dir=run_dir,
+            )
+        self.assertEqual(result["browser_success"], "")
+        self.assertEqual(
+            result["browser_details"]["status"],
+            "browser_render_or_interaction_evidence_missing",
+        )
+
+    def test_saved_browser_canvas_unavailable_is_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            run_dir = root / "run"
+            run_dir.mkdir(parents=True)
+            (run_dir / "browser-readiness.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "http_status": 200,
+                        "route_rendered": True,
+                        "interaction_performed": True,
+                        "canvas_found": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = evaluate_browser_oracle(
+                {
+                    "profile": "nextjs",
+                    "prompt": "Create a keyboard controlled game.",
+                },
+                root / "workdir",
+                run_dir=run_dir,
+            )
+        self.assertFalse(result["browser_success"])
+        self.assertEqual(result["browser_failure_kind"], "canvas_unavailable")
 
 
 if __name__ == "__main__":

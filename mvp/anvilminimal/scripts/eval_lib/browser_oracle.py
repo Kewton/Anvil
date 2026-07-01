@@ -117,16 +117,6 @@ def normalize_browser_evidence(
         "http_status",
         "status_code",
     )
-    if success is True:
-        return browser_pass(evidence_path=evidence_path, workdir=workdir, http_status=http_status)
-    if success is False:
-        return browser_fail(
-            failure_kind=browser_failure_kind(evidence, details, http_status=http_status),
-            evidence_path=evidence_path,
-            workdir=workdir,
-            status=status_value or "failed",
-            http_status=http_status,
-        )
     if http_status is not None and http_status >= 400:
         return browser_fail(
             failure_kind=f"browser_http_{http_status}",
@@ -135,13 +125,39 @@ def normalize_browser_evidence(
             status="failed",
             http_status=http_status,
         )
-    if http_status is not None and 200 <= http_status < 400 and status_value in {"ok", "pass", "passed", "ready"}:
-        return browser_pass(evidence_path=evidence_path, workdir=workdir, http_status=http_status)
-    if status_value in {"ok", "pass", "passed", "ready"}:
+    if success is False:
+        return browser_fail(
+            failure_kind=browser_failure_kind(evidence, details, http_status=http_status),
+            evidence_path=evidence_path,
+            workdir=workdir,
+            status=status_value or "failed",
+            http_status=http_status,
+        )
+    explicit_failure = browser_detail_failure(evidence, details)
+    if explicit_failure:
+        return browser_fail(
+            failure_kind=explicit_failure,
+            evidence_path=evidence_path,
+            workdir=workdir,
+            status="failed",
+            http_status=http_status,
+        )
+    if saved_browser_evidence_has_required_details(evidence, details):
         return browser_pass(evidence_path=evidence_path, workdir=workdir, http_status=http_status)
     if status_value in {"not_enabled", "adapter_not_implemented", "unavailable"}:
         return browser_unavailable(
             status=status_value,
+            evidence_path=evidence_path,
+            workdir=workdir,
+            http_status=http_status,
+        )
+    if (
+        success is True
+        or (http_status is not None and 200 <= http_status < 400)
+        or status_value in {"ok", "pass", "passed", "ready"}
+    ):
+        return browser_unavailable(
+            status="browser_render_or_interaction_evidence_missing",
             evidence_path=evidence_path,
             workdir=workdir,
             http_status=http_status,
@@ -263,6 +279,51 @@ def browser_failure_kind(
         "error_kind",
     )
     return kind or "browser_behavior_failure"
+
+
+def saved_browser_evidence_has_required_details(
+    evidence: dict[str, Any], details: dict[str, Any]
+) -> bool:
+    return any_true(evidence, details, "route_rendered", "rendered", "page_loaded", "dom_ready") and any_true(
+        evidence,
+        details,
+        "interaction_performed",
+        "basic_interaction",
+        "interaction_success",
+        "input_event_observed",
+        "keyboard_event_observed",
+        "pointer_event_observed",
+        "state_changed",
+        "visible_state_changed",
+    )
+
+
+def browser_detail_failure(evidence: dict[str, Any], details: dict[str, Any]) -> str:
+    if any_false(evidence, details, "route_rendered", "rendered", "page_loaded", "dom_ready"):
+        return "browser_route_not_rendered"
+    if any_false(evidence, details, "canvas_found", "canvas_available"):
+        return "canvas_unavailable"
+    if any_false(evidence, details, "interactive_surface", "interaction_surface"):
+        return "interactive_surface_missing"
+    if any_false(
+        evidence,
+        details,
+        "input_event_observed",
+        "keyboard_event_observed",
+        "pointer_event_observed",
+    ):
+        return "input_event_missing"
+    if any_false(evidence, details, "state_changed", "visible_state_changed"):
+        return "interaction_state_change_missing"
+    return ""
+
+
+def any_true(evidence: dict[str, Any], details: dict[str, Any], *keys: str) -> bool:
+    return any(bool_field(evidence, key) is True or bool_field(details, key) is True for key in keys)
+
+
+def any_false(evidence: dict[str, Any], details: dict[str, Any], *keys: str) -> bool:
+    return any(bool_field(evidence, key) is False or bool_field(details, key) is False for key in keys)
 
 
 def bool_field(value: dict[str, Any], *keys: str) -> bool | None:

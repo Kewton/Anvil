@@ -387,6 +387,14 @@ def evaluate_browser_evidence(paths: list[str]) -> dict[str, Any]:
     details = value.get("browser_details") if isinstance(value.get("browser_details"), dict) else {}
     if status_code is None:
         status_code = int_field(details, "http_status", "status", "status_code")
+    if status_code is not None and status_code >= 400:
+        return {
+            "status": "fail",
+            "path": path,
+            "failure_kind": f"browser_http_{status_code}",
+            "http_status": status_code,
+            "reason": f"http_{status_code}",
+        }
     if ok is False:
         failure = browser_failure_kind(value, details, status_code)
         return {
@@ -396,16 +404,17 @@ def evaluate_browser_evidence(paths: list[str]) -> dict[str, Any]:
             "http_status": status_code or "",
             "reason": failure,
         }
-    if status_code is not None and status_code >= 400:
+    explicit_failure = browser_readiness_detail_failure(value, details)
+    if explicit_failure:
         return {
             "status": "fail",
             "path": path,
-            "failure_kind": f"browser_http_{status_code}",
-            "http_status": status_code,
-            "reason": f"http_{status_code}",
+            "failure_kind": explicit_failure,
+            "http_status": status_code or "",
+            "reason": explicit_failure,
         }
     text_status = text_field(value, "status") or text_field(details, "status")
-    if ok is True:
+    if browser_readiness_has_required_detail(value, details):
         return {"status": "pass", "path": path, "http_status": status_code or ""}
     if text_status in {"not_enabled", "adapter_not_implemented", "unavailable"}:
         return {
@@ -414,8 +423,13 @@ def evaluate_browser_evidence(paths: list[str]) -> dict[str, Any]:
             "reason": text_status,
             "http_status": status_code or "",
         }
-    if text_status in {"ok", "pass", "passed", "ready"}:
-        return {"status": "pass", "path": path, "http_status": status_code or ""}
+    if ok is True or (status_code is not None and 200 <= status_code < 400) or text_status in {"ok", "pass", "passed", "ready"}:
+        return {
+            "status": "partial",
+            "path": path,
+            "reason": "browser_render_evidence_missing",
+            "http_status": status_code or "",
+        }
     return {
         "status": "invalid",
         "path": path,
@@ -430,8 +444,23 @@ def evaluate_interaction_evidence(paths: list[str]) -> dict[str, Any]:
     value = parsed["value"]
     path = parsed["path"]
     ok = bool_field(value, "ok", "success", "interaction_success")
+    details = value.get("browser_details") if isinstance(value.get("browser_details"), dict) else {}
+    explicit_failure = interaction_detail_failure(value, details)
+    if explicit_failure:
+        return {
+            "status": "fail",
+            "path": path,
+            "failure_kind": explicit_failure,
+            "reason": explicit_failure,
+        }
     if ok is True:
-        return {"status": "pass", "path": path}
+        if interaction_has_required_detail(value, details):
+            return {"status": "pass", "path": path}
+        return {
+            "status": "partial",
+            "path": path,
+            "reason": "interaction_detail_missing",
+        }
     if ok is False:
         return {
             "status": "fail",
@@ -535,6 +564,57 @@ def browser_failure_kind(
         or text_field(details, "browser_failure_kind", "failure_kind", "error_kind")
         or "browser_failed"
     )
+
+
+def browser_readiness_has_required_detail(value: dict[str, Any], details: dict[str, Any]) -> bool:
+    return any_true(value, details, "route_rendered", "rendered", "page_loaded", "dom_ready")
+
+
+def browser_readiness_detail_failure(value: dict[str, Any], details: dict[str, Any]) -> str:
+    if any_false(value, details, "route_rendered", "rendered", "page_loaded", "dom_ready"):
+        return "browser_route_not_rendered"
+    return ""
+
+
+def interaction_has_required_detail(value: dict[str, Any], details: dict[str, Any]) -> bool:
+    return any_true(
+        value,
+        details,
+        "interaction_performed",
+        "basic_interaction",
+        "interaction_success",
+        "input_event_observed",
+        "keyboard_event_observed",
+        "pointer_event_observed",
+        "state_changed",
+        "visible_state_changed",
+    )
+
+
+def interaction_detail_failure(value: dict[str, Any], details: dict[str, Any]) -> str:
+    if any_false(value, details, "canvas_found", "canvas_available"):
+        return "canvas_unavailable"
+    if any_false(value, details, "interactive_surface", "interaction_surface"):
+        return "interactive_surface_missing"
+    if any_false(
+        value,
+        details,
+        "input_event_observed",
+        "keyboard_event_observed",
+        "pointer_event_observed",
+    ):
+        return "input_event_missing"
+    if any_false(value, details, "state_changed", "visible_state_changed"):
+        return "interaction_state_change_missing"
+    return ""
+
+
+def any_true(value: dict[str, Any], details: dict[str, Any], *keys: str) -> bool:
+    return any(bool_field(value, key) is True or bool_field(details, key) is True for key in keys)
+
+
+def any_false(value: dict[str, Any], details: dict[str, Any], *keys: str) -> bool:
+    return any(bool_field(value, key) is False or bool_field(details, key) is False for key in keys)
 
 
 def bool_field(value: dict[str, Any], *keys: str) -> bool | None:

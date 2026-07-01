@@ -6,7 +6,9 @@ use crate::eval_events;
 use crate::minimal_loop::build_verifier::emit_dependency_build_lifecycle;
 use crate::minimal_loop::completion::CompletionContract;
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
-use crate::minimal_loop::evidence::{required_evidence_for_capability, verify_runtime_acceptance};
+use crate::minimal_loop::evidence::{
+    required_evidence_for_capability, verify_runtime_acceptance_with_browser_dirs,
+};
 use crate::minimal_loop::loop_run::{
     RunSessionOptions, RunSessionOutcome, RunSessionStepKind, extract_requested_artifact_paths,
     run_session_with_outcome_with_options,
@@ -1132,7 +1134,7 @@ fn verify_plan_final_contract(
         || !required_evidence.is_empty()
         || !required_obligations.is_empty();
     let runtime_acceptance = runtime_acceptance_required.then(|| {
-        verify_runtime_acceptance(
+        verify_runtime_acceptance_with_browser_dirs(
             &config.workspace_root,
             &required_paths,
             &verify_commands,
@@ -1140,6 +1142,7 @@ fn verify_plan_final_contract(
             &required_evidence,
             &required_obligations,
             &deferred_commands,
+            &release_evidence_extra_dirs(config),
         )
     });
     let release_gate = final_acceptance_release_gate(
@@ -1158,6 +1161,7 @@ fn verify_plan_final_contract(
     let release_gate_failed = release_gate.status == "failed";
     let ok =
         missing_final_artifacts.is_empty() && external_ok && runtime_ok && !release_gate_failed;
+    let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
     let primary_reason = if !missing_final_artifacts.is_empty() {
         format!(
             "missing final artifacts: {}",
@@ -1172,7 +1176,7 @@ fn verify_plan_final_contract(
     } else {
         "ok".to_string()
     };
-    if release_gate.status != "pass"
+    if release_gate.status != "not_applicable"
         && runtime_ok
         && missing_final_artifacts.is_empty()
         && external_ok
@@ -1226,6 +1230,7 @@ fn verify_plan_final_contract(
                 .as_ref()
                 .map(|report| report.inconclusive)
                 .unwrap_or(false),
+            "final_acceptance_status": final_acceptance_status,
             "release_gate_status": release_gate.status.clone(),
             "release_gate_reasons": release_gate.reasons.clone(),
             "browser_readiness_status": release_gate.browser_readiness_status.clone(),
@@ -2393,7 +2398,7 @@ fn ultra_final_acceptance_report(
         &inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities),
     );
     let missing = missing_final_artifacts(&config.workspace_root, &required_paths);
-    let acceptance = verify_runtime_acceptance(
+    let acceptance = verify_runtime_acceptance_with_browser_dirs(
         &config.workspace_root,
         &required_paths,
         &verify_commands,
@@ -2401,6 +2406,7 @@ fn ultra_final_acceptance_report(
         &required_evidence,
         &required_obligations,
         &deferred_commands,
+        &release_evidence_extra_dirs(config),
     );
     let release_gate = final_acceptance_release_gate(
         config,
@@ -2409,7 +2415,8 @@ fn ultra_final_acceptance_report(
         &required_capabilities,
         Some(&acceptance),
     );
-    if release_gate.status != "pass" && acceptance.passed && missing.is_empty() {
+    let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
+    if release_gate.status != "not_applicable" && acceptance.passed && missing.is_empty() {
         append_release_gate_summary(config, &release_gate);
     }
     eval_events::emit(
@@ -2423,6 +2430,7 @@ fn ultra_final_acceptance_report(
             "required_obligations": required_obligations.clone(),
             "runtime_acceptance_passed": acceptance.passed,
             "runtime_acceptance_inconclusive": acceptance.inconclusive,
+            "final_acceptance_status": final_acceptance_status,
             "missing_capabilities": acceptance.missing_capabilities.clone(),
             "missing_evidence": acceptance.missing_evidence.clone(),
             "missing_obligations": acceptance.missing_obligations.clone(),
@@ -2664,6 +2672,12 @@ struct ReleaseEvidence {
     path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseEvidenceKind {
+    BrowserReadiness,
+    Interaction,
+}
+
 fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
     let browser = read_release_evidence(
         config,
@@ -2673,6 +2687,7 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
             "browser-readiness-evidence.json",
         ],
         "browser_readiness_evidence_missing",
+        ReleaseEvidenceKind::BrowserReadiness,
     );
     let interaction = read_release_evidence(
         config,
@@ -2682,6 +2697,7 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
             "browser-interaction.json",
         ],
         "interaction_evidence_missing",
+        ReleaseEvidenceKind::Interaction,
     );
     let browser_status = browser.status.as_status();
     let interaction_status = interaction.status.as_status();
@@ -2741,6 +2757,7 @@ fn read_release_evidence(
     config: &Config,
     names: &[&str],
     missing_reason: &'static str,
+    kind: ReleaseEvidenceKind,
 ) -> ReleaseEvidence {
     for path in release_evidence_candidate_paths(config, names) {
         if !path.is_file() {
@@ -2760,7 +2777,7 @@ fn read_release_evidence(
             };
         };
         return ReleaseEvidence {
-            status: classify_release_evidence_json(&json),
+            status: classify_release_evidence_json(kind, &json),
             path: display,
         };
     }
@@ -2786,73 +2803,179 @@ fn release_evidence_candidate_paths(config: &Config, names: &[&str]) -> Vec<Path
     out
 }
 
-fn classify_release_evidence_json(value: &Value) -> ReleaseEvidenceStatus {
-    if let Some(success) = bool_field(value, &["ok", "success", "browser_success"]) {
-        if success {
-            return ReleaseEvidenceStatus::Passed;
-        }
-        return ReleaseEvidenceStatus::Failed(evidence_failure_reason(value));
-    }
-    if let Some(details) = value
+fn release_evidence_extra_dirs(config: &Config) -> Vec<PathBuf> {
+    config
+        .eval_events_path
+        .as_ref()
+        .and_then(|events_path| events_path.parent())
+        .map(|run_dir| vec![run_dir.to_path_buf()])
+        .unwrap_or_default()
+}
+
+fn classify_release_evidence_json(
+    kind: ReleaseEvidenceKind,
+    value: &Value,
+) -> ReleaseEvidenceStatus {
+    let details = value
         .get("browser_details")
         .or_else(|| value.get("details"))
+        .filter(|value| value.is_object());
+    if let Some(status) =
+        numeric_field_deep(value, details, &["http_status", "status", "status_code"])
     {
-        if let Some(success) = bool_field(details, &["ok", "success", "browser_success"]) {
-            if success {
-                return ReleaseEvidenceStatus::Passed;
-            }
-            return ReleaseEvidenceStatus::Failed(evidence_failure_reason(details));
-        }
-        if let Some(status) = text_field(details, &["status"]) {
-            if matches!(
-                status.as_str(),
-                "not_enabled" | "adapter_not_implemented" | "unavailable"
-            ) {
-                return ReleaseEvidenceStatus::Unavailable(status);
-            }
-        }
-    }
-    if let Some(status) = numeric_field(value, &["http_status", "status", "status_code"]) {
         if status >= 400 {
             return ReleaseEvidenceStatus::Failed(format!("http_{status}"));
         }
-        if (200..400).contains(&status) {
-            return ReleaseEvidenceStatus::Passed;
-        }
     }
-    if let Some(kind) = text_field(
+    if let Some(success) = bool_field_deep(
         value,
-        &["browser_failure_kind", "failure_kind", "error_kind"],
+        details,
+        &["ok", "success", "browser_success", "interaction_success"],
     ) {
-        if !kind.is_empty() {
-            return ReleaseEvidenceStatus::Failed(kind);
+        if !success {
+            return ReleaseEvidenceStatus::Failed(evidence_failure_reason(value, details));
         }
     }
-    if let Some(status) = text_field(value, &["status"]) {
+    if let Some(reason) = explicit_release_evidence_failure(kind, value, details) {
+        return ReleaseEvidenceStatus::Failed(reason);
+    }
+    if let Some(status) = text_field_deep(value, details, &["status"]) {
         if matches!(
             status.as_str(),
-            "not_enabled" | "adapter_not_implemented" | "unavailable"
+            "not_enabled" | "adapter_not_implemented" | "unavailable" | "skipped"
         ) {
             return ReleaseEvidenceStatus::Unavailable(status);
         }
-        if matches!(status.as_str(), "ok" | "pass" | "passed" | "ready") {
-            return ReleaseEvidenceStatus::Passed;
+        if matches!(status.as_str(), "failed" | "fail" | "error") {
+            return ReleaseEvidenceStatus::Failed(evidence_failure_reason(value, details));
         }
-        if !status.is_empty() {
-            return ReleaseEvidenceStatus::Failed(status);
+    }
+    if let Some(kind_value) = text_field_deep(
+        value,
+        details,
+        &["browser_failure_kind", "failure_kind", "error_kind"],
+    ) {
+        if !kind_value.is_empty() {
+            return ReleaseEvidenceStatus::Failed(kind_value);
         }
+    }
+    if release_evidence_has_required_detail(kind, value, details) {
+        return ReleaseEvidenceStatus::Passed;
+    }
+    let status_is_pass_like = text_field_deep(value, details, &["status"])
+        .is_some_and(|status| matches!(status.as_str(), "ok" | "pass" | "passed" | "ready"));
+    let success_is_true = bool_field_deep(
+        value,
+        details,
+        &["ok", "success", "browser_success", "interaction_success"],
+    ) == Some(true);
+    let http_is_ok = numeric_field_deep(value, details, &["http_status", "status", "status_code"])
+        .is_some_and(|status| (200..400).contains(&status));
+    if success_is_true || status_is_pass_like || http_is_ok {
+        return ReleaseEvidenceStatus::Unavailable(
+            match kind {
+                ReleaseEvidenceKind::BrowserReadiness => "browser_render_evidence_missing",
+                ReleaseEvidenceKind::Interaction => "interaction_detail_missing",
+            }
+            .to_string(),
+        );
     }
     ReleaseEvidenceStatus::Unavailable("evidence_inconclusive".to_string())
 }
 
-fn evidence_failure_reason(value: &Value) -> String {
-    if let Some(status) = numeric_field(value, &["http_status", "status", "status_code"])
+fn explicit_release_evidence_failure(
+    kind: ReleaseEvidenceKind,
+    value: &Value,
+    details: Option<&Value>,
+) -> Option<String> {
+    match kind {
+        ReleaseEvidenceKind::BrowserReadiness => {
+            if bool_field_deep(
+                value,
+                details,
+                &["route_rendered", "rendered", "page_loaded", "dom_ready"],
+            ) == Some(false)
+            {
+                return Some("browser_route_not_rendered".to_string());
+            }
+        }
+        ReleaseEvidenceKind::Interaction => {
+            if bool_field_deep(value, details, &["canvas_found", "canvas_available"]) == Some(false)
+            {
+                return Some("canvas_unavailable".to_string());
+            }
+            if bool_field_deep(
+                value,
+                details,
+                &["interactive_surface", "interaction_surface"],
+            ) == Some(false)
+            {
+                return Some("interactive_surface_missing".to_string());
+            }
+            if bool_field_deep(
+                value,
+                details,
+                &[
+                    "input_event_observed",
+                    "keyboard_event_observed",
+                    "pointer_event_observed",
+                ],
+            ) == Some(false)
+            {
+                return Some("input_event_missing".to_string());
+            }
+            if bool_field_deep(value, details, &["state_changed", "visible_state_changed"])
+                == Some(false)
+            {
+                return Some("interaction_state_change_missing".to_string());
+            }
+        }
+    }
+    None
+}
+
+fn release_evidence_has_required_detail(
+    kind: ReleaseEvidenceKind,
+    value: &Value,
+    details: Option<&Value>,
+) -> bool {
+    match kind {
+        ReleaseEvidenceKind::BrowserReadiness => {
+            bool_field_deep(
+                value,
+                details,
+                &["route_rendered", "rendered", "page_loaded", "dom_ready"],
+            ) == Some(true)
+        }
+        ReleaseEvidenceKind::Interaction => {
+            bool_field_deep(
+                value,
+                details,
+                &[
+                    "interaction_performed",
+                    "basic_interaction",
+                    "interaction_success",
+                    "input_event_observed",
+                    "keyboard_event_observed",
+                    "pointer_event_observed",
+                    "state_changed",
+                    "visible_state_changed",
+                ],
+            ) == Some(true)
+        }
+    }
+}
+
+fn evidence_failure_reason(value: &Value, details: Option<&Value>) -> String {
+    if let Some(status) =
+        numeric_field_deep(value, details, &["http_status", "status", "status_code"])
         && status >= 400
     {
         return format!("http_{status}");
     }
-    text_field(
+    text_field_deep(
         value,
+        details,
         &[
             "browser_failure_kind",
             "failure_kind",
@@ -2863,9 +2986,17 @@ fn evidence_failure_reason(value: &Value) -> String {
     .unwrap_or_else(|| "browser_check_failed".to_string())
 }
 
+fn bool_field_deep(value: &Value, details: Option<&Value>, keys: &[&str]) -> Option<bool> {
+    bool_field(value, keys).or_else(|| details.and_then(|details| bool_field(details, keys)))
+}
+
 fn bool_field(value: &Value, keys: &[&str]) -> Option<bool> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_bool))
+}
+
+fn numeric_field_deep(value: &Value, details: Option<&Value>, keys: &[&str]) -> Option<i64> {
+    numeric_field(value, keys).or_else(|| details.and_then(|details| numeric_field(details, keys)))
 }
 
 fn numeric_field(value: &Value, keys: &[&str]) -> Option<i64> {
@@ -2885,6 +3016,10 @@ fn numeric_field(value: &Value, keys: &[&str]) -> Option<i64> {
     None
 }
 
+fn text_field_deep(value: &Value, details: Option<&Value>, keys: &[&str]) -> Option<String> {
+    text_field(value, keys).or_else(|| details.and_then(|details| text_field(details, keys)))
+}
+
 fn text_field(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
@@ -2895,7 +3030,8 @@ fn append_release_gate_summary(config: &Config, release_gate: &ReleaseGateSummar
     eval_events::append_run_summary(
         config.eval_events_path.as_deref(),
         &format!(
-            "Release gate: {}\nReasons:\n{}\nBrowser readiness: {}\nBrowser readiness evidence: {}\nInteraction evidence: {}\nInteraction evidence path: {}",
+            "Final acceptance: {}\nRelease gate: {}\nReasons:\n{}\nBrowser readiness: {}\nBrowser readiness evidence: {}\nInteraction evidence: {}\nInteraction evidence path: {}",
+            release_gate_final_acceptance_status(release_gate),
             release_gate.status,
             render_prompt_bullets(&release_gate.reasons),
             release_gate.browser_readiness_status,
@@ -2912,6 +3048,15 @@ fn append_release_gate_summary(config: &Config, release_gate: &ReleaseGateSummar
             },
         ),
     );
+}
+
+fn release_gate_final_acceptance_status(release_gate: &ReleaseGateSummary) -> &'static str {
+    match release_gate.status.as_str() {
+        "pass" | "not_applicable" => "full_success",
+        "partial" => "partial",
+        "failed" => "incomplete",
+        _ => "incomplete",
+    }
 }
 
 fn emit_ultra_phase_event(
@@ -6202,6 +6347,7 @@ export default function Page(){
         assert!(event_text.contains("\"nextjs_route_evidence\""));
         assert!(event_text.contains("\"build_command_or_dependency_missing_boundary\""));
         assert!(event_text.contains("\"release_gate_status\":\"partial\""));
+        assert!(event_text.contains("\"final_acceptance_status\":\"partial\""));
         assert!(
             event_text.contains("browser_readiness_or_interaction_evidence_required"),
             "{event_text}"
@@ -6263,7 +6409,7 @@ export default function Page(){
         cfg.eval_events_path = Some(events.clone());
         std::fs::write(
             dir.path().join("browser-readiness.json"),
-            r#"{"ok":true,"http_status":200}"#,
+            r#"{"ok":true,"http_status":200,"route_rendered":true}"#,
         )
         .unwrap();
         let plan = StepPlan {
@@ -6311,12 +6457,12 @@ export default function Page(){
         cfg.eval_events_path = Some(events.clone());
         std::fs::write(
             dir.path().join("browser-readiness.json"),
-            r#"{"ok":true,"http_status":200}"#,
+            r#"{"ok":true,"http_status":200,"route_rendered":true}"#,
         )
         .unwrap();
         std::fs::write(
             dir.path().join("interaction-evidence.json"),
-            r#"{"ok":true}"#,
+            r#"{"ok":true,"interaction_performed":true,"input_event_observed":true,"state_changed":true,"canvas_found":true}"#,
         )
         .unwrap();
         let plan = StepPlan {
@@ -6346,8 +6492,118 @@ export default function Page(){
         assert_eq!(result, "plan-run complete: 1 steps");
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"release_gate_status\":\"pass\""));
+        assert!(event_text.contains("\"final_acceptance_status\":\"full_success\""));
         assert!(event_text.contains("\"browser_readiness_status\":\"passed\""));
         assert!(event_text.contains("\"interaction_evidence_status\":\"passed\""));
+    }
+
+    #[test]
+    fn plan_run_nextjs_browser_ok_without_render_detail_is_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":true,"http_status":200}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("interaction-evidence.json"),
+            r#"{"ok":true,"interaction_performed":true,"state_changed":true,"canvas_found":true}"#,
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Create an interactive browser game\n\nRequired final artifacts:\n- package.json\n- src/app/page.tsx\n- src/app/layout.tsx\n- src/app/global.d.ts".to_string(),
+            steps: vec![PlanStep {
+                id: "app".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the interactive Next.js game app".to_string(),
+                expected_paths: vec![
+                    "package.json".to_string(),
+                    "src/app/page.tsx".to_string(),
+                    "src/app/layout.tsx".to_string(),
+                    "src/app/global.d.ts".to_string(),
+                ],
+                verify: Vec::new(),
+            }],
+        };
+        let page = interactive_game_page_source();
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: nextjs_interactive_app_tool_calls(page),
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let result = run_step_plan(&mut fake, &plan, &cfg).unwrap();
+        assert_eq!(result, "plan-run complete: 1 steps");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"release_gate_status\":\"partial\""));
+        assert!(event_text.contains("\"final_acceptance_status\":\"partial\""));
+        assert!(
+            event_text.contains(
+                "\"browser_readiness_status\":\"unavailable:browser_render_evidence_missing\""
+            ),
+            "{event_text}"
+        );
+    }
+
+    #[test]
+    fn plan_run_nextjs_canvas_unavailable_fails_release_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":true,"http_status":200,"route_rendered":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("interaction-evidence.json"),
+            r#"{"ok":true,"interaction_performed":true,"state_changed":true,"canvas_found":false}"#,
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Create an interactive browser game\n\nRequired final artifacts:\n- package.json\n- src/app/page.tsx\n- src/app/layout.tsx\n- src/app/global.d.ts".to_string(),
+            steps: vec![PlanStep {
+                id: "app".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the interactive Next.js game app".to_string(),
+                expected_paths: vec![
+                    "package.json".to_string(),
+                    "src/app/page.tsx".to_string(),
+                    "src/app/layout.tsx".to_string(),
+                    "src/app/global.d.ts".to_string(),
+                ],
+                verify: Vec::new(),
+            }],
+        };
+        let page = interactive_game_page_source();
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: nextjs_interactive_app_tool_calls(page),
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("release gate failed"), "{err}");
+        assert!(
+            err.contains("browser_interaction_failed:canvas_unavailable"),
+            "{err}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"release_gate_status\":\"failed\""));
+        assert!(event_text.contains("\"final_acceptance_status\":\"incomplete\""));
+        assert!(
+            event_text.contains("\"interaction_evidence_status\":\"failed:canvas_unavailable\"")
+        );
     }
 
     fn nextjs_interactive_app_tool_calls(page: &str) -> Vec<crate::state::ToolCall> {
