@@ -1110,6 +1110,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "planner_raw_schema_violation": diagnostics["planner_raw_schema_violation"],
             "planner_parser_limitation": diagnostics["planner_parser_limitation"],
             "planner_prompt_issue": diagnostics["planner_prompt_issue"],
+            "planner_quality_warning_count": diagnostics["planner_quality_warning_count"],
             "planner_quality_issue_count": diagnostics["planner_quality_issue_count"],
             "planner_retryable_quality_count": diagnostics["planner_retryable_quality_count"],
             "planner_advisory_quality_count": diagnostics["planner_advisory_quality_count"],
@@ -1408,6 +1409,9 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
     quality_issues = [
         event for event in events if event.get("event") == "planner_quality_issue"
     ]
+    quality_warnings = [
+        event for event in events if event.get("event") == "planner_quality_warning"
+    ]
     quality_retries = [
         event for event in events if event.get("event") == "planner_quality_retry"
     ]
@@ -1477,6 +1481,9 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
             event.get("planner_stage") == "lint" for event in planner_errors
         )).lower()
         if planner_errors
+        else "",
+        "planner_quality_warning_count": str(len(quality_warnings))
+        if quality_warnings
         else "",
         "planner_quality_issue_count": str(len(quality_issues)) if quality_issues else "",
         "planner_retryable_quality_count": str(

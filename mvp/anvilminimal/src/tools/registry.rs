@@ -162,6 +162,8 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
         "read_directory"
     } else if message.contains("dangerous command blocked") {
         "dangerous_command"
+    } else if message.contains("verify_command_policy_error") {
+        "verify_command_policy_error"
     } else if message.contains("edit_anchor_not_found") {
         "edit_anchor_not_found"
     } else if message.contains("edit_noop") {
@@ -183,6 +185,7 @@ pub fn recoverable_tool_error(err: &anyhow::Error) -> bool {
         "missing_arg"
             | "unknown_tool"
             | "path_not_found_recoverable"
+            | "verify_command_policy_error"
             | "invalid_glob"
             | "read_directory"
             | "edit_anchor_not_found"

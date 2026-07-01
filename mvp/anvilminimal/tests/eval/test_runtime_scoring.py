@@ -71,6 +71,41 @@ class RuntimeScoringTest(unittest.TestCase):
         self.assertEqual(score["execution_contract_adherence_raw_score"], "")
         self.assertEqual(score["postcheck_stability_reason"], "")
 
+    def test_runtime_bash_verify_policy_bypass_reduces_tool_policy_score(self):
+        events = [
+            {
+                "event": "runtime_bash_policy",
+                "step_kind": "verify",
+                "bash_policy_purpose": "deterministic_verifier_evidence",
+                "verifier_policy_checked": True,
+                "deterministic_verifier_evidence": False,
+                "blocked": True,
+                "policy_error_kind": "verify_command_policy_error",
+                "verify_command_violation_kind": "shell_control_syntax",
+            },
+            {
+                "event": "tool_policy_error",
+                "name": "Bash",
+                "policy_error_kind": "verify_command_policy_error",
+            },
+            {
+                "event": "tool_validation_error",
+                "name": "Bash",
+                "error_kind": "verify_command_policy_error",
+            },
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="plan-run",
+                success=False,
+                scenario={"expected_artifacts": []},
+                workdir=Path(td),
+            )
+        self.assertEqual(score["runtime_bash_policy_error_count"], 1)
+        self.assertEqual(score["runtime_bash_verifier_bypass_count"], 1)
+        self.assertLess(score["tool_policy_compatibility_score"], 100.0)
+
     def test_final_acceptance_repair_events_are_runtime_events(self):
         events = [
             {"event": "ultra_phase_start", "phase_id": "finish", "total_phases": 1},

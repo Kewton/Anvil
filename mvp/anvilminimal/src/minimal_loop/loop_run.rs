@@ -2,11 +2,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::bail;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::eval_events;
 use crate::mode::ExecutionMode;
+use crate::planner::verify::diagnose_verify_command;
 use crate::providers::ChatClient;
 use crate::state::{ConversationMessage, SessionSnapshot};
 use crate::tools::args_recovery::recover_tool_arguments;
@@ -190,6 +191,135 @@ impl RunSessionStepKind {
             RunSessionStepKind::Unknown => "unknown",
         }
     }
+
+    fn bash_policy_purpose(self) -> &'static str {
+        match self {
+            RunSessionStepKind::Inspect => "runtime_inspection",
+            RunSessionStepKind::Setup => "runtime_setup",
+            RunSessionStepKind::Implement => "runtime_implementation",
+            RunSessionStepKind::Verify | RunSessionStepKind::Report => {
+                "deterministic_verifier_evidence"
+            }
+            RunSessionStepKind::Unknown => "runtime_unknown",
+        }
+    }
+
+    fn requires_verifier_bash_policy(self) -> bool {
+        matches!(
+            self,
+            RunSessionStepKind::Verify | RunSessionStepKind::Report
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeBashPolicyDecision {
+    step_kind: &'static str,
+    bash_policy_purpose: &'static str,
+    verifier_policy_checked: bool,
+    verifier_policy_ok: bool,
+    deterministic_verifier_evidence: bool,
+    blocked: bool,
+    policy_error_kind: &'static str,
+    violation_kind: &'static str,
+    reason: String,
+}
+
+impl RuntimeBashPolicyDecision {
+    fn for_step(step_kind: RunSessionStepKind, command: &str) -> Self {
+        let verifier_policy_checked = step_kind.requires_verifier_bash_policy();
+        if !verifier_policy_checked {
+            return Self {
+                step_kind: step_kind.as_str(),
+                bash_policy_purpose: step_kind.bash_policy_purpose(),
+                verifier_policy_checked: false,
+                verifier_policy_ok: true,
+                deterministic_verifier_evidence: false,
+                blocked: false,
+                policy_error_kind: "",
+                violation_kind: "",
+                reason: "runtime Bash is not deterministic verifier evidence".to_string(),
+            };
+        }
+        let diagnosis = diagnose_verify_command(command);
+        if let Some(violation) = diagnosis.violation {
+            let reason = diagnosis
+                .reason
+                .unwrap_or_else(|| violation.message().to_string());
+            return Self {
+                step_kind: step_kind.as_str(),
+                bash_policy_purpose: step_kind.bash_policy_purpose(),
+                verifier_policy_checked: true,
+                verifier_policy_ok: false,
+                deterministic_verifier_evidence: false,
+                blocked: true,
+                policy_error_kind: "verify_command_policy_error",
+                violation_kind: violation.as_str(),
+                reason,
+            };
+        }
+        Self {
+            step_kind: step_kind.as_str(),
+            bash_policy_purpose: step_kind.bash_policy_purpose(),
+            verifier_policy_checked: true,
+            verifier_policy_ok: true,
+            deterministic_verifier_evidence: true,
+            blocked: false,
+            policy_error_kind: "",
+            violation_kind: "",
+            reason: "runtime Bash admitted as deterministic verifier evidence".to_string(),
+        }
+    }
+}
+
+fn runtime_bash_policy_decision(
+    options: RunSessionOptions,
+    tool_name: &str,
+    arguments: &Value,
+) -> Option<RuntimeBashPolicyDecision> {
+    if tool_name != "Bash" {
+        return None;
+    }
+    let recovered = recover_tool_arguments(tool_name, arguments.clone());
+    let command = recovered.arguments.get("command").and_then(Value::as_str)?;
+    let step_kind = options.step_kind.unwrap_or(RunSessionStepKind::Unknown);
+    Some(RuntimeBashPolicyDecision::for_step(step_kind, command))
+}
+
+fn recovered_bash_command(tool_name: &str, arguments: &Value) -> Option<String> {
+    if tool_name != "Bash" {
+        return None;
+    }
+    let recovered = recover_tool_arguments(tool_name, arguments.clone());
+    recovered
+        .arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn emit_runtime_bash_policy(
+    path: Option<&Path>,
+    decision: &RuntimeBashPolicyDecision,
+    command: &str,
+) {
+    eval_events::emit(
+        path,
+        json!({
+            "event": "runtime_bash_policy",
+            "tool_name": "Bash",
+            "step_kind": decision.step_kind,
+            "bash_policy_purpose": decision.bash_policy_purpose,
+            "verifier_policy_checked": decision.verifier_policy_checked,
+            "verifier_policy_ok": decision.verifier_policy_ok,
+            "deterministic_verifier_evidence": decision.deterministic_verifier_evidence,
+            "blocked": decision.blocked,
+            "policy_error_kind": decision.policy_error_kind,
+            "verify_command_violation_kind": decision.violation_kind,
+            "reason": eval_events::body_snippet(&decision.reason),
+            "command_summary": eval_events::body_snippet(command),
+        }),
+    );
 }
 
 #[derive(Debug, Default)]
@@ -681,6 +811,7 @@ pub(crate) fn run_session_with_outcome_with_options(
         let mut batch_had_edit = false;
         let mut batch_changed_paths = Vec::new();
         let mut batch_non_edit_tools = 0usize;
+        let mut batch_had_recoverable_tool_error = false;
         let missing_before_batch = missing_paths(&config.workspace_root, &required_paths);
         for call in tool_calls {
             if ui.interrupted() {
@@ -694,6 +825,64 @@ pub(crate) fn run_session_with_outcome_with_options(
             }
             if !names_seen.insert(call.name.clone()) {
                 // Multiple same-tool calls are fine; this keeps clippy from seeing unused state.
+            }
+            if let (Some(command), Some(decision)) = (
+                recovered_bash_command(&call.name, &call.arguments),
+                runtime_bash_policy_decision(options, &call.name, &call.arguments),
+            ) {
+                emit_runtime_bash_policy(config.eval_events_path.as_deref(), &decision, &command);
+                if decision.blocked {
+                    batch_had_recoverable_tool_error = true;
+                    let policy_error =
+                        anyhow::anyhow!("{}: {}", decision.policy_error_kind, decision.reason);
+                    let repeats = recoverable_tool_error_state.record(&call.name, &policy_error);
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "tool_policy_error",
+                            "name": call.name.as_str(),
+                            "policy_error_kind": decision.policy_error_kind,
+                            "verify_command_violation_kind": decision.violation_kind,
+                            "bash_policy_purpose": decision.bash_policy_purpose,
+                            "step_kind": decision.step_kind,
+                            "deterministic_verifier_evidence": false,
+                            "repeat_count": repeats,
+                        }),
+                    );
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "tool_validation_error",
+                            "name": call.name.as_str(),
+                            "error_kind": decision.policy_error_kind,
+                            "missing_arg": null,
+                            "repeat_count": repeats,
+                        }),
+                    );
+                    if repeats > RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT {
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "loop_stop",
+                                "reason": "recoverable_tool_error_repeated",
+                                "name": call.name.as_str(),
+                                "error_kind": decision.policy_error_kind,
+                                "repeat_count": repeats - 1,
+                            }),
+                        );
+                        bail!(
+                            "recoverable tool error repeated: {}",
+                            decision.policy_error_kind
+                        );
+                    }
+                    let feedback = recoverable_tool_feedback(&call.name, &policy_error);
+                    session.messages.push(ConversationMessage::tool_result(
+                        call.name,
+                        Some(call.id),
+                        feedback,
+                    ));
+                    continue;
+                }
             }
             let result = {
                 let _guard = ui.before_tool_call(&call.name);
@@ -726,6 +915,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     result
                 }
                 Err(err) if recoverable_tool_error(&err) => {
+                    batch_had_recoverable_tool_error = true;
                     let kind = tool_error_kind(&err);
                     let repeats = recoverable_tool_error_state.record(&call.name, &err);
                     eval_events::emit(
@@ -791,7 +981,10 @@ pub(crate) fn run_session_with_outcome_with_options(
                 artifact_recovery_state.record_action("non_edit_tool");
             }
         }
-        if required_paths.is_empty() && options.allows_tool_only_step_completion() {
+        if required_paths.is_empty()
+            && options.allows_tool_only_step_completion()
+            && !batch_had_recoverable_tool_error
+        {
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
@@ -2115,6 +2308,14 @@ mod tests {
         }
     }
 
+    fn event_values(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    }
+
     #[test]
     fn fake_write_then_final() {
         let dir = tempfile::tempdir().unwrap();
@@ -2388,6 +2589,135 @@ export default function Page(){
         assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
         assert_eq!(outcome.final_text, "step tool observation completed");
         assert_eq!(outcome.tool_calls, 1);
+    }
+
+    #[test]
+    fn verify_step_bash_shell_control_is_policy_error_not_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"scripts":{}}"#).unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path.clone());
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Bash",
+                        json!({"command":"grep -q 3011 package.json && echo \"Port 3011 configured\""}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Bash",
+                        json!({"command":"test -f package.json"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create app. Verify the current step.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert_eq!(outcome.final_text, "step tool observation completed");
+        let events = event_values(&events_path);
+        let policy_error = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("tool_policy_error"));
+        assert_eq!(
+            policy_error.and_then(|event| event.get("policy_error_kind")),
+            Some(&json!("verify_command_policy_error"))
+        );
+        assert_eq!(
+            policy_error.and_then(|event| event.get("verify_command_violation_kind")),
+            Some(&json!("shell_control_syntax"))
+        );
+        let blocked_policy = events.iter().find(|event| {
+            event.get("event").and_then(Value::as_str) == Some("runtime_bash_policy")
+                && event.get("blocked").and_then(Value::as_bool) == Some(true)
+        });
+        assert_eq!(
+            blocked_policy.and_then(|event| event.get("deterministic_verifier_evidence")),
+            Some(&json!(false))
+        );
+        let successful_bash_execs = events
+            .iter()
+            .filter(|event| {
+                event.get("event").and_then(Value::as_str) == Some("tool_execute")
+                    && event.get("name").and_then(Value::as_str) == Some("Bash")
+                    && event.get("status").and_then(Value::as_str) == Some("ok")
+            })
+            .count();
+        assert_eq!(successful_bash_execs, 1);
+    }
+
+    #[test]
+    fn setup_step_bash_shell_control_is_runtime_setup_not_verifier_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path.clone());
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Bash",
+                    json!({"command":"printf ok && printf done"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Set up the current step.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        let events = event_values(&events_path);
+        let policy = events.iter().find(|event| {
+            event.get("event").and_then(Value::as_str) == Some("runtime_bash_policy")
+        });
+        assert_eq!(
+            policy.and_then(|event| event.get("bash_policy_purpose")),
+            Some(&json!("runtime_setup"))
+        );
+        assert_eq!(
+            policy.and_then(|event| event.get("verifier_policy_checked")),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            policy.and_then(|event| event.get("blocked")),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            policy.and_then(|event| event.get("deterministic_verifier_evidence")),
+            Some(&json!(false))
+        );
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(Value::as_str) == Some("tool_execute")
+                && event.get("name").and_then(Value::as_str) == Some("Bash")
+                && event.get("status").and_then(Value::as_str) == Some("ok")
+        }));
     }
 
     #[test]

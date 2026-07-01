@@ -174,6 +174,12 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "recovery_ultra_plan_path": &completion.recovery_ultra_plan_path,
             "suggested_recovery_command": &completion.suggested_recovery_command,
             "suggested_recovery_yaml_command": &completion.suggested_recovery_yaml_command,
+            "planner_verify_normalization_count": completion.planner_verify_normalization_count,
+            "planner_retry_count": completion.planner_retry_count,
+            "planner_quality_warning_count": completion.planner_quality_warning_count,
+            "planner_quality_issue_count": completion.planner_quality_issue_count,
+            "planner_repaired": completion.planner_repaired,
+            "planner_release_risk": completion.planner_release_risk,
         }),
     );
     eval_events::append_completion_summary(

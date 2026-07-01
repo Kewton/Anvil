@@ -91,13 +91,13 @@ G10 は横断 gap として扱う。runtime summary の比較可能性は RECOVE
 | G03 | P0 | `acceptance_bridge_gap` | browser/dev route failure が repair target / recovery UltraPlan に接続されない | partial |
 | G04 | P0 | `semantic_drift` | Next.js/Tailwind dev pipeline が build verifier lifecycle に含まれていない | partial |
 | G05 | P1 | `acceptance_bridge_gap` | static capability evidence が interactive behavior を過大評価する | partial |
-| G06 | P1 | `semantic_drift` | verifier command policy と runtime Bash policy が一致しない | open |
+| G06 | P1 | `semantic_drift` | verifier command policy と runtime Bash policy が一致しない | partial |
 | G07 | P1 | `diagnostic_gap` | TUI/summary が partial artifact を完成品に見せる | partial |
 | G08 | P1 | `migration_missing` | source の repair handoff semantics が release gate partial/fail に横展開されていない | partial |
 | G09 | P2 | `diagnostic_gap` | RECOVERY-001 の pass 判定が UAT/release evidence に十分連動していない | open |
 | G10 | P2 | `acceptance_bridge_gap` | source/MVP 比較が aggregate success に寄り、completion authority 差分を見落とす | partial |
 | G11 | P0 | `new_release_gate_gap` | browser readiness の dev server lifecycle が controller にない | partial |
-| G12 | P1 | `diagnostic_gap` | planner verify normalization / quality warning が不安定性として gate に残らない | open |
+| G12 | P1 | `diagnostic_gap` | planner verify normalization / quality warning が不安定性として gate に残らない | partial |
 | G13 | P0 | `acceptance_bridge_gap` | CompletionContract / external contract が通常 TUI ultra-run に bind されていない | partial |
 | G14 | P2 | `semantic_drift` | step kind の role authority が弱く、setup/verify/report と implementation の責務境界が曖昧 | partial |
 
@@ -393,7 +393,7 @@ keyword/static evidence を completion authority として扱っており、inte
 | --- | --- |
 | priority | P1 |
 | category | `semantic_drift` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 
@@ -429,6 +429,13 @@ source の verifier command admission は shell control を deterministic eviden
 - implementation/setup 目的の Bash は別 policy として分類され、success が verifier evidence に流入しない。
 - `&&`, `||`, `|`, `;`, redirection, command substitution は deterministic verification evidence として拒否される。
 - unsafe runtime Bash は `tool_policy_error` または `verify_command_policy_error` として event に残る。
+
+### RECOVERY-002-E status / evidence
+
+- `mvp/anvilminimal/src/minimal_loop/loop_run.rs` で plan step kind ごとの Bash purpose を分類し、Verify/Report Bash は `planner::verify::diagnose_verify_command` と同じ deterministic verifier policy を通す。
+- Verify/Report Bash が `&&`, `||`, `|`, `;`, redirection, command substitution などを含む場合は実行前に `runtime_bash_policy`、`tool_policy_error`、`tool_validation_error(error_kind=verify_command_policy_error)` を emit し、deterministic verifier evidence にはしない。
+- Setup/implementation/inspect 目的の Bash は `runtime_setup` / `runtime_implementation` / `runtime_inspection` として event に残し、`deterministic_verifier_evidence=false` のまま通常作業を許可する。
+- fixture: `verify_step_bash_shell_control_is_policy_error_not_evidence`、`setup_step_bash_shell_control_is_runtime_setup_not_verifier_evidence`。
 
 ---
 
@@ -708,7 +715,7 @@ browser readiness を gate scoring の入力として追加したが、入力 ev
 | --- | --- |
 | priority | P1 |
 | category | `diagnostic_gap` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 
@@ -745,6 +752,13 @@ planner output quality と runtime success を分ける設計は入ったが、p
 - safe normalization で成功した場合も `planner_repaired` として記録される。
 - warning が残った plan は release-quality full pass にならない、または intentional evidence を要求する。
 - verify command policy violation が runtime Bash で迂回されていないことを確認する fixture がある。
+
+### RECOVERY-002-E status / evidence
+
+- `mvp/anvilminimal/src/eval_events.rs` の completion projection が run 全体の `planner_verify_command_normalized`、planner retry/error、`planner_quality_warning`、`planner_quality_issue` を集計し、TUI と `.anvil/runs/<run-id>/summary.md` に `Planner diagnostics`、`Planner repaired`、`Planner release risk` として表示する。
+- `tui_command_stop` / `run_stop` events に planner diagnostics fields を追加し、machine-readable event でも normalization/retry/warning/issue counts を確認できる。
+- `mvp/anvilminimal/scripts/eval_lib/runtime_scoring.py` と summary TSV に `runtime_bash_policy_error_count` / `runtime_bash_verifier_bypass_count` を追加し、runtime Bash による verifier policy bypass を tool policy score に反映する。
+- fixtures: `completion_projection_renders_planner_diagnostics_as_release_risk`、`test_runtime_bash_verify_policy_bypass_reduces_tool_policy_score`。
 
 ---
 

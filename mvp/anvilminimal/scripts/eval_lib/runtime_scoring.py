@@ -87,6 +87,8 @@ def score_runtime_health(
         "tool_call_raw",
         "tool_execute",
         "tool_validation_error",
+        "runtime_bash_policy",
+        "tool_policy_error",
         "artifact_stagnation_feedback",
         "loop_stop",
         "step_obligation_scope",
@@ -133,6 +135,18 @@ def score_runtime_health(
     stop = next((event for event in reversed(events) if event.get("event") == "loop_stop"), {})
     stop_reason = str(stop.get("reason", ""))
     validation_errors = event_counts.get("tool_validation_error", 0)
+    runtime_bash_policy_errors = sum(
+        1
+        for event in events
+        if event.get("event") == "runtime_bash_policy" and bool(event.get("blocked"))
+    )
+    runtime_bash_verifier_bypasses = sum(
+        1
+        for event in events
+        if event.get("event") == "runtime_bash_policy"
+        and bool(event.get("verifier_policy_checked"))
+        and not bool(event.get("deterministic_verifier_evidence"))
+    )
     execution_errors = sum(
         1
         for event in events
@@ -205,6 +219,7 @@ def score_runtime_health(
     policy = 100.0
     policy -= 35.0 * validation_errors
     policy -= 35.0 * execution_errors
+    policy -= 35.0 * runtime_bash_policy_errors
     policy = clamp(policy)
 
     runtime_health = round(
@@ -237,6 +252,8 @@ def score_runtime_health(
         "artifact_progress_score": round(artifact_progress, 1),
         **finalization_scores,
         "tool_policy_compatibility_score": round(policy, 1),
+        "runtime_bash_policy_error_count": runtime_bash_policy_errors,
+        "runtime_bash_verifier_bypass_count": runtime_bash_verifier_bypasses,
         "plan_run_runtime_health_score": runtime_health,
         "prompt_contract_score": score_prompt_contract(events),
         **bridge_scores,
@@ -286,6 +303,8 @@ def empty_runtime_scores() -> dict[str, str]:
         "deferred_verify_finalization_score": "",
         "postcheck_finalization_score": "",
         "tool_policy_compatibility_score": "",
+        "runtime_bash_policy_error_count": "",
+        "runtime_bash_verifier_bypass_count": "",
         "plan_run_runtime_health_score": "",
         "prompt_contract_score": "",
         **empty_bridge_scores(),

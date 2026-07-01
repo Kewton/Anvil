@@ -116,6 +116,12 @@ pub struct CompletionSnapshot {
     pub recovery_ultra_plan_path: String,
     pub suggested_recovery_command: String,
     pub suggested_recovery_yaml_command: String,
+    pub planner_verify_normalization_count: usize,
+    pub planner_retry_count: usize,
+    pub planner_quality_warning_count: usize,
+    pub planner_quality_issue_count: usize,
+    pub planner_repaired: bool,
+    pub planner_release_risk: bool,
 }
 
 impl CompletionSnapshot {
@@ -139,6 +145,12 @@ impl CompletionSnapshot {
             recovery_ultra_plan_path: String::new(),
             suggested_recovery_command: String::new(),
             suggested_recovery_yaml_command: String::new(),
+            planner_verify_normalization_count: 0,
+            planner_retry_count: 0,
+            planner_quality_warning_count: 0,
+            planner_quality_issue_count: 0,
+            planner_repaired: false,
+            planner_release_risk: false,
         }
     }
 
@@ -175,6 +187,30 @@ pub struct CompletionProjection {
     pub recovery_ultra_plan_path: String,
     pub suggested_recovery_command: String,
     pub suggested_recovery_yaml_command: String,
+    pub planner_verify_normalization_count: usize,
+    pub planner_retry_count: usize,
+    pub planner_quality_warning_count: usize,
+    pub planner_quality_issue_count: usize,
+    pub planner_repaired: bool,
+    pub planner_release_risk: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PlannerDiagnostics {
+    verify_normalization_count: usize,
+    retry_count: usize,
+    quality_warning_count: usize,
+    quality_issue_count: usize,
+}
+
+impl PlannerDiagnostics {
+    fn repaired(self) -> bool {
+        self.verify_normalization_count > 0 || self.retry_count > 0
+    }
+
+    fn release_risk(self) -> bool {
+        self.repaired() || self.quality_warning_count > 0 || self.quality_issue_count > 0
+    }
 }
 
 pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
@@ -184,10 +220,24 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
     let Ok(text) = std::fs::read_to_string(path) else {
         return CompletionSnapshot::empty();
     };
-    text.lines()
+    let events = text
+        .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|event| snapshot_from_completion_event(&event))
+        .collect::<Vec<_>>();
+    let diagnostics = planner_diagnostics_from_events(&events);
+    events
+        .iter()
+        .filter_map(snapshot_from_completion_event)
         .last()
+        .map(|mut snapshot| {
+            snapshot.planner_verify_normalization_count = diagnostics.verify_normalization_count;
+            snapshot.planner_retry_count = diagnostics.retry_count;
+            snapshot.planner_quality_warning_count = diagnostics.quality_warning_count;
+            snapshot.planner_quality_issue_count = diagnostics.quality_issue_count;
+            snapshot.planner_repaired = diagnostics.repaired();
+            snapshot.planner_release_risk = diagnostics.release_risk();
+            snapshot
+        })
         .unwrap_or_else(CompletionSnapshot::empty)
 }
 
@@ -234,7 +284,41 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         recovery_ultra_plan_path: snapshot.recovery_ultra_plan_path.clone(),
         suggested_recovery_command: snapshot.suggested_recovery_command.clone(),
         suggested_recovery_yaml_command: snapshot.suggested_recovery_yaml_command.clone(),
+        planner_verify_normalization_count: snapshot.planner_verify_normalization_count,
+        planner_retry_count: snapshot.planner_retry_count,
+        planner_quality_warning_count: snapshot.planner_quality_warning_count,
+        planner_quality_issue_count: snapshot.planner_quality_issue_count,
+        planner_repaired: snapshot.planner_repaired,
+        planner_release_risk: snapshot.planner_release_risk,
     }
+}
+
+fn planner_diagnostics_from_events(events: &[Value]) -> PlannerDiagnostics {
+    let mut diagnostics = PlannerDiagnostics::default();
+    for event in events {
+        match event.get("event").and_then(Value::as_str).unwrap_or("") {
+            "planner_verify_command_normalized" => {
+                diagnostics.verify_normalization_count += 1;
+            }
+            "planner_quality_retry"
+            | "planner_quality_retry_degraded"
+            | "planner_quality_retry_exhausted"
+            | "ultra_plan_generation_retry" => {
+                diagnostics.retry_count += 1;
+            }
+            "planner_error" if event.get("planner_error_kind").is_some() => {
+                diagnostics.retry_count += 1;
+            }
+            "planner_quality_warning" => {
+                diagnostics.quality_warning_count += 1;
+            }
+            "planner_quality_issue" => {
+                diagnostics.quality_issue_count += 1;
+            }
+            _ => {}
+        }
+    }
+    diagnostics
 }
 
 pub fn append_completion_summary(
@@ -267,7 +351,7 @@ pub fn render_tui_completion_output(output: &str, projection: &CompletionProject
         return output.to_string();
     }
     let mut output = format!(
-        "{}\n\nCommand completion: {}\nRuntime acceptance: {}\nFinal acceptance: {}\nRelease gate: {}\ncompletion_contract_verification_enabled={}\nexternal_contract_checked={}\nNext action: {}",
+        "{}\n\nCommand completion: {}\nRuntime acceptance: {}\nFinal acceptance: {}\nRelease gate: {}\ncompletion_contract_verification_enabled={}\nexternal_contract_checked={}\nPlanner diagnostics: normalizations={} retries={} quality_warnings={} quality_issues={}\nPlanner release risk: {}\nNext action: {}",
         output,
         projection.command_completion,
         projection.runtime_acceptance,
@@ -275,6 +359,11 @@ pub fn render_tui_completion_output(output: &str, projection: &CompletionProject
         projection.release_gate,
         projection.completion_contract_verification_enabled,
         projection.external_contract_checked,
+        projection.planner_verify_normalization_count,
+        projection.planner_retry_count,
+        projection.planner_quality_warning_count,
+        projection.planner_quality_issue_count,
+        projection.planner_release_risk,
         projection.next_action
     );
     if !projection.recovery_ultra_plan_path.is_empty()
@@ -403,6 +492,30 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        planner_verify_normalization_count: event
+            .get("planner_verify_normalization_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        planner_retry_count: event
+            .get("planner_retry_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        planner_quality_warning_count: event
+            .get("planner_quality_warning_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        planner_quality_issue_count: event
+            .get("planner_quality_issue_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        planner_repaired: event
+            .get("planner_repaired")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        planner_release_risk: event
+            .get("planner_release_risk")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -514,6 +627,15 @@ fn render_completion_summary(
             projection.external_contract_checked
         ),
         format!("external_contract_ok={}", projection.external_contract_ok),
+        format!("Planner repaired: {}", projection.planner_repaired),
+        format!("Planner release risk: {}", projection.planner_release_risk),
+        format!(
+            "Planner diagnostics: normalizations={} retries={} quality_warnings={} quality_issues={}",
+            projection.planner_verify_normalization_count,
+            projection.planner_retry_count,
+            projection.planner_quality_warning_count,
+            projection.planner_quality_issue_count
+        ),
         format!(
             "Release quality completion: {}",
             projection.release_quality_completion
@@ -811,5 +933,61 @@ mod tests {
         assert!(summary.contains("completion_contract_path_merge_enabled=true"));
         assert!(summary.contains("external_contract_checked=true"));
         assert!(summary.contains("external_contract_ok=true"));
+    }
+
+    #[test]
+    fn completion_projection_renders_planner_diagnostics_as_release_risk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "planner_verify_command_normalized",
+                "planner_stage": "verify_policy",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "planner_error",
+                "planner_error_kind": "verify_command_policy_error",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "planner_quality_warning",
+                "planner_error_kind": "planner_quality_warning",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "partial",
+                "release_gate_status": "partial",
+            }),
+        );
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(true, &snapshot);
+        let tui = render_tui_completion_output("done", &projection);
+        assert!(tui.contains(
+            "Planner diagnostics: normalizations=1 retries=1 quality_warnings=1 quality_issues=0"
+        ));
+        assert!(tui.contains("Planner release risk: true"));
+        let summary = render_completion_summary(
+            "tui_command",
+            None,
+            Some("/ultra-plan-run"),
+            "completed",
+            "",
+            &projection,
+        );
+        assert!(summary.contains("Planner repaired: true"));
+        assert!(summary.contains("Planner release risk: true"));
+        assert!(summary.contains(
+            "Planner diagnostics: normalizations=1 retries=1 quality_warnings=1 quality_issues=0"
+        ));
     }
 }
