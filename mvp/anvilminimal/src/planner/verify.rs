@@ -608,10 +608,12 @@ mod tests {
     fn verify_command_rejects_shell_control_syntax() {
         for command in [
             "npm test && npm run build",
+            "npm run build && test -f package.json",
             "cargo test | cat",
             "npm test; echo ok",
             "cargo test > out.log",
             "cargo test \\; echo ok",
+            "cargo test $(whoami)",
         ] {
             assert!(validate_verify_command(command).is_err(), "{command}");
         }

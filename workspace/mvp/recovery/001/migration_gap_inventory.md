@@ -86,7 +86,7 @@ REC の状態は以下で管理する。
 | REC-006 | P1 | pass | 実装レベルの受入条件は unit/fixture/eval で確認済み。live browser/manual UAT evidence は REC-010 で扱う。 | none。browser/Playwright は通常 unit test 必須にせず、保存済み evidence content gate として管理する。 |
 | REC-007 | P1 | pass | 実装レベルの受入条件は normalized trace diff / parity report / eval pytest で確認済み。release-level failed gates は report の `failed_gate_ids` として扱う。 | none。code reference だけの pass と trace 欠損 gate の pass 扱いは schema/gate で禁止済み。 |
 | REC-008 | P2 | pass | provider probe metadata / summary、provider-specific args shape observation、tool args recovery classification。 | live provider smoke は credentials/network がある release/targeted gate で再確認する。 |
-| REC-009 | P2 | open | verify normalization fixture、original/normalized verify event、runtime Bash policy rejection fixture。 | shell control syntax 許可、setup/build ordering 違反の success、normalization event 欠損。 |
+| REC-009 | P2 | pass | verify normalization fixture、original/normalized verify event、runtime verify policy rejection fixture、provider retry vs deterministic normalization summary。 | none。safe split は planner normalization 専用に留め、runtime verify policy は shell control syntax を拒否する。 |
 | REC-010 | P2 | open | manual TUI run events、summary、recovery `.md` / `.yaml` parse check、release evidence registration。 | silent exit、summary 欠損、recovery artifact path だけで内容未確認。 |
 
 ## 達成確認マトリクス
@@ -701,7 +701,7 @@ provider-specific instability は runtime success と混同すべきではない
 
 ### 現状
 
-safe `&&` split など deterministic normalization は追加済み。ただし latest matrix では smoke/source trace 再計測が未完で、OpenAI verify policy 違反も残る。
+safe `&&` split など deterministic normalization は追加済み。REC-009 では、normalization event に normalized command list と original command hash/summary を追加し、eval summary/report で provider retry と deterministic verify normalization を別々に集計するようにした。unsafe shell control は runtime verify policy 側では引き続き拒否し、dependency setup before build の ordering 違反は `verify_dependency_order_error` として分類する。
 
 ### 問題点
 
@@ -720,6 +720,22 @@ source では verifier policy と setup boundary が明確に分かれる。MVP 
 - step-plan score と plan-run failure の相関で false positive が減る。
 - verify normalization が行われた場合は normalized command list と original command hash/summary を event に残す。
 - provider retry で直った case と deterministic normalization で直った case を区別して集計する。
+
+### 実装結果
+
+| 項目 | 内容 |
+| --- | --- |
+| status | pass |
+| 実施日 | 2026-07-01 |
+| 実施 step | RECOVERY-001-G / REC-009 |
+| 実装概要 | StepPlan 生成時の safe `&&` split は `normalize_planner_verify_command` 経由の planner normalization に限定し、runtime `validate_verify_command` / `verify_step` は shell control syntax を拒否する境界を維持した。`planner_verify_command_normalized` event には `normalized_commands`、`original_command_hash`、`original_command_summary`、`normalization_source=deterministic_verify_policy` を追加した。eval summary/report には `provider_retry_count` と `deterministic_verify_normalization_count` を追加し、provider retry と deterministic normalization を別集計にした。 |
+| source parity 判断 | source と差分あり。source の `verifier_command_policy` は evidence hint の allowlist を小さく持つ。MVP は StepPlan/UltraPlan YAML 生成を挟むため、source policy を runtime verify admission と planner-only deterministic normalization に分けて写像した。 |
+| 証跡 | `mvp/anvilminimal/src/planner/verify.rs`: safe split は planner normalization 専用、`;` / `||` / pipe / redirection / command substitution / shell control は runtime verify policy で reject。`mvp/anvilminimal/src/planner/lint.rs`: dependency setup before build は `dependency_order` lint category。`mvp/anvilminimal/src/planner/runner.rs`: `planner_verify_command_normalized` event に normalized command list と original hash/summary、lint category -> `verify_command_policy_error` / `verify_dependency_order_error` mapping。`mvp/anvilminimal/scripts/eval-run.py`、`scripts/eval_lib/run_summary.py`、`scripts/eval_lib/report.py`: provider retry と deterministic verify normalization の別集計。 |
+| 通過した確認 | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` 通過。`pytest -q mvp/anvilminimal/tests/eval` は 213 passed, 1 skipped, 65 subtests passed。targeted: `safe_and_verify_policy_is_normalized_without_corrective_retry`、`verify_command_rejects_shell_control_syntax`、`planner_verify_normalization_rejects_unsafe_shell_syntax`、`test_report_distinguishes_provider_retry_from_deterministic_normalization`。 |
+| 未確認事項 | source/MVP same-condition trace の再計測は実施していない。REC-009 の実装受入条件は unit/eval fixture で確認済みとし、release-level trace 更新は次の full eval / REC-010 後に行う。 |
+| blocking condition | none |
+| 次の確認タイミング | full eval 後 / source-MVP trace diff 再生成時 / REC-010 manual UAT 後 |
+| rollback 判断 | rollback 不要。残リスクは planner が allowlist 外の有用な verify command を出した場合の fail-fast だが、runtime policy を緩めず retry prompt と deterministic normalization の境界で管理する。 |
 
 ---
 

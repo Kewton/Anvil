@@ -3518,10 +3518,32 @@ fn emit_planner_verify_command_normalized(
             "before_count": before.len(),
             "after_count": after.len(),
             "contains_safe_shell_split": before.iter().any(|command| command.contains("&&")),
+            "normalization_source": "deterministic_verify_policy",
+            "original_command_hash": stable_command_list_hash(before),
+            "original_command_summary": command_list_summary(before),
+            "normalized_command_hash": stable_command_list_hash(after),
+            "normalized_commands": after.iter().map(|command| eval_events::body_snippet(command)).collect::<Vec<_>>(),
             "before_preview": eval_events::body_snippet(&before.join(" | ")),
             "after_preview": eval_events::body_snippet(&after.join(" | ")),
         }),
     );
+}
+
+fn stable_command_list_hash(commands: &[String]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for command in commands {
+        for byte in eval_events::body_snippet(command).bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn command_list_summary(commands: &[String]) -> String {
+    eval_events::body_snippet(&commands.join(" | "))
 }
 
 fn emit_ultra_plan_raw_output_shape(
@@ -4840,6 +4862,15 @@ mod tests {
         );
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("planner_verify_command_normalized"));
+        assert!(event_text.contains("\"normalization_source\":\"deterministic_verify_policy\""));
+        assert!(event_text.contains("\"original_command_hash\""));
+        assert!(
+            event_text
+                .contains("\"original_command_summary\":\"npm test && test -f package.json\"")
+        );
+        assert!(
+            event_text.contains("\"normalized_commands\":[\"npm test\",\"test -f package.json\"]")
+        );
         assert!(!event_text.contains("\"event\":\"planner_error\""));
     }
 

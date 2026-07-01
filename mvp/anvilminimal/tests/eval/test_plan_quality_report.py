@@ -125,6 +125,40 @@ class PlanQualityReportTest(unittest.TestCase):
         self.assertIn("retryable_quality", report)
         self.assertIn("weak_code_verify", report)
 
+    def test_report_distinguishes_provider_retry_from_deterministic_normalization(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td)
+            row = {key: "" for key in SUMMARY_HEADER}
+            row.update(
+                {
+                    "run_id": "repair-source",
+                    "suite": "s",
+                    "scenario": "scenario",
+                    "size": "small",
+                    "category": "planner",
+                    "mode": "step-plan",
+                    "planner_provider": "openai",
+                    "planner_model": "gpt-5.4-mini",
+                    "success": "true",
+                    "rc": "0",
+                    "provider_retry_count": "2",
+                    "deterministic_verify_normalization_count": "1",
+                    "extras_json": {
+                        "deterministic_verify_normalizations": [
+                            {
+                                "original_command_hash": "abc123",
+                                "normalized_commands": ["npm test", "npm run build"],
+                            }
+                        ]
+                    },
+                }
+            )
+            write_summary(run_root / "summary.eval.tsv", [row])
+            report = generate_report(run_root)
+        self.assertIn("## Planner Repair Sources", report)
+        self.assertIn("| provider_retry | 2 |", report)
+        self.assertIn("| deterministic_verify_normalization | 1 |", report)
+
     def test_report_summarizes_predictiveness_pair(self):
         with tempfile.TemporaryDirectory() as td:
             run_root = Path(td)

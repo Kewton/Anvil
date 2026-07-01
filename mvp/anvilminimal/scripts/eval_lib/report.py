@@ -36,6 +36,7 @@ def generate_report(run_root: Path) -> str:
     lines.extend(stop_reason_summary(rows))
     lines.extend(planner_failure_summary(rows))
     lines.extend(planner_repair_summary(rows))
+    lines.extend(planner_repair_source_summary(rows))
     lines.extend(planner_raw_shape_summary(rows))
     lines.extend(planner_quality_warning_summary(rows))
     lines.extend(planner_quality_issue_summary(rows))
@@ -766,6 +767,29 @@ def planner_repair_summary(rows: list[dict[str, str]]) -> list[str]:
     ]
     lines = ["## Planner Repairs", ""]
     return lines + table_rows(rows_out, ["metric", "count"])
+
+
+def planner_repair_source_summary(rows: list[dict[str, str]]) -> list[str]:
+    provider_retry_count = 0
+    deterministic_normalization_count = 0
+    for row in rows:
+        extras = parse_extras(row)
+        provider_retry_count += safe_int(
+            row.get("provider_retry_count") or extras.get("provider_retry_count")
+        )
+        deterministic_normalization_count += safe_int(
+            row.get("deterministic_verify_normalization_count")
+            or extras.get("deterministic_verify_normalization_count")
+        )
+    rows_out = [
+        {"source": "provider_retry", "count": str(provider_retry_count)},
+        {
+            "source": "deterministic_verify_normalization",
+            "count": str(deterministic_normalization_count),
+        },
+    ]
+    lines = ["## Planner Repair Sources", ""]
+    return lines + table_rows(rows_out, ["source", "count"])
 
 
 def planner_raw_shape_summary(rows: list[dict[str, str]]) -> list[str]:

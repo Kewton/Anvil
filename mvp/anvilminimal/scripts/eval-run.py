@@ -1079,6 +1079,7 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "last_provider_error_kind": diagnostics["last_provider_error_kind"],
             "last_provider_http_status": diagnostics["last_provider_http_status"],
             "provider_attempts": diagnostics["provider_attempts"],
+            "provider_retry_count": diagnostics["provider_retry_count"],
             "fallback_decision": diagnostics["fallback_decision"],
             "planner_stage": diagnostics["planner_stage"],
             "planner_error_kind": diagnostics["planner_error_kind"],
@@ -1094,6 +1095,9 @@ def run_one(spec: dict, command: list[str], run_dir: Path, workdir: Path, timeou
             "planner_quality_retry_count": diagnostics["planner_quality_retry_count"],
             "planner_quality_retry_degraded_count": diagnostics[
                 "planner_quality_retry_degraded_count"
+            ],
+            "deterministic_verify_normalization_count": diagnostics[
+                "deterministic_verify_normalization_count"
             ],
             "valid_plan_generated": valid_plan_generated,
             "failure_kind": failure_kind,
@@ -1190,6 +1194,12 @@ def summarize_planner_observability(events: list[dict]) -> dict[str, object]:
     quality_degraded = [
         event for event in events if event.get("event") == "planner_quality_retry_degraded"
     ]
+    verify_normalizations = [
+        event for event in events if event.get("event") == "planner_verify_command_normalized"
+    ]
+    provider_retries = [
+        event for event in events if event.get("event") == "provider_retry"
+    ]
     ultra_generation_attempts = [
         event for event in events if event.get("event") == "ultra_plan_generation_attempt"
     ]
@@ -1223,6 +1233,23 @@ def summarize_planner_observability(events: list[dict]) -> dict[str, object]:
         out["planner_quality_retry_count"] = len(quality_retries)
     if quality_degraded:
         out["planner_quality_retry_degraded_count"] = len(quality_degraded)
+    if verify_normalizations:
+        out["deterministic_verify_normalization_count"] = len(verify_normalizations)
+        out["deterministic_verify_normalizations"] = [
+            {
+                "planner_provider": event.get("planner_provider", ""),
+                "planner_model": event.get("planner_model", ""),
+                "repair_attempt": event.get("repair_attempt", ""),
+                "original_command_hash": event.get("original_command_hash", ""),
+                "original_command_summary": event.get("original_command_summary", ""),
+                "normalized_commands": event.get("normalized_commands", []),
+                "contains_safe_shell_split": event.get("contains_safe_shell_split", ""),
+                "normalization_source": event.get("normalization_source", ""),
+            }
+            for event in verify_normalizations
+        ]
+    if provider_retries:
+        out["provider_retry_count"] = len(provider_retries)
     if ultra_generation_attempts:
         out["ultra_plan_generation_attempt_count"] = len(ultra_generation_attempts)
     if ultra_generation_retries:
@@ -1305,6 +1332,9 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
         (event for event in reversed(events) if event.get("event") == "fallback_decision"),
         {},
     )
+    provider_retries = [
+        event for event in events if event.get("event") == "provider_retry"
+    ]
     planner_errors = [
         event for event in events if event.get("event") == "planner_error"
     ]
@@ -1319,6 +1349,9 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
     ]
     quality_degraded = [
         event for event in events if event.get("event") == "planner_quality_retry_degraded"
+    ]
+    verify_normalizations = [
+        event for event in events if event.get("event") == "planner_verify_command_normalized"
     ]
     planner_error = planner_errors[-1] if planner_errors else {}
     tool_error = next(
@@ -1352,6 +1385,7 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
         "provider_attempts": str(
             provider_error.get("attempt", provider_response.get("attempt", ""))
         ),
+        "provider_retry_count": str(len(provider_retries)) if provider_retries else "",
         "fallback_decision": fallback_decision_cell(fallback),
         "repair_progress": str(repair_progress.get("verdict", "")),
         "provider_transient_excluded_from_agent_capability": str(provider_transient).lower()
@@ -1402,6 +1436,9 @@ def summarize_run_events(events: list[dict], post: dict) -> dict[str, str]:
         "planner_quality_retry_count": str(len(quality_retries)) if quality_retries else "",
         "planner_quality_retry_degraded_count": str(len(quality_degraded))
         if quality_degraded
+        else "",
+        "deterministic_verify_normalization_count": str(len(verify_normalizations))
+        if verify_normalizations
         else "",
     }
 
