@@ -165,6 +165,49 @@ class FailureClassificationTest(unittest.TestCase):
         self.assertEqual(result["failure_kind"], "dependency_setup_blocked")
         self.assertEqual(failure_layer_for_kind(result["failure_kind"]), "bridge")
 
+    def test_dependency_build_lifecycle_classifies_plan_run_setup_blocked(self):
+        result = classify_events(
+            [
+                {
+                    "event": "dependency_build_lifecycle",
+                    "mode": "plan-run",
+                    "lifecycle_stage": "dependency_setup_build",
+                    "lifecycle_stages": [
+                        "dependency_check",
+                        "setup_authority_missing",
+                        "setup_blocked",
+                        "verification_dependency_missing",
+                    ],
+                    "setup_status": "blocked",
+                    "final_status": "dependency_missing",
+                },
+                {
+                    "event": "step_verify_failure",
+                    "dependency_missing": [
+                        "dependency_setup_missing: Next.js build dependency setup missing"
+                    ],
+                    "repair_target": "dependency_setup",
+                },
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "dependency_setup_blocked")
+        self.assertEqual(result["dependency_setup_status"], "blocked")
+
+    def test_tailwind_profile_failure_is_precise_contract_kind(self):
+        result = classify_events(
+            [
+                {
+                    "event": "step_verify_failure",
+                    "profile_failures": [
+                        "tailwind_contract_failure: Tailwind config file missing"
+                    ],
+                    "repair_target": "framework_config",
+                }
+            ]
+        )
+        self.assertEqual(result["failure_kind"], "tailwind_contract_failure")
+        self.assertEqual(failure_layer_for_kind(result["failure_kind"]), "bridge")
+
     def test_later_step_verify_event_wins_over_older_planner_error(self):
         result = classify_events(
             [

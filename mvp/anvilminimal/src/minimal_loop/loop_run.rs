@@ -1465,6 +1465,13 @@ fn terminal_verify_stop_reason(
     if report
         .profile_failures
         .iter()
+        .any(|reason| reason.contains("tailwind_contract_failure"))
+    {
+        return "tailwind_contract_failure".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
         .any(|reason| !reason.contains("deferred verify requirement pending"))
     {
         return "profile_contract_failure".to_string();

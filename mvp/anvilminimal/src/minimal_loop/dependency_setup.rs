@@ -207,6 +207,129 @@ pub fn next_binary_ready(root: &Path) -> bool {
     root.join("node_modules/.bin/next").is_file()
 }
 
+pub fn next_build_dependencies_ready(root: &Path) -> bool {
+    next_build_missing_dependency_labels(root).is_empty()
+}
+
+pub fn next_build_missing_dependency_reason(root: &Path) -> String {
+    let missing = next_build_missing_dependency_labels(root);
+    if missing.is_empty() {
+        "Next.js build dependencies are ready".to_string()
+    } else {
+        format!(
+            "Next.js build dependency setup missing: {}",
+            missing.join(", ")
+        )
+    }
+}
+
+fn next_build_missing_dependency_labels(root: &Path) -> Vec<String> {
+    let mut missing = Vec::new();
+    if !next_binary_ready(root) {
+        missing.push("node_modules/.bin/next".to_string());
+    }
+    if workspace_requires_tailwind_toolchain(root) {
+        for package in ["tailwindcss", "postcss", "autoprefixer"] {
+            if !node_package_installed(root, package) {
+                missing.push(format!("node_modules/{package}"));
+            }
+        }
+    }
+    missing
+}
+
+fn node_package_installed(root: &Path, package: &str) -> bool {
+    let package_dir = root.join("node_modules").join(package);
+    package_dir.join("package.json").is_file() || package_dir.is_dir()
+}
+
+fn workspace_requires_tailwind_toolchain(root: &Path) -> bool {
+    package_json_has_dependency(root, "tailwindcss")
+        || !tailwind_directive_files(root).is_empty()
+        || has_any_file(
+            root,
+            &[
+                "tailwind.config.js",
+                "tailwind.config.cjs",
+                "tailwind.config.mjs",
+                "tailwind.config.ts",
+            ],
+        )
+        || postcss_config_references_tailwind(root)
+}
+
+fn tailwind_package_contract_missing(root: &Path) -> Option<String> {
+    if !workspace_requires_tailwind_toolchain(root) {
+        return None;
+    }
+    let missing = ["tailwindcss", "postcss", "autoprefixer"]
+        .into_iter()
+        .filter(|package| !package_json_has_dependency(root, package))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Tailwind toolchain package dependency missing: {}",
+            missing.join(", ")
+        ))
+    }
+}
+
+fn package_json_has_dependency(root: &Path, name: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(root.join("package.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ]
+    .iter()
+    .filter_map(|section| value.get(*section).and_then(serde_json::Value::as_object))
+    .any(|deps| deps.contains_key(name))
+}
+
+fn tailwind_directive_files(root: &Path) -> Vec<String> {
+    [
+        "src/app/globals.css",
+        "src/app/global.css",
+        "app/globals.css",
+        "app/global.css",
+        "src/styles/globals.css",
+        "styles/globals.css",
+    ]
+    .iter()
+    .filter_map(|rel| {
+        std::fs::read_to_string(root.join(rel))
+            .ok()
+            .filter(|content| content.contains("@tailwind"))
+            .map(|_| (*rel).to_string())
+    })
+    .collect()
+}
+
+fn postcss_config_references_tailwind(root: &Path) -> bool {
+    [
+        "postcss.config.js",
+        "postcss.config.cjs",
+        "postcss.config.mjs",
+    ]
+    .iter()
+    .any(|rel| {
+        std::fs::read_to_string(root.join(rel))
+            .is_ok_and(|content| content.to_ascii_lowercase().contains("tailwind"))
+    })
+}
+
+fn has_any_file(root: &Path, paths: &[&str]) -> bool {
+    paths.iter().any(|path| root.join(path).is_file())
+}
+
 pub fn requirement_for_next_build(
     root: &Path,
     profile: Option<&str>,
@@ -215,12 +338,15 @@ pub fn requirement_for_next_build(
 ) -> NodeDependencySetupRequirement {
     let package_manager = package_manager_for_root(root);
     let mut blocked_reason = None;
+    let missing_dependencies = next_build_missing_dependency_labels(root);
     if !root.join("package.json").is_file() {
         blocked_reason = Some("package.json missing".to_string());
     } else if !package_json_declares_dependencies(root) {
         blocked_reason = Some("package.json has no dependency table".to_string());
-    } else if next_binary_ready(root) {
-        blocked_reason = Some("node_modules/.bin/next already present".to_string());
+    } else if let Some(reason) = tailwind_package_contract_missing(root) {
+        blocked_reason = Some(reason);
+    } else if missing_dependencies.is_empty() {
+        blocked_reason = Some("Next.js build dependencies already present".to_string());
     } else if !authority.allows_setup() {
         blocked_reason = Some("dependency setup authority missing".to_string());
     } else if matches!(
@@ -239,7 +365,10 @@ pub fn requirement_for_next_build(
         setup_kind: NodeDependencySetupKind::NextBuildDependencies,
         project_root: ".".to_string(),
         reason: reason.to_string(),
-        required_binary: "node_modules/.bin/next".to_string(),
+        required_binary: missing_dependencies
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "node_modules/.bin/next".to_string()),
         setup_authority: authority,
         allowed,
         blocked_reason,
@@ -321,7 +450,7 @@ pub(crate) fn run_node_dependency_setup_with_program(
         );
     }
     let before_lock = root.join("package-lock.json").exists();
-    let before_next = next_binary_ready(root);
+    let before_missing = next_build_missing_dependency_labels(root);
     let started = Instant::now();
     let mut child = match Command::new(npm_program)
         .args(["install", "--ignore-scripts"])
@@ -363,10 +492,19 @@ pub(crate) fn run_node_dependency_setup_with_program(
                 if !before_lock && root.join("package-lock.json").exists() {
                     changed_paths.push("package-lock.json".to_string());
                 }
-                if !before_next && next_binary_ready(root) {
-                    changed_paths.push("node_modules/.bin/next".to_string());
+                for path in before_missing {
+                    if path == "node_modules/.bin/next" {
+                        if next_binary_ready(root) {
+                            changed_paths.push(path);
+                        }
+                    } else if let Some(package) = path.strip_prefix("node_modules/")
+                        && node_package_installed(root, package)
+                    {
+                        changed_paths.push(path);
+                    }
                 }
-                let status_kind = if status.success() {
+                let required_ready = next_build_dependencies_ready(root);
+                let status_kind = if status.success() && required_ready {
                     NodeDependencySetupStatus::Passed
                 } else {
                     NodeDependencySetupStatus::Failed
@@ -378,8 +516,13 @@ pub(crate) fn run_node_dependency_setup_with_program(
                     authority: requirement.setup_authority,
                     attempted: true,
                     command: "npm install --ignore-scripts".to_string(),
-                    primary_reason: if status.success() {
+                    primary_reason: if status.success() && required_ready {
                         "dependency setup passed".to_string()
+                    } else if status.success() {
+                        format!(
+                            "dependency setup completed but required dependencies are still missing: {}",
+                            next_build_missing_dependency_labels(root).join(", ")
+                        )
                     } else {
                         format!("dependency setup failed: {status}")
                     },
@@ -696,6 +839,61 @@ mod tests {
         );
         assert!(requirement.allowed);
         assert_eq!(requirement.package_manager, PackageManagerKind::Npm);
+    }
+
+    #[test]
+    fn tailwind_directive_requires_package_contract_before_network_setup() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        write_package(
+            dir.path(),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        );
+        fs::write(
+            dir.path().join("src/app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        let requirement = requirement_for_next_build(
+            dir.path(),
+            Some("nextjs"),
+            "build",
+            NodeDependencySetupAuthority::CompletionContract,
+        );
+        assert!(!requirement.allowed);
+        assert!(
+            requirement
+                .blocked_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("Tailwind toolchain package dependency missing"),
+            "{requirement:?}"
+        );
+    }
+
+    #[test]
+    fn tailwind_declared_but_not_installed_is_setup_candidate_even_when_next_exists() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/.bin")).unwrap();
+        fs::write(dir.path().join("node_modules/.bin/next"), "").unwrap();
+        write_package(
+            dir.path(),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}}"#,
+        );
+        fs::write(
+            dir.path().join("src/app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        let requirement = requirement_for_next_build(
+            dir.path(),
+            Some("nextjs"),
+            "build",
+            NodeDependencySetupAuthority::CompletionContract,
+        );
+        assert!(requirement.allowed, "{requirement:?}");
+        assert_eq!(requirement.required_binary, "node_modules/tailwindcss");
     }
 
     #[test]

@@ -53,6 +53,7 @@ KNOWN_FAILURE_KINDS = {
     "source_semantic_failure",
     "static_title_only",
     "browser_http_500",
+    "browser_readiness_failed",
     "browser_behavior_failure",
     "missing_required_capabilities",
     "missing_required_evidence",
@@ -71,6 +72,8 @@ KNOWN_FAILURE_KINDS = {
     "repair_stagnation",
     "package_lock_stale",
     "profile_static_build_gap",
+    "profile_runtime_contract_error",
+    "tailwind_contract_failure",
 }
 
 PROVIDER_FAILURE_KINDS = {
@@ -104,6 +107,8 @@ BRIDGE_FAILURE_KINDS = {
     "verifier_missing",
     "verifier_bootstrap_blocked",
     "profile_static_build_gap",
+    "profile_runtime_contract_error",
+    "tailwind_contract_failure",
 }
 POSTCHECK_FAILURE_KINDS = {"postcheck_failure"}
 ENVIRONMENT_FAILURE_KINDS = {"timeout", "diagnostic_skipped"}
@@ -116,6 +121,7 @@ ACCEPTANCE_FAILURE_KINDS = {
     "source_semantic_failure",
     "static_title_only",
     "browser_http_500",
+    "browser_readiness_failed",
     "browser_behavior_failure",
 }
 
@@ -188,6 +194,14 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         (event for event in reversed(events) if event.get("event") == "provider_error"),
         None,
     )
+    last_dependency_lifecycle = next(
+        (
+            event
+            for event in reversed(events)
+            if event.get("event") == "dependency_build_lifecycle"
+        ),
+        None,
+    )
     for event in reversed(events):
         name = event.get("event")
         if name == "planner_error":
@@ -201,6 +215,29 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "planner_repair_attempts": event.get("repair_attempt", ""),
             }
         if name == "step_verify_failure":
+            dependency_kind = dependency_lifecycle_failure_kind(last_dependency_lifecycle)
+            lifecycle_step = str((last_dependency_lifecycle or {}).get("step_id", "") or "")
+            event_step = str(event.get("step_id", "") or "")
+            same_step = not lifecycle_step or not event_step or lifecycle_step == event_step
+            if dependency_kind and same_step and event.get("dependency_missing"):
+                return {
+                    "failure_kind": dependency_kind,
+                    "last_loop_stop": "step_verify_failure",
+                    "repair_target": event.get("repair_target", ""),
+                    "dependency_lifecycle_stage": (
+                        last_dependency_lifecycle or {}
+                    ).get("lifecycle_stage", ""),
+                    "dependency_setup_status": (
+                        last_dependency_lifecycle or {}
+                    ).get("setup_status", ""),
+                }
+            profile_kind = profile_failure_kind(event.get("profile_failures", []) or [])
+            if profile_kind:
+                return {
+                    "failure_kind": profile_kind,
+                    "last_loop_stop": "step_verify_failure",
+                    "repair_target": event.get("repair_target", ""),
+                }
             return {
                 "failure_kind": "step_verify_failure",
                 "last_loop_stop": "step_verify_failure",
@@ -220,6 +257,13 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         if name == "ultra_phase_failed":
             reason = str(event.get("reason", ""))
             lower_reason = reason.lower()
+            if "tailwind_contract_failure" in lower_reason or "tailwind" in lower_reason:
+                return {
+                    "failure_kind": "tailwind_contract_failure",
+                    "last_loop_stop": "ultra_phase_failed",
+                    "phase_failure_stage": event.get("stage", ""),
+                    "phase_id": event.get("phase_id", ""),
+                }
             if "failed verification after bounded repair" in lower_reason:
                 return {
                     "failure_kind": "step_verify_failure",
@@ -269,6 +313,15 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 ),
             }
         if name == "plan_final_contract" and event.get("ok") is False:
+            primary_reason = str(event.get("primary_reason", ""))
+            if "tailwind_contract_failure" in primary_reason.lower():
+                return {
+                    "failure_kind": "tailwind_contract_failure",
+                    "last_loop_stop": "plan_final_contract_failure",
+                    "missing_artifacts": ",".join(
+                        str(path) for path in event.get("missing_final_artifacts", []) or []
+                    ),
+                }
             return {
                 "failure_kind": "plan_final_contract_failure",
                 "last_loop_stop": "plan_final_contract_failure",
@@ -351,6 +404,8 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             "repair_stagnation",
             "package_lock_stale",
             "profile_static_build_gap",
+            "profile_runtime_contract_error",
+            "tailwind_contract_failure",
         }:
             kind = event.get("reason")
             if kind == "dependency_setup_missing":
@@ -395,6 +450,16 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "failure_kind": "profile_contract_failure",
                 "last_loop_stop": "profile_contract_failure",
             }
+        if name == "dependency_build_lifecycle":
+            kind = dependency_lifecycle_failure_kind(event)
+            if kind:
+                return {
+                    "failure_kind": kind,
+                    "last_loop_stop": "dependency_build_lifecycle",
+                    "dependency_lifecycle_stage": event.get("lifecycle_stage", ""),
+                    "dependency_setup_status": event.get("setup_status", ""),
+                    "build_verifier_statuses": event.get("final_status", ""),
+                }
         if name == "loop_stop" and event.get("reason") == "verify_repair_exhausted":
             return {
                 "failure_kind": "verify_repair_exhausted",
@@ -476,6 +541,41 @@ def classify_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {}
 
 
+def profile_failure_kind(profile_failures: list[Any]) -> str:
+    text = " ".join(str(item) for item in profile_failures).lower()
+    if not text:
+        return ""
+    if "tailwind_contract_failure" in text or "tailwind" in text:
+        return "tailwind_contract_failure"
+    if "profile_runtime_contract_error" in text:
+        return "profile_runtime_contract_error"
+    return ""
+
+
+def dependency_lifecycle_failure_kind(event: dict[str, Any] | None) -> str:
+    if not isinstance(event, dict):
+        return ""
+    final_status = str(event.get("final_status", "") or "")
+    setup_status = str(event.get("setup_status", "") or "")
+    if not final_status or final_status == "passed":
+        return ""
+    if final_status == "dependency_missing":
+        if setup_status == "blocked":
+            return "dependency_setup_blocked"
+        if setup_status in {"failed", "timed_out"}:
+            return "dependency_setup_failed"
+        return "dependency_setup_missing"
+    if final_status == "blocked":
+        return "build_verify_blocked"
+    if final_status == "failed":
+        if setup_status == "passed":
+            return "build_after_setup_failed"
+        return "build_verify_failed"
+    if final_status == "policy_rejected":
+        return "verify_command_policy_error"
+    return ""
+
+
 def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = False) -> dict[str, Any]:
     if timeout or str(rc) == "124":
         return {"failure_kind": "timeout"}
@@ -506,6 +606,8 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
     if "test_discovery_failure" in lower or "no tests ran" in lower or "ran 0 tests" in lower:
         return {"failure_kind": "test_discovery_failure"}
     if "completion contract verify failed" in lower:
+        if "tailwind_contract_failure" in lower or "tailwind" in lower:
+            return {"failure_kind": "tailwind_contract_failure"}
         if "dependency_setup_missing" in lower or "node_modules/.bin/next missing" in lower:
             return {"failure_kind": "dependency_setup_missing"}
         if "build_verify_failed" in lower:
@@ -526,6 +628,12 @@ def classify_stderr(stderr: str, rc: int | str | None = None, timeout: bool = Fa
             return {"failure_kind": "profile_contract_failure"}
         return {"failure_kind": "verify_repair_exhausted"}
     if "plan final contract failed" in lower:
+        if "tailwind_contract_failure" in lower:
+            return {"failure_kind": "tailwind_contract_failure"}
+        if "browser_http_500" in lower or "http_500" in lower:
+            return {"failure_kind": "browser_http_500"}
+        if "browser_readiness_failed" in lower:
+            return {"failure_kind": "browser_readiness_failed"}
         return {"failure_kind": "plan_final_contract_failure"}
     if "ultra final acceptance failed after bounded repair" in lower:
         return {"failure_kind": "final_acceptance_repair_exhausted"}

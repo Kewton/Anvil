@@ -1076,6 +1076,13 @@ def score_build_lifecycle(events: list[dict[str, Any]]) -> dict[str, float | str
     completion_events = [
         event for event in events if event.get("event") == "completion_verify"
     ]
+    dependency_lifecycle_events = [
+        event for event in events if event.get("event") == "dependency_build_lifecycle"
+    ]
+    if not completion_events and dependency_lifecycle_events:
+        completion_events = [
+            dependency_lifecycle_completion_event(dependency_lifecycle_events)
+        ]
     if not completion_events:
         step_bridge = score_step_runtime_bridge(events)
         repair_followthrough = score_repair_target_followthrough(events)
@@ -1262,6 +1269,68 @@ def score_build_lifecycle(events: list[dict[str, Any]]) -> dict[str, float | str
         if isinstance(profile_gap, (int, float))
         else "",
     }
+
+
+def dependency_lifecycle_completion_event(events: list[dict[str, Any]]) -> dict[str, Any]:
+    lifecycles = []
+    observations = []
+    for event in events:
+        setup_status = str(event.get("setup_status", "") or "")
+        setup = {"status": setup_status} if setup_status and setup_status != "not_required" else None
+        final_status = str(event.get("final_status", "") or "")
+        required = bool(event.get("required_for_completion", True))
+        lifecycle = {
+            "requirement": {
+                "command": event.get("command", ""),
+                "required_for_completion": required,
+            },
+            "final_status": final_status,
+        }
+        if setup is not None:
+            lifecycle["setup"] = setup
+        lifecycles.append(lifecycle)
+        observations.append(
+            {
+                "command": event.get("command", ""),
+                "status": final_status,
+                "required_for_completion": required,
+                "requires_dependency_setup": bool(
+                    event.get("requires_dependency_setup", False)
+                ),
+                "attempted": bool(event.get("after_attempted") or event.get("before_attempted")),
+            }
+        )
+    required_lifecycles = [
+        lifecycle
+        for lifecycle in lifecycles
+        if (lifecycle.get("requirement") or {}).get("required_for_completion", True)
+    ]
+    ok = bool(required_lifecycles) and all(
+        str(lifecycle.get("final_status", "")) == "passed"
+        for lifecycle in required_lifecycles
+    )
+    return {
+        "event": "completion_verify",
+        "ok": ok,
+        "build_verifier_required": True,
+        "build_verifier_lifecycle": lifecycles,
+        "build_verifier_observations": observations,
+        "repair_target": dependency_lifecycle_repair_target(events),
+    }
+
+
+def dependency_lifecycle_repair_target(events: list[dict[str, Any]]) -> str:
+    final_statuses = {str(event.get("final_status", "") or "") for event in events}
+    setup_statuses = {str(event.get("setup_status", "") or "") for event in events}
+    if "dependency_missing" in final_statuses or setup_statuses & {
+        "blocked",
+        "failed",
+        "timed_out",
+    }:
+        return "dependency_setup"
+    if "failed" in final_statuses:
+        return "build"
+    return ""
 
 
 def score_step_runtime_bridge(events: list[dict[str, Any]]) -> float | str:

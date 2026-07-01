@@ -667,6 +667,42 @@ steps:
         self.assertEqual(score["profile_static_vs_build_gap_score"], 70.0)
         self.assertLess(score["plan_run_success_predictor"], 80.0)
 
+    def test_standalone_dependency_build_lifecycle_scores_plan_run_taxonomy(self):
+        events = [
+            {
+                "event": "dependency_build_lifecycle",
+                "mode": "plan-run",
+                "lifecycle_stage": "dependency_setup_build",
+                "lifecycle_stages": [
+                    "dependency_check",
+                    "setup_authority_missing",
+                    "setup_blocked",
+                    "verification_dependency_missing",
+                ],
+                "command": "npm run build",
+                "required_for_completion": True,
+                "requires_dependency_setup": True,
+                "setup_status": "blocked",
+                "final_status": "dependency_missing",
+                "before_attempted": False,
+                "after_attempted": False,
+            },
+            {"event": "loop_stop", "reason": "dependency_setup_missing"},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            score = score_runtime_health(
+                events,
+                mode="plan-run",
+                success=False,
+                scenario={"expected_artifacts": ["package.json"]},
+                workdir=Path(td),
+            )
+        self.assertEqual(score["build_verifier_completion_score"], 30.0)
+        self.assertEqual(score["dependency_setup_boundary_score"], 85.0)
+        self.assertEqual(score["dependency_setup_bridge_score"], 45.0)
+        self.assertEqual(score["build_verifier_lifecycle_score"], 35.0)
+        self.assertEqual(score["repair_target_resolution_score"], 70.0)
+
     def test_build_lifecycle_scores_setup_passed_then_build_failed(self):
         events = [
             {

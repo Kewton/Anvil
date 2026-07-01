@@ -90,9 +90,21 @@ impl BuildVerifierLifecycleObservation {
         if self.before_setup.status == BuildVerifierStatus::DependencyMissing
             && self.requirement.requires_dependency_setup
         {
+            if self
+                .setup
+                .as_ref()
+                .is_some_and(|setup| setup.authority.allows_setup())
+            {
+                stages.push("setup_authority_selected");
+            } else {
+                stages.push("setup_authority_missing");
+            }
+            if self.setup.as_ref().is_some_and(|setup| setup.attempted) {
+                stages.push("setup_attempted");
+            }
             match self.setup.as_ref().map(|setup| setup.status) {
                 Some(NodeDependencySetupStatus::Blocked) => stages.push("setup_blocked"),
-                Some(NodeDependencySetupStatus::Attempted) => stages.push("setup_attempted"),
+                Some(NodeDependencySetupStatus::Attempted) => {}
                 Some(NodeDependencySetupStatus::Passed) => stages.push("setup_passed"),
                 Some(NodeDependencySetupStatus::Failed) => stages.push("setup_failed"),
                 Some(NodeDependencySetupStatus::TimedOut) => stages.push("setup_timed_out"),
@@ -101,6 +113,7 @@ impl BuildVerifierLifecycleObservation {
             }
         }
         if self.after_setup.is_some() {
+            stages.push("build_rerun_attempted");
             stages.push("build_rerun");
         }
         stages.push(match self.final_status {
@@ -201,7 +214,7 @@ pub fn observe_requirement(
             dependency_ready,
             attempted: false,
             status: BuildVerifierStatus::DependencyMissing,
-            primary_reason: dependency_missing_reason(&requirement.command),
+            primary_reason: dependency_missing_reason(root, &requirement.command),
             output_snippet: String::new(),
         };
     }
@@ -344,7 +357,7 @@ fn dependency_ready(root: &Path, command: &str) -> bool {
         if requires_package_manifest(command) && !root.join("package.json").is_file() {
             return false;
         }
-        return root.join("node_modules/.bin/next").is_file();
+        return dependency_setup::next_build_dependencies_ready(root);
     }
     if requires_node_test_runner(command) {
         return dependency_setup::node_test_runner_bindable(root);
@@ -359,9 +372,9 @@ fn requires_package_manifest(command: &str) -> bool {
         || normalized.starts_with("yarn ")
 }
 
-fn dependency_missing_reason(command: &str) -> String {
+fn dependency_missing_reason(root: &Path, command: &str) -> String {
     if requires_next_binary(command) {
-        "node_modules/.bin/next missing for Next.js build".to_string()
+        dependency_setup::next_build_missing_dependency_reason(root)
     } else if requires_node_test_runner(command) {
         "package.json scripts.test missing before Node test verifier".to_string()
     } else {
@@ -497,9 +510,45 @@ mod tests {
             lifecycle.lifecycle_stages(),
             vec![
                 "dependency_check",
+                "setup_authority_missing",
                 "setup_blocked",
                 "verification_dependency_missing"
             ]
+        );
+    }
+
+    #[test]
+    fn next_build_with_tailwind_requires_tailwind_node_modules_not_only_next_binary() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/.bin")).unwrap();
+        std::fs::write(dir.path().join("node_modules/.bin/next"), "").unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        let requirement = requirement_from_deferred(
+            "npm run build",
+            Some("nextjs"),
+            "final build check",
+            "profile:nextjs",
+            "pending",
+        )
+        .unwrap();
+        let observation = observe_requirement(dir.path(), &requirement);
+        assert_eq!(observation.status, BuildVerifierStatus::DependencyMissing);
+        assert!(!observation.attempted);
+        assert!(
+            observation
+                .primary_reason
+                .contains("node_modules/tailwindcss"),
+            "{observation:?}"
         );
     }
 
@@ -541,12 +590,74 @@ mod tests {
         assert_eq!(lifecycle.setup_status(), "passed");
         assert_eq!(lifecycle.final_status, BuildVerifierStatus::Passed);
         assert!(lifecycle.after_setup.is_some());
+        assert!(
+            lifecycle
+                .lifecycle_stages()
+                .contains(&"setup_authority_selected")
+        );
+        assert!(lifecycle.lifecycle_stages().contains(&"setup_attempted"));
         assert!(lifecycle.lifecycle_stages().contains(&"setup_passed"));
+        assert!(
+            lifecycle
+                .lifecycle_stages()
+                .contains(&"build_rerun_attempted")
+        );
         assert!(lifecycle.lifecycle_stages().contains(&"build_rerun"));
         assert!(
             lifecycle
                 .lifecycle_stages()
                 .contains(&"verification_passed")
+        );
+    }
+
+    #[test]
+    fn dependency_missing_setup_failed_records_attempted_and_failed_stages() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        let fake_npm = dir.path().join("fake-npm-fail.sh");
+        std::fs::write(&fake_npm, "#!/bin/sh\necho install failed >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake_npm).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake_npm, perms).unwrap();
+        }
+        let requirement = requirement_from_deferred(
+            "npm run build",
+            Some("nextjs"),
+            "final build check",
+            "profile:nextjs",
+            "pending",
+        )
+        .unwrap();
+        let lifecycle = observe_requirement_lifecycle_with_setup_program(
+            dir.path(),
+            &requirement,
+            NodeDependencySetupAuthority::EvalExplicit,
+            &fake_npm,
+        );
+        assert_eq!(lifecycle.setup_status(), "failed");
+        assert_eq!(
+            lifecycle.final_status,
+            BuildVerifierStatus::DependencyMissing
+        );
+        assert!(lifecycle.after_setup.is_none());
+        assert!(
+            lifecycle
+                .lifecycle_stages()
+                .contains(&"setup_authority_selected")
+        );
+        assert!(lifecycle.lifecycle_stages().contains(&"setup_attempted"));
+        assert!(lifecycle.lifecycle_stages().contains(&"setup_failed"));
+        assert!(
+            lifecycle
+                .lifecycle_stages()
+                .contains(&"verification_dependency_missing")
         );
     }
 
@@ -588,6 +699,7 @@ mod tests {
             lifecycle.lifecycle_stages(),
             vec![
                 "dependency_check",
+                "setup_authority_missing",
                 "setup_blocked",
                 "verification_dependency_missing"
             ]
@@ -620,7 +732,18 @@ mod tests {
         assert_eq!(lifecycle.final_status, BuildVerifierStatus::Passed);
         assert!(lifecycle.after_setup.is_some());
         assert!(dir.path().join("package.json").is_file());
+        assert!(
+            lifecycle
+                .lifecycle_stages()
+                .contains(&"setup_authority_selected")
+        );
+        assert!(lifecycle.lifecycle_stages().contains(&"setup_attempted"));
         assert!(lifecycle.lifecycle_stages().contains(&"setup_passed"));
+        assert!(
+            lifecycle
+                .lifecycle_stages()
+                .contains(&"build_rerun_attempted")
+        );
         assert!(lifecycle.lifecycle_stages().contains(&"build_rerun"));
         assert!(
             lifecycle

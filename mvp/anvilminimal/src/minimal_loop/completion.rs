@@ -151,7 +151,7 @@ impl CompletionContract {
     pub fn dependency_precondition_active(&self, root: &Path) -> bool {
         self.verify_commands.iter().any(|command| {
             build_verifier::requires_next_binary(command)
-                && !root.join("node_modules/.bin/next").is_file()
+                && !crate::minimal_loop::dependency_setup::next_build_dependencies_ready(root)
         })
     }
 
@@ -407,7 +407,9 @@ impl CompletionContract {
                         build_requirement.status
                     } else if build_requirement.requires_dependency_setup
                         && build_verifier::requires_next_binary(&build_requirement.command)
-                        && !root.join("node_modules/.bin/next").is_file()
+                        && !crate::minimal_loop::dependency_setup::next_build_dependencies_ready(
+                            root,
+                        )
                     {
                         "dependency_setup_missing".to_string()
                     } else {
