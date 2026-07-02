@@ -100,6 +100,11 @@ pub fn handle_command(
                 &completion,
             )
         );
+    } else if let Some(notice) = crate::eval_events::render_tui_command_incomplete_notice(
+        config.eval_events_path.as_deref(),
+        &completion,
+    ) {
+        eprintln!("{notice}");
     }
     result.map(|output| crate::eval_events::render_tui_completion_output(&output, &completion))
 }

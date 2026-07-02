@@ -400,53 +400,73 @@ pub fn render_tui_command_failure_block(
     projection: &CompletionProjection,
 ) -> String {
     let events = read_event_values(path);
+    let summary_text = read_run_summary(path).unwrap_or_default();
     let failed_phase = latest_event_field(
         &events,
         &["failed_phase_id", "failed_phase", "phase_id", "step_id"],
     )
+    .or_else(|| failed_phase_from_summary(&summary_text))
     .unwrap_or_else(|| "unknown".to_string());
-    let missing_evidence = latest_missing_evidence_keys(&events, stop_reason);
-    let missing_evidence = if missing_evidence.is_empty() {
-        "none recorded".to_string()
-    } else {
-        missing_evidence.join(", ")
-    };
-    let recovery_prompt_path = latest_event_field(&events, &["recovery_prompt_path"])
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| projection.recovery_prompt_path.clone());
-    let recovery_ultra_plan_path = latest_event_field(&events, &["recovery_ultra_plan_path"])
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| projection.recovery_ultra_plan_path.clone());
+    let (completed_phases, total_phases) = phase_counts_from_events(&events)
+        .or_else(|| phase_counts_from_summary(&summary_text))
+        .unwrap_or((None, None));
+    let primary_stop_reason = tui_primary_stop_reason(&events, &summary_text, stop_reason);
     let suggested_recovery_command = latest_event_field(&events, &["suggested_recovery_command"])
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| projection.suggested_recovery_command.clone());
+        .or_else(|| non_empty(projection.suggested_recovery_command.clone()))
+        .or_else(|| {
+            summary_value(
+                &summary_text,
+                &[
+                    "Suggested prompt command:",
+                    "Recovery prompt command:",
+                    "Suggested recovery command:",
+                ],
+            )
+        })
+        .unwrap_or_default();
     let suggested_recovery_yaml_command =
         latest_event_field(&events, &["suggested_recovery_yaml_command"])
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| projection.suggested_recovery_yaml_command.clone());
-    [
-        "=== TUI Command Failed ===".to_string(),
-        format!("Task status: {}", projection.task_status),
-        format!("Failed phase: {failed_phase}"),
-        format!("Missing evidence keys: {missing_evidence}"),
-        format!(
-            "Recovery prompt: {}",
-            missing_if_empty(&recovery_prompt_path)
-        ),
-        format!(
-            "Recovery prompt command: {}",
-            missing_if_empty(&suggested_recovery_command)
-        ),
-        format!(
-            "Recovery UltraPlan: {}",
-            missing_if_empty(&recovery_ultra_plan_path)
-        ),
-        format!(
-            "Recovery UltraPlan command: {}",
-            missing_if_empty(&suggested_recovery_yaml_command)
-        ),
-    ]
-    .join("\n")
+            .or_else(|| non_empty(projection.suggested_recovery_yaml_command.clone()))
+            .or_else(|| {
+                summary_value(
+                    &summary_text,
+                    &["Suggested YAML command:", "Recovery UltraPlan command:"],
+                )
+            })
+            .unwrap_or_default();
+    let summary_path = run_summary_path(path)
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    crate::tui::status::render_task_failure_block(&crate::tui::status::TaskFailureBlock {
+        task_status: projection.task_status.clone(),
+        failed_phase,
+        completed_phases,
+        total_phases,
+        primary_stop_reason,
+        recovery_prompt_command: suggested_recovery_command,
+        recovery_ultra_plan_command: suggested_recovery_yaml_command,
+        summary_path,
+    })
+}
+
+pub fn render_tui_command_incomplete_notice(
+    path: Option<&Path>,
+    projection: &CompletionProjection,
+) -> Option<String> {
+    if projection.command_completion != "completed" || !command_returned_incomplete(projection) {
+        return None;
+    }
+    Some(crate::tui::status::render_task_incomplete_notice(
+        &crate::tui::status::TaskIncompleteNotice {
+            status: projection.status.clone(),
+            task_status: projection.task_status.clone(),
+            summary_path: run_summary_path(path)
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        },
+    ))
 }
 
 fn read_event_values(path: Option<&Path>) -> Vec<Value> {
@@ -461,6 +481,15 @@ fn read_event_values(path: Option<&Path>) -> Vec<Value> {
         .collect()
 }
 
+fn read_run_summary(path: Option<&Path>) -> Option<String> {
+    std::fs::read_to_string(run_summary_path(path)?).ok()
+}
+
+fn run_summary_path(path: Option<&Path>) -> Option<PathBuf> {
+    path.and_then(Path::parent)
+        .map(|parent| parent.join("summary.md"))
+}
+
 fn latest_event_field(events: &[Value], keys: &[&str]) -> Option<String> {
     events.iter().rev().find_map(|event| {
         keys.iter().find_map(|key| {
@@ -472,6 +501,163 @@ fn latest_event_field(events: &[Value], keys: &[&str]) -> Option<String> {
                 .map(ToOwned::to_owned)
         })
     })
+}
+
+fn phase_counts_from_events(events: &[Value]) -> Option<(Option<usize>, Option<usize>)> {
+    for event in events.iter().rev() {
+        let completed_ids = event
+            .get("completed_phase_ids")
+            .and_then(Value::as_array)
+            .map(Vec::len);
+        let pending_ids = event
+            .get("pending_phase_ids")
+            .and_then(Value::as_array)
+            .map(Vec::len);
+        if completed_ids.is_some() || pending_ids.is_some() {
+            let total = completed_ids
+                .zip(pending_ids)
+                .map(|(completed, pending)| completed + 1 + pending);
+            return Some((completed_ids, total));
+        }
+        if let Some(total) = event.get("total_phases").and_then(Value::as_u64) {
+            let completed = event
+                .get("completed_phase_count")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize)
+                .or_else(|| {
+                    event
+                        .get("phase_index")
+                        .and_then(Value::as_u64)
+                        .map(|value| value.saturating_sub(1) as usize)
+                });
+            return Some((completed, Some(total as usize)));
+        }
+        if let Some(completed) = event.get("completed_phase_count").and_then(Value::as_u64) {
+            return Some((Some(completed as usize), None));
+        }
+    }
+    None
+}
+
+fn phase_counts_from_summary(text: &str) -> Option<(Option<usize>, Option<usize>)> {
+    let completed = summary_section_count(text, "Completed phases:");
+    let pending = summary_section_count(text, "Pending phases:");
+    if completed.is_none() && pending.is_none() {
+        return None;
+    }
+    let total = completed
+        .zip(pending)
+        .map(|(completed, pending)| completed + 1 + pending);
+    Some((completed, total))
+}
+
+fn summary_section_count(text: &str, header: &str) -> Option<usize> {
+    let mut in_section = false;
+    let mut saw_bullet = false;
+    let mut count = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if trimmed.is_empty() || (trimmed.ends_with(':') && !trimmed.starts_with("- ")) {
+            break;
+        }
+        if let Some(item) = trimmed.strip_prefix("- ") {
+            saw_bullet = true;
+            if item.trim() != "none" {
+                count += 1;
+            }
+        }
+    }
+    saw_bullet.then_some(count)
+}
+
+fn failed_phase_from_summary(text: &str) -> Option<String> {
+    let mut next_line_is_failed_phase = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if next_line_is_failed_phase {
+            if let Some(value) = phase_from_bullet(trimmed) {
+                return Some(value);
+            }
+            if !trimmed.is_empty() {
+                next_line_is_failed_phase = false;
+            }
+        }
+        if trimmed == "Failed phase:" {
+            next_line_is_failed_phase = true;
+            continue;
+        }
+        for prefix in ["Failed phase:", "- Failed phase:", "- Last failed phase:"] {
+            if let Some(value) = trimmed.strip_prefix(prefix)
+                && let Some(value) = clean_phase_value(value)
+            {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn phase_from_bullet(line: &str) -> Option<String> {
+    line.strip_prefix("- ").and_then(clean_phase_value)
+}
+
+fn clean_phase_value(value: &str) -> Option<String> {
+    let value = value
+        .split_once(" (")
+        .map(|(phase, _)| phase)
+        .unwrap_or(value)
+        .trim()
+        .trim_matches('`');
+    (!value.is_empty() && value != "none").then(|| value.to_string())
+}
+
+fn tui_primary_stop_reason(events: &[Value], summary_text: &str, stop_reason: &str) -> String {
+    let missing_evidence = latest_missing_evidence_keys(events, stop_reason);
+    if !missing_evidence.is_empty() {
+        return missing_evidence.join(", ");
+    }
+    latest_event_field(events, &["primary_reason", "stop_reason", "reason"])
+        .or_else(|| summary_value(summary_text, &["Failure:", "Stop reason:"]))
+        .unwrap_or_else(|| stop_reason.to_string())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn summary_value(text: &str, prefixes: &[&str]) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let trimmed = trimmed.strip_prefix("- ").unwrap_or(trimmed).trim();
+        for prefix in prefixes {
+            if let Some(value) = trimmed.strip_prefix(prefix) {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
+fn command_returned_incomplete(projection: &CompletionProjection) -> bool {
+    projection.status.starts_with("incomplete")
+        || projection.status.contains("partial")
+        || matches!(
+            projection.task_status.as_str(),
+            "partial" | "incomplete" | "failed"
+        )
 }
 
 fn latest_missing_evidence_keys(events: &[Value], stop_reason: &str) -> Vec<String> {
@@ -1203,7 +1389,9 @@ mod tests {
             Some(&path),
             json!({
                 "event": "ultra_partial_artifact_summary",
+                "completed_phase_ids": ["scaffold"],
                 "failed_phase_id": "project-setup",
+                "pending_phase_ids": ["final-verify"],
                 "recovery_prompt_path": ".anvil/repairs/repair-project-setup.md",
                 "recovery_ultra_plan_path": ".anvil/plans/recovery-ultra-plan-project-setup.yaml",
                 "suggested_recovery_command": "/ultra-plan-run --profile nextjs \"$(cat .anvil/repairs/repair-project-setup.md)\"",
@@ -1216,9 +1404,11 @@ mod tests {
             "phase project-setup failed",
             &projection,
         );
-        assert!(block.contains("=== TUI Command Failed ==="));
+        assert!(block.contains("TASK FAILED (process exited normally)"));
         assert!(block.contains("Task status: failed"));
         assert!(block.contains("Failed phase: project-setup"));
+        assert!(block.contains("Phases completed: 1/3"));
+        assert!(block.contains("Primary stop reason:"));
         assert!(block.contains("challenge_or_adversary_evidence"));
         assert!(block.contains("failure_or_collision_evidence"));
         assert!(block.contains("restart_or_recoverable_state_evidence"));
@@ -1226,5 +1416,7 @@ mod tests {
         assert!(block.contains(
             "Recovery UltraPlan command: /run-ultra-plan .anvil/plans/recovery-ultra-plan-project-setup.yaml"
         ));
+        assert!(block.contains("Run summary:"));
+        assert!(block.contains("summary.md"));
     }
 }
