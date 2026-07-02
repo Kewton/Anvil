@@ -1,0 +1,203 @@
+# test0701_005 Regression Fixture
+
+作成日: 2026-07-02
+
+## Purpose
+
+UAT004-GATE-00 の failure fixture として、`test0701_005` の失敗を再現可能な evidence set に固定する。
+
+この fixture は Space Invaders 固有文字列ではなく、generic interactive app/game task の runtime semantics として扱う。
+
+## Fixture Identity
+
+| field | value |
+| --- | --- |
+| workspace | `/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0701_005` |
+| run id | `019f1e0b-3acd-7fd1-97dd-c10e03ba37eb` |
+| run events | `.anvil/runs/019f1e0b-3acd-7fd1-97dd-c10e03ba37eb/events.jsonl` |
+| event count | 249 lines |
+| run summary | `.anvil/runs/019f1e0b-3acd-7fd1-97dd-c10e03ba37eb/summary.md` |
+| UltraPlan | `.anvil/plans/ultra-plan-019f1e0b-9468-73b1-aa65-67d27ea5bc7b.yaml` |
+| Recovery UltraPlan | `.anvil/plans/recovery-ultra-plan-phase-build-and-verify-019f1e11-5644-7e02-968c-8823ddff460b.yaml` |
+| generated source | `src/app/page.tsx` |
+| generated CSS | `src/app/globals.css` |
+| command shape | `/ultra-plan-run --profile nextjs ...` |
+| task kind | Next.js interactive app/game on port 3011 |
+
+## UltraPlan Baseline
+
+The generated UltraPlan has 5 phases:
+
+| phase | baseline result |
+| --- | --- |
+| `setup-and-base-layout` | completed |
+| `game-engine-core` | completed |
+| `game-polish-and-effects` | completed |
+| `ui-and-responsiveness` | completed |
+| `build-and-verify` | failed before execution at scaffold |
+
+The final phase prompt is a deterministic build verification request: run `npm run build` and ensure TypeScript/React/configuration errors are absent.
+
+## Failure Fixtures
+
+### F-001: Final Phase Scaffold Failure
+
+| field | evidence |
+| --- | --- |
+| event | `ultra_phase_failed` |
+| phase | `build-and-verify` |
+| stage | `scaffold` |
+| reason | `invalid StepPlan after corrective retries: Next.js build verify requires an entrypoint expected path first` |
+| supporting planner errors | `verify_dependency_order_error`, `verify_command_policy_error`, `phase_scaffold_error` |
+| expected classification | correct failure detection |
+| gates | G-S03, G-S04, G-S08, G-S09 |
+
+Expected future behavior:
+
+- A final verify phase must inspect existing workspace state before rejecting valid verification.
+- An invalid final verify plan must not be accepted as success.
+- Shell control rejection and setup/build ordering must remain strict.
+
+### F-002: Recovery Handoff Exists But Is Not Success
+
+| field | evidence |
+| --- | --- |
+| events | `recovery_prompt_saved`, `ultra_partial_artifact_summary` |
+| recovery prompt | `.anvil/repairs/repair-phase-build-and-verify-019f1e11-5644-7e02-968c-881734c65602.md` |
+| recovery YAML | `.anvil/plans/recovery-ultra-plan-phase-build-and-verify-019f1e11-5644-7e02-968c-8823ddff460b.yaml` |
+| parse checks | `recovery_prompt_parse_ok=true`, `recovery_yaml_parse_ok=true`, `recovery_command_targets_valid=true` |
+| expected classification | correct handoff evidence, not task success |
+| gates | G-S10, G-S13, G-S16 |
+
+Expected future behavior:
+
+- Recovery artifact persistence is a useful failure outcome.
+- It must not promote the original task to success.
+- Later gates must verify that the suggested recovery run can actually repair or cleanly fail.
+
+### F-003: Summary Contradiction
+
+| field | evidence |
+| --- | --- |
+| summary top | `Status: incomplete` |
+| failed phase | `build-and-verify (phase_scaffold_error)` |
+| summary tail | `Status: complete`, `Action: Repl`, `Stop reason: completed` |
+| TUI command stop | `tui_command_stop ok=false`, `failure_kind=tui_command_failed` |
+| process run stop | `run_stop ok=true`, `failure_kind=""`, `stop_reason=completed` |
+| expected classification | regression / diagnostic gap |
+| gates | G-S14, G-S16 |
+
+Expected future behavior:
+
+- Task status, command status, and REPL/process readiness must be projected separately.
+- A failed command must not be summarized as unconditional task completion.
+- A failed lifecycle stage must not end with blank failure kind.
+
+### F-004: Plan-run Completion Contract Disabled
+
+| field | evidence |
+| --- | --- |
+| repeated event | `step_obligation_scope` |
+| observed values | `completion_contract_verification_enabled=false`, `completion_contract_path_merge_enabled=false`, `completion_contract_paths=[]`, `contract_paths_merged=false` |
+| affected step kinds | setup, implement, verify, inspect |
+| expected classification | regression / source parity gap |
+| gates | G-S01, G-S02, G-S12 |
+
+Expected future behavior:
+
+- Interactive implementation steps must not release-pass with completion contract verification disabled.
+- Non-interactive file creation should still complete via required paths when appropriate.
+- Source TaskContract authority or a trace-proven equivalent must decide completion.
+
+### F-005: Static Capability Evidence Can Become Pass Without Browser/Interaction Evidence
+
+| field | evidence |
+| --- | --- |
+| event | `step_capability_evidence_check` |
+| early result | `ok=false`, missing interactive evidence such as implementation, visible surface, input handler, state update, challenge/adversary, score/progression, collision/failure evidence |
+| later result | `ok=true`, `primary_reason=pass` while `browser_readiness_evidence_path=""` and `interaction_evidence_path=""` |
+| expected classification | partial diagnostic surface plus false positive risk |
+| gates | G-S01, G-S11, G-S12 |
+
+Expected future behavior:
+
+- Static source hints are not enough for full interactive app/game acceptance.
+- Browser readiness and interaction evidence are release-grade gates, with skip evidence when unavailable.
+- Correct failure detection must be separated from success-rate regression.
+
+### F-006: Generated Interactive App Is Shallow
+
+From `src/app/page.tsx`:
+
+| requirement class | fixture evidence | expected result |
+| --- | --- | --- |
+| player input | no `keydown`/`keyup`/keyboard listener; touch handlers are empty | should fail interactive acceptance |
+| projectile mechanics | `bullets` is declared but never spawned, updated, rendered, or collided | should fail challenge/combat acceptance |
+| collision/failure | no player damage, enemy projectile, lives, win, lose, or game-over transition setter | should fail failure/collision rule acceptance |
+| scoring/progression | `score` is reset but never incremented; high score is read but not written | should fail progression evidence |
+| requested polish | no Web Audio implementation and no power-up behavior | should not pass rich gameplay capability |
+
+This fixture must not be implemented as a Space Invaders keyword check. The generic negative fixture is: an interactive app/game that has a visual surface and static source tokens but lacks input-driven state transitions, challenge/adversary resolution, score/progression, and failure/restart behavior.
+
+### F-007: Browser Readiness Environment Sensitivity
+
+From the UAT current-state record and `src/app/globals.css`:
+
+| condition | observed baseline |
+| --- | --- |
+| `NODE_ENV=production` with `npm run dev` | `/` returned HTTP 500 in manual UAT record |
+| failing source | `src/app/globals.css` starts with Tailwind directives |
+| `NODE_ENV` unset with `npm run dev` | `/` returned HTTP 200 in manual UAT record |
+| expected classification | release/browser readiness evidence required; environment must be recorded |
+| gates | G-S09, G-S12, G-S16 |
+
+Expected future behavior:
+
+- Browser readiness must record environment, port, HTTP status, and failure kind.
+- HTTP 500 is failure; browser unavailable is partial/skip evidence.
+- Browser checks must not become normal unit-test requirements.
+
+## Correct Failure Detection vs Regression
+
+| item | classification | preserve or fix |
+| --- | --- | --- |
+| final invalid StepPlan rejected | correct failure detection | preserve; later fix source parity so valid final verify is accepted |
+| recovery prompt/YAML saved and parse OK | correct failure detection / handoff | preserve; do not count as success |
+| early missing capability/evidence reports | correct diagnostic surface | preserve; bind to completion authority later |
+| step completion contract disabled | regression / source parity gap | fix |
+| shallow interactive app reaching later phases | regression / false positive risk | fix |
+| summary says incomplete and complete | regression / diagnostics gap | fix |
+| `run_stop` blank failure kind after failed command | regression / diagnostics gap | fix |
+| browser readiness depends on unrecorded `NODE_ENV` | regression / acceptance evidence gap | fix or record as explicit skip/failure |
+
+## Positive And Negative Fixture Expectations
+
+| fixture type | expected future assertion |
+| --- | --- |
+| positive | A valid existing Next.js workspace with entrypoint, package manifest, and build script can run a final build verification phase without requiring the final StepPlan to re-own entrypoint paths. |
+| positive | A failed phase saves recovery prompt/YAML and exposes structured suggested commands without claiming original task success. |
+| negative | An interactive app/game with only a title screen, canvas/static render, empty touch handlers, no input state, no scoring/progression, no collision/failure, and no browser/interaction evidence cannot pass final acceptance. |
+| negative | `completion_contract_verification_enabled=false` cannot be a full release pass for interactive implementation steps. |
+| negative | Summary/TUI cannot overwrite a failed task with unconditional `Status: complete`. |
+
+## Fixture Reproduction Notes
+
+No new executable tests are created in GATE-00. The fixed baseline is document-level and must be converted into targeted automated fixtures in later gates.
+
+The following checks were used to inspect the baseline:
+
+- `wc -l` on `events.jsonl` confirmed 249 event lines.
+- `jq` selected `step_obligation_scope` and `step_capability_evidence_check` events.
+- `rg` checked generated `page.tsx` for input, projectile, collision, score, storage, audio, and touch handler signals.
+- `sed` inspected `summary.md`, UltraPlan YAML, recovery UltraPlan YAML, `page.tsx`, and `globals.css`.
+
+## Rollback Guard
+
+Do not merge a later change that makes any of these fixture failures disappear by weakening the gate:
+
+- accepting invalid planner output as success,
+- allowing setup/scaffold/style/build-only output to count as a completed interactive app/game,
+- hiding browser/interaction evidence gaps,
+- dropping recovery handoff evidence,
+- removing concrete failure kinds,
+- showing REPL readiness as task completion.
