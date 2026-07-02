@@ -115,6 +115,20 @@ GATE-00 では実装変更、provider probe、browser run、anvildev 比較を�
 | source/anvildev same-condition run | skipped | Local source refs plus deterministic lifecycle fixtures cover GATE-03 scope. Full comparative source/MVP run remains UAT004-GATE-09. |
 | browser/manual evidence | skipped | GATE-03 does not close final browser readiness or interaction acceptance; G-S12/G-S16 remain later gates. |
 
+## UAT004-GATE-04 Trace Update
+
+| item | status | evidence |
+| --- | --- | --- |
+| source refs inspected | complete | `src/agent/loop_run/repair_job.rs`, `repair_lifecycle.rs`, `repair_job_dispatch.rs`, `verifier_repair_targeting.rs`, `scaffold_pipeline.rs`, `no_progress_recovery.rs`, `safe_stop_emit.rs`, `safe_stop_payload.rs`, `actor_loop_flow.rs`, `verifier_driver.rs`, `src/agent/minimal_step_runner/repair.rs` |
+| MVP refs changed | complete | `mvp/anvilminimal/src/minimal_loop/repair_target.rs` adds browser route failure repair-target fixtures. Existing audited refs: `minimal_loop/repair_progress.rs`, `minimal_loop/loop_run.rs`, `planner/repair.rs`, `planner/runner.rs`, `eval_events.rs`. |
+| G-S10 repair target evidence | source-equivalent local fixture | Missing entrypoint and missing capability targets are covered by existing `classifies_missing_entrypoint`, `classifies_capability_missing`, `step_repair_missing_entrypoint_followthrough_creates_expected_artifact`. New `browser_http_500_route_failure_targets_framework_config` and `browser_route_failure_targets_test_or_evidence` fix browser route failure as repair targets. |
+| G-S10 follow-through evidence | source-equivalent local fixture | `step_repair_no_change_is_classified_and_handoff_saved`, `step_repair_target_not_followed_is_classified_and_handoff_saved`, and `step_repair_unrelated_change_is_classified_and_handoff_saved` classify no-change, target-misdirected, and unrelated repair with dedicated failure kinds and recovery handoff. |
+| G-S11 scaffold continuation evidence | source-equivalent local fixture | `deterministic_profile_fallback_requires_targeted_continuation_before_success` emits `used_for_completion=false`, `profile_auto_repair_continuation_prompt_treats_scaffold_as_incomplete` keeps scaffold as recovery scaffold, and `plan_run_nextjs_game_scaffold_only_fails_inferred_capabilities` rejects scaffold-only completion. |
+| G-S13 recovery handoff evidence | source-equivalent local fixture | `ultra_phase_scaffold_failure_saves_recovery_yaml_and_incomplete_handoff`, `ultra_final_acceptance_repair_failure_saves_recovery_handoff`, `plan_run_nextjs_interactive_app_records_partial_release_gate`, and `saved_recovery_ultra_plan_can_drive_fixture_recovery_success` prove `.md`, recovery YAML, suggested commands, incomplete status, and targeted recovery execution. |
+| required local tests | passed | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`: passed with 440 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval`: passed with 222 passed, 1 skipped |
+| source/anvildev same-condition run | skipped | GATE-04 did not run the full source `RepairJob` under anvildev. The scoped parity claim is based on source refs plus deterministic MVP fixtures. Full source/MVP comparative trace remains UAT004-GATE-09. |
+| provider/browser/manual evidence | skipped | No live provider or browser run was required for GATE-04. Browser route failures are fixed as deterministic repair-target fixtures; release-grade browser/interaction execution remains GATE-05/GATE-09. |
+
 ## Skip Evidence
 
 | skipped item | reason | impact | next action |

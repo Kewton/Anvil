@@ -524,6 +524,26 @@ mod tests {
     }
 
     #[test]
+    fn browser_http_500_route_failure_targets_framework_config() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure("release gate failed: browser_readiness_failed:http_500");
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::FrameworkConfig
+        );
+    }
+
+    #[test]
+    fn browser_route_failure_targets_test_or_evidence() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure("release gate failed: browser_readiness_failed:route_render");
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::TestOrEvidence
+        );
+    }
+
+    #[test]
     fn repair_target_followed_accepts_package_config_paths() {
         assert!(repair_target_followed(
             RepairTarget::PackageConfig,

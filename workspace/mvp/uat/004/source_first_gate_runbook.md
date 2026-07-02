@@ -42,6 +42,19 @@ UAT004 の各 gate で、実行した検証、skip evidence、rollback 条件、
 | anvildev comparison | skipped; final comparative source/MVP run remains GATE-09 |
 | rollback guard | do not execute dependency setup without authority; do not let setup-only, manifest-only, build-only, or dependency handoff-only output become task success; do not relax verifier shell-control/workspace-escape rejection |
 
+## UAT004-GATE-04 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/loop_run/repair_job.rs`, `repair_lifecycle.rs`, `repair_job_dispatch.rs`, `verifier_repair_targeting.rs`, `scaffold_pipeline.rs`, `no_progress_recovery.rs`, `safe_stop_emit.rs`, `safe_stop_payload.rs`, `actor_loop_flow.rs`, `verifier_driver.rs`, `src/agent/minimal_step_runner/repair.rs` |
+| MVP refs | `mvp/anvilminimal/src/minimal_loop/repair_target.rs`, `minimal_loop/repair_progress.rs`, `minimal_loop/loop_run.rs`, `planner/repair.rs`, `planner/runner.rs`, `eval_events.rs` |
+| targeted fixtures | `browser_http_500_route_failure_targets_framework_config`, `browser_route_failure_targets_test_or_evidence`; existing missing-entrypoint, no-change, target-not-followed, unrelated-change, scaffold-continuation, recovery-handoff, and saved-recovery-run fixtures rerun in full cargo |
+| full local verification | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 440 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 222 passed / 1 skipped |
+| source/anvildev comparison | skipped; source `RepairJob` was inspected but not run under a same-condition anvildev trace. Comparative normalized source/MVP lifecycle trace remains GATE-09. |
+| browser/manual UAT | skipped; browser route failures are covered by deterministic fixtures, while release-grade browser/interaction execution remains GATE-05/GATE-09 |
+| provider probe | skipped; no provider request schema, parser, tool-call shape, or prompt text changed |
+| rollback guard | do not allow no-change repair, target-misdirected repair, scaffold-only output, or recovery handoff persistence to become task success; browser route failures must remain repair/recovery targets |
+
 ## Re-run Notes
 
 Before closing an implementation gate, update:

@@ -198,6 +198,16 @@ Expected future behavior:
 | setup-only / manifest-only false positive | `manifest_only_nextjs_build_verify_is_not_success`, `minimal_loop_nextjs_required_paths_only_does_not_complete`, and `plan_run_nextjs_game_setup_only_fails_inferred_obligation` continue to reject setup-only or manifest-only output as task success | correct false-positive rejection preserved |
 | G-S08 verifier command policy | `verify_command_rejects_shell_control_syntax`, `verify_command_rejects_install_or_dev_server`, `rust_manifest_path_escape_rejected`, `planner_verify_normalization_splits_only_allowlisted_and_commands`, and `planner_verify_normalization_rejects_unsafe_shell_syntax` were rerun in full `cargo test` | source verifier command policy parity re-audited |
 
+## UAT004-GATE-04 Executable Fixture Binding
+
+| baseline fixture | executable assertion | expected classification |
+| --- | --- | --- |
+| F-002 recovery YAML saved after failed run | `step_repair_no_change_is_classified_and_handoff_saved`, `ultra_phase_scaffold_failure_saves_recovery_yaml_and_incomplete_handoff`, and `ultra_final_acceptance_repair_failure_saves_recovery_handoff` assert recovery `.md`, recovery UltraPlan YAML, suggested commands, and `Status: incomplete` | correct handoff preserved; saved recovery artifacts are not original task success |
+| F-002 recovery YAML must be executable | `saved_recovery_ultra_plan_can_drive_fixture_recovery_success` parses a saved recovery YAML and executes it through `run_ultra_plan` to create and verify the missing entrypoint | regression fixed: recovery handoff is tied to a targeted recovery run gate |
+| F-002 repair no-progress / no-change | `step_repair_no_change_is_classified_and_handoff_saved`, `step_repair_target_not_followed_is_classified_and_handoff_saved`, and `step_repair_unrelated_change_is_classified_and_handoff_saved` emit dedicated failure kinds instead of success | correct failure detection preserved |
+| F-006 scaffold-only interactive app | `deterministic_profile_fallback_requires_targeted_continuation_before_success`, `profile_auto_repair_continuation_prompt_treats_scaffold_as_incomplete`, and `plan_run_nextjs_game_scaffold_only_fails_inferred_capabilities` keep scaffold as continuation target and reject scaffold-only app completion | false-positive completion blocked |
+| F-007 browser route failure | `browser_http_500_route_failure_targets_framework_config`, `browser_route_failure_targets_test_or_evidence`, `plan_run_nextjs_browser_http_500_fails_final_contract`, and `plan_run_nextjs_tailwind_dev_route_failure_keeps_failure_kind` fix browser route failures as repair/recovery targets | browser route failure cannot be hidden behind build/path success |
+
 ## Fixture Reproduction Notes
 
 No new executable tests are created in GATE-00. The fixed baseline is document-level and must be converted into targeted automated fixtures in later gates.
