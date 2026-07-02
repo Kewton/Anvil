@@ -34,8 +34,8 @@ use crate::planner::lint::{
     lint_ultra_plan_report, step_plan_quality_report, step_plan_quality_warnings,
 };
 use crate::planner::profile::{
-    PhaseVerificationMode, profile_auto_repair, profile_before_phase, profile_expected_paths,
-    profile_generation_rules, profile_guidance, profile_post_step_repair,
+    PhaseVerificationMode, ProfileSnapshot, profile_auto_repair, profile_before_phase,
+    profile_expected_paths, profile_generation_rules, profile_guidance, profile_post_step_repair,
     profile_quality_expectations, profile_repair_prompt, profile_runtime_contract,
     verify_profile_final, verify_profile_invariant,
 };
@@ -70,6 +70,7 @@ const NEXTJS_DEV_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const NEXTJS_DEV_SERVER_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 const DEV_SERVER_ROUTE: &str = "/";
 const DEV_SERVER_LIFECYCLE_STAGES: [&str; 4] = ["start", "wait", "probe", "cleanup"];
+const PROFILE_REPAIR_FILE_EXCERPT_MAX_CHARS: usize = 2_400;
 
 #[derive(Debug, Clone)]
 struct RecoveryArtifactValidation {
@@ -2560,12 +2561,28 @@ pub fn run_ultra_plan_with_ui(
             None,
             None,
         );
-        let invariant_report = verify_profile_invariant(
+        let mut invariant_report = verify_profile_invariant(
             &config.workspace_root,
             &plan.profile,
             &plan.goal,
             &profile_snapshot,
         );
+        if !final_phase && !invariant_report.is_pass() {
+            invariant_report = repair_intermediate_profile_invariant(
+                execution,
+                &mut ultra_session,
+                config,
+                plan,
+                phase,
+                index,
+                &profile_snapshot,
+                &step_plan,
+                &mut ultra_context,
+                &final_expected_paths,
+                ui,
+                invariant_report,
+            )?;
+        }
         if !invariant_report.is_pass() {
             ultra_context.update_after_profile_failure(
                 phase,
@@ -3208,6 +3225,406 @@ pub fn run_ultra_plan_with_ui(
         "ultra-plan-run complete: {} phases",
         plan.phases.len()
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn repair_intermediate_profile_invariant(
+    execution: &mut dyn ChatClient,
+    ultra_session: &mut SessionSnapshot,
+    config: &Config,
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    index: usize,
+    profile_snapshot: &ProfileSnapshot,
+    step_plan: &StepPlan,
+    ultra_context: &mut UltraRunContext,
+    final_expected_paths: &[String],
+    ui: &dyn InteractionUi,
+    failed_report: VerificationReport,
+) -> anyhow::Result<VerificationReport> {
+    let mut retry = failed_report.clone();
+    let deterministic_error = match profile_auto_repair(
+        &config.workspace_root,
+        &plan.profile,
+        &plan.goal,
+        &failed_report,
+    ) {
+        Ok(changed) => {
+            retry = verify_profile_invariant(
+                &config.workspace_root,
+                &plan.profile,
+                &plan.goal,
+                profile_snapshot,
+            );
+            emit_profile_invariant_repair_event(
+                config,
+                plan,
+                phase,
+                index,
+                "deterministic",
+                changed,
+                retry.is_pass(),
+                &retry.primary_reason(),
+            );
+            None
+        }
+        Err(err) => {
+            let message = err.to_string();
+            emit_profile_invariant_repair_event(
+                config,
+                plan,
+                phase,
+                index,
+                "deterministic",
+                false,
+                false,
+                &message,
+            );
+            Some(message)
+        }
+    };
+    if retry.is_pass() {
+        return Ok(confirm_phase_build_after_profile_repair(
+            config, plan, phase, index, step_plan, retry,
+        ));
+    }
+
+    let expected_paths = profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+    let repair_prompt = profile_invariant_model_repair_prompt(
+        plan,
+        phase,
+        &retry,
+        ultra_context,
+        &expected_paths,
+        config,
+        deterministic_error.as_deref(),
+    );
+    let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
+    match run_profile_repair_with_ultra_session(
+        execution,
+        ultra_session,
+        &repair_prompt,
+        &expected_paths,
+        &repair_config,
+        ui,
+    ) {
+        Ok(repair_outcome) => {
+            push_context_items_capped(
+                &mut ultra_context.created_or_changed_paths,
+                &repair_outcome.changed_paths,
+                ULTRA_CONTEXT_MAX_PATHS,
+                &mut ultra_context.truncated,
+            );
+            push_context_items_capped(
+                &mut ultra_context.last_repair_changed_paths,
+                &repair_outcome.changed_paths,
+                ULTRA_CONTEXT_MAX_PATHS,
+                &mut ultra_context.truncated,
+            );
+            emit_ultra_phase_context_updated(
+                config,
+                plan,
+                phase,
+                index,
+                ultra_context,
+                ultra_session.messages.len(),
+                true,
+            );
+            retry = verify_profile_invariant(
+                &config.workspace_root,
+                &plan.profile,
+                &plan.goal,
+                profile_snapshot,
+            );
+            emit_profile_invariant_repair_event(
+                config,
+                plan,
+                phase,
+                index,
+                "model",
+                !repair_outcome.changed_paths.is_empty(),
+                retry.is_pass(),
+                &retry.primary_reason(),
+            );
+            if retry.is_pass() {
+                return Ok(confirm_phase_build_after_profile_repair(
+                    config, plan, phase, index, step_plan, retry,
+                ));
+            }
+        }
+        Err(err) => {
+            emit_profile_invariant_repair_event(
+                config,
+                plan,
+                phase,
+                index,
+                "model",
+                false,
+                false,
+                &err.to_string(),
+            );
+        }
+    }
+    ultra_context.update_after_profile_failure(
+        phase,
+        &retry.primary_reason(),
+        missing_final_artifacts(&config.workspace_root, final_expected_paths),
+    );
+    emit_ultra_phase_context_updated(
+        config,
+        plan,
+        phase,
+        index,
+        ultra_context,
+        ultra_session.messages.len(),
+        true,
+    );
+    Ok(retry)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_profile_invariant_repair_event(
+    config: &Config,
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    index: usize,
+    method: &str,
+    changed: bool,
+    ok: bool,
+    reason: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "profile_invariant_repair",
+            "phase_id": phase.id,
+            "phase_index": index + 1,
+            "total_phases": plan.phases.len(),
+            "final_phase": false,
+            "method": method,
+            "changed": changed,
+            "ok": ok,
+            "reason": eval_events::body_snippet(reason),
+            "bounded_repair": method == "model",
+        }),
+    );
+}
+
+fn confirm_phase_build_after_profile_repair(
+    config: &Config,
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    index: usize,
+    step_plan: &StepPlan,
+    profile_report: VerificationReport,
+) -> VerificationReport {
+    let build_commands = phase_build_verify_commands(step_plan);
+    if build_commands.is_empty() {
+        return profile_report;
+    }
+    let build_step = PlanStep {
+        id: "profile-repair-build".to_string(),
+        kind: "verify".to_string(),
+        expected_result: "pass".to_string(),
+        instruction: "Re-run the phase build verification after profile repair".to_string(),
+        expected_paths: Vec::new(),
+        verify: build_commands.clone(),
+    };
+    let (build_report, build_lifecycles) = verify_step_with_setup_observed_with_offline(
+        &config.workspace_root,
+        &build_step,
+        NodeDependencySetupAuthority::None,
+        config.offline,
+    );
+    for lifecycle in &build_lifecycles {
+        emit_dependency_build_lifecycle(
+            config.eval_events_path.as_deref(),
+            "ultra-plan-run",
+            Some(&phase.id),
+            lifecycle,
+        );
+    }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "profile_invariant_repair_build_verify",
+            "phase_id": phase.id,
+            "phase_index": index + 1,
+            "total_phases": plan.phases.len(),
+            "commands": build_commands,
+            "ok": build_report.is_pass(),
+            "reason": eval_events::body_snippet(&build_report.primary_reason()),
+        }),
+    );
+    if build_report.is_pass() {
+        profile_report
+    } else {
+        build_report
+    }
+}
+
+fn phase_build_verify_commands(plan: &StepPlan) -> Vec<String> {
+    let mut commands = Vec::new();
+    for command in plan.steps.iter().flat_map(|step| step.verify.iter()) {
+        if is_nextjs_build_verify_command_like(command) && !commands.contains(command) {
+            commands.push(command.clone());
+        }
+    }
+    commands
+}
+
+fn is_nextjs_build_verify_command_like(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower == "npm run build"
+        || lower.starts_with("npm run build ")
+        || lower == "pnpm build"
+        || lower.starts_with("pnpm build ")
+        || lower == "yarn build"
+        || lower.starts_with("yarn build ")
+        || lower == "next build"
+        || lower.starts_with("next build ")
+}
+
+fn profile_invariant_model_repair_prompt(
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    report: &VerificationReport,
+    context: &UltraRunContext,
+    expected_paths: &[String],
+    config: &Config,
+    deterministic_error: Option<&str>,
+) -> String {
+    let exact_reason = report.primary_reason();
+    let expected = render_prompt_bullets(expected_paths);
+    let file_excerpts = profile_invariant_offending_file_excerpts(
+        &config.workspace_root,
+        &plan.profile,
+        &exact_reason,
+    );
+    let deterministic_note = deterministic_error
+        .map(|err| format!("\nDeterministic repair error:\n{err}\n"))
+        .unwrap_or_default();
+    format!(
+        "Repair this intermediate profile invariant failure in one bounded turn.\n\n\
+Original ultra goal:\n{goal}\n\n\
+Profile: {profile}\nIntent: {intent}\nPhase id: {phase_id}\nPhase task:\n{phase_task}\n\n\
+Exact invariant reason:\n\"{exact_reason}\"\n{deterministic_note}\n\
+Offending file contents:\n{file_excerpts}\n\n\
+Expected profile artifacts:\n{expected}\n\n\
+{prior_context}\n\n\
+Bounded repair rules:\n\
+- Repair only the quoted invariant reason without weakening scripts, dependencies, tests, or profile checks.\n\
+- Prefer the smallest edit to the offending file shown above.\n\
+- For Tailwind, package.json must include tailwindcss/postcss/autoprefixer and postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n\
+- Stop after one repair pass; do not start a new planning cycle.",
+        goal = plan.goal,
+        profile = plan.profile,
+        intent = plan.intent,
+        phase_id = phase.id,
+        phase_task = phase.prompt,
+        exact_reason = exact_reason,
+        deterministic_note = deterministic_note,
+        file_excerpts = file_excerpts,
+        expected = expected,
+        prior_context = context.render_prompt_section(),
+    )
+}
+
+fn profile_invariant_offending_file_excerpts(root: &Path, profile: &str, reason: &str) -> String {
+    let paths = profile_invariant_relevant_paths(root, profile, reason);
+    if paths.is_empty() {
+        return "- no matching profile files found".to_string();
+    }
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let content = std::fs::read_to_string(&path).ok()?;
+            let label = path
+                .strip_prefix(root)
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| path.display().to_string());
+            Some(format!(
+                "--- {label} ---\n{}",
+                bounded_file_excerpt(&content, PROFILE_REPAIR_FILE_EXCERPT_MAX_CHARS)
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn profile_invariant_relevant_paths(root: &Path, profile: &str, reason: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if !matches!(profile, "nextjs" | "next-js" | "next.js") {
+        return out;
+    }
+    let tailwind_failure = reason.contains("tailwind_contract_failure");
+    let rels: &[&str] = if tailwind_failure {
+        &[
+            "package.json",
+            "postcss.config.js",
+            "postcss.config.cjs",
+            "postcss.config.mjs",
+            "postcss.config",
+            "tailwind.config.js",
+            "tailwind.config.cjs",
+            "tailwind.config.mjs",
+            "tailwind.config.ts",
+            "src/app/layout.tsx",
+            "src/app/layout.jsx",
+            "src/app/layout.ts",
+            "src/app/layout.js",
+            "app/layout.tsx",
+            "app/layout.jsx",
+            "app/layout.ts",
+            "app/layout.js",
+            "src/app/globals.css",
+            "src/app/global.css",
+            "app/globals.css",
+            "app/global.css",
+            "src/styles/globals.css",
+            "styles/globals.css",
+        ]
+    } else {
+        &[
+            "package.json",
+            "tsconfig.json",
+            "src/app/page.tsx",
+            "src/app/layout.tsx",
+            "app/page.tsx",
+            "app/layout.tsx",
+        ]
+    };
+    for project_root in profile_excerpt_project_roots(root) {
+        for rel in rels {
+            let path = project_root.join(rel);
+            if path.is_file() && !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn profile_excerpt_project_roots(root: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![root.to_path_buf()];
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join("package.json").is_file() && !roots.contains(&path) {
+                roots.push(path);
+            }
+        }
+    }
+    roots
+}
+
+fn bounded_file_excerpt(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+    let mut excerpt = content.chars().take(max_chars).collect::<String>();
+    excerpt.push_str("\n[truncated]");
+    excerpt
 }
 
 fn ultra_final_acceptance_report(
@@ -8892,43 +9309,76 @@ mod tests {
     }
 
     #[test]
-    fn ultra_plan_non_final_profile_failure_stops() {
+    fn ultra_plan_non_final_tailwind_invariant_repair_completes_and_runs_next_phase() {
         let dir = tempfile::tempdir().unwrap();
-        let step_json = generated_nextjs_artifact_plan_json("Scaffold project");
-        let mut planner = FakeClient::new(
-            (0..3)
-                .map(|_| AssistantReply::text(step_json.clone()))
-                .collect(),
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let scaffold_plan = generated_nextjs_fixture_plan_json_with_kind(
+            "scaffold phase",
+            "check_scaffold.py",
+            "setup",
         );
-        let package = r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
-        let bad_package = r#"{"dependencies":{"next":"x"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let finish_plan = generated_nextjs_fixture_plan_json_with_kind(
+            "finish phase",
+            "check_finish.py",
+            "setup",
+        );
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(scaffold_plan),
+            AssistantReply::text(finish_plan),
+        ]);
+        let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
         let mut execution = FakeClient::new(vec![
             AssistantReply {
                 content: String::new(),
                 tool_calls: vec![
                     crate::state::ToolCall::new(
                         "Write",
-                        serde_json::json!({"path":"package.json","content":bad_package}),
+                        serde_json::json!({"path":"package.json","content":package}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
-                        serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main>App</main>;}"}),
+                        serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main className=\"min-h-screen\">App</main>;}"}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
-                        serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+                        serde_json::json!({"path":"src/app/layout.tsx","content":"import './globals.css';\nexport default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
                         serde_json::json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";"}),
                     ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/globals.css","content":"@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"tailwind.config.js","content":"module.exports = { content: ['./src/pages/**/*.{ts,tsx}', './src/components/**/*.{ts,tsx}', './src/app/**/*.{ts,tsx}'], theme: { extend: {} }, plugins: [] };\n"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"postcss.config.js","content":"module.exports = { plugins: { tailwindcss: {} } };\n"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"check_scaffold.py","content":"x = 1\n"}),
+                    ),
                 ],
                 prompt_tokens: None,
                 completion_tokens: None,
             },
-            AssistantReply::text("done"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"check_finish.py","content":"x = 1\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
         ]);
-        let _ = package;
         let plan = UltraPlan {
             goal: "3011 port app".to_string(),
             profile: "nextjs".to_string(),
@@ -8945,15 +9395,104 @@ mod tests {
                 },
             ],
         };
-        let err = run_ultra_plan(
-            &mut planner,
-            &mut execution,
-            &plan,
-            &config(dir.path().to_path_buf()),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("phase scaffold profile invariant verification failed"));
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let postcss = std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap();
+        assert!(postcss.contains("tailwindcss"));
+        assert!(postcss.contains("autoprefixer"));
+        assert!(dir.path().join("check_finish.py").is_file());
+        assert!(!dir.path().join(".anvil/repairs").exists());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"profile_invariant_repair\""));
+        assert!(event_text.contains("\"method\":\"deterministic\""));
+        assert!(event_text.contains("\"ok\":true"));
+        assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
+    }
+
+    #[test]
+    fn ultra_plan_non_final_profile_repair_exhaustion_still_saves_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let step_json = generated_nextjs_artifact_plan_json("Scaffold project");
+        let mut planner = FakeClient::new(
+            (0..3)
+                .map(|_| AssistantReply::text(step_json.clone()))
+                .collect(),
+        );
+        let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"package.json","content":package}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main>App</main>;}"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"next.config.js","content":"/** @type {import('next').NextConfig} */\nconst nextConfig = {};\n\nmodule.exports = nextConfig;\n"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/globals.css","content":"body { margin: 0; }\n"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"tsconfig.json","content":"{\"compilerOptions\":{\"rootDir\":\"src\"}}\n"}),
+                    ),
+                ],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("model repair made no changes"),
+        ]);
+        let plan = UltraPlan {
+            goal: "3011 port app".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "scaffold".to_string(),
+                    prompt: "Scaffold project".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "finish".to_string(),
+                    prompt: "Finish project".to_string(),
+                },
+            ],
+        };
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("phase scaffold profile invariant verification failed"),
+            "{err}"
+        );
+        assert!(err.contains("tsconfig.rootDir"), "{err}");
+        assert!(dir.path().join(".anvil/repairs").is_dir());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"profile_invariant_repair\""));
+        assert!(event_text.contains("\"method\":\"deterministic\""));
+        assert!(event_text.contains("\"method\":\"model\""));
+        assert!(event_text.contains("\"recovery_handoff_kind\":\"profile_invariant_failure\""));
     }
 
     #[test]

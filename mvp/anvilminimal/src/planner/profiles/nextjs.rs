@@ -9,7 +9,7 @@ use crate::planner::verify::{VerificationReport, VerifyStatus};
 pub fn generation_rules(intent: &str) -> &'static str {
     match intent {
         "create" => {
-            "- Profile nextjs/create: preserve a real Next.js app contract. Include next/react/react-dom dependencies, keep scripts.build as next build, and end with a build verification phase. Put dependency setup before any npm run build verification when node_modules is not already present; setup instructions may install dependencies, but verify must not contain npm install. If dependency setup is not allowed or cannot run, stop with dependency_missing instead of claiming build success. If you use Tailwind utility classes or @tailwind directives, include tailwindcss/postcss/autoprefixer and create tailwind.config.* plus postcss.config.*; otherwise use plain CSS and do not write Tailwind utility classes. If the goal mentions port 3011, keep scripts.dev as next dev -p 3011 or next dev --port 3011.\n"
+            "- Profile nextjs/create: preserve a real Next.js app contract. Include next/react/react-dom dependencies, keep scripts.build as next build, and end with a build verification phase. Put dependency setup before any npm run build verification when node_modules is not already present; setup instructions may install dependencies, but verify must not contain npm install. If dependency setup is not allowed or cannot run, stop with dependency_missing instead of claiming build success. If you use Tailwind utility classes or @tailwind directives, include tailwindcss/postcss/autoprefixer and create tailwind.config.* plus postcss.config.*; postcss.config plugins must include BOTH tailwindcss and autoprefixer. Otherwise use plain CSS and do not write Tailwind utility classes. If the goal mentions port 3011, keep scripts.dev as next dev -p 3011 or next dev --port 3011.\n"
         }
         "fix" => {
             "- Profile nextjs/fix: preserve the existing Next.js structure and verifier integrity. Do not weaken next/react/react-dom dependencies, scripts.build, app/page, layout, or TypeScript configuration to make a failing verifier pass.\n"
@@ -18,7 +18,7 @@ pub fn generation_rules(intent: &str) -> &'static str {
             "- Profile nextjs/research: inspect the existing app and produce concrete findings. Do not modify source unless the user explicitly asks for fixes.\n"
         }
         _ => {
-            "- Profile nextjs: preserve a real Next.js app when present. Keep next/react/react-dom dependencies, scripts.build as next build, app/ or pages/ entrypoints, and a final build verification phase. Keep styling toolchains internally consistent.\n"
+            "- Profile nextjs: preserve a real Next.js app when present. Keep next/react/react-dom dependencies, scripts.build as next build, app/ or pages/ entrypoints, and a final build verification phase. Keep styling toolchains internally consistent; if Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n"
         }
     }
 }
@@ -174,6 +174,7 @@ pub fn guidance(goal: &str) -> String {
          If those files are absent, write package.json, src/app/layout.tsx, src/app/page.tsx, and src/app/global.d.ts before further inspection. \
          If any layout imports CSS such as ./globals.css, src/app/global.d.ts must declare module \"*.css\". \
          package.json must include compatible next, react, react-dom, @types/react, @types/react-dom, and TypeScript 5.x dependencies plus scripts.build = `next build`. \
+         If Tailwind is used, package.json must include tailwindcss/postcss/autoprefixer and postcss.config plugins must include BOTH tailwindcss and autoprefixer. \
          For TypeScript/TSX apps, create tsconfig.json before treating the app as complete. \
          Do not use deprecated moduleResolution=node10 or target=ES5; prefer moduleResolution=bundler and target=ES2017 or newer.{port}"
     )
@@ -192,7 +193,7 @@ pub fn runtime_contract(intent: &str, goal: &str) -> String {
 - Keep scripts.build as next build; do not replace it with echo/skip/no-op commands.\n\
 - If npm run build cannot run because dependencies are not installed, report dependency_missing or use an explicit setup step; do not fake success.\
 {port}\n\
-- If using Tailwind utility classes or @tailwind directives, keep the Tailwind toolchain complete. Otherwise use plain CSS.\n\
+- If using Tailwind utility classes or @tailwind directives, keep the Tailwind toolchain complete: tailwindcss/postcss/autoprefixer dependencies, tailwind.config.*, and postcss.config plugins with BOTH tailwindcss and autoprefixer. Otherwise use plain CSS.\n\
 - Keep TypeScript and app router configuration coherent.\n\
 - Do not treat scaffold-only, package-only, or build-only output as complete."
         ),
@@ -202,6 +203,7 @@ pub fn runtime_contract(intent: &str, goal: &str) -> String {
 - Keep scripts.build as next build when already present; do not weaken build/test scripts to hide failures.\n\
 - If npm run build cannot run because dependencies are missing, report dependency_missing or use the existing dependency workflow.\
 {port}\n\
+- If Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n\
 - Keep TypeScript and app router configuration coherent.\n\
 - Do not treat scaffold-only, package-only, or build-only output as complete."
         ),
@@ -218,7 +220,7 @@ pub fn runtime_contract(intent: &str, goal: &str) -> String {
 - Keep next/react/react-dom dependencies when already present.\n\
 - Keep scripts.build as next build when already present.\
 {port}\n\
-- Keep styling and TypeScript toolchains internally consistent.\n\
+- Keep styling and TypeScript toolchains internally consistent; if Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n\
 - Do not treat scaffold-only, package-only, or build-only output as complete."
         ),
     }
@@ -265,6 +267,7 @@ pub fn repair_prompt(root: &Path, goal: &str, report: &VerificationReport) -> St
          If package.json exists only in a project subdirectory, continue using that subdirectory. \
          Ensure the app has a concrete playable page and layout, package dependencies, \
          scripts.build = `next build`, and a dev script on port 3011 when the goal mentions 3011. \
+         If Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer. \
          Use tools for file changes, then stop."
     )
 }
@@ -272,6 +275,10 @@ pub fn repair_prompt(root: &Path, goal: &str, report: &VerificationReport) -> St
 pub fn auto_repair(root: &Path, goal: &str, report: &VerificationReport) -> anyhow::Result<bool> {
     if report.is_pass() {
         return Ok(false);
+    }
+    let reason = report.primary_reason();
+    if reason.contains("tailwind_contract_failure") {
+        return repair_tailwind_contract(root, goal, &reason);
     }
     let project = locate_project_root(root).unwrap_or_else(|_| ProjectRoot {
         path: root.to_path_buf(),
@@ -318,6 +325,48 @@ export default function RootLayout({
     )?;
     ensure_file(&project.path.join("src/app/page.tsx"), fallback_page())?;
     Ok(true)
+}
+
+pub fn repair_tailwind_contract(root: &Path, goal: &str, reason: &str) -> anyhow::Result<bool> {
+    if !reason.contains("tailwind_contract_failure") {
+        return Ok(false);
+    }
+    let project = locate_project_root(root).unwrap_or_else(|_| ProjectRoot {
+        path: root.to_path_buf(),
+        prefix: String::new(),
+    });
+    let project_root = project.path.as_path();
+    let mut changed = false;
+    if reason.contains("Tailwind toolchain dependency missing:") {
+        changed |= ensure_package_json_changed(project_root, goal)?;
+        return Ok(changed);
+    }
+    if reason.contains("Tailwind config file missing") {
+        changed |= write_file_if_changed(
+            &project_root.join("tailwind.config.js"),
+            canonical_tailwind_config(),
+        )?;
+        return Ok(changed);
+    }
+    if reason.contains("PostCSS config file missing") {
+        changed |= ensure_package_json_changed(project_root, goal)?;
+        changed |= write_file_if_changed(
+            &project_root.join("postcss.config.js"),
+            canonical_postcss_config(),
+        )?;
+        return Ok(changed);
+    }
+    if reason.contains("PostCSS config must include the Tailwind plugin")
+        || reason.contains("PostCSS config must include autoprefixer")
+    {
+        changed |= ensure_package_json_changed(project_root, goal)?;
+        changed |= repair_postcss_plugins(project_root)?;
+        return Ok(changed);
+    }
+    if reason.contains("@tailwind CSS file must be imported by app layout") {
+        return repair_tailwind_layout_import(project_root, reason);
+    }
+    Ok(false)
 }
 
 pub fn repair_manifest_coherence(root: &Path, goal: &str) -> anyhow::Result<bool> {
@@ -476,6 +525,275 @@ fn ensure_file(path: &Path, content: &str) -> anyhow::Result<()> {
         std::fs::write(path, content)?;
     }
     Ok(())
+}
+
+fn ensure_package_json_changed(root: &Path, goal: &str) -> anyhow::Result<bool> {
+    let path = root.join("package.json");
+    let before = std::fs::read_to_string(&path).unwrap_or_default();
+    ensure_package_json(root, goal)?;
+    let after = std::fs::read_to_string(path).unwrap_or_default();
+    Ok(before != after)
+}
+
+fn write_file_if_changed(path: &Path, content: &str) -> anyhow::Result<bool> {
+    if std::fs::read_to_string(path).is_ok_and(|existing| existing == content) {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(true)
+}
+
+fn canonical_tailwind_config() -> &'static str {
+    "module.exports = {\n  content: [\n    \"./src/pages/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/components/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/app/**/*.{js,ts,jsx,tsx,mdx}\",\n  ],\n  theme: { extend: {} },\n  plugins: [],\n};\n"
+}
+
+fn canonical_postcss_config() -> &'static str {
+    "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n"
+}
+
+fn repair_postcss_plugins(root: &Path) -> anyhow::Result<bool> {
+    let Some(path) = postcss_config_path(root) else {
+        return write_file_if_changed(&root.join("postcss.config.js"), canonical_postcss_config());
+    };
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let lower = content.to_ascii_lowercase();
+    let needs_tailwind = !(lower.contains("tailwindcss") || lower.contains("@tailwindcss/postcss"));
+    let needs_autoprefixer = !lower.contains("autoprefixer");
+    if !needs_tailwind && !needs_autoprefixer {
+        return Ok(false);
+    }
+    let repaired = insert_missing_postcss_plugins(&content, needs_tailwind, needs_autoprefixer)
+        .unwrap_or_else(|| canonical_postcss_config().to_string());
+    write_file_if_changed(&path, &repaired)
+}
+
+fn insert_missing_postcss_plugins(
+    content: &str,
+    needs_tailwind: bool,
+    needs_autoprefixer: bool,
+) -> Option<String> {
+    let (open, close) = find_plugins_object_block(content)?;
+    let base_indent = line_indent_before(content, open);
+    let entry_indent = format!("{base_indent}  ");
+    let body = &content[open + 1..close];
+    let needs_separator = !body.trim().is_empty() && !body.trim_end().ends_with(',');
+    let mut insertion = String::new();
+    if needs_separator {
+        insertion.push(',');
+    }
+    if needs_tailwind {
+        insertion.push('\n');
+        insertion.push_str(&entry_indent);
+        insertion.push_str("tailwindcss: {},");
+    }
+    if needs_autoprefixer {
+        insertion.push('\n');
+        insertion.push_str(&entry_indent);
+        insertion.push_str("autoprefixer: {},");
+    }
+    insertion.push('\n');
+    insertion.push_str(&base_indent);
+
+    let mut repaired = String::new();
+    repaired.push_str(&content[..close]);
+    repaired.push_str(&insertion);
+    repaired.push_str(&content[close..]);
+    Some(repaired)
+}
+
+fn find_plugins_object_block(content: &str) -> Option<(usize, usize)> {
+    let lower = content.to_ascii_lowercase();
+    let mut search_from = 0usize;
+    while let Some(relative) = lower[search_from..].find("plugins") {
+        let index = search_from + relative;
+        let before = content[..index].chars().next_back();
+        let after = content[index + "plugins".len()..].chars().next();
+        if before.is_some_and(is_identifier_char) || after.is_some_and(is_identifier_char) {
+            search_from = index + "plugins".len();
+            continue;
+        }
+        let mut cursor = index + "plugins".len();
+        cursor = skip_ascii_whitespace(content, cursor);
+        if content[cursor..].starts_with(':') {
+            cursor += 1;
+        } else {
+            search_from = cursor;
+            continue;
+        }
+        cursor = skip_ascii_whitespace(content, cursor);
+        if !content[cursor..].starts_with('{') {
+            search_from = cursor;
+            continue;
+        }
+        let close = find_matching_brace(content, cursor)?;
+        return Some((cursor, close));
+    }
+    None
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+}
+
+fn skip_ascii_whitespace(content: &str, mut cursor: usize) -> usize {
+    while let Some(ch) = content[cursor..].chars().next()
+        && ch.is_ascii_whitespace()
+    {
+        cursor += ch.len_utf8();
+    }
+    cursor
+}
+
+fn find_matching_brace(content: &str, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut string_quote: Option<char> = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut chars = content[open..].char_indices().peekable();
+    while let Some((offset, ch)) = chars.next() {
+        let index = open + offset;
+        if line_comment {
+            if ch == '\n' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if block_comment {
+            if ch == '*'
+                && let Some((_, '/')) = chars.peek().copied()
+            {
+                let _ = chars.next();
+                block_comment = false;
+            }
+            continue;
+        }
+        if let Some(quote) = string_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                string_quote = None;
+            }
+            continue;
+        }
+        if ch == '/'
+            && let Some((_, next)) = chars.peek().copied()
+        {
+            if next == '/' {
+                let _ = chars.next();
+                line_comment = true;
+                continue;
+            }
+            if next == '*' {
+                let _ = chars.next();
+                block_comment = true;
+                continue;
+            }
+        }
+        match ch {
+            '"' | '\'' | '`' => string_quote = Some(ch),
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn line_indent_before(content: &str, index: usize) -> String {
+    let line_start = content[..index].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    content[line_start..index]
+        .chars()
+        .take_while(|ch| ch.is_ascii_whitespace())
+        .collect()
+}
+
+fn repair_tailwind_layout_import(root: &Path, reason: &str) -> anyhow::Result<bool> {
+    let Some(css_path) = reported_tailwind_css_path(root, reason) else {
+        return Ok(false);
+    };
+    let Some(layout_path) = app_layout_paths(root)
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
+        return Ok(false);
+    };
+    let content = std::fs::read_to_string(&layout_path).unwrap_or_default();
+    let import_path = css_import_path_for_layout(&layout_path, &css_path)
+        .unwrap_or_else(|| "./globals.css".to_string());
+    if css_imports_from_content(&content)
+        .iter()
+        .any(|existing| existing == &import_path)
+    {
+        return Ok(false);
+    }
+    let import_line = format!("import \"{import_path}\";\n");
+    let repaired = insert_import_after_directives(&content, &import_line);
+    write_file_if_changed(&layout_path, &repaired)
+}
+
+fn reported_tailwind_css_path(root: &Path, reason: &str) -> Option<PathBuf> {
+    let files = tailwind_directive_files(root);
+    files
+        .iter()
+        .find(|path| reason.contains(&path.display().to_string()))
+        .cloned()
+        .or_else(|| files.into_iter().next())
+}
+
+fn app_layout_paths(root: &Path) -> Vec<PathBuf> {
+    [
+        "src/app/layout.tsx",
+        "src/app/layout.jsx",
+        "src/app/layout.ts",
+        "src/app/layout.js",
+        "app/layout.tsx",
+        "app/layout.jsx",
+        "app/layout.ts",
+        "app/layout.js",
+    ]
+    .iter()
+    .map(|rel| root.join(rel))
+    .collect()
+}
+
+fn css_import_path_for_layout(layout_path: &Path, css_path: &Path) -> Option<String> {
+    let layout_dir = layout_path.parent()?;
+    let relative = css_path.strip_prefix(layout_dir).ok()?;
+    if relative.components().count() != 1 {
+        return None;
+    }
+    Some(format!(
+        "./{}",
+        relative.to_string_lossy().replace('\\', "/")
+    ))
+}
+
+fn insert_import_after_directives(content: &str, import_line: &str) -> String {
+    let mut offset = 0usize;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim().trim_end_matches(';');
+        if matches!(trimmed, "\"use client\"" | "'use client'") || trimmed.is_empty() {
+            offset += line.len();
+            continue;
+        }
+        break;
+    }
+    let mut repaired = String::new();
+    repaired.push_str(&content[..offset]);
+    repaired.push_str(import_line);
+    repaired.push_str(&content[offset..]);
+    repaired
 }
 
 fn fallback_page() -> &'static str {
@@ -980,6 +1298,7 @@ fn postcss_config_path(root: &Path) -> Option<PathBuf> {
         "postcss.config.js",
         "postcss.config.mjs",
         "postcss.config.cjs",
+        "postcss.config",
     ]
     .iter()
     .map(|rel| root.join(rel))
@@ -1653,6 +1972,91 @@ export default function Page() {
             assert!(package_has_dependency(&package, dep), "{dep}");
         }
         assert!(verify(dir.path(), "3011").is_pass());
+    }
+
+    #[test]
+    fn repair_tailwind_contract_adds_missing_autoprefixer_plugin_and_is_idempotent() {
+        let dir = complete_tailwind_app("module.exports = { plugins: { tailwindcss: {} } };\n");
+        let report = verify_invariant(dir.path(), "3011");
+        let reason = report.primary_reason();
+        assert!(reason.contains("PostCSS config must include autoprefixer"));
+
+        assert!(repair_tailwind_contract(dir.path(), "3011", &reason).unwrap());
+        let postcss = std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap();
+        assert!(postcss.contains("tailwindcss"));
+        assert!(postcss.contains("autoprefixer"));
+        assert!(verify_invariant(dir.path(), "3011").is_pass());
+
+        let before = std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap();
+        assert!(!repair_tailwind_contract(dir.path(), "3011", &reason).unwrap());
+        let after = std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn repair_tailwind_contract_rewrites_unrecognizable_postcss_config() {
+        let dir = complete_tailwind_app("export default [require('tailwindcss')];\n");
+        let report = verify_invariant(dir.path(), "3011");
+        let reason = report.primary_reason();
+        assert!(reason.contains("PostCSS config must include autoprefixer"));
+
+        assert!(repair_tailwind_contract(dir.path(), "3011", &reason).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap(),
+            canonical_postcss_config()
+        );
+        assert!(verify_invariant(dir.path(), "3011").is_pass());
+    }
+
+    #[test]
+    fn repair_tailwind_contract_adds_missing_layout_import() {
+        let dir = complete_tailwind_app(
+            "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n",
+        );
+        std::fs::write(
+            dir.path().join("src/app/layout.tsx"),
+            "export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}",
+        )
+        .unwrap();
+        let report = verify_invariant(dir.path(), "3011");
+        let reason = report.primary_reason();
+        assert!(reason.contains("@tailwind CSS file must be imported"));
+
+        assert!(repair_tailwind_contract(dir.path(), "3011", &reason).unwrap());
+        let layout = std::fs::read_to_string(dir.path().join("src/app/layout.tsx")).unwrap();
+        assert!(layout.contains("import \"./globals.css\";"));
+        assert!(verify_invariant(dir.path(), "3011").is_pass());
+    }
+
+    fn complete_tailwind_app(postcss_config: &str) -> tempfile::TempDir {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/layout.tsx"),
+            "import './globals.css';\nexport default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tailwind.config.js"),
+            "module.exports = { content: ['./src/pages/**/*.{ts,tsx}', './src/components/**/*.{ts,tsx}', './src/app/**/*.{ts,tsx}'], theme: { extend: {} }, plugins: [] };\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("postcss.config.js"), postcss_config).unwrap();
+        dir
     }
 
     fn complete_app() -> tempfile::TempDir {
