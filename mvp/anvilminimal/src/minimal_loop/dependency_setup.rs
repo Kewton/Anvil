@@ -35,6 +35,7 @@ impl PackageManagerKind {
 #[serde(rename_all = "snake_case")]
 pub enum NodeDependencySetupKind {
     NextBuildDependencies,
+    NodeDeclaredDependencies,
     NodeTestRunnerManifest,
 }
 
@@ -42,6 +43,7 @@ impl NodeDependencySetupKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NextBuildDependencies => "next_build_dependencies",
+            Self::NodeDeclaredDependencies => "node_declared_dependencies",
             Self::NodeTestRunnerManifest => "node_test_runner_manifest",
         }
     }
@@ -209,6 +211,22 @@ pub fn next_binary_ready(root: &Path) -> bool {
 
 pub fn next_build_dependencies_ready(root: &Path) -> bool {
     next_build_missing_dependency_labels(root).is_empty()
+}
+
+pub fn node_declared_dependencies_ready(root: &Path) -> bool {
+    root.join("node_modules").is_dir()
+}
+
+pub fn node_declared_dependencies_missing_reason(root: &Path) -> String {
+    if node_declared_dependencies_ready(root) {
+        "declared Node dependencies are ready".to_string()
+    } else if !root.join("package.json").is_file() {
+        "package.json missing before Node dependency verifier".to_string()
+    } else if !package_json_declares_dependencies(root) {
+        "package.json has no dependency table".to_string()
+    } else {
+        "node_modules missing for declared package.json dependencies".to_string()
+    }
 }
 
 pub fn next_build_missing_dependency_reason(root: &Path) -> String {
@@ -412,6 +430,43 @@ pub fn requirement_for_node_test_runner(
     }
 }
 
+pub fn requirement_for_node_declared_dependencies(
+    root: &Path,
+    profile: Option<&str>,
+    reason: &str,
+    authority: NodeDependencySetupAuthority,
+) -> NodeDependencySetupRequirement {
+    let package_manager = package_manager_for_root(root);
+    let mut blocked_reason = None;
+    if !root.join("package.json").is_file() {
+        blocked_reason = Some("package.json missing".to_string());
+    } else if !package_json_declares_dependencies(root) {
+        blocked_reason = Some("package.json has no dependency table".to_string());
+    } else if !authority.allows_setup() {
+        blocked_reason = Some("dependency setup authority missing".to_string());
+    } else if matches!(
+        package_manager,
+        PackageManagerKind::Pnpm | PackageManagerKind::Yarn | PackageManagerKind::Mixed
+    ) {
+        blocked_reason = Some(format!(
+            "package manager {} is not supported by initial npm-only setup bridge",
+            package_manager.as_str()
+        ));
+    }
+    let allowed = blocked_reason.is_none();
+    NodeDependencySetupRequirement {
+        profile: profile.map(str::to_string),
+        setup_kind: NodeDependencySetupKind::NodeDeclaredDependencies,
+        package_manager,
+        project_root: ".".to_string(),
+        reason: reason.to_string(),
+        required_binary: "node_modules".to_string(),
+        setup_authority: authority,
+        allowed,
+        blocked_reason,
+    }
+}
+
 pub fn run_node_dependency_setup(
     root: &Path,
     requirement: &NodeDependencySetupRequirement,
@@ -423,6 +478,15 @@ pub(crate) fn run_node_dependency_setup_with_program(
     root: &Path,
     requirement: &NodeDependencySetupRequirement,
     npm_program: &Path,
+) -> NodeDependencySetupObservation {
+    run_node_dependency_setup_with_program_and_offline(root, requirement, npm_program, false)
+}
+
+pub(crate) fn run_node_dependency_setup_with_program_and_offline(
+    root: &Path,
+    requirement: &NodeDependencySetupRequirement,
+    npm_program: &Path,
+    offline: bool,
 ) -> NodeDependencySetupObservation {
     if !requirement.allowed {
         return NodeDependencySetupObservation::blocked(
@@ -438,6 +502,14 @@ pub(crate) fn run_node_dependency_setup_with_program(
     if requirement.setup_kind == NodeDependencySetupKind::NodeTestRunnerManifest {
         return run_node_test_runner_manifest_setup(root, requirement);
     }
+    if offline {
+        return NodeDependencySetupObservation::blocked(
+            requirement.setup_kind,
+            requirement.package_manager,
+            requirement.setup_authority,
+            "dependency_setup_blocked_offline",
+        );
+    }
     if requirement.package_manager == PackageManagerKind::Pnpm
         || requirement.package_manager == PackageManagerKind::Yarn
         || requirement.package_manager == PackageManagerKind::Mixed
@@ -450,7 +522,7 @@ pub(crate) fn run_node_dependency_setup_with_program(
         );
     }
     let before_lock = root.join("package-lock.json").exists();
-    let before_missing = next_build_missing_dependency_labels(root);
+    let before_missing = setup_missing_dependency_labels(root, requirement.setup_kind);
     let started = Instant::now();
     let mut child = match Command::new(npm_program)
         .args(["install", "--ignore-scripts"])
@@ -493,17 +565,11 @@ pub(crate) fn run_node_dependency_setup_with_program(
                     changed_paths.push("package-lock.json".to_string());
                 }
                 for path in before_missing {
-                    if path == "node_modules/.bin/next" {
-                        if next_binary_ready(root) {
-                            changed_paths.push(path);
-                        }
-                    } else if let Some(package) = path.strip_prefix("node_modules/")
-                        && node_package_installed(root, package)
-                    {
+                    if setup_dependency_label_ready(root, &path) {
                         changed_paths.push(path);
                     }
                 }
-                let required_ready = next_build_dependencies_ready(root);
+                let required_ready = setup_dependencies_ready(root, requirement.setup_kind);
                 let status_kind = if status.success() && required_ready {
                     NodeDependencySetupStatus::Passed
                 } else {
@@ -521,7 +587,8 @@ pub(crate) fn run_node_dependency_setup_with_program(
                     } else if status.success() {
                         format!(
                             "dependency setup completed but required dependencies are still missing: {}",
-                            next_build_missing_dependency_labels(root).join(", ")
+                            setup_missing_dependency_labels(root, requirement.setup_kind)
+                                .join(", ")
                         )
                     } else {
                         format!("dependency setup failed: {status}")
@@ -565,6 +632,46 @@ pub(crate) fn run_node_dependency_setup_with_program(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn setup_dependencies_ready(root: &Path, setup_kind: NodeDependencySetupKind) -> bool {
+    match setup_kind {
+        NodeDependencySetupKind::NextBuildDependencies => next_build_dependencies_ready(root),
+        NodeDependencySetupKind::NodeDeclaredDependencies => node_declared_dependencies_ready(root),
+        NodeDependencySetupKind::NodeTestRunnerManifest => node_test_runner_bindable(root),
+    }
+}
+
+fn setup_missing_dependency_labels(
+    root: &Path,
+    setup_kind: NodeDependencySetupKind,
+) -> Vec<String> {
+    match setup_kind {
+        NodeDependencySetupKind::NextBuildDependencies => {
+            next_build_missing_dependency_labels(root)
+        }
+        NodeDependencySetupKind::NodeDeclaredDependencies => {
+            if node_declared_dependencies_ready(root) {
+                Vec::new()
+            } else {
+                vec!["node_modules".to_string()]
+            }
+        }
+        NodeDependencySetupKind::NodeTestRunnerManifest => Vec::new(),
+    }
+}
+
+fn setup_dependency_label_ready(root: &Path, path: &str) -> bool {
+    if path == "node_modules" {
+        return root.join("node_modules").is_dir();
+    }
+    if path == "node_modules/.bin/next" {
+        return next_binary_ready(root);
+    }
+    if let Some(package) = path.strip_prefix("node_modules/") {
+        return node_package_installed(root, package);
+    }
+    false
 }
 
 fn run_node_test_runner_manifest_setup(
@@ -945,6 +1052,35 @@ mod tests {
             run_node_dependency_setup_with_program(dir.path(), &requirement, Path::new("missing"));
         assert_eq!(observation.status, NodeDependencySetupStatus::Blocked);
         assert!(!observation.attempted);
+    }
+
+    #[test]
+    fn offline_mode_blocks_network_dependency_setup_without_spawn() {
+        let dir = TempDir::new().unwrap();
+        write_package(
+            dir.path(),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        );
+        let requirement = requirement_for_node_declared_dependencies(
+            dir.path(),
+            None,
+            "dependency probe",
+            NodeDependencySetupAuthority::PlanSetupStep,
+        );
+
+        let observation = run_node_dependency_setup_with_program_and_offline(
+            dir.path(),
+            &requirement,
+            Path::new("missing-npm"),
+            true,
+        );
+
+        assert_eq!(observation.status, NodeDependencySetupStatus::Blocked);
+        assert!(!observation.attempted);
+        assert_eq!(
+            observation.primary_reason,
+            "dependency_setup_blocked_offline"
+        );
     }
 
     #[test]

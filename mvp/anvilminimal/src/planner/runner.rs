@@ -41,7 +41,7 @@ use crate::planner::step_plan::{
     parse_step_plan, render_step_plan, repair_generated_step_plan_contract,
 };
 use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
-use crate::planner::verify::{VerificationReport, verify_step_with_setup_observed};
+use crate::planner::verify::{VerificationReport, verify_step_with_setup_observed_with_offline};
 use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
 use crate::tools::path_guard::resolve_existing;
@@ -839,8 +839,12 @@ fn run_step(
         });
     }
     let setup_authority = step_verify_setup_authority(plan, step);
-    let (report, build_lifecycles) =
-        verify_step_with_setup_observed(&config.workspace_root, step, setup_authority);
+    let (report, build_lifecycles) = verify_step_with_setup_observed_with_offline(
+        &config.workspace_root,
+        step,
+        setup_authority,
+        config.offline,
+    );
     for lifecycle in &build_lifecycles {
         emit_dependency_build_lifecycle(
             config.eval_events_path.as_deref(),
@@ -950,8 +954,12 @@ fn run_step(
                 });
             }
         }
-        let (retry, retry_lifecycles) =
-            verify_step_with_setup_observed(&config.workspace_root, step, setup_authority);
+        let (retry, retry_lifecycles) = verify_step_with_setup_observed_with_offline(
+            &config.workspace_root,
+            step,
+            setup_authority,
+            config.offline,
+        );
         for lifecycle in &retry_lifecycles {
             emit_dependency_build_lifecycle(
                 config.eval_events_path.as_deref(),
@@ -6791,6 +6799,7 @@ mod tests {
     #[test]
     fn safe_and_verify_policy_is_normalized_without_corrective_retry() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
@@ -8798,6 +8807,12 @@ export default function Page(){
     #[test]
     fn plan_run_emits_dependency_build_lifecycle_event() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){return <main/>;}",
+        )
+        .unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());

@@ -4,8 +4,7 @@ use serde::Serialize;
 
 use crate::eval_events;
 use crate::minimal_loop::dependency_setup::{
-    self, NodeDependencySetupAuthority, NodeDependencySetupKind, NodeDependencySetupObservation,
-    NodeDependencySetupStatus,
+    self, NodeDependencySetupAuthority, NodeDependencySetupObservation, NodeDependencySetupStatus,
 };
 use crate::planner::verify::validate_verify_command;
 use crate::tools::bash;
@@ -184,6 +183,49 @@ pub fn requirement_from_deferred(
     })
 }
 
+pub fn requirement_from_dependency_state(
+    root: &Path,
+    command: &str,
+    profile: Option<&str>,
+    reason: &str,
+    authority: &str,
+    status: &str,
+) -> Option<BuildVerifierRequirement> {
+    if !dependency_setup::package_json_declares_dependencies(root) {
+        return None;
+    }
+    if node_dependency_state_ready(root, profile, command) {
+        return None;
+    }
+    Some(BuildVerifierRequirement {
+        command: command.to_string(),
+        profile: profile.map(str::to_string),
+        reason: reason.to_string(),
+        authority: authority.to_string(),
+        status: status.to_string(),
+        requires_dependency_setup: true,
+        required_for_completion: status != "optional",
+    })
+}
+
+pub fn requirement_from_dependency_missing_output(
+    command: &str,
+    profile: Option<&str>,
+    reason: &str,
+    authority: &str,
+    status: &str,
+) -> BuildVerifierRequirement {
+    BuildVerifierRequirement {
+        command: command.to_string(),
+        profile: profile.map(str::to_string),
+        reason: reason.to_string(),
+        authority: authority.to_string(),
+        status: status.to_string(),
+        requires_dependency_setup: true,
+        required_for_completion: status != "optional",
+    }
+}
+
 pub fn observe_requirement(
     root: &Path,
     requirement: &BuildVerifierRequirement,
@@ -261,21 +303,114 @@ pub fn observe_requirement_lifecycle(
     requirement: &BuildVerifierRequirement,
     setup_authority: NodeDependencySetupAuthority,
 ) -> BuildVerifierLifecycleObservation {
-    observe_requirement_lifecycle_with_setup_program(
+    observe_requirement_lifecycle_with_offline(root, requirement, setup_authority, false)
+}
+
+pub fn observe_requirement_lifecycle_with_offline(
+    root: &Path,
+    requirement: &BuildVerifierRequirement,
+    setup_authority: NodeDependencySetupAuthority,
+    offline: bool,
+) -> BuildVerifierLifecycleObservation {
+    observe_requirement_lifecycle_with_setup_program_and_offline(
         root,
         requirement,
         setup_authority,
         Path::new("npm"),
+        offline,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn observe_requirement_lifecycle_with_setup_program(
     root: &Path,
     requirement: &BuildVerifierRequirement,
     setup_authority: NodeDependencySetupAuthority,
     npm_program: &Path,
 ) -> BuildVerifierLifecycleObservation {
+    observe_requirement_lifecycle_with_setup_program_and_offline(
+        root,
+        requirement,
+        setup_authority,
+        npm_program,
+        false,
+    )
+}
+
+pub(crate) fn observe_requirement_lifecycle_with_setup_program_and_offline(
+    root: &Path,
+    requirement: &BuildVerifierRequirement,
+    setup_authority: NodeDependencySetupAuthority,
+    npm_program: &Path,
+    offline: bool,
+) -> BuildVerifierLifecycleObservation {
     let before_setup = observe_requirement(root, requirement);
+    observe_requirement_lifecycle_from_before(
+        root,
+        requirement,
+        setup_authority,
+        npm_program,
+        offline,
+        before_setup,
+    )
+}
+
+pub fn observe_dependency_missing_output_lifecycle_with_offline(
+    root: &Path,
+    requirement: &BuildVerifierRequirement,
+    setup_authority: NodeDependencySetupAuthority,
+    output: &str,
+    offline: bool,
+) -> BuildVerifierLifecycleObservation {
+    observe_dependency_missing_output_lifecycle_with_setup_program_and_offline(
+        root,
+        requirement,
+        setup_authority,
+        output,
+        Path::new("npm"),
+        offline,
+    )
+}
+
+pub(crate) fn observe_dependency_missing_output_lifecycle_with_setup_program_and_offline(
+    root: &Path,
+    requirement: &BuildVerifierRequirement,
+    setup_authority: NodeDependencySetupAuthority,
+    output: &str,
+    npm_program: &Path,
+    offline: bool,
+) -> BuildVerifierLifecycleObservation {
+    let snippet = eval_events::body_snippet(output);
+    let before_setup = BuildVerifierObservation {
+        command: requirement.command.clone(),
+        profile: requirement.profile.clone(),
+        authority: requirement.authority.clone(),
+        required_for_completion: requirement.required_for_completion,
+        requires_dependency_setup: requirement.requires_dependency_setup,
+        dependency_ready: dependency_ready(root, &requirement.command),
+        attempted: true,
+        status: BuildVerifierStatus::DependencyMissing,
+        primary_reason: snippet.clone(),
+        output_snippet: snippet,
+    };
+    observe_requirement_lifecycle_from_before(
+        root,
+        requirement,
+        setup_authority,
+        npm_program,
+        offline,
+        before_setup,
+    )
+}
+
+fn observe_requirement_lifecycle_from_before(
+    root: &Path,
+    requirement: &BuildVerifierRequirement,
+    setup_authority: NodeDependencySetupAuthority,
+    npm_program: &Path,
+    offline: bool,
+    before_setup: BuildVerifierObservation,
+) -> BuildVerifierLifecycleObservation {
     let mut setup = None;
     let mut after_setup = None;
     if before_setup.status == BuildVerifierStatus::DependencyMissing
@@ -283,10 +418,11 @@ pub(crate) fn observe_requirement_lifecycle_with_setup_program(
     {
         let setup_requirement = dependency_setup_requirement(root, requirement, setup_authority);
         let setup_observation = if setup_requirement.allowed {
-            dependency_setup::run_node_dependency_setup_with_program(
+            dependency_setup::run_node_dependency_setup_with_program_and_offline(
                 root,
                 &setup_requirement,
                 npm_program,
+                offline,
             )
         } else {
             NodeDependencySetupObservation::blocked(
@@ -349,7 +485,9 @@ pub fn requires_next_binary(command: &str) -> bool {
 }
 
 fn requires_dependency_setup(command: &str) -> bool {
-    requires_next_binary(command) || requires_node_test_runner(command)
+    requires_next_binary(command)
+        || requires_node_test_runner(command)
+        || requires_node_dependency_probe(command)
 }
 
 fn dependency_ready(root: &Path, command: &str) -> bool {
@@ -361,6 +499,9 @@ fn dependency_ready(root: &Path, command: &str) -> bool {
     }
     if requires_node_test_runner(command) {
         return dependency_setup::node_test_runner_bindable(root);
+    }
+    if dependency_setup::package_json_declares_dependencies(root) {
+        return dependency_setup::node_declared_dependencies_ready(root);
     }
     true
 }
@@ -380,6 +521,8 @@ fn dependency_missing_reason(root: &Path, command: &str) -> String {
         dependency_setup::next_build_missing_dependency_reason(root)
     } else if requires_node_test_runner(command) {
         "package.json scripts.test missing before Node test verifier".to_string()
+    } else if dependency_setup::package_json_declares_dependencies(root) {
+        dependency_setup::node_declared_dependencies_missing_reason(root)
     } else {
         format!("dependency setup missing before `{command}`")
     }
@@ -418,17 +561,12 @@ fn dependency_setup_requirement(
             setup_authority,
         );
     }
-    dependency_setup::NodeDependencySetupRequirement {
-        profile: requirement.profile.clone(),
-        setup_kind: NodeDependencySetupKind::NextBuildDependencies,
-        package_manager: dependency_setup::package_manager_for_root(root),
-        project_root: ".".to_string(),
-        reason: requirement.reason.clone(),
-        required_binary: "unknown".to_string(),
+    dependency_setup::requirement_for_node_declared_dependencies(
+        root,
+        requirement.profile.as_deref(),
+        &requirement.reason,
         setup_authority,
-        allowed: false,
-        blocked_reason: Some("unsupported dependency setup requirement".to_string()),
-    }
+    )
 }
 
 pub fn is_dependency_missing_output(output: &str) -> bool {
@@ -437,7 +575,22 @@ pub fn is_dependency_missing_output(output: &str) -> bool {
         || lower.contains("not found")
         || lower.contains("cannot find module")
         || lower.contains("module not found")
+        || lower.contains("modulenotfounderror")
+        || lower.contains("can't find crate")
         || lower.contains("no such file or directory")
+}
+
+pub fn requires_node_dependency_probe(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    (lower.contains("node -e") && lower.contains("require(")) || lower.contains("npx --no-install")
+}
+
+fn node_dependency_state_ready(root: &Path, profile: Option<&str>, command: &str) -> bool {
+    if profile == Some("nextjs") || requires_next_binary(command) {
+        dependency_setup::next_build_dependencies_ready(root)
+    } else {
+        dependency_setup::node_declared_dependencies_ready(root)
+    }
 }
 
 #[cfg(test)]

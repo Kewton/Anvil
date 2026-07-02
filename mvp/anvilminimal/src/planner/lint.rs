@@ -221,7 +221,6 @@ pub fn lint_step_plan_report_with_workspace(
             }
             if requires_dependency_setup_before_verify(command)
                 && !setup_seen
-                && !step_creates_dependency_manifest(step)
                 && !work_root.is_some_and(|root| workspace_has_dependency_boundary(root, command))
             {
                 report.push(
@@ -239,7 +238,7 @@ pub fn lint_step_plan_report_with_workspace(
                 );
             }
         }
-        if step.step_kind() == StepKind::Setup || step_creates_dependency_manifest(step) {
+        if step.step_kind() == StepKind::Setup {
             setup_seen = true;
         }
         for path in &step.expected_paths {
@@ -605,6 +604,8 @@ fn requires_dependency_setup_before_verify(command: &str) -> bool {
         || lower.starts_with("pnpm test ")
         || lower.starts_with("yarn build ")
         || lower.starts_with("yarn test ")
+        || (lower.contains("node -e") && lower.contains("require("))
+        || lower.contains("npx --no-install")
 }
 
 fn is_nextjs_build(command: &str) -> bool {
@@ -613,7 +614,7 @@ fn is_nextjs_build(command: &str) -> bool {
 }
 
 fn workspace_has_node_dependency_context(root: &Path) -> bool {
-    root.join("node_modules").is_dir() || root.join("package.json").is_file()
+    root.join("node_modules").is_dir()
 }
 
 fn workspace_has_nextjs_entrypoint(root: &Path) -> bool {
@@ -1271,6 +1272,36 @@ mod tests {
                 .any(|err| err.message.contains("requires dependency setup")),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn dependency_probe_after_manifest_creation_still_requires_setup_or_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = StepPlan {
+            goal: "Create a Next.js app".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "manifest".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create package.json with dependencies".to_string(),
+                    expected_paths: vec!["package.json".to_string()],
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "verify-dependency".to_string(),
+                    kind: "verify".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Verify Next can be resolved".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: vec![r#"node -e "require('next/package.json')""#.to_string()],
+                },
+            ],
+        };
+
+        let report = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+
+        assert!(report.has_category("dependency_order"), "{report:?}");
     }
 
     #[test]

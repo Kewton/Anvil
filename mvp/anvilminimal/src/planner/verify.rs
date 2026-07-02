@@ -181,6 +181,31 @@ pub fn verify_step_with_setup_observed(
     step: &PlanStep,
     setup_authority: NodeDependencySetupAuthority,
 ) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+    verify_step_with_setup_observed_with_offline(root, step, setup_authority, false)
+}
+
+pub fn verify_step_with_setup_observed_with_offline(
+    root: &Path,
+    step: &PlanStep,
+    setup_authority: NodeDependencySetupAuthority,
+    offline: bool,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+    verify_step_with_setup_observed_with_options(
+        root,
+        step,
+        setup_authority,
+        Path::new("npm"),
+        offline,
+    )
+}
+
+fn verify_step_with_setup_observed_with_options(
+    root: &Path,
+    step: &PlanStep,
+    setup_authority: NodeDependencySetupAuthority,
+    npm_program: &Path,
+    offline: bool,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
     let mut report = VerificationReport::pass();
     let mut build_lifecycles = Vec::new();
     for path in &step.expected_paths {
@@ -201,39 +226,43 @@ pub fn verify_step_with_setup_observed(
             "required",
         ) {
             let lifecycle =
-                build_verifier::observe_requirement_lifecycle(root, &requirement, setup_authority);
-            let observation = lifecycle.final_observation();
-            match observation.status {
-                BuildVerifierStatus::Passed => {
-                    build_lifecycles.push(lifecycle);
-                    continue;
-                }
-                BuildVerifierStatus::DependencyMissing => {
-                    report.push_dependency_missing(format!(
-                        "dependency_setup_missing: {}",
-                        lifecycle.final_reason
-                    ));
-                }
-                BuildVerifierStatus::PolicyRejected => {
-                    report.push_command_failure(
-                        command.clone(),
-                        format!("build_verify_policy_rejected: {}", lifecycle.final_reason),
-                    );
-                }
-                BuildVerifierStatus::Blocked => {
-                    report.push_profile_failure(format!(
-                        "build_verify_blocked: command `{}` reason `{}`",
-                        command, lifecycle.final_reason
-                    ));
-                }
-                BuildVerifierStatus::Failed => {
-                    report.push_command_failure(
-                        command.clone(),
-                        format!("build_verify_failed: {}", lifecycle.final_reason),
-                    );
-                }
-            }
+                build_verifier::observe_requirement_lifecycle_with_setup_program_and_offline(
+                    root,
+                    &requirement,
+                    setup_authority,
+                    npm_program,
+                    offline,
+                );
+            let passed = record_build_lifecycle_result(&mut report, command, &lifecycle);
             build_lifecycles.push(lifecycle);
+            if passed {
+                continue;
+            }
+            continue;
+        }
+        if setup_authority == NodeDependencySetupAuthority::PlanSetupStep
+            && let Some(requirement) = build_verifier::requirement_from_dependency_state(
+                root,
+                command,
+                build_verifier_profile(command),
+                "step verify requires dependency setup before command execution",
+                setup_authority.as_str(),
+                "required",
+            )
+        {
+            let lifecycle =
+                build_verifier::observe_requirement_lifecycle_with_setup_program_and_offline(
+                    root,
+                    &requirement,
+                    setup_authority,
+                    npm_program,
+                    offline,
+                );
+            let passed = record_build_lifecycle_result(&mut report, command, &lifecycle);
+            build_lifecycles.push(lifecycle);
+            if passed {
+                continue;
+            }
             continue;
         }
         match crate::tools::bash::run_checked(command, root, false) {
@@ -247,20 +276,117 @@ pub fn verify_step_with_setup_observed(
                     report.push_command_failure(command.clone(), "Node 0 tests rejected");
                 }
             }
-            Err(err)
-                if err.to_string().contains("not found")
-                    || err.to_string().contains("No such file") =>
-            {
-                report.push_dependency_missing(command.clone());
-            }
             Err(err) => {
-                if step.expected_result_kind() != ExpectedResult::Fail {
-                    report.push_command_failure(command.clone(), err.to_string());
+                let reason = err.to_string();
+                if build_verifier::is_dependency_missing_output(&reason) {
+                    if setup_authority.allows_setup() {
+                        let requirement =
+                            build_verifier::requirement_from_dependency_missing_output(
+                                command,
+                                build_verifier_profile(command),
+                                "verify command failed with dependency-missing output",
+                                setup_authority.as_str(),
+                                "required",
+                            );
+                        let lifecycle =
+                            build_verifier::observe_dependency_missing_output_lifecycle_with_setup_program_and_offline(
+                                root,
+                                &requirement,
+                                setup_authority,
+                                &reason,
+                                npm_program,
+                                offline,
+                            );
+                        let passed =
+                            record_build_lifecycle_result(&mut report, command, &lifecycle);
+                        build_lifecycles.push(lifecycle);
+                        if passed {
+                            continue;
+                        }
+                    } else {
+                        report.push_dependency_missing(format!(
+                            "dependency_setup_authority_required: {command}"
+                        ));
+                    }
+                } else if step.expected_result_kind() != ExpectedResult::Fail {
+                    report.push_command_failure(command.clone(), reason);
                 }
             }
         }
     }
     (report, build_lifecycles)
+}
+
+fn record_build_lifecycle_result(
+    report: &mut VerificationReport,
+    command: &str,
+    lifecycle: &BuildVerifierLifecycleObservation,
+) -> bool {
+    let observation = lifecycle.final_observation();
+    match observation.status {
+        BuildVerifierStatus::Passed => true,
+        BuildVerifierStatus::DependencyMissing => {
+            report.push_dependency_missing(format!(
+                "dependency_setup_missing: {}",
+                dependency_lifecycle_report_reason(lifecycle)
+            ));
+            false
+        }
+        BuildVerifierStatus::PolicyRejected => {
+            report.push_command_failure(
+                command.to_string(),
+                format!("build_verify_policy_rejected: {}", lifecycle.final_reason),
+            );
+            false
+        }
+        BuildVerifierStatus::Blocked => {
+            report.push_profile_failure(format!(
+                "build_verify_blocked: command `{}` reason `{}`",
+                command, lifecycle.final_reason
+            ));
+            false
+        }
+        BuildVerifierStatus::Failed => {
+            report.push_command_failure(
+                command.to_string(),
+                format!(
+                    "dependency_setup_lifecycle_failed: {}",
+                    lifecycle_failure_with_setup_output(lifecycle)
+                ),
+            );
+            false
+        }
+    }
+}
+
+fn dependency_lifecycle_report_reason(lifecycle: &BuildVerifierLifecycleObservation) -> String {
+    if let Some(setup) = lifecycle.setup.as_ref()
+        && setup.primary_reason == "dependency_setup_blocked_offline"
+    {
+        return setup.primary_reason.clone();
+    }
+    if let Some(setup) = lifecycle.setup.as_ref()
+        && matches!(setup.status.as_str(), "failed" | "timed_out")
+    {
+        let mut reason = setup.primary_reason.clone();
+        if !setup.output_snippet.trim().is_empty() {
+            reason.push_str("; setup_output: ");
+            reason.push_str(&setup.output_snippet);
+        }
+        return reason;
+    }
+    lifecycle.final_reason.clone()
+}
+
+fn lifecycle_failure_with_setup_output(lifecycle: &BuildVerifierLifecycleObservation) -> String {
+    let mut reason = lifecycle.final_reason.clone();
+    if let Some(setup) = lifecycle.setup.as_ref()
+        && !setup.output_snippet.trim().is_empty()
+    {
+        reason.push_str("; setup_output: ");
+        reason.push_str(&setup.output_snippet);
+    }
+    reason
 }
 
 pub fn validate_verify_command(command: &str) -> anyhow::Result<()> {
@@ -517,7 +643,20 @@ fn manifest_path_arg(command: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::minimal_loop::repair_target::{RepairTarget, classify_repair_target};
     use crate::planner::step_plan::PlanStep;
+    use std::path::Path;
+
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
 
     #[test]
     fn missing_path_before_evidence() {
@@ -753,6 +892,115 @@ mod tests {
         assert!(report.primary_reason().contains("dependency_setup_missing"));
         assert_eq!(lifecycles.len(), 1);
         assert!(lifecycles[0].lifecycle_stages().contains(&"setup_blocked"));
+    }
+
+    #[test]
+    fn setup_authority_dependency_probe_installs_before_raw_verify_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        )
+        .unwrap();
+        let fake_npm = dir.path().join("fake-npm.sh");
+        write_executable(
+            &fake_npm,
+            "#!/bin/sh\nmkdir -p node_modules/next\necho '{\"version\":\"14.2.0\"}' > node_modules/next/package.json\ntouch package-lock.json\nexit 0\n",
+        );
+        let step = PlanStep {
+            id: "probe-next".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Verify Next package resolution".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec![r#"node -e "require('next/package.json')""#.to_string()],
+        };
+
+        let (report, lifecycles) = verify_step_with_setup_observed_with_options(
+            dir.path(),
+            &step,
+            NodeDependencySetupAuthority::PlanSetupStep,
+            &fake_npm,
+            false,
+        );
+
+        assert!(report.is_pass(), "{report:?}");
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].setup_status(), "passed");
+        assert_eq!(
+            lifecycles[0]
+                .setup
+                .as_ref()
+                .map(|setup| setup.setup_kind.as_str()),
+            Some("node_declared_dependencies")
+        );
+        assert!(!lifecycles[0].before_setup.attempted);
+        assert!(
+            lifecycles[0]
+                .after_setup
+                .as_ref()
+                .is_some_and(|after| after.attempted)
+        );
+    }
+
+    #[test]
+    fn raw_cannot_find_module_routes_to_dependency_setup_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = dir.path().join("missing-module.sh");
+        write_executable(
+            &failing,
+            "#!/bin/sh\necho \"Cannot find module 'next/package.json'\" >&2\nexit 1\n",
+        );
+        let step = PlanStep {
+            id: "probe".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Probe dependency resolution".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["./missing-module.sh".to_string()],
+        };
+
+        let report = verify_step_with_setup(
+            dir.path(),
+            &step,
+            NodeDependencySetupAuthority::PlanSetupStep,
+        );
+
+        assert!(matches!(report.status, VerifyStatus::DependencyMissing(_)));
+        assert!(report.command_failures.is_empty(), "{report:?}");
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::DependencySetup
+        );
+    }
+
+    #[test]
+    fn raw_cannot_find_module_without_authority_reports_setup_authority_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = dir.path().join("missing-module.sh");
+        write_executable(
+            &failing,
+            "#!/bin/sh\necho \"Cannot find module 'next/package.json'\" >&2\nexit 1\n",
+        );
+        let step = PlanStep {
+            id: "probe".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Probe dependency resolution".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["./missing-module.sh".to_string()],
+        };
+
+        let report = verify_step(dir.path(), &step);
+
+        assert!(matches!(report.status, VerifyStatus::DependencyMissing(_)));
+        assert!(
+            report
+                .dependency_missing
+                .iter()
+                .any(|reason| reason == "dependency_setup_authority_required: ./missing-module.sh"),
+            "{report:?}"
+        );
     }
 
     #[test]
