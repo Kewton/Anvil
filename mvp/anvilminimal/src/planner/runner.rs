@@ -43,6 +43,7 @@ use crate::planner::repair::{
     RecoveryHandoff, RepairContext, build_repair_prompt_with_context, save_recovery_ultra_plan,
     save_repair_report_with_context, save_ultra_recovery_prompt,
     suggested_recovery_ultra_plan_command, suggested_ultra_recovery_command,
+    workspace_relative_handoff_path,
 };
 use crate::planner::step_plan::{
     PlanStep, StepKind, StepPlan, extract_json_object, parse_generated_step_plan_json,
@@ -523,10 +524,7 @@ impl UltraRunContext {
     }
 
     fn refresh_pending_capability_evidence(&mut self, report: &RuntimeAcceptanceReport) {
-        let mut still_missing = Vec::new();
-        merge_unique_strings(&mut still_missing, &report.missing_capabilities);
-        merge_unique_strings(&mut still_missing, &report.missing_evidence);
-        merge_unique_strings(&mut still_missing, &report.missing_obligations);
+        let still_missing = runtime_missing_signals(report);
         self.pending_capability_evidence
             .retain(|item| still_missing.contains(item));
     }
@@ -1276,13 +1274,14 @@ fn run_step(
         match save_recovery_ultra_plan(&config.workspace_root, &step.id, &step_handoff) {
             Ok(path) => Some(path),
             Err(err) => {
+                let repair_report_display = handoff_path(&repair_report_path);
                 eval_events::emit(
                     config.eval_events_path.as_deref(),
                     json!({
                         "event": "recovery_ultra_plan_save_failed",
                         "recovery_handoff_kind": final_failure_kind,
                         "step_id": step.id,
-                        "recovery_prompt_path": repair_report_path.display().to_string(),
+                        "recovery_prompt_path": repair_report_display,
                         "reason": eval_events::body_snippet(&err.to_string()),
                         "recovery_yaml_missing": true,
                     }),
@@ -1303,17 +1302,16 @@ fn run_step(
         .as_ref()
         .filter(|_| validation.yaml_command_available())
         .map(|path| suggested_recovery_ultra_plan_command(path));
+    let repair_report_display = handoff_path(&repair_report_path);
+    let recovery_plan_display = optional_handoff_path(recovery_plan_path.as_ref());
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
             "event": "recovery_prompt_saved",
             "recovery_handoff_kind": final_failure_kind,
             "step_id": step.id,
-            "recovery_prompt_path": repair_report_path.display().to_string(),
-            "recovery_ultra_plan_path": recovery_plan_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
+            "recovery_prompt_path": &repair_report_display,
+            "recovery_ultra_plan_path": &recovery_plan_display,
             "recovery_yaml_missing": recovery_plan_path.is_none(),
             "recovery_prompt_exists": validation.prompt_exists,
             "recovery_prompt_parse_ok": validation.prompt_parse_ok,
@@ -1333,12 +1331,13 @@ fn run_step(
     let yaml_summary = recovery_plan_path
         .as_ref()
         .map(|path| {
+            let display = handoff_path(path);
             if validation.yaml_parse_ok {
-                format!("Recovery UltraPlan YAML saved: {}", path.display())
+                format!("Recovery UltraPlan YAML saved: {display}")
             } else {
                 format!(
                     "Recovery UltraPlan YAML invalid: {} ({})",
-                    path.display(),
+                    display,
                     validation
                         .yaml_parse_error
                         .as_deref()
@@ -1373,7 +1372,7 @@ fn run_step(
             "Status: incomplete\n{}\n{}\nRecovery prompt saved: {}\n{}\n{}\nFailure: {}",
             yaml_summary,
             yaml_command_summary,
-            repair_report_path.display(),
+            repair_report_display,
             prompt_command_summary,
             artifact_check_summary,
             current_report.primary_reason()
@@ -1383,10 +1382,10 @@ fn run_step(
         .as_ref()
         .zip(suggested_yaml_command.as_ref())
         .map(|(path, command)| {
+            let display = handoff_path(path);
             format!(
                 "; incomplete; recovery YAML saved: {}; suggested YAML command: {}",
-                path.display(),
-                command
+                display, command
             )
         })
         .unwrap_or_else(|| "; incomplete; recovery YAML missing".to_string());
@@ -1399,7 +1398,7 @@ fn run_step(
         "step {} failed verification after bounded repair: {}; repair prompt saved: {}; {}; {}; {}",
         step.id,
         current_report.primary_reason(),
-        repair_report_path.display(),
+        repair_report_display,
         prompt_message,
         yaml_message.trim_start_matches("; "),
         artifact_check_summary
@@ -1901,6 +1900,91 @@ fn merge_unique_strings(out: &mut Vec<String>, incoming: &[String]) {
     }
 }
 
+fn runtime_missing_signals(report: &RuntimeAcceptanceReport) -> Vec<String> {
+    let mut out = Vec::new();
+    merge_unique_strings(&mut out, &report.missing_capabilities);
+    merge_unique_strings(&mut out, &report.missing_evidence);
+    merge_unique_strings(&mut out, &report.missing_obligations);
+    out
+}
+
+fn verification_missing_signals(report: &VerificationReport) -> Vec<String> {
+    let mut out = Vec::new();
+    merge_unique_strings(
+        &mut out,
+        &missing_signals_from_text(&report.primary_reason()),
+    );
+    for failure in &report.profile_failures {
+        merge_unique_strings(&mut out, &missing_signals_from_text(failure));
+    }
+    out
+}
+
+fn missing_signals_from_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    merge_unique_strings(
+        &mut out,
+        &missing_signal_values_after_prefix(text, "missing_required_capabilities:"),
+    );
+    merge_unique_strings(
+        &mut out,
+        &missing_signal_values_after_prefix(text, "missing_required_evidence:"),
+    );
+    merge_unique_strings(
+        &mut out,
+        &missing_signal_values_after_prefix(text, "missing_required_obligations:"),
+    );
+    merge_unique_strings(&mut out, &missing_obligation_targets_from_text(text));
+    out
+}
+
+fn missing_signal_values_after_prefix(text: &str, prefix: &str) -> Vec<String> {
+    let Some((_, rest)) = text.split_once(prefix) else {
+        return Vec::new();
+    };
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | ')' | ']'))
+        .unwrap_or(rest.len());
+    rest[..end]
+        .split(',')
+        .filter_map(|value| {
+            let value = value
+                .trim()
+                .trim_matches(|ch: char| matches!(ch, '.' | ':'));
+            let value = value
+                .strip_prefix("required_obligation:")
+                .unwrap_or(value)
+                .trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .collect()
+}
+
+fn missing_obligation_targets_from_text(text: &str) -> Vec<String> {
+    let Some((_, rest)) = text.split_once("missing_required_obligation_target:") else {
+        return Vec::new();
+    };
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | ')' | ']'))
+        .unwrap_or(rest.len());
+    rest[..end]
+        .split(',')
+        .filter_map(|value| value.split(':').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn handoff_path(path: &Path) -> String {
+    workspace_relative_handoff_path(path)
+}
+
+fn optional_handoff_path(path: Option<&PathBuf>) -> String {
+    path.map(|path| handoff_path(path.as_path()))
+        .unwrap_or_default()
+}
+
 fn command_failure_summaries(report: &VerificationReport) -> Vec<String> {
     report
         .command_failures
@@ -2348,10 +2432,16 @@ pub fn run_ultra_plan_with_ui(
                     config,
                     plan,
                     phase,
-                    "phase_scaffold_error",
-                    &message,
-                    &missing_final_artifacts(&config.workspace_root, &final_expected_paths),
-                    &["phase_scaffold".to_string()],
+                    UltraPhaseRecoveryRequest {
+                        failure_kind: "phase_scaffold_error",
+                        reason: &message,
+                        missing_paths: &missing_final_artifacts(
+                            &config.workspace_root,
+                            &final_expected_paths,
+                        ),
+                        missing_signals: &[],
+                        repair_targets: &["phase_scaffold".to_string()],
+                    },
                 )
                 .unwrap_or_default();
                 anyhow::anyhow!("phase scaffold failed: {}{}", message, handoff)
@@ -2418,14 +2508,21 @@ pub fn run_ultra_plan_with_ui(
                     Some(&message),
                     None,
                 );
+                let missing_signals = err.partial_outcome.observed_contract_keys();
                 let handoff = save_ultra_phase_recovery_handoff(
                     config,
                     plan,
                     phase,
-                    "phase_execute_error",
-                    &message,
-                    &missing_final_artifacts(&config.workspace_root, &final_expected_paths),
-                    &err.partial_outcome.repair_targets,
+                    UltraPhaseRecoveryRequest {
+                        failure_kind: "phase_execute_error",
+                        reason: &message,
+                        missing_paths: &missing_final_artifacts(
+                            &config.workspace_root,
+                            &final_expected_paths,
+                        ),
+                        missing_signals: &missing_signals,
+                        repair_targets: &err.partial_outcome.repair_targets,
+                    },
                 )
                 .unwrap_or_default();
                 return Err(anyhow::anyhow!(
@@ -2513,10 +2610,13 @@ pub fn run_ultra_plan_with_ui(
                     config,
                     plan,
                     phase,
-                    "profile_invariant_failure",
-                    &invariant_report.primary_reason(),
-                    &invariant_report.missing_paths,
-                    &["profile_contract".to_string()],
+                    UltraPhaseRecoveryRequest {
+                        failure_kind: "profile_invariant_failure",
+                        reason: &invariant_report.primary_reason(),
+                        missing_paths: &invariant_report.missing_paths,
+                        missing_signals: &verification_missing_signals(&invariant_report),
+                        repair_targets: &["profile_contract".to_string()],
+                    },
                 );
                 return Err(anyhow::anyhow!(
                     "phase {} profile invariant verification failed: {}{}",
@@ -2664,10 +2764,16 @@ pub fn run_ultra_plan_with_ui(
                         config,
                         plan,
                         phase,
-                        "profile_auto_repair_continuation_failed",
-                        &message,
-                        &missing_final_artifacts(&config.workspace_root, &final_expected_paths),
-                        &["profile_contract".to_string()],
+                        UltraPhaseRecoveryRequest {
+                            failure_kind: "profile_auto_repair_continuation_failed",
+                            reason: &message,
+                            missing_paths: &missing_final_artifacts(
+                                &config.workspace_root,
+                                &final_expected_paths,
+                            ),
+                            missing_signals: &missing_signals_from_text(&message),
+                            repair_targets: &["profile_contract".to_string()],
+                        },
                     )
                     .unwrap_or_default();
                     anyhow::anyhow!(
@@ -2868,10 +2974,13 @@ pub fn run_ultra_plan_with_ui(
                         config,
                         plan,
                         phase,
-                        "profile_repair_failed",
-                        &format!("{:?}", retry.status),
-                        &retry.missing_paths,
-                        &["profile_contract".to_string()],
+                        UltraPhaseRecoveryRequest {
+                            failure_kind: "profile_repair_failed",
+                            reason: &format!("{:?}", retry.status),
+                            missing_paths: &retry.missing_paths,
+                            missing_signals: &verification_missing_signals(&retry),
+                            repair_targets: &["profile_contract".to_string()],
+                        },
                     )
                     .unwrap_or_default()
                 ));
@@ -2891,10 +3000,13 @@ pub fn run_ultra_plan_with_ui(
                 config,
                 plan,
                 phase,
-                "profile_final_failure",
-                &format!("{:?}", profile_report.status),
-                &profile_report.missing_paths,
-                &["profile_contract".to_string()],
+                UltraPhaseRecoveryRequest {
+                    failure_kind: "profile_final_failure",
+                    reason: &format!("{:?}", profile_report.status),
+                    missing_paths: &profile_report.missing_paths,
+                    missing_signals: &verification_missing_signals(&profile_report),
+                    repair_targets: &["profile_contract".to_string()],
+                },
             );
             return Err(anyhow::anyhow!(
                 "phase {} profile verification failed: {:?}{}",
@@ -3011,10 +3123,13 @@ pub fn run_ultra_plan_with_ui(
                     config,
                     plan,
                     &fallback_phase,
-                    "final_acceptance_repair_failed",
-                    &err_text,
-                    &acceptance_report.missing_paths,
-                    &[initial_target.as_str().to_string()],
+                    UltraPhaseRecoveryRequest {
+                        failure_kind: "final_acceptance_repair_failed",
+                        reason: &err_text,
+                        missing_paths: &acceptance_report.missing_paths,
+                        missing_signals: &verification_missing_signals(&acceptance_report),
+                        repair_targets: &[initial_target.as_str().to_string()],
+                    },
                 )
                 .unwrap_or_default();
                 anyhow::bail!("ultra final acceptance repair failed: {err_text}{handoff}");
@@ -3069,10 +3184,13 @@ pub fn run_ultra_plan_with_ui(
                 config,
                 plan,
                 &fallback_phase,
-                "final_acceptance_repair_exhausted",
-                &reason,
-                &acceptance_report.missing_paths,
-                &[target.as_str().to_string()],
+                UltraPhaseRecoveryRequest {
+                    failure_kind: "final_acceptance_repair_exhausted",
+                    reason: &reason,
+                    missing_paths: &acceptance_report.missing_paths,
+                    missing_signals: &verification_missing_signals(&acceptance_report),
+                    repair_targets: &[target.as_str().to_string()],
+                },
             )
             .unwrap_or_default();
             anyhow::bail!("ultra final acceptance failed after bounded repair: {reason}{handoff}");
@@ -5255,28 +5373,35 @@ fn emit_phase_verification_event(
     );
 }
 
+struct UltraPhaseRecoveryRequest<'a> {
+    failure_kind: &'a str,
+    reason: &'a str,
+    missing_paths: &'a [String],
+    missing_signals: &'a [String],
+    repair_targets: &'a [String],
+}
+
 fn save_ultra_phase_recovery_handoff(
     config: &Config,
     plan: &UltraPlan,
     phase: &UltraPhase,
-    failure_kind: &str,
-    reason: &str,
-    missing_paths: &[String],
-    repair_targets: &[String],
+    request: UltraPhaseRecoveryRequest<'_>,
 ) -> Option<String> {
     let handoff = RecoveryHandoff {
         profile: plan.profile.clone(),
         original_goal: plan.goal.clone(),
         failed_phase: Some(phase.id.clone()),
         failed_step: None,
-        failure_kind: failure_kind.to_string(),
-        failure_evidence: vec![reason.to_string()],
-        missing_paths: missing_paths.to_vec(),
-        missing_capabilities: repair_targets.to_vec(),
+        failure_kind: request.failure_kind.to_string(),
+        failure_evidence: vec![request.reason.to_string()],
+        missing_paths: request.missing_paths.to_vec(),
+        missing_capabilities: request.missing_signals.to_vec(),
         verify_commands: Vec::new(),
         changed_paths: Vec::new(),
-        repair_targets: repair_targets.to_vec(),
+        repair_targets: request.repair_targets.to_vec(),
     };
+    let failure_kind = request.failure_kind;
+    let reason = request.reason;
     let scope = format!("phase-{}", recovery_scope_token(&phase.id));
     let path = match save_ultra_recovery_prompt(&config.workspace_root, &scope, &handoff) {
         Ok(path) => path,
@@ -5296,13 +5421,14 @@ fn save_ultra_phase_recovery_handoff(
     let recovery_plan = match save_recovery_ultra_plan(&config.workspace_root, &scope, &handoff) {
         Ok(path) => Some(path),
         Err(err) => {
+            let prompt_path = handoff_path(&path);
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
                     "event": "recovery_ultra_plan_save_failed",
                     "recovery_handoff_kind": failure_kind,
                     "phase_id": phase.id,
-                    "recovery_prompt_path": path.display().to_string(),
+                    "recovery_prompt_path": prompt_path,
                     "reason": eval_events::body_snippet(&err.to_string()),
                     "recovery_yaml_missing": true,
                 }),
@@ -5321,6 +5447,8 @@ fn save_ultra_phase_recovery_handoff(
         .as_ref()
         .filter(|_| validation.yaml_command_available())
         .map(|path| suggested_recovery_ultra_plan_command(path));
+    let prompt_path = handoff_path(&path);
+    let recovery_plan_path = optional_handoff_path(recovery_plan.as_ref());
     let (completed_phases, pending_phases) = ultra_phase_status(plan, phase);
     eval_events::emit(
         config.eval_events_path.as_deref(),
@@ -5328,11 +5456,8 @@ fn save_ultra_phase_recovery_handoff(
             "event": "recovery_prompt_saved",
             "recovery_handoff_kind": failure_kind,
             "phase_id": phase.id,
-            "recovery_prompt_path": path.display().to_string(),
-            "recovery_ultra_plan_path": recovery_plan
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
+            "recovery_prompt_path": &prompt_path,
+            "recovery_ultra_plan_path": &recovery_plan_path,
             "recovery_yaml_missing": recovery_plan.is_none(),
             "recovery_prompt_exists": validation.prompt_exists,
             "recovery_prompt_parse_ok": validation.prompt_parse_ok,
@@ -5357,11 +5482,8 @@ fn save_ultra_phase_recovery_handoff(
             "failed_phase_id": phase.id,
             "pending_phase_ids": pending_phases.clone(),
             "failure_kind": failure_kind,
-            "recovery_prompt_path": path.display().to_string(),
-            "recovery_ultra_plan_path": recovery_plan
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default(),
+            "recovery_prompt_path": &prompt_path,
+            "recovery_ultra_plan_path": &recovery_plan_path,
             "recovery_yaml_missing": recovery_plan.is_none(),
             "recovery_prompt_exists": validation.prompt_exists,
             "recovery_prompt_parse_ok": validation.prompt_parse_ok,
@@ -5375,12 +5497,13 @@ fn save_ultra_phase_recovery_handoff(
     let recovery_yaml_summary = recovery_plan
         .as_ref()
         .map(|path| {
+            let display = handoff_path(path);
             if validation.yaml_parse_ok {
-                format!("Recovery UltraPlan YAML saved: {}", path.display())
+                format!("Recovery UltraPlan YAML saved: {display}")
             } else {
                 format!(
                     "Recovery UltraPlan YAML invalid: {} ({})",
-                    path.display(),
+                    display,
                     validation
                         .yaml_parse_error
                         .as_deref()
@@ -5417,7 +5540,7 @@ fn save_ultra_phase_recovery_handoff(
             pending_phases: &pending_phases,
             failure_kind,
             reason,
-            recovery_prompt_path: &path.display().to_string(),
+            recovery_prompt_path: &prompt_path,
             recovery_yaml_summary: &recovery_yaml_summary,
             prompt_command_summary: &prompt_command_summary,
             recovery_yaml_command_summary: &recovery_yaml_command_summary,
@@ -5428,10 +5551,10 @@ fn save_ultra_phase_recovery_handoff(
         .as_ref()
         .zip(recovery_plan_command.as_ref())
         .map(|(path, command)| {
+            let display = handoff_path(path);
             format!(
                 "; incomplete; recovery YAML saved: {}; suggested YAML command: {}",
-                path.display(),
-                command
+                display, command
             )
         })
         .unwrap_or_else(|| "; incomplete; recovery YAML missing".to_string());
@@ -5442,7 +5565,7 @@ fn save_ultra_phase_recovery_handoff(
     };
     Some(format!(
         "; repair prompt saved: {}; {}; {}; {}",
-        path.display(),
+        &prompt_path,
         prompt_message,
         recovery_yaml_message.trim_start_matches("; "),
         artifact_check_summary
@@ -5495,13 +5618,14 @@ fn save_release_recovery_handoff(
     let recovery_plan = match save_recovery_ultra_plan(&config.workspace_root, scope, &handoff) {
         Ok(path) => Some(path),
         Err(err) => {
+            let prompt_path = handoff_path(&path);
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
                     "event": "recovery_ultra_plan_save_failed",
                     "recovery_handoff_kind": failure_kind,
                     "acceptance_layer": acceptance_layer,
-                    "recovery_prompt_path": path.display().to_string(),
+                    "recovery_prompt_path": prompt_path,
                     "reason": eval_events::body_snippet(&err.to_string()),
                     "recovery_yaml_missing": true,
                     "status": "incomplete",
@@ -5521,14 +5645,13 @@ fn save_release_recovery_handoff(
         .as_ref()
         .filter(|_| validation.yaml_command_available())
         .map(|path| suggested_recovery_ultra_plan_command(path));
+    let prompt_path = handoff_path(&path);
+    let recovery_plan_path = optional_handoff_path(recovery_plan.as_ref());
     let summary = ReleaseRecoveryHandoffSummary {
         recovery_handoff_kind: failure_kind.to_string(),
         acceptance_layer: acceptance_layer.to_string(),
-        recovery_prompt_path: path.display().to_string(),
-        recovery_ultra_plan_path: recovery_plan
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
+        recovery_prompt_path: prompt_path,
+        recovery_ultra_plan_path: recovery_plan_path,
         suggested_recovery_command: prompt_command.clone(),
         suggested_recovery_yaml_command: recovery_plan_command.clone().unwrap_or_default(),
     };
@@ -8414,6 +8537,104 @@ mod tests {
         assert!(summary.contains("Recovery UltraPlan YAML saved:"));
         assert!(summary.contains("Suggested YAML command:"));
         assert!(summary.contains("Recovery artifact check:"));
+    }
+
+    #[test]
+    fn ultra_phase_recovery_handoff_renders_observed_missing_evidence_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let plan = challenge_ultra_plan();
+        let phase = &plan.phases[0];
+
+        let message = save_ultra_phase_recovery_handoff(
+            &cfg,
+            &plan,
+            phase,
+            UltraPhaseRecoveryRequest {
+                failure_kind: "phase_execute_error",
+                reason: "missing_required_evidence:challenge_or_adversary_evidence",
+                missing_paths: &[],
+                missing_signals: &["challenge_or_adversary_evidence".to_string()],
+                repair_targets: &["completion_contract".to_string()],
+            },
+        )
+        .expect("recovery handoff should be saved");
+
+        assert!(message.contains("recovery YAML saved"), "{message}");
+        let repairs_dir = dir.path().join(".anvil/repairs");
+        let repair_text = std::fs::read_dir(&repairs_dir)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .find(|text| text.contains("Missing capabilities:"))
+            .expect("recovery prompt");
+        assert!(
+            repair_text.contains("- challenge_or_adversary_evidence"),
+            "{repair_text}"
+        );
+        assert!(!repair_text.contains("Missing capabilities:\n- none"));
+        assert!(repair_text.contains("Repair targets:\n- completion_contract"));
+        let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
+        assert!(
+            recovery_plan
+                .phases
+                .iter()
+                .any(|phase| { phase.prompt.contains("- challenge_or_adversary_evidence") })
+        );
+        assert!(recovery_plan.phases.iter().any(|phase| {
+            phase
+                .prompt
+                .contains("Repair targets:\n- completion_contract")
+        }));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"recovery_prompt_path\":\".anvil/repairs/"));
+        assert!(event_text.contains("\"recovery_ultra_plan_path\":\".anvil/plans/"));
+    }
+
+    #[test]
+    fn ultra_phase_failure_stop_reason_and_summary_use_relative_recovery_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text("not a step plan"),
+            AssistantReply::text("still not a step plan"),
+            AssistantReply::text("no valid step plan"),
+        ]);
+        let mut execution = FakeClient::new(Vec::new());
+        let plan = challenge_ultra_plan();
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+        let summary = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+        let event_text = std::fs::read_to_string(events).unwrap();
+        let root = dir.path().display().to_string();
+
+        for text in [&err, &summary, &event_text] {
+            assert!(
+                !text.contains(&format!("{root}{root}")),
+                "workspace root duplicated in:\n{text}"
+            );
+            assert!(
+                text.contains(".anvil/plans/recovery-ultra-plan-"),
+                "missing relative recovery yaml path in:\n{text}"
+            );
+        }
+        assert!(
+            !err.contains(&format!("{root}/.anvil/plans/recovery-ultra-plan-")),
+            "{err}"
+        );
+        assert!(
+            !summary.contains(&format!("{root}/.anvil/plans/recovery-ultra-plan-")),
+            "{summary}"
+        );
+        assert!(
+            event_text.contains("\"recovery_ultra_plan_path\":\".anvil/plans/"),
+            "{event_text}"
+        );
     }
 
     #[test]

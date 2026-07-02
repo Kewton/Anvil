@@ -235,7 +235,7 @@ fn shell_quote_path(path: &Path) -> String {
     }
 }
 
-fn workspace_relative_handoff_path(path: &Path) -> String {
+pub(crate) fn workspace_relative_handoff_path(path: &Path) -> String {
     let components = path
         .components()
         .map(|component| component.as_os_str().to_string_lossy().to_string())
@@ -248,12 +248,7 @@ fn workspace_relative_handoff_path(path: &Path) -> String {
 
 fn recovery_missing_signals(handoff: &RecoveryHandoff) -> Vec<String> {
     let mut signals = Vec::new();
-    signals.extend(
-        handoff
-            .missing_capabilities
-            .iter()
-            .map(|value| format!("missing capability: {value}")),
-    );
+    signals.extend(handoff.missing_capabilities.iter().cloned());
     signals.extend(
         handoff
             .missing_paths

@@ -410,7 +410,11 @@ pub fn render_tui_command_failure_block(
     let (completed_phases, total_phases) = phase_counts_from_events(&events)
         .or_else(|| phase_counts_from_summary(&summary_text))
         .unwrap_or((None, None));
-    let primary_stop_reason = tui_primary_stop_reason(&events, &summary_text, stop_reason);
+    let primary_stop_reason = normalize_handoff_display_text(tui_primary_stop_reason(
+        &events,
+        &summary_text,
+        stop_reason,
+    ));
     let suggested_recovery_command = latest_event_field(&events, &["suggested_recovery_command"])
         .filter(|value| !value.is_empty())
         .or_else(|| non_empty(projection.suggested_recovery_command.clone()))
@@ -424,6 +428,7 @@ pub fn render_tui_command_failure_block(
                 ],
             )
         })
+        .map(normalize_handoff_display_text)
         .unwrap_or_default();
     let suggested_recovery_yaml_command =
         latest_event_field(&events, &["suggested_recovery_yaml_command"])
@@ -435,9 +440,10 @@ pub fn render_tui_command_failure_block(
                     &["Suggested YAML command:", "Recovery UltraPlan command:"],
                 )
             })
+            .map(normalize_handoff_display_text)
             .unwrap_or_default();
     let summary_path = run_summary_path(path)
-        .map(|path| path.display().to_string())
+        .map(|path| handoff_display_path(&path))
         .unwrap_or_default();
     crate::tui::status::render_task_failure_block(&crate::tui::status::TaskFailureBlock {
         task_status: projection.task_status.clone(),
@@ -651,6 +657,59 @@ fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+fn handoff_display_path(path: &Path) -> String {
+    crate::planner::repair::workspace_relative_handoff_path(path)
+}
+
+fn handoff_display_value(value: &str) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        handoff_display_path(Path::new(value))
+    }
+}
+
+fn normalize_handoff_display_text(value: String) -> String {
+    if !value.contains(".anvil") {
+        return value;
+    }
+    value
+        .split_whitespace()
+        .map(normalize_handoff_display_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_handoff_display_token(token: &str) -> String {
+    let Some(index) = token.find(".anvil") else {
+        return token.to_string();
+    };
+    let (prefix, rest) = token.split_at(index);
+    let mut path = rest.to_string();
+    let mut trailing = Vec::new();
+    while path.len() > ".anvil".len() {
+        let Some(ch) = path.chars().next_back() else {
+            break;
+        };
+        if !matches!(ch, '"' | '\'' | ')' | ']' | ',' | ';') {
+            break;
+        }
+        path.pop();
+        trailing.push(ch);
+    }
+    let preserved_prefix = prefix
+        .chars()
+        .filter(|ch| matches!(*ch, '"' | '\'' | '(' | '['))
+        .collect::<String>();
+    let trailing = trailing.into_iter().rev().collect::<String>();
+    format!(
+        "{}{}{}",
+        preserved_prefix,
+        handoff_display_path(Path::new(&path)),
+        trailing
+    )
+}
+
 fn command_returned_incomplete(projection: &CompletionProjection) -> bool {
     projection.status.starts_with("incomplete")
         || projection.status.contains("partial")
@@ -814,23 +873,23 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
         recovery_prompt_path: event
             .get("recovery_prompt_path")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+            .map(handoff_display_value)
+            .unwrap_or_default(),
         recovery_ultra_plan_path: event
             .get("recovery_ultra_plan_path")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+            .map(handoff_display_value)
+            .unwrap_or_default(),
         suggested_recovery_command: event
             .get("suggested_recovery_command")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+            .map(|value| normalize_handoff_display_text(value.to_string()))
+            .unwrap_or_default(),
         suggested_recovery_yaml_command: event
             .get("suggested_recovery_yaml_command")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+            .map(|value| normalize_handoff_display_text(value.to_string()))
+            .unwrap_or_default(),
         planner_verify_normalization_count: event
             .get("planner_verify_normalization_count")
             .and_then(Value::as_u64)
@@ -1374,6 +1433,10 @@ mod tests {
     fn tui_failure_block_renders_phase_evidence_and_recovery_commands() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
+        let workspace = dir.path().join("workspace");
+        let prompt_path = workspace.join(".anvil/repairs/repair-project-setup.md");
+        let recovery_plan_path =
+            workspace.join(".anvil/plans/recovery-ultra-plan-project-setup.yaml");
         emit(
             Some(&path),
             json!({
@@ -1392,10 +1455,16 @@ mod tests {
                 "completed_phase_ids": ["scaffold"],
                 "failed_phase_id": "project-setup",
                 "pending_phase_ids": ["final-verify"],
-                "recovery_prompt_path": ".anvil/repairs/repair-project-setup.md",
-                "recovery_ultra_plan_path": ".anvil/plans/recovery-ultra-plan-project-setup.yaml",
-                "suggested_recovery_command": "/ultra-plan-run --profile nextjs \"$(cat .anvil/repairs/repair-project-setup.md)\"",
-                "suggested_recovery_yaml_command": "/run-ultra-plan .anvil/plans/recovery-ultra-plan-project-setup.yaml",
+                "recovery_prompt_path": prompt_path.display().to_string(),
+                "recovery_ultra_plan_path": recovery_plan_path.display().to_string(),
+                "suggested_recovery_command": format!(
+                    "/ultra-plan-run --profile nextjs \"$(cat {})\"",
+                    prompt_path.display()
+                ),
+                "suggested_recovery_yaml_command": format!(
+                    "/run-ultra-plan {}",
+                    recovery_plan_path.display()
+                ),
             }),
         );
         let projection = project_completion(false, &CompletionSnapshot::empty());
@@ -1413,9 +1482,11 @@ mod tests {
         assert!(block.contains("failure_or_collision_evidence"));
         assert!(block.contains("restart_or_recoverable_state_evidence"));
         assert!(block.contains("Recovery prompt command: /ultra-plan-run --profile nextjs"));
+        assert!(block.contains("$(cat .anvil/repairs/repair-project-setup.md)"));
         assert!(block.contains(
             "Recovery UltraPlan command: /run-ultra-plan .anvil/plans/recovery-ultra-plan-project-setup.yaml"
         ));
+        assert!(!block.contains(&workspace.display().to_string()), "{block}");
         assert!(block.contains("Run summary:"));
         assert!(block.contains("summary.md"));
     }

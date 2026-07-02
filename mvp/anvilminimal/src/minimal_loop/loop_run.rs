@@ -2052,12 +2052,14 @@ fn save_minimal_recovery_handoff(
         match crate::planner::repair::save_recovery_ultra_plan(root, "minimal-loop", &handoff) {
             Ok(path) => path,
             Err(err) => {
+                let prompt_display =
+                    crate::planner::repair::workspace_relative_handoff_path(&prompt_path);
                 eval_events::emit(
                     eval_events_path,
                     json!({
                         "event": "recovery_ultra_plan_save_failed",
                         "recovery_handoff_kind": failure_kind,
-                        "recovery_prompt_path": prompt_path.display().to_string(),
+                        "recovery_prompt_path": prompt_display,
                         "reason": eval_events::body_snippet(&err.to_string()),
                         "recovery_yaml_missing": true,
                         "status": "incomplete",
@@ -2070,13 +2072,15 @@ fn save_minimal_recovery_handoff(
         crate::planner::repair::suggested_ultra_recovery_command(&prompt_path, &profile);
     let suggested_yaml_command =
         crate::planner::repair::suggested_recovery_ultra_plan_command(&yaml_path);
+    let prompt_display = crate::planner::repair::workspace_relative_handoff_path(&prompt_path);
+    let yaml_display = crate::planner::repair::workspace_relative_handoff_path(&yaml_path);
     eval_events::emit(
         eval_events_path,
         json!({
             "event": "recovery_prompt_saved",
             "recovery_handoff_kind": failure_kind,
-            "recovery_prompt_path": prompt_path.display().to_string(),
-            "recovery_ultra_plan_path": yaml_path.display().to_string(),
+            "recovery_prompt_path": &prompt_display,
+            "recovery_ultra_plan_path": &yaml_display,
             "recovery_yaml_missing": false,
             "recovery_yaml_roundtrip_ok": true,
             "suggested_recovery_command": suggested_prompt_command,
@@ -2088,8 +2092,8 @@ fn save_minimal_recovery_handoff(
         }),
     );
     Some(MinimalRecoveryPaths {
-        prompt_path: prompt_path.display().to_string(),
-        yaml_path: yaml_path.display().to_string(),
+        prompt_path: prompt_display,
+        yaml_path: yaml_display,
     })
 }
 
