@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::planner::step_plan::{ExpectedResult, StepKind, StepPlan};
 use crate::planner::ultra_plan::UltraPlan;
 use crate::tools::path_guard::validate_workspace_relative;
@@ -147,6 +149,13 @@ pub fn lint_step_plan(plan: &StepPlan) -> anyhow::Result<()> {
 }
 
 pub fn lint_step_plan_report(plan: &StepPlan) -> PlanLintReport {
+    lint_step_plan_report_with_workspace(plan, None)
+}
+
+pub fn lint_step_plan_report_with_workspace(
+    plan: &StepPlan,
+    work_root: Option<&Path>,
+) -> PlanLintReport {
     let mut report = PlanLintReport::pass();
     if plan.goal.chars().count() > 4000 {
         report.push("contract", "StepPlan goal is too long");
@@ -157,7 +166,8 @@ pub fn lint_step_plan_report(plan: &StepPlan) -> PlanLintReport {
     let mut ids = std::collections::BTreeSet::new();
     let mut path_owners = std::collections::BTreeMap::new();
     let mut seen_paths = std::collections::BTreeSet::new();
-    let mut setup_seen = false;
+    let mut setup_seen = work_root.is_some_and(workspace_has_node_dependency_context);
+    let workspace_has_nextjs_entrypoint = work_root.is_some_and(workspace_has_nextjs_entrypoint);
     for step in &plan.steps {
         if step.id.trim().is_empty() {
             report.push("contract", "step id is empty");
@@ -218,7 +228,10 @@ pub fn lint_step_plan_report(plan: &StepPlan) -> PlanLintReport {
                     "verify command requires dependency setup or package manifest first",
                 );
             }
-            if is_nextjs_build(command) && !has_nextjs_entrypoint(&seen_paths, step) {
+            if is_nextjs_build(command)
+                && !workspace_has_nextjs_entrypoint
+                && !has_nextjs_entrypoint(&seen_paths, step)
+            {
                 report.push(
                     "dependency_order",
                     "Next.js build verify requires an entrypoint expected path first",
@@ -610,6 +623,16 @@ fn is_nextjs_build(command: &str) -> bool {
     lower == "npm run build" || lower == "pnpm build" || lower == "yarn build"
 }
 
+fn workspace_has_node_dependency_context(root: &Path) -> bool {
+    root.join("node_modules").is_dir() || root.join("package.json").is_file()
+}
+
+fn workspace_has_nextjs_entrypoint(root: &Path) -> bool {
+    nextjs_entrypoints()
+        .iter()
+        .any(|path| root.join(path).is_file())
+}
+
 fn step_creates_dependency_manifest(step: &crate::planner::step_plan::PlanStep) -> bool {
     step.expected_paths.iter().any(|path| {
         matches!(
@@ -623,17 +646,7 @@ fn has_nextjs_entrypoint(
     seen_paths: &std::collections::BTreeSet<&str>,
     step: &crate::planner::step_plan::PlanStep,
 ) -> bool {
-    let entrypoints = [
-        "src/app/page.tsx",
-        "src/app/page.jsx",
-        "app/page.tsx",
-        "app/page.jsx",
-        "pages/index.tsx",
-        "pages/index.jsx",
-        "src/pages/index.tsx",
-        "src/pages/index.jsx",
-    ];
-    entrypoints.iter().any(|path| {
+    nextjs_entrypoints().iter().any(|path| {
         seen_paths.contains(path)
             || step
                 .expected_paths
@@ -708,6 +721,19 @@ fn has_preferred_verify(commands: &[&str], preferred: &[String]) -> bool {
             lower == expected || lower.starts_with(&(expected + " "))
         })
     })
+}
+
+fn nextjs_entrypoints() -> &'static [&'static str] {
+    &[
+        "src/app/page.tsx",
+        "src/app/page.jsx",
+        "app/page.tsx",
+        "app/page.jsx",
+        "pages/index.tsx",
+        "pages/index.jsx",
+        "src/pages/index.tsx",
+        "src/pages/index.jsx",
+    ]
 }
 
 fn has_nextjs_artifact_intent(paths: &[&str], context: &PlanQualityContext) -> bool {
@@ -1033,6 +1059,69 @@ mod tests {
             }],
         };
         assert!(lint_step_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn workspace_manifest_and_entrypoint_allow_final_nextjs_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page() { return null; }\n",
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Verify the existing Next.js app".to_string(),
+            steps: vec![PlanStep {
+                id: "final-verify".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Run deterministic Next.js build verification".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["npm run build".to_string()],
+            }],
+        };
+
+        let report = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+
+        assert!(report.is_pass(), "{report:?}");
+    }
+
+    #[test]
+    fn workspace_manifest_without_entrypoint_still_rejects_nextjs_build() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Verify the existing Next.js app".to_string(),
+            steps: vec![PlanStep {
+                id: "final-verify".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Run deterministic Next.js build verification".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["npm run build".to_string()],
+            }],
+        };
+
+        let report = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+
+        assert!(report.has_category("dependency_order"), "{report:?}");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|err| err.message.contains("entrypoint")),
+            "{report:?}"
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::minimal_loop::repair_target::{
 };
 use crate::planner::intent::detect_intent;
 use crate::planner::lint::{
-    PlanLintReport, PlanQualityContext, PlanQualityReport, lint_step_plan_report,
+    PlanLintReport, PlanQualityContext, PlanQualityReport, lint_step_plan_report_with_workspace,
     lint_ultra_plan_report, step_plan_quality_report, step_plan_quality_warnings,
 };
 use crate::planner::profile::{
@@ -238,7 +238,8 @@ pub fn generate_step_plan_with_ui(
                 );
                 strengthen_step_plan_for_profile(&mut plan, config);
                 repair_generated_step_plan_contract(&mut plan);
-                let lint_report = lint_step_plan_report(&plan);
+                let lint_report =
+                    lint_step_plan_report_with_workspace(&plan, Some(&config.workspace_root));
                 if lint_report.is_pass() {
                     let quality_context = plan_quality_context(config, goal);
                     let quality_report = step_plan_quality_report(&plan, &quality_context);
@@ -679,7 +680,7 @@ fn run_step_plan_with_session_with_ui(
     mode: &'static str,
 ) -> Result<StepPlanRunOutcome, StepPlanRunError> {
     let mut outcome = StepPlanRunOutcome::for_plan(plan);
-    let report = lint_step_plan_report(plan);
+    let report = lint_step_plan_report_with_workspace(plan, Some(&config.workspace_root));
     if !report.is_pass() {
         emit_planner_error_for_lint(config, "plan-file", &config.planner_model, &report, 0);
         return Err(StepPlanRunError::from_error(
@@ -7122,22 +7123,54 @@ mod tests {
     #[test]
     fn invalid_ultra_plan_generation_does_not_save_plan_file() {
         let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
         let mut planner = FakeClient::new(vec![
             AssistantReply::text("not yaml"),
             AssistantReply::text("still not yaml"),
             AssistantReply::text("nope"),
         ]);
         let mut execution = FakeClient::new(vec![]);
-        let err = generate_and_run_ultra_plan(
-            &mut planner,
-            &mut execution,
-            "goal",
-            &config(dir.path().to_path_buf()),
-        )
-        .unwrap_err()
-        .to_string();
+        let err = generate_and_run_ultra_plan(&mut planner, &mut execution, "goal", &cfg)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid generated UltraPlan after corrective retries"));
         assert!(!dir.path().join(".anvil/plans").exists());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"ultra_plan_generation_failed\""));
+        assert!(event_text.contains("\"planner_error_kind\":\"planner_schema_error\""));
+        assert!(!event_text.contains("\"event\":\"ultra_plan_generation_succeeded\""));
+    }
+
+    #[test]
+    fn generated_final_verify_uses_existing_workspace_nextjs_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page() { return null; }\n",
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan_json = r#"{"goal":"Verify the existing Next.js app","steps":[{"id":"final-verify","kind":"verify","expected_result":"pass","instruction":"Run deterministic Next.js build verification","expected_paths":[],"verify":["npm run build"]}]}"#;
+        let mut planner = FakeClient::new(vec![AssistantReply::text(plan_json)]);
+
+        let plan = generate_step_plan(&mut planner, "Verify the existing Next.js app", &cfg)
+            .expect("workspace entrypoint and manifest should satisfy generation lint");
+
+        assert_eq!(planner.messages.len(), 1);
+        assert_eq!(plan.steps[0].id, "final-verify");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(!event_text.contains("\"event\":\"planner_error\""));
     }
 
     #[test]

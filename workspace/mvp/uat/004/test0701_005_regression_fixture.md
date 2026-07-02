@@ -180,6 +180,15 @@ Expected future behavior:
 | negative | `completion_contract_verification_enabled=false` cannot be a full release pass for interactive implementation steps. |
 | negative | Summary/TUI cannot overwrite a failed task with unconditional `Status: complete`. |
 
+## UAT004-GATE-02 Executable Fixture Binding
+
+| baseline fixture | executable assertion | expected classification |
+| --- | --- | --- |
+| F-001 valid final verify over existing workspace | `workspace_manifest_and_entrypoint_allow_final_nextjs_verify` and `generated_final_verify_uses_existing_workspace_nextjs_artifacts` accept a final verify-only StepPlan when `package.json` and a Next.js entrypoint already exist in the workspace | regression fixed: valid final verify is no longer rejected only because the StepPlan did not re-own entrypoint expected paths |
+| F-001 invalid early/final verify without entrypoint | `workspace_manifest_without_entrypoint_still_rejects_nextjs_build` still emits `dependency_order` for `npm run build` when only the manifest exists | correct failure detection preserved |
+| invalid UltraPlan output | `invalid_ultra_plan_generation_does_not_save_plan_file` records `ultra_plan_generation_failed` with `planner_schema_error`, does not emit success, and does not save `.anvil/plans` | correct failure detection preserved; deterministic fallback is not treated as normal success |
+| scaffold fallback boundary | existing `deterministic_profile_fallback_requires_targeted_continuation_before_success` keeps `deterministic_scaffold_recovery` as `used_for_completion=false` until targeted implementation continuation succeeds | correct boundary preserved |
+
 ## Fixture Reproduction Notes
 
 No new executable tests are created in GATE-00. The fixed baseline is document-level and must be converted into targeted automated fixtures in later gates.

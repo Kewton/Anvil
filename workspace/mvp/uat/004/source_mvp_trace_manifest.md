@@ -87,6 +87,20 @@ GATE-00 では実装変更、provider probe、browser run、anvildev 比較を�
 | source/anvildev same-condition run | skipped | This gate restored deterministic TaskContract/completion semantics using source refs and local fixtures. Same-condition source/anvildev runtime comparison remains deferred to UAT004-GATE-09 because provider/browser/manual execution is not a normal unit-test requirement. |
 | provider/browser evidence | skipped | No live provider or browser readiness/interaction run was required for GATE-01; G-S12/G-S15/G-S16 remain covered by later gates. |
 
+## UAT004-GATE-02 Trace Update
+
+| item | status | evidence |
+| --- | --- | --- |
+| source refs inspected | complete | `src/agent/minimal_step_runner.rs`, `src/agent/minimal_step_runner/profile.rs`, `src/agent/minimal_step_runner/plan_lint.rs`, `src/agent/minimal_step_runner/verify.rs`, `src/agent/minimal_step_runner/repair.rs`, `src/agent/minimal_step_runner/profiles/nextjs.rs` |
+| MVP refs changed | complete | `mvp/anvilminimal/src/planner/lint.rs`, `mvp/anvilminimal/src/planner/runner.rs` |
+| G-S03 re-audit evidence | source-equivalent local fixture | Existing MVP generator already rejects tool calls, retries schema/lint failures, emits concrete `planner_error_kind`, and fails invalid UltraPlan after retry exhaustion without saving a plan. `invalid_ultra_plan_generation_does_not_save_plan_file` now also asserts `ultra_plan_generation_failed` with `planner_schema_error` and no success event. |
+| G-S04 final verify fixture | source-equivalent local fixture | `workspace_manifest_and_entrypoint_allow_final_nextjs_verify`, `workspace_manifest_without_entrypoint_still_rejects_nextjs_build`, and `generated_final_verify_uses_existing_workspace_nextjs_artifacts` prove final build verify can use existing workspace manifest+entrypoint while package-only/no-entrypoint still fails with concrete dependency-order lint. |
+| deterministic fallback boundary | preserved | `deterministic_profile_fallback_requires_targeted_continuation_before_success` continues to require targeted implementation continuation after deterministic scaffold recovery and records `used_for_completion=false`. |
+| required local tests | passed | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`: passed; `pytest mvp/anvilminimal/tests/eval`: 222 passed, 1 skipped |
+| provider probe | skipped | GATE-02 did not change provider request schema, provider parser, tool-call shape, or prompt text. The change is deterministic lint/generation validation. Provider probe remains deferred to UAT004-GATE-07/GATE-09 if prompt/provider-sensitive behavior changes. |
+| anvildev same-condition run | skipped | Local source refs plus deterministic fixtures cover the scoped planner lint/fail-fast semantics. Comparative anvildev/MVP run remains a final UAT004-GATE-09 responsibility. |
+| browser/manual evidence | skipped | GATE-02 does not close final browser readiness or interaction acceptance. Those remain G-S12/G-S16 work in GATE-05/GATE-08. |
+
 ## Skip Evidence
 
 | skipped item | reason | impact | next action |

@@ -96,14 +96,21 @@ UAT004-GATE-00 の baseline として、source-first runtime semantics 復元で
 | G-S01 | `TaskContract::evaluate*`, `CompletionPolicy`, request inference, artifact contract, evidence binding, artifact ledger/ownership/target alignment, worker contract | `minimal_loop/evidence.rs` blocks weak verifier evidence under source-first runtime requirements and keeps implementation/style/docs/scaffold roles separate; `minimal_loop/loop_run.rs` exposes capability/evidence bindings in step-level completion events | focused artifact-only verifier fixture plus existing title-only, docs-only, style-only, scaffold-only, canvas/browser negative fixtures passed under `cargo test` | source/anvildev same-condition trace deferred to GATE-09 |
 | G-S02 | Source completion authority is deterministic and tied to required roles/evidence, not path existence alone | `RunSessionOptions::plan_step(Implement)` enables completion contract verification/path merge; `planner/runner.rs` passes generated or explicit contract path into implement step config; setup/inspect/verify/report step side effects remain disabled | `implement_plan_step_keeps_completion_contract_authority_enabled`, non-interactive path completion fixture, external contract evidence fixture, and interactive scaffold/docs negative plan fixtures passed | browser/provider/release evidence remains GATE-05/GATE-09 |
 
+## UAT004-GATE-02 Port Record
+
+| gate | source authority applied | MVP implementation | local evidence | remaining trace gap |
+| --- | --- | --- | --- | --- |
+| G-S03 | `minimal_step_runner.rs` generation loop rejects tool calls, validates schema/lint, retries with corrective prompts, and fails invalid plans instead of returning fallback success | Existing `planner/runner.rs` source-shaped UltraPlan/StepPlan generation was re-audited; StepPlan generation now calls workspace-aware lint so source `lint_plan_with_workspace` semantics are used before success | `generated_final_verify_uses_existing_workspace_nextjs_artifacts`, `invalid_ultra_plan_generation_does_not_save_plan_file`, existing tool-call/schema/lint retry tests; full `cargo test` and `pytest mvp/anvilminimal/tests/eval` passed | provider probe skipped because no prompt/provider schema changed; final comparative source/MVP run deferred to GATE-09 |
+| G-S04 | `minimal_step_runner/plan_lint.rs` and `profiles/nextjs.rs` allow final build verification to rely on existing workspace entrypoint while keeping early build/order failures strict | `planner/lint.rs` adds `lint_step_plan_report_with_workspace`, checks existing `package.json`/`node_modules` context and Next.js entrypoints, and `planner/runner.rs` uses it for generation and plan-file validation | `workspace_manifest_and_entrypoint_allow_final_nextjs_verify`, `workspace_manifest_without_entrypoint_still_rejects_nextjs_build`, existing deterministic scaffold recovery completion-boundary fixture; full local tests passed | dependency setup/build rerun remains G-S09; browser/final acceptance remains G-S12 |
+
 ## Gate-Level Migration Decision
 
 | gate | baseline status from matrix | UAT004 source-first decision | inventory note |
 | --- | --- | --- | --- |
 | G-S01 | fail | `full_source_port_target` | TaskContract request inference and completion authority are not restored. |
 | G-S02 | pass | pass re-audit, `full_source_port_target` or documented equivalent authority | Existing pass is provisional because full TaskContract graph is not ported. |
-| G-S03 | pass | pass re-audit | Planner retry/lint exists, but source prompt/schema/retry/fail-fast trace is missing. |
-| G-S04 | fail | `full_source_port_target` | UltraPlan generation and final phase scaffold still drift from source runtime semantics. |
+| G-S03 | pass | `source_parity_pass` after GATE-02 re-audit | Source prompt/schema/retry/lint/fail-fast semantics are covered by source refs and local fixtures; provider probe is skipped because no prompt/provider schema changed. |
+| G-S04 | fail | `source_parity_pass` for GATE-02 generation/lint scope | Final verify phase now uses existing workspace manifest+entrypoint for plan validity; downstream dependency/build/final acceptance work remains assigned to G-S09/G-S12. |
 | G-S05 | fail | `source_trace_verification_target` | Phase context exists in MVP events; source same-condition trace is missing. |
 | G-S06 | fail | `source_trace_verification_target` | Step prompt contract events exist; source same-condition trace is missing. |
 | G-S07 | fail | `source_trace_verification_target` | Provider/tool recovery requires live/source trace; no provider probe in GATE-00. |
