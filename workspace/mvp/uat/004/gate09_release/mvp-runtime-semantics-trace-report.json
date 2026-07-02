@@ -1,0 +1,58 @@
+{
+  "binary_kind": "anvilminimal",
+  "binary_path": "<HOME>/share/work/github_kewton/Anvil-develop/mvp/anvilminimal/target/release/anvilminimal",
+  "commit_sha": "",
+  "env_redaction_status": "redacted",
+  "events_path": "/private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live/events.jsonl",
+  "gate_counts": {
+    "G-S01": 1,
+    "G-S02": 1,
+    "G-S07": 4,
+    "G-S10": 1,
+    "G-S12": 1,
+    "G-S13": 1,
+    "G-S14": 2,
+    "G-S15": 4
+  },
+  "generated_at": "2026-07-02T06:26:36.168216+00:00",
+  "known_gaps": [
+    "source same-condition trace must be compared before parity gates can pass",
+    "manual TUI trace evidence is not attached"
+  ],
+  "manifest_rows": [
+    {
+      "command": "'<HOME>/share/work/github_kewton/Anvil-develop/mvp/anvilminimal/target/release/anvilminimal' --yes --context-budget 65536 --chat-retries 1 --provider openai --model gpt-5.4-mini --planner-provider openai --planner-model gpt-5.4-mini --profile generic --cwd /private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live/runs/mvp-provider-smoke__write-one-file-small__minimal-loop__openai-gpt-5.4-mini__openai-gpt-5.4-mini__r1/workdir --completion-contract-json /private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live/runs/mvp-provider-smoke__write-one-file-small__minimal-loop__openai-gpt-5.4-mini__openai-gpt-5.4-mini__r1/completion-contract.json --prompt '<redacted-task-prompt>'",
+      "events_path": "/private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live/runs/mvp-provider-smoke__write-one-file-small__minimal-loop__openai-gpt-5.4-mini__openai-gpt-5.4-mini__r1/anvil-events.jsonl",
+      "failure_kind": "verify_repair_no_change",
+      "mode": "minimal-loop",
+      "provider_model_pair": "openai:gpt-5.4-mini planner=openai:gpt-5.4-mini",
+      "run_id": "mvp-provider-smoke__write-one-file-small__minimal-loop__openai-gpt-5.4-mini__openai-gpt-5.4-mini__r1",
+      "scenario": "write-one-file-small",
+      "success": "false",
+      "suite": "mvp-provider-smoke",
+      "summary_path": "/private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live/summary.eval.tsv"
+    }
+  ],
+  "matrix_path": "/private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live/matrix.json",
+  "normalized_event_count": 15,
+  "normalized_event_sequence_path": "/private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live/runtime-semantics-normalized-events.jsonl",
+  "output_dir": "/private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live",
+  "run_count": 1,
+  "run_root": "/private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live",
+  "schema_version": "1",
+  "silent_exit_count": 0,
+  "stage_counts": {
+    "acceptance_passed": 1,
+    "contract_loaded": 1,
+    "diagnostic_emitted": 2,
+    "provider_observed": 4,
+    "recovery_handoff_saved": 1,
+    "repair_attempted": 1,
+    "request_understood": 1,
+    "tool_executed": 2,
+    "tool_requested": 2
+  },
+  "subject": "mvp-anvilminimal",
+  "summary_path": "/private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live/summary.eval.tsv",
+  "trace_id": "mvp-anvilminimal-mvp-provider-smoke-live"
+}

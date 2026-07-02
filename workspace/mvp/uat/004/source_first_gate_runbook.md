@@ -121,3 +121,21 @@ Before closing an implementation gate, update:
 - `source_mvp_trace_manifest.md` with source/MVP refs, trace or skip evidence, provider/browser/anvildev status.
 - `source_runtime_module_inventory.md` with source authority applied and MVP implementation.
 - `test0701_005_regression_fixture.md` when a baseline fixture gains executable assertions.
+
+## UAT004-GATE-09 Run Record
+
+| item | result |
+| --- | --- |
+| release build | `cargo build --release --manifest-path mvp/anvilminimal/Cargo.toml` passed; release binary used for MVP comparative eval |
+| cargo verification | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 446 lib tests plus integration/doc tests |
+| eval verification | `pytest mvp/anvilminimal/tests/eval` passed with 227 passed / 1 skipped |
+| MVP targeted eval | `python3 scripts/eval-run.py --suite eval/suites/mvp-provider-smoke.yaml --model-profile openai-only --modes minimal-loop --runs 1 --scenario write-one-file-small --binary .../target/release/anvilminimal --binary-kind anvilminimal --run-root /private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live --parallel 1 --provider-limit 1 --timeout-sec 420` ran with network approval and failed as `verify_repair_no_change` |
+| anvildev comparison | same suite/profile/mode/scenario with `--binary anvildev --binary-kind anvildev --run-root /private/tmp/anvil-uat004-gate09/anvildev-provider-smoke-live`; command used `anvildev --engine minimal`; result passed |
+| trace comparison | `python3 scripts/eval-trace.py --compare-source-report .../anvildev-provider-smoke-live/runtime-semantics-trace-report.json --compare-mvp-report .../mvp-provider-smoke-live/runtime-semantics-trace-report.json --diff-output /private/tmp/anvil-uat004-gate09/source-mvp-runtime-trace-diff.json` |
+| release parity report | Generated `workspace/mvp/uat/004/gate09_release/parity_gate_report.json` with `build_parity_gate_report(gate_level="release")`; schema validation errors `[]`; release result is open/fail, not pass |
+| manual browser UAT | Copied original `test0701_005` workspace to `/private/tmp/anvil-uat004-gate09/test0701_005_browser_uat`; `env -u NODE_ENV npm run dev` started on 3011 after approval; `curl` returned HTTP 200; Playwright with cached Chromium clicked `DIFF 1` and observed canvas state change |
+| manual TUI UAT | Original `test0701_005` events/summary were fixed as failure evidence in `gate09_release/test0701_005.original-events.jsonl` and `.summary.md`; parity gate treats it as `tui_command_failed`, so release UAT does not pass |
+| recovery run | Saved MVP recovery YAML from provider-smoke run was executed with release binary and dotenv-loaded OpenAI key. It failed concretely as `phase_scaffold_error` because generated StepPlan verify command violated shell-control policy. Evidence: `recovery-run.events.jsonl`, `.summary.md`, `.stderr.log` |
+| correct failure detection vs regression | MVP did not falsely pass after bad artifact content, but anvildev produced accepted artifact. Classification: `release_quality_blocker_detected`, runtime/artifact quality gap relative to source; not an intentional non-port candidate |
+| full eval | Skipped; targeted same-condition comparative eval already exposed a release blocker. Re-run full eval after provider-smoke and release/TUI blockers are fixed. |
+| rollback guard | Do not permit blank failure kind, build-only/path-only release pass, missing recovery handoff, recovery handoff as success, or failed TUI task hidden behind REPL readiness. |

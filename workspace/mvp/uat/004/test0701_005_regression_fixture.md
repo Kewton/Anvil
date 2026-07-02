@@ -271,3 +271,22 @@ Do not merge a later change that makes any of these fixture failures disappear b
 - dropping recovery handoff evidence,
 - removing concrete failure kinds,
 - showing REPL readiness as task completion.
+
+## UAT004-GATE-09 Release Fixture Binding
+
+| fixture / evidence | GATE-09 assertion | classification |
+| --- | --- | --- |
+| `gate09_release/test0701_005.original-events.jsonl` | Original manual TUI event stream still contains `tui_command_stop ok=false` and is release-blocking evidence in `parity_gate_report.json` | correct failure evidence preserved; REPL/process readiness is not release success |
+| `gate09_release/test0701_005.original-summary.md` | Original summary remains non-passing UAT evidence: incomplete task plus failed TUI command is not hidden by a later complete/REPL tail | diagnostics regression remains guarded by G-S14/G-S16 |
+| `gate09_release/browser-readiness.json` | Copied test0701_005 app served HTTP 200 and route rendered under `env -u NODE_ENV npm run dev` | positive browser route evidence, not sufficient alone for release pass |
+| `gate09_release/interaction-evidence.json` | Playwright clicked `DIFF 1` and observed visible state change to canvas | positive basic interaction evidence, still not sufficient while TUI/comparative gates fail |
+| `gate09_release/dev-server-events.jsonl` | Manual UAT recorded dev-server start, wait, probe, browser interaction probe, and cleanup | dev server lifecycle evidence must remain visible |
+| `gate09_release/mvp-provider-smoke-live.summary.eval.tsv` | MVP release binary failed provider-smoke with `verify_repair_no_change` and `release_gate_status=failed` after producing an incorrect artifact | correct failure detection preserved, but source comparison shows artifact quality gap |
+| `gate09_release/anvildev-provider-smoke-live.summary.eval.tsv` | Same-condition `anvildev --engine minimal` passed and produced the accepted artifact | MVP is below source for accepted artifact quality |
+| `gate09_release/recovery-run.events.jsonl` and `.summary.md` | Saved recovery YAML was executed, then failed concretely as `phase_scaffold_error` / `verify command may not use shell control syntax` | recovery handoff is executable evidence, not success |
+| `gate09_release/parity_gate_report.json` | Release report is schema-valid, has no blank failure kind violations, and remains open/fail with G-S02/G-S12/G-S14 pass and the other gates failed/reopened | comparative release gate is not passed; rollback must not re-allow false positives |
+
+GATE-09 separates the two outcomes:
+
+- Preserved correct failure detection: MVP did not mark the bad `provider smoke ok.` artifact as full success, and recovery handoff did not become success.
+- Remaining runtime regression / release gap: anvildev produced exactly `provider smoke ok`, while MVP produced punctuation and then no-change repair. This is recorded as `release_quality_blocker_detected`, not as an intentional non-port candidate.

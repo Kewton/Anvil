@@ -141,3 +141,41 @@
 | regression / source parity gap | shallow interactive app can reach later phases with static/source evidence | must be rejected as false positive |
 | regression / diagnostic gap | summary reports incomplete and then appends complete/REPL status | must be fixed in G-S14/G-S16 |
 | regression / diagnostic gap | outer `run_stop` has `ok=true` and blank failure kind after command failure | must be fixed or explicitly projected as REPL-only status |
+
+## UAT004-GATE-09 Release Gate Status
+
+GATE-09 は release pass ではなく、comparative/release/UAT の open result として確定する。`workspace/mvp/uat/004/gate09_release/parity_gate_report.json` は schema validation error 0 件だが、MVP が same-condition `anvildev --engine minimal` を下回り、release-quality comparison と runtime semantics gates が失敗している。
+
+| gate | GATE-09 status | reason | evidence | next action | rollback condition |
+| --- | --- | --- | --- | --- | --- |
+| G-S01 | `full_source_port_target_reopened` | MVP-only request-understood trace; source gate not observed in this minimal-loop comparison | `gate09_release/source-mvp-runtime-trace-diff.json`, `parity_gate_report.json` | collect a richer same-condition source/MVP trace that observes request-understanding lifecycle, or port missing source event projection | do not weaken interactive request/completion authority to raise success rate |
+| G-S02 | `release_trace_pass` | source and MVP both observed contract-loaded trace | same diff, `parity_gate_report.json` | keep closed; recheck only if completion contract binding changes | preserve non-interactive path completion and interactive evidence requirements |
+| G-S03 | `full_source_port_target_reopened` | planner generation gate not observed in this comparative trace | same diff | run same-condition plan/ultra scenario trace or keep GATE-02 local fixture evidence as scoped only | no deterministic fallback success or blank planner failure kind |
+| G-S04 | `full_source_port_target_reopened` | Ultra phase generation gate not observed in this comparative trace | same diff | run Next.js/ultra comparative trace that exercises phase scaffold/final verify | invalid final verify planning cannot be release success |
+| G-S05 | `full_source_port_target_reopened` | GATE-09 minimal-loop trace lacks phase context on both source and MVP; trace absence is non-pass | `semantic_findings` in same diff | keep GATE-06 pass for scoped trace, but add release scenario trace coverage before final release pass | missing context must remain a failure, not a pass |
+| G-S06 | `full_source_port_target_reopened` | GATE-09 minimal-loop trace lacks step prompt trace on both source and MVP; trace absence is non-pass | `semantic_findings` in same diff | keep GATE-06 pass for scoped trace, but add release scenario trace coverage before final release pass | missing expected_result / verify / prompt trace must remain a failure |
+| G-S07 | `full_source_port_target_reopened` | MVP tool events observed but source tool gate not observed in this comparison | same diff; GATE-07 provider probe remains separate pass evidence | add same-condition source/MVP tool trace or mark as covered by provider probe only with explicit release waiver | unsafe path/shell-control args stay nonrecoverable |
+| G-S08 | `full_source_port_target_reopened` | source observed verify_started, MVP trace did not; deterministic verifier trace gap remains in this release comparison | same diff | run a verifier-focused comparative trace or add MVP normalized verify_started event parity | do not relax shell-control/setup/dev-server verify rejection |
+| G-S09 | `full_source_port_target_reopened` | dependency/setup/build lifecycle not observed in provider-smoke comparison | same diff plus GATE-03 fixtures | run Next.js dependency/build comparative UAT before release pass | setup-only/manifest-only/build-only cannot pass |
+| G-S10 | `full_source_port_target_reopened` | MVP repair/recovery events observed after failure; source repair gate not observed in same-condition source run | same diff and `mvp-provider-smoke-live.anvil-events.jsonl` | run source/MVP failure-repair scenario trace | no-change or target-misdirected repair stays failure |
+| G-S11 | `full_source_port_target_reopened` | scaffold continuation not observed in this comparative trace | same diff plus GATE-04 fixtures | run scaffold/continuation comparative trace if release wants this gate closed | scaffold-only output cannot be completion |
+| G-S12 | `release_trace_pass_with_uat_caveat` | trace observed final acceptance on both sides and browser/interaction manual evidence passed; overall release still fails due TUI/comparison gaps | `browser-readiness.json`, `interaction-evidence.json`, `parity_gate_report.json` | keep final acceptance authority; do not mark full release until G-S16/comparative gaps close | browser-ready/interaction-ready alone is not full release success |
+| G-S13 | `full_source_port_target_reopened` | recovery handoff saved and recovery run executed, but targeted recovery ended in concrete `phase_scaffold_error`; source recovery gate not observed | `recovery-run.events.jsonl`, `recovery-run.summary.md`, `recovery-run.stderr.log` | fix recovery StepPlan verify policy prompt or run source-equivalent recovery trace | saved recovery YAML alone must not be success |
+| G-S14 | `release_trace_pass` | diagnostics trace observed on both source and MVP; MVP summary has concrete `verify_repair_no_change` and no blank failure kind in eval summary | `mvp-provider-smoke-live.summary.eval.tsv`, same diff | keep GATE-08 diagnostics guard; recheck on manual terminal runs | failed lifecycle cannot lose failure kind or stop reason |
+| G-S15 | `full_source_port_target_reopened` | MVP provider observed; source provider gate not observed in same trace | same diff plus GATE-07 provider probe pass | keep provider probe evidence, and add same-condition source trace only if provider behavior becomes release blocker | provider-specific failure is not runtime success |
+| G-S16 | `full_source_port_target_reopened` | release UAT uses original `test0701_005` TUI events and fails with `tui_command_failed`; this prevents release pass | `test0701_005.original-events.jsonl`, `test0701_005.original-summary.md`, `parity_gate_report.json` | run a current live TUI command that produces valid command/task/session status before release pass | REPL/session ready must not overwrite failed task status |
+
+### GATE-09 Comparative Result
+
+| item | MVP | anvildev/source | classification |
+| --- | --- | --- | --- |
+| same-condition provider smoke | `success=false`, `failure_kind=verify_repair_no_change`, `release_gate_status=failed` | `success=true`, `release_gate_status=pass` | MVP is below source by accepted artifact quality and deterministic verification |
+| artifact quality | `hello.txt` contains `provider smoke ok.` and fails `grep -qx "provider smoke ok" hello.txt` | `hello.txt` contains exactly `provider smoke ok` | runtime/artifact quality regression relative to source |
+| false-positive behavior | MVP did not claim full success; release gate failed | source passed | correct failure detection preserved, but not enough to call success-rate drop purely correct detection |
+| success delta classification | `release_quality_blocker_detected`; `correct_failure_detection=false` in parity report | source success 100% | treat as release blocker/runtime gap, not an intentional non-port candidate |
+| browser route / interaction | test0701_005 copied workspace served HTTP 200; click `DIFF 1` changed UI to canvas | not compared to source in this run | manual UAT evidence pass for browser/interaction only |
+| recovery run | saved recovery YAML was executed and failed concretely with `phase_scaffold_error` / `verify command may not use shell control syntax` | no source recovery run in this comparison | saved recovery handoff is executable evidence, not success |
+
+### GATE-09 Rollback Guard
+
+Rollback is blocked if it would re-allow blank failure kinds, build-only false positives, missing recovery handoff, path-only release pass, or recovery handoff persistence as success. The GATE-09 release report intentionally keeps release status open until comparative source trace gaps, MVP provider-smoke artifact quality, recovery run failure, and TUI evidence failure are resolved.

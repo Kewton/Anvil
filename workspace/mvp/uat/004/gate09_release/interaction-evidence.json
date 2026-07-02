@@ -1,0 +1,12 @@
+{
+  "action": "click DIFF 1",
+  "after_canvas_count": 1,
+  "before_canvas_count": 0,
+  "browser_executable": "/Users/maenokota/Library/Caches/ms-playwright/chromium_headless_shell-1208/chrome-headless-shell-mac-arm64/chrome-headless-shell",
+  "canvas_found": true,
+  "interaction_performed": true,
+  "interactive_surface": true,
+  "ok": true,
+  "state_changed": true,
+  "visible_state_changed": true
+}

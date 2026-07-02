@@ -1,0 +1,316 @@
+{
+  "correct_failure_detection": [],
+  "extra_gate_ids_in_mvp": [
+    "G-S01",
+    "G-S07",
+    "G-S10",
+    "G-S13",
+    "G-S15"
+  ],
+  "extra_stages_in_mvp": [
+    "provider_observed",
+    "recovery_handoff_saved",
+    "repair_attempted",
+    "request_understood",
+    "tool_executed",
+    "tool_requested"
+  ],
+  "failed_gate_ids": [
+    "G-S01",
+    "G-S03",
+    "G-S04",
+    "G-S05",
+    "G-S06",
+    "G-S07",
+    "G-S08",
+    "G-S09",
+    "G-S10",
+    "G-S11",
+    "G-S13",
+    "G-S15",
+    "G-S16"
+  ],
+  "gate_results": [
+    {
+      "gate_id": "G-S01",
+      "mvp_event_count": 1,
+      "mvp_stages": [
+        "request_understood"
+      ],
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S02",
+      "mvp_event_count": 1,
+      "mvp_stages": [
+        "contract_loaded"
+      ],
+      "reason": "source_and_mvp_gate_observed",
+      "source_event_count": 1,
+      "source_stages": [
+        "contract_loaded"
+      ],
+      "status": "pass"
+    },
+    {
+      "gate_id": "G-S03",
+      "mvp_event_count": 0,
+      "mvp_stages": [],
+      "reason": "gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S04",
+      "mvp_event_count": 0,
+      "mvp_stages": [],
+      "reason": "gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S05",
+      "mvp_event_count": 0,
+      "mvp_stages": [],
+      "reason": "semantic_trace_contract_missing",
+      "semantic_finding_count": 2,
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S06",
+      "mvp_event_count": 0,
+      "mvp_stages": [],
+      "reason": "semantic_trace_contract_missing",
+      "semantic_finding_count": 2,
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S07",
+      "mvp_event_count": 4,
+      "mvp_stages": [
+        "tool_executed",
+        "tool_requested"
+      ],
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S08",
+      "mvp_event_count": 0,
+      "mvp_stages": [],
+      "reason": "missing_gate_in_mvp_trace",
+      "source_event_count": 1,
+      "source_stages": [
+        "verify_started"
+      ],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S09",
+      "mvp_event_count": 0,
+      "mvp_stages": [],
+      "reason": "gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S10",
+      "mvp_event_count": 1,
+      "mvp_stages": [
+        "repair_attempted"
+      ],
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S11",
+      "mvp_event_count": 0,
+      "mvp_stages": [],
+      "reason": "gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S12",
+      "mvp_event_count": 1,
+      "mvp_stages": [
+        "acceptance_passed"
+      ],
+      "reason": "source_and_mvp_gate_observed",
+      "source_event_count": 3,
+      "source_stages": [
+        "acceptance_passed",
+        "acceptance_started"
+      ],
+      "status": "pass"
+    },
+    {
+      "gate_id": "G-S13",
+      "mvp_event_count": 1,
+      "mvp_stages": [
+        "recovery_handoff_saved"
+      ],
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S14",
+      "mvp_event_count": 2,
+      "mvp_stages": [
+        "diagnostic_emitted"
+      ],
+      "reason": "source_and_mvp_gate_observed",
+      "source_event_count": 1,
+      "source_stages": [
+        "diagnostic_emitted"
+      ],
+      "status": "pass"
+    },
+    {
+      "gate_id": "G-S15",
+      "mvp_event_count": 4,
+      "mvp_stages": [
+        "provider_observed"
+      ],
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S16",
+      "mvp_event_count": 0,
+      "mvp_stages": [],
+      "reason": "gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "source_stages": [],
+      "status": "fail"
+    }
+  ],
+  "gate_status_counts": {
+    "fail": 13,
+    "pass": 3
+  },
+  "intentionally_different_gate_ids": [],
+  "missing_gate_ids_in_mvp": [
+    "G-S08"
+  ],
+  "missing_stages_in_mvp": [
+    "acceptance_started",
+    "verify_started"
+  ],
+  "mvp_trace_available": true,
+  "mvp_trace_id": "mvp-anvilminimal-mvp-provider-smoke-live",
+  "partial_gate_ids": [],
+  "passed_gate_ids": [
+    "G-S02",
+    "G-S12",
+    "G-S14"
+  ],
+  "regressions": [
+    {
+      "kind": "missing_stage_in_mvp_trace",
+      "mvp": 0,
+      "source": 1,
+      "stage": "acceptance_started"
+    },
+    {
+      "kind": "missing_stage_in_mvp_trace",
+      "mvp": 0,
+      "source": 1,
+      "stage": "verify_started"
+    },
+    {
+      "gate_id": "G-S08",
+      "kind": "missing_gate_in_mvp_trace",
+      "mvp": 0,
+      "source": 1
+    },
+    {
+      "field": "",
+      "gate_id": "G-S05",
+      "kind": "missing_context",
+      "run_id": "",
+      "side": "source",
+      "source_event": ""
+    },
+    {
+      "field": "",
+      "gate_id": "G-S05",
+      "kind": "missing_context",
+      "run_id": "",
+      "side": "mvp",
+      "source_event": ""
+    },
+    {
+      "field": "",
+      "gate_id": "G-S06",
+      "kind": "missing_step_prompt",
+      "run_id": "",
+      "side": "source",
+      "source_event": ""
+    },
+    {
+      "field": "",
+      "gate_id": "G-S06",
+      "kind": "missing_step_prompt",
+      "run_id": "",
+      "side": "mvp",
+      "source_event": ""
+    }
+  ],
+  "same_condition": {
+    "extra_in_mvp": [],
+    "missing_in_mvp": [],
+    "mvp_signature_count": 1,
+    "source_signature_count": 1,
+    "status": "match"
+  },
+  "schema_version": "1",
+  "semantic_findings": [
+    {
+      "gate_id": "G-S05",
+      "kind": "missing_context",
+      "reason": "phase_context_trace_missing",
+      "side": "source"
+    },
+    {
+      "gate_id": "G-S05",
+      "kind": "missing_context",
+      "reason": "phase_context_trace_missing",
+      "side": "mvp"
+    },
+    {
+      "gate_id": "G-S06",
+      "kind": "missing_step_prompt",
+      "reason": "step_prompt_trace_missing",
+      "side": "source"
+    },
+    {
+      "gate_id": "G-S06",
+      "kind": "missing_step_prompt",
+      "reason": "step_prompt_trace_missing",
+      "side": "mvp"
+    }
+  ],
+  "source_trace_available": true,
+  "source_trace_id": "source-anvildev-anvildev-provider-smoke-live",
+  "status": "compared"
+}

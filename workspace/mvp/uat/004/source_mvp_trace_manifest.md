@@ -213,3 +213,27 @@ Each later gate update must append enough data to answer:
 - provider/browser/manual UAT evidence path when relevant.
 - rollback condition and whether the change would reintroduce a known false positive.
 - whether success-rate movement is correct failure detection or runtime regression.
+
+## UAT004-GATE-09 Trace Update
+
+| item | status | evidence |
+| --- | --- | --- |
+| release build | passed | `cargo build --release --manifest-path mvp/anvilminimal/Cargo.toml` completed before comparative runs; release binary used: `mvp/anvilminimal/target/release/anvilminimal` |
+| cargo verification | passed | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 446 lib tests plus integration/doc tests |
+| eval verification | passed | `pytest mvp/anvilminimal/tests/eval` passed with 227 passed / 1 skipped |
+| initial MVP eval attempt | expected harness/confinement failure | `gate09_eval/mvp-provider-smoke/.../stderr.log` records external completion contract path outside workspace/temp; not used as provider result |
+| MVP same-condition eval | executed with network approval | `gate09_release/mvp-provider-smoke-live.summary.eval.tsv`, `mvp-provider-smoke-live.anvil-events.jsonl`, `mvp-runtime-semantics-trace-report.json`; result `success=false`, `failure_kind=verify_repair_no_change`, `release_gate_status=failed` |
+| source/anvildev same-condition eval | executed with network approval | `gate09_release/anvildev-provider-smoke-live.summary.eval.tsv`, `anvildev-runtime-semantics-trace-report.json`; command used `anvildev --engine minimal`; result `success=true`, `release_gate_status=pass` |
+| normalized comparison | compared | `gate09_release/source-mvp-runtime-trace-diff.json`; `same_condition.status=match`; passed gates G-S02/G-S12/G-S14; failed gates G-S01/G-S03/G-S04/G-S05/G-S06/G-S07/G-S08/G-S09/G-S10/G-S11/G-S13/G-S15/G-S16 |
+| release parity report | generated and schema-valid | `gate09_release/parity_gate_report.json`; validation errors `[]`; `success_rate_delta_pp=-100.0`; `success_delta_classification=release_quality_blocker_detected`; `correct_failure_detection=false`; `recovery_item_status.status=open` |
+| browser route UAT | passed | `gate09_release/browser-readiness.json`: HTTP 200, route rendered, DOM ready; source app copied to `/private/tmp/anvil-uat004-gate09/test0701_005_browser_uat` |
+| interaction UAT | passed for basic route interaction | `gate09_release/interaction-evidence.json`: clicked `DIFF 1`, canvas count changed 0 -> 1, state changed |
+| dev server lifecycle | recorded | `gate09_release/dev-server-events.jsonl` records start/wait/probe/cleanup. Initial sandbox `listen EPERM` was rerun with approval; default Playwright browser missing was resolved by existing cached Chromium executable. |
+| manual TUI UAT fixture | failed as expected | `gate09_release/test0701_005.original-events.jsonl` and `test0701_005.original-summary.md` preserve original `tui_command_stop ok=false` plus REPL/process complete contradiction as release-blocking evidence |
+| recovery handoff execution | executed and failed concretely | `gate09_release/recovery-run.events.jsonl`, `recovery-run.summary.md`, `recovery-run.stderr.log`; saved recovery YAML ran and stopped with `phase_scaffold_error` / `verify command may not use shell control syntax` |
+| provider probe status | reused from GATE-07 plus live comparative eval | GATE-07 provider probe remains `passed`; GATE-09 OpenAI provider was reachable after network approval and produced tool calls. No API-key skip was used. |
+| full eval | skipped | Targeted provider-smoke comparative eval already exposed a release-quality blocker and source/MVP divergence. Full eval is not required until the blocker is fixed or a release candidate is promoted. |
+
+### GATE-09 Success-Rate Classification
+
+The lower MVP success rate is not accepted as a pure correct-failure-detection improvement. MVP correctly avoided a false full success after producing `provider smoke ok.`, but source/anvildev produced the exact accepted artifact. Therefore GATE-09 classifies the delta as a release-quality/runtime artifact gap while preserving the important negative invariant: failed verification did not become release-grade success.

@@ -187,3 +187,18 @@ Rollback is not allowed if it reintroduces any of the following:
 - relaxed workspace confinement or shell control syntax acceptance.
 
 Success-rate regression must be classified separately from correct failure detection. A lower success rate is acceptable when it comes from newly correct rejection of shallow interactive output, missing browser evidence, or invalid final verify planning.
+
+## UAT004-GATE-09 Release Inventory Decision
+
+GATE-09 did not add new source modules to the inventory. It used the existing source authority list plus same-condition MVP/anvildev release evidence to decide which previously scoped passes remain release-ready and which need fuller source-port trace coverage.
+
+| area | source authority | MVP/runtime evidence | GATE-09 decision |
+| --- | --- | --- | --- |
+| Completion contract / artifact quality | `task_contract_completion_policy.rs`, `artifact_ledger.rs`, `worker_contract.rs` | MVP provider-smoke produced `hello.txt` with punctuation and failed deterministic verify; anvildev produced exact content and passed | Release blocker: MVP lower success is an artifact/runtime quality gap, not a pure correct-failure-detection win |
+| Planner / phase / prompt trace | `minimal_step_runner.rs`, `profile.rs`, `repair.rs` | `source-mvp-runtime-trace-diff.json` lacks G-S05/G-S06 prompt/phase observations for this minimal-loop release scenario | Reopened for release trace coverage while retaining GATE-06 scoped pass |
+| Verifier / dependency lifecycle | `verifier_command_policy.rs`, `project_verifier.rs`, `node_*` | Provider-smoke comparison does not observe dependency/build lifecycle and misses MVP `verify_started` parity for G-S08 | Reopened for release comparative trace; local GATE-03 fixtures remain valid |
+| Repair / recovery | `repair_job.rs`, `repair_lifecycle.rs`, `minimal_step_runner/repair.rs`, `safe_stop_*` | Saved recovery YAML was executed and failed concretely with `phase_scaffold_error` / shell-control verify policy | Recovery handoff is validated as executable evidence, but not success |
+| Final acceptance / browser / interaction | `verifier.rs`, `verifier_driver.rs`, `task_contract_completion_policy.rs` | Manual browser route and interaction evidence passed, but parity report release UAT still fails due TUI command failure and comparative gaps | Browser/interaction readiness alone is insufficient for release pass |
+| Diagnostics / TUI observability | `summary.rs`, `safe_stop_emit.rs`, `safe_stop_payload.rs`, `emit_verifier_events.rs` | Original test0701_005 TUI events remain `tui_command_failed`; parity report uses this to block release. Eval summary has no blank failure kind. | G-S14 stays trace-pass; G-S16 remains release-blocking until current live TUI evidence passes |
+
+Evidence root: `workspace/mvp/uat/004/gate09_release/`.
