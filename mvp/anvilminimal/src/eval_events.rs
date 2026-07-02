@@ -1581,6 +1581,40 @@ pub fn body_snippet(body: &str) -> String {
     clean.chars().take(SNIPPET_LIMIT).collect()
 }
 
+pub fn body_snippet_whole_tokens(body: &str) -> String {
+    let mut clean = body.replace('\n', " ");
+    clean = clean.replace('\r', " ");
+    clean = redact_secret_like(&clean);
+    clean = redact_home_paths(&clean);
+    truncate_whole_tokens(&clean, SNIPPET_LIMIT)
+}
+
+fn truncate_whole_tokens(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let mut out = String::new();
+    let mut len = 0usize;
+    for token in value.split_whitespace() {
+        let token_len = token.chars().count();
+        let next_len = len + usize::from(!out.is_empty()) + token_len;
+        if next_len > limit {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+            len += 1;
+        }
+        out.push_str(token);
+        len += token_len;
+    }
+    if out.is_empty() {
+        value.chars().take(limit).collect()
+    } else {
+        out
+    }
+}
+
 fn summary_body(body: &str) -> String {
     let clean = body.replace("\r\n", "\n").replace('\r', "\n");
     let clean = redact_home_paths(&clean);

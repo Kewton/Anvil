@@ -4,6 +4,22 @@ use crate::planner::step_plan::{ExpectedResult, StepKind, StepPlan};
 use crate::planner::ultra_plan::UltraPlan;
 use crate::tools::path_guard::validate_workspace_relative;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyDependencyOrderViolationKind {
+    RequiresSetup,
+    NextjsEntrypoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyDependencyOrderOffense {
+    pub step_index: usize,
+    pub command_index: usize,
+    pub step_id: String,
+    pub command: String,
+    pub kind: VerifyDependencyOrderViolationKind,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanLintReport {
     pub errors: Vec<PlanLintError>,
@@ -165,9 +181,6 @@ pub fn lint_step_plan_report_with_workspace(
     }
     let mut ids = std::collections::BTreeSet::new();
     let mut path_owners = std::collections::BTreeMap::new();
-    let mut seen_paths = std::collections::BTreeSet::new();
-    let mut setup_seen = work_root.is_some_and(workspace_has_node_dependency_context);
-    let workspace_has_nextjs_entrypoint = work_root.is_some_and(workspace_has_nextjs_entrypoint);
     for step in &plan.steps {
         if step.id.trim().is_empty() {
             report.push("contract", "step id is empty");
@@ -217,25 +230,50 @@ pub fn lint_step_plan_report_with_workspace(
         for command in &step.verify {
             if let Err(err) = crate::planner::verify::validate_verify_command(command) {
                 report.push("verify_policy", err.to_string());
+            }
+        }
+    }
+    for offense in diagnose_step_plan_dependency_order(plan, work_root) {
+        report.push(
+            "dependency_order",
+            format!(
+                "{}: step {} command `{}`",
+                offense.message, offense.step_id, offense.command
+            ),
+        );
+    }
+    report
+}
+
+pub fn diagnose_step_plan_dependency_order(
+    plan: &StepPlan,
+    work_root: Option<&Path>,
+) -> Vec<VerifyDependencyOrderOffense> {
+    let mut offenses = Vec::new();
+    let mut seen_paths = std::collections::BTreeSet::new();
+    let mut setup_seen = work_root.is_some_and(workspace_has_node_dependency_context);
+    let workspace_has_nextjs_entrypoint = work_root.is_some_and(workspace_has_nextjs_entrypoint);
+    for (step_index, step) in plan.steps.iter().enumerate() {
+        for (command_index, command) in step.verify.iter().enumerate() {
+            if crate::planner::verify::validate_verify_command(command).is_err() {
                 continue;
             }
-            if requires_dependency_setup_before_verify(command)
-                && !setup_seen
-                && !work_root.is_some_and(|root| workspace_has_dependency_boundary(root, command))
-            {
-                report.push(
-                    "dependency_order",
-                    "verify command requires dependency setup or package manifest first",
-                );
-            }
-            if is_nextjs_build(command)
-                && !workspace_has_nextjs_entrypoint
-                && !has_nextjs_entrypoint(&seen_paths, step)
-            {
-                report.push(
-                    "dependency_order",
-                    "Next.js build verify requires an entrypoint expected path first",
-                );
+            for (kind, message) in diagnose_verify_dependency_order(
+                command,
+                setup_seen,
+                work_root,
+                workspace_has_nextjs_entrypoint,
+                &seen_paths,
+                step,
+            ) {
+                offenses.push(VerifyDependencyOrderOffense {
+                    step_index,
+                    command_index,
+                    step_id: step.id.clone(),
+                    command: command.clone(),
+                    kind,
+                    message: message.to_string(),
+                });
             }
         }
         if step.step_kind() == StepKind::Setup {
@@ -245,7 +283,37 @@ pub fn lint_step_plan_report_with_workspace(
             seen_paths.insert(path.as_str());
         }
     }
-    report
+    offenses
+}
+
+fn diagnose_verify_dependency_order(
+    command: &str,
+    setup_seen: bool,
+    work_root: Option<&Path>,
+    workspace_has_nextjs_entrypoint: bool,
+    seen_paths: &std::collections::BTreeSet<&str>,
+    step: &crate::planner::step_plan::PlanStep,
+) -> Vec<(VerifyDependencyOrderViolationKind, &'static str)> {
+    let mut out = Vec::new();
+    if requires_dependency_setup_before_verify(command)
+        && !setup_seen
+        && !work_root.is_some_and(|root| workspace_has_dependency_boundary(root, command))
+    {
+        out.push((
+            VerifyDependencyOrderViolationKind::RequiresSetup,
+            "verify command requires dependency setup or package manifest first",
+        ));
+    }
+    if is_nextjs_build(command)
+        && !workspace_has_nextjs_entrypoint
+        && !has_nextjs_entrypoint(seen_paths, step)
+    {
+        out.push((
+            VerifyDependencyOrderViolationKind::NextjsEntrypoint,
+            "Next.js build verify requires an entrypoint expected path first",
+        ));
+    }
+    out
 }
 
 pub fn step_plan_quality_warnings(plan: &StepPlan) -> Vec<String> {

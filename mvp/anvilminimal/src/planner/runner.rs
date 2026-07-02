@@ -49,6 +49,7 @@ use crate::planner::repair::{
     suggested_recovery_ultra_plan_command, suggested_ultra_recovery_command,
     workspace_relative_handoff_path,
 };
+use crate::planner::sanitizer::{SanitizerReport, sanitize_step_plan_against_policy};
 use crate::planner::step_plan::{
     PlanStep, StepKind, StepPlan, extract_json_object, parse_generated_step_plan_json,
     parse_step_plan, render_step_plan, repair_generated_step_plan_contract,
@@ -257,6 +258,16 @@ pub fn generate_step_plan_with_ui(
                 );
                 strengthen_step_plan_for_profile(&mut plan, config);
                 repair_generated_step_plan_contract(&mut plan);
+                let sanitizer_report =
+                    sanitize_step_plan_against_policy(&mut plan, Some(&config.workspace_root));
+                let plan_was_sanitized = !sanitizer_report.is_empty();
+                emit_planner_plan_sanitized(
+                    config,
+                    client.label(),
+                    model,
+                    attempt,
+                    &sanitizer_report,
+                );
                 let lint_report =
                     lint_step_plan_report_with_workspace(&plan, Some(&config.workspace_root));
                 if lint_report.is_pass() {
@@ -270,7 +281,7 @@ pub fn generate_step_plan_with_ui(
                         attempt,
                         &quality_report,
                     );
-                    if quality_report.has_retryable_quality() {
+                    if quality_report.has_retryable_quality() && !plan_was_sanitized {
                         last_valid_plan = Some(plan.clone());
                         if attempt < 3 {
                             emit_planner_quality_retry(
@@ -355,6 +366,17 @@ pub fn generate_step_plan_with_ui(
         }
     }
     if let Some(plan) = last_valid_plan {
+        return Ok(plan);
+    }
+    if let Some(plan) = fallback_step_plan_for_setup_phase(goal, config) {
+        emit_planner_fallback_plan(
+            config,
+            client.label(),
+            model,
+            goal,
+            &plan,
+            last_error.as_deref().unwrap_or("unknown parse error"),
+        );
         return Ok(plan);
     }
     anyhow::bail!(
@@ -6703,7 +6725,7 @@ Failure:\n{}",
         summary.prompt_command_summary,
         summary.recovery_yaml_command_summary,
         summary.recovery_artifact_check,
-        eval_events::body_snippet(summary.reason),
+        eval_events::body_snippet_whole_tokens(summary.reason),
     )
 }
 
@@ -6954,6 +6976,84 @@ fn emit_planner_verify_command_normalized(
     );
 }
 
+fn emit_planner_plan_sanitized(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    report: &SanitizerReport,
+) {
+    if report.is_empty() {
+        return;
+    }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "planner_plan_sanitized",
+            "planner_stage": "sanitize",
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+            "removed_commands": report.removed_commands.iter().map(|record| json!({
+                "step_id": &record.step_id,
+                "command": eval_events::body_snippet(&record.command),
+                "reason": eval_events::body_snippet(&record.reason),
+            })).collect::<Vec<_>>(),
+            "substituted_commands": report.substituted_commands.iter().map(|record| json!({
+                "step_id": &record.step_id,
+                "removed_command": eval_events::body_snippet(&record.removed_command),
+                "substituted_command": eval_events::body_snippet(&record.substituted_command),
+            })).collect::<Vec<_>>(),
+            "moved_commands": report.moved_commands.iter().map(|record| json!({
+                "from_step_id": &record.from_step_id,
+                "to_step_id": &record.to_step_id,
+                "command": eval_events::body_snippet(&record.command),
+                "reason": eval_events::body_snippet(&record.reason),
+            })).collect::<Vec<_>>(),
+            "dropped_commands": report.dropped_commands.iter().map(|record| json!({
+                "step_id": &record.step_id,
+                "command": eval_events::body_snippet(&record.command),
+                "reason": eval_events::body_snippet(&record.reason),
+            })).collect::<Vec<_>>(),
+            "retyped_steps": report.retyped_steps.iter().map(|record| json!({
+                "step_id": &record.step_id,
+                "from_kind": &record.from_kind,
+                "to_kind": &record.to_kind,
+                "reason": eval_events::body_snippet(&record.reason),
+            })).collect::<Vec<_>>(),
+            "instruction_notes": report.instruction_notes.iter().map(|record| json!({
+                "step_id": &record.step_id,
+                "note": eval_events::body_snippet(&record.note),
+            })).collect::<Vec<_>>(),
+        }),
+    );
+}
+
+fn emit_planner_fallback_plan(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    goal: &str,
+    plan: &StepPlan,
+    reason: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "planner_fallback_plan",
+            "planner_stage": "fallback",
+            "planner_provider": provider,
+            "planner_model": model,
+            "planner_error_message": eval_events::body_snippet(reason),
+            "profile": config.profile,
+            "goal": eval_events::body_snippet(goal),
+            "step_count": plan.steps.len(),
+            "expected_paths": plan.steps.iter().flat_map(|step| step.expected_paths.iter()).cloned().collect::<Vec<_>>(),
+            "verify": collect_step_verify_commands(plan),
+        }),
+    );
+}
+
 fn stable_command_list_hash(commands: &[String]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for command in commands {
@@ -6969,6 +7069,70 @@ fn stable_command_list_hash(commands: &[String]) -> String {
 
 fn command_list_summary(commands: &[String]) -> String {
     eval_events::body_snippet(&commands.join(" | "))
+}
+
+fn fallback_step_plan_for_setup_phase(goal: &str, config: &Config) -> Option<StepPlan> {
+    if !known_profile_for_setup_fallback(&config.profile) || !looks_like_setup_phase_goal(goal) {
+        return None;
+    }
+    let expected_paths = profile_expected_paths(&config.workspace_root, &config.profile, goal);
+    if expected_paths.is_empty() {
+        return None;
+    }
+    let verify = expected_paths
+        .iter()
+        .map(|path| format!("test -f {path}"))
+        .filter(|command| crate::planner::verify::validate_verify_command(command).is_ok())
+        .collect::<Vec<_>>();
+    let plan = StepPlan {
+        goal: goal.to_string(),
+        steps: vec![PlanStep {
+            id: "fallback-setup".to_string(),
+            kind: "setup".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: format!(
+                "Create the generic {} project scaffold required for this phase: {}",
+                config.profile,
+                compact_single_line(goal)
+            ),
+            expected_paths,
+            verify,
+        }],
+    };
+    let lint_report = lint_step_plan_report_with_workspace(&plan, Some(&config.workspace_root));
+    lint_report.is_pass().then_some(plan)
+}
+
+fn known_profile_for_setup_fallback(profile: &str) -> bool {
+    matches!(profile, "nextjs" | "next-js" | "next.js")
+}
+
+fn looks_like_setup_phase_goal(goal: &str) -> bool {
+    let phase_text = phase_id_and_task_text(goal).unwrap_or_else(|| goal.to_string());
+    let lower = phase_text.to_ascii_lowercase();
+    lower.contains("setup")
+        || lower.contains("set up")
+        || lower.contains("scaffold")
+        || lower.contains("init")
+        || lower.contains("initialize")
+        || lower.contains("initialise")
+        || lower.contains("project-setup")
+        || lower.contains("project setup")
+}
+
+fn phase_id_and_task_text(goal: &str) -> Option<String> {
+    let mut out = Vec::new();
+    for line in goal.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("Phase id:") || trimmed.starts_with("Phase task:") {
+            out.push(trimmed.to_string());
+        }
+    }
+    (!out.is_empty()).then(|| out.join("\n"))
+}
+
+fn compact_single_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn emit_ultra_plan_raw_output_shape(
@@ -7452,6 +7616,8 @@ Rules:\n\
 - If the user goal contains a Required final artifacts list, preserve those exact repository-relative paths across phases. Do not rename or relocate them.\n\
 - Do not make a phase prompt a shell command or a REPL command.\n\
 - Do not include long-running dev servers, network setup, or package installation as a phase unless the user explicitly requires it.\n\
+- Phase descriptions must not request dev-server startup or page-load/browser-route verification outside the final phase.\n\
+- Browser readiness and page-route acceptance are verified by the runtime at final acceptance.\n\
 - Stop at a clean final verification or cleanup phase.\n\
 {profile_rules}{style_rules}"
     )
@@ -7635,7 +7801,25 @@ fn build_step_plan_user_prompt(goal: &str, config: &Config) -> String {
             }
         }
     }
+    if is_ultra_phase_step_goal(goal) {
+        prompt.push_str("\nUltra phase hard constraints:\n");
+        prompt.push_str("- Do not put dev-server startup, page-load probes, curl localhost, or dependency installation in verify.\n");
+        prompt.push_str("- Browser readiness is verified by the runtime at final acceptance.\n");
+        prompt.push_str("- GOOD verify examples:\n");
+        prompt.push_str("  - test -f package.json\n");
+        prompt.push_str("  - node -p \"require('./package.json').scripts.dev\"\n");
+        prompt.push_str("- BAD verify examples:\n");
+        prompt.push_str("  - npm install\n");
+        prompt.push_str("  - npm run dev\n");
+        prompt.push_str("  - curl http://localhost:3011\n");
+    }
     prompt
+}
+
+fn is_ultra_phase_step_goal(goal: &str) -> bool {
+    goal.contains("Original ultra goal:")
+        && goal.contains("Phase id:")
+        && goal.contains("Phase task:")
 }
 
 fn plan_quality_context(config: &Config, goal: &str) -> PlanQualityContext {
@@ -8586,6 +8770,98 @@ mod tests {
             .to_string();
         assert!(err.contains("verify command"));
         assert!(!dir.path().join(".anvil/plans").exists());
+    }
+
+    #[test]
+    fn sanitizer_repairs_setup_dev_verify_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan_json = serde_json::to_string(&StepPlan {
+            goal: "Project setup phase".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "create-manifest".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create package.json".to_string(),
+                    expected_paths: vec!["package.json".to_string()],
+                    verify: vec!["npm install".to_string()],
+                },
+                PlanStep {
+                    id: "create-page".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create src/app/page.tsx".to_string(),
+                    expected_paths: vec!["src/app/page.tsx".to_string()],
+                    verify: vec!["npm run dev & curl http://localhost:3011".to_string()],
+                },
+            ],
+        })
+        .unwrap();
+        let mut planner = FakeClient::new(vec![AssistantReply::text(plan_json)]);
+
+        let plan = generate_step_plan(&mut planner, "Project setup phase", &cfg).unwrap();
+
+        assert_eq!(planner.messages.len(), 1);
+        assert_eq!(plan.steps[0].kind, "setup");
+        assert_eq!(plan.steps[0].verify, vec!["test -f package.json"]);
+        assert!(plan.steps[1].verify.is_empty());
+        assert!(
+            plan.steps[1]
+                .instruction
+                .contains("Browser readiness is verified by the runtime")
+        );
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"planner_plan_sanitized\""));
+        assert!(!event_text.contains("\"event\":\"planner_error\""));
+    }
+
+    #[test]
+    fn setup_phase_fallback_generates_profile_scaffold_after_invalid_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Original ultra goal: Build an interactive app\n\
+Profile: nextjs\n\
+Style: default\n\
+Intent: create\n\
+Phase id: project-setup\n\
+Phase task: Initialize the Next.js project shell";
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text("not a step plan"),
+            AssistantReply::text("still not a step plan"),
+            AssistantReply::text("no valid step plan"),
+        ]);
+
+        let plan = generate_step_plan(&mut planner, goal, &cfg).unwrap();
+
+        let expected_paths = profile_expected_paths(dir.path(), "nextjs", goal);
+        assert_eq!(planner.messages.len(), 3);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].kind, "setup");
+        assert_eq!(plan.steps[0].expected_paths, expected_paths);
+        assert_eq!(
+            plan.steps[0].verify,
+            expected_paths
+                .iter()
+                .map(|path| format!("test -f {path}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"planner_fallback_plan\""));
     }
 
     #[test]
@@ -9601,6 +9877,7 @@ mod tests {
         );
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"planner_error_kind\":\"phase_scaffold_error\""));
+        assert!(!event_text.contains("\"event\":\"planner_fallback_plan\""));
         assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
         assert!(event_text.contains("\"status\":\"incomplete\""));
         assert!(event_text.contains("\"recovery_yaml_missing\":false"));
@@ -9828,6 +10105,45 @@ mod tests {
         assert!(
             event_text.contains("\"recovery_ultra_plan_path\":\".anvil/plans/"),
             "{event_text}"
+        );
+    }
+
+    #[test]
+    fn ultra_partial_summary_does_not_cut_recovery_yaml_path_mid_token() {
+        let recovery_path = ".anvil/plans/recovery-ultra-plan-project-setup-019f2512-5e1e-7cb3-b18a-e71b939f8810.yaml";
+        let command = format!("/run-ultra-plan {recovery_path}");
+        let old_cut_offset = command.find(".yaml").unwrap() + ".yam".len();
+        let prefix_len = 500usize.saturating_sub(old_cut_offset);
+        let reason = format!("{} {command}", "x".repeat(prefix_len.saturating_sub(1)));
+
+        let summary = render_ultra_partial_run_summary(UltraPartialRunSummary {
+            completed_phases: &[],
+            failed_phase: "project-setup",
+            pending_phases: &["final-verify".to_string()],
+            failure_kind: "phase_scaffold_error",
+            reason: &reason,
+            recovery_prompt_path: ".anvil/repairs/repair-project-setup.md",
+            recovery_yaml_summary: &format!("Recovery UltraPlan YAML saved: {recovery_path}"),
+            prompt_command_summary: "Suggested command: unavailable",
+            recovery_yaml_command_summary: &format!("Suggested YAML command: {command}"),
+            recovery_artifact_check: "Recovery artifact check: prompt_parse_ok=true, yaml_parse_ok=true, command_targets_valid=true",
+        });
+        let failure = summary.split("Failure:\n").nth(1).expect("failure block");
+
+        assert!(
+            !failure.contains(
+                "recovery-ultra-plan-project-setup-019f2512-5e1e-7cb3-b18a-e71b939f8810.yam"
+            ),
+            "{failure}"
+        );
+        for token in failure.split_whitespace() {
+            if token.contains("recovery-ultra-plan-project-setup") {
+                assert!(token.ends_with(".yaml"), "{token}");
+            }
+        }
+        assert!(
+            summary.contains(&format!("Suggested YAML command: {command}")),
+            "{summary}"
         );
     }
 
@@ -10950,6 +11266,7 @@ mod tests {
     #[test]
     #[ignore]
     #[cfg(unix)]
+    #[allow(clippy::zombie_processes)]
     fn fake_dev_server_package_manager_child() {
         if std::env::var("ANVIL_FAKE_DEV_SERVER_CHILD").ok().as_deref() != Some("1") {
             return;
@@ -12372,7 +12689,7 @@ exit 2\n"
             .collect()
     }
 
-    fn dev_server_stage_names<'a>(events: &'a [Value]) -> Vec<&'a str> {
+    fn dev_server_stage_names(events: &[Value]) -> Vec<&str> {
         events
             .iter()
             .filter(|event| {

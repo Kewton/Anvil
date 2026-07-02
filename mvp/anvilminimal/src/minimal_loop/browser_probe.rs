@@ -899,12 +899,10 @@ mod tests {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0u8; 512];
         let _ = stream.read(&mut request);
-        let code = if status == "500" || status == "node-env-marker" {
-            500
-        } else if status == "env-sensitive"
+        let env_sensitive_failure = status == "env-sensitive"
             && (std::env::var_os("NODE_ENV").is_some()
-                || std::env::var_os("NODE_OPTIONS").is_some())
-        {
+                || std::env::var_os("NODE_OPTIONS").is_some());
+        let code = if status == "500" || status == "node-env-marker" || env_sensitive_failure {
             500
         } else {
             200

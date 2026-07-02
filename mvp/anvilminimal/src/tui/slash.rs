@@ -490,8 +490,7 @@ mod tests {
         let event_text = std::fs::read_to_string(&events).unwrap();
         let tui_stop = event_text
             .lines()
-            .filter(|line| line.contains(r#""event":"tui_command_stop""#))
-            .next_back()
+            .rfind(|line| line.contains(r#""event":"tui_command_stop""#))
             .unwrap();
         assert!(
             tui_stop.contains(r#""recovery_prompt_path":".anvil/repairs/repair-phase.md""#),

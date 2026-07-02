@@ -508,24 +508,18 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
     if crate::tools::bash::blocked_reason(&normalized, false).is_some() {
         return verify_command_violation(normalized, VerifyCommandViolationKind::Blocked, None);
     }
+    let lower = normalized.to_ascii_lowercase();
+    if is_setup_or_dev_server_verify_command(&lower) {
+        return verify_command_violation(
+            normalized,
+            VerifyCommandViolationKind::SetupOrDevServer,
+            None,
+        );
+    }
     if contains_shell_control_syntax(&normalized) {
         return verify_command_violation(
             normalized,
             VerifyCommandViolationKind::ShellControlSyntax,
-            None,
-        );
-    }
-    let lower = normalized.to_ascii_lowercase();
-    if lower.contains("npm install")
-        || lower.contains("pnpm install")
-        || lower.contains("yarn install")
-        || lower.contains("cargo install")
-        || lower.contains("next dev")
-        || lower.contains("vite --host")
-    {
-        return verify_command_violation(
-            normalized,
-            VerifyCommandViolationKind::SetupOrDevServer,
             None,
         );
     }
@@ -543,6 +537,32 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
         violation: None,
         reason: None,
     }
+}
+
+fn is_setup_or_dev_server_verify_command(lower: &str) -> bool {
+    lower.contains("npm install")
+        || lower.contains("pnpm install")
+        || lower.contains("yarn install")
+        || lower.contains("cargo install")
+        || lower.contains("npm run dev")
+        || lower.contains("pnpm dev")
+        || lower.contains("yarn dev")
+        || lower.contains("next dev")
+        || lower.contains("vite --host")
+        || lower.contains("vite --port")
+        || (lower.contains("curl ") && is_localhost_reference(lower))
+        || (lower.contains("wget ") && is_localhost_reference(lower))
+        || lower.contains("python -m http.server")
+        || lower.contains("python3 -m http.server")
+        || lower.contains("server start")
+        || lower.contains("serve ")
+}
+
+fn is_localhost_reference(lower: &str) -> bool {
+    lower.contains("localhost")
+        || lower.contains("127.0.0.1")
+        || lower.contains("0.0.0.0")
+        || lower.contains("[::1]")
 }
 
 fn normalize_planner_shell_and_verify_command(command: &str) -> anyhow::Result<Vec<String>> {
@@ -777,6 +797,15 @@ mod tests {
         assert_eq!(
             diagnosis.reason.as_deref(),
             Some("verify command may not perform setup or start a dev server")
+        );
+    }
+
+    #[test]
+    fn verify_command_diagnoses_dev_server_probe_before_shell_syntax() {
+        let diagnosis = diagnose_verify_command("npm run dev & curl http://localhost:3011");
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::SetupOrDevServer)
         );
     }
 
