@@ -1,0 +1,5 @@
+{"command": "env -u NODE_ENV npm run dev", "event": "dev_server_lifecycle", "port": 3011, "source": "GATE-09 manual UAT", "stage": "start", "status": "started", "workdir": "/private/tmp/anvil-uat004-gate09/test0701_005_browser_uat"}
+{"event": "dev_server_lifecycle", "message": "Next.js Ready in 2.5s", "ready": true, "stage": "wait", "status": "ready"}
+{"event": "dev_server_lifecycle", "http_status": 200, "probe": "curl", "ready": true, "stage": "probe", "url": "http://127.0.0.1:3011/"}
+{"action": "click DIFF 1", "browser_evidence_path": "workspace/mvp/uat/004/gate09_release/browser-readiness.json", "browser_ok": true, "event": "browser_interaction_probe", "interaction_evidence_path": "workspace/mvp/uat/004/gate09_release/interaction-evidence.json", "interaction_ok": true}
+{"event": "dev_server_lifecycle", "signal": "SIGINT", "stage": "cleanup", "status": "stopped"}

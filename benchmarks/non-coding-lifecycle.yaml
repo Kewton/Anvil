@@ -1,0 +1,48 @@
+name: non-coding-lifecycle
+description: >-
+  Non-coding evaluation set (Issue #1008). One case per non-coding TaskKind
+  (docs / data / research / ops / authoring) exercised on the same
+  Objective / Evidence / Recovery lifecycle as coding. Fixtures are tiny,
+  reproducible, and network-free; evidence is judged by the deterministic
+  per-kind checkers (no LLM judge). Categories are pinned to the agent
+  classifier by the issue1008 divergence guard in task_contract.rs.
+args:
+  max_iterations: 30
+  chat_retries: 2
+  sidecar_model: qwen3.5:9b
+cases:
+  - name: docs-configuration-reference
+    category: docs
+    prompt: |
+      Update docs/configuration-reference.md with a configuration reference for the agent.
+      Document the configuration file location, the available settings with their default values, and a short troubleshooting section.
+      This is a documentation-only task: do not modify code.
+      Stop after confirming the documentation file is written.
+  - name: data-json-to-csv-summary
+    category: data
+    prompt: |
+      Create a small documented command that transforms input/events.json into output/event-summary.csv.
+      Required columns: id, name, event_count, last_seen.
+      Preserve the input row order, write a short note on how to run it, and include a tiny sample fixture if none exists.
+      Stop after confirming the transform artifact is present.
+  - name: research-logging-strategy-brief
+    category: research
+    prompt: |
+      Research and compare three local logging approaches (structured JSON logs, plain text logs, and rotating file logs) for a local CLI agent.
+      Capture the analysis in research/logging-strategy-brief.md with a recommendation, tradeoffs, failure modes, cited sources, and an explicit assumptions section.
+      Do not change code.
+      Stop after confirming the report file is written.
+  - name: ops-local-agent-triage-runbook
+    category: ops
+    prompt: |
+      Prepare an operations runbook at runbooks/local-agent-triage.md for a local Ollama-backed agent.
+      Include a symptom checklist, the exact shell commands to collect logs with their expected exit codes, the log files to gather and their locations, recovery steps, and escalation criteria.
+      Keep it operational and checklist-oriented.
+      Stop after confirming the runbook is written.
+  - name: authoring-onboarding-explainer
+    category: authoring
+    prompt: |
+      Rewrite the onboarding explanation of how the agent loop works into docs/agent-loop-onboarding.md for new contributors.
+      Use plain language for a beginner audience, a short analogy, and at least two concrete examples so a newcomer can follow it.
+      Do not modify code.
+      Stop after confirming the document is written.

@@ -34,8 +34,9 @@
 //!      `test_*.py` / `*_test.py`)
 //!   2. `is_setup_file` (covers `package.json` / `tsconfig.json` / lock files)
 //!   3. Docs extension (`.md` / `.mdx` / `.txt` / `.rst`)
-//!   4. `is_implementation_file` (covers `.rs` / `.py` / `.ts` / `.tsx` / ...)
-//!   5. fallback `Other`
+//!   4. `is_structured_data_file` (covers `.csv` / `.json` / `.jsonl` / ...)
+//!   5. `is_implementation_file` (covers `.rs` / `.py` / `.ts` / `.tsx` / ...)
+//!   6. fallback `Other`
 //!
 //! Docs comes **before** `is_implementation_file` because `.mdx` is in the
 //! impl SSOT (`util::file_classify::is_implementation_file`) — DR1-001 pins
@@ -51,7 +52,9 @@
 use std::path::Path;
 
 use crate::tools::bash::BashCommandClass;
-use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
+use crate::util::file_classify::{
+    is_implementation_file, is_setup_file, is_structured_data_file, is_test_file,
+};
 
 /// Repository edit category emitted by `Edit` / `Write` tool calls. Mirrors
 /// the SSOT classifiers in `util::file_classify` but distinguishes Docs from
@@ -63,6 +66,7 @@ pub(crate) enum RepoEditCategory {
     Test,
     Docs,
     Setup,
+    Data,
     Other,
 }
 
@@ -78,6 +82,8 @@ pub(crate) enum CompletionEvidence {
     RepoEdit {
         category: RepoEditCategory,
         count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
     /// A Bash command classified as `BuildTest` that exited with code 0.
     /// `command` is masked through `redact_verifier_command_for_storage`
@@ -111,6 +117,40 @@ pub(crate) enum CompletionEvidence {
         command: String,
         #[serde(default)]
         bound_test_artifacts_count: Option<usize>,
+    },
+    /// A non-shell task-kind verifier proved that a documentation artifact
+    /// contains the required section surface. This is intentionally not a
+    /// Bash verifier: docs completion should not need a fake command exit to
+    /// produce completion evidence.
+    RequiredSectionsPass {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// A non-shell task-kind verifier proved that a structured data artifact
+    /// is present and satisfies its required schema surface. This is used for
+    /// CSV / TSV / JSON / JSONL style data-output tasks that should not need
+    /// a coding build/test command to complete.
+    StructuredDataPass {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        columns: Vec<String>,
+    },
+    /// A non-shell deliverable checker proved that a report-like artifact is
+    /// complete enough for the active obligation. This is intentionally
+    /// generic so docs/research/ops producers can emit completion evidence
+    /// without pretending they ran a coding verifier.
+    ReportCompletenessPass {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// A local command was actually executed and observed through the safety
+    /// boundary. This is the completion authority for command-observation
+    /// objectives; prose that merely describes a command result is not enough.
+    CommandObservation {
+        command: String,
+        exit_status: i32,
+        safety_boundary_passed: bool,
     },
     /// The model produced an answer-only reply (no tool calls). Reserved
     /// for AnswerOnly protocol acceptance.
@@ -166,10 +206,20 @@ pub(crate) fn classify_repo_edit_path<P: AsRef<Path>>(path: P) -> RepoEditCatego
     if has_docs_extension(path) {
         return RepoEditCategory::Docs;
     }
+    if is_structured_data_file(path) {
+        return RepoEditCategory::Data;
+    }
     if is_implementation_file(path) {
         return RepoEditCategory::Impl;
     }
     RepoEditCategory::Other
+}
+
+/// Returns true only when a repository edit tool completed but left the file
+/// content hash unchanged. Missing hashes are treated conservatively as real
+/// edits because they represent first observation, creation, or deletion.
+pub(crate) fn is_repo_edit_no_op(pre_tool_hash: Option<&str>, current_hash: Option<&str>) -> bool {
+    matches!((pre_tool_hash, current_hash), (Some(p), Some(c)) if p == c)
 }
 
 fn has_docs_extension(path: &Path) -> bool {
@@ -306,7 +356,15 @@ mod tests {
 
     #[test]
     fn repo_edit_category_classifies_setup_path() {
-        // U-02 — package.json explicitly; Cargo.toml is out of SSOT scope (DR1-002).
+        // U-02 — setup / manifest files are evidence for dependency/config work.
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("Cargo.toml")),
+            RepoEditCategory::Setup
+        );
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("Cargo.lock")),
+            RepoEditCategory::Setup
+        );
         assert_eq!(
             classify_repo_edit_path(PathBuf::from("package.json")),
             RepoEditCategory::Setup
@@ -361,16 +419,41 @@ mod tests {
     }
 
     #[test]
+    fn repo_edit_category_classifies_structured_data_path() {
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("output.csv")),
+            RepoEditCategory::Data
+        );
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("summary.json")),
+            RepoEditCategory::Data
+        );
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("reports/summary.jsonl")),
+            RepoEditCategory::Data
+        );
+        assert_eq!(
+            classify_repo_edit_path(PathBuf::from("package.json")),
+            RepoEditCategory::Setup
+        );
+    }
+
+    #[test]
     fn repo_edit_category_classifies_other_path() {
         // U-05
         assert_eq!(
             classify_repo_edit_path(PathBuf::from("Makefile")),
             RepoEditCategory::Other
         );
-        assert_eq!(
-            classify_repo_edit_path(PathBuf::from("Cargo.toml")),
-            RepoEditCategory::Other
-        );
+    }
+
+    #[test]
+    fn repo_edit_no_op_detector_returns_true_only_for_matching_hashes() {
+        assert!(is_repo_edit_no_op(Some("abc"), Some("abc")));
+        assert!(!is_repo_edit_no_op(Some("abc"), Some("def")));
+        assert!(!is_repo_edit_no_op(None, Some("abc"))); // file didn't exist before
+        assert!(!is_repo_edit_no_op(Some("abc"), None)); // file deleted
+        assert!(!is_repo_edit_no_op(None, None));
     }
 
     // ----------------------------- EvidenceSet basics ---------------------
@@ -382,6 +465,7 @@ mod tests {
         set.push(CompletionEvidence::RepoEdit {
             category: RepoEditCategory::Impl,
             count: 1,
+            path: None,
         });
         set.push(CompletionEvidence::VerifierExitZero {
             class: BashCommandClass::BuildTest,

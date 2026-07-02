@@ -1,0 +1,17 @@
+goal: nextjs game
+steps:
+  - id: setup
+    kind: setup
+    instruction: Create package.json.
+    expected_paths:
+      - package.json
+    verify:
+      - test -f package.json
+  - id: implement
+    kind: implement
+    instruction: Create src/app/page.tsx.
+    expected_paths:
+      - src/app/page.tsx
+    verify:
+      - node -e "require('fs').existsSync('src/app/page.tsx')"
+      - npm run build

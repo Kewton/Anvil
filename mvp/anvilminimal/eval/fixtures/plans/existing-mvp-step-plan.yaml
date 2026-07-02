@@ -1,0 +1,29 @@
+goal: "Create a small markdown heading linter."
+steps:
+  - id: "inspect"
+    kind: "inspect"
+    expected_result: "pass"
+    instruction: "Inspect the workspace and confirm no existing linter files conflict."
+    expected_paths:
+    verify:
+  - id: "implement"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create a Python markdown heading linter and a focused unittest file."
+    expected_paths:
+      - "heading_linter.py"
+      - "test_heading_linter.py"
+    verify:
+  - id: "verify"
+    kind: "verify"
+    expected_result: "pass"
+    instruction: "Run the deterministic unittest suite for the linter."
+    expected_paths:
+    verify:
+      - "python3 -m unittest test_heading_linter.py"
+  - id: "report"
+    kind: "report"
+    expected_result: "pass"
+    instruction: "Report the created files and verification result."
+    expected_paths:
+    verify:

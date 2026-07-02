@@ -1,0 +1,4 @@
+{
+  "plan_verify_coverage_max": 40,
+  "plan_verify_gap_kind": "build_only_verify_for_behavior_contract"
+}

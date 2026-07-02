@@ -1,0 +1,183 @@
+name: mvp-blind
+description: Holdout suite for checking generalization after mvp-smoke-driven fixes. Do not use this suite to tune runtime logic before acceptance.
+blind: true
+scenarios:
+  - id: duration-parser-small
+    size: small
+    category: fix-code
+    profile: generic
+    blind: true
+    prompt: Create duration_parser.js with a deterministic node self-test for parsing compact durations such as 2h 15m and 45s.
+    functional_contract:
+      category: data-transform
+      required_capabilities:
+        - input_output_contract
+        - deterministic_check
+    expected_artifacts:
+      - duration_parser.js
+    postcheck:
+      commands:
+        - node duration_parser.js
+    timeouts:
+      total_sec: 600
+      model_call_sec: 180
+    plan_constraints:
+      min_steps: 2
+      max_steps: 5
+      required_verify_keywords:
+        - node
+
+  - id: cli-usage-reference-small
+    size: small
+    category: data-docs
+    profile: generic
+    blind: true
+    prompt: Create docs/CLI_USAGE.md documenting a command line tool with an options table and one complete example invocation.
+    functional_contract:
+      category: docs-content
+      required_capabilities:
+        - requested_content
+    expected_artifacts:
+      - docs/CLI_USAGE.md
+    postcheck:
+      commands: []
+    timeouts:
+      total_sec: 600
+      model_call_sec: 180
+    plan_constraints:
+      min_steps: 1
+      max_steps: 4
+      required_verify_keywords:
+        - docs/CLI_USAGE.md
+
+  - id: python-ini-merger-medium
+    size: medium
+    category: new-code
+    profile: generic
+    blind: true
+    prompt: Build a Python INI merge utility with deterministic unittest.TestCase coverage for override precedence and preserved section order.
+    functional_contract:
+      category: library-with-tests
+      required_capabilities:
+        - implementation
+        - deterministic_test
+    expected_artifacts:
+      - ini_merge.py
+      - test_ini_merge.py
+    postcheck:
+      commands:
+        - python3 -m unittest test_ini_merge.py
+    timeouts:
+      total_sec: 1200
+      model_call_sec: 240
+    plan_constraints:
+      min_steps: 3
+      max_steps: 7
+      required_verify_keywords:
+        - python3 -m unittest
+
+  - id: rust-range-set-medium
+    size: medium
+    category: new-code
+    profile: generic
+    blind: true
+    prompt: Create a small Rust range-set library with unit tests for merging overlapping ranges and querying containment.
+    functional_contract:
+      category: library-with-tests
+      required_capabilities:
+        - implementation
+        - deterministic_test
+    expected_artifacts:
+      - Cargo.toml
+      - src/lib.rs
+    postcheck:
+      commands:
+        - cargo test
+    timeouts:
+      total_sec: 1200
+      model_call_sec: 240
+    plan_constraints:
+      min_steps: 3
+      max_steps: 8
+      required_verify_keywords:
+        - cargo test
+
+  - id: nextjs-memory-grid-large
+    size: large
+    category: new-code
+    profile: nextjs
+    blind: true
+    prompt: Create a polished Next.js memory grid game that can run on port 3011 with keyboard-friendly controls.
+    functional_contract:
+      category: interactive-game
+      required_capabilities:
+        - stateful_interaction
+        - start_or_restart_flow
+        - player_control
+        - adversary_or_challenge
+        - progression_or_score
+        - failure_or_collision_rule
+      forbidden_minimal_outputs:
+        - static_title_only
+    interaction_contract:
+      keyboard: true
+      pointer: optional
+    quality_contract:
+      minimum_acceptance: playable_core_loop
+    oracle_contract:
+      deterministic_oracles:
+        - source_semantic
+        - browser_interaction
+    expected_artifacts:
+      - package.json
+      - src/app/page.tsx
+      - src/app/layout.tsx
+      - src/app/global.d.ts
+    postcheck:
+      commands:
+        - npm install --ignore-scripts
+        - npm run build
+      dev_server:
+        command: env -u NODE_ENV npm run dev
+        port: 3011
+        readiness:
+          url: http://127.0.0.1:3011/
+          expect_status: 200
+          timeout_sec: 60
+        shutdown: signal
+    timeouts:
+      total_sec: 3600
+      model_call_sec: 300
+    plan_constraints:
+      min_steps: 3
+      max_steps: 8
+      required_verify_keywords:
+        - npm run build
+        - 3011
+
+  - id: python-log-analyzer-large
+    size: large
+    category: data-docs
+    profile: generic
+    blind: true
+    prompt: Create a Python log analyzer that reads fixtures/events.log, groups events by severity, and verifies the behavior with unittest.TestCase tests.
+    functional_contract:
+      category: data-transform
+      required_capabilities:
+        - input_output_contract
+        - deterministic_check
+    expected_artifacts:
+      - log_analyzer.py
+      - test_log_analyzer.py
+      - fixtures/events.log
+    postcheck:
+      commands:
+        - python3 -m unittest test_log_analyzer.py
+    timeouts:
+      total_sec: 2400
+      model_call_sec: 300
+    plan_constraints:
+      min_steps: 4
+      max_steps: 9
+      required_verify_keywords:
+        - python3 -m unittest

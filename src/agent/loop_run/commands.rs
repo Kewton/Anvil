@@ -3,6 +3,7 @@ use super::quality::{
     deterministic_empty_python_cli_files, first_existing_impl_target,
     request_allows_fast_polish_fallback, request_is_playable_ui_improvement,
 };
+use super::scaffold_pipeline::project_skeleton_plan_for_request;
 use super::slash_commands::{self, AnvilEditor, build_editor};
 use super::summary::{ExitReason, format_run_summary};
 use super::*;
@@ -637,7 +638,7 @@ impl Agent {
             "The user approved the plan and said: {trigger_text}\nExecute the approved plan now. Follow this accepted plan summary:\n\n{plan_summary}\n\n{profile_guidance} Start with one small, self-contained repository change, then continue until the requested work is complete."
         );
         println!("{status}");
-        match self.handle_user_message(&exec_prompt, stream_output) {
+        match super::handle_user_message::handle_user_message(self, &exec_prompt, stream_output) {
             Ok((prose, stats)) => {
                 if !stream_output {
                     if crate::tui::markdown::markdown_fully_disabled() {
@@ -782,11 +783,14 @@ impl Agent {
             .mode_state
             .enter_plan(self.session_store.plan_dir(), task_profile)?;
         self.ensure_plan_file(&plan_path)?;
-        self.push_system_note(format!(
-            "[Plan Mode / {}] Explore with Read, Glob, and Grep. Write the plan to {}. Wait for /approve before making code changes.",
-            self.session.mode_state.task_profile.as_str(),
-            plan_path.display()
-        ));
+        super::message_push::push_system_note(
+            self,
+            format!(
+                "[Plan Mode / {}] Explore with Read, Glob, and Grep. Write the plan to {}. Wait for /approve before making code changes.",
+                self.session.mode_state.task_profile.as_str(),
+                plan_path.display()
+            ),
+        );
         self.footer.publish_flags(
             self.session.mode_state.mode,
             self.config.log_level,
@@ -816,12 +820,15 @@ impl Agent {
             return Err("plan file is not ready for approval yet".to_string());
         }
         self.session.mode_state.approve();
-        super::turn::prune_plan_mode_messages(&mut self.session.messages);
-        self.push_system_note(format!(
-            "[Act Mode / {}] Execute the accepted plan in phases and keep the work aligned with its acceptance criteria and quality bar.\n\n{}",
-            self.session.mode_state.task_profile.as_str(),
-            lifecycle::plan_act_summary(&plan_contents)
-        ));
+        super::plan_mode_helpers::prune_plan_mode_messages(&mut self.session.messages);
+        super::message_push::push_system_note(
+            self,
+            format!(
+                "[Act Mode / {}] Execute the accepted plan in phases and keep the work aligned with its acceptance criteria and quality bar.\n\n{}",
+                self.session.mode_state.task_profile.as_str(),
+                lifecycle::plan_act_summary(&plan_contents)
+            ),
+        );
         self.footer.publish_flags(
             self.session.mode_state.mode,
             self.config.log_level,
@@ -912,7 +919,11 @@ impl Agent {
         // `maybe_invoke_work_mode_confirm`. After it returns, the final
         // work_mode (LLM-corrected when applicable) lives in
         // `self.session.mode_state.work_mode`.
-        let _classification = self.classify_with_confirmation(input, "auto_plan_precheck");
+        let _classification = super::classify_confirm_flow::classify_with_confirmation(
+            self,
+            input,
+            "auto_plan_precheck",
+        );
         let work_mode = self.session.mode_state.work_mode;
         let policy = work_mode.policy();
         if !policy.repo_edit_required {
@@ -937,6 +948,8 @@ impl Agent {
             && Self::command_workspace_appears_empty(&self.work_root))
             || (policy.allow_docs_deterministic_fallback
                 && deterministic_empty_docs_files(input).is_some()
+                && Self::command_workspace_appears_empty(&self.work_root))
+            || (project_skeleton_plan_for_request(input).is_some()
                 && Self::command_workspace_appears_empty(&self.work_root))
         {
             self.session.mode_state.task_profile = TaskProfile::Coding;
@@ -1053,17 +1066,7 @@ impl Agent {
     }
 
     fn command_workspace_appears_empty(work_root: &std::path::Path) -> bool {
-        let Ok(entries) = std::fs::read_dir(work_root) else {
-            return false;
-        };
-        entries.flatten().all(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            matches!(
-                name.as_ref(),
-                ".git" | ".anvil" | ".anvil-state" | "node_modules" | "target"
-            )
-        })
+        super::workspace_walk::workspace_appears_empty(work_root)
     }
 
     pub fn initial_prompt_from_cli_or_stdin(&self) -> Result<Option<String>, String> {
@@ -1309,6 +1312,16 @@ impl Agent {
         // returns) so a Plan-approved-via-`execute_approved_plan` turn does
         // not inherit a stale `true` from the previous turn (DR3-003).
         self.work_mode_confirm_called_this_turn = false;
+        // Issue #926 (DR2-001): reset the TaskKind confirm per-user-input cap on
+        // the same boundary as the WorkMode cap (before `maybe_auto_plan_prompt`
+        // and the Plan early-returns) so an `execute_approved_plan` turn does not
+        // inherit a stale `true`. The `task_contract_this_turn` OnceCell (the
+        // classification memo, not a cap) is reset separately in
+        // `handle_user_message`.
+        self.task_kind_confirm_called_this_turn = false;
+        // ProjectProfile confirm shares the task-contract authority boundary
+        // with TaskKind confirm, so reset the cap at the same user-input edge.
+        self.project_profile_confirm_called_this_turn = false;
         // Issue #592: reset the photon user-feedback per-turn cap on the same
         // boundary. Must run BEFORE Plan-mode early returns so the thumbs/
         // correct/rule commands are dispatchable even from Plan mode.
@@ -1350,7 +1363,8 @@ The plan must still define: (1) the first shippable vertical slice, (2) concrete
             } else {
                 trimmed.to_string()
             };
-            match self.handle_user_message(&user_input, stream_output) {
+            match super::handle_user_message::handle_user_message(self, &user_input, stream_output)
+            {
                 Ok((prose, stats)) => {
                     if !stream_output {
                         // Issue #431: non-streaming assistant prose also goes
@@ -2604,7 +2618,7 @@ mod tests {
         assert_eq!(state_suffix(true, true), "fresh");
     }
 
-    // --- banner_no_color_requested vs turn::no_color_requested -------------
+    // --- banner_no_color_requested vs loop_run::no_color_requested ---------
 
     #[test]
     fn banner_no_color_requested_unset_is_false() {
@@ -2612,7 +2626,7 @@ mod tests {
         let guard = NoColorGuard::capture();
         guard.unset();
         assert!(!banner_no_color_requested());
-        assert!(!super::super::turn::no_color_requested());
+        assert!(!crate::agent::loop_run::no_color_requested());
     }
 
     #[test]
@@ -2621,7 +2635,7 @@ mod tests {
         let guard = NoColorGuard::capture();
         guard.set("");
         assert!(!banner_no_color_requested());
-        assert!(!super::super::turn::no_color_requested());
+        assert!(!crate::agent::loop_run::no_color_requested());
     }
 
     #[test]
@@ -2630,7 +2644,7 @@ mod tests {
         let guard = NoColorGuard::capture();
         guard.set("1");
         assert!(banner_no_color_requested());
-        assert!(super::super::turn::no_color_requested());
+        assert!(crate::agent::loop_run::no_color_requested());
     }
 
     #[test]
@@ -2641,14 +2655,14 @@ mod tests {
             guard.set(value);
             assert_eq!(
                 banner_no_color_requested(),
-                super::super::turn::no_color_requested(),
+                crate::agent::loop_run::no_color_requested(),
                 "drift detected for NO_COLOR={value:?}"
             );
         }
         guard.unset();
         assert_eq!(
             banner_no_color_requested(),
-            super::super::turn::no_color_requested()
+            crate::agent::loop_run::no_color_requested()
         );
     }
 

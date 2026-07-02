@@ -225,6 +225,19 @@ const EXPLICIT_SPEC_KEYWORDS: &[&str] = &[
 /// without forcing the user to write a formal grammar.
 const EXPLICIT_SPEC_MIN_DISTINCT_HITS: usize = 2;
 
+/// Strong section markers that mean the user intentionally introduced a
+/// specification block. Unlike conversational words such as "should", one of
+/// these markers is enough to elect user-request authority.
+const EXPLICIT_SPEC_STRONG_MARKERS: &[&str] = &[
+    "contract:",
+    "spec:",
+    "specification:",
+    "requirements:",
+    "要件:",
+    "仕様:",
+    "仕様は",
+];
+
 /// Issue #647 (SF1 V3.1): cheap heuristic that classifies an
 /// `active_request` as "carries an explicit specification" iff at least
 /// `EXPLICIT_SPEC_MIN_DISTINCT_HITS` distinct, **non-overlapping** keyword
@@ -247,6 +260,13 @@ pub(super) fn detect_explicit_spec_in_user_request(active_request: &str) -> bool
         return false;
     }
     let lowered = active_request.to_ascii_lowercase();
+
+    if EXPLICIT_SPEC_STRONG_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker) || active_request.contains(marker))
+    {
+        return true;
+    }
 
     // CB-010: gather every keyword match as a byte-span and dedup
     // overlapping spans so a single phrase only counts once.
@@ -1251,6 +1271,12 @@ mod tests {
         // → user-request match fires.
         let request = "The endpoint must return 404 when the item is missing. \
                        The response should also include a JSON error body.";
+        assert!(detect_explicit_spec_in_user_request(request));
+    }
+
+    #[test]
+    fn sf1_v3_explicit_spec_positive_contract_marker() {
+        let request = "Scoring contract: empty string is 0; add 1 point for each criterion.";
         assert!(detect_explicit_spec_in_user_request(request));
     }
 

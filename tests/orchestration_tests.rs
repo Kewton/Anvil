@@ -112,6 +112,32 @@ fn runtime_artifact_dirs_are_ignored() {
 }
 
 #[test]
+fn controller_metadata_outputs_are_ignored() {
+    let temp = tempdir().unwrap();
+    std::fs::write(temp.path().join("calculator.py"), "def f(): return 1\n").unwrap();
+    let before = capture_repo_snapshot(temp.path());
+
+    std::fs::write(temp.path().join("calculator.py"), "def f(): return 2\n").unwrap();
+    std::fs::write(temp.path().join("anvil.out"), "controller stdout\n").unwrap();
+    std::fs::write(temp.path().join("anvil.err"), "controller stderr\n").unwrap();
+    std::fs::write(temp.path().join("postcheck.out"), "postcheck stdout\n").unwrap();
+    std::fs::write(temp.path().join("postcheck.err"), "postcheck stderr\n").unwrap();
+    std::fs::write(temp.path().join("postcheck.junit.xml"), "<testsuite />\n").unwrap();
+    std::fs::write(temp.path().join("eval.out"), "eval stdout\n").unwrap();
+    std::fs::write(temp.path().join("eval.err"), "eval stderr\n").unwrap();
+    std::fs::write(temp.path().join("runtime.log"), "runtime log\n").unwrap();
+    std::fs::write(temp.path().join("sidecar.log"), "sidecar log\n").unwrap();
+    std::fs::write(temp.path().join("prompt.md"), "task input\n").unwrap();
+    std::fs::write(temp.path().join("cmd.txt"), "python calculator.py\n").unwrap();
+
+    let v = verify_repo_progress(&before, temp.path());
+    assert_eq!(v.changed_files, vec!["calculator.py".to_string()]);
+    assert_eq!(v.all_changed_files, vec!["calculator.py".to_string()]);
+    assert_eq!(v.implementation_files_changed, 1);
+    assert_eq!(v.total_changed_files(), 1);
+}
+
+#[test]
 fn changed_files_capped_at_sixteen() {
     let temp = tempdir().unwrap();
     let before = capture_repo_snapshot(temp.path());

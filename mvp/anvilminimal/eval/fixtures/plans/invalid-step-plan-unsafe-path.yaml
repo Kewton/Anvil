@@ -1,0 +1,9 @@
+goal: "Create a file outside the workspace."
+steps:
+  - id: "implement"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Write a file outside the workspace."
+    expected_paths:
+      - "../secret.txt"
+    verify:

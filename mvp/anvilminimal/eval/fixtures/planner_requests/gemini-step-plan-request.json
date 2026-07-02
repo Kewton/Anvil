@@ -1,0 +1,13 @@
+{
+  "provider": "gemini",
+  "endpoint": "/v1beta/interactions",
+  "model": "gemini-3.5-flash",
+  "tools": [],
+  "input_text_contains": [
+    "system:",
+    "Return only one JSON object",
+    "Allowed step kinds",
+    "Create a step plan",
+    "Required final artifacts"
+  ]
+}

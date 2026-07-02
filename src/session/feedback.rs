@@ -239,7 +239,7 @@ fn kv_secret_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"([Aa][Pp][Ii][_\-]?[Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Aa][Cc][Cc][Ee][Ss][Ss][_\-]?[Kk][Ee][Yy]|[Cc][Ll][Ii][Ee][Nn][Tt][_\-]?[Ss][Ee][Cc][Rr][Ee][Tt])\s*[=:]\s*\S+",
+            r"([Aa][Pp][Ii][_\-]?[Kk][Ee][Yy]|[Tt][Oo][Kk][Ee][Nn]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Aa][Cc][Cc][Ee][Ss][Ss][_\-]?[Kk][Ee][Yy]|[Cc][Ll][Ii][Ee][Nn][Tt][_\-]?[Ss][Ee][Cc][Rr][Ee][Tt])([ \t]*[=:][ \t]*)(\S+)",
         )
         .expect("valid static key-value secret regex")
     })
@@ -258,10 +258,53 @@ fn url_credential_regex() -> &'static Regex {
 pub fn mask_secrets(input: &str) -> String {
     let s1 = token_prefix_regex().replace_all(input, "***");
     let s2 = kv_secret_regex().replace_all(&s1, |caps: &regex::Captures<'_>| {
+        if kv_secret_match_is_source_type_annotation(&caps[2], &caps[3]) {
+            return caps[0].to_string();
+        }
         format!("{}=***", &caps[1])
     });
     let s3 = url_credential_regex().replace_all(&s2, "$1***:***@");
     s3.into_owned()
+}
+
+fn kv_secret_match_is_source_type_annotation(separator: &str, value: &str) -> bool {
+    if !separator.contains(':') || separator.contains('=') {
+        return false;
+    }
+    let token = value
+        .trim_matches(|ch: char| matches!(ch, ')' | ',' | ']' | '}' | ';'))
+        .trim_start_matches('&')
+        .trim_end_matches('?');
+    matches!(
+        token,
+        "str"
+            | "String"
+            | "bool"
+            | "int"
+            | "float"
+            | "bytes"
+            | "Any"
+            | "Dict"
+            | "List"
+            | "Set"
+            | "Tuple"
+            | "Path"
+            | "PathBuf"
+            | "usize"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "f32"
+            | "f64"
+    )
 }
 
 /// Issue #608 Phase α-2 (CB-001): mask HTTP header-family credential lines
@@ -910,6 +953,25 @@ mod tests {
         for _ in 0..16 {
             let _ = mask_secrets("api_key=AKIAIOSFODNN7EXAMPLE");
         }
+    }
+
+    #[test]
+    fn mask_secrets_preserves_source_type_annotations() {
+        let input =
+            "def password_score(password: str) -> int:\n    if not password:\n        return 0\n";
+
+        assert_eq!(mask_secrets(input), input);
+    }
+
+    #[test]
+    fn mask_secrets_still_redacts_single_line_key_values() {
+        let colon = mask_secrets("password: hunter2");
+        assert_eq!(colon, "password=***");
+        assert!(!colon.contains("hunter2"));
+
+        let equals = mask_secrets("api_key=AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(equals, "api_key=***");
+        assert!(!equals.contains("AKIAIOSFODNN7EXAMPLE"));
     }
 
     // --- T4.1 / AC6: excerpt truncation -----------------------------------

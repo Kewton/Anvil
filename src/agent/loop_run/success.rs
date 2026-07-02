@@ -1,13 +1,14 @@
 use std::path::Path;
 
-use super::auto_test::AutoTestRunner;
 use super::completion_evidence::{CompletionEvidence, EvidenceSet};
 use super::protocol::{
     ExecutionProtocol, ProtocolKind, ProtocolSuccessContext, RequestContext,
     requested_paths_from_text,
 };
 use super::summary::{ExitReason, LoopStats};
-use super::task_contract::TaskContract;
+use super::task_contract::{
+    ArtifactExcerpts, ArtifactRole, CompletionDecision, TaskContract, TaskKind,
+};
 use super::task_workspace_scope::TaskWorkspaceScope;
 use super::tester;
 use super::verifier_skill::VerifierInputs;
@@ -73,6 +74,40 @@ pub(super) fn suppress_success_verifier_for_context(
     ctx.is_env_setup_only && env_setup_only_satisfied && !ctx.requires_tests
 }
 
+/// Issue #919 (Decision #8 / S5-001): post-loop prose-verifier-free predicate.
+///
+/// A prose deliverable (Authoring / Docs / AnswerOnly-intent) must never
+/// re-enter the coding-verifier demand at the post-loop dispatch site. The SSOT
+/// is the #918-clamped policy fields `!verification_required() &&
+/// !test_execution_required()`; the trailing kind/intent disjunction is a
+/// belt-and-suspenders **positive identification** of prose so the suppression
+/// fires only for recognized prose shapes, not for an incidental zero-verifier
+/// contract. A `debug_assert!` (DR1-007) surfaces any divergence between the
+/// policy fields and the disjunction as a bug rather than papering over it.
+///
+/// This is **distinct** from `suppress_success_verifier_for_context` (EnvSetup
+/// only); both can apply, for different reasons.
+pub(super) fn post_loop_verifier_free_for_prose(contract: &TaskContract) -> bool {
+    use super::task_contract::{CompletionProjectIntent, TaskKind};
+    let policy = &contract.completion_policy;
+    let policy_fields_verifier_free =
+        !policy.verification_required() && !policy.test_execution_required();
+    let is_prose = matches!(contract.task_kind, TaskKind::Authoring | TaskKind::Docs)
+        || matches!(
+            policy.project_intent,
+            CompletionProjectIntent::DocsOnly | CompletionProjectIntent::AnswerOnly
+        );
+    // DR1-007: a recognized prose contract MUST already be verifier-free at the
+    // #918-clamped policy fields. If a future change ever produces a prose-shaped
+    // contract that still demands verification, this surfaces the divergence as a
+    // bug rather than letting the disjunction silently mask it.
+    debug_assert!(
+        !is_prose || policy_fields_verifier_free,
+        "a recognized prose contract must be verifier-free at the policy fields"
+    );
+    policy_fields_verifier_free && is_prose
+}
+
 /// Issue #607 (CB-001 fix): pure predicate. True iff the suppression of
 /// post-loop verifier dispatch is **specifically grounded** in EnvSetup
 /// evidence (i.e. the agent actually saw at least one
@@ -124,6 +159,54 @@ pub(super) fn build_feedback_for_no_verifier(workspace_root: &Path) -> FeedbackF
 }
 
 impl Agent {
+    pub(super) fn reconcile_terminal_completion_credit(
+        &mut self,
+        exit_reason: &mut ExitReason,
+        error_text: &mut String,
+        final_prose: &mut String,
+    ) {
+        if !terminal_allows_completion_credit_reconciliation(*exit_reason) {
+            return;
+        }
+        let Some(contract) = super::task_classification::task_contract_authority(self) else {
+            return;
+        };
+        let evidence = self.task_contract_evidence_set_this_turn.clone();
+        let owned_test_artifacts =
+            super::owned_test_projection::owned_test_artifacts_for_verifier(self, &contract);
+        if !completion_credit_reconciliation_allows_done(
+            &contract,
+            &evidence,
+            &owned_test_artifacts,
+            *exit_reason,
+        ) {
+            return;
+        }
+
+        let objective = contract.objective_contract();
+        log_llm_event(
+            "agent.completion_credit.reconciled",
+            serde_json::json!({
+                "session_id": self.session_store.session_id(),
+                "turn_index": self.current_turn_index,
+                "from_terminal": exit_reason.label(),
+                "task_kind": contract.task_kind.as_str(),
+                "objective_kind": objective.objective_kind.label(),
+                "deliverable_kind": objective.deliverable_kind.label(),
+                "evidence_kind": objective.evidence_kind.label(),
+                "evidence_count": evidence.len(),
+                "owned_test_artifacts_count": owned_test_artifacts.len(),
+            }),
+        );
+        self.prepare_final_verification_job_report_after_success();
+        *exit_reason = ExitReason::Done;
+        error_text.clear();
+        if final_prose.trim().is_empty() {
+            *final_prose =
+                "Completed requested changes and reconciled objective-bound evidence.".to_string();
+        }
+    }
+
     pub(super) fn should_run_auto_test_for_success(&self) -> bool {
         if self.session.mode_state.work_mode == WorkMode::Python {
             return true;
@@ -134,11 +217,28 @@ impl Agent {
         if !recent_successful_bash_commands_since_last_user(&self.session.messages).is_empty() {
             return true;
         }
-        if AutoTestRunner::detect(&self.work_root, &[]).is_some() {
+        let scope = super::workspace_access::current_workspace_scope(self);
+        let project_unit = if let Some(request) = super::workspace_access::active_request_text(self)
+        {
+            super::project_probe::probe_project_unit_for_request(
+                &self.work_root,
+                &request,
+                &scope,
+                &self.turn_edited_relative_paths,
+            )
+        } else {
+            super::project_probe::probe_project_unit(
+                &self.work_root,
+                &scope,
+                &self.turn_edited_relative_paths,
+            )
+        };
+        if project_unit.is_some_and(|unit| !unit.verifier_candidates.is_empty()) {
             return true;
         }
-        self.active_request_text()
-            .is_some_and(|request| super::quality::request_explicitly_requires_tests(&request))
+        // Issue #917: per-turn classification authority (None → false).
+        super::task_classification::task_contract_authority(self)
+            .is_some_and(|contract| contract.completion_policy.test_execution_required())
     }
 
     /// Issue #607 (DR1-001 SSOT): build the current `RequestContext` from
@@ -147,10 +247,18 @@ impl Agent {
     /// `evidence_set_missing_shapes_with_context`, and
     /// `should_run_auto_test_for_success_with_context`.
     pub(super) fn current_request_context(&self) -> RequestContext {
-        let request = self.active_request_text().unwrap_or_default();
+        // Issue #917: per-turn classification authority. `request` is still
+        // needed for `request_is_env_setup_only`; the contract comes from the
+        // memo (None → empty-input contract, matching `unwrap_or_default`).
+        let request = super::workspace_access::active_request_text(self).unwrap_or_default();
+        let contract = super::task_classification::task_contract_authority(self)
+            .unwrap_or_else(|| std::rc::Rc::new(TaskContract::from_request(&request)));
+        let requires_tests = contract.completion_policy.test_execution_required();
+        let completion_policy = contract.completion_policy.clone();
         RequestContext {
-            requires_tests: super::quality::request_explicitly_requires_tests(&request),
+            requires_tests,
             is_env_setup_only: super::quality::request_is_env_setup_only(&request),
+            completion_policy,
         }
     }
 
@@ -182,12 +290,13 @@ impl Agent {
     /// structured Weak/Missing branch is then skipped and the legacy
     /// `detect_with_recent_successes -> run` path runs verbatim.
     fn success_verifier_test_binding(&mut self) -> (Vec<String>, bool) {
-        let Some(request) = self.active_request_text() else {
+        // Issue #917: per-turn classification authority (None → no binding).
+        let Some(contract) = super::task_classification::task_contract_authority(self) else {
             return (Vec::new(), false);
         };
-        let contract = TaskContract::from_request(&request);
-        let test_execution_required = contract.required_behavior.test_execution_required;
-        let owned_test_artifacts = self.owned_test_artifacts_for_verifier(&contract);
+        let test_execution_required = contract.completion_policy.test_execution_required();
+        let owned_test_artifacts =
+            super::owned_test_projection::owned_test_artifacts_for_verifier(self, &contract);
         (owned_test_artifacts, test_execution_required)
     }
 
@@ -204,14 +313,17 @@ impl Agent {
         // Issue #607: build the request context once and reuse it across the
         // satisfaction / missing-shapes / post-loop verifier-demand sinks.
         let ctx = self.current_request_context();
+        let contract_authority = super::task_classification::task_contract_authority(self);
         let should_dispatch_success_verifier = if exit_reason.is_success() {
-            let protocol = ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode);
+            let protocol = ExecutionProtocol::from_work_mode_with_contract(
+                self.session.mode_state.work_mode,
+                contract_authority.as_deref(),
+            );
             let deterministic_recovery_recorded =
                 self.session.last_feedback.as_ref().is_some_and(|frame| {
                     frame.primary_error.as_deref() == Some(DETERMINISTIC_CONTENT_FALLBACK_TAG)
                 });
-            let requested_paths = self
-                .active_request_text()
+            let requested_paths = super::workspace_access::active_request_text(self)
                 .map(|text| requested_paths_from_text(&text))
                 .unwrap_or_default();
             // Issue #606 T-1.5 / Issue #607: Stage-2 short-circuit. Context-
@@ -219,8 +331,15 @@ impl Agent {
             // TypeScriptUi / GenericCode protocols when the user only asked
             // to install dependencies.
             let kind = protocol.kind();
-            let evidence_satisfied =
-                kind.evidence_set_satisfies_with_context(&self.evidence_set_this_turn, &ctx);
+            let evidence_satisfied = kind
+                .evidence_set_satisfies_with_context(&self.evidence_set_this_turn, &ctx)
+                || contract_authority.as_deref().is_some_and(|contract| {
+                    contract_artifact_acceptance_satisfies_protocol(
+                        contract,
+                        &self.task_contract_excerpts,
+                        kind,
+                    )
+                });
             let success_context = ProtocolSuccessContext {
                 stats,
                 deterministic_recovery_recorded,
@@ -273,20 +392,38 @@ impl Agent {
         // OR-fold, which fired for any accepted evidence (RepoEdit only,
         // BuildTest only, etc.) and over-suppressed legitimate verifier
         // runs. See `env_setup_only_evidence_satisfies` doc for details.
-        let protocol_kind =
-            ExecutionProtocol::from_work_mode(self.session.mode_state.work_mode).kind();
+        let protocol_kind = ExecutionProtocol::from_work_mode_with_contract(
+            self.session.mode_state.work_mode,
+            contract_authority.as_deref(),
+        )
+        .kind();
         let env_setup_only_satisfied =
             env_setup_only_evidence_satisfies(&self.evidence_set_this_turn, protocol_kind, &ctx);
         let suppress_success_verifier =
             suppress_success_verifier_for_context(&ctx, env_setup_only_satisfied);
 
-        let tester_candidate_some =
-            if should_dispatch_success_verifier && !suppress_success_verifier {
-                tester::TesterCandidate::detect(&self.work_root, &stats.changed_files).is_some()
-            } else {
-                false
-            };
-        let protocol_demands_verifier = !suppress_success_verifier
+        // Issue #919 (Decision #8): prose-aware suppression. When the active
+        // contract is a verifier-free prose deliverable (Authoring / Docs /
+        // AnswerOnly), collapse ALL THREE verifier inputs to false BEFORE they
+        // reach `select_success_verifier` — toggling only
+        // `protocol_demands_verifier` is insufficient because
+        // `select_success_verifier(false, false, true) == Tester` and the
+        // `TesterDelegated` fallback re-calls the raw demand. Non-prose contracts
+        // are unaffected (all three inputs computed exactly as today).
+        let prose_verifier_free = contract_authority
+            .as_deref()
+            .is_some_and(post_loop_verifier_free_for_prose);
+
+        let tester_candidate_some = if !prose_verifier_free
+            && should_dispatch_success_verifier
+            && !suppress_success_verifier
+        {
+            tester::TesterCandidate::detect(&self.work_root, &stats.changed_files).is_some()
+        } else {
+            false
+        };
+        let protocol_demands_verifier = !prose_verifier_free
+            && !suppress_success_verifier
             && self.should_run_auto_test_for_success_with_context(&ctx, env_setup_only_satisfied);
         let session_id = self.session_store.session_id().to_string();
         let model = self.models.main.clone();
@@ -294,7 +431,23 @@ impl Agent {
             recent_successful_bash_commands_since_last_user(&self.session.messages);
         // Issue #651 Phase 5.1: structured verifier binding inputs.
         let (owned_test_artifacts, test_execution_required) = self.success_verifier_test_binding();
-        let workspace_scope: TaskWorkspaceScope = self.current_workspace_scope();
+        let workspace_scope: TaskWorkspaceScope =
+            super::workspace_access::current_workspace_scope(self);
+        let project_unit = if let Some(request) = super::workspace_access::active_request_text(self)
+        {
+            super::project_probe::probe_project_unit_for_request(
+                &self.work_root,
+                &request,
+                &workspace_scope,
+                &self.turn_edited_relative_paths,
+            )
+        } else {
+            super::project_probe::probe_project_unit(
+                &self.work_root,
+                &workspace_scope,
+                &self.turn_edited_relative_paths,
+            )
+        };
         let v_inputs = VerifierInputs {
             score_inputs: crate::session::anvil_score::AnvilScoreInputs {
                 unsafe_blocks_this_turn: self.session.unsafe_blocks_this_turn,
@@ -310,8 +463,14 @@ impl Agent {
             tester_candidate_some,
             workspace_root: &self.work_root,
             owned_test_artifacts: &owned_test_artifacts,
+            project_unit: project_unit.as_ref(),
             test_execution_required,
             workspace_scope: &workspace_scope,
+            // Issue #918 (P1) DR3-003: real task kind for the spawn gate;
+            // `None => Coding` 1:1-preserves the historical always-Coding path.
+            task_kind: super::task_classification::task_contract_authority(self)
+                .map(|c| c.task_kind)
+                .unwrap_or(super::task_contract::TaskKind::Coding),
         };
 
         let started = std::time::Instant::now();
@@ -432,7 +591,11 @@ impl Agent {
                     let mut fb = fb.clone();
                     let combined_output = auto_test_combined_output.as_str();
                     if let Some(confirmed_kind) =
-                        self.classify_with_feedback_confirm(&fb.kind, combined_output)
+                        super::classify_confirm_flow::classify_with_feedback_confirm(
+                            self,
+                            &fb.kind,
+                            combined_output,
+                        )
                     {
                         fb.kind = confirmed_kind;
                     }
@@ -442,8 +605,14 @@ impl Agent {
                     self.session.record_feedback_if_unset(feedback.clone());
                 }
                 if matches!(outcome, VerifierOutcome::TesterDelegated { .. }) {
-                    let tester_recorded = self.try_invoke_tester(&stats.changed_files);
-                    if !tester_recorded && self.should_run_auto_test_for_success() {
+                    let tester_recorded =
+                        super::tester_invocation::try_invoke_tester(self, &stats.changed_files);
+                    // Issue #919 (Decision #8): also gate the fallback raw demand
+                    // so a prose contract never records NoVerifier feedback here.
+                    if !tester_recorded
+                        && !prose_verifier_free
+                        && self.should_run_auto_test_for_success()
+                    {
                         let frame = build_feedback_for_no_verifier(&self.work_root);
                         self.session.record_feedback_if_unset(frame);
                     }
@@ -475,6 +644,16 @@ impl Agent {
                     ..
                 } = &outcome
                 {
+                    let weak_reason =
+                        super::verifier_weak_reason::structured_selection_unbound_reason();
+                    self.turn_state.verifier_weak_reason_this_turn = Some(weak_reason);
+                    super::verifier_weak_repair_target::log_shadow_repair_target(
+                        &session_id,
+                        self.current_turn_index,
+                        self.session.iter_count_this_turn,
+                        "success_verifier_skill",
+                        weak_reason,
+                    );
                     if !self.session.verifier_safe_stop_emitted_this_turn {
                         self.session.verifier_safe_stop_emitted_this_turn = true;
                         log_llm_event(
@@ -485,6 +664,8 @@ impl Agent {
                                 "iter_index": self.session.iter_count_this_turn,
                                 "owned_test_artifacts_count": owned_test_artifacts_count,
                                 "command_runner": command_runner,
+                                "weak_reason": weak_reason.label(),
+                                "repairability_hint": weak_reason.repairability_hint(),
                                 "auto_test_detected": true,
                                 "test_execution_required": true,
                             }),
@@ -549,6 +730,55 @@ impl Agent {
     }
 }
 
+pub(super) fn contract_artifact_acceptance_satisfies_protocol(
+    contract: &TaskContract,
+    excerpts: &ArtifactExcerpts,
+    kind: ProtocolKind,
+) -> bool {
+    match kind {
+        ProtocolKind::Data => {
+            super::task_contract_artifact_predicates::role_deliverable_content_satisfied(
+                contract,
+                excerpts,
+                ArtifactRole::DataOutput,
+            )
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn terminal_allows_completion_credit_reconciliation(reason: ExitReason) -> bool {
+    matches!(
+        reason,
+        ExitReason::MissingRepoEdits
+            | ExitReason::MissingVerification
+            | ExitReason::SafeStopVerifierWeak
+            | ExitReason::SafeStopVerifierMissing
+            | ExitReason::RepairSafeStop
+    )
+}
+
+pub(super) fn completion_credit_reconciliation_allows_done(
+    contract: &TaskContract,
+    evidence: &EvidenceSet,
+    owned_test_artifacts: &[String],
+    current_terminal: ExitReason,
+) -> bool {
+    (terminal_allows_completion_credit_reconciliation(current_terminal)
+        || terminal_allows_non_coding_completion_credit_reconciliation(contract, current_terminal))
+        && matches!(
+            contract.evaluate_with_owned_test_artifacts(evidence, owned_test_artifacts),
+            CompletionDecision::Done
+        )
+}
+
+fn terminal_allows_non_coding_completion_credit_reconciliation(
+    contract: &TaskContract,
+    reason: ExitReason,
+) -> bool {
+    reason == ExitReason::MaxIterations && contract.task_kind != TaskKind::Coding
+}
+
 pub(super) fn recent_successful_bash_commands_since_last_user(
     messages: &[ConversationMessage],
 ) -> Vec<String> {
@@ -592,6 +822,50 @@ pub(super) fn recent_successful_bash_commands_since_last_user(
         commands.drain(..commands.len() - 6);
     }
     commands
+}
+
+pub(super) fn recent_bash_verifier_command_hint_since_last_user(
+    messages: &[ConversationMessage],
+) -> Option<String> {
+    let start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let mut pending_bash_commands: VecDeque<String> = VecDeque::new();
+    let mut last_hint = None;
+    for message in &messages[start..] {
+        match message.role.as_str() {
+            "assistant" => {
+                pending_bash_commands = message
+                    .tool_calls
+                    .iter()
+                    .filter(|tool_call| tool_call.name == "Bash")
+                    .filter_map(|tool_call| {
+                        tool_call
+                            .arguments
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|command| !command.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
+                    .collect();
+            }
+            "tool" if message.name.as_deref() == Some("Bash") => {
+                let Some(command) = pending_bash_commands.pop_front() else {
+                    continue;
+                };
+                if super::auto_test::AutoTestRunner::plan_from_evidence_command_hint(&command)
+                    .is_some()
+                {
+                    last_hint = Some(command);
+                }
+            }
+            _ => {}
+        }
+    }
+    last_hint
 }
 
 fn bash_tool_result_succeeded(content: &str) -> bool {
@@ -671,6 +945,7 @@ mod tests {
         let ctx = RequestContext {
             requires_tests: false,
             is_env_setup_only: true,
+            completion_policy: Default::default(),
         };
         // setup-only request + EnvSetup-only evidence satisfied → suppress.
         assert!(suppress_success_verifier_for_context(&ctx, true));
@@ -684,6 +959,7 @@ mod tests {
         let ctx = RequestContext {
             requires_tests: true,
             is_env_setup_only: true,
+            completion_policy: Default::default(),
         };
         assert!(!suppress_success_verifier_for_context(&ctx, true));
     }
@@ -693,6 +969,7 @@ mod tests {
         let ctx = RequestContext {
             requires_tests: false,
             is_env_setup_only: false,
+            completion_policy: Default::default(),
         };
         // Regular feature request → verifier never suppressed.
         assert!(!suppress_success_verifier_for_context(&ctx, false));
@@ -704,6 +981,7 @@ mod tests {
         let ctx = RequestContext {
             requires_tests: false,
             is_env_setup_only: true,
+            completion_policy: Default::default(),
         };
         assert!(suppress_success_verifier_for_context(&ctx, true));
         // When suppression fires in `run_post_loop_success_verifier`,
@@ -730,6 +1008,9 @@ mod tests {
         RequestContext {
             requires_tests: false,
             is_env_setup_only: true,
+            completion_policy: super::super::task_contract::CompletionPolicy::from_request(
+                "Install the dependencies listed in requirements.txt.",
+            ),
         }
     }
 
@@ -737,6 +1018,9 @@ mod tests {
         RequestContext {
             requires_tests: true,
             is_env_setup_only: true,
+            completion_policy: super::super::task_contract::CompletionPolicy::from_request(
+                "Implement feature X and add tests",
+            ),
         }
     }
 
@@ -767,6 +1051,7 @@ mod tests {
         set.push(CE::RepoEdit {
             category: RepoEditCategory::Impl,
             count: 1,
+            path: None,
         });
         for kind in [
             ProtocolKind::Python,
@@ -873,6 +1158,7 @@ mod tests {
         let ctx = RequestContext {
             requires_tests: false,
             is_env_setup_only: false,
+            completion_policy: Default::default(),
         };
         let mut set = ES::new();
         set.push(env_setup_evidence());
@@ -893,6 +1179,7 @@ mod tests {
         set.push(CE::RepoEdit {
             category: RepoEditCategory::Setup,
             count: 1,
+            path: None,
         });
         let ctx = setup_only_ctx();
         let satisfied = env_setup_only_evidence_satisfies(&set, ProtocolKind::GenericCode, &ctx);
@@ -921,6 +1208,222 @@ mod tests {
         let satisfied = env_setup_only_evidence_satisfies(&set, ProtocolKind::GenericCode, &ctx);
         assert!(satisfied);
         assert!(suppress_success_verifier_for_context(&ctx, satisfied));
+    }
+
+    fn coding_contract_evidence(bound_test_artifacts_count: Option<usize>) -> ES {
+        let mut set = ES::new();
+        set.push(CE::RepoEdit {
+            category: RepoEditCategory::Impl,
+            count: 1,
+            path: Some("src/lib.rs".to_string()),
+        });
+        set.push(CE::RepoEdit {
+            category: RepoEditCategory::Test,
+            count: 1,
+            path: Some("tests/feature_test.rs".to_string()),
+        });
+        set.push(CE::VerifierExitZero {
+            class: BashCommandClass::BuildTest,
+            command: "cargo test".to_string(),
+            bound_test_artifacts_count,
+        });
+        set
+    }
+
+    #[test]
+    fn data_protocol_acceptance_uses_schema_aware_artifact_excerpt() {
+        let contract = TaskContract::from_request(
+            "Create output.csv with exactly columns id,name and exactly rows 1,Ada and 2,Linus.",
+        );
+        let mut excerpts = ArtifactExcerpts::default();
+        excerpts.insert(
+            ArtifactRole::DataOutput,
+            "id,name\n1,Ada\n2,Linus\n".to_string(),
+        );
+
+        assert!(contract_artifact_acceptance_satisfies_protocol(
+            &contract,
+            &excerpts,
+            ProtocolKind::Data
+        ));
+    }
+
+    #[test]
+    fn data_protocol_acceptance_rejects_extra_columns_when_rows_are_exact() {
+        let contract = TaskContract::from_request(
+            "Create output.csv with exactly columns id,name and exactly rows 1,Ada and 2,Linus.",
+        );
+        let mut excerpts = ArtifactExcerpts::default();
+        excerpts.insert(
+            ArtifactRole::DataOutput,
+            "id,name,these\n1,Ada,\n2,Linus,\n".to_string(),
+        );
+
+        assert!(!contract_artifact_acceptance_satisfies_protocol(
+            &contract,
+            &excerpts,
+            ProtocolKind::Data
+        ));
+    }
+
+    #[test]
+    fn completion_credit_reconciliation_promotes_bound_objective_evidence() {
+        let contract =
+            TaskContract::from_request("Implement feature X and add tests for the behavior.");
+        let evidence = coding_contract_evidence(Some(1));
+        let owned = vec!["tests/feature_test.rs".to_string()];
+
+        for terminal in [
+            ExitReason::MissingRepoEdits,
+            ExitReason::MissingVerification,
+            ExitReason::SafeStopVerifierWeak,
+            ExitReason::SafeStopVerifierMissing,
+            ExitReason::RepairSafeStop,
+        ] {
+            assert!(
+                completion_credit_reconciliation_allows_done(
+                    &contract, &evidence, &owned, terminal
+                ),
+                "{terminal:?} should reconcile to done when objective-bound evidence is complete"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_credit_reconciliation_promotes_non_coding_max_iterations_with_done_evidence() {
+        let request = "Run pwd and capture the observation.";
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"command_observation",
+                "primary_artifacts":[],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"the objective is observing a shell command result"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        assert_eq!(
+            contract.task_kind,
+            super::super::task_contract::TaskKind::Ops
+        );
+
+        let mut evidence = ES::new();
+        evidence.push(CE::CommandObservation {
+            command: "pwd".to_string(),
+            exit_status: 0,
+            safety_boundary_passed: true,
+        });
+
+        assert!(
+            completion_credit_reconciliation_allows_done(
+                &contract,
+                &evidence,
+                &[],
+                ExitReason::MaxIterations,
+            ),
+            "non-coding objective-bound evidence should reconcile max_iterations to done"
+        );
+    }
+
+    #[test]
+    fn completion_credit_reconciliation_rejects_coding_max_iterations_even_with_done_evidence() {
+        let contract =
+            TaskContract::from_request("Implement feature X and add tests for the behavior.");
+        let evidence = coding_contract_evidence(Some(1));
+        let owned = vec!["tests/feature_test.rs".to_string()];
+
+        assert!(
+            !completion_credit_reconciliation_allows_done(
+                &contract,
+                &evidence,
+                &owned,
+                ExitReason::MaxIterations,
+            ),
+            "coding max_iterations remains unsafe to promote because it may hide unfinished repair"
+        );
+    }
+
+    #[test]
+    fn completion_credit_reconciliation_rejects_failed_non_coding_max_iterations_evidence() {
+        let request = "Run pwd and capture the observation.";
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"unknown",
+                "deliverable_kind":"command_observation",
+                "primary_artifacts":[],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":null,
+                "confidence":0.95,
+                "reason":"the objective is observing a shell command result"
+            }"#,
+        )
+        .expect("profile");
+        let contract =
+            TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+        let mut evidence = ES::new();
+        evidence.push(CE::CommandObservation {
+            command: "pwd".to_string(),
+            exit_status: 1,
+            safety_boundary_passed: true,
+        });
+
+        assert!(
+            !completion_credit_reconciliation_allows_done(
+                &contract,
+                &evidence,
+                &[],
+                ExitReason::MaxIterations,
+            ),
+            "failed command observation must not become completion credit"
+        );
+    }
+
+    #[test]
+    fn completion_credit_reconciliation_rejects_unbound_or_failed_terminals() {
+        let contract =
+            TaskContract::from_request("Implement feature X and add tests for the behavior.");
+        let unbound = coding_contract_evidence(None);
+        let owned = vec!["tests/feature_test.rs".to_string()];
+
+        assert!(
+            !completion_credit_reconciliation_allows_done(
+                &contract,
+                &unbound,
+                &owned,
+                ExitReason::MissingVerification,
+            ),
+            "unbound verifier success must not be credited as done"
+        );
+
+        let bound = coding_contract_evidence(Some(1));
+        assert!(
+            !completion_credit_reconciliation_allows_done(
+                &contract,
+                &bound,
+                &owned,
+                ExitReason::VerifierFailed,
+            ),
+            "raw verifier failure must not be overridden by accumulated pass evidence"
+        );
+        assert!(
+            !completion_credit_reconciliation_allows_done(
+                &contract,
+                &bound,
+                &owned,
+                ExitReason::TransportError,
+            ),
+            "tool/transport failures are outside completion-credit reconciliation"
+        );
     }
 
     #[test]
@@ -968,6 +1471,101 @@ mod tests {
         assert_eq!(
             recent_successful_bash_commands_since_last_user(&messages),
             vec!["python3 -m pytest".to_string()]
+        );
+    }
+
+    #[test]
+    fn recent_bash_verifier_command_hint_keeps_latest_current_turn_verifier() {
+        let messages = vec![
+            ConversationMessage::user("old task".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "old".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "cargo test"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=1\n".to_string()),
+            ConversationMessage::user("fix python tests".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "first".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "python3 -m pytest -q"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=1\n".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "second".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "python3 -m pytest -q tests/test_password_strength.py"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=1\n".to_string()),
+        ];
+
+        assert_eq!(
+            recent_bash_verifier_command_hint_since_last_user(&messages),
+            Some("python3 -m pytest -q tests/test_password_strength.py".to_string())
+        );
+    }
+
+    #[test]
+    fn recent_bash_verifier_command_hint_rejects_non_verifier_commands() {
+        let messages = vec![
+            ConversationMessage::user("inspect files".to_string()),
+            ConversationMessage::assistant(
+                String::new(),
+                vec![ToolCall {
+                    id: "echo".to_string(),
+                    name: "Bash".to_string(),
+                    arguments: json!({"command": "echo ok"}),
+                }],
+            ),
+            ConversationMessage::tool("Bash".to_string(), "exit_code=0\n".to_string()),
+        ];
+
+        assert_eq!(
+            recent_bash_verifier_command_hint_since_last_user(&messages),
+            None
+        );
+    }
+
+    // ----- Issue #919: post-loop prose-verifier-free predicate (Decision #8) -----
+
+    #[test]
+    fn post_loop_prose_predicate_fires_for_prose_kinds() {
+        // Authoring.
+        let authoring = TaskContract::from_request("Translate README.ja.md and write README.md");
+        assert!(post_loop_verifier_free_for_prose(&authoring));
+        // Docs.
+        let docs =
+            TaskContract::from_request("Update README.md with setup, usage, and test sections");
+        assert!(post_loop_verifier_free_for_prose(&docs));
+        // AnswerOnly intent (Explain).
+        let answer = TaskContract::from_request("Explain how the auth flow works");
+        assert!(post_loop_verifier_free_for_prose(&answer));
+    }
+
+    #[test]
+    fn post_loop_prose_predicate_false_for_coding() {
+        let coding = TaskContract::from_request("Implement slugify in Python and add pytest tests");
+        assert!(!post_loop_verifier_free_for_prose(&coding));
+    }
+
+    #[test]
+    fn non_prose_tester_still_dispatches() {
+        // Regression guard (mirrors select_success_verifier_runs_tester_*):
+        // for a non-prose contract, prose_verifier_free is false so the three
+        // inputs are computed as today; with a tester candidate present and no
+        // protocol demand, Tester is still selected.
+        assert_eq!(
+            select_success_verifier(false, false, true),
+            SuccessVerifier::Tester
         );
     }
 }

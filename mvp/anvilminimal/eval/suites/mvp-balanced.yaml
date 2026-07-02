@@ -1,0 +1,90 @@
+name: mvp-balanced
+description: Balanced suite with small, medium, and large tasks across categories.
+include_suites:
+  - mvp-smoke.yaml
+scenarios:
+  - id: json-normalizer-small
+    size: small
+    category: fix-code
+    prompt: Fix a JSON normalizer and add a node smoke check.
+    expected_artifacts: [normalizer.js]
+    postcheck: {commands: [node normalizer.js]}
+    plan_constraints: {min_steps: 2, max_steps: 5, required_verify_keywords: [node]}
+  - id: slugify-helper-small
+    size: small
+    category: fix-code
+    prompt: Fix a Python slugify helper and add Python unittest.TestCase coverage.
+    expected_artifacts: [slugify_helper.py, test_slugify_helper.py]
+    postcheck: {commands: [python3 -m unittest test_slugify_helper.py]}
+    plan_constraints: {min_steps: 2, max_steps: 5, required_verify_keywords: [python3 -m unittest]}
+  - id: readme-command-small
+    size: small
+    category: config-profile
+    prompt: Create README command documentation for a CLI tool.
+    expected_artifacts: [README.md]
+    postcheck: {commands: []}
+    plan_constraints: {min_steps: 1, max_steps: 4, required_verify_keywords: [README.md]}
+  - id: csv-utility-medium
+    size: medium
+    category: new-code
+    prompt: Create a Python CSV summary utility with Python unittest.TestCase coverage.
+    expected_artifacts: [csv_summary.py, test_csv_summary.py]
+    postcheck: {commands: [python3 -m unittest test_csv_summary.py]}
+    plan_constraints: {min_steps: 3, max_steps: 7, required_verify_keywords: [python3 -m unittest]}
+  - id: typescript-formatter-medium
+    size: medium
+    category: new-code
+    prompt: Create a TypeScript formatter script with a node-based smoke test.
+    expected_artifacts: [formatter.ts, package.json]
+    postcheck: {commands: [npm install --ignore-scripts, npm run build]}
+    plan_constraints: {min_steps: 3, max_steps: 8, required_verify_keywords: [npm run build]}
+  - id: schema-check-medium
+    size: medium
+    category: data-docs
+    prompt: Create a data schema checker with fixtures and Python unittest.TestCase tests.
+    expected_artifacts: [schema_check.py, test_schema_check.py]
+    postcheck: {commands: [python3 -m unittest test_schema_check.py]}
+    plan_constraints: {min_steps: 3, max_steps: 8, required_verify_keywords: [python3 -m unittest]}
+  - id: nextjs-port-config-medium
+    size: medium
+    category: config-profile
+    profile: nextjs
+    prompt: Create a minimal Next.js app configured to run on port 3011.
+    expected_artifacts: [package.json, src/app/page.tsx, src/app/layout.tsx, src/app/global.d.ts]
+    postcheck: {commands: [npm install --ignore-scripts, npm run build]}
+    plan_constraints: {min_steps: 3, max_steps: 8, required_verify_keywords: [npm run build, "3011"]}
+  - id: multi-module-rust-parser-large
+    size: large
+    category: fix-code
+    prompt: Create a multi-module Rust parser library with tests.
+    expected_artifacts: [Cargo.toml, src/lib.rs, src/parser.rs]
+    postcheck: {commands: [cargo test]}
+    plan_constraints: {min_steps: 4, max_steps: 9, required_verify_keywords: [cargo test]}
+  - id: raw-data-protected-report-large
+    size: large
+    category: data-docs
+    prompt: Create a report generator that reads raw data without mutating it and verifies that behavior with Python unittest.TestCase tests.
+    expected_artifacts: [report.py, test_report.py, data/raw.csv]
+    postcheck: {commands: [python3 -m unittest test_report.py]}
+    plan_constraints: {min_steps: 4, max_steps: 9, required_verify_keywords: [python3 -m unittest]}
+  - id: malformed-tool-call-recovery-large
+    size: large
+    category: recovery
+    prompt: Create a parser feedback loop demo that recovers from malformed tool call text with Python unittest.TestCase tests.
+    expected_artifacts: [tool_recovery.py, test_tool_recovery.py]
+    postcheck: {commands: [python3 -m unittest test_tool_recovery.py]}
+    plan_constraints: {min_steps: 4, max_steps: 9, required_verify_keywords: [python3 -m unittest]}
+  - id: copy-artifact-smoke-medium
+    size: medium
+    category: recovery
+    prompt: Create a copy artifact smoke validator with deterministic Python unittest.TestCase tests.
+    expected_artifacts: [copy_artifact.py, test_copy_artifact.py]
+    postcheck: {commands: [python3 -m unittest test_copy_artifact.py]}
+    plan_constraints: {min_steps: 3, max_steps: 8, required_verify_keywords: [python3 -m unittest]}
+  - id: node-zero-test-guard-medium
+    size: medium
+    category: recovery
+    prompt: Create a Node test guard that fails when zero tests are discovered.
+    expected_artifacts: [test_guard.js, package.json]
+    postcheck: {commands: [node test_guard.js]}
+    plan_constraints: {min_steps: 3, max_steps: 8, required_verify_keywords: [node]}

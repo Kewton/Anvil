@@ -1,0 +1,34 @@
+step_plan_weights:
+  yaml_validity: 10
+  step_count_fit: 10
+  atomicity: 15
+  responsibility_boundary: 15
+  instruction_clarity: 15
+  expected_paths: 10
+  verify_commands: 10
+  dependency_order: 10
+  repairability: 5
+ultra_plan_weights:
+  phase_count_fit: 15
+  phase_boundary: 20
+  contract_carryover: 15
+  phase_prompt_clarity: 15
+  risk_isolation: 10
+  step_plan_quality_average: 15
+  final_verification_strength: 10
+guardrails:
+  invalid_path_penalty: 20
+  overlong_step_penalty: 8
+  duplicate_verify_penalty: 6
+  min_instruction_chars: 24
+  max_instruction_chars_for_single_step: 1200
+deterministic_verify_allowlist:
+  - cargo test
+  - cargo fmt
+  - cargo clippy
+  - npm run build
+  - npm test
+  - python3 -m unittest
+  - pytest
+  - node
+  - curl

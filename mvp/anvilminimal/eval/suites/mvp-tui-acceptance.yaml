@@ -1,0 +1,54 @@
+name: mvp-tui-acceptance
+description: TUI acceptance scenario definitions. The current harness records the contract; PTY slash automation is validated separately by Rust TUI tests.
+scenarios:
+  - id: tui-nextjs-space-invaders-large
+    size: large
+    category: new-code
+    profile: nextjs
+    prompt: /ultra-plan-run --profile nextjs あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。
+    functional_contract:
+      category: interactive-game
+      required_capabilities:
+        - stateful_interaction
+        - start_or_restart_flow
+        - player_control
+        - adversary_or_challenge
+        - progression_or_score
+        - failure_or_collision_rule
+      forbidden_minimal_outputs:
+        - static_title_only
+    interaction_contract:
+      keyboard: true
+      pointer: optional
+    quality_contract:
+      minimum_acceptance: playable_core_loop
+    oracle_contract:
+      deterministic_oracles:
+        - source_semantic
+        - browser_interaction
+    expected_artifacts:
+      - package.json
+      - src/app/page.tsx
+      - src/app/layout.tsx
+      - src/app/global.d.ts
+    postcheck:
+      commands:
+        - npm install --ignore-scripts
+        - npm run build
+      dev_server:
+        command: env -u NODE_ENV npm run dev
+        port: 3011
+        readiness:
+          url: http://127.0.0.1:3011/
+          expect_status: 200
+          timeout_sec: 60
+        shutdown: signal
+    timeouts:
+      total_sec: 3600
+      model_call_sec: 300
+    plan_constraints:
+      min_steps: 3
+      max_steps: 8
+      required_verify_keywords:
+        - npm run build
+        - 3011

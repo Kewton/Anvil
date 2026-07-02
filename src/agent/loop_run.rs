@@ -1,29 +1,29 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
 
 use crate::agent::prompting;
+// Re-exposed for legacy `super::recovery::*` paths in `progress_tests.rs`
+// (parent #680: after `turn.rs` became empty, this import is no longer
+// referenced from within `loop_run` itself).
+#[allow(unused_imports)]
 use crate::agent::recovery;
 use crate::config::Config;
 use crate::format_model_banner;
 use crate::logging::log_llm_event;
 use crate::model_registry::RuntimeModels;
 use crate::modes::plan_act::{ExecutionMode, ModePolicy};
-use crate::ollama::client::{AssistantReply, OllamaClient, should_use_native_tool_calls};
-use crate::ollama::xml_fallback::ToolCall;
+use crate::ollama::client::{OllamaClient, should_use_native_tool_calls};
 use crate::repo_graph::{
     BuildOptions as RepoGraphBuildOptions, BuildOutcome, RepoGraph, RepoGraphError,
     build_repo_graph,
 };
-use crate::safety::path_guard::resolve_user_path;
 use crate::session::compact::{
     approximate_token_count, compact_messages, compact_messages_with_strategy,
 };
 use crate::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
 use crate::stdin_prompt;
-use crate::system_prompt::build_system_prompt;
-use crate::tools::registry::{ToolContext, ToolRegistry};
+use crate::tools::registry::ToolRegistry;
 
 // Issue #646: artifact ownership classification. Module is intentionally
 // *not* re-exported (DR3-001) — `turn.rs` and `task_contract.rs` are the
@@ -69,6 +69,383 @@ mod artifact_ledger_phase5_tests;
 // re-exported (DR3-001) — `turn.rs` is the only in-crate consumer via
 // `super::active_job_arbiter::*`.
 mod active_job_arbiter;
+// Issue #681 (parent #680, Phase 1): actor loop control-flow data types
+// (`PostReplyRecovery*` / `ActorLoop*Args` / `ActorLoop*Outcome`) +
+// 2 small Outcome constructor helpers extracted from `turn.rs`. Module
+// is intentionally *not* re-exported (DR3-001) — `turn.rs` is the only
+// in-crate consumer via `super::actor_loop_flow::*`.
+mod actor_loop_flow;
+mod actor_loop_phase_decision;
+mod cargo_manifest_summary;
+mod node_test_evidence_quality;
+mod objective_contract_projection;
+mod objective_evidence;
+mod package_manifest_summary;
+mod structured_data_observation;
+// Anti-pattern extraction + retrieval flow extracted from `turn.rs`
+// (parent #680). Hosts `maybe_extract_anti_pattern` and
+// `try_inject_anti_pattern_message` (free fns over `&mut Agent`) plus
+// their private logging / feedback helpers. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod anti_pattern_flow;
+// Case-record extraction + retrieval flow extracted from `turn.rs`
+// (parent #680). Hosts `maybe_extract_case_record` and
+// `try_inject_case_retrieval_message` (free fns over `&mut Agent`) plus
+// `persist_case_record` / `finish_case_record_extraction` private
+// helpers. `pub(super)` limited / no facade re-export (DR3-001).
+mod case_record_flow;
+// Work-mode / feedback-kind / quality second-pass confirmation flow
+// extracted from `turn.rs` (parent #680). Hosts 4 production entry
+// points + 4 private attempt/resolution helpers, all free fns over
+// `&mut Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod api_contract_expectation;
+mod classify_confirm_flow;
+mod completion_probe_gate;
+mod contract_bound_generation;
+mod contract_generation_expectations;
+mod deliverable_freshness;
+mod deliverable_obligation_audit;
+mod runtime_capability;
+// Tester invocation flow extracted from `turn.rs` (parent #680). Hosts
+// `try_invoke_tester` (pub(super)) and 5 private helpers as free fns
+// over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod tester_invocation;
+// Python package-marker materialization extracted from `turn.rs`
+// (parent #680). Hosts 2 entry points + a shared materializer, all free
+// fns over `&mut Agent`. `pub(super)` limited / no facade re-export
+// (DR3-001).
+mod python_markers;
+// Verifier event emitters extracted from `turn.rs` (parent #680). Hosts
+// `emit_agent_verifier_invoked_if_new` (per-turn payload-digest dedup)
+// + `emit_agent_verifier_external_import_rejected_if_first` (single
+// per-turn cap). Both apply `mask_payload_inplace` as final defence.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod emit_verifier_events;
+// Task-contract verifier observation hooks extracted from `turn.rs`
+// (parent #680). Hosts `record_task_contract_verifier_invocation`,
+// `observe_task_contract_verifier_exit_zero`, and
+// `observe_task_contract_verifier_exit_zero_bound` — all free fns over
+// `&mut Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod verifier_observation;
+// Assistant-reply retry orchestration extracted from `turn.rs` (parent
+// #680). Hosts the retry loop entry point + 10 branch-by-branch error
+// handlers (format-error / timeout / transport / native-tool downgrade /
+// generic retry + actual Ollama dispatch). `current_assistant_model`
+// stays on Agent (5+ external call sites). `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod reply_retry;
+// Repair-job dispatch flow extracted from `turn.rs` (parent #680). Hosts
+// `dispatch_repair_job_step`, `dispatch_missing_verifier_job_step`,
+// `repair_rejection_next_action` (pub(super)) + 11 private branch
+// handlers as free fns over `&mut Agent`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod repair_job_dispatch;
+// Request-message assembly extracted from `turn.rs` (parent #680).
+// Hosts `build_request_messages` (pub(super) entry point) + 4 private
+// helpers (general context / context-pack / common / focused-edit
+// message appenders). All free fns over `&mut Agent` / `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod build_request_messages;
+// Effective-tool-policy + arbiter candidate selection extracted from
+// `turn.rs` (parent #680). Hosts `effective_tool_policy` (pub(super)
+// entry point), `build_arbiter_candidates` (pub(super)), and 5 private
+// helpers as free fns over `&Agent`. Replaces former `impl Agent`
+// methods. `pub(super)` limited / no facade re-export (DR3-001).
+mod effective_tool_policy_flow;
+// Per-turn entry point extracted from `turn.rs` (parent #680). Hosts
+// `handle_user_message` as a free fn over `&mut Agent`. Owns the per-
+// turn state reset (CLAUDE.md per-turn rule) + dispatch to
+// `Agent::run_turn` + post-turn ledger refresh + job report emit.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod handle_user_message;
+// Per-actor-loop-turn state initializer extracted from `turn.rs`
+// (parent #680). Hosts `prepare_actor_loop_turn_state` as a free fn
+// over `&mut Agent`. Resets ~25 per-actor-loop caps / dedup carriers
+// and computes the initial TaskContract. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod prepare_actor_loop_state;
+// Per-turn driver extracted from `turn.rs` (parent #680). Hosts
+// `run_turn` as a free fn over `&mut Agent`. Pushes user message +
+// runs work-mode classify second-pass + plan stage refresh + photon
+// context-pack hook + actor loop entry. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod run_turn;
+// Active-job + behavior-contract event emit helpers extracted from
+// `turn.rs` (parent #680). Hosts `emit_active_job_selected_if_changed`,
+// `emit_behavior_contract_projected_if_changed`, and
+// `current_active_job_selection` as free fns over `&mut Agent` /
+// `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod active_job_emit;
+// Working-memory + repo-context prompt messages extracted from
+// `turn.rs` (parent #680). Hosts `refresh_working_memory`,
+// `working_memory_message`, `answer_only_fallback_response`, and
+// `repo_context_message` as free fns over `&mut Agent` / `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod working_memory_messages;
+// Artifact-recovery target + completion-job lifecycle extracted from
+// `turn.rs` (parent #680). Hosts `clear_artifact_recovery_target`,
+// `maybe_install_artifact_completion_job_for_hint`,
+// `maybe_emit_artifact_completion_failed_diagnostic`, and
+// `artifact_recovery_target_path` as free fns over `&mut Agent` /
+// `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod artifact_recovery_flow;
+mod artifact_target_alignment;
+mod authoring_style;
+mod behavior_delta_obligation;
+// Artifact-recovery target installer (projection-write half)
+// extracted from `turn.rs` (parent #680). Hosts
+// `set_artifact_recovery_target_for_decision`,
+// `set_artifact_recovery_target_for_action`,
+// `set_artifact_recovery_target_from_hint`. Free fns over `&mut Agent` /
+// `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod set_artifact_recovery_target;
+// Per-turn artifact-ledger state management (parent #680). Hosts the
+// per-turn lifecycle of `Agent::artifact_ledger`: reset + observability
+// stamp, end-of-turn summary emit, four seed helpers (Existing /
+// Scaffold / RepoEdit / VerifierObservation), dual-source divergence
+// assertion + release-mode emitter. Free fns over `&mut Agent` /
+// `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod artifact_ledger_state;
+// TaskContract artifact-state projection extracted from `turn.rs` (parent
+// #680). Hosts the Phase-3 (Issue #659 Task 3.2) production helper
+// `task_contract_artifact_states` (ledger authority + legacy shadow +
+// divergence emit), the legacy / ledger derivations, the masked
+// observability emit, and three `#[cfg(test)]` test seams. Free fns
+// over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod artifact_state_projection;
+mod post_tool_reconciliation;
+// `agent.safe_stop.report` emit cluster extracted from `turn.rs` (parent
+// #680). Hosts the Issue #654 emit lifecycle: per-StopReason dedup +
+// emit-4-job-reports + SafeStopReport build + bounded payload render +
+// final-defence-masked log_llm_event, the §6.4 current-role priority
+// chain, six emit shells, the shared repair-job emit helper, and the
+// owned-test-artifact collector. Free fns over `&mut Agent` / `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod safe_stop_emit;
+// Verifier-diagnostic pass flow extracted from `turn.rs` (parent #680).
+// Hosts the Issue #637 / #638 / #654 lifecycle: prepare → request →
+// failure → record_failure / record_unavailable, plus the stale-state
+// reset helper. Free fns over `&mut Agent` / `&Agent`. `pub(super)`
+// limited / no facade re-export (DR3-001).
+mod verifier_diagnostic_flow;
+// Verifier-repair pass flow extracted from `turn.rs` (parent #680).
+// Hosts the per-attempt repair-plan-driven targeted-edit loop:
+// prepare (admission + accepted-plan build + behavior projection emit +
+// prompt render) → handle_attempt (per-reply dispatcher → progress
+// outcome) → handle_reply (parse + shadow validation + intent admission
+// + legacy comparison + apply via `apply_verifier_repair_pass_edit`),
+// plus wall-clock-timeout error + bounded timeout-event log helper.
+// Free fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod verifier_repair_pass_flow;
+// Artifact-completion attempt-recording cluster extracted from `turn.rs`
+// (parent #680). Hosts `push_artifact_directed_recovery_note` (system
+// note push gated by focused-edit target) + `record_artifact_completion_attempt`
+// + `record_artifact_completion_bash_violation` + the shared
+// `record_artifact_completion_outcome` core (append outcome + trigger
+// turn-local `artifact_completion_failed` diagnostic on Exhausted
+// transition). Free fns over `&mut Agent`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod artifact_completion_record;
+// Recovery / verifier-repair policy message builders extracted from
+// `turn.rs` (parent #680). Hosts the prompt-text builders that drive
+// the focused-edit / artifact-directed / verifier-repair recovery
+// policies: focused_edit_no_tool_note_for_{target,policy},
+// artifact_directed_recovery_message, verifier_repair_policy_message
+// (RepairNextAction dispatcher) + 2 private repair-policy sub-builders,
+// artifact_directed_policy_violation_message,
+// push_deterministic_ui_recovery_continuation_note. Free fns over
+// `&mut Agent` / `&Agent`. `pub(super)` limited / no facade re-export
+// (DR3-001).
+mod recovery_messages;
+// TaskContract recovery action / target planners extracted from
+// `turn.rs` (parent #680). Hosts `task_contract_recovery_action` (the
+// production chokepoint that routes between `RunVerifier` / `Continue`
+// / `Done` per artifact state + repair state + completion probe) +
+// `task_contract_recovery_target` (`Continue { missing }` →
+// scaffold-candidate / existing-Owned / synthesised-implementation
+// target hint) + the private `task_contract_repair_state` adapter.
+// Free fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod task_contract_recovery;
+// `owned_test_artifacts_for_verifier` projection extracted from
+// `turn.rs` (parent #680). Hosts the Phase-3 (Issue #659 Task 3.3)
+// verifier-binding Owned-test-artifacts projection: legacy + ledger
+// derivations with masked `agent.artifact_ledger.divergence_detected`
+// emit when they disagree; returns the ledger projection as the v0.4.8
+// production authority. Free fns over `&mut Agent` / `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod owned_test_projection;
+// Issue #901: generated tests are not verifier authority until a bounded
+// preflight rejects missing, racy, brittle, or contract-unsupported tests.
+mod generated_test_guard;
+// Tool-call execution dispatch extracted from `turn.rs` (parent #680).
+// Hosts the per-tool-call execution lifecycle: production chokepoint
+// `execute_tool_call` (policy gates → Bash vs. non-Bash dispatch) +
+// `tool_context` builder + 4 dispatch helpers
+// (`{handle_tool_execution_rejection,execute_bash_tool_call,capture_pre_tool_hash_if_needed,execute_non_bash_tool_call}`)
+// + Issue #606 T-1.6 `observe_evidence_from_bash_outcome` (Bash exit-0
+// → VerifierExitZero evidence + last_verifier_invocation record). Free
+// fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod tool_call_execution;
+// Post-Edit/Write repo-edit evidence observation extracted from
+// `turn.rs` (parent #680). Hosts the Issue #606 (T-1.7)
+// `observe_evidence_from_repo_edit` chokepoint: ignored-top-dir gate
+// → scaffold-delta gate → no-op-hash gate →
+// `turn_edited_relative_paths` write-through + per-turn evidence +
+// task-contract evidence + bounded post-edit excerpt + Issue #659
+// Task 2.5 ArtifactLedger seed. Free fn over `&mut Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod repo_edit_observation;
+// Focused-edit / repo-change / verifier-repair recovery target +
+// note builders extracted from `turn.rs` (parent #680). Hosts
+// `focused_edit_recovery_target` (focused-edit chain),
+// `repo_change_no_edit_recovery_target` (private repo-change chain),
+// `push_repo_change_no_edit_recovery_note`, and
+// `push_verifier_repair_recovery_note` (RequestDiagnostic /
+// RequestPatch branches). Free fns over `&mut Agent` / `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod recovery_targets;
+// Issue #979 (parent #974, Issue E): controller-side ToolFailure recovery.
+// Pure decision logic — `is_tool_protocol_failure` classifier +
+// `decide_tool_protocol_recovery` zero-file escalation guard — that keeps a
+// tool *protocol* failure (malformed/truncated/unparseable tool call) with no
+// deliverable from terminating on assistant prose, escalating one bounded round
+// into the normal tool/action path instead. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod tool_failure_recovery;
+// Playable-UI quality gate decision helpers extracted from `turn.rs`
+// (parent #680). Hosts `current_request_needs_playable_ui_quality_gate`
+// (Act + policy + request gate), `accepted_repo_change_quality_issue`
+// (Issue #580 second-pass classifier), `accepted_repo_change_polish_target`
+// (deterministic polish target with quality-suppression), and the
+// private `unsupported_ui_framework_context` predicate. Free fns over
+// `&mut Agent` / `&Agent`. `pub(super)` limited / no facade re-export
+// (DR3-001).
+mod quality_gate;
+// Per-Agent tool-policy decision helpers extracted from `turn.rs`
+// (parent #680). Hosts `answer_only_mode_active` (Issue #576 / DR3-001
+// SSOT: second-pass work_mode only) + `script_execution_requested` +
+// `answer_only_policy_error` (read-only gate with Read/Glob/Grep
+// allowlist + Bash-script allowlist branch) +
+// `effective_tool_policy_error` (no-explicit-policy fallback via
+// `effective_tool_policy_flow`). Free fns over `&Agent`. `pub(super)`
+// limited / no facade re-export (DR3-001).
+mod tool_policy_decisions;
+// Python request inspection helpers extracted from `turn.rs` (parent
+// #680). Hosts the Python-specific signals that drive completion /
+// scaffold gating: `active_python_request_requires_tests`,
+// `python_verifier_available_for_requested_tests`, and
+// `python_test_artifact_exists` (top-level `test_*.py` / `*_test.py` /
+// `tests.py` scan). Free fns over `&Agent`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod python_request_helpers;
+// Issue #977 (parent #974, Issue C): Node request / workspace-state
+// inspection helpers (`active_node_request_requires_tests`,
+// `node_test_artifact_exists`, `node_test_runner_completion`,
+// `node_test_runner_bindable`) that gate the deterministic Node
+// test-runner manifest completion, plus the pure operator that produces
+// the completed `package.json` contents. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod node_request_helpers;
+mod node_runner_manifest;
+// Per-Agent `#[cfg(test)]` test seams extracted from `turn.rs` (parent
+// #680). Hosts the test-only `pub(super)` seams that drive the
+// production wiring without widening visibility (Issue #664 / CB2-003):
+// effective_tool_policy_pub / build_arbiter_candidates_pub /
+// drive_policy_error / artifact_directed_policy /
+// last_attempt_bash_policy_violation / artifact_completion_job_attempts_len.
+// Free fns over `&mut Agent` / `&Agent`. `#![cfg(test)]` module guard
+// excludes from production binary. `pub(super)` limited / no facade
+// re-export (DR3-001).
+#[cfg(test)]
+mod test_seams;
+// Forced-small-edit recovery target / note builders extracted from
+// `turn.rs` (parent #680). Hosts the focused-edit policy's
+// "previous tool call truncated → force a small follow-up edit"
+// branch: `forced_small_edit_recovery_target` (Act mode + truncated +
+// no successful non-plan edit since) + `forced_small_edit_recovery_message`
+// (renders the recovery note). Free fns over `&Agent`. `pub(super)`
+// limited / no facade re-export (DR3-001).
+mod forced_small_edit;
+// Issue #636 bounded post-edit excerpt reader extracted from `turn.rs`
+// (parent #680). Hosts `bounded_post_edit_excerpt`: workspace-confined
+// + O_NOFOLLOW + 8 KiB cap + NUL/UTF-8 guards + mask_secrets +
+// mask_header_family + post-mask char-boundary re-truncation. Used by
+// `repo_edit_observation::observe_evidence_from_repo_edit` to capture
+// a behavior-coverage snippet for `plan_artifact_recovery`. Free fn
+// over `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod post_edit_excerpt;
+// Tool-prep helpers extracted from `turn.rs` (parent #680). Hosts
+// `tool_specs_for_policy` (filter registered tool specs by policy
+// allowlist), `local_llm_small_edit_target` (small-edit Edit target
+// for local LLMs), and `mode_policy_message` (per-`WorkMode`
+// `[Mode Policy]` system note; Auto returns None). Free fns over
+// `&Agent`. `pub(super)` limited / no facade re-export (DR3-001).
+mod tool_prep;
+// Per-Agent misc lifecycle helpers extracted from `turn.rs` (parent
+// #680). Hosts `refresh_artifact_completion_satisfied` (Issue #663
+// SSOT for ledger-driven Satisfied transition),
+// `tool_policy_violation_exit_reason` (RecoveryOwner → ExitReason
+// mapping), `record_missing_verifier_setup_failure` (invalid setup
+// attempt → SafeStop or task_contract_no_verifier_note push), and
+// `current_assistant_model` (mode + plan-model override picker). Free
+// fns over `&mut Agent` / `&Agent`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod agent_misc;
+// Per-tool-call argument normalization extracted from `turn.rs`
+// (parent #680). Hosts `prepare_tool_call`: per-tool argument sanitise
+// + Read/Write/Edit workspace-confined path resolution +
+// focused-edit Read directory→target redirect. Free fn over `&Agent`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod tool_call_prepare;
+// Read-tool path lookup helpers extracted from `turn.rs` (parent
+// #680). Hosts `last_read_tool_path` (most recent `Read` path across
+// all turns) and `latest_turn_preferred_read_edit_target` (latest user
+// turn's `Read`s, resolved + filtered to existing files, prefers
+// `is_preferred_read_edit_target` matches). Free fns (no Agent
+// dependency). `pub(super)` limited / no facade re-export (DR3-001).
+mod read_target_helpers;
+// Small helpers + shared types extracted from `turn.rs` (parent #680).
+// Hosts `extract_filename_with_suffix`, `write_stdout_rendered`,
+// `tool_result_failed`, `quality_confirm_cache_key` free fns +
+// `RetrievalInjection` struct + `WrittenScaffoldArtifacts` type alias.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod loop_phase;
+mod loop_state;
+mod model_request_phase;
+mod turn_helpers;
+mod turn_state;
+// Assistant-reply retry state types extracted from `turn.rs` (parent
+// #680). Hosts `AssistantReplyRetryState` (per-attempt accumulator +
+// `new(chat_retries, message_count)` constructor) and
+// `AssistantReplyRetryDecision` (Retry / ReturnReply / Fail triplet).
+// Consumed only by `reply_retry`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod reply_retry_types;
+// Module-level constants extracted from `turn.rs` (parent #680). Hosts
+// `LOG_ARGS_MAX_CHARS`, `PLAN_REPEATED_EXPLORATION_BLOCK_THRESHOLD`,
+// `TASK_CONTRACT_VERIFIER_ATTEMPT_LIMIT`,
+// `TASK_CONTRACT_VERIFIER_REPAIR_ATTEMPT_LIMIT`, `USER_INTERRUPT_ERROR`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod turn_constants;
+// Session message push helpers extracted from `turn.rs` (parent #680).
+// Hosts `push_system_note` (`prompting::should_skip_system_note`
+// dedup + ConversationMessage::system push) and `push_user_message`
+// (working_memory.set_active_task + ConversationMessage::user push).
+// Free fns over `&mut Agent`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod message_push;
+// Per-Agent workspace + active-request accessors extracted from
+// `turn.rs` (parent #680). Hosts `current_workspace_scope` (Issue
+// #646), `workspace_appears_empty`, `active_task_expects_repo_change`,
+// and `active_request_text`. Free fns over `&Agent`. `pub(super)`
+// limited / no facade re-export (DR3-001).
+mod workspace_access;
 // Issue #652: `ArtifactCompletionJob` + role-specific retry budget +
 // `ArtifactAttemptOutcome` 4-variant taxonomy +
 // `ArtifactCompletionFailureSnapshot` for #654. Module is intentionally
@@ -86,34 +463,317 @@ pub mod commands;
 // reaching into private module state — see `is_completion_verifier_command`
 // / `classify_repo_edit_path` in `loop_run::completion_evidence`.
 pub(crate) mod completion_evidence;
+// Issues #989/#993 (parent #988): structured evidence binding plan plus the
+// generic `EvidenceBindingFailedJob` routing seam. Runtime-neutral binding
+// types route binding gaps to `EvidenceBindingFailed` instead of
+// `safe_stop_verifier_missing`; runtime-specific differences stay in data
+// enums/adapters. `pub(super)` only, no facade re-export (DR3-001).
+mod evidence_binding;
+mod evidence_observation;
+mod evidence_runner;
+mod worker_contract;
+// Issue #994 (parent #988, Issue F): ContractConflictJob — typed arbitration of
+// ambiguous impl/test/setup/docs/data/research contracts at the no-progress /
+// repair_exhausted chokepoint. pub(super) only, no facade re-export (DR3-001).
+mod contract_conflict_job;
+// Issue #950: delegated local-LLM persistence policy. Records static
+// controller recovery strategy labels and gates prose-only recovery exits
+// without widening provider abstractions.
+mod controller_policy;
 mod deterministic;
 pub(crate) mod feedback_kind_confirm;
 mod footer;
+// Focused-edit recovery helpers extracted from `turn.rs` (parent #680).
+// Hosts the guidance-note builders, page-component anchor extractors, and
+// conversation history shapers used by the focused-edit recovery flow.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod focused_edit_recovery;
+// File excerpt + content-hash helpers extracted from `turn.rs` (parent
+// #680). Hosts `open_excerpt_file_nofollow`, `utf8_prefix_respecting_cap`,
+// `truncate_on_char_boundary`, `current_file_hash_for_relative_path`,
+// `sha256_hex`. `pub(super)` limited / no facade re-export (DR3-001).
+mod file_excerpt;
+// v0.4.13 Phase 1: bounded verifier-failure packet used as the shared
+// controller/LLM input for the new repair pipeline. Private module; no facade
+// re-export (DR3-001 pattern).
+mod failure_packet;
 mod interrupt;
 mod lifecycle;
+mod verifier_evidence_scope;
+mod verifier_failure_artifacts;
+// v0.4.25: model request policy helpers. Keeps transport and focused-edit
+// request sizing decisions out of the actor-loop dispatcher as they are
+// extracted toward a dedicated request boundary.
+mod model_request;
 pub mod photon_user_feedback;
 // Issue #639: ProjectVerifier capability. Module is intentionally *not*
 // re-exported (DR3-001) — `turn.rs` is the only in-crate consumer via
 // `super::project_verifier::*`.
 mod project_verifier;
+// v0.4.22: generic completion probe. Private helper that can advance to
+// verifier execution when current-turn artifacts are physically present even
+// if the legacy artifact projection is still asking for another edit.
+mod progress_text;
+mod project_probe;
 mod protocol;
 mod quality;
 pub(crate) mod quality_confirm;
 pub(crate) mod reminder;
+// v0.4.13 Phase 4: controller-owned action projected from a validated
+// RepairBrief. Private module; consumed by the repair pipeline as it is wired.
+mod repair_action;
+mod repair_action_space;
+// v0.4.15 MVP: provenance/authority boundary for verifier repair proposals.
+// Private module; `turn.rs` is the only production consumer.
+mod repair_authority;
+// v0.4.16: accepted repair-plan boundary. Diagnostic output remains a proposal
+// until this module validates it against FailurePacket + authority evidence.
+mod repair_plan;
+// v0.4.25: verifier-repair admission boundary. Keeps RepairPlan acceptance and
+// admission error transition mapping out of the turn dispatcher.
+mod repair_plan_admission;
+// v0.4.13 Phase 2: small diagnostic schema returned by the short-lived
+// diagnostic LLM. Private module; no direct provider abstraction.
+mod repair_brief;
+// Issue #877: deliverable-obligation repair packet projection. Private
+// adapter over TaskContract + RepairJob state; repair loop ownership stays
+// with the repair modules.
 mod repair_job;
+mod repair_lifecycle;
+// Issue #990 (parent #988, Issue B): failure-cluster-scoped no-progress
+// recovery policy. Connects the `TargetReassessmentRequired` event (#987) to
+// deterministic target/role bans + forced role switch + `repair_exhausted`
+// sub-classification. Private module, not re-exported (DR3-001) — `repair_job`
+// / `verifier_orchestration` are the only in-crate consumers.
+mod no_progress_recovery;
+mod repair_packet;
 // Issue #653: `RepairAttemptOutcome` lifecycle ledger. Module is intentionally
 // *not* re-exported (DR3-001) — `turn.rs` and `repair_job.rs` are the only
 // in-crate consumers via `super::repair_attempt_outcome::*`.
 mod repair_attempt_outcome;
+// v0.4.26: repair-pass driver boundary. Keeps verifier-repair pass outcome
+// typing, retry timing, and retry advice out of the actor-loop dispatcher as
+// repair execution moves behind a dedicated owner.
+mod repair_driver;
+// v0.4.25: pure assertion/output analysis helpers shared by verifier repair
+// diagnostics and generated-test semantic weakening filters.
+mod mechanical_compile_repair;
+// Issue #978 (parent #974, Issue D): deterministic EvidenceFailed operator for
+// missing serde-family Cargo dependencies. Runs in the deterministic repair
+// slot before the LLM verifier-repair pass. Not re-exported (DR3-001).
+mod cargo_dependency_repair;
+// Issue #991 (parent #988, Issue C): deterministic Rust binding-mismatch repair
+// operators (lib name / CARGO_BIN_EXE). Runs in the deterministic repair slot
+// before the LLM verifier-repair pass, after `cargo_dependency_repair`. Not
+// re-exported (DR3-001).
+mod repair_assertion_analysis;
+mod rust_binding_repair;
+// Issue #1005: RepairOperatorRegistry — organizes the deterministic repair
+// operators by failure class / binding check / target role so docs/data/research
+// operators are table rows, not new task-kind jobs. Pure metadata + selection +
+// session-observation over the existing operators (no re-implementation). Not
+// re-exported (DR3-001).
+mod repair_operator;
+// v0.6.9 P0: admitted repair-target decision boundary. Keeps failure-class /
+// operator / target-role / target-hint handoff explicit without expanding
+// benchmark-specific repair rules.
+mod repair_target_decision;
 // Issue #635: deterministic RequiredBehaviorContract extractor. Module is
 // intentionally *not* re-exported (DR3-001) — `task_contract.rs` is the only
 // in-crate consumer via `super::required_behavior::*`.
 mod required_behavior;
+// v0.4.13 Phase 5: bounded patch proposal schema for the patch shaper LLM.
+mod patch_proposal;
+// v0.4.16: patch-provider admission boundary. Providers propose concrete
+// edits only after the controller has accepted a repair plan.
+mod patch_provider;
+// v0.4.25: applies already validated verifier-repair patches with preimage
+// protection. This is intentionally separate from patch validation.
+mod repair_patch_executor;
+// v0.4.25: pure patch-admission checks shared by verifier repair validation.
+mod repair_patch_validation;
+// v0.4.25: verifier-repair target ownership admission SSOT. Keeps the
+// path-local ownership gate out of the actor loop dispatcher.
+mod repair_target_admission;
+// v0.4.25: bounded Python local import-contract evidence for verifier repair
+// validation. Keeps filesystem probing out of the turn dispatcher.
+mod repair_python_import_evidence;
+// v0.4.25: Python pytest/test-fragment analysis shared by verifier framework
+// diagnostics and semantic test-repair validation.
+mod repair_python_test_analysis;
+// v0.4.25: semantic test weakening admission filter. Keeps verifier repair
+// authority decisions out of the actor loop.
+mod repair_test_weakening_filter;
+// v0.4.25: objective framework/test-runner findings used as bounded evidence
+// for verifier diagnostics.
+mod repair_framework_findings;
+// v0.4.25: diagnostic LLM assessment JSON boundary. Keeps schema-shape
+// tolerance and enum mapping out of the actor loop dispatcher.
+mod verifier_assessment_parser;
+// v0.4.26: task-contract verifier outcome normalization boundary. Keeps
+// pass/fail/transport classification separate from the actor-loop dispatcher
+// while command execution and state transitions remain in turn.rs.
+mod verifier_diagnostic_payload;
+mod verifier_diagnostic_prompt;
+mod verifier_driver;
+// v0.4.25: diagnostic LLM attempt schedule and timeout constants.
+mod verifier_diagnostic_attempt;
+// v0.4.25: verifier failure fingerprint/signature helpers. Keeps log
+// summarization out of the actor loop dispatcher.
+mod verifier_failure_signature;
+// v0.4.25: verifier-repair shadow telemetry and legacy brief projection.
+// Keeps observational payload shaping out of the actor loop dispatcher.
+mod verifier_repair_shadow;
+// v0.4.25: verifier-repair target/path helper boundary. Keeps diagnostic
+// path safety and Python module/dependency candidate parsing out of the actor
+// loop dispatcher.
+mod verifier_repair_targeting;
+// Issue #682 (parent #680, Phase 2): verifier orchestration data types
+// extracted from `turn.rs`. Hosts 7 pub(super) types
+// (JobInstallOutcome / VerifierDiagnosticPassOutcome /
+// PreparedVerifierDiagnosticPass / PreparedVerifierRepairPass /
+// VerifierRepairAttemptProgress / StructuredTaskContractVerifierRun /
+// TaskContractVerifierFlowArgs). Module is intentionally *not*
+// re-exported (DR3-001) — `turn.rs` is the only in-crate consumer.
+// Dispatch methods on `impl Agent` stay in turn.rs and will be migrated
+// in follow-up PRs (mirrors Phase 1 / actor_loop_flow pattern).
+mod verifier_orchestration;
+// Issue #683 (parent #680, Phase 3): scaffold / deterministic-scaffold
+// pipeline data types + telemetry-event-name constants extracted from
+// `turn.rs`. Hosts ScaffoldFramework / PlanExplorationKey /
+// ScaffoldFallbackResult / DeterministicScaffoldSpec + 5 const
+// (EVENT_DETERMINISTIC_FASTAPI_SCAFFOLD / _PYTHON_CLI /
+// _FORMAT_ERROR_SMALL_EDIT / _PYTHON_TEST_FALLBACK /
+// CREATE_NEXT_APP_PACKAGE_VERSION). Module is intentionally *not*
+// re-exported (DR3-001) — `turn.rs` is the only in-crate consumer.
+// Scaffold install / framework detection / fallback dispatch methods
+// on `impl Agent` stay in turn.rs for now and will be migrated in
+// follow-up PRs.
+mod scaffold_pipeline;
+// Issue #1003: `ScaffoldProfile` registry — deterministic, table-driven SSOT for
+// the minimal per-runtime/use scaffolds (coding / docs / data / research). Coding
+// profiles delegate materialization to `scaffold_pipeline`'s skeleton generators;
+// the rest expand small `&'static` template tables. `plan_project_skeleton_with_obligations`
+// routes the empty-workspace coding skeletons through it and asserts the binding
+// contract. `pub(super)` limited / no facade re-export (DR3-001). No provider abstraction.
+mod scaffold_profile;
+// Issue #1003: in-crate `#[cfg(test)] mod` E2E suite for the ScaffoldProfile
+// registry — table-driven over every profile id (materialize + verify_bindings),
+// pinning the Node test-script/package.json binding and the Rust Cargo entrypoint
+// binding. `#[cfg(test)]` keeps it out of the production binary; the explicit
+// `mod` is required (no auto-discovery). No facade re-export (DR3-001 / CB-001).
+#[cfg(test)]
+mod scaffold_profile_e2e_tests;
+// Issue #684 (parent #680, Phase 4): reminder dispatch orchestration extracted
+// from `turn.rs`. Hosts `ReminderCallContext` + the impl that materialises a
+// `ReminderInputs<'_>` view and emits the `agent.reminder.*` log event. The
+// reminder helper (`reminder.rs` sibling) keeps its public SSOT (Inputs /
+// Outcome / build_log_payload); only the orchestration that assembles the
+// context lives here. `pub(super)` limited / no facade re-export (DR3-001) —
+// `turn.rs` is the only in-crate consumer.
+mod reminder_pipeline;
+// Issue #685 (parent #680, Phase 5): streaming reply render state + chunk-
+// handling flow extracted from `turn.rs`. Hosts
+// `StreamingReplyRenderState` + `handle_streaming_assistant_chunk` /
+// `finish_streaming_assistant_reply` + the prefix/trailing-newline
+// predicates. The renderer is `None` when markdown is fully disabled;
+// otherwise a fresh `tui::markdown::MarkdownRenderer` is built per
+// stream. `pub(super)` limited / no facade re-export (DR3-001) —
+// `turn.rs` is the only in-crate consumer.
+mod streaming_reply;
+// Issue #688 (parent #680, Phase 8): photon feedback derive core
+// (`PhotonOutcomeInputs` / `PhotonFeedbackOutcome` / `case_f_condition_met`
+// + the static-allowlist `PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT`
+// const) extracted from `turn.rs`. `pub(super)` for the types (turn.rs
+// internal); the const stays `pub` via the existing `pub use` re-export
+// below so `tests/photon_evaluate_signal_smoke.rs` keeps working without
+// path changes.
+mod photon_feedback_derive;
+// Answer-only mode shell-command allowlist + script-execution fallback
+// response builder extracted from `turn.rs` (parent #680). Hosts
+// `answer_only_script_command_allowed` + the prefix / blocked-contains
+// / blocked-prefix const lists + `truncate_for_answer` +
+// `answer_only_script_execution_fallback_response`. `pub(super)`
+// limited / no facade re-export (DR3-001) — `turn.rs` is the only
+// in-crate consumer.
+mod answer_only_mode;
+// `FeedbackFrame` builder helpers + path-extraction utilities used by
+// the bash / edit failure pipelines, extracted from `turn.rs` (parent
+// #680). Hosts `build_feedback_for_{bash,unsafe_block_reason,edit_failure}`
+// + `bash_outcome_primary_error` + `extract_{suspected_files,path_tokens,current_request}_*`.
+// `pub(super)` limited / no facade re-export (DR3-001) — `turn.rs` is
+// the only in-crate consumer.
+mod feedback_builders;
+// Case-record extraction helpers + supporting agent-layer projections
+// (`derive_language_stack` for `RepoFingerprint`, `build_anvil_test_summary`
+// orchestration boundary) extracted from `turn.rs` (parent #680).
+// Hosts `case_record_auto_test_active` / `case_record_extraction_succeeded`
+// / `case_record_initial_feedback` / `derive_language_stack` /
+// `build_anvil_test_summary`. `pub(super)` limited / no facade re-export
+// (DR3-001).
+mod case_record_extract;
+// Issue #453: per-prompt precaution selection pipeline extracted from
+// `turn.rs` (parent #680). Hosts `select_precautions_for_prompt` +
+// `normalize_relevance_key` / `relevance_keyset_from_*` /
+// `relevance_score` / `sort_precautions_for_prompt` /
+// `apply_budget_caps`. `select_precautions_for_prompt` is re-exported
+// below via `pub use` (pre-existing surface), the rest is `pub(super)`
+// (DR3-001).
+mod precaution_relevance;
+// Issue #576 / #579 / #580 confirmation-flow plumbing extracted from
+// `turn.rs` (parent #680). Hosts `should_writeback_first_pass`,
+// `effective_turn_index_for_stage`, `preflight_*_skip_reason`,
+// `quality_confirm_cached_result`, `work_mode_confirm_parse_status`,
+// `log_*_confirm_outcome`, `override_feedback_kind_from_outcome`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod confirmation_flow;
+// Deterministic fallback-plan generator extracted from `turn.rs`
+// (parent #680). Used by `scaffold_pipeline.rs::maybe_materialize_plan_after_timeout`
+// when the main planning model fails to produce a usable plan.
+// Hosts `deterministic_timeout_fallback_plan` + 3 supporting helpers
+// (`extract_requested_port`, `fallback_plan_request_label`,
+// `fallback_plan_platform_label`). `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod deterministic_fallback_plan;
+// Workspace-relative path normalization + package.json/lock sync
+// helpers extracted from `turn.rs` (parent #680). Hosts
+// `normalize_memory_path`, `normalize_exploration_path`,
+// `sync_package_json_with_existing_lock`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod path_helpers;
+// Plan-section progress helpers extracted from `turn.rs` (parent #680).
+// Hosts `join_sections_for_progress`, `plan_sections_with_content`,
+// `plan_section_body_for_progress` + the private heading normalization
+// SSOT (`plan_section_has_content`, `normalize_plan_heading_for_progress`).
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod plan_sections;
+// Plan-mode helpers extracted from `turn.rs` (parent #680). Hosts
+// `should_materialize_plan_after_timeout`,
+// `should_materialize_plan_after_tool_call_format_error`,
+// `should_fallback_plan_model_after_timeout`, `assistant_model_for_mode`,
+// `plan_file_alias`, `prune_plan_mode_messages`,
+// `is_plan_mode_only_system_note`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod plan_mode_helpers;
+// Small standalone helpers extracted from `turn.rs` (parent #680). Hosts
+// `rfc3339_now_utc`, `masked_path_hash_bounded_list`,
+// `latest_tool_result_since_last_user`, `raw_mode_safe_text`,
+// `user_interrupt_result`, `anti_pattern_failed_action_summary`.
+// `pub(super)` limited / no facade re-export (DR3-001).
+mod small_helpers;
+// v0.4.13 Phase 6: verifier rerun progress classifier.
+mod repair_progress;
+mod safe_stop_payload;
 // Issue #647 (Phase A.1): semantic repair planning — bounded failure-report
 // schema and deterministic cluster-key generation. Module is intentionally
 // *not* re-exported (DR3-001) — future consumers (`turn.rs`, `repair_job.rs`)
 // reach in via `super::semantic_failure::*`.
 mod semantic_failure;
+// v0.4.25: semantic verifier-repair planning bridge. Converts parsed
+// diagnostic reports and admitted legacy assessments into SemanticRepairPlan
+// values outside the actor loop dispatcher.
+mod semantic_repair_planning;
+mod setup_artifact_validation;
 pub mod slash_commands;
 // Issue #647 (Phase A.2): spec-authority enum + tie-break scoring + test/impl
 // weakening detectors. Module is intentionally *not* re-exported (DR3-001) —
@@ -122,41 +782,552 @@ pub mod slash_commands;
 mod spec_authority;
 mod spinner;
 mod success;
+// Per-iteration progress line rendering extracted from `turn.rs` (parent
+// #680). Hosts `ProgressDisplay`, `progress_path_display`, `tool_display`
+// (entry point) and the per-tool projection helpers (write/edit/read/bash/
+// search/default plus plan_read/workspace_read shells). `pub(super)` limited
+// / no facade re-export (DR3-001).
+mod tool_display;
+// v0.4.25: tool-call history projection helpers. Keeps conversation evidence
+// lookup out of both the actor loop dispatcher and RepairJob state machine.
+mod tool_history;
+// v0.4.26: typed tool execution outcome boundary. Keeps artifact evidence
+// interpretation separate from low-level tool dispatch as turn.rs is reduced
+// toward a coordinator.
+mod tool_execution;
 // Issue #654 (CB-001): in-crate `#[cfg(test)]` E2E suite for the bounded
 // safe-stop-report pipeline. The seam set above is `#[cfg(test)]`-only, so
 // the cross-crate `tests/bounded_safe_stop_report_e2e.rs` integration file
 // has been migrated here to keep the seams unreachable from release builds.
 #[cfg(test)]
 mod safe_stop_e2e_tests;
+// Repair-runner contract tests extracted from `turn.rs` (parent #680).
+// Hosts `repair_lifecycle_event_tests` (pure-fn timeout / shadow validation)
+// and `v0421_repair_runner_contract_tests` (source-string grep assertions
+// pinning production invariants). #[cfg(test)] only; production binary
+// excludes this mod. No facade re-export (DR3-001).
+#[cfg(test)]
+mod repair_runner_contract_tests;
+// Photon-feedback derive unit tests extracted from `turn.rs` (parent
+// #680). Hosts `derive_photon_feedback_outcome_tests`,
+// `is_rerun_trigger_tests`, `rerun_hint_eligibility_tests`, and
+// `prepare_adopted_ids_for_evaluate_tests`. #[cfg(test)] only; production
+// binary excludes this mod. No facade re-export (DR3-001).
+#[cfg(test)]
+mod photon_feedback_derive_tests;
+// turn.rs `mod tests` extracted to a sibling file (parent #680).
+// Inner mod accesses turn.rs items via `super::X` (resolved through
+// `use super::turn::*;` at the wrapper file scope) and sibling modules
+// / loop_run items via `super::super::X` (depth preserved).
+// #[cfg(test)] only. No facade re-export (DR3-001).
+#[cfg(test)]
+mod turn_tests;
+// turn.rs `mod progress_tests` extracted to a sibling file (parent #680).
+// Inner mod accesses turn.rs items via `super::X` and sibling modules /
+// loop_run items via `super::super::X` — same pattern as `turn_tests`.
+// #[cfg(test)] only. No facade re-export (DR3-001).
+#[cfg(test)]
+mod progress_tests;
+// turn.rs `mod truncate_tests` extracted to a sibling file (parent #680).
+// Same pattern as turn_tests / progress_tests. #[cfg(test)] only.
+// No facade re-export (DR3-001).
+#[cfg(test)]
+mod truncate_tests;
+// Issue #666: structured per-turn job reports
+// (ArtifactCompletion/Verification/Repair/Memory). Private mod, no
+// facade re-export (DR3-001). `turn.rs` is the only in-crate consumer
+// via `super::job_report::*`.
+mod job_report;
+// Issue #666: in-crate `#[cfg(test)]` E2E suite (CB-001 fix pattern,
+// safe_stop_e2e_tests.rs precedent). Production binary does not include
+// this module.
+#[cfg(test)]
+mod job_report_e2e_tests;
+// Issue #994 (parent #988, Issue F): in-crate `#[cfg(test)]` E2E suite for the
+// ContractConflictJob production hook + typed `agent.contract_arbitration.report`
+// emission (CB-001 fix pattern, `job_report_e2e_tests.rs` precedent). Production
+// binary does not include this module (DR3-001).
+#[cfg(test)]
+mod contract_conflict_job_e2e_tests;
+// Issue #1005: in-crate `#[cfg(test)]` E2E suite for the RepairOperatorRegistry
+// production projection (`FailureContext::from_repair_job`) + failure-class
+// routing (CB-001 fix pattern, `job_report_e2e_tests.rs` precedent). Production
+// binary does not include this module (DR3-001).
+#[cfg(test)]
+mod repair_operator_e2e_tests;
+// Issue #664: in-crate `#[cfg(test)]` E2E suite for Bash/Setup policy
+// wiring (CB-001 fix pattern, `safe_stop_e2e_tests.rs` /
+// `job_report_e2e_tests.rs` / `behavior_contract_projection_e2e_tests.rs`
+// precedent). Production binary does not include this module (DR3-001).
+#[cfg(test)]
+mod bash_policy_e2e_tests;
+// Issue #922 (P5): in-crate `#[cfg(test)]` E2E suite for the Research
+// capability — obligation-bridge reachability, OR-tolerant acceptance,
+// answer-only non-regression, and Docs/Ops non-regression. Production binary
+// does not include this module (DR3-001 / CB-001 pattern).
+#[cfg(test)]
+mod research_acceptance_e2e_tests;
+// Issue #667: PAM advisory adapter SSOT (pure functions + decision types).
+// Module is intentionally *not* re-exported (DR3-001) — `turn.rs` is the
+// only behavioral in-crate consumer via the `record_pam_advisory_decision`
+// thin shell on `impl Agent`.
+mod pam_advisory;
+
+/// Issue #667 (DR2-004 Tier-2 / CB-001 precedent): drive
+/// `Agent::record_pam_advisory_decision` from `pam_advisory_e2e_tests`
+/// without widening the production API. `#[cfg(test)]` keeps the seam out
+/// of release builds entirely (matches the precedent set by
+/// `emit_safe_stop_report_*_for_test` and `maybe_emit_job_reports_for_test`).
+#[cfg(test)]
+pub(in crate::agent::loop_run) fn record_pam_advisory_decision_for_test(
+    agent: &mut Agent,
+    resp: &crate::photon::schema::ContextPackResponse,
+    blocked_ids: &std::collections::HashSet<String>,
+    shadow: bool,
+) {
+    let _ = agent.record_pam_advisory_decision(resp, blocked_ids, shadow);
+}
+
+#[cfg(test)]
+impl Agent {
+    /// Issue #667 test-only accessor: snapshot of the PAM decision carrier.
+    pub(in crate::agent::loop_run) fn last_pam_decision_this_turn(
+        &self,
+    ) -> Option<&pam_advisory::PamAdvisoryDecision> {
+        self.turn_state.pam_decision()
+    }
+
+    /// Issue #667 test-only accessor: deep clone of the active job selection
+    /// so a test can assert "adapter did not mutate selection state".
+    pub(in crate::agent::loop_run) fn last_active_job_selection_clone(
+        &self,
+    ) -> Option<active_job_arbiter::ActiveJobSelection> {
+        self.turn_state.last_active_job_selection.clone()
+    }
+
+    /// Issue #667 iteration-2 test-only seam: simulate the turn-boundary
+    /// reset that production `handle_user_message` performs at the top of
+    /// each turn. Lets the T5 boundary test drive multiple turns without
+    /// constructing a full request lifecycle. `#[cfg(test)]` keeps this out
+    /// of release binaries.
+    pub(in crate::agent::loop_run) fn reset_last_pam_decision_for_test(&mut self) {
+        self.turn_state.reset_pam_state();
+    }
+}
+
+/// Issue #667 (CB-001): in-crate test helpers exposed via a thin shim
+/// module so the e2e tests can reference schema-pin sample payloads and
+/// constants without exporting them across the crate boundary.
+#[cfg(test)]
+pub(in crate::agent::loop_run) mod tests_export {
+    use crate::agent::loop_run::pam_advisory::{
+        MAX_PAM_DECISION_LIST_LEN, PamAdvisoryDecision, PamAdvisoryDecisionPayload,
+        PamAdvisoryMode, PamAdvisoryTarget, PamCandidateAction, PamCandidateDecision,
+        PamDecisionEffect, ShadowVsLiveDiff, SuppressedSummary, SuppressionReason,
+    };
+
+    /// Re-export of `MemoryReport::PAYLOAD_SCHEMA_VERSION` for the
+    /// regression test (T17 schema-pin sibling). Issue #667 must remain 1.
+    pub const MEMORY_REPORT_SCHEMA_VERSION: u32 = {
+        use super::job_report::JobReport;
+        <super::job_report::MemoryReport as JobReport>::PAYLOAD_SCHEMA_VERSION
+    };
+
+    /// Schema-pin shape: build a sample `PamAdvisoryDecisionPayload`
+    /// matching the documented JSON wire format for the "live" mode.
+    pub struct PamAdvisoryDecisionPayloadShape;
+
+    impl PamAdvisoryDecisionPayloadShape {
+        pub fn sample_live() -> serde_json::Value {
+            let decision = PamAdvisoryDecision {
+                mode: PamAdvisoryMode::Live,
+                injected_summary_ids: vec!["s1".to_string()],
+                injected_summary_ids_truncated: false,
+                suppressed_summary_ids: vec![SuppressedSummary {
+                    summary_id: "s2".to_string(),
+                    reason: SuppressionReason::RoleMismatch,
+                }],
+                suppressed_summary_ids_truncated: false,
+                shadow_vs_live_diff: None,
+                active_job_role: "ArtifactRecovery:test".to_string(),
+                candidate_decisions: vec![
+                    PamCandidateDecision {
+                        summary_id: "s1".to_string(),
+                        action: PamCandidateAction::Inject,
+                        advisory_target: PamAdvisoryTarget::TaskContractCandidateGeneration,
+                        inferred_role: Some("test"),
+                        suppression_reason: None,
+                        unused_reason: None,
+                        decision_impact: "task_contract_candidate_advised",
+                        context_excerpt: "tests/foo_test.py".to_string(),
+                        context_excerpt_truncated: false,
+                    },
+                    PamCandidateDecision {
+                        summary_id: "s2".to_string(),
+                        action: PamCandidateAction::Suppress,
+                        advisory_target: PamAdvisoryTarget::TaskContractCandidateGeneration,
+                        inferred_role: Some("implementation"),
+                        suppression_reason: Some(SuppressionReason::RoleMismatch),
+                        unused_reason: Some("artifact_role_mismatch"),
+                        decision_impact: "artifact_role_mismatch_suppressed",
+                        context_excerpt: "src/lib.rs".to_string(),
+                        context_excerpt_truncated: false,
+                    },
+                ],
+                candidate_decisions_truncated: false,
+                decision_effect: PamDecisionEffect {
+                    actual_injected_count: 1,
+                    suppressed_count: 1,
+                    would_inject_in_live_count: 0,
+                    influenced_decision: "task_contract_candidate_generation",
+                },
+            };
+            decision.to_json_value()
+        }
+
+        pub fn sample_shadow() -> serde_json::Value {
+            let decision = PamAdvisoryDecision {
+                mode: PamAdvisoryMode::Shadow,
+                injected_summary_ids: Vec::new(),
+                injected_summary_ids_truncated: false,
+                suppressed_summary_ids: Vec::new(),
+                suppressed_summary_ids_truncated: false,
+                shadow_vs_live_diff: Some(ShadowVsLiveDiff {
+                    would_inject_in_live: vec!["sX".to_string()],
+                    would_inject_in_live_truncated: false,
+                }),
+                active_job_role: ":".to_string(),
+                candidate_decisions: vec![PamCandidateDecision {
+                    summary_id: "sX".to_string(),
+                    action: PamCandidateAction::WouldInjectInLive,
+                    advisory_target: PamAdvisoryTarget::TaskContractCandidateGeneration,
+                    inferred_role: Some("test"),
+                    suppression_reason: None,
+                    unused_reason: None,
+                    decision_impact: "shadow_task_contract_candidate_advised",
+                    context_excerpt: "tests/shadow_test.py".to_string(),
+                    context_excerpt_truncated: false,
+                }],
+                candidate_decisions_truncated: false,
+                decision_effect: PamDecisionEffect {
+                    actual_injected_count: 0,
+                    suppressed_count: 0,
+                    would_inject_in_live_count: 1,
+                    influenced_decision: "shadow_counterfactual",
+                },
+            };
+            decision.to_json_value()
+        }
+    }
+
+    /// Schema-pin sample for the per-list cap (T7): build a payload with
+    /// 16 injected ids and the truncated flag set so the cap is observable
+    /// in the wire format without spinning up a full adapter call.
+    pub fn sample_truncated_decision_payload() -> serde_json::Value {
+        let ids: Vec<String> = (0..MAX_PAM_DECISION_LIST_LEN)
+            .map(|i| format!("s{i:02}"))
+            .collect();
+        let decision = PamAdvisoryDecision {
+            mode: PamAdvisoryMode::Live,
+            injected_summary_ids: ids,
+            injected_summary_ids_truncated: true,
+            suppressed_summary_ids: Vec::new(),
+            suppressed_summary_ids_truncated: false,
+            shadow_vs_live_diff: None,
+            active_job_role: ":".to_string(),
+            candidate_decisions: Vec::new(),
+            candidate_decisions_truncated: false,
+            decision_effect: PamDecisionEffect {
+                actual_injected_count: MAX_PAM_DECISION_LIST_LEN as u32,
+                suppressed_count: 0,
+                would_inject_in_live_count: 0,
+                influenced_decision: "task_contract_candidate_generation",
+            },
+        };
+        decision.to_json_value()
+    }
+
+    // Type-export so the wire wrapper struct stays reachable for
+    // PamAdvisoryDecisionPayload-direct serde verification, if needed.
+    #[allow(dead_code)]
+    pub(in crate::agent::loop_run) type Payload = PamAdvisoryDecisionPayload;
+
+    /// Issue #667 T24 boundary regression: expose the per-list cap constant
+    /// so the e2e test can pin the documented value (16) without piercing
+    /// `pam_advisory.rs::pub(super)` visibility.
+    pub const MAX_PAM_DECISION_LIST_LEN_FOR_TEST: usize = MAX_PAM_DECISION_LIST_LEN;
+
+    /// Issue #667 iteration-3 BND-002 boundary regression: expose the
+    /// envelope cap so the e2e proof can pin the documented value (8 KiB)
+    /// without piercing `job_report.rs::pub(super)` visibility.
+    pub const MAX_REPORT_PAYLOAD_BYTES_FOR_TEST: usize =
+        super::job_report::MAX_REPORT_PAYLOAD_BYTES;
+
+    /// Issue #667 iteration-3 BND-002: build the design's section 6 decision-3
+    /// worst-case `PamAdvisoryDecision` — all three per-list caps fully
+    /// saturated at `MAX_PAM_DECISION_LIST_LEN = 16` entries, every
+    /// `summary_id` synthesised at exactly the renderer SSOT cap
+    /// (`MAX_BLOCKED_SUMMARY_ID_BYTES = 256` bytes) — and return the
+    /// `PamAdvisoryDecisionPayload::to_json_value()` projection that flows
+    /// into `MemoryReport.pam_decision`. The caller pairs this with
+    /// `enforce_envelope_bounds_with_pam_decision_for_test` to verify the
+    /// envelope cap proof (`section 6 decision 3`).
+    pub fn build_worst_case_pam_decision_payload_for_test() -> serde_json::Value {
+        // Each id is exactly 256 bytes of ASCII `a` — the exact SSOT cap.
+        let max_id: String = "a".repeat(crate::photon::prompt::MAX_BLOCKED_SUMMARY_ID_BYTES);
+        let injected: Vec<String> = (0..MAX_PAM_DECISION_LIST_LEN)
+            .map(|i| {
+                // Vary one suffix char so ids are distinct but stay at the
+                // 256-byte cap exactly.
+                let mut id = max_id.clone();
+                let prefix_len = format!("{i:02}").len();
+                id.replace_range(0..prefix_len, &format!("{i:02}"));
+                id
+            })
+            .collect();
+        let suppressed: Vec<SuppressedSummary> = (0..MAX_PAM_DECISION_LIST_LEN)
+            .map(|i| {
+                let mut id = max_id.clone();
+                let prefix = format!("s{i:02}");
+                id.replace_range(0..prefix.len(), &prefix);
+                SuppressedSummary {
+                    summary_id: id,
+                    reason: SuppressionReason::RoleMismatch,
+                }
+            })
+            .collect();
+        let would_inject: Vec<String> = (0..MAX_PAM_DECISION_LIST_LEN)
+            .map(|i| {
+                let mut id = max_id.clone();
+                let prefix = format!("w{i:02}");
+                id.replace_range(0..prefix.len(), &prefix);
+                id
+            })
+            .collect();
+        let decision = PamAdvisoryDecision {
+            mode: PamAdvisoryMode::Shadow,
+            injected_summary_ids: injected,
+            injected_summary_ids_truncated: true,
+            suppressed_summary_ids: suppressed,
+            suppressed_summary_ids_truncated: true,
+            shadow_vs_live_diff: Some(ShadowVsLiveDiff {
+                would_inject_in_live: would_inject,
+                would_inject_in_live_truncated: true,
+            }),
+            active_job_role: "ArtifactRecovery:test".to_string(),
+            candidate_decisions: Vec::new(),
+            candidate_decisions_truncated: true,
+            decision_effect: PamDecisionEffect {
+                actual_injected_count: MAX_PAM_DECISION_LIST_LEN as u32,
+                suppressed_count: MAX_PAM_DECISION_LIST_LEN as u32,
+                would_inject_in_live_count: MAX_PAM_DECISION_LIST_LEN as u32,
+                influenced_decision: "shadow_counterfactual",
+            },
+        };
+        decision.to_json_value()
+    }
+
+    /// Issue #667 iteration-3 BND-002 envelope-cap proof helper. Wraps the
+    /// given `PamAdvisoryDecision` JSON into a `MemoryReport`, builds the
+    /// envelope via the production `build_envelope::<MemoryReport>` chokepoint
+    /// and runs `enforce_bounds`. Returns
+    /// `(serialized_len_after_enforce, overflowed, truncated)` so the e2e
+    /// proof can assert `serialized_len <= MAX_REPORT_PAYLOAD_BYTES` and the
+    /// payload was NOT replaced with `"<dropped:overflow>"`.
+    pub fn enforce_envelope_bounds_with_pam_decision_for_test(
+        pam_decision: serde_json::Value,
+    ) -> (usize, bool, bool) {
+        use super::job_report::{MemoryReport, build_envelope, enforce_bounds};
+        let report = MemoryReport {
+            turn_index: 1,
+            pam_decision: Some(pam_decision),
+            context_pack_binding: None,
+            adopted_item_count: 0,
+            injection_skipped_reason: None,
+            task_kind: None,
+        };
+        let mut envelope = build_envelope(&report);
+        let (overflowed, truncated) = enforce_bounds(&mut envelope);
+        let serialized_len = serde_json::to_string(&envelope)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        (serialized_len, overflowed, truncated)
+    }
+}
+// Issue #667: in-crate `#[cfg(test)]` E2E suite for the PAM advisory
+// pipeline (CB-001 fix pattern, `safe_stop_e2e_tests.rs` /
+// `job_report_e2e_tests.rs` precedent). Production binary does not include
+// this module (DR3-001).
+#[cfg(test)]
+mod pam_advisory_e2e_tests;
+
+// Issue #905: regression tests that PAM advisory metadata cannot become
+// TaskContract completion authority.
+#[cfg(test)]
+mod issue905_pam_completion_tests;
+
+// Issue #919 (P2 / Decision #7 + #8): in-crate `#[cfg(test)]` per-kind matrix
+// pinning that verifier-free prose tasks (AnswerOnly / Authoring / Docs) never
+// route to a coding-verifier ExitReason / verifier-missing SafeStop. Production
+// binary excludes this module (DR3-001 / CB-001 pattern).
+#[cfg(test)]
+mod authoring_prose_verifier_free_e2e_tests;
+
+/// Test seam (#[cfg(test)] only): drive
+/// `Agent::maybe_emit_job_reports_with_linkage` from
+/// `job_report_e2e_tests` without widening the production API.
+///
+/// CB-004 fix: empty turns produce no Reports by design. The test seam
+/// passes a synthetic linkage reason so the 3 linked Reports (Artifact,
+/// Verification, Repair) are forced observable for channel-wiring
+/// tests, and pre-seeds Memory observability via
+/// `last_injected_summary_ids`. Production callers go through
+/// `maybe_emit_job_reports` (no linkage override).
+#[cfg(test)]
+pub(crate) fn maybe_emit_job_reports_for_test(agent: &mut Agent) {
+    if agent.last_injected_summary_ids.is_empty() {
+        agent
+            .last_injected_summary_ids
+            .push("test-seed-summary-id".to_string());
+    }
+    agent.maybe_emit_job_reports_with_linkage(Some("test_synthetic".to_string()));
+}
+
+// Issue #665 (Phase 8 / S7-001 / CB-001): in-crate E2E test module for
+// `BehaviorContractProjection` consumer wiring + `agent.behavior_contract.projected`
+// observability event. `#[cfg(test)]` ensures production binary does NOT
+// include the module. Rust does not auto-discover sibling test files, so
+// this explicit `mod` declaration is REQUIRED.
+#[cfg(test)]
+mod behavior_contract_projection_e2e_tests;
+// Issue #921 (P4): in-crate `#[cfg(test)]` E2E suite for the OR-tolerant Data
+// capability acceptance spine (`assess_structured_data` SSOT routed through both
+// production gates). Mirrors `safe_stop_e2e_tests.rs` / `pam_advisory_e2e_tests.rs`
+// (CB-001 / DR3-001) — production binary excludes this module, no facade re-export.
+#[cfg(test)]
+mod data_capability_e2e_tests;
+// Issue #923 (P6): in-crate E2E test module for the Ops capability — the
+// OpsRunbook obligation bridge + tiered `ops_runbook_pass` through the
+// production `verifier_diagnostic_for_obligation` path. `#[cfg(test)]` keeps it
+// out of the production binary; the explicit `mod` is required (no auto-discovery).
+#[cfg(test)]
+mod ops_capability_e2e_tests;
+// Issue #931 (P1c): in-crate `#[cfg(test)]` suite for the recovery-prompt
+// masking convention — enumerated mask + byte-equality golden tests for the
+// Choke B/C renderers and Choke D `json!` wire payloads, the shared-SSOT
+// (`obligation_report_label`) byte-identity regression, and the structural
+// source-scan guard (function-scoped allowlist + intra-function taint pass +
+// broad smoke). `#[cfg(test)]` keeps it out of the production binary; the
+// explicit `mod` is required (no auto-discovery). No facade re-export (DR3-001).
+#[cfg(test)]
+mod recovery_masking_tests;
+// Issue #924 (P7): in-crate E2E test module for the scaffold/manifest coding
+// guard — `scaffold_allowed_for_active_task` SSOT + the 10 fn-entry gates +
+// `mode_deterministic_scaffold_spec` branch-local gate + the artifact-path
+// manifest gate. `#[cfg(test)]` keeps it out of the production binary; the
+// explicit `mod` is required (no auto-discovery). Mirrors `data_capability_e2e_tests.rs`
+// (CB-001 / DR3-001) — no facade re-export.
+#[cfg(test)]
+mod scaffold_coding_guard_e2e_tests;
+// Issue #929 (P1b): combined 6-kind capability-invariant matrix. Consolidates
+// the cross-kind invariants (allows_process_exec / requires_executable_verifier
+// / is_coding / verifier_for_task_kind round-trip) otherwise scattered across
+// verifier.rs `mod tests` + the per-kind capability E2E mods into one canonical
+// table-driven SSOT, with a wildcard-free `expected` match that compile-forces a
+// 7th-kind update. `#[cfg(test)]` keeps it out of the production binary; the
+// explicit `mod` is required (no auto-discovery). No facade re-export (DR3-001).
+// Task 9 (the SRP trait split) is recorded as not-warranted in the design-policy.
+#[cfg(test)]
+mod capability_matrix_e2e_tests;
+// Issue #926 (P0.5b): in-crate E2E suite for the TaskKind confirm sidecar —
+// drives the production populate / confirm-override path (capability + scaffold
+// gate propagation, sidecar-None determinism, matched==true immutability, lazy
+// -net no-override) without Ollama. `#[cfg(test)]` keeps it out of the
+// production binary; the explicit `mod` is required. No facade re-export (DR3-001).
+mod contract_request_signals;
+mod project_profile;
+mod project_profile_projection;
 mod summary;
 mod task_contract;
+mod task_contract_admission;
+mod task_contract_artifact_contract;
+mod task_contract_artifact_intent;
+mod task_contract_artifact_predicates;
+mod task_contract_completion_policy;
+mod task_contract_controller_packet;
+mod task_contract_core;
+mod task_contract_data_output_context;
+mod task_contract_deliverable_lifecycle;
+mod task_contract_deliverable_projection;
+mod task_contract_display;
+mod task_contract_evidence_stage;
+mod task_contract_input_projection;
+mod task_contract_obligation_planning;
+mod task_contract_path_context;
+mod task_contract_recovery_model;
+mod task_contract_recovery_planning;
+mod task_contract_request_inference;
+#[cfg(test)]
+mod task_contract_request_inference_tests;
+mod task_contract_semantic_candidate;
+mod task_contract_taxonomy;
+#[cfg(test)]
+mod task_kind_confirm_e2e_tests;
+mod test_expectation_audit;
+mod verifier_command_policy;
+mod verifier_weak_reason;
+mod verifier_weak_repair_target;
+// Issue #917 (P0.5): per-turn single classification authority accessor.
+// Private module, not re-exported (DR3-001) — the 18 former `from_request`
+// sites and `run_turn` consume it via `super::task_classification::*`.
+mod task_classification;
+// Issue #926 (P0.5b): TaskKind second-pass confirm adapter (mirrors the
+// `work_mode_confirm` surface, CB-001 visibility). `pub(super)` limited / no
+// facade re-export (DR3-001) — driven from `task_classification::populate`
+// via `classify_confirm_flow::maybe_invoke_task_kind_confirm`.
+mod task_kind_confirm;
 // Issue #646: task workspace scope detection. Module is intentionally
 // *not* re-exported (DR3-001) — `turn.rs` is the only in-crate consumer
 // via `super::task_workspace_scope::*`.
 mod task_workspace_scope;
 mod tester;
+mod verifier;
+// Workspace walker helpers extracted from `turn.rs` (parent #680).
+// Hosts `workspace_appears_empty`, `meaningful_workspace_files`,
+// `collect_meaningful_workspace_files`. `pub(super)` limited / no
+// facade re-export (DR3-001).
+mod tool_policy;
 mod turn;
 pub(crate) mod verifier_skill;
 pub(crate) mod work_mode_confirm;
+mod workspace_walk;
+// Workspace candidate lookup helpers extracted from `turn.rs` (parent
+// #680). Hosts `existing_workspace_candidate_for_role_in_scope` (the
+// scope-aware lookup used by `task_contract_artifact_states` /
+// `task_contract_recovery_target`) plus the test-only legacy un-scoped
+// variant and `target_path_in_scope`. `pub(super)` limited / no facade
+// re-export (DR3-001).
+mod workspace_candidates;
 
 // Public re-exports so `lib.rs::run_cli` can hand a `FooterHandle` into
 // `Agent::new` and own the matching `FooterLease` for its scope (issue #430).
 pub use footer::{FooterHandle, FooterLease};
 
-// Re-export env helpers from `turn` so `src/tui/markdown.rs` can reuse the
+// Re-export env helpers so `src/tui/markdown.rs` can reuse the
 // existing POSIX-compliant NO_COLOR and UTF-8 locale logic without duplicating
 // it. `mod turn;` itself stays private; only these two fns leak out (issue #431).
-pub(crate) use turn::{no_color_requested, unicode_supported};
+pub(crate) use progress_text::no_color_requested;
+pub(crate) use progress_text::unicode_supported;
 
 // Issue #453: expose the precaution prompt selector so integration tests in
 // `tests/` (and any future callers) can validate the Act-mode prompt
 // selection pipeline without requiring a live Ollama call.
-pub use turn::select_precautions_for_prompt;
+pub use precaution_relevance::select_precautions_for_prompt;
 
 // Issue #556: expose pure helper functions so `tests/photon_turn_hook_smoke.rs`
 // can verify truncation and injection-message building without constructing
 // a full Agent (Ollama-free).
-pub use turn::{
+pub use photon_feedback_derive::{
     MAX_PHOTON_CONTEXT_PACK_PROMPT_BYTES, build_photon_injection_message,
     truncate_photon_context_pack,
 };
@@ -165,7 +1336,7 @@ pub use turn::{
 // `tests/photon_evaluate_signal_smoke.rs` can grep / assert against the same
 // SSOT used by production. `mod turn;` is private, so a `pub const` alone is
 // not reachable from integration tests; this re-export widens visibility.
-pub use turn::PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT;
+pub use photon_feedback_derive::PHOTON_OUTCOME_DETAIL_NO_PROGRESS_DESPITE_INJECT;
 
 // Issue #594: expose the /photon-why message builder so
 // `tests/photon_provenance_smoke.rs` can verify the 7 status branches and the
@@ -191,6 +1362,7 @@ pub fn classify_repo_edit_path_for_test(path: &std::path::Path) -> &'static str 
         RepoEditCategory::Test => "test",
         RepoEditCategory::Docs => "docs",
         RepoEditCategory::Setup => "setup",
+        RepoEditCategory::Data => "data",
         RepoEditCategory::Other => "other",
     }
 }
@@ -198,6 +1370,14 @@ pub fn classify_repo_edit_path_for_test(path: &std::path::Path) -> &'static str 
 #[doc(hidden)]
 pub fn is_completion_verifier_command_for_test(command: &str) -> bool {
     completion_evidence::is_completion_verifier_command(command)
+}
+
+#[doc(hidden)]
+pub fn acquire_footer_with_terminal_flag_for_test(
+    config: &crate::config::Config,
+    stdout_is_terminal: bool,
+) -> FooterLease {
+    footer::FooterLease::acquire_with_terminal_flag_for_test(config, stdout_is_terminal)
 }
 
 /// Issue #607: integration-test seam exposing the pure projection from a
@@ -212,7 +1392,7 @@ pub fn is_completion_verifier_command_for_test(command: &str) -> bool {
 pub fn build_verifier_exit_zero_evidence_for_test(
     outcome: &crate::tools::bash::BashExecutionOutcome,
 ) -> Option<(String, &'static str)> {
-    let evidence = turn::build_verifier_exit_zero_evidence(outcome)?;
+    let evidence = verifier_orchestration::build_verifier_exit_zero_evidence(outcome)?;
     match evidence {
         completion_evidence::CompletionEvidence::VerifierExitZero { class, command, .. } => {
             Some((command, class.as_str()))
@@ -332,7 +1512,9 @@ pub(crate) fn emit_safe_stop_report_diagnostic_target_missing_for_test(agent: &m
         // production guarantee by ensuring callers see the same no-op path.
         agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
     }
-    agent.emit_safe_stop_report_for_diagnostic_target_missing();
+    crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_diagnostic_target_missing(
+        agent,
+    );
 }
 
 /// Issue #654 (E.3) test seam: invoke the `verifier_failed_safe_stop` emit
@@ -343,7 +1525,9 @@ pub(crate) fn emit_safe_stop_report_verifier_failed_safe_stop_for_test(agent: &m
     if agent.repair_job.is_none() {
         agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
     }
-    agent.emit_safe_stop_report_for_verifier_failed_safe_stop();
+    crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_verifier_failed_safe_stop(
+        agent,
+    );
 }
 
 /// Issue #654 (E.4) test seam: invoke the `verifier_weak` emit shell. In
@@ -354,7 +1538,153 @@ pub(crate) fn emit_safe_stop_report_verifier_weak_for_test(agent: &mut Agent) {
     if agent.repair_job.is_none() {
         agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
     }
-    agent.emit_safe_stop_report_for_verifier_weak();
+    crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_verifier_weak(agent);
+}
+
+/// Issue #662 test seam: invoke the `repair_exhausted` emit shell. In
+/// production this fires when `record_repair_attempt_outcome` reports
+/// `PromotionResult.all_clusters_exhausted = true` at either the Applied
+/// path (`turn.rs::drive_task_contract_verifier`) or the Invalid path
+/// (`record_controller_verifier_repair_invalid`).
+///
+/// `#[cfg(test)] pub(crate)` scoping matches the existing 5 stop-reason
+/// in-crate E2E seams introduced by Codex review v1 / CB-001 (the
+/// `safe_stop_e2e_tests.rs` precedent — production binary excludes the test
+/// mod, the seam is invisible to release builds, and DR3-001 holds because
+/// no internal `pub(super)` type leaks across the `pub(crate)` boundary).
+#[cfg(test)]
+pub(crate) fn emit_safe_stop_report_repair_exhausted_for_test(agent: &mut Agent) {
+    if agent.repair_job.is_none() {
+        agent.repair_job = Some(repair_job::RepairJob::empty_synthetic());
+    }
+    verifier_orchestration::emit_safe_stop_report_for_repair_exhausted(agent);
+}
+
+/// Issue #662 (Codex CB-002): production-path test seam that drives the
+/// full Applied / Invalid caller observation pipeline. The Codex review v1
+/// CB-002 finding was that the Applied caller in `drive_task_contract_verifier`
+/// and the Invalid caller in `record_controller_verifier_repair_invalid`
+/// independently observed `PromotionResult` and called the emit shell — a
+/// CB-002-style regression in either site would leak past the unit test
+/// surface. This seam pairs the **production** `record_repair_attempt_outcome`
+/// and `maybe_emit_repair_exhausted_from_promotion` helpers so the in-crate
+/// E2E suite exercises the actual production observation/emit pair.
+///
+///   1. seed `Agent.repair_job` with a `RepairJob` whose `semantic_plan`
+///      carries a single cluster bound to `cluster_label` + `role_label` so
+///      the `record_repair_attempt_outcome` precondition (`semantic_plan =
+///      Some`) is satisfied;
+///   2. push two outcomes (the caller picks the variants as `kind_labels`
+///      so the test can cover Applied caller paths
+///      (`applied_no_progress` / `applied_worsened`) or Invalid caller
+///      paths (`rejected_noop` / `rejected_malformed` / `rejected_duplicate`));
+///   3. after each push, invoke the **production**
+///      `Agent::maybe_emit_repair_exhausted_from_promotion` helper — the
+///      very same observation/emit pair the Applied caller (in
+///      `drive_task_contract_verifier`) and the Invalid caller (in
+///      `record_controller_verifier_repair_invalid`) call in production.
+///
+/// **`#[cfg(test)] pub(crate)` scoping (DR3-001 / `private_interfaces`)**:
+/// only `&mut Agent` and string literals cross the `pub(crate)` boundary,
+/// so the internal types (`ArtifactRole` / `RepairAttemptOutcomeKind` /
+/// `SemanticRepairPlan`) stay `pub(super)` to the `loop_run` module,
+/// mirroring `emit_safe_stop_report_artifact_completion_failed_for_test`'s
+/// `role_label: &str` convention. The seam is invisible to release builds.
+///
+/// Unknown labels are mapped to a deterministic fallback (Implementation
+/// role / RejectedNoop kind) so a typo never silently produces a different
+/// behavioural path than the test intended.
+#[cfg(test)]
+pub(crate) fn drive_record_repair_attempt_outcomes_for_test(
+    agent: &mut Agent,
+    cluster_label: &str,
+    role_label: &str,
+    kind_labels: &[&str],
+) {
+    use repair_attempt_outcome::{RepairAttemptOutcome, RepairAttemptOutcomeKind};
+    use repair_job::{RepairJob, SemanticRepairPlan};
+    use semantic_failure::{cluster_key_for_test, parse_semantic_failure_report};
+    use spec_authority::SpecAuthority;
+
+    // Issue #920: canonical labels via the `from_label` SSOT; Implementation
+    // is the deterministic fallback for unknown labels.
+    let role = task_contract::ArtifactRole::from_label(role_label)
+        .unwrap_or(task_contract::ArtifactRole::Implementation);
+
+    // Build a minimal semantic_report with exactly one cluster bound to
+    // `cluster_label` so `next_repairable_cluster` returns `None` (= all
+    // clusters exhausted) as soon as the `(cluster, role)` lands in
+    // `exhausted_attempts`. The cluster's `cluster_key` is overridden to
+    // match `cluster_key_for_test(cluster_label)`, mirroring the existing
+    // `semantic_report_fixture_with_cluster` repair_job.rs helper.
+    let json = serde_json::json!({
+        "failure_kind": "assertion_mismatch",
+        "confidence": 0.7,
+        "preferred_repair_role": role_label,
+        "repair_hypothesis": "hypothesis text",
+        "failure_clusters": [
+            {
+                "observed": cluster_label,
+                "expected": "exp",
+                "input_shape": "shape",
+                "assertion_shape": "AssertEq",
+                "involved_artifacts": ["test"],
+                "affected_cases": ["case1"],
+            }
+        ],
+    });
+    let mut report = parse_semantic_failure_report(&json).expect("fixture parses");
+    let cluster_key = cluster_key_for_test(cluster_label);
+    if let Some(cluster) = report.failure_clusters.get_mut(0) {
+        cluster.cluster_key = cluster_key.clone();
+        cluster
+            .admitted_cluster_targets
+            .push(task_contract::RecoveryTargetHint {
+                role,
+                path: format!("tests/{cluster_label}_smoke.rs"),
+                reason: "CB-002 fixture".to_string(),
+            });
+    }
+    let plan = SemanticRepairPlan {
+        semantic_report: report,
+        failure_cluster_id: cluster_key.clone(),
+        semantic_cause: crate::agent::loop_run::VerifierDiagnosticFailureKind::AssertionMismatch,
+        spec_authority: SpecAuthority::BehaviorContract,
+        preferred_repair_role: role,
+        repair_hypothesis: "h".to_string(),
+        expected_improvement: None,
+        assessment_generation_at_creation: 0,
+    };
+    let job = RepairJob {
+        semantic_plan: Some(plan),
+        ..RepairJob::new_for_test()
+    };
+    agent.repair_job = Some(job);
+
+    // Drive each pushed outcome through the production observation/emit
+    // pair (`record_repair_attempt_outcome` + `maybe_emit_repair_exhausted_
+    // from_promotion`). The second push (count >= 2 for the same (cluster,
+    // role)) is what flips `all_clusters_exhausted` to `true` for this
+    // single-cluster fixture.
+    for label in kind_labels {
+        // Map the test-supplied label to the internal kind. Unknown labels
+        // fall through to `RejectedNoop` (safe default — Invalid caller
+        // path, no weakening metadata required).
+        let kind = match *label {
+            "applied_no_progress" => RepairAttemptOutcomeKind::AppliedNoProgress,
+            "applied_worsened" => RepairAttemptOutcomeKind::AppliedWorsened,
+            "rejected_noop" => RepairAttemptOutcomeKind::RejectedNoop,
+            "rejected_duplicate" => RepairAttemptOutcomeKind::RejectedDuplicate,
+            "rejected_malformed" => RepairAttemptOutcomeKind::RejectedMalformed,
+            _ => RepairAttemptOutcomeKind::RejectedNoop,
+        };
+        let outcome = RepairAttemptOutcome::for_test(cluster_key.clone(), role, kind);
+        let promotion = agent
+            .repair_job
+            .as_mut()
+            .map(|job| job.record_repair_attempt_outcome(outcome));
+        verifier_orchestration::maybe_emit_repair_exhausted_from_promotion(agent, promotion);
+    }
 }
 
 /// Issue #654 (E.5) test seam: invoke the `verifier_missing` emit shell
@@ -364,7 +1694,7 @@ pub(crate) fn emit_safe_stop_report_verifier_missing_for_test(agent: &mut Agent)
     if agent.missing_verifier_job.is_none() {
         agent.missing_verifier_job = Some(repair_job::MissingVerifierJob::new(1, 0));
     }
-    agent.emit_safe_stop_report_for_verifier_missing();
+    crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_verifier_missing(agent);
 }
 
 /// Issue #654 (E.2) test seam: invoke the `artifact_completion_failed` emit
@@ -376,20 +1706,22 @@ pub(crate) fn emit_safe_stop_report_artifact_completion_failed_for_test(
     role_label: &str,
     expected_target: Option<String>,
 ) {
-    let role = match role_label {
-        "test" => task_contract::ArtifactRole::Test,
-        "usage_docs" => task_contract::ArtifactRole::UsageDocs,
-        "setup" => task_contract::ArtifactRole::Setup,
-        _ => task_contract::ArtifactRole::Implementation,
-    };
-    agent.emit_safe_stop_report_for_artifact_completion_failed(role, expected_target);
+    // Issue #920: canonical labels via the `from_label` SSOT; Implementation
+    // is the deterministic fallback for unknown labels.
+    let role = task_contract::ArtifactRole::from_label(role_label)
+        .unwrap_or(task_contract::ArtifactRole::Implementation);
+    crate::agent::loop_run::safe_stop_emit::emit_safe_stop_report_for_artifact_completion_failed(
+        agent,
+        role,
+        expected_target,
+    );
 }
 
 /// Issue #654 test seam: clear the per-turn dedup marker so a test can verify
 /// the reset path (re-emit after `handle_user_message`-style clear).
 #[cfg(test)]
 pub(crate) fn clear_safe_stop_report_dedup_for_test(agent: &mut Agent) {
-    agent.safe_stop_report_emitted.clear();
+    agent.turn_state.safe_stop_report_emitted.clear();
 }
 
 /// Issue #659 (Phase 4 / Task 4.1) test seam: simulate "agent successfully
@@ -433,8 +1765,275 @@ pub(crate) fn seed_artifact_ledger_repo_edit_for_test(agent: &mut Agent, path: S
         return;
     };
 
-    let scope = agent.current_workspace_scope();
-    agent.seed_artifact_ledger_repo_edit(&path, role, &scope);
+    let scope = workspace_access::current_workspace_scope(agent);
+    crate::agent::loop_run::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        agent, &path, role, &scope,
+    );
+}
+
+// Issue #664 — in-crate `#[cfg(test)]` test seams for the Bash/Setup
+// policy E2E suite. The seams follow the precedent established by
+// #654 (`emit_safe_stop_report_*_for_test`) / #659
+// (`seed_artifact_ledger_repo_edit_for_test`) / #666
+// (`maybe_emit_job_reports_for_test`): `#[cfg(test)] pub(crate)`-only,
+// signature accepts primitives + `&{,mut} Agent`, never leaks an
+// internal `pub(super)` type across the boundary (DR3-001 / AD19 /
+// S7-003 / DR2-005). Production code MUST NOT reach into these.
+
+/// Issue #664 test seam: install a freshly built `ArtifactCompletionJob`
+/// for the requested role on the agent so the structured report
+/// projection pipeline (Phase 4 `attempt_outcome_to_json_value` +
+/// `job_report.rs::maybe_emit_job_reports`) can be exercised without
+/// driving the full recovery target plumbing. Accepts a role label
+/// string + workspace-relative path (primitives only — `ArtifactRole`
+/// stays `pub(super)`).
+///
+/// The seam:
+/// 1. Maps the role string to `ArtifactRole` via the same vocabulary
+///    used by `emit_safe_stop_report_artifact_completion_failed_for_test`.
+/// 2. Materialises the path as a real file under `agent.work_root` so
+///    `ArtifactCompletionJob::new` succeeds (it canonicalises the path
+///    via `classify_ownership`).
+/// 3. Installs the resulting job at `agent.artifact_completion_job`.
+#[cfg(test)]
+pub(crate) fn seed_artifact_completion_job_pending_for_test(
+    agent: &mut Agent,
+    role_label: &str,
+    relative_path: &str,
+) {
+    use std::fs;
+    // Issue #920: canonical labels via the `from_label` SSOT; Implementation
+    // is the deterministic fallback for unknown labels.
+    let role = task_contract::ArtifactRole::from_label(role_label)
+        .unwrap_or(task_contract::ArtifactRole::Implementation);
+
+    // Materialise the file under work_root so `ArtifactCompletionJob::new`
+    // accepts the target. Parent directories are created best-effort.
+    let target_full = agent.work_root.join(relative_path);
+    if let Some(parent) = target_full.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&target_full, "// seeded for bash_policy_e2e_tests\n");
+
+    let hint = task_contract::RecoveryTargetHint {
+        role,
+        path: relative_path.to_string(),
+        reason: "664 e2e seed".to_string(),
+    };
+
+    let scope = workspace_access::current_workspace_scope(agent);
+    let work_root = agent.work_root.clone();
+    if let Ok(job) = artifact_completion_job::ArtifactCompletionJob::new(
+        &work_root, &scope, hint, true,  // edited_this_session
+        false, // scaffold_changed
+    ) {
+        agent.artifact_completion_job = Some(job);
+    }
+}
+
+/// Issue #664 iteration-2 (CB-001) test seam: drive the per-turn Stage A
+/// observation flag (`owned_test_verifier_missing_observed_this_turn`)
+/// so `bash_policy_e2e_tests.rs` can exercise both halves of the
+/// SetupBootstrap decision tree without spinning up a real verifier
+/// run. Production code sets the flag in
+/// `run_task_contract_verifier_once`'s `OwnedTestVerifierPlan::Missing`
+/// arm; this seam mirrors that producer for unit-level E2E.
+///
+/// The seam takes a `bool` so it can also un-set the flag — useful for
+/// pinning the Stage-A-false branch (false-positive suppression
+/// regression) from the same fixture.
+#[cfg(test)]
+pub(crate) fn seed_owned_test_verifier_missing_for_test(agent: &mut Agent, observed: bool) {
+    agent.owned_test_verifier_missing_observed_this_turn = observed;
+}
+
+/// Issue #664 iteration-3 (CB2-001) test seam: drive the cross-turn
+/// carryover for the Stage A observation. Mirrors the production
+/// setter inside `run_task_contract_verifier_once`'s
+/// `OwnedTestVerifierPlan::Missing` arm without requiring a live
+/// verifier run + SafeStop cycle.
+///
+/// Issue #664 iteration-4 (CB3-001): the seam takes an
+/// `Option<&str>` so tests can bind the carryover to a specific
+/// originating request text (`Some`) or clear it (`None`). The raw
+/// text is immediately piped through `mask_secrets` +
+/// `stable_path_hash` inside `RequestCarryoverKey::from_request`, so
+/// the seam never persists the raw string on the Agent.
+#[cfg(test)]
+pub(crate) fn seed_owned_test_verifier_missing_carryover_for_test(
+    agent: &mut Agent,
+    originating_request_text: Option<&str>,
+) {
+    agent.owned_test_verifier_missing_observed_carryover =
+        originating_request_text.map(task_contract::RequestCarryoverKey::from_request);
+}
+
+/// Issue #664 iteration-3 (CB2-001) test seam: simulate the next-turn
+/// entry into `run_actor_loop` so unit tests can drive the carryover
+/// → `_this_turn` promotion without spinning up the full actor loop.
+///
+/// Issue #664 iteration-4 (CB3-001): the seam now takes
+/// `current_request_text: Option<&str>` to mirror the
+/// request-bound consume semantics implemented in
+/// `run_actor_loop`'s head. The carryover promotes into
+/// `_this_turn` iff the current-turn key equals the stored key;
+/// otherwise the carryover is cleared without promotion (topic
+/// switch / unrelated request).
+#[cfg(test)]
+pub(crate) fn consume_carryover_at_actor_loop_head_for_test(
+    agent: &mut Agent,
+    current_request_text: Option<&str>,
+) {
+    let promoted = match (
+        agent.owned_test_verifier_missing_observed_carryover.take(),
+        current_request_text,
+    ) {
+        (Some(stored), Some(current)) => {
+            let current_key = task_contract::RequestCarryoverKey::from_request(current);
+            stored == current_key
+        }
+        // No stored carryover OR no current request text → no promotion.
+        _ => false,
+    };
+    agent.owned_test_verifier_missing_observed_this_turn = promoted;
+}
+
+/// Issue #664 iteration-3 (CB2-001) test seam: read both Stage A
+/// flags as a primitive `(observed_this_turn, carryover_present)`
+/// tuple. Used by `bash_policy_e2e_tests` to assert the consume-once
+/// invariant.
+///
+/// Issue #664 iteration-4 (CB3-001): the second tuple slot is now
+/// `carryover.is_some()` rather than a raw bool field — the seam
+/// never returns the underlying `RequestCarryoverKey` so the hash
+/// digest stays inside the `pub(super)` boundary (DR3-001 /
+/// forgeability-safe).
+#[cfg(test)]
+pub(crate) fn owned_test_verifier_missing_flags_for_test(agent: &Agent) -> (bool, bool) {
+    (
+        agent.owned_test_verifier_missing_observed_this_turn,
+        agent
+            .owned_test_verifier_missing_observed_carryover
+            .is_some(),
+    )
+}
+
+/// Issue #664 iteration-4 (CB3-001) test seam: assert that the raw
+/// request text is never directly stored in the carryover field.
+/// Returns `true` iff a carryover is present AND its 16-hex
+/// `originating_request_hash` is NOT equal to the raw `needle`
+/// text — proving the carryover key passed through
+/// `mask_secrets` + `stable_path_hash` (the hash digest differs
+/// from any raw input).
+///
+/// Returns `false` (= "raw text NOT detected"; the safe outcome) if
+/// the carryover is absent.
+#[cfg(test)]
+pub(crate) fn carryover_key_raw_text_not_stored_for_test(agent: &Agent, needle: &str) -> bool {
+    match &agent.owned_test_verifier_missing_observed_carryover {
+        Some(key) => {
+            let hash = key.originating_request_hash_for_test();
+            !hash.contains(needle) && hash != needle
+        }
+        None => true,
+    }
+}
+
+/// Issue #664 test seam: project the production `build_arbiter_candidates`
+/// output into a primitive 4-field DTO array (`kind` /
+/// `desired_action_label` / `allowed_tool_names` / `budget_kind`).
+///
+/// The seam never returns the internal `pub(super)` types
+/// (`JobCandidate` / `EffectiveToolPolicy` / `Budget` etc.) so DR3-001 /
+/// AD19 / DR2-005 are upheld at the type level (the return type itself
+/// is the contract — see `test_seam_return_type_is_primitive_only`).
+///
+/// Each element shape:
+/// ```jsonc
+/// {
+///   "kind": "VerifierRepair" | "ForcedSmallEditRecovery" | ... | "SetupBootstrap",
+///   "desired_action_label": "verifier_repair" | ... | "setup_bash",
+///   "allowed_tool_names": ["Bash"]   // None policy → empty array
+///   "budget_kind": "unbounded" | "bounded"
+/// }
+/// ```
+#[cfg(test)]
+pub(crate) fn build_arbiter_candidates_for_test(agent: &Agent) -> Vec<serde_json::Value> {
+    let candidates =
+        crate::agent::loop_run::test_seams::build_arbiter_candidates_pub_for_test(agent);
+    candidates
+        .into_iter()
+        .map(|c| {
+            let allowed_tool_names: Vec<String> = c
+                .policy
+                .allowed_tool_names_for_prompt()
+                .map(|tools| tools.iter().map(|s| (*s).to_string()).collect())
+                .unwrap_or_default();
+            let budget_kind = match c.budget {
+                active_job_arbiter::Budget::Unbounded => "unbounded",
+                active_job_arbiter::Budget::Bounded { .. } => "bounded",
+            };
+            serde_json::json!({
+                "kind": c.kind.as_str(),
+                "desired_action_label": c.desired_action.label(),
+                "allowed_tool_names": allowed_tool_names,
+                "budget_kind": budget_kind,
+            })
+        })
+        .collect()
+}
+
+/// Issue #664 test seam: project the production `effective_tool_policy()`
+/// into a primitive `(Vec<String>, String)` tuple
+/// (`(allowed_tool_names, reason_label)`).
+///
+/// As with `build_arbiter_candidates_for_test`, the return type carries
+/// only primitives so the internal `EffectiveToolPolicy` /
+/// `EffectiveToolPolicyReason` types stay private to the `loop_run`
+/// module (DR3-001 / DR2-005).
+#[cfg(test)]
+pub(crate) fn effective_tool_policy_for_test(agent: &Agent) -> (Vec<String>, String) {
+    let policy = crate::agent::loop_run::test_seams::effective_tool_policy_pub_for_test(agent);
+    let allowed_tool_names: Vec<String> = policy
+        .allowed_tool_names_for_prompt()
+        .map(|tools| tools.iter().map(|s| (*s).to_string()).collect())
+        .unwrap_or_default();
+    let reason_label = policy.reason().as_str().to_string();
+    (allowed_tool_names, reason_label)
+}
+
+/// Issue #664 iteration-3 (CB2-003) test seam: drive the
+/// `effective_tool_policy_error_for_call_with_scope` rejection +
+/// `record_artifact_completion_bash_violation` chokepoint under an
+/// `artifact_directed_from_job` policy that was built from the currently-
+/// installed `ArtifactCompletionJob`.
+///
+/// Returns
+/// `Some((error_string, bash_policy_violation_marker, attempts_after))`
+/// — `bash_policy_violation_marker` is the marker observed on the
+/// **latest** attempt (`None` when no attempt was recorded). Returns
+/// `None` when no `ArtifactCompletionJob` is installed (the seam refuses
+/// to fabricate a policy without a real job).
+///
+/// All return values are primitive types (`String` / `bool` / `usize`)
+/// so `EffectiveToolPolicy` / `ArtifactAttemptOutcome` stay private to
+/// the `loop_run` module (DR3-001 / AD19 / DR2-005).
+#[cfg(test)]
+pub(crate) fn drive_artifact_directed_policy_error_for_test(
+    agent: &mut Agent,
+    name: &str,
+    arguments: serde_json::Value,
+) -> Option<(Option<String>, Option<bool>, usize)> {
+    let policy = crate::agent::loop_run::test_seams::artifact_directed_policy_for_test(agent)?;
+    let (err, _delta) = crate::agent::loop_run::test_seams::drive_policy_error_for_test(
+        agent, &policy, name, &arguments,
+    );
+    let marker =
+        crate::agent::loop_run::test_seams::last_attempt_bash_policy_violation_for_test(agent);
+    let attempts_after =
+        crate::agent::loop_run::test_seams::artifact_completion_job_attempts_len_for_test(agent)
+            .unwrap_or(0);
+    Some((err, marker, attempts_after))
 }
 
 // Issue #576: expose WorkMode second-pass confirmation adapter surface so
@@ -526,6 +2125,16 @@ pub struct Agent {
     /// `handle_user_message`, set to `true` only when an actual sidecar call
     /// was attempted (Completed/Failed); Skipped does not consume the cap.
     reminder_called_this_turn: bool,
+    /// Issue #917 (P0.5): per-turn single task-classification authority. The
+    /// `OnceCell` enforces "classify exactly once per turn" at the type level;
+    /// eager-populated right after `push_user_message` (run_turn) and shared by
+    /// the 18 former `TaskContract::from_request` sites via
+    /// `task_classification::task_contract_authority`. Reset (`OnceCell::new()`)
+    /// at the top of every `handle_user_message`. `std::cell::OnceCell` + `Rc`
+    /// suit the synchronous single-thread agent loop; if `Agent: Send` is ever
+    /// required, switch to `std::sync::OnceLock` + `Arc`.
+    pub(in crate::agent::loop_run) task_contract_this_turn:
+        std::cell::OnceCell<std::rc::Rc<task_contract::TaskContract>>,
     /// Issue #459: per-turn cap for the Tester Skill. Reset at the top of every
     /// `handle_user_message`. Consumed only when a Tester smoke run actually
     /// dispatched (Recorded / Aborted); NotInvoked does not consume the cap.
@@ -541,6 +2150,21 @@ pub struct Agent {
     /// the cap is consumed (`true`), the value already in the session is the
     /// authoritative resolved mode and must not be clobbered.
     pub(super) work_mode_confirm_called_this_turn: bool,
+    /// Issue #926 (P0.5b): per-turn cap for the TaskKind second-pass confirm.
+    /// Reset in `process_line` (commands.rs) adjacent to
+    /// `work_mode_confirm_called_this_turn`, before the Plan early-returns, so
+    /// an `execute_approved_plan` turn does not inherit a stale `true`
+    /// (DR2-001). Consumed only when the orchestrator actually dispatches to the
+    /// sidecar LLM (`model.is_some()`); the `sidecar: None` no-op does not
+    /// consume it. The dispatch site is single (`populate_task_contract_authority`
+    /// via `run_turn`), so the OnceCell idempotency + this cap together
+    /// guarantee one dispatch per turn.
+    pub(super) task_kind_confirm_called_this_turn: bool,
+    /// Per-turn cap for the ProjectProfile second-pass confirmation. This runs
+    /// at the same task-contract authority boundary as TaskKind confirmation,
+    /// but refines objective deliverable/evidence details rather than tool
+    /// policy or the coarse task kind.
+    pub(super) project_profile_confirm_called_this_turn: bool,
     /// Issue #579: per-turn cap for the FeedbackKind second-pass confirmation.
     /// Reset at the top of every `run_turn` (DR2-005), consumed only when the
     /// orchestrator actually dispatches to the sidecar LLM (i.e.
@@ -709,6 +2333,15 @@ pub struct Agent {
     /// projection_recovery_target()` at the same call sites — there is no
     /// divergent independent assignment outside of `set_artifact_recovery_target_from_hint`.
     current_artifact_recovery_target: Option<crate::agent::loop_run::task_contract::RecoveryTarget>,
+    /// Turn-local reset-only carriers grouped behind one owner. WP8 starts
+    /// with event dedup state; additional reset-only fields can move here in
+    /// small, auditable batches.
+    pub(in crate::agent::loop_run) turn_state: turn_state::TurnState,
+    /// Issue #950: turn-local controller strategy ledger for delegated
+    /// local-LLM persistence. Static labels only; no commands, paths, tool
+    /// args, or approval details. Reset at every user turn and actor-loop
+    /// entry, consumed by eval logging and focused controller tests.
+    controller_policy_ledger: crate::agent::loop_run::controller_policy::ControllerPolicyLedger,
     /// Issue #652: in-flight artifact-completion job (role-specific retry
     /// budget, sanitized attempt history, wrong-target / no-tool / prose-only
     /// / role-policy-violation taxonomy). Reset at every
@@ -813,27 +2446,6 @@ pub struct Agent {
     /// artifacts cannot auto-promote themselves (Issue #646 §修正方針 2
     /// `Owned` rules).
     turn_edited_relative_paths: std::collections::HashSet<String>,
-    /// Issue #654 (DR1-006): per-turn dedup marker for the `agent.safe_stop.report`
-    /// event. `HashSet<StopReason>` provides type-safe membership tests
-    /// (typo detection at compile time). Reset at the head of every
-    /// `handle_user_message` so a new turn can re-emit the same StopReason.
-    /// NOT serialized — `SessionSnapshot` / `CaseRecord` / `EvalTurnRecord`
-    /// persistence schemas are unchanged by Issue #654.
-    pub(in crate::agent::loop_run) safe_stop_report_emitted:
-        std::collections::HashSet<repair_job::StopReason>,
-    /// Issue #660 (Phase C / DD-4): per-turn diff-based dedup state for the
-    /// `agent.active_job.selected` structured log event. Holds the
-    /// `ActiveJobSelection` most recently passed to
-    /// `emit_active_job_selected_if_changed`; the helper re-emits only when
-    /// the new selection differs. Reset at the head of every
-    /// `handle_user_message` adjacent to `safe_stop_report_emitted.clear()`
-    /// (per DR1-007 — per-turn reset group locality).
-    ///
-    /// NOT serialized — `SessionSnapshot` / `CaseRecord` / `EvalTurnRecord`
-    /// persistence schemas are unchanged by Issue #660 (in-memory only,
-    /// same pattern as `safe_stop_report_emitted` and `artifact_ledger`).
-    pub(in crate::agent::loop_run) last_active_job_selection:
-        Option<active_job_arbiter::ActiveJobSelection>,
     /// Issue #659 (Phase 2): per-turn SSOT for artifact observations
     /// (Existing / Scaffold / RepoEdit) + verifier observations bound by
     /// path. Adapter-period contract: `turn_edited_relative_paths` remains
@@ -847,6 +2459,69 @@ pub struct Agent {
     /// ledger lives only on `Agent`, never on `SessionSnapshot`.
     pub(in crate::agent::loop_run) artifact_ledger:
         crate::agent::loop_run::artifact_ledger::ArtifactLedger,
+    /// Issue #979 (parent #974, Issue E): per-turn budget for the zero-file
+    /// tool-protocol-failure escalation. Set the first time
+    /// `actor_loop_pre_reply_request_error` escalates a protocol failure back
+    /// into the tool/action path (instead of a 0-file terminal); a second
+    /// protocol failure in the same turn then takes the terminal path so the
+    /// protocol classification is preserved and the loop cannot churn. Reset at
+    /// the actor-loop head in `prepare_actor_loop_state`.
+    pub(in crate::agent::loop_run) tool_protocol_recovery_escalated_this_turn: bool,
+    /// Issue #664 iteration-2 (CB-001): per-turn observation flag set when
+    /// `run_task_contract_verifier_once` observes
+    /// `OwnedTestVerifierPlan::Missing`. Read by
+    /// `build_arbiter_candidates` as Stage A of the
+    /// `VerifierPrerequisiteSignal` (the live observation path,
+    /// distinguished from Stage B label fallback).
+    ///
+    /// Reset to `false` at the head of every `handle_user_message`
+    /// (alongside `verifier_safe_stop_emitted_this_turn`) so a previous
+    /// turn's verifier-missing observation cannot leak into the current
+    /// turn's SetupBootstrap decision tree (CLAUDE.md per-turn rule).
+    ///
+    /// NOT serialized (per-turn runtime state only).
+    pub(in crate::agent::loop_run) owned_test_verifier_missing_observed_this_turn: bool,
+    /// Issue #664 iteration-3 (CB2-001): cross-turn carryover for the
+    /// Stage A `OwnedTestVerifierPlan::Missing` observation. The
+    /// iteration-2 flag was reset at `run_actor_loop` head, but the
+    /// only production setter is the `Missing` arm in
+    /// `run_task_contract_verifier_once` which immediately returns
+    /// `TaskContractVerifierOutcome::SafeStop` — the same turn never
+    /// reaches a subsequent `build_arbiter_candidates` cycle that
+    /// could consume the signal. Without a carryover, the next user
+    /// message starts a fresh turn that resets the flag before any
+    /// arbiter call can see it (`Stage A live observation set only on
+    /// a terminal SafeStop path` — Codex CB2-001).
+    ///
+    /// The carryover preserves the Stage A observation across exactly
+    /// one turn boundary so the next `handle_user_message` can promote
+    /// it into `owned_test_verifier_missing_observed_this_turn` at the
+    /// head of `run_actor_loop`, before the per-turn reset would
+    /// otherwise drop it. The carryover is consumed exactly once and
+    /// reset on the same turn so it never accumulates across multiple
+    /// safe-stop cycles.
+    ///
+    /// Issue #664 iteration-4 (CB3-001): the carryover is now a
+    /// `RequestCarryoverKey` (16-hex digest of `mask_secrets(originating
+    /// request text)`) instead of a plain `bool`. The actor-loop head
+    /// consumer promotes the carryover into
+    /// `owned_test_verifier_missing_observed_this_turn` only when the
+    /// **current** turn's request still hashes to the same key. A topic
+    /// switch (different request text) clears the carryover and does
+    /// NOT promote, closing the false-positive grant of the
+    /// `setup_bootstrap` Bash-only policy to unrelated requests.
+    ///
+    /// NOT serialized (cross-turn runtime state only; #659 / #663 ledger
+    /// is the authority for any persisted ownership / completion data).
+    pub(in crate::agent::loop_run) owned_test_verifier_missing_observed_carryover:
+        Option<task_contract::RequestCarryoverKey>,
+    /// Issue #994 (parent #988, Issue F): per-turn carrier for the
+    /// `ContractConflictJob` arbitrated at the `repair_exhausted` chokepoint.
+    /// `is_some()` drives the `agent.contract_arbitration.report` emit in
+    /// `maybe_emit_job_reports_with_linkage`. Reset to `None` at the head of
+    /// every `handle_user_message` (per-turn rule). NOT serialized.
+    pub(in crate::agent::loop_run) last_contract_conflict_job_this_turn:
+        Option<contract_conflict_job::ContractConflictJob>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -881,6 +2556,11 @@ enum VerifierFailureType {
     /// `verifier_failure_type_for_diagnostic_kind` /
     /// `classify_verifier_failure_type` never map to this variant — DR3-005).
     DiagnosticTargetMissing,
+    /// Issue #662: control-flow failure_type emitted when `StopReason::RepairExhausted`
+    /// fires. `SafeStopReport::build_from` sets this variant directly via the
+    /// same `if stop_reason == ...` upgrade pattern used for
+    /// `DiagnosticTargetMissing`; classifier helpers never map to this variant.
+    RepairExhausted,
 }
 
 impl VerifierFailureType {
@@ -893,6 +2573,7 @@ impl VerifierFailureType {
             Self::MissingVerifierOrConfig => "missing_verifier_or_config",
             Self::Unknown => "unknown",
             Self::DiagnosticTargetMissing => "diagnostic_target_missing",
+            Self::RepairExhausted => "repair_exhausted",
         }
     }
 }
@@ -916,6 +2597,12 @@ enum VerifierRepairAssessmentSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VerifierDiagnosticFailureKind {
+    MissingFile,
+    InvalidManifest,
+    BadTest,
+    WrongSemantics,
+    EvidenceMissing,
+    SchemaMismatch,
     DependencyMissing,
     LocalImportContractMismatch,
     CompileOrSyntaxError,
@@ -929,6 +2616,12 @@ enum VerifierDiagnosticFailureKind {
 impl VerifierDiagnosticFailureKind {
     fn as_str(self) -> &'static str {
         match self {
+            Self::MissingFile => "missing_file",
+            Self::InvalidManifest => "invalid_manifest",
+            Self::BadTest => "bad_test",
+            Self::WrongSemantics => "wrong_semantics",
+            Self::EvidenceMissing => "evidence_missing",
+            Self::SchemaMismatch => "schema_mismatch",
             Self::DependencyMissing => "dependency_missing",
             Self::LocalImportContractMismatch => "local_import_contract_mismatch",
             Self::CompileOrSyntaxError => "compile_or_syntax_error",
@@ -941,7 +2634,14 @@ impl VerifierDiagnosticFailureKind {
     }
 
     fn allows_setup_target(self) -> bool {
-        matches!(self, Self::DependencyMissing | Self::ConfigOrVerifierError)
+        matches!(
+            self,
+            Self::DependencyMissing
+                | Self::InvalidManifest
+                | Self::CompileOrSyntaxError
+                | Self::EvidenceMissing
+                | Self::ConfigOrVerifierError
+        )
     }
 }
 
@@ -1040,8 +2740,11 @@ impl Agent {
             repo_context_cache: None,
             footer,
             reminder_called_this_turn: false,
+            task_contract_this_turn: std::cell::OnceCell::new(),
             tester_called_this_turn: false,
             work_mode_confirm_called_this_turn: false,
+            task_kind_confirm_called_this_turn: false,
+            project_profile_confirm_called_this_turn: false,
             feedback_kind_confirm_called_this_turn: false,
             quality_confirm_called_this_turn: false,
             last_quality_confirm_result: None,
@@ -1065,6 +2768,8 @@ impl Agent {
             evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             task_contract_evidence_set_this_turn: completion_evidence::EvidenceSet::new(),
             current_artifact_recovery_target: None,
+            turn_state: turn_state::TurnState::new(),
+            controller_policy_ledger: controller_policy::ControllerPolicyLedger::default(),
             artifact_completion_job: None,
             artifact_completion_exhausted_this_turn: false,
             artifact_completion_failed_diagnostic_emitted_this_turn: false,
@@ -1077,9 +2782,15 @@ impl Agent {
             missing_verifier_job: None,
             turn_pre_tool_file_hashes: std::collections::HashMap::new(),
             turn_edited_relative_paths: std::collections::HashSet::new(),
-            safe_stop_report_emitted: std::collections::HashSet::new(),
-            last_active_job_selection: None,
             artifact_ledger: artifact_ledger::ArtifactLedger::new(),
+            // Issue #979 (parent #974, Issue E): per-turn zero-file
+            // tool-protocol-failure escalation budget. Reset at actor-loop head.
+            tool_protocol_recovery_escalated_this_turn: false,
+            // Issue #664 iteration-2 (CB-001): per-turn Stage A observation.
+            owned_test_verifier_missing_observed_this_turn: false,
+            // Issue #664 iteration-4 (CB3-001): request-bound carryover.
+            owned_test_verifier_missing_observed_carryover: None,
+            last_contract_conflict_job_this_turn: None,
         }
     }
 
@@ -1091,6 +2802,95 @@ impl Agent {
     #[allow(dead_code)] // forward-facing helper; call sites migrate off the legacy bool in a follow-up.
     pub(super) fn is_verifier_repair_pending(&self) -> bool {
         self.repair_job.is_some()
+    }
+
+    /// Issue #667 (DR1-008): SSOT helper that resolves the adapter's
+    /// per-turn inputs (S3-008 ordering priorities (1)(2)(3) + `#665`
+    /// behavior projection). Called once per turn by
+    /// `record_pam_advisory_decision` so the 2 chokepoints never inline
+    /// the resolution logic (DR1-005).
+    pub(in crate::agent::loop_run) fn pam_advisory_inputs(
+        &self,
+    ) -> pam_advisory::PamAdvisoryInputs {
+        // Priority (1): active-job arbiter selected kind.
+        let role_hint_from_active = self
+            .turn_state
+            .last_active_job_selection
+            .as_ref()
+            .and_then(|sel| sel.selected.as_ref())
+            .and_then(|c| pam_advisory::job_kind_to_artifact_role(c.kind));
+
+        // Priority (2): artifact_completion_job's role (SSOT for
+        // role-specific completion targets).
+        let role_hint_from_completion = self.artifact_completion_job.as_ref().map(|job| job.role());
+
+        // Priority (3): TaskContract derived from active request text.
+        // `first_missing_required_role` is evidence-aware and not available
+        // here, so we fall back to the first required role hint
+        // (DR3-004 — same pattern as `refresh_artifact_completion_satisfied`).
+        // Issue #917: per-turn classification authority (None → no role hint).
+        let task_contract = task_classification::task_contract_authority(self);
+        let role_hint_from_contract = task_contract
+            .as_ref()
+            .and_then(|tc| tc.required_artifacts.first().copied());
+
+        let role_hint = role_hint_from_active
+            .or(role_hint_from_completion)
+            .or(role_hint_from_contract);
+
+        let behavior = task_contract
+            .as_ref()
+            .and_then(|tc| required_behavior::project_behavior_contract(tc));
+
+        pam_advisory::PamAdvisoryInputs {
+            role_hint,
+            behavior,
+        }
+    }
+
+    /// Issue #667 (DR1-005): adapter SSOT entry point. The 2 production
+    /// chokepoints (`turn.rs::invoke_photon_context_pack` and the path-b
+    /// branch in `build_request_messages`) call this shell instead of
+    /// touching the adapter directly. Performs:
+    ///
+    /// 1. `config.pam_advisory_enabled` gate (early `None`).
+    /// 2. Per-turn dedup via `last_pam_decision_this_turn.is_some()`.
+    /// 3. Builds `PamAdvisoryInputs` once.
+    /// 4. Invokes `evaluate_pam_advisory` (pure fn).
+    /// 5. Writes `last_pam_decision_this_turn = Some(decision)` exactly once.
+    pub(in crate::agent::loop_run) fn record_pam_advisory_decision(
+        &mut self,
+        resp: &crate::photon::schema::ContextPackResponse,
+        blocked_ids: &std::collections::HashSet<String>,
+        shadow_input: bool,
+    ) -> Option<pam_advisory::PamAdvisoryOutcome> {
+        if !self.config.pam_advisory_enabled {
+            self.record_pam_unused_reason("pam_disabled");
+            return None;
+        }
+        if self.turn_state.pam_decision().is_some() {
+            self.record_pam_unused_reason("already_decided_this_turn");
+            return None;
+        }
+        let inputs = self.pam_advisory_inputs();
+        let active_ref = self.turn_state.last_active_job_selection.as_ref();
+        let outcome = pam_advisory::evaluate_pam_advisory(
+            resp,
+            blocked_ids,
+            active_ref,
+            inputs.role_hint,
+            inputs.behavior.as_ref(),
+            pam_advisory::PamAdvisoryModeInput {
+                shadow: shadow_input,
+            },
+        );
+        self.turn_state
+            .record_pam_decision(outcome.decision.clone());
+        Some(outcome)
+    }
+
+    pub(in crate::agent::loop_run) fn record_pam_unused_reason(&mut self, reason: &str) {
+        self.turn_state.record_pam_unused_reason(reason);
     }
 }
 
@@ -1272,7 +3072,7 @@ mod tests {
     }
 
     #[test]
-    fn verifier_diagnostic_failure_kind_has_8_variants() {
+    fn verifier_diagnostic_failure_kind_has_14_variants() {
         // S1-001: SemanticFailureReport is an upper-layer wrapper that
         // **reuses** the existing 8-variant `VerifierDiagnosticFailureKind`
         // enum. Adding or removing a variant breaks the SSOT invariant
@@ -1280,6 +3080,12 @@ mod tests {
         // enum surface drifts.
         use super::VerifierDiagnosticFailureKind as K;
         let all = [
+            K::MissingFile,
+            K::InvalidManifest,
+            K::BadTest,
+            K::WrongSemantics,
+            K::EvidenceMissing,
+            K::SchemaMismatch,
             K::DependencyMissing,
             K::LocalImportContractMismatch,
             K::CompileOrSyntaxError,
@@ -1293,6 +3099,12 @@ mod tests {
             // Exhaustive match — extension of the enum forces this to
             // be updated (compile-time lock).
             let label: &'static str = match v {
+                K::MissingFile => "missing_file",
+                K::InvalidManifest => "invalid_manifest",
+                K::BadTest => "bad_test",
+                K::WrongSemantics => "wrong_semantics",
+                K::EvidenceMissing => "evidence_missing",
+                K::SchemaMismatch => "schema_mismatch",
                 K::DependencyMissing => "dependency_missing",
                 K::LocalImportContractMismatch => "local_import_contract_mismatch",
                 K::CompileOrSyntaxError => "compile_or_syntax_error",
@@ -1304,6 +3116,6 @@ mod tests {
             };
             assert!(!label.is_empty());
         }
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 14);
     }
 }

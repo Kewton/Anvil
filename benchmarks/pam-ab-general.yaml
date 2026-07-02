@@ -1,0 +1,45 @@
+name: pam-ab-general
+description: Fixed prompt suite for PAM advisory A/B evaluation across coding, docs, data, research, and ops tasks.
+args:
+  max_iterations: 30
+  chat_retries: 2
+  sidecar_model: qwen3.5:9b
+cases:
+  - name: coding-react-form
+    category: coding
+    prompt: |
+      You are in a small React TypeScript project.
+      Implement a reusable src/components/ValidatedEmailForm.tsx component with:
+      - email validation
+      - disabled submit while invalid
+      - a visible success message after submit
+      - a focused unit test or smoke test if the project has a test harness
+      Stop after the files are written and any available focused check has been run.
+  - name: docs-cli-quickstart
+    category: docs
+    prompt: |
+      Update README.md with a concise CLI quickstart section.
+      Document install steps, first command, configuration file location, and troubleshooting notes.
+      This is a documentation-only task: do not modify code.
+      Stop after confirming the documentation file is written.
+  - name: data-json-to-csv
+    category: data
+    prompt: |
+      Create a small documented command that transforms input/users.json into output/users.csv.
+      Required columns: id, email, signup_date, active.
+      Preserve row order, write a short README note for running it, and include a tiny sample fixture if none exists.
+      Stop after confirming the transform artifact is present.
+  - name: research-decision-brief
+    category: research
+    prompt: |
+      Research and compare in-memory, SQLite, and file-based cache options for a local CLI agent.
+      Capture the analysis in research/cache-strategy-brief.md with a recommendation, tradeoffs, failure modes, and an explicit assumptions section.
+      Do not change code.
+      Stop after confirming the report file is written.
+  - name: ops-runbook
+    category: ops
+    prompt: |
+      Prepare an operational triage runbook at runbooks/ollama-local-agent-triage.md for a local Ollama-backed coding agent.
+      Include a symptom table, commands to collect logs, recovery steps, and escalation criteria.
+      Keep it operational and checklist-oriented.
+      Stop after confirming the runbook is written.

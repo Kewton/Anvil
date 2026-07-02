@@ -83,6 +83,9 @@ pub(crate) fn run_git(work_root: &Path, args: &[&str]) -> Option<String> {
 mod tests {
     use super::*;
     use std::process::Command as Cmd;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     #[cfg(unix)]
@@ -124,17 +127,25 @@ mod tests {
     }
 
     fn tempdir() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        let n = format!(
-            "anvil-git-hardened-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
-        p.push(n);
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        let base = std::env::temp_dir();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for _ in 0..100 {
+            let n = format!(
+                "anvil-git-hardened-{}-{}-{}",
+                std::process::id(),
+                now,
+                TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+            let p = base.join(n);
+            match std::fs::create_dir(&p) {
+                Ok(()) => return p,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => panic!("failed to create temp dir {p:?}: {err}"),
+            }
+        }
+        panic!("failed to allocate unique temp dir under {base:?}");
     }
 }

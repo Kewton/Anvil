@@ -1,5 +1,5 @@
-//! Single source of truth for "is this path a test/setup/implementation file?"
-//! style classification (Issue #456 / DR1-007).
+//! Single source of truth for "is this path a test/setup/implementation/data
+//! file?" style classification (Issue #456 / DR1-007).
 //!
 //! Both `RepoVerification` (in `agent/orchestration.rs`) and AnvilScore
 //! computation (in `session/anvil_score.rs`) depend on this classification.
@@ -35,8 +35,9 @@ pub fn is_test_file(path: &Path) -> bool {
 
 /// Setup / configuration files that ship with the repo. The list is pinned to
 /// the same set previously hard-coded in `agent::orchestration::is_setup_file`
-/// — extending it requires updating both the helper and the AC tests that
-/// rely on the classification.
+/// plus language manifest files used by the first-class verifier selectors.
+/// Extending it requires updating both the helper and the AC tests that rely
+/// on the classification.
 pub fn is_setup_file(path: &Path) -> bool {
     let file_name = path
         .file_name()
@@ -44,7 +45,9 @@ pub fn is_setup_file(path: &Path) -> bool {
         .unwrap_or_default();
     matches!(
         file_name,
-        "package.json"
+        "Cargo.toml"
+            | "Cargo.lock"
+            | "package.json"
             | "package-lock.json"
             | "pnpm-lock.yaml"
             | "yarn.lock"
@@ -100,6 +103,26 @@ pub fn is_implementation_file(path: &Path) -> bool {
     )
 }
 
+/// Structured data output files that can be treated as data deliverables.
+/// Setup/config JSON files are intentionally excluded so a DataOutput role
+/// cannot claim files such as `package.json` or `tsconfig.json`.
+pub fn is_structured_data_file(path: &Path) -> bool {
+    if is_setup_file(path) {
+        return false;
+    }
+    let Some(ext) = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return false;
+    };
+    matches!(
+        ext.as_str(),
+        "csv" | "tsv" | "json" | "jsonl" | "ndjson" | "parquet"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +153,8 @@ mod tests {
     #[test]
     fn test_is_setup_file_known_names() {
         for name in [
+            "Cargo.toml",
+            "Cargo.lock",
             "package.json",
             "package-lock.json",
             "pnpm-lock.yaml",
@@ -161,7 +186,6 @@ mod tests {
 
     #[test]
     fn test_is_setup_file_negative() {
-        assert!(!is_setup_file(&PathBuf::from("Cargo.toml")));
         assert!(!is_setup_file(&PathBuf::from("src/main.rs")));
         assert!(!is_setup_file(&PathBuf::from("README.md")));
     }
@@ -186,6 +210,26 @@ mod tests {
         assert!(!is_implementation_file(&PathBuf::from("Cargo.toml")));
         assert!(!is_implementation_file(&PathBuf::from("foo")));
         assert!(!is_implementation_file(&PathBuf::from("foo.txt")));
+    }
+
+    #[test]
+    fn test_is_structured_data_file_extensions() {
+        for ext in ["csv", "tsv", "json", "jsonl", "ndjson", "parquet"] {
+            let path = PathBuf::from(format!("output.{ext}"));
+            assert!(
+                is_structured_data_file(&path),
+                "expected .{ext} to classify as structured data"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_structured_data_file_excludes_setup_json() {
+        assert!(!is_structured_data_file(&PathBuf::from("package.json")));
+        assert!(!is_structured_data_file(&PathBuf::from("tsconfig.json")));
+        assert!(!is_structured_data_file(&PathBuf::from(
+            "config/package-lock.json"
+        )));
     }
 
     #[test]

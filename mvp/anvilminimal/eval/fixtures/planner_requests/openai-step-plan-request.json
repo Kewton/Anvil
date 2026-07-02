@@ -1,0 +1,33 @@
+{
+  "provider": "openai",
+  "endpoint": "/v1/responses",
+  "model": "gpt-5.4-mini",
+  "tools": [],
+  "input": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "input_text",
+          "text_contains": [
+            "Return only one JSON object",
+            "Allowed step kinds",
+            "Expected paths must be workspace-relative"
+          ]
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text_contains": [
+            "Create a step plan",
+            "Required final artifacts"
+          ]
+        }
+      ]
+    }
+  ]
+}

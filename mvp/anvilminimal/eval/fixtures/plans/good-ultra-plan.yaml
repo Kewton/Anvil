@@ -1,0 +1,11 @@
+goal: "Create a Next.js app on port 3011"
+profile: "nextjs"
+style: "default"
+intent: "create"
+phases:
+  - id: "scaffold"
+    prompt: "Scaffold package.json and src/app files for a Next.js app that must run on port 3011."
+  - id: "implement"
+    prompt: "Implement the Space Invaders game in src/app/page.tsx while preserving the Next.js profile contract."
+  - id: "verify"
+    prompt: "Run npm run build, verify port 3011 readiness, and repair any profile contract failures."

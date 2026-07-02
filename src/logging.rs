@@ -9,9 +9,79 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::LogLevel;
 use crate::session::feedback::mask_secrets;
+use crate::session::store::ConversationMessage;
 
 static LLM_IO_LOGGER: OnceLock<Mutex<File>> = OnceLock::new();
 static LLM_IO_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+pub const LLM_IO_PROMPT_SCHEMA_VERSION: u64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PromptLogMetrics {
+    pub schema_version: u64,
+    pub final_prompt: String,
+    pub prompt_char_count: usize,
+    pub approx_prompt_tokens: usize,
+    pub injection_blocks: Vec<PromptInjectionBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PromptInjectionBlock {
+    pub index: usize,
+    pub kind: String,
+    pub role: String,
+    pub name: Option<String>,
+    pub char_count: usize,
+    pub approx_tokens: usize,
+    pub tool_call_count: usize,
+}
+
+pub fn build_prompt_log_metrics(
+    messages: &[ConversationMessage],
+    final_prompt: String,
+) -> PromptLogMetrics {
+    let prompt_char_count = final_prompt.chars().count();
+    let injection_blocks = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| PromptInjectionBlock {
+            index,
+            kind: prompt_block_kind(index, message).to_string(),
+            role: message.role.clone(),
+            name: message.name.clone(),
+            char_count: message.content.chars().count(),
+            approx_tokens: approximate_message_tokens(message),
+            tool_call_count: message.tool_calls.len(),
+        })
+        .collect();
+
+    PromptLogMetrics {
+        schema_version: LLM_IO_PROMPT_SCHEMA_VERSION,
+        final_prompt,
+        prompt_char_count,
+        approx_prompt_tokens: approximate_text_tokens(prompt_char_count),
+        injection_blocks,
+    }
+}
+
+fn prompt_block_kind(index: usize, message: &ConversationMessage) -> &'static str {
+    match message.role.as_str() {
+        "system" if index == 0 => "system_prompt",
+        "system" => "system_injection",
+        "user" => "user_message",
+        "assistant" => "assistant_history",
+        "tool" => "tool_result",
+        _ => "message",
+    }
+}
+
+fn approximate_message_tokens(message: &ConversationMessage) -> usize {
+    approximate_text_tokens(message.content.chars().count()) + message.tool_calls.len() * 32 + 12
+}
+
+fn approximate_text_tokens(char_count: usize) -> usize {
+    char_count.div_ceil(4)
+}
 
 pub fn init_logging(log_level: LogLevel, log_path: &Path) -> Result<(), String> {
     let directive = log_level.env_filter();
@@ -166,6 +236,79 @@ pub(crate) fn is_secret_like_key(key: &str) -> bool {
 // that pipeline.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Issue #661 DR1-002 / DR2-005: `stable_path_hash` SSOT.
+//
+// Path-hash representation is the single 16-hex `DefaultHasher` digest shared by:
+//
+//   * `agent.artifact_ledger.*` events (Issue #659)
+//   * `agent.active_job.selected` events (Issue #660)
+//   * `agent.verifier.invoked` events (Issue #661)
+//   * `agent.verifier.external_import_rejected` events (Issue #661)
+//
+// Prior to Issue #661 the same algorithm lived in three private duplicates
+// (`src/agent/loop_run/artifact_ledger.rs::stable_path_hash`,
+// `src/agent/loop_run/turn.rs::stable_path_hash_for_active_job`,
+// `src/agent/loop_run/active_job_arbiter.rs::stable_path_hash` `#[cfg(test)]`).
+// This module now owns the canonical implementation and all callers must
+// route through `crate::logging::stable_path_hash` so the per-event
+// `path_hash` values remain a stable correlator across releases.
+//
+// Caller responsibility (NOT enforced by this layer):
+//   1. Always pass `mask_secrets(...)`-applied input. The hash function is
+//      not a secret-hiding primitive — the legitimate path-secrecy defence
+//      is `mask_secrets` + `mask_payload_inplace` at `log_llm_event` time.
+//   2. Treat the 16-hex string only as a non-cryptographic correlator
+//      (`DefaultHasher` is not stable across Rust versions for
+//      cross-deployment use; intra-deployment it IS stable, which is what
+//      log consumers need).
+// ---------------------------------------------------------------------------
+
+/// 16-hex `DefaultHasher` digest of `input`. SSOT for the `path_hash` field
+/// emitted across `agent.artifact_ledger.*` / `agent.active_job.selected` /
+/// `agent.verifier.invoked` payloads. Callers MUST pass `mask_secrets(...)`-
+/// applied input — this helper does not redact, and the secret-hiding
+/// defence-in-depth is `mask_payload_inplace` at `log_llm_event` time.
+pub(crate) fn stable_path_hash(input: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// 8-byte `DefaultHasher` digest over the canonical JSON serialization of
+/// `payload`. SSOT for per-turn payload-dedup digests (Issue #661
+/// `last_verifier_invoked_payload_digest`).
+///
+/// Caller responsibility (DR1-004):
+///   1. Apply `mask_payload_inplace(&mut payload)` before calling this
+///      helper. Hashing the pre-mask payload would mean the dedup key
+///      changes after secret redaction, which would break per-turn
+///      suppression semantics.
+///   2. Treat the `[u8; 8]` value as a non-cryptographic correlator.
+///
+/// Implementation: `serde_json::to_vec` is used as the canonical-byte
+/// serializer (serde_json::Map preserves insertion order, so payloads
+/// constructed via the same `json!{...}` literal hash equally). On
+/// serialization failure (effectively impossible for valid `Value`s) the
+/// fallback is the digest of an empty byte slice — this keeps the function
+/// total without panicking inside a logging hot path.
+//
+// Production caller arrives in Issue #661 Phase 5 (`run_task_contract_verifier_once`
+// pre-spawn `agent.verifier.invoked` dedup). Phase 1 lands the SSOT helper +
+// unit tests only, so this is intentionally unused in production code until
+// then.
+#[allow(dead_code)]
+pub(crate) fn compute_payload_digest(payload: &Value) -> [u8; 8] {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    hasher.write(&bytes);
+    hasher.finish().to_be_bytes()
+}
+
 /// Issue #606 T-1.9 — `agent.completion_evidence.observed`.
 ///
 /// `event_label` is a `&'static str` matching the `serde tag = "kind"`
@@ -238,8 +381,129 @@ pub(crate) fn log_completion_evidence_deterministic_rescued(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_secret_like_key, mask_payload_inplace};
+    use super::{
+        compute_payload_digest, is_secret_like_key, mask_payload_inplace, stable_path_hash,
+    };
     use serde_json::{Value, json};
+
+    // ---- Issue #661 DR1-002: stable_path_hash SSOT (16-hex DefaultHasher) ----
+
+    #[test]
+    fn stable_path_hash_is_deterministic() {
+        let h1 = stable_path_hash("src/lib.rs");
+        let h2 = stable_path_hash("src/lib.rs");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn stable_path_hash_is_16_hex_chars() {
+        let h = stable_path_hash("src/agent/loop_run/turn.rs");
+        assert_eq!(h.len(), 16);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn stable_path_hash_differs_for_different_inputs() {
+        let h1 = stable_path_hash("tests/test_a.py");
+        let h2 = stable_path_hash("tests/test_b.py");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn stable_path_hash_handles_empty_input() {
+        // empty input must still produce a 16-hex string (no panic, deterministic)
+        let h = stable_path_hash("");
+        assert_eq!(h.len(), 16);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Issue #661 DR2-005: pin that the SSOT in `logging.rs` matches the
+    /// `DefaultHasher` + `{:016x}` algorithm previously duplicated in
+    /// `artifact_ledger.rs` / `turn.rs::stable_path_hash_for_active_job` /
+    /// `active_job_arbiter.rs` test-only helper. Migration-prior callers
+    /// computed `format!("{:016x}", DefaultHasher::new().hash(input).finish())`
+    /// — this test reproduces that algorithm inline to guard against silent
+    /// drift between the SSOT and the on-disk event payload hashes from
+    /// `agent.artifact_ledger.*` / `agent.active_job.selected`.
+    #[test]
+    fn stable_path_hash_matches_default_hasher_16_hex_inline_algorithm() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let input = "src/agent/loop_run/artifact_ledger.rs";
+        let mut hasher = DefaultHasher::new();
+        input.hash(&mut hasher);
+        let expected = format!("{:016x}", hasher.finish());
+        assert_eq!(stable_path_hash(input), expected);
+    }
+
+    /// Issue #661 caller-migration regression guard. Replicates the exact
+    /// `DefaultHasher` + `{:016x}` form of the (now-deleted) duplicate
+    /// implementations and asserts the SSOT produces the same hash. Future
+    /// algorithm changes in the SSOT MUST keep prior on-disk
+    /// `agent.artifact_ledger.*` / `agent.active_job.selected` event
+    /// `path_hash` values stable, or this test must be updated in lockstep
+    /// with a schema-bump record in `dev-reports/`.
+    #[test]
+    fn stable_path_hash_matches_pre_issue_661_duplicate_implementations() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // Sample inputs covering the 3 historical caller sites.
+        for input in [
+            "tests/test_a.py",                          // artifact_ledger duplicate
+            "src/agent/loop_run/turn.rs",               // turn.rs duplicate
+            "src/agent/loop_run/active_job_arbiter.rs", // active_job_arbiter test-only duplicate
+        ] {
+            let mut hasher = DefaultHasher::new();
+            input.hash(&mut hasher);
+            let pre_migration = format!("{:016x}", hasher.finish());
+            assert_eq!(
+                stable_path_hash(input),
+                pre_migration,
+                "SSOT hash for {input:?} must match the pre-migration inline algorithm"
+            );
+        }
+    }
+
+    // ---- Issue #661 DR2-009: compute_payload_digest SSOT ([u8; 8]) ----------
+
+    #[test]
+    fn compute_payload_digest_is_deterministic() {
+        let payload = json!({"k": "v", "n": 42});
+        let d1 = compute_payload_digest(&payload);
+        let d2 = compute_payload_digest(&payload);
+        assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn compute_payload_digest_differs_for_different_payloads() {
+        let p1 = json!({"k": "v1"});
+        let p2 = json!({"k": "v2"});
+        assert_ne!(compute_payload_digest(&p1), compute_payload_digest(&p2));
+    }
+
+    #[test]
+    fn compute_payload_digest_returns_eight_bytes() {
+        let payload = json!({"foo": "bar"});
+        let digest = compute_payload_digest(&payload);
+        // digest is [u8; 8] by type; assert the length is 8 to lock the SSOT
+        assert_eq!(digest.len(), 8);
+    }
+
+    /// DR1-004: caller is required to pass `mask_payload_inplace`-applied
+    /// payload. The helper does not invoke `mask_payload_inplace` internally
+    /// (would be a layering violation); but the digest function must be a
+    /// pure hash over the canonical JSON bytes of whatever Value is passed in,
+    /// so two payloads with identical canonical JSON shapes hash equally.
+    #[test]
+    fn compute_payload_digest_uses_canonical_json_serialization() {
+        // Build the same payload via two different construction orders; the
+        // resulting Value's serialization should be identical and produce the
+        // same digest.
+        let p_a = json!({"a": 1, "b": 2});
+        let p_b = json!({"a": 1, "b": 2});
+        assert_eq!(compute_payload_digest(&p_a), compute_payload_digest(&p_b));
+    }
 
     // ---- is_secret_like_key boundary cases (DR1-006 / DR2-003) -----------
 

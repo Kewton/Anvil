@@ -1,0 +1,36 @@
+goal: "Create a Next.js Space Invaders app on port 3011."
+steps:
+  - id: "inspect-workspace"
+    kind: "inspect"
+    expected_result: "pass"
+    instruction: "Inspect the workspace for an existing package manifest and app directory before writing files."
+    expected_paths:
+    verify:
+  - id: "create-project-manifest"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create package.json with Next.js, React, React DOM, and scripts for build and dev on port 3011."
+    expected_paths:
+      - "package.json"
+    verify:
+  - id: "edit-app-entrypoints"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create the App Router entrypoints and implement the playable Space Invaders experience."
+    expected_paths:
+      - "src/app/layout.tsx"
+      - "src/app/page.tsx"
+    verify:
+  - id: "verify-build"
+    kind: "verify"
+    expected_result: "pass"
+    instruction: "Run the deterministic build check after the manifest and app files exist."
+    expected_paths:
+    verify:
+      - "npm run build"
+  - id: "report-run-command"
+    kind: "report"
+    expected_result: "pass"
+    instruction: "Report that the app can be started with npm run dev and served on port 3011."
+    expected_paths:
+    verify:

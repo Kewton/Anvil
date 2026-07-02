@@ -1,0 +1,14 @@
+{
+  "deterministic_oracles": [],
+  "required_capabilities": [],
+  "required_evidence": [],
+  "required_obligations": [],
+  "required_paths": [
+    "hello.txt"
+  ],
+  "source": "eval_scenario",
+  "verify_commands": [
+    "grep -qx \"provider smoke ok\" hello.txt"
+  ],
+  "verify_repair_cap": 2
+}

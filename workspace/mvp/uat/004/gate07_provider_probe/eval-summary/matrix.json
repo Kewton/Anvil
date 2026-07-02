@@ -1,0 +1,265 @@
+[
+  {
+    "_model_profile": "openai-only",
+    "_parallel_limit": 4,
+    "_provider_limit": 2,
+    "_provider_probe_summary": {
+      "events": [
+        {
+          "event": "provider_probe",
+          "probe": "tool_argument_parser_shapes",
+          "provider": "fixture",
+          "providers": [
+            "openai",
+            "gemini",
+            "ollama_xml_fallback"
+          ],
+          "status": "passed"
+        },
+        {
+          "arguments_shape": "object_recovered",
+          "event": "provider_probe",
+          "live": false,
+          "probe": "xml_fallback_tool_like_output",
+          "provider": "ollama",
+          "status": "passed",
+          "tool_calls": 1,
+          "tool_names": [
+            "Write"
+          ]
+        },
+        {
+          "arguments_shape": "object_recovered",
+          "event": "provider_probe",
+          "probe": "tool_args_recovery_classification",
+          "provider": "openai",
+          "recoverable_tool_args": "recovered_and_executed",
+          "status": "passed",
+          "unsafe_error_kind": "path_confinement_error",
+          "unsafe_shell_control": "rejected_nonrecoverable",
+          "unsafe_shell_error_kind": "dangerous_command",
+          "unsafe_tool_args": "rejected_nonrecoverable"
+        },
+        {
+          "arguments_shape": "object_recovered",
+          "event": "provider_probe",
+          "probe": "tool_args_recovery_classification",
+          "provider": "gemini",
+          "recoverable_tool_args": "recovered_and_executed",
+          "status": "passed",
+          "unsafe_error_kind": "path_confinement_error",
+          "unsafe_shell_control": "rejected_nonrecoverable",
+          "unsafe_shell_error_kind": "dangerous_command",
+          "unsafe_tool_args": "rejected_nonrecoverable"
+        },
+        {
+          "arguments_shape": "object_recovered",
+          "event": "provider_probe",
+          "probe": "tool_args_recovery_classification",
+          "provider": "ollama",
+          "recoverable_tool_args": "recovered_and_executed",
+          "status": "passed",
+          "unsafe_error_kind": "path_confinement_error",
+          "unsafe_shell_control": "rejected_nonrecoverable",
+          "unsafe_shell_error_kind": "dangerous_command",
+          "unsafe_tool_args": "rejected_nonrecoverable"
+        },
+        {
+          "arguments_shape": "object",
+          "event": "provider_probe",
+          "model": "gpt-5.4-mini",
+          "probe": "tool_args_shape",
+          "provider": "openai",
+          "status": "passed",
+          "tool_calls": 1,
+          "tool_names": [
+            "Write"
+          ]
+        },
+        {
+          "arguments_shape": "object",
+          "event": "provider_probe",
+          "model": "gemini-3.5-flash",
+          "probe": "function_calling_schema",
+          "provider": "gemini",
+          "status": "passed",
+          "tool_calls": 1,
+          "tool_names": [
+            "Write"
+          ]
+        }
+      ],
+      "failed": 0,
+      "missing_paths": [],
+      "passed": 7,
+      "probes_by_provider": {
+        "fixture": [
+          "tool_argument_parser_shapes"
+        ],
+        "gemini": [
+          "function_calling_schema",
+          "tool_args_recovery_classification"
+        ],
+        "ollama": [
+          "tool_args_recovery_classification",
+          "xml_fallback_tool_like_output"
+        ],
+        "openai": [
+          "tool_args_recovery_classification",
+          "tool_args_shape"
+        ]
+      },
+      "recoverable_tool_args_classified": 3,
+      "result_paths": [
+        "/Users/maenokota/share/work/github_kewton/Anvil-develop/workspace/mvp/uat/004/gate07_provider_probe/provider-probe-live.jsonl"
+      ],
+      "skipped": 0,
+      "status": "passed",
+      "tool_args_recovery_classifications": [
+        {
+          "arguments_shape": "object_recovered",
+          "provider": "openai",
+          "recoverable_tool_args": "recovered_and_executed",
+          "status": "passed",
+          "unsafe_error_kind": "path_confinement_error",
+          "unsafe_shell_control": "rejected_nonrecoverable",
+          "unsafe_shell_error_kind": "dangerous_command",
+          "unsafe_tool_args": "rejected_nonrecoverable"
+        },
+        {
+          "arguments_shape": "object_recovered",
+          "provider": "gemini",
+          "recoverable_tool_args": "recovered_and_executed",
+          "status": "passed",
+          "unsafe_error_kind": "path_confinement_error",
+          "unsafe_shell_control": "rejected_nonrecoverable",
+          "unsafe_shell_error_kind": "dangerous_command",
+          "unsafe_tool_args": "rejected_nonrecoverable"
+        },
+        {
+          "arguments_shape": "object_recovered",
+          "provider": "ollama",
+          "recoverable_tool_args": "recovered_and_executed",
+          "status": "passed",
+          "unsafe_error_kind": "path_confinement_error",
+          "unsafe_shell_control": "rejected_nonrecoverable",
+          "unsafe_shell_error_kind": "dangerous_command",
+          "unsafe_tool_args": "rejected_nonrecoverable"
+        }
+      ],
+      "unsafe_shell_control_rejected": 3,
+      "unsafe_tool_args_rejected": 3
+    },
+    "binary": "anvilminimal",
+    "binary_kind": "anvilminimal",
+    "chat_retries": 1,
+    "command": [
+      "anvilminimal",
+      "--yes",
+      "--context-budget",
+      "65536",
+      "--chat-retries",
+      "1",
+      "--provider",
+      "openai",
+      "--model",
+      "gpt-5.4-mini",
+      "--planner-provider",
+      "openai",
+      "--planner-model",
+      "gpt-5.4-mini",
+      "--profile",
+      "generic",
+      "--cwd",
+      "workdir",
+      "--prompt",
+      "Create hello.txt containing exactly provider smoke ok.\n\nRequired final artifacts:\n- hello.txt\n\nCreate every required final artifact as an exact workspace-relative path before any final response. If implementation is needed, prefer Write/Edit tool calls for the missing files over additional inspection."
+    ],
+    "command_text": "anvilminimal --yes --context-budget 65536 --chat-retries 1 --provider openai --model gpt-5.4-mini --planner-provider openai --planner-model gpt-5.4-mini --profile generic --cwd workdir --prompt 'Create hello.txt containing exactly provider smoke ok.\n\nRequired final artifacts:\n- hello.txt\n\nCreate every required final artifact as an exact workspace-relative path before any final response. If implementation is needed, prefer Write/Edit tool calls for the missing files over additional inspection.'",
+    "local_llm_used": false,
+    "main": {
+      "model": "gpt-5.4-mini",
+      "provider": "openai"
+    },
+    "mode": "minimal-loop",
+    "planner": {
+      "model": "gpt-5.4-mini",
+      "provider": "openai"
+    },
+    "port_mutex": null,
+    "provider_limits": 2,
+    "provider_probe": {
+      "command": "ANVIL_PROVIDER_PROBE=1 ANVIL_PROVIDER_PROBE_OUT=/tmp/anvil-provider-probe.jsonl cargo test --manifest-path mvp/anvilminimal/Cargo.toml --test live_provider provider_probe -- --nocapture",
+      "probes": [
+        {
+          "classifies": [
+            "recoverable_tool_args",
+            "unsafe_tool_args"
+          ],
+          "credential": "OPENAI_API_KEY",
+          "observes": [
+            "tool_args_shape",
+            "tool_args_recovery_classification"
+          ],
+          "optional_without_credential": true,
+          "provider": "openai"
+        },
+        {
+          "classifies": [
+            "recoverable_tool_args",
+            "unsafe_tool_args"
+          ],
+          "credential": "GEMINI_API_KEY",
+          "observes": [
+            "function_calling_schema",
+            "tool_args_recovery_classification"
+          ],
+          "optional_without_credential": true,
+          "provider": "gemini"
+        },
+        {
+          "classifies": [
+            "recoverable_tool_args",
+            "unsafe_tool_args"
+          ],
+          "observes": [
+            "xml_fallback_tool_like_output",
+            "tool_args_recovery_classification"
+          ],
+          "optional_without_credential": true,
+          "provider": "ollama"
+        }
+      ],
+      "required_for_prompt_sensitive_fix": true
+    },
+    "run_id": "mvp-provider-smoke__write-one-file-small__minimal-loop__openai-gpt-5.4-mini__openai-gpt-5.4-mini__r1",
+    "scenario": {
+      "category": "provider-smoke",
+      "expected_artifacts": [
+        "hello.txt"
+      ],
+      "id": "write-one-file-small",
+      "plan_constraints": {
+        "max_steps": 3,
+        "min_steps": 1,
+        "required_verify_keywords": [
+          "hello.txt"
+        ]
+      },
+      "postcheck": {
+        "commands": [
+          "grep -qx \"provider smoke ok\" hello.txt"
+        ]
+      },
+      "profile": "generic",
+      "prompt": "Create hello.txt containing exactly provider smoke ok.",
+      "size": "small",
+      "timeouts": {
+        "model_call_sec": 120,
+        "total_sec": 300
+      }
+    },
+    "serial_lane": false,
+    "suite": "mvp-provider-smoke"
+  }
+]

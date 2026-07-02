@@ -6,9 +6,9 @@
 use anvil::session::case_retrieval::CaseScoreBreakdown;
 use anvil::session::eval_log::{
     AnvilScoreSummary, CaseRetrievalSummary, ChangedFileClasses, EvalPrecautionSnapshot,
-    EvalRecord, FeedbackFrameSummary, MAX_EVAL_LOG_RECORD_BYTES, MAX_EVAL_PRECAUTIONS,
-    MAX_EVAL_TASK_BYTES, ToolCallSummary, build_eval_record, scrub_absolute_paths,
-    write_eval_record_to,
+    EvalRecord, EvaluationTaxonomySummary, FeedbackFrameSummary, MAX_EVAL_LOG_RECORD_BYTES,
+    MAX_EVAL_PRECAUTIONS, MAX_EVAL_TASK_BYTES, PamEvalSummary, ToolCallSummary, build_eval_record,
+    build_terminal_diagnostics, scrub_absolute_paths, write_eval_record_to,
 };
 use serde_json::Value;
 use std::fs::OpenOptions;
@@ -97,7 +97,128 @@ fn r1_build_eval_record_round_trip() {
     assert_eq!(rec.changed_file_classes.test, 1);
     assert_eq!(rec.verify_commands, vec!["cargo build"]);
     assert!(rec.case_retrieval_result.is_none());
+    assert_eq!(rec.completion_reason, "verifier_evidence_satisfied");
     assert_eq!(rec.final_outcome, "done");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R1b: PAM eval summary is additive and advisory-only
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn r1b_pam_eval_summary_serializes_advisory_impact() {
+    let mut rec = build_eval_record(
+        "sess-r1b",
+        1_700_000_000_001,
+        "fix the compilation error",
+        "qwen3:14b",
+        "Act",
+        "native",
+        &[],
+        None,
+        &[],
+        None,
+        make_classes(),
+        &[],
+        None,
+        None,
+        None,
+        "done",
+    );
+    rec.pam_eval = Some(PamEvalSummary {
+        mode: "live".to_string(),
+        decision_type: "prompt_context_injection".to_string(),
+        decision_types: vec!["prompt_context_injection".to_string()],
+        availability: PamEvalSummary::derive_availability("live", 2, 1, 0, None).to_string(),
+        failure_phase: None,
+        affected_targets: vec![anvil::session::eval_log::PamEvalTarget {
+            target_type: "prompt_context".to_string(),
+            target: "context_pack_prompt".to_string(),
+            decision_type: "prompt_context_injection".to_string(),
+            summary_id: Some("seed-a".to_string()),
+        }],
+        actual_injected_count: 2,
+        suppressed_count: 1,
+        would_inject_in_live_count: 0,
+        advisory_only: true,
+        completion_judgement_override: false,
+        unused_reason: None,
+    });
+
+    let json = serde_json::to_value(&rec).unwrap();
+    assert_eq!(
+        json["pam_eval"]["decision_type"],
+        "prompt_context_injection"
+    );
+    assert_eq!(json["pam_eval"]["actual_injected_count"], 2);
+    assert_eq!(json["pam_eval"]["advisory_only"], true);
+    assert_eq!(json["pam_eval"]["completion_judgement_override"], false);
+    assert_eq!(
+        json["pam_eval"]["affected_targets"][0]["target_type"],
+        "prompt_context"
+    );
+    assert!(json["pam_eval"].get("unused_reason").is_none());
+}
+
+#[test]
+fn r1c_pam_eval_summary_serializes_unused_reason() {
+    let mut rec = build_eval_record(
+        "sess-r1c",
+        1_700_000_000_002,
+        "fix the compilation error",
+        "qwen3:14b",
+        "Act",
+        "native",
+        &[],
+        None,
+        &[],
+        None,
+        make_classes(),
+        &[],
+        None,
+        None,
+        None,
+        "safe_stop",
+    );
+    rec.pam_eval = Some(PamEvalSummary::skipped("canary_gate"));
+
+    let json = serde_json::to_value(&rec).unwrap();
+    assert_eq!(json["pam_eval"]["decision_type"], "not_used");
+    assert_eq!(json["pam_eval"]["unused_reason"], "canary_gate");
+    assert_eq!(json["pam_eval"]["completion_judgement_override"], false);
+}
+
+#[test]
+fn issue950_recovery_strategy_fields_serialize_when_present() {
+    let mut rec = build_eval_record(
+        "sess-950",
+        1_700_000_000_003,
+        "recover from a local test failure",
+        "qwen3:14b",
+        "Act",
+        "native",
+        &[],
+        None,
+        &[],
+        None,
+        make_classes(),
+        &[],
+        None,
+        None,
+        None,
+        "missing_evidence",
+    );
+    rec.recovery_strategy_count = 3;
+    rec.recovery_strategies = vec![
+        "tool_first_retry".to_string(),
+        "targeted_artifact_retry".to_string(),
+        "evidence_action".to_string(),
+    ];
+
+    let json = serde_json::to_value(&rec).unwrap();
+    assert_eq!(json["recovery_strategy_count"], 3);
+    assert_eq!(json["recovery_strategies"][0], "tool_first_retry");
+    assert_eq!(json["recovery_strategies"][1], "targeted_artifact_retry");
+    assert_eq!(json["recovery_strategies"][2], "evidence_action");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -256,6 +377,10 @@ fn r5_write_eval_record_valid_jsonl() {
     assert_eq!(parsed["schema_version"], 1);
     assert_eq!(parsed["session_id"], "sess-r5");
     assert_eq!(parsed["final_outcome"], "done");
+    assert_eq!(
+        parsed["terminal_diagnostics"]["classification"], "success",
+        "eval log should carry issue-848 terminal diagnostics"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -359,9 +484,31 @@ fn r9_oversized_record_is_dropped() {
         verify_commands: giant_cmds,
         case_retrieval_result: None,
         photon_eval: None,
+        pam_eval: None,
         photon_canary: 0,
         auto_promote: None,
+        terminal_diagnostics: Some(build_terminal_diagnostics(
+            "done",
+            &ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            0,
+        )),
+        shadow_terminal_projection: None,
+        recovery_strategy_count: 0,
+        recovery_strategies: vec![],
+        evaluation_taxonomy: EvaluationTaxonomySummary {
+            pam_variant: "unknown".to_string(),
+            task_kind: "coding".to_string(),
+            anvil_terminal_class: "success".to_string(),
+            outcome_agreement: "external_postcheck_unavailable".to_string(),
+            failure_authority: "success".to_string(),
+        },
+        completion_reason: "answer_or_plan_completion".to_string(),
         final_outcome: "done".to_string(),
+        classified_task_kind: None,
     };
 
     // Confirm the record would exceed the byte cap
@@ -477,4 +624,59 @@ fn r12_anvil_score_summary_all_fields() {
     assert_eq!(summary.unsafe_actions_blocked, 1);
     assert_eq!(summary.consecutive_no_progress_turns, 3);
     assert!(!summary.user_visible_artifact);
+}
+
+/// Issue #925 (P8): `EvalRecord.classified_task_kind` is additive and
+/// serializes as a TOP-LEVEL field distinct from `evaluation_taxonomy`.
+/// `None` is omitted (so old readers / old records stay compatible); `Some`
+/// emits the key. This is the field `analyze_run.py` reads for the R5 gate.
+#[test]
+fn issue925_classified_task_kind_serde_smoke() {
+    let mut rec = build_eval_record(
+        "sess-925",
+        0,
+        "task",
+        "m",
+        "Act",
+        "native",
+        &[],
+        None,
+        &[],
+        None,
+        ChangedFileClasses {
+            test: 0,
+            impl_files: 0,
+            setup: 0,
+        },
+        &[],
+        None,
+        None,
+        None,
+        "done",
+    );
+
+    // The builder leaves it None (post-set by the agent layer); None is omitted.
+    assert!(rec.classified_task_kind.is_none());
+    let json_none: Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+    assert!(
+        json_none.get("classified_task_kind").is_none(),
+        "None classified_task_kind must be omitted (additive / backward-compatible)"
+    );
+
+    // Some serializes under the TOP-LEVEL key, not inside evaluation_taxonomy.
+    rec.classified_task_kind = Some("docs".to_string());
+    let json_some: Value = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+    assert_eq!(
+        json_some
+            .get("classified_task_kind")
+            .and_then(|v| v.as_str()),
+        Some("docs"),
+        "Some classified_task_kind must serialize as a top-level string"
+    );
+    assert!(
+        json_some["evaluation_taxonomy"]
+            .get("classified_task_kind")
+            .is_none(),
+        "classified_task_kind must stay distinct from evaluation_taxonomy.task_kind"
+    );
 }

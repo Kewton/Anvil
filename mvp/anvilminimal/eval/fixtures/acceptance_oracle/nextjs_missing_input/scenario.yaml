@@ -1,0 +1,4 @@
+profile: nextjs
+prompt: Create a keyboard controlled memory grid game.
+expected_artifacts:
+  - src/app/page.tsx

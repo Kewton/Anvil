@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 
 use crate::util::file_classify::{is_implementation_file, is_setup_file, is_test_file};
+use crate::util::workspace_paths::is_workspace_artifact_admitted_relative_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSnapshot {
@@ -136,23 +137,64 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 fn should_skip_path(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root)
         .ok()
-        .map(|relative| {
-            relative.components().any(|component| {
-                matches!(
-                    component.as_os_str().to_str(),
-                    Some(
-                        ".git"
-                            | ".anvil"
-                            | ".next"
-                            | ".pytest_cache"
-                            | "__pycache__"
-                            | "node_modules"
-                            | "target"
-                    )
-                )
-            })
-        })
+        .map(|relative| !is_workspace_artifact_admitted_relative_path(relative))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_snapshot_ignores_controller_owned_state() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(
+            temp.path()
+                .join(".anvil-state/verifier-python/site/_pytest"),
+        )
+        .unwrap();
+        fs::create_dir_all(temp.path().join("app")).unwrap();
+        fs::write(
+            temp.path()
+                .join(".anvil-state/verifier-python/site/_pytest/__init__.py"),
+            "internal",
+        )
+        .unwrap();
+        fs::write(temp.path().join("app/main.py"), "print('ok')\n").unwrap();
+
+        let snapshot = capture_repo_snapshot(temp.path());
+
+        assert!(snapshot.files.contains_key(Path::new("app/main.py")));
+        assert!(!snapshot.files.contains_key(Path::new(
+            ".anvil-state/verifier-python/site/_pytest/__init__.py"
+        )));
+    }
+
+    #[test]
+    fn repo_progress_does_not_count_anvil_state_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("app")).unwrap();
+        fs::write(temp.path().join("app/main.py"), "print('before')\n").unwrap();
+        let before = capture_repo_snapshot(temp.path());
+
+        fs::create_dir_all(
+            temp.path()
+                .join(".anvil-state/verifier-python/site/_pytest"),
+        )
+        .unwrap();
+        fs::write(
+            temp.path()
+                .join(".anvil-state/verifier-python/site/_pytest/__init__.py"),
+            "internal",
+        )
+        .unwrap();
+        fs::write(temp.path().join("app/main.py"), "print('after')\n").unwrap();
+
+        let progress = verify_repo_progress(&before, temp.path());
+
+        assert_eq!(progress.total_changed_files(), 1);
+        assert_eq!(progress.all_changed_files, vec!["app/main.py"]);
+    }
 }
 
 // Issue #456 / DR1-007: file classification helpers were moved to

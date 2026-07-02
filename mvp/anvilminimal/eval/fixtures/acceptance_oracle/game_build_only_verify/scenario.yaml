@@ -1,0 +1,12 @@
+profile: nextjs
+prompt: Create a playable browser game with keyboard control, challenge, score, and failure rules.
+functional_contract:
+  category: interactive-game
+  required_capabilities:
+    - stateful_interaction
+    - player_control
+    - adversary_or_challenge
+    - progression_or_score
+    - failure_or_collision_rule
+expected_artifacts:
+  - src/app/page.tsx

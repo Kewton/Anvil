@@ -12,18 +12,21 @@
 //! These tests drive the production emit pipeline
 //! (`record_safe_stop_report` -> `build_safe_stop_payload` -> `log_llm_event`
 //! -> `mask_payload_inplace`) through the public `Agent` surface for each of
-//! the 5 stop reasons defined by the design policy:
+//! the 6 stop reasons defined by the design policy (Issue #662 added
+//! `repair_exhausted` as the 6th):
 //!
 //! - `mod diagnostic_target_missing`
 //! - `mod verifier_failed_safe_stop`
 //! - `mod verifier_missing`
 //! - `mod artifact_completion_failed`
 //! - `mod verifier_weak`
+//! - `mod repair_exhausted` (Issue #662)
 //!
 //! Each test uses a unique `session_id` so the shared `init_logging` log can
 //! be filtered safely under cargo's parallel test execution (DR3-003).
 
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use serde_json::Value;
@@ -32,8 +35,10 @@ use tempfile::{TempDir, tempdir};
 use crate::agent::Agent;
 use crate::agent::loop_run::{
     FooterHandle, clear_safe_stop_report_dedup_for_test,
+    drive_record_repair_attempt_outcomes_for_test,
     emit_safe_stop_report_artifact_completion_failed_for_test,
     emit_safe_stop_report_diagnostic_target_missing_for_test,
+    emit_safe_stop_report_repair_exhausted_for_test,
     emit_safe_stop_report_verifier_failed_safe_stop_for_test,
     emit_safe_stop_report_verifier_missing_for_test, emit_safe_stop_report_verifier_weak_for_test,
     seed_artifact_ledger_repo_edit_for_test,
@@ -41,7 +46,7 @@ use crate::agent::loop_run::{
 use crate::config::Config;
 use crate::model_registry::RuntimeModels;
 use crate::ollama::client::OllamaClient;
-use crate::session::store::{SessionSnapshot, SessionStore};
+use crate::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
 
 // ---------------------------------------------------------------------------
 // Shared logger setup (DR3-003) — one TempDir for all tests so OnceLock-backed
@@ -109,6 +114,9 @@ const DOCUMENTED_STOP_REASONS: &[&str] = &[
     "verifier_weak",
     "verifier_missing",
     "diagnostic_target_missing",
+    // Issue #662: 6th stop_reason for RepairJob exhaustion (same (cluster, role)
+    // attacked >= 2 times AND all repairable clusters exhausted).
+    "repair_exhausted",
 ];
 
 const DOCUMENTED_FAILURE_TYPES: &[&str] = &[
@@ -119,6 +127,11 @@ const DOCUMENTED_FAILURE_TYPES: &[&str] = &[
     "missing_verifier_or_config",
     "unknown",
     "diagnostic_target_missing",
+    // Issue #662: documented vocabulary upgrade applied inside
+    // `SafeStopReport::build_from` when `stop_reason == RepairExhausted`
+    // (design judgment #5 (b) — failure_type carries the meta-state label,
+    // not the underlying verifier failure kind).
+    "repair_exhausted",
 ];
 
 const DOCUMENTED_DIAGNOSTIC_REASONS: &[&str] = &[
@@ -505,6 +518,63 @@ mod verifier_missing {
             "non-test paths must be excluded by classify_ownership / is_test_file gate; got {owned:?}",
         );
     }
+
+    #[test]
+    fn from_missing_verifier_contract_bounds_owned_tests_to_explicit_identity() {
+        // Real local-LLM regression: after a profile-confirmed Python TDD task,
+        // a stale ambient Rust-family test path (`tests/cli.rs`) was still
+        // reported as the owned verifier artifact even though the objective
+        // contract required `tests/test_math_utils.py`.
+        let _ = shared_log_path();
+        let session_id = unique_session_id("vm-contract-bound");
+        let server = mockito::Server::new();
+        let (mut agent, dir) = build_live_agent(&session_id, &server.url());
+        let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        let profile = super::super::project_profile::parse_project_profile_confirmation(
+            r#"{"language":"python","shape":"library","deliverable_kind":"code","primary_artifacts":["math_utils.py","tests/test_math_utils.py"],"forbidden_artifacts":["setup","docs"],"evidence_kind":"test_run","needs_environment_setup":false,"preferred_runner":null,"confidence":1.0,"reason":"explicit Python TDD target"}"#,
+        )
+        .expect("profile");
+        let contract =
+            super::super::task_contract::TaskContract::from_request_with_kind_and_project_profile(
+                request,
+                None,
+                Some(&profile),
+            );
+        agent
+            .task_contract_this_turn
+            .set(Rc::new(contract))
+            .expect("unset task contract");
+
+        let stale = seed_owned_test_artifact(&mut agent, &dir, "cli.rs");
+        let expected = seed_owned_test_artifact(&mut agent, &dir, "test_math_utils.py");
+
+        emit_safe_stop_report_verifier_missing_for_test(&mut agent);
+
+        let events = safe_stop_events_for(&session_id);
+        assert_eq!(events.len(), 1, "expected exactly one safe_stop event");
+        let payload = events[0].get("payload").expect("payload");
+        let owned: Vec<String> = payload
+            .get("owned_test_artifacts")
+            .and_then(|v| v.as_array())
+            .expect("owned_test_artifacts must be an array")
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        assert_eq!(
+            owned,
+            vec![expected],
+            "contract test identity must exclude stale verifier-owned path {stale:?}",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +721,260 @@ mod verifier_weak {
         assert!(
             owned.iter().any(|v| v.as_str() == Some(owned_rel.as_str())),
             "expected seeded path {owned_rel:?} in {owned:?}",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #662: mod repair_exhausted — wired at the Applied / Invalid path
+// observers in `turn.rs` once `PromotionResult.all_clusters_exhausted = true`.
+// The seam reuses the shared `FromRepair` SSOT, so the documented vocabulary
+// (`stop_reason: "repair_exhausted"` / `failure_type: "repair_exhausted"`)
+// and the 4 KB payload cap are validated identically to the other 5 paths.
+// ---------------------------------------------------------------------------
+
+mod repair_exhausted {
+    use super::*;
+
+    #[test]
+    fn safe_stop_report_repair_exhausted_emits_payload() {
+        let _ = shared_log_path();
+        let session_id = unique_session_id("re-basic");
+        let server = mockito::Server::new();
+        let (mut agent, _dir) = build_live_agent(&session_id, &server.url());
+
+        emit_safe_stop_report_repair_exhausted_for_test(&mut agent);
+
+        let events = safe_stop_events_for(&session_id);
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one agent.safe_stop.report event must be emitted"
+        );
+        let payload = events[0].get("payload").expect("payload");
+        assert_payload_schema(payload);
+        assert_eq!(
+            payload.get("stop_reason").and_then(|v| v.as_str()),
+            Some("repair_exhausted"),
+            "stop_reason vocabulary must carry the documented 6th label"
+        );
+        // Design judgment #5 (b): failure_type is upgraded from the underlying
+        // verifier failure kind to the meta-state label so downstream consumers
+        // can branch on `failure_type == \"repair_exhausted\"` without
+        // inspecting `stop_reason`.
+        assert_eq!(
+            payload.get("failure_type").and_then(|v| v.as_str()),
+            Some("repair_exhausted"),
+            "failure_type must be upgraded for RepairExhausted"
+        );
+        // `FromRepair` path always populates a (possibly empty) summary.
+        assert!(payload.get("exhausted_attempts_summary").is_some());
+    }
+
+    #[test]
+    fn safe_stop_report_repair_exhausted_dedup_blocks_second_emit_in_same_turn() {
+        let _ = shared_log_path();
+        let session_id = unique_session_id("re-dedup");
+        let server = mockito::Server::new();
+        let (mut agent, _dir) = build_live_agent(&session_id, &server.url());
+
+        emit_safe_stop_report_repair_exhausted_for_test(&mut agent);
+        emit_safe_stop_report_repair_exhausted_for_test(&mut agent);
+
+        let after_two = safe_stop_events_for(&session_id);
+        assert_eq!(
+            after_two.len(),
+            1,
+            "per-StopReason dedup must block the second emit"
+        );
+
+        clear_safe_stop_report_dedup_for_test(&mut agent);
+        emit_safe_stop_report_repair_exhausted_for_test(&mut agent);
+        let after_reset = safe_stop_events_for(&session_id);
+        assert_eq!(
+            after_reset.len(),
+            2,
+            "after dedup reset the same StopReason must re-emit"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #662 (Codex CB-002): production observation-path E2E.
+    //
+    // The two tests above exercise only the bare emit shell
+    // (`emit_safe_stop_report_for_repair_exhausted`). They DO NOT touch:
+    //
+    //   - `record_repair_attempt_outcome` (the ledger push + promotion
+    //     judgement),
+    //   - the `count >= 2` promotion SSOT
+    //     (`should_promote_to_exhausted_after_push`),
+    //   - `next_repairable_cluster`'s "all clusters exhausted" judgement, or
+    //   - `Agent::maybe_emit_repair_exhausted_from_promotion`'s observation
+    //     logic (the Applied / Invalid caller chokepoint in `turn.rs`).
+    //
+    // If any of those four moving parts regresses, the bare-shell tests
+    // above remain green and the regression escapes review. The two tests
+    // below close that gap by driving the **same** `record_repair_attempt_
+    // outcome → PromotionResult.all_clusters_exhausted → emit` pipeline the
+    // Applied caller (`drive_task_contract_verifier`) and the Invalid caller
+    // (`record_controller_verifier_repair_invalid`) call in production.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn safe_stop_report_repair_exhausted_emits_from_applied_caller_path() {
+        // Production analogue: two AppliedNoProgress (or one + Worsened)
+        // outcomes against the same (cluster, role) under a single-cluster
+        // semantic plan. The second `record_repair_attempt_outcome` push
+        // promotes the (cluster, role) to `exhausted_attempts` (count >= 2);
+        // because the plan only has one repairable cluster,
+        // `next_repairable_cluster` returns `None` and
+        // `PromotionResult.all_clusters_exhausted = true`. The shared
+        // `maybe_emit_repair_exhausted_from_promotion` helper then fires
+        // the `repair_exhausted` safe-stop report — the very same path the
+        // production Applied caller executes.
+        let _ = shared_log_path();
+        let session_id = unique_session_id("re-applied");
+        let server = mockito::Server::new();
+        let (mut agent, _dir) = build_live_agent(&session_id, &server.url());
+
+        // 2x AppliedNoProgress against the same (cluster, role) → same
+        // `PromotionBucket::NoProgress` count >= 2 → promotion → with the
+        // single-cluster plan, `next_repairable_cluster` returns `None`
+        // and `PromotionResult.all_clusters_exhausted = true` on the
+        // second push. (Mixing buckets — e.g. NoProgress + Worsened —
+        // would NOT promote because `should_promote_non_unsafe` counts
+        // within a single bucket. The design judgment #5 SSOT
+        // intentionally distinguishes `Worsened` from `NoProgress` so
+        // crossing the buckets does not budget against each other.)
+        drive_record_repair_attempt_outcomes_for_test(
+            &mut agent,
+            "cb002-applied",
+            "implementation",
+            &["applied_no_progress", "applied_no_progress"],
+        );
+
+        let events = safe_stop_events_for(&session_id);
+        assert_eq!(
+            events.len(),
+            1,
+            "Applied caller path must emit exactly one repair_exhausted report \
+             after 2 same-(cluster, role) Applied outcomes; got {events:?}"
+        );
+        let payload = events[0].get("payload").expect("payload");
+        assert_payload_schema(payload);
+        assert_eq!(
+            payload.get("stop_reason").and_then(|v| v.as_str()),
+            Some("repair_exhausted"),
+            "production Applied caller must surface stop_reason=repair_exhausted"
+        );
+        // Design judgement #5 (b): the failure_type is upgraded to the
+        // meta-state label so downstream consumers can branch on
+        // `failure_type == \"repair_exhausted\"` without inspecting
+        // `stop_reason`.
+        assert_eq!(
+            payload.get("failure_type").and_then(|v| v.as_str()),
+            Some("repair_exhausted"),
+            "failure_type upgrade must flow through the FromRepair builder"
+        );
+    }
+
+    #[test]
+    fn safe_stop_report_repair_exhausted_emits_from_invalid_caller_path() {
+        // Production analogue: two invalid validator rejections (RejectedNoop
+        // and RejectedDuplicate) against the same (cluster, role). Each
+        // outcome flows through `record_repair_attempt_outcome` exactly the
+        // way `record_controller_verifier_repair_invalid` pushes it; the
+        // shared observation helper then fires once the second push
+        // promotes the (cluster, role) and `all_clusters_exhausted = true`.
+        let _ = shared_log_path();
+        let session_id = unique_session_id("re-invalid");
+        let server = mockito::Server::new();
+        let (mut agent, _dir) = build_live_agent(&session_id, &server.url());
+
+        // 2x RejectedNoop against the same (cluster, role) → same
+        // `PromotionBucket::Noop` count >= 2 → promotion → emit. Like the
+        // Applied caller test above, the bucket SSOT requires both pushes
+        // to share a bucket (so `rejected_noop` + `rejected_duplicate`
+        // would NOT promote even though both are Invalid-caller variants).
+        drive_record_repair_attempt_outcomes_for_test(
+            &mut agent,
+            "cb002-invalid",
+            "implementation",
+            &["rejected_noop", "rejected_noop"],
+        );
+
+        let events = safe_stop_events_for(&session_id);
+        assert_eq!(
+            events.len(),
+            1,
+            "Invalid caller path must emit exactly one repair_exhausted report \
+             after 2 same-(cluster, role) Invalid outcomes; got {events:?}"
+        );
+        let payload = events[0].get("payload").expect("payload");
+        assert_payload_schema(payload);
+        assert_eq!(
+            payload.get("stop_reason").and_then(|v| v.as_str()),
+            Some("repair_exhausted"),
+            "production Invalid caller must surface stop_reason=repair_exhausted"
+        );
+        assert_eq!(
+            payload.get("failure_type").and_then(|v| v.as_str()),
+            Some("repair_exhausted"),
+            "failure_type upgrade must flow through the FromRepair builder"
+        );
+    }
+
+    #[test]
+    fn safe_stop_report_repair_exhausted_does_not_emit_after_only_one_push() {
+        // Negative regression: a single outcome push (count = 1 for the
+        // (cluster, role)) MUST NOT promote and MUST NOT emit
+        // `repair_exhausted`. Anchors the `count >= 2` SSOT
+        // (`should_promote_to_exhausted_after_push`) directly: a regression
+        // that promoted on the first push would surface here.
+        let _ = shared_log_path();
+        let session_id = unique_session_id("re-single");
+        let server = mockito::Server::new();
+        let (mut agent, _dir) = build_live_agent(&session_id, &server.url());
+
+        drive_record_repair_attempt_outcomes_for_test(
+            &mut agent,
+            "cb002-single",
+            "implementation",
+            &["applied_no_progress"],
+        );
+
+        let events = safe_stop_events_for(&session_id);
+        assert!(
+            events.is_empty(),
+            "count >= 2 SSOT regression: single push promoted prematurely; got {events:?}"
+        );
+    }
+
+    #[test]
+    fn safe_stop_report_repair_exhausted_does_not_emit_when_buckets_differ() {
+        // Negative regression: 2 outcomes against the same (cluster, role)
+        // but spanning **different** `PromotionBucket` variants (e.g.
+        // `NoProgress` + `Worsened`) MUST NOT promote. The
+        // `should_promote_non_unsafe` SSOT counts within a single bucket
+        // only — anchor that contract directly so a regression that fused
+        // buckets (e.g. counted any non-`AppliedImproved` against the same
+        // budget) does not slip through.
+        let _ = shared_log_path();
+        let session_id = unique_session_id("re-buckets");
+        let server = mockito::Server::new();
+        let (mut agent, _dir) = build_live_agent(&session_id, &server.url());
+
+        drive_record_repair_attempt_outcomes_for_test(
+            &mut agent,
+            "cb002-buckets",
+            "implementation",
+            &["applied_no_progress", "applied_worsened"],
+        );
+
+        let events = safe_stop_events_for(&session_id);
+        assert!(
+            events.is_empty(),
+            "bucket discrimination SSOT regression: cross-bucket pair promoted; got {events:?}"
         );
     }
 }

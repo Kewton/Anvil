@@ -58,6 +58,7 @@ class Column:
 
 COLUMNS: list[Column] = [
     Column("rc", "rc", False, "int"),
+    Column("postcheck_success", "postcheck", False, "bool"),
     Column("elapsed_s", "elapsed_s", True, "int"),
     Column("we_total", "we_total", True, "int"),
     Column("page_tsx_has_game_keywords", "page_game", False, "bool"),
@@ -65,6 +66,14 @@ COLUMNS: list[Column] = [
     Column("error_500_count", "error_500", False, "int"),
     Column("compact_events", "compacts", False, "int"),
 ]
+
+OUTCOME_AGREEMENTS = (
+    "true_positive",
+    "false_positive",
+    "false_negative",
+    "true_negative",
+    "unknown",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +185,46 @@ def _run_sort_key(p: Path) -> int:
     return int(m.group(1)) if m else -1
 
 
+def _valid_suite_dir(p: Path, bench_root: Path) -> bool:
+    if p.is_symlink() or not p.is_dir():
+        return False
+    if not MODEL_SLUG_RE.match(p.name):
+        return False
+    return _resolve_in(p, bench_root) is not None
+
+
+def _append_run(
+    runs: list[tuple[str, int, Path]],
+    bench_root: Path,
+    model_slug: str,
+    run_dir: Path,
+) -> bool:
+    if not RUN_DIR_RE.match(run_dir.name):
+        return False
+    if run_dir.is_symlink():
+        _warn(f"skipping symlink run-dir: {run_dir}")
+        return False
+    if not run_dir.is_dir():
+        return False
+    if _resolve_in(run_dir, bench_root) is None:
+        _warn(f"skipping run-dir outside BENCH_ROOT: {run_dir}")
+        return False
+    runs.append((model_slug, int(run_dir.name[4:]), run_dir))
+    return len(runs) >= MAX_RUNS
+
+
 def _discover_runs(bench_root: Path) -> list[tuple[str, int, Path]]:
-    """Walk bench_root and return sorted [(model_slug, run_n, run_dir), ...]."""
+    """Walk bench_root and return sorted [(model_slug, run_n, run_dir), ...].
+
+    Supports both legacy flat layout:
+      <root>/<model>/run-N
+
+    suite/PAM layout:
+      <root>/<model>/<case>/<pam_variant>/run-N
+
+    and engine/case/PAM layout:
+      <root>/<model>/<engine>/<case>/<pam_variant>/run-N
+    """
     runs: list[tuple[str, int, Path]] = []
     try:
         children = sorted(bench_root.iterdir())
@@ -195,27 +242,43 @@ def _discover_runs(bench_root: Path) -> list[tuple[str, int, Path]]:
         if _resolve_in(model_dir, bench_root) is None:
             _warn(f"skipping model dir outside BENCH_ROOT: {model_dir.name}")
             continue
-        try:
-            run_children = sorted(model_dir.iterdir(), key=_run_sort_key)
-        except OSError as e:
-            _warn(f"cannot list {model_dir.name}: {e}")
-            continue
-        for run_dir in run_children:
-            if not RUN_DIR_RE.match(run_dir.name):
-                continue
-            if run_dir.is_symlink():
-                _warn(f"skipping symlink run-dir: {run_dir}")
-                continue
-            if not run_dir.is_dir():
-                continue
-            if _resolve_in(run_dir, bench_root) is None:
-                _warn(f"skipping run-dir outside BENCH_ROOT: {run_dir}")
-                continue
-            runs.append((model_dir.name, int(run_dir.name[4:]), run_dir))
-            if len(runs) >= MAX_RUNS:
-                _warn(f"reached MAX_RUNS={MAX_RUNS}, truncating discovery")
-                return runs
+        if _discover_model_runs(runs, bench_root, model_dir.name, model_dir, 4):
+            _warn(f"reached MAX_RUNS={MAX_RUNS}, truncating discovery")
+            return runs
     return runs
+
+
+def _discover_model_runs(
+    runs: list[tuple[str, int, Path]],
+    bench_root: Path,
+    model_slug: str,
+    parent: Path,
+    depth_remaining: int,
+) -> bool:
+    """Recursively discover run dirs below one model dir with bounded depth."""
+    try:
+        children = sorted(parent.iterdir(), key=_run_sort_key)
+    except OSError as e:
+        _warn(f"cannot list {parent}: {e}")
+        return False
+    for child in children:
+        if RUN_DIR_RE.match(child.name):
+            if _append_run(runs, bench_root, model_slug, child):
+                return True
+            continue
+        if depth_remaining <= 0:
+            continue
+        if not _valid_suite_dir(child, bench_root):
+            continue
+        if _discover_model_runs(
+            runs,
+            bench_root,
+            model_slug,
+            child,
+            depth_remaining - 1,
+        ):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +331,15 @@ def _success_rate(rows: list[dict]) -> tuple[str, int, int]:
     success = sum(1 for rc in rcs if rc == 0)
     pct = 100 * success // len(rcs)
     return f"{pct}%", success, len(rcs)
+
+
+def _bool_success_rate(rows: list[dict], key: str) -> tuple[str, int, int]:
+    vals = [r.get(key) for r in rows if isinstance(r.get(key), bool)]
+    if not vals:
+        return "N/A", 0, 0
+    success = sum(1 for v in vals if v is True)
+    pct = 100 * success // len(vals)
+    return f"{pct}%", success, len(vals)
 
 
 def _aggregate(rows: list[dict]) -> dict:
@@ -333,6 +405,387 @@ def _aggregate_tool_calls(rows: list[dict]) -> dict[str, int]:
     return dict(sorted(totals.items()))
 
 
+def _terminal_success(row: dict) -> bool | None:
+    success = row.get("anvil_terminal_success")
+    if isinstance(success, bool):
+        return success
+    rc = row.get("rc")
+    if isinstance(rc, bool) or not isinstance(rc, int):
+        return None
+    return rc == 0
+
+
+def _outcome_agreement(row: dict) -> str:
+    raw = row.get("outcome_agreement")
+    if isinstance(raw, str) and raw in OUTCOME_AGREEMENTS:
+        return raw
+    terminal_success = _terminal_success(row)
+    postcheck_success = row.get("postcheck_success")
+    if terminal_success is None or not isinstance(postcheck_success, bool):
+        return "unknown"
+    if terminal_success and postcheck_success:
+        return "true_positive"
+    if terminal_success and not postcheck_success:
+        return "false_positive"
+    if not terminal_success and postcheck_success:
+        return "false_negative"
+    return "true_negative"
+
+
+def _agreement_counts(rows: list[dict]) -> dict[str, int]:
+    counts = {name: 0 for name in OUTCOME_AGREEMENTS}
+    for row in rows:
+        counts[_outcome_agreement(row)] += 1
+    return counts
+
+
+def _count_strings(rows: list[dict], key: str, default: str = "unknown") -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        raw = row.get(key)
+        value = raw if isinstance(raw, str) and raw else default
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _ratio(ok: int, total: int) -> float | None:
+    return None if total == 0 else ok / total
+
+
+def _quality_summary(rows: list[dict]) -> dict:
+    term_rate, term_ok, term_total = _success_rate(rows)
+    post_rate, post_ok, post_total = _bool_success_rate(rows, "postcheck_success")
+    both_total = 0
+    both_ok = 0
+    for r in rows:
+        terminal_success = _terminal_success(r)
+        postcheck_success = r.get("postcheck_success")
+        if terminal_success is None or not isinstance(postcheck_success, bool):
+            continue
+        both_total += 1
+        if terminal_success and postcheck_success:
+            both_ok += 1
+    return {
+        "runs": len(rows),
+        "terminal_success": {
+            "ok": term_ok,
+            "total": term_total,
+            "rate": _ratio(term_ok, term_total),
+            "display": term_rate,
+        },
+        "postcheck_success": {
+            "ok": post_ok,
+            "total": post_total,
+            "rate": _ratio(post_ok, post_total),
+            "display": post_rate,
+        },
+        "both_success": {
+            "ok": both_ok,
+            "total": both_total,
+            "rate": _ratio(both_ok, both_total),
+        },
+        "outcome_agreement": _agreement_counts(rows),
+        "failure_authority": _count_strings(rows, "failure_authority"),
+    }
+
+
+# Issue #976 (parent #974, Issue B): transition metrics aggregated from the
+# per-run `failure_observation` projection emitted by analyze_run.py.
+TRANSITION_FLAG_METRICS = (
+    "wrong_target_repair",
+    "same_diagnostic_repeated",
+    "runner_present_but_failed",
+    "repair_should_target_test_or_setup",
+    "missing_evidence",
+    "missing_deliverable",
+)
+TRANSITION_RATE_METRICS = (
+    "evidence_runner_executed",
+    "deterministic_operator_hit",
+)
+
+# Issue #1007: repair-to-pass lifecycle metrics. These collapse the per-run
+# `failure_observation` projection + recovery-strategy counts (plus the optional
+# `worker_lifecycle` bools, when emitted) into a funnel that shows *where in the
+# lifecycle* runs get stuck rather than only the terminal pass rate. report.py
+# does not import analyze_run.py (it shells out per run), so the terminal-state
+# vocabulary the predicates need is restated locally here. The labels are kept
+# aligned with `analyze_run.py` generic terminal states.
+#
+# Reaching any of these terminals implies a deliverable was actually produced
+# (the run advanced past the scaffold/deliverable stage).
+_POST_DELIVERABLE_TERMINAL_STATES = frozenset(
+    {
+        "completed",
+        "missing_evidence",
+        "evidence_runner_missing",
+        "evidence_binding_failed",
+        "evidence_failed",
+        "evidence_repair_exhausted",
+        "evidence_repair_safe_stop",
+    }
+)
+# Terminals that imply an evidence runner bound AND executed. Note this EXCLUDES
+# `evidence_binding_failed` (runner could not bind) and `evidence_runner_missing`
+# (no runner at all) — those are exactly the not-runnable cases.
+_EVIDENCE_RUNNABLE_TERMINAL_STATES = frozenset(
+    {
+        "completed",
+        "evidence_failed",
+        "evidence_repair_exhausted",
+        "evidence_repair_safe_stop",
+    }
+)
+# Terminals that imply a repair loop ran against a failing diagnostic.
+_REPAIR_REACHED_TERMINAL_STATES = frozenset(
+    {
+        "evidence_repair_exhausted",
+        "evidence_repair_safe_stop",
+    }
+)
+
+
+def _obs_int(obs: dict, key: str) -> int | None:
+    value = obs.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _lifecycle_passed_deliverable(obs: dict, row: dict) -> bool:
+    """True when the run produced its deliverable (scaffold complete).
+
+    Prefers the explicit `worker_lifecycle.deliverable_created` bool when the
+    eval log emits it; otherwise falls back to terminal-state / generated-file
+    signals. A `missing_deliverable` terminal is a hard False.
+    """
+    created = row.get("deliverable_created")
+    if isinstance(created, bool):
+        return created
+    if obs.get("missing_deliverable") is True:
+        return False
+    if obs.get("terminal_state") in _POST_DELIVERABLE_TERMINAL_STATES:
+        return True
+    generated = _obs_int(obs, "generated_file_count")
+    return generated is not None and generated > 0
+
+
+def _lifecycle_evidence_runnable(obs: dict, row: dict) -> bool:
+    """True when an evidence runner bound and ran for the run.
+
+    Prefers `worker_lifecycle.runner_bound`; otherwise uses the
+    `evidence_runner_executed` flag or a runner-ran terminal state. Binding
+    failures and runner-missing terminals are not runnable.
+    """
+    bound = row.get("runner_bound")
+    if isinstance(bound, bool):
+        return bound
+    if obs.get("evidence_runner_executed") is True:
+        return True
+    return obs.get("terminal_state") in _EVIDENCE_RUNNABLE_TERMINAL_STATES
+
+
+def _lifecycle_reached_repair(obs: dict, row: dict) -> bool:
+    """True when the run entered the repair/recovery loop.
+
+    Signals: `worker_lifecycle.repair_applied`, a non-zero `repair_count` on the
+    failure observation (which falls back to the controller recovery-strategy
+    count when the eval log does not emit an explicit repair count), or a repair
+    terminal state.
+    """
+    if row.get("repair_applied") is True:
+        return True
+    repair_count = _obs_int(obs, "repair_count")
+    if repair_count is not None and repair_count >= 1:
+        return True
+    return obs.get("terminal_state") in _REPAIR_REACHED_TERMINAL_STATES
+
+
+def _lifecycle_run_passed(obs: dict, row: dict) -> bool:
+    """True when the run ultimately passed (postcheck success / completed)."""
+    ps = obs.get("postcheck_success")
+    if isinstance(ps, bool):
+        return ps
+    ps = row.get("postcheck_success")
+    if isinstance(ps, bool):
+        return ps
+    return obs.get("terminal_state") == "completed"
+
+
+def _lifecycle_strategy_switches(row: dict) -> int:
+    """Number of controller recovery-strategy switches for the run.
+
+    `recovery_strategy_count` is the count of *distinct* controller strategies
+    attempted (deduped at source), so the number of switches is that count minus
+    the initial strategy. Falls back to the deduped label-list length.
+    """
+    count = row.get("recovery_strategy_count")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        strategies = row.get("recovery_strategies")
+        count = len(strategies) if isinstance(strategies, list) else 0
+    return max(0, count - 1)
+
+
+def _lifecycle_operator_missing(obs: dict, row: dict) -> bool:
+    """True when recovery exhausted with no deterministic operator available.
+
+    Mirrors the agent-side `NoProgressExhaustionReason::OperatorMissing` intent:
+    the repair loop ran out of road and no deterministic operator ever fired.
+    """
+    terminal = obs.get("terminal_state")
+    recovery_exhausted = (
+        terminal in _REPAIR_REACHED_TERMINAL_STATES
+        or obs.get("failure_class") == "recovery_exhausted"
+    )
+    if not recovery_exhausted:
+        return False
+    return obs.get("deterministic_operator_hit") is not True
+
+
+def _lifecycle_observation_rows(rows: list[dict]) -> list[dict]:
+    return [
+        row
+        for row in rows
+        if not row.get("_failed") and isinstance(row.get("failure_observation"), dict)
+    ]
+
+
+def _lifecycle_metrics(rows: list[dict]) -> dict:
+    """Aggregate per-run lifecycle signals into repair-to-pass funnel metrics.
+
+    The denominator (``runs``) is every analyzed run that carries a
+    ``failure_observation`` (successful runs included, exactly like
+    :func:`_transition_metrics`), so each rate is comparable across reports.
+    """
+    observed = _lifecycle_observation_rows(rows)
+    total = len(observed)
+    scaffold_ok = 0
+    evidence_ok = 0
+    binding_failures = 0
+    repair_reached = 0
+    repair_converted = 0
+    same_failure_repeated = 0
+    strategy_switches = 0
+    operator_missing = 0
+    for row in observed:
+        obs = row["failure_observation"]
+        if _lifecycle_passed_deliverable(obs, row):
+            scaffold_ok += 1
+        if _lifecycle_evidence_runnable(obs, row):
+            evidence_ok += 1
+        if obs.get("terminal_state") == "evidence_binding_failed":
+            binding_failures += 1
+        if _lifecycle_reached_repair(obs, row):
+            repair_reached += 1
+            if _lifecycle_run_passed(obs, row):
+                repair_converted += 1
+        if obs.get("same_diagnostic_repeated") is True:
+            same_failure_repeated += 1
+        strategy_switches += _lifecycle_strategy_switches(row)
+        if _lifecycle_operator_missing(obs, row):
+            operator_missing += 1
+    return {
+        "runs": total,
+        "first_pass_scaffold_complete": {
+            "ok": scaffold_ok,
+            "total": total,
+            "rate": _ratio(scaffold_ok, total),
+        },
+        "first_evidence_runnable": {
+            "ok": evidence_ok,
+            "total": total,
+            "rate": _ratio(evidence_ok, total),
+        },
+        "binding_failure_count": binding_failures,
+        "repair_loop_reached": repair_reached,
+        "repair_to_pass_conversion": {
+            "reached": repair_reached,
+            "converted": repair_converted,
+            "rate": _ratio(repair_converted, repair_reached),
+        },
+        "same_failure_repeated_count": same_failure_repeated,
+        "strategy_switch_count": strategy_switches,
+        "operator_missing_count": operator_missing,
+    }
+
+
+def _lifecycle_metrics_by_task_kind(rows: list[dict]) -> list[dict]:
+    """Per-task_kind lifecycle metrics (Issue #1007 AC4)."""
+    groups: dict[str, list[dict]] = {}
+    for row in _lifecycle_observation_rows(rows):
+        kind = str(row.get("task_kind", "coding"))
+        groups.setdefault(kind, []).append(row)
+    out: list[dict] = []
+    for kind in sorted(groups):
+        item: dict = {"task_kind": kind}
+        item.update(_lifecycle_metrics(groups[kind]))
+        out.append(item)
+    return out
+
+
+def _transition_metrics(rows: list[dict]) -> dict:
+    """Aggregate per-run failure_observation flags into transition metrics.
+
+    Surfaces the lifecycle transition signals the v0.6.3 countermeasure analysis
+    tracks (Issue #976): failure-class distribution, wrong-target / repeated-
+    diagnostic / tool-protocol counts, plus evidence-runner-executed and
+    deterministic-operator-hit rates. The denominator for rates is every
+    analyzed run that carries a failure_observation, so a shrinking
+    missing_evidence count against a stable runner-executed rate is visible.
+    """
+    observations = [
+        row["failure_observation"]
+        for row in rows
+        if not row.get("_failed") and isinstance(row.get("failure_observation"), dict)
+    ]
+    total = len(observations)
+
+    def _count_true(key: str) -> int:
+        return sum(1 for o in observations if o.get(key) is True)
+
+    def _count_strings(key: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for o in observations:
+            raw = o.get(key)
+            value = raw if isinstance(raw, str) and raw else "unknown"
+            counts[value] = counts.get(value, 0) + 1
+        return dict(sorted(counts.items()))
+
+    failure_class = _count_strings("failure_class")
+    out: dict = {
+        "runs": total,
+        "failure_class": failure_class,
+        "target_role": _count_strings("target_role"),
+        "tool_protocol_failure": _count_true("tool_protocol_error"),
+        "evidence_failed": failure_class.get("evidence_failed", 0),
+        "recovery_exhausted": failure_class.get("recovery_exhausted", 0),
+    }
+    for metric in TRANSITION_FLAG_METRICS:
+        out[metric] = _count_true(metric)
+    for metric in TRANSITION_RATE_METRICS:
+        ok = _count_true(metric)
+        out[metric] = {"ok": ok, "total": total, "rate": _ratio(ok, total)}
+    return out
+
+
+def _grouped_quality(rows: list[dict], group_keys: list[str]) -> list[dict]:
+    groups: dict[tuple[str, ...], list[dict]] = {}
+    for r in rows:
+        if r.get("_failed"):
+            continue
+        key = tuple(str(r.get(k, "default")) for k in group_keys)
+        groups.setdefault(key, []).append(r)
+
+    out: list[dict] = []
+    for key in sorted(groups):
+        item = {group_keys[i]: key[i] for i in range(len(group_keys))}
+        item.update(_quality_summary(groups[key]))
+        for i, group_key in enumerate(group_keys):
+            item[group_key] = key[i]
+        out.append(item)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # rendering: per-bench-root report
 # ---------------------------------------------------------------------------
@@ -373,12 +826,28 @@ def _gather(bench_root: Path) -> tuple[list[tuple[str, int, Path]], list[dict]]:
 
 
 def _render_run_summary(rows: list[dict]) -> list[str]:
-    headers = ["run", "model"] + [c.label for c in COLUMNS]
+    headers = [
+        "run",
+        "model",
+        "case",
+        "task_kind",
+        "pam",
+        "agreement",
+        "failure_authority",
+    ] + [c.label for c in COLUMNS]
     lines: list[str] = []
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("|" + "|".join("-----" for _ in headers) + "|")
     for r in rows:
-        cells: list[str] = [str(r["_run_n"]), r["_model"]]
+        cells: list[str] = [
+            str(r["_run_n"]),
+            _md_escape_cell(r["_model"]),
+            _md_escape_cell(r.get("case", "default")),
+            _md_escape_cell(r.get("task_kind", "coding")),
+            _md_escape_cell(r.get("pam_variant", "default")),
+            _md_escape_cell(r.get("outcome_agreement", _outcome_agreement(r))),
+            _md_escape_cell(r.get("failure_authority", "unknown")),
+        ]
         if r.get("_failed"):
             # rc column shows the analyze_run.py rc; rest are N/A.
             cells.append(str(r.get("_analyze_rc", "")))
@@ -423,6 +892,23 @@ def _render_aggregate(rows: list[dict]) -> tuple[list[str], list[str]]:
                 + " |"
             )
             continue
+        if col.type == "bool":
+            rate, ok, total = _bool_success_rate(only_ok, col.key)
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        f"{col.label}_rate",
+                        str(total),
+                        rate,
+                        f"{ok}/{total}" if total else "-",
+                        "-",
+                        "-",
+                    ]
+                )
+                + " |"
+            )
+            continue
         stats = agg.get(col.key, {})
         label = col.label
         if stats.get("cv_warn"):
@@ -438,6 +924,349 @@ def _render_aggregate(rows: list[dict]) -> tuple[list[str], list[str]]:
         ]
         lines.append("| " + " | ".join(cells) + " |")
     return lines, warnings
+
+
+def _terminal_postcheck_summary(rows: list[dict], group_keys: list[str]) -> list[list[str]]:
+    groups: dict[tuple[str, ...], list[dict]] = {}
+    for r in rows:
+        if r.get("_failed"):
+            continue
+        key = tuple(str(r.get(k, "default")) for k in group_keys)
+        groups.setdefault(key, []).append(r)
+
+    out: list[list[str]] = []
+    for key in sorted(groups):
+        sub = groups[key]
+        term_rate, term_ok, term_total = _success_rate(sub)
+        post_rate, post_ok, post_total = _bool_success_rate(sub, "postcheck_success")
+        both_total = 0
+        both_ok = 0
+        for r in sub:
+            terminal_success = _terminal_success(r)
+            if terminal_success is None or not isinstance(r.get("postcheck_success"), bool):
+                continue
+            both_total += 1
+            if terminal_success and r.get("postcheck_success") is True:
+                both_ok += 1
+        both_rate = "N/A" if both_total == 0 else f"{100 * both_ok // both_total}%"
+        counts = _agreement_counts(sub)
+        out.append(
+            [
+                *[_md_escape_cell(v) for v in key],
+                str(len(sub)),
+                f"{term_rate} ({term_ok}/{term_total})",
+                f"{post_rate} ({post_ok}/{post_total})",
+                f"{both_rate} ({both_ok}/{both_total})" if both_total else "N/A",
+                str(counts["true_positive"]),
+                str(counts["false_positive"]),
+                str(counts["false_negative"]),
+                str(counts["true_negative"]),
+            ]
+        )
+    return out
+
+
+def _render_task_kind_summary(rows: list[dict]) -> list[str]:
+    table_rows = _terminal_postcheck_summary(rows, ["task_kind"])
+    lines = ["## Task Kind Summary", ""]
+    if not table_rows:
+        lines.append("(no completed analyses)")
+        return lines
+    headers = [
+        "task_kind",
+        "runs",
+        "terminal_success",
+        "postcheck_success",
+        "both_success",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "true_negative",
+    ]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("-----" for _ in headers) + "|")
+    for row in table_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def _render_pam_task_kind_summary(rows: list[dict]) -> list[str]:
+    table_rows = _terminal_postcheck_summary(rows, ["task_kind", "pam_variant"])
+    lines = ["## PAM By Task Kind", ""]
+    if not table_rows:
+        lines.append("(no completed analyses)")
+        return lines
+    headers = [
+        "task_kind",
+        "pam_variant",
+        "runs",
+        "terminal_success",
+        "postcheck_success",
+        "both_success",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "true_negative",
+    ]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("-----" for _ in headers) + "|")
+    for row in table_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def _render_pam_summary(rows: list[dict]) -> list[str]:
+    table_rows = _terminal_postcheck_summary(rows, ["pam_variant"])
+    lines = ["## PAM Summary", ""]
+    if not table_rows:
+        lines.append("(no completed analyses)")
+        return lines
+    headers = [
+        "pam_variant",
+        "runs",
+        "terminal_success",
+        "postcheck_success",
+        "both_success",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "true_negative",
+    ]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("-----" for _ in headers) + "|")
+    for row in table_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def _render_failure_authority_summary(rows: list[dict]) -> list[str]:
+    table_rows = _terminal_postcheck_summary(rows, ["failure_authority"])
+    lines = ["## Failure Authority Summary", ""]
+    if not table_rows:
+        lines.append("(no completed analyses)")
+        return lines
+    headers = [
+        "failure_authority",
+        "runs",
+        "terminal_success",
+        "postcheck_success",
+        "both_success",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "true_negative",
+    ]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("-----" for _ in headers) + "|")
+    for row in table_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def _render_quality_group_summary(
+    title: str,
+    group_keys: list[str],
+    *,
+    rows: list[dict],
+) -> list[str]:
+    table_rows = _terminal_postcheck_summary(rows, group_keys)
+    lines = [f"## {title}", ""]
+    if not table_rows:
+        lines.append("(no completed analyses)")
+        return lines
+    headers = [
+        *group_keys,
+        "runs",
+        "terminal_success",
+        "postcheck_success",
+        "both_success",
+        "true_positive",
+        "false_positive",
+        "false_negative",
+        "true_negative",
+    ]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("|" + "|".join("-----" for _ in headers) + "|")
+    for row in table_rows:
+        lines.append("| " + " | ".join(row) + " |")
+    return lines
+
+
+def _render_objective_matrix_summary(rows: list[dict]) -> list[str]:
+    return _render_quality_group_summary(
+        "Objective Matrix",
+        [
+            "task_kind",
+            "deliverable_kind",
+            "evidence_kind",
+            "generic_terminal_state",
+            "recovery_job_kind",
+        ],
+        rows=rows,
+    )
+
+
+def _render_terminal_state_summary(rows: list[dict]) -> list[str]:
+    return _render_quality_group_summary(
+        "Terminal State Summary",
+        ["generic_terminal_state"],
+        rows=rows,
+    )
+
+
+def _render_recovery_job_summary(rows: list[dict]) -> list[str]:
+    return _render_quality_group_summary(
+        "Recovery Job Summary",
+        ["recovery_job_kind"],
+        rows=rows,
+    )
+
+
+def _fmt_rate_cell(stat: dict) -> str:
+    ok = stat.get("ok", 0)
+    total = stat.get("total", 0)
+    rate = stat.get("rate")
+    pct = "N/A" if not isinstance(rate, (int, float)) else f"{rate * 100:.0f}%"
+    return f"{ok}/{total} ({pct})"
+
+
+def _render_transition_metrics_summary(rows: list[dict]) -> list[str]:
+    metrics = _transition_metrics(rows)
+    lines = ["## Transition Metrics", ""]
+    if metrics["runs"] == 0:
+        lines.append("(no completed analyses)")
+        return lines
+    lines.append("| metric | value |")
+    lines.append("|-----|-----|")
+    lines.append(f"| runs | {metrics['runs']} |")
+    for metric in (
+        "missing_evidence",
+        "missing_deliverable",
+        "evidence_failed",
+        "recovery_exhausted",
+        "wrong_target_repair",
+        "same_diagnostic_repeated",
+        "tool_protocol_failure",
+        "runner_present_but_failed",
+        "repair_should_target_test_or_setup",
+    ):
+        lines.append(f"| {metric} | {metrics[metric]} |")
+    for metric in TRANSITION_RATE_METRICS:
+        lines.append(f"| {metric} | {_fmt_rate_cell(metrics[metric])} |")
+    lines.append("")
+    lines.append("| failure_class | count |")
+    lines.append("|-----|-----|")
+    for name, count in metrics["failure_class"].items():
+        lines.append(f"| {name} | {count} |")
+    return lines
+
+
+def _fmt_conversion_cell(stat: dict) -> str:
+    reached = stat.get("reached", 0)
+    converted = stat.get("converted", 0)
+    rate = stat.get("rate")
+    pct = "N/A" if not isinstance(rate, (int, float)) else f"{rate * 100:.0f}%"
+    return f"{converted}/{reached} ({pct})"
+
+
+_LIFECYCLE_BY_KIND_HEADERS = (
+    "task_kind",
+    "runs",
+    "first_pass_scaffold_complete",
+    "first_evidence_runnable",
+    "binding_failure_count",
+    "repair_loop_reached",
+    "repair_to_pass_conversion",
+    "same_failure_repeated_count",
+    "strategy_switch_count",
+    "operator_missing_count",
+)
+
+
+def _render_lifecycle_metrics_summary(rows: list[dict]) -> list[str]:
+    metrics = _lifecycle_metrics(rows)
+    lines = ["## Lifecycle Metrics", ""]
+    if metrics["runs"] == 0:
+        lines.append("(no completed analyses)")
+        return lines
+    lines.append("| metric | value |")
+    lines.append("|-----|-----|")
+    lines.append(f"| runs | {metrics['runs']} |")
+    lines.append(
+        f"| first_pass_scaffold_complete | "
+        f"{_fmt_rate_cell(metrics['first_pass_scaffold_complete'])} |"
+    )
+    lines.append(
+        f"| first_evidence_runnable | "
+        f"{_fmt_rate_cell(metrics['first_evidence_runnable'])} |"
+    )
+    lines.append(f"| binding_failure_count | {metrics['binding_failure_count']} |")
+    lines.append(f"| repair_loop_reached | {metrics['repair_loop_reached']} |")
+    lines.append(
+        f"| repair_to_pass_conversion | "
+        f"{_fmt_conversion_cell(metrics['repair_to_pass_conversion'])} |"
+    )
+    lines.append(
+        f"| same_failure_repeated_count | {metrics['same_failure_repeated_count']} |"
+    )
+    lines.append(f"| strategy_switch_count | {metrics['strategy_switch_count']} |")
+    lines.append(f"| operator_missing_count | {metrics['operator_missing_count']} |")
+
+    by_kind = _lifecycle_metrics_by_task_kind(rows)
+    if by_kind:
+        lines.append("")
+        lines.append("### Lifecycle Metrics By Task Kind")
+        lines.append("")
+        lines.append("| " + " | ".join(_LIFECYCLE_BY_KIND_HEADERS) + " |")
+        lines.append("|" + "|".join("-----" for _ in _LIFECYCLE_BY_KIND_HEADERS) + "|")
+        for item in by_kind:
+            cells = [
+                _md_escape_cell(str(item["task_kind"])),
+                str(item["runs"]),
+                _fmt_rate_cell(item["first_pass_scaffold_complete"]),
+                _fmt_rate_cell(item["first_evidence_runnable"]),
+                str(item["binding_failure_count"]),
+                str(item["repair_loop_reached"]),
+                _fmt_conversion_cell(item["repair_to_pass_conversion"]),
+                str(item["same_failure_repeated_count"]),
+                str(item["strategy_switch_count"]),
+                str(item["operator_missing_count"]),
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+    return lines
+
+
+def _worker_lifecycle_rows(rows: list[dict]) -> list[dict]:
+    lifecycle_keys = {
+        "worker_kind",
+        "context_pack_kind",
+        "lifecycle_failure_stage",
+        "deliverable_created",
+        "evidence_created",
+        "runner_bound",
+        "diagnostic_classified",
+        "repair_applied",
+        "rerun_passed",
+    }
+    return [
+        row
+        for row in rows
+        if not row.get("_failed") and any(key in row for key in lifecycle_keys)
+    ]
+
+
+def _render_worker_lifecycle_summary(rows: list[dict]) -> list[str]:
+    lifecycle_rows = _worker_lifecycle_rows(rows)
+    return _render_quality_group_summary(
+        "Worker Lifecycle Summary",
+        [
+            "worker_kind",
+            "context_pack_kind",
+            "lifecycle_failure_stage",
+            "recovery_job_kind",
+        ],
+        rows=lifecycle_rows,
+    )
 
 
 def _render_report(bench_root: Path, rows: list[dict]) -> str:
@@ -465,7 +1294,88 @@ def _render_report(bench_root: Path, rows: list[dict]) -> str:
     else:
         parts.append("(no runs discovered)")
     parts.append("")
+    if rows:
+        parts.extend(_render_pam_summary(rows))
+        parts.append("")
+        parts.extend(_render_task_kind_summary(rows))
+        parts.append("")
+        parts.extend(_render_pam_task_kind_summary(rows))
+        parts.append("")
+        parts.extend(_render_failure_authority_summary(rows))
+        parts.append("")
+        parts.extend(_render_objective_matrix_summary(rows))
+        parts.append("")
+        parts.extend(_render_terminal_state_summary(rows))
+        parts.append("")
+        parts.extend(_render_recovery_job_summary(rows))
+        parts.append("")
+        parts.extend(_render_transition_metrics_summary(rows))
+        parts.append("")
+        parts.extend(_render_lifecycle_metrics_summary(rows))
+        parts.append("")
+        if _worker_lifecycle_rows(rows):
+            parts.extend(_render_worker_lifecycle_summary(rows))
+            parts.append("")
     return "\n".join(parts)
+
+
+def _render_json_report(bench_root: Path, rows: list[dict]) -> str:
+    analyzed = [r for r in rows if not r.get("_failed")]
+    failed = [r for r in rows if r.get("_failed")]
+    lifecycle_rows = _worker_lifecycle_rows(analyzed)
+    out = {
+        "schema_version": 1,
+        "bench_root": str(bench_root),
+        "bench_root_name": bench_root.name,
+        "generated_at": _now_iso(),
+        "runs": {
+            "total": len(rows),
+            "analyzed": len(analyzed),
+            "analysis_failed": len(failed),
+        },
+        "overall": _quality_summary(analyzed),
+        "by_pam_variant": _grouped_quality(analyzed, ["pam_variant"]),
+        "by_task_kind": _grouped_quality(analyzed, ["task_kind"]),
+        "by_deliverable_kind": _grouped_quality(analyzed, ["deliverable_kind"]),
+        "by_evidence_kind": _grouped_quality(analyzed, ["evidence_kind"]),
+        "by_generic_terminal_state": _grouped_quality(
+            analyzed, ["generic_terminal_state"]
+        ),
+        "by_recovery_job_kind": _grouped_quality(analyzed, ["recovery_job_kind"]),
+        "by_worker_kind": _grouped_quality(lifecycle_rows, ["worker_kind"]),
+        "by_context_pack_kind": _grouped_quality(lifecycle_rows, ["context_pack_kind"]),
+        "by_lifecycle_failure_stage": _grouped_quality(
+            lifecycle_rows, ["lifecycle_failure_stage"]
+        ),
+        "by_worker_lifecycle": _grouped_quality(
+            lifecycle_rows,
+            [
+                "worker_kind",
+                "context_pack_kind",
+                "lifecycle_failure_stage",
+                "recovery_job_kind",
+            ],
+        ),
+        "by_objective_matrix": _grouped_quality(
+            analyzed,
+            [
+                "task_kind",
+                "deliverable_kind",
+                "evidence_kind",
+                "generic_terminal_state",
+                "recovery_job_kind",
+            ],
+        ),
+        "by_task_kind_pam_variant": _grouped_quality(
+            analyzed, ["task_kind", "pam_variant"]
+        ),
+        "by_failure_authority": _grouped_quality(analyzed, ["failure_authority"]),
+        "transition_metrics": _transition_metrics(analyzed),
+        # Issue #1007: repair-to-pass lifecycle funnel + TaskKind breakdown.
+        "lifecycle_metrics": _lifecycle_metrics(analyzed),
+        "lifecycle_metrics_by_task_kind": _lifecycle_metrics_by_task_kind(analyzed),
+    }
+    return json.dumps(out, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +1424,24 @@ def _render_compare_section(model: str, rows_a: list[dict], rows_b: list[dict]) 
     lines.append("| " + " | ".join(["success_rate", sr_a, sr_b, "-", "-"]) + " |")
     for col in COLUMNS:
         if col.key == "rc":
+            continue
+        if col.type == "bool":
+            rate_a, ok_a, total_a = _bool_success_rate(only_a, col.key)
+            rate_b, ok_b, total_b = _bool_success_rate(only_b, col.key)
+            if total_a and total_b:
+                diff = (ok_b / total_b) - (ok_a / total_a)
+                sign = "+" if diff >= 0 else ""
+                diff_cell = f"{sign}{diff * 100:.1f}pt"
+            else:
+                diff_cell = "-"
+            cells = [
+                f"{col.label}_rate",
+                f"{rate_a} ({ok_a}/{total_a})" if total_a else "N/A",
+                f"{rate_b} ({ok_b}/{total_b})" if total_b else "N/A",
+                diff_cell,
+                "-",
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
             continue
         sa = agg_a.get(col.key, {})
         sb = agg_b.get(col.key, {})
@@ -640,10 +1568,13 @@ def _render_compare(root_a: Path, root_b: Path, rows_a: list[dict], rows_b: list
 # ---------------------------------------------------------------------------
 
 
-def _cmd_report(raw_bench_root: str) -> int:
+def _cmd_report(raw_bench_root: str, output_format: str) -> int:
     bench_root = _validate_bench_root(raw_bench_root)
     _runs, rows = _gather(bench_root)
-    sys.stdout.write(_render_report(bench_root, rows))
+    if output_format == "json":
+        sys.stdout.write(_render_json_report(bench_root, rows))
+    else:
+        sys.stdout.write(_render_report(bench_root, rows))
     return 0
 
 
@@ -672,12 +1603,21 @@ def main(argv: list[str] | None = None) -> int:
         metavar=("A", "B"),
         help="Render an A/B comparison report instead of a single-root report",
     )
+    parser.add_argument(
+        "--format",
+        choices=("markdown", "json"),
+        default="markdown",
+        help="Output format for a single-root report (default: markdown)",
+    )
     args = parser.parse_args(argv)
 
     if args.compare:
+        if args.format != "markdown":
+            print("error: --format json is not supported with --compare", file=sys.stderr)
+            return 1
         return _cmd_compare(args.compare[0], args.compare[1])
     if args.bench_root:
-        return _cmd_report(args.bench_root)
+        return _cmd_report(args.bench_root, args.format)
     parser.print_help(sys.stderr)
     return 1
 

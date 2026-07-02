@@ -149,6 +149,37 @@ impl FromStr for DeterministicFallbackMode {
     }
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, serde::Serialize, serde::Deserialize,
+)]
+pub enum Engine {
+    #[default]
+    Legacy,
+    Minimal,
+}
+
+impl fmt::Display for Engine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Legacy => "legacy",
+            Self::Minimal => "minimal",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl FromStr for Engine {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "minimal" => Ok(Self::Minimal),
+            other => Err(format!("unknown engine: {other}")),
+        }
+    }
+}
+
 /// Identifies where a `log_level` / legacy `debug` setting was read from, so
 /// `resolve_log_level` can emit source-appropriate warning messages.
 #[derive(Debug, Clone, Copy)]
@@ -221,6 +252,7 @@ pub struct Config {
     pub requested_sidecar_model: Option<String>,
     pub ollama_host: String,
     pub context_budget: usize,
+    pub num_predict: usize,
     pub max_iterations: usize,
     pub chat_timeout_secs: u64,
     pub chat_retries: usize,
@@ -232,6 +264,7 @@ pub struct Config {
     pub auto_plan: bool,
     pub offline: bool,
     pub deterministic_fallback: DeterministicFallbackMode,
+    pub engine: Engine,
     pub prompt: Option<String>,
     pub state_dir_override: Option<PathBuf>,
     pub resume: ResumeRequest,
@@ -241,6 +274,14 @@ pub struct Config {
     pub footer: bool,
     pub photon_enabled: bool,
     pub photon_url: String,
+    /// Issue #667 (S3-004 / S7-004 / DR2-007): toggle for the PAM
+    /// (photon-action-memory) advisory pipeline. Default: `true` via
+    /// `Config::load`'s `unwrap_or(true)` (the struct's derived `Default`
+    /// is `false`; production callers always go through `Config::load`).
+    /// Setting this to `false` is the immediate rollback (§10.1) — the
+    /// adapter chokepoint (`Agent::record_pam_advisory_decision`) early-
+    /// returns and `MemoryReport.pam_decision` stays `None`.
+    pub pam_advisory_enabled: bool,
     pub photon_shadow_mode: bool,
     pub photon_canary: u16,
     pub photon_timeout_ms: u64,
@@ -312,6 +353,7 @@ pub struct PartialConfig {
     pub sidecar_model: Option<String>,
     pub ollama_host: Option<String>,
     pub context_budget: Option<usize>,
+    pub num_predict: Option<usize>,
     pub max_iterations: Option<usize>,
     pub chat_timeout_secs: Option<u64>,
     pub chat_retries: Option<usize>,
@@ -322,6 +364,7 @@ pub struct PartialConfig {
     pub auto_plan: Option<bool>,
     pub offline: Option<bool>,
     pub deterministic_fallback: Option<DeterministicFallbackMode>,
+    pub engine: Option<Engine>,
     pub state_dir_override: Option<PathBuf>,
     /// `Some(false)` when an explicit disable signal is present
     /// (`--no-footer` / non-empty `ANVIL_NO_FOOTER` / `.anvil/config` `footer=false`).
@@ -329,6 +372,9 @@ pub struct PartialConfig {
     pub footer: Option<bool>,
     pub photon_enabled: Option<bool>,
     pub photon_url: Option<String>,
+    /// Issue #667: optional override for the PAM advisory pipeline gate
+    /// (None = production default `true` via `Config::load`).
+    pub pam_advisory_enabled: Option<bool>,
     pub photon_shadow_mode: Option<bool>,
     pub photon_canary: Option<u16>,
     pub photon_timeout_ms: Option<u64>,
@@ -394,6 +440,7 @@ impl Config {
             sidecar_model: args.sidecar_model.clone(),
             ollama_host: args.ollama_host.clone(),
             context_budget: args.context_budget,
+            num_predict: args.num_predict,
             max_iterations: args.max_iterations,
             chat_timeout_secs: args.chat_timeout_secs,
             chat_retries: args.chat_retries,
@@ -404,6 +451,7 @@ impl Config {
             auto_plan: args.auto_plan.then_some(true),
             offline: args.offline.then_some(true),
             deterministic_fallback: args.deterministic_fallback,
+            engine: args.engine,
             state_dir_override: args.state_dir.clone(),
             // CLI footer flag is "disable-only": `--no-footer` emits Some(false),
             // omission emits None so file/env/default can still apply.
@@ -411,6 +459,8 @@ impl Config {
             // photon settings are not configurable via CLI flags in A1
             photon_enabled: None,
             photon_url: None,
+            // Issue #667: PAM advisory CLI flag not introduced — env + file only.
+            pam_advisory_enabled: None,
             photon_shadow_mode: None,
             photon_canary: None,
             photon_timeout_ms: None,
@@ -443,12 +493,19 @@ impl Config {
         }
         let photon_enabled = !offline && merged.photon_enabled.unwrap_or(false);
 
+        let engine = merged.engine.unwrap_or_default();
+        let default_num_predict = match engine {
+            Engine::Legacy => 2_048,
+            Engine::Minimal => 8_192,
+        };
+
         let config = Self {
             cwd,
             requested_model: merged.model,
             requested_sidecar_model: merged.sidecar_model,
             ollama_host,
             context_budget: merged.context_budget.unwrap_or(24_000),
+            num_predict: merged.num_predict.unwrap_or(default_num_predict),
             max_iterations: merged.max_iterations.unwrap_or(50),
             chat_timeout_secs: merged.chat_timeout_secs.unwrap_or(300),
             chat_retries: merged.chat_retries.unwrap_or(2),
@@ -460,6 +517,7 @@ impl Config {
             auto_plan: merged.auto_plan.unwrap_or(false),
             offline,
             deterministic_fallback: merged.deterministic_fallback.unwrap_or_default(),
+            engine,
             prompt: args.prompt,
             state_dir_override: merged.state_dir_override,
             resume: ResumeRequest::from_flag(args.resume),
@@ -467,6 +525,10 @@ impl Config {
             footer: merged.footer.unwrap_or(true),
             photon_enabled,
             photon_url,
+            // Issue #667 (S3-004 / DR3-005): production default is `true`
+            // — `Config::default()` (derive) yields `false`, which fixtures
+            // must override explicitly (see T22 in the in-crate test mod).
+            pam_advisory_enabled: merged.pam_advisory_enabled.unwrap_or(true),
             photon_shadow_mode: merged.photon_shadow_mode.unwrap_or(true),
             photon_canary: merged.photon_canary.unwrap_or(0),
             photon_timeout_ms: merged.photon_timeout_ms.unwrap_or(200),
@@ -521,6 +583,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.context_budget.is_some() {
             merged.context_budget = config.context_budget;
         }
+        if config.num_predict.is_some() {
+            merged.num_predict = config.num_predict;
+        }
         if config.max_iterations.is_some() {
             merged.max_iterations = config.max_iterations;
         }
@@ -551,6 +616,9 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         if config.deterministic_fallback.is_some() {
             merged.deterministic_fallback = config.deterministic_fallback;
         }
+        if config.engine.is_some() {
+            merged.engine = config.engine;
+        }
         if config.state_dir_override.is_some() {
             merged.state_dir_override = config.state_dir_override.clone();
         }
@@ -562,6 +630,11 @@ pub fn merge_partial_configs(configs: &[PartialConfig]) -> PartialConfig {
         }
         if config.photon_url.is_some() {
             merged.photon_url = config.photon_url.clone();
+        }
+        // Issue #667 (DR2-007): merged adjacent to photon_shadow_mode
+        // (alphabetical `pam_*` < `photon_*` + functional adjacency).
+        if config.pam_advisory_enabled.is_some() {
+            merged.pam_advisory_enabled = config.pam_advisory_enabled;
         }
         if config.photon_shadow_mode.is_some() {
             merged.photon_shadow_mode = config.photon_shadow_mode;
@@ -626,6 +699,7 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         context_budget: map
             .get("context_budget")
             .and_then(|value| value.parse().ok()),
+        num_predict: map.get("num_predict").and_then(|value| value.parse().ok()),
         max_iterations: map
             .get("max_iterations")
             .and_then(|value| value.parse().ok()),
@@ -642,6 +716,9 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         deterministic_fallback: map
             .get("deterministic_fallback")
             .and_then(|value| value.parse::<DeterministicFallbackMode>().ok()),
+        engine: map
+            .get("engine")
+            .and_then(|value| value.parse::<Engine>().ok()),
         state_dir_override: map.get("state_dir").map(PathBuf::from),
         // Only emit Some(false) for explicit disable; any other value (true /
         // unrecognized / missing) leaves footer as None so default wins.
@@ -652,6 +729,9 @@ pub fn load_config_file(path: &Path, warnings: &mut Vec<String>) -> Result<Parti
         photon_enabled: map.get("photon_enabled").and_then(|v| parse_bool(v)),
         // photon_url empty string is skipped by parse_key_value_config, so None means unset
         photon_url: map.get("photon_url").cloned(),
+        // Issue #667: `.anvil/config` key `pam_advisory_enabled` (DR2-007
+        // adjacent to `photon_shadow_mode`).
+        pam_advisory_enabled: map.get("pam_advisory_enabled").and_then(|v| parse_bool(v)),
         photon_shadow_mode: map.get("photon_shadow_mode").and_then(|v| parse_bool(v)),
         photon_canary: map
             .get("photon_canary")
@@ -703,6 +783,9 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
         context_budget: env::var("ANVIL_CONTEXT_BUDGET")
             .ok()
             .and_then(|value| value.parse().ok()),
+        num_predict: env::var("ANVIL_NUM_PREDICT")
+            .ok()
+            .and_then(|value| value.parse().ok()),
         max_iterations: env::var("ANVIL_MAX_ITERATIONS")
             .ok()
             .and_then(|value| value.parse().ok()),
@@ -731,6 +814,9 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
         deterministic_fallback: env::var("ANVIL_DETERMINISTIC_FALLBACK")
             .ok()
             .and_then(|value| value.parse::<DeterministicFallbackMode>().ok()),
+        engine: env::var("ANVIL_ENGINE")
+            .ok()
+            .and_then(|value| value.parse::<Engine>().ok()),
         state_dir_override: env::var("ANVIL_STATE_DIR").ok().map(PathBuf::from),
         // POSIX `NO_COLOR` convention: any non-empty value disables; matches
         // `ANVIL_NO_SPINNER` / `ANVIL_NO_INTERRUPT` precedent (see spinner.rs).
@@ -741,6 +827,10 @@ pub fn load_env_config(warnings: &mut Vec<String>) -> PartialConfig {
             .ok()
             .and_then(|v| parse_bool(&v)),
         photon_url: env::var("ANVIL_PHOTON_URL").ok(),
+        // Issue #667: env override `ANVIL_PAM_ADVISORY_ENABLED` (DR2-007).
+        pam_advisory_enabled: env::var("ANVIL_PAM_ADVISORY_ENABLED")
+            .ok()
+            .and_then(|v| parse_bool(&v)),
         photon_shadow_mode: env::var("ANVIL_PHOTON_SHADOW_MODE")
             .ok()
             .and_then(|v| parse_bool(&v)),

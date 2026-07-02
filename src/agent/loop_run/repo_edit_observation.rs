@@ -1,0 +1,471 @@
+//! Post-Edit/Write repo-edit evidence observation extracted from
+//! `turn.rs` (parent #680).
+//!
+//! Hosts the Issue #606 (T-1.7) post-hoc `RepoEdit` evidence
+//! observation that the production tool-call pipeline invokes after a
+//! successful Edit/Write. Order of gates and side-effects:
+//!
+//! 1. `workspace_relative_path_for_tool_arg` workspace-relative
+//!    normalization.
+//! 2. `WorkspacePolicy` artifact-admission gate (emits
+//!    `repo_edit_ignored_controller_state` with a rejection reason and returns).
+//! 3. `workspace_walk::is_user_deliverable_path` excludes protected
+//!    inputs and generated metadata/log files from edited-file and
+//!    completion-evidence summaries.
+//! 4. `classify_repo_edit_path` + `repo_edit_has_post_scaffold_delta`
+//!    scaffold-delta gate (emits `repo_edit_scaffold_unchanged` and
+//!    returns when the path is a scaffold body that didn't change).
+//! 5. Issue #646 (C2 / A4) content-no-op gate: pre-tool hash vs.
+//!    current on-disk hash. Identical → emit `repo_edit_no_op` and
+//!    return. The pre-tool entry is removed in either branch to keep
+//!    the cache turn-local and bounded.
+//! 6. Record the path into `turn_edited_relative_paths` (the legacy
+//!    adapter-period authority).
+//! 7. Issue #646 (A1/B2): record an in-scope edit against the active
+//!    `MissingVerifierJob` (if any).
+//! 8. Append `CompletionEvidence::RepoEdit` to the per-turn evidence
+//!    set; when it satisfies the current artifact-recovery target,
+//!    mirror it into `task_contract_evidence_set_this_turn` + capture
+//!    a bounded `bounded_post_edit_excerpt` for the role.
+//! 9. Emit `agent.completion_evidence.observed` with category + path.
+//! 10. Issue #659 Task 2.5 write-through seed into the
+//!     `ArtifactLedger` SSOT.
+//!
+//! Originally an `impl Agent` method; converted to a free function
+//! taking `&mut Agent`, matching the `actor_loop_flow` / `reply_retry`
+//! / earlier vertical-slice precedent. `pub(super)` limited / no
+//! facade re-export (DR3-001).
+
+use super::Agent;
+use super::completion_evidence::is_repo_edit_no_op;
+use super::file_excerpt::current_file_hash_for_relative_path;
+use super::tool_policy::workspace_relative_path_for_tool_arg;
+use crate::logging::stable_path_hash;
+use crate::session::feedback::mask_secrets;
+use crate::util::workspace_paths::{
+    WorkspacePathAdmission, artifact_admission_decision_display_path,
+};
+
+/// Issue #606 (T-1.7): post-hoc observation of an Edit/Write success
+/// as `RepoEdit` completion evidence. The path is run through
+/// `classify_repo_edit_path` which uses the SSOT in
+/// `util::file_classify` and applies the DR1-001 ordering rule
+/// (`.mdx → Docs` even though `is_implementation_file` would otherwise
+/// claim it).
+pub(super) fn observe_evidence_from_repo_edit(agent: &mut Agent, path: &str) {
+    let Some(relative_path) = workspace_relative_path_for_tool_arg(&agent.work_root, path) else {
+        return;
+    };
+    if let WorkspacePathAdmission::Rejected { class, reason } =
+        artifact_admission_decision_display_path(&relative_path)
+    {
+        let masked = mask_secrets(&relative_path);
+        crate::logging::log_completion_evidence_observed(
+            agent.current_turn_index,
+            0,
+            "repo_edit_ignored_controller_state",
+            serde_json::json!({
+                "path_hash": stable_path_hash(&masked),
+                "path_len": relative_path.len() as u32,
+                "class": format!("{:?}", class),
+                "reason": reason.as_str(),
+            }),
+        );
+        return;
+    }
+    if !super::workspace_walk::is_user_deliverable_path(&relative_path) {
+        crate::logging::log_completion_evidence_observed(
+            agent.current_turn_index,
+            0,
+            "repo_edit_non_user_deliverable",
+            serde_json::json!({
+                "path_hash": stable_path_hash(&relative_path),
+            }),
+        );
+        return;
+    }
+    let category =
+        super::completion_evidence::classify_repo_edit_path(std::path::Path::new(&relative_path));
+    if !super::scaffold_pipeline::repo_edit_has_post_scaffold_delta(agent, &relative_path) {
+        crate::logging::log_completion_evidence_observed(
+            agent.current_turn_index,
+            0,
+            "repo_edit_scaffold_unchanged",
+            serde_json::json!({
+                "category": format!("{:?}", category),
+                "path": relative_path,
+            }),
+        );
+        return;
+    }
+    // Issue #646 (C2 / A4): even after the scaffold-delta gate, a
+    // Write/Edit can be a content no-op for a NON-scaffold file (e.g.
+    // model writes the same body back, or `Edit` whose `old_string`
+    // equals `new_string`). Compare the pre-tool hash captured in
+    // `execute_tool_call` against the current on-disk hash. Identical
+    // hashes mean the file did not actually change — bail out so the
+    // path does NOT enter `turn_edited_relative_paths` and does NOT
+    // contribute completion evidence. The pre-tool entry is removed in
+    // either branch to keep the cache turn-local and bounded.
+    let pre_tool_hash = agent.turn_pre_tool_file_hashes.remove(&relative_path);
+    let current_hash = current_file_hash_for_relative_path(&agent.work_root, &relative_path);
+    if is_repo_edit_no_op(
+        pre_tool_hash.as_ref().and_then(Option::as_deref),
+        current_hash.as_deref(),
+    ) {
+        if maybe_record_no_op_command_observation_binding(agent, category, &relative_path) {
+            return;
+        }
+        crate::logging::log_completion_evidence_observed(
+            agent.current_turn_index,
+            0,
+            "repo_edit_no_op",
+            serde_json::json!({
+                "category": format!("{:?}", category),
+                "path": relative_path,
+            }),
+        );
+        return;
+    }
+    // Issue #646 (C2): record the edited path AFTER both the
+    // scaffold-delta gate AND the no-op hash check so a
+    // content-unchanged Write/Edit (scaffold body re-written, or
+    // `Edit` with `old_string == new_string`) never promotes the file
+    // to `Owned`.
+    agent
+        .turn_edited_relative_paths
+        .insert(relative_path.clone());
+    // Issue #646 (A1/B2): once an in-scope edit has landed, the
+    // MissingVerifierJob can begin retrying verifier creation.
+    if agent.missing_verifier_job.is_some() {
+        let in_scope =
+            super::workspace_access::current_workspace_scope(agent).contains(&relative_path);
+        if in_scope && let Some(job) = agent.missing_verifier_job.as_mut() {
+            job.record_in_scope_edit();
+        }
+    }
+    let repo_edit_evidence = super::completion_evidence::CompletionEvidence::RepoEdit {
+        category,
+        count: 1,
+        path: Some(relative_path.clone()),
+    };
+    agent
+        .evidence_set_this_turn
+        .push(repo_edit_evidence.clone());
+    if super::task_contract::repo_edit_satisfies_artifact_recovery_target(
+        category,
+        &relative_path,
+        agent.current_artifact_recovery_target.as_ref(),
+    ) {
+        agent
+            .task_contract_evidence_set_this_turn
+            .push(repo_edit_evidence.clone());
+        // Issue #636: capture bounded post-edit excerpt for the
+        // current role so `plan_artifact_recovery` can assert that the
+        // edit actually carries the requested behavior. Silent skip on
+        // role-miss / read failure (back-compat with the existing
+        // `repo_edit_has_post_scaffold_delta` no-data path).
+        if let Some(role) = super::task_contract::role_from_repo_edit(category)
+            && let Some(excerpt) =
+                super::post_edit_excerpt::bounded_post_edit_excerpt(agent, &relative_path)
+        {
+            // Issue #919 (CB-001): for an Authoring contract a raw
+            // `RepoEdit(Docs)` is existence/progress evidence only — the
+            // DR3-002 completion gate (`required_role_satisfied_by_evidence`)
+            // requires a path-matched accept-tier pass. The verifier-driven
+            // recovery path runs `authoring_accept_tier_diagnostic`, but the
+            // production Write/Edit observation never promoted a sufficient
+            // first-shot artifact to that pass, leaving a real "translate
+            // README.ja.md → write README.md" stuck on `Continue { UsageDocs }`
+            // until retry exhaustion. Promote here, gated strictly on the
+            // active task being Authoring and the edited path matching a
+            // required UsageDocs obligation, reusing the already-admitted
+            // workspace-relative `relative_path` and the bounded excerpt
+            // captured above (no new file read; never raw obligation text).
+            maybe_promote_authoring_accept_tier(agent, &relative_path, &excerpt);
+            agent.task_contract_excerpts.insert(role, excerpt);
+        }
+    }
+    crate::logging::log_completion_evidence_observed(
+        agent.current_turn_index,
+        0,
+        "repo_edit",
+        serde_json::json!({
+            "category": format!("{:?}", category),
+            "path": relative_path,
+        }),
+    );
+    if let Some(observation) =
+        super::evidence_observation::EvidenceObservation::from_completion_evidence(
+            &repo_edit_evidence,
+            super::task_contract::ObjectiveEvidenceKind::FileLayoutCheck,
+            None,
+            super::evidence_observation::EvidenceObservationSource::CompletionEvidence,
+        )
+    {
+        super::evidence_observation::log_evidence_observation_observed(
+            agent.current_turn_index,
+            0,
+            &observation,
+        );
+    }
+    // Issue #659 Task 2.5: write-through seed into the ArtifactLedger
+    // SSOT. `relative_path` has already passed the workspace-relative
+    // / scaffold-delta / no-op guards; the legacy
+    // `turn_edited_relative_paths` insert above stays as the
+    // adapter-period authority. The seed is gated by category-to-role
+    // mapping so the `Other` category (which legacy callers do not
+    // classify into a role) does not inject an ambiguous event.
+    if let Some(role) = super::task_contract::role_from_repo_edit(category) {
+        let scope = super::workspace_access::current_workspace_scope(agent);
+        super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+            agent,
+            &relative_path,
+            role,
+            &scope,
+        );
+    }
+}
+
+fn maybe_record_no_op_command_observation_binding(
+    agent: &mut Agent,
+    category: super::completion_evidence::RepoEditCategory,
+    relative_path: &str,
+) -> bool {
+    use super::task_contract::{
+        ObjectiveEvidenceKind, normalized_artifact_path_eq, role_from_repo_edit,
+    };
+
+    let Some(role) = role_from_repo_edit(category) else {
+        return false;
+    };
+    let Some(contract) = super::task_classification::task_contract_authority(agent) else {
+        return false;
+    };
+    let objective = contract.objective_contract();
+    if objective.evidence_kind != ObjectiveEvidenceKind::SafetyBoundaryEvidence
+        || !objective.requires_evidence()
+        || !objective.required_deliverables().contains(&role)
+        || !super::objective_evidence::command_observation_evidence_collected_for_contract(
+            &agent.task_contract_evidence_set_this_turn,
+            &contract,
+        )
+        || !contract
+            .required_identities_for_role(role)
+            .iter()
+            .any(|identity| normalized_artifact_path_eq(relative_path, &identity.path))
+    {
+        return false;
+    }
+
+    let repo_edit_evidence = super::completion_evidence::CompletionEvidence::RepoEdit {
+        category,
+        count: 1,
+        path: Some(relative_path.to_string()),
+    };
+    agent
+        .task_contract_evidence_set_this_turn
+        .push(repo_edit_evidence.clone());
+    crate::logging::log_completion_evidence_observed(
+        agent.current_turn_index,
+        0,
+        "repo_edit_no_op_command_binding",
+        serde_json::json!({
+            "category": format!("{:?}", category),
+            "path": relative_path,
+        }),
+    );
+    if let Some(observation) =
+        super::evidence_observation::EvidenceObservation::from_completion_evidence(
+            &repo_edit_evidence,
+            ObjectiveEvidenceKind::FileLayoutCheck,
+            None,
+            super::evidence_observation::EvidenceObservationSource::CompletionEvidence,
+        )
+    {
+        super::evidence_observation::log_evidence_observation_observed(
+            agent.current_turn_index,
+            0,
+            &observation,
+        );
+    }
+    true
+}
+
+/// Issue #919 (CB-001): production promotion of an edited Authoring UsageDocs
+/// artifact to a path-matched `CompletionEvidence::ReportCompletenessPass`.
+///
+/// The DR3-002 completion gate (`task_contract::required_role_satisfied_by_evidence`)
+/// rejects raw `RepoEdit(Docs)` as Authoring completion authority; it only
+/// accepts a path-matched accept-tier pass. The verifier-driven recovery path
+/// already runs `authoring_accept_tier_diagnostic`, but `observe_evidence_from_repo_edit`
+/// (the production Write/Edit observation entry point) never promoted a
+/// sufficient first-shot artifact, so a real Authoring write stayed
+/// `Continue { UsageDocs }` until retry exhaustion.
+///
+/// Gates (all must hold; non-Authoring kinds and non-matching paths are
+/// untouched so Docs/Data/Research/Ops/Coding behavior is preserved):
+///   1. the active task-contract authority resolves to `TaskKind::Authoring`;
+///   2. `relative_path` matches a required UsageDocs obligation under the same
+///      `normalized_artifact_path_eq` identity the completion gate uses; and
+///   3. `authoring_accept_tier_diagnostic` PASSES (returns `None`) for the
+///      bounded excerpt against the obligation's requested sections.
+///
+/// Security/containment: `relative_path` is the already-admitted
+/// workspace-relative path from this observation (it passed the
+/// workspace-relative normalization, artifact admission, user-deliverable and
+/// scaffold/no-op gates above); `excerpt` is the existing 8 KiB-capped
+/// `bounded_post_edit_excerpt`. No raw obligation text and no new file read.
+fn maybe_promote_authoring_accept_tier(agent: &mut Agent, relative_path: &str, excerpt: &str) {
+    use super::task_contract::{ArtifactRole, TaskKind, normalized_artifact_path_eq};
+
+    let Some(contract) = super::task_classification::task_contract_authority(agent) else {
+        return;
+    };
+    if contract.task_kind != TaskKind::Authoring {
+        return;
+    }
+    // Match the edited path against a required UsageDocs obligation using the
+    // exact identity predicate the completion gate consumes, so multi-file
+    // Authoring promotes the correct obligation (and its requested sections).
+    let Some(obligation) = contract
+        .required_identities_for_role(ArtifactRole::UsageDocs)
+        .into_iter()
+        .find(|identity| normalized_artifact_path_eq(relative_path, &identity.path))
+    else {
+        return;
+    };
+    // Accept tier: min length + (if requested) the M-of-N section surface. A
+    // `None` return means the artifact PASSES; `Some(_)` means it fails the
+    // accept tier and must stay `Continue` (no pass pushed).
+    if super::verifier::authoring_accept_tier_diagnostic(
+        TaskKind::Authoring,
+        relative_path,
+        excerpt,
+        &obligation.required_sections,
+    )
+    .is_some()
+    {
+        return;
+    }
+    agent.task_contract_evidence_set_this_turn.push(
+        super::completion_evidence::CompletionEvidence::ReportCompletenessPass {
+            path: Some(relative_path.to_string()),
+        },
+    );
+    crate::logging::log_completion_evidence_observed(
+        agent.current_turn_index,
+        0,
+        "authoring_accept_tier_pass",
+        serde_json::json!({
+            "path_hash": stable_path_hash(&mask_secrets(relative_path)),
+        }),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::agent::loop_run::commands::test_agent_with_config;
+    use crate::agent::loop_run::completion_evidence::CompletionEvidence;
+    use crate::agent::loop_run::file_excerpt::current_file_hash_for_relative_path;
+    use crate::agent::loop_run::project_profile::parse_project_profile_confirmation;
+    use crate::agent::loop_run::task_contract::{CompletionDecision, TaskContract};
+    use crate::config::Config;
+    use crate::session::store::ConversationMessage;
+
+    use super::*;
+
+    fn seed_command_observation_contract(
+        agent: &mut crate::agent::loop_run::Agent,
+        request: &str,
+    ) -> Rc<TaskContract> {
+        let profile = parse_project_profile_confirmation(
+            r#"{
+                "language":"unknown",
+                "shape":"cli",
+                "deliverable_kind":"document",
+                "primary_artifacts":["reports/health-check.md"],
+                "forbidden_artifacts":["source_code","tests","setup"],
+                "evidence_kind":"command_observation",
+                "needs_environment_setup":false,
+                "preferred_runner":"./scripts/health.sh",
+                "confidence":1.0,
+                "reason":"the document must be grounded in an observed local command"
+            }"#,
+        )
+        .expect("profile");
+        agent
+            .session
+            .messages
+            .push(ConversationMessage::user(request.to_string()));
+        agent
+            .session
+            .working_memory
+            .set_active_task(Some(request.to_string()));
+        agent.project_profile_confirm_called_this_turn = true;
+        let contract = Rc::new(TaskContract::from_request_with_kind_and_project_profile(
+            request,
+            None,
+            Some(&profile),
+        ));
+        agent
+            .task_contract_this_turn
+            .set(contract.clone())
+            .expect("unset task contract cell");
+        contract
+    }
+
+    #[test]
+    fn no_op_write_after_command_observation_binds_existing_artifact_without_ledger_edit() {
+        let (mut agent, temp) = test_agent_with_config(Config::default());
+        let request = "Run ./scripts/health.sh and write reports/health-check.md containing the command, stdout, stderr, and exit code.";
+        let contract = seed_command_observation_contract(&mut agent, request);
+        let rel = "reports/health-check.md";
+        std::fs::create_dir_all(temp.path().join("reports")).unwrap();
+        std::fs::write(
+            temp.path().join(rel),
+            "# Health Check Report\n\n## Command\n\n./scripts/health.sh\n",
+        )
+        .unwrap();
+        let hash =
+            current_file_hash_for_relative_path(&agent.work_root, rel).expect("current hash");
+        agent
+            .turn_pre_tool_file_hashes
+            .insert(rel.to_string(), Some(hash));
+        agent
+            .task_contract_evidence_set_this_turn
+            .push(CompletionEvidence::CommandObservation {
+                command: "bash ./scripts/health.sh 2>stderr.tmp; echo \"EXIT_CODE=$?\"; cat stderr.tmp; rm stderr.tmp".to_string(),
+                exit_status: 0,
+                safety_boundary_passed: true,
+            });
+
+        observe_evidence_from_repo_edit(&mut agent, rel);
+
+        assert!(
+            agent
+                .task_contract_evidence_set_this_turn
+                .iter()
+                .any(|item| matches!(
+                    item,
+                    CompletionEvidence::RepoEdit { path: Some(path), .. } if path == rel
+                )),
+            "no-op binding should be visible to task-contract evidence"
+        );
+        assert!(
+            !agent.turn_edited_relative_paths.contains(rel),
+            "no-op binding must not masquerade as a real file edit"
+        );
+        assert_eq!(
+            agent.artifact_ledger.event_count(),
+            0,
+            "no-op binding must not seed the artifact ledger"
+        );
+        assert_eq!(
+            contract.evaluate(&agent.task_contract_evidence_set_this_turn),
+            CompletionDecision::Done
+        );
+    }
+}

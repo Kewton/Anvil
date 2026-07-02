@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use anvil::cli::CliArgs;
 use anvil::config::{
-    Config, DeterministicFallbackMode, LogLevel, PartialConfig, load_config_file, load_env_config,
-    merge_partial_configs, parse_key_value_config,
+    Config, DeterministicFallbackMode, Engine, LogLevel, PartialConfig, load_config_file,
+    load_env_config, merge_partial_configs, parse_key_value_config,
 };
 
 #[test]
@@ -78,6 +78,14 @@ fn merge_offline_prefers_later_sources() {
         },
     ]);
     assert_eq!(merged.offline, Some(true));
+}
+
+#[test]
+fn engine_parses_and_defaults_to_legacy() {
+    assert_eq!(Engine::default(), Engine::Legacy);
+    assert_eq!("legacy".parse::<Engine>().unwrap(), Engine::Legacy);
+    assert_eq!("minimal".parse::<Engine>().unwrap(), Engine::Minimal);
+    assert_eq!(Engine::Legacy.to_string(), "legacy");
 }
 
 #[test]
@@ -170,6 +178,21 @@ fn merge_experimental_specialized_fallback_prefers_later_sources() {
         PartialConfig::default(),
     ]);
     assert_eq!(merged.experimental_specialized_fallback, Some(true));
+}
+
+#[test]
+fn merge_engine_prefers_later_sources() {
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            engine: Some(Engine::Legacy),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            engine: Some(Engine::Minimal),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(merged.engine, Some(Engine::Minimal));
 }
 
 /// Issue #634: `parse_key_value_config` accepts the new
@@ -532,9 +555,13 @@ fn minimal_args(cwd: &std::path::Path) -> CliArgs {
         cwd: Some(cwd.to_path_buf()),
         prompt: None,
         model: None,
+        provider: None,
+        planner_model: None,
+        planner_provider: None,
         sidecar_model: None,
         ollama_host: None,
         context_budget: None,
+        num_predict: None,
         max_iterations: None,
         chat_timeout_secs: None,
         chat_retries: None,
@@ -546,14 +573,89 @@ fn minimal_args(cwd: &std::path::Path) -> CliArgs {
         fresh_session: false,
         oneshot: false,
         auto_plan: false,
+        plan_steps: None,
+        plan_run: None,
+        run_plan: None,
+        ultra_plan: None,
+        ultra_plan_run: None,
+        run_ultra_plan: None,
+        ultra_style: None,
+        ultra_profile: None,
         offline: false,
         deterministic_fallback: None,
+        engine: None,
         experimental_specialized_fallback: None,
         no_footer: false,
         resume: None,
         state_dir: None,
         command: None,
     }
+}
+
+#[test]
+fn config_load_defaults_engine_to_legacy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+    assert_eq!(cfg.engine, Engine::Legacy);
+    assert_eq!(cfg.num_predict, 2_048);
+}
+
+#[test]
+fn config_load_defaults_minimal_num_predict_to_8192() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut args = minimal_args(tmp.path());
+    args.engine = Some(Engine::Minimal);
+    let (cfg, _) = Config::load(args).unwrap();
+    assert_eq!(cfg.engine, Engine::Minimal);
+    assert_eq!(cfg.num_predict, 8_192);
+}
+
+#[test]
+fn config_load_num_predict_override_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut args = minimal_args(tmp.path());
+    args.engine = Some(Engine::Minimal);
+    args.num_predict = Some(4_096);
+    let (cfg, _) = Config::load(args).unwrap();
+    assert_eq!(cfg.num_predict, 4_096);
+}
+
+#[test]
+fn config_file_engine_minimal_is_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config");
+    std::fs::write(&config_path, "engine = minimal\n").unwrap();
+    let mut warnings: Vec<String> = Vec::new();
+    let cfg = load_config_file(&config_path, &mut warnings).unwrap();
+    assert_eq!(cfg.engine, Some(Engine::Minimal));
+}
+
+#[test]
+fn config_file_num_predict_is_loaded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config");
+    std::fs::write(&config_path, "num_predict = 4096\n").unwrap();
+    let mut warnings: Vec<String> = Vec::new();
+    let cfg = load_config_file(&config_path, &mut warnings).unwrap();
+    assert_eq!(cfg.num_predict, Some(4_096));
+}
+
+#[test]
+fn env_config_reads_engine() {
+    with_env(&[("ANVIL_ENGINE", Some("minimal"))], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.engine, Some(Engine::Minimal));
+    });
+}
+
+#[test]
+fn env_config_reads_num_predict() {
+    with_env(&[("ANVIL_NUM_PREDICT", Some("4096"))], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.num_predict, Some(4_096));
+    });
 }
 
 const PHOTON_ENV_VARS: &[(&str, Option<&str>)] = &[
@@ -565,6 +667,20 @@ const PHOTON_ENV_VARS: &[(&str, Option<&str>)] = &[
     ("ANVIL_OFFLINE", None),
     // Issue #583: keep this entry at the tail so existing index-based
     // overrides (PHOTON_ENV_VARS[0..=4]) remain stable.
+    ("ANVIL_PHOTON_RESPECT_WARNINGS", None),
+];
+
+/// Issue #667 T19: complete photon-adjacent env-clear set that also masks
+/// `ANVIL_PAM_ADVISORY_ENABLED`. Kept separate from `PHOTON_ENV_VARS` so the
+/// existing index-based overrides (e.g. `vars[0] = (...)`) remain stable.
+const PAM_AND_PHOTON_ENV_VARS: &[(&str, Option<&str>)] = &[
+    ("ANVIL_PAM_ADVISORY_ENABLED", None),
+    ("ANVIL_PHOTON_ENABLED", None),
+    ("ANVIL_PHOTON_URL", None),
+    ("ANVIL_PHOTON_SHADOW_MODE", None),
+    ("ANVIL_PHOTON_CANARY", None),
+    ("ANVIL_PHOTON_TIMEOUT_MS", None),
+    ("ANVIL_OFFLINE", None),
     ("ANVIL_PHOTON_RESPECT_WARNINGS", None),
 ];
 
@@ -587,6 +703,128 @@ fn photon_shadow_mode_default_true() {
         let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
         assert!(cfg.photon_shadow_mode);
     });
+}
+
+// --- Issue #667 T19: pam_advisory_enabled precedence regression ---
+
+/// Default value of `pam_advisory_enabled` (no file, no env override) is `true`.
+/// SSOT lives in `Config::load` (`merged.pam_advisory_enabled.unwrap_or(true)`).
+#[test]
+fn pam_advisory_enabled_default_true() {
+    let tmp = tempfile::tempdir().unwrap();
+    with_env(PAM_AND_PHOTON_ENV_VARS, || {
+        let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            cfg.pam_advisory_enabled,
+            "default must be true (Issue #667 / Config::load unwrap_or(true))"
+        );
+    });
+}
+
+/// `.anvil/config` file with `pam_advisory_enabled = false` overrides the
+/// hard-coded default.
+#[test]
+fn file_pam_advisory_enabled_false_overrides_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let anvil_dir = tmp.path().join(".anvil");
+    std::fs::create_dir_all(&anvil_dir).unwrap();
+    std::fs::write(anvil_dir.join("config"), "pam_advisory_enabled = false\n").unwrap();
+    with_env(PAM_AND_PHOTON_ENV_VARS, || {
+        let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            !cfg.pam_advisory_enabled,
+            "file `pam_advisory_enabled = false` must override default `true`"
+        );
+    });
+}
+
+/// `ANVIL_PAM_ADVISORY_ENABLED=true` env var overrides a `false` file value
+/// (env > file precedence — same ordering as `photon_shadow_mode`).
+#[test]
+fn env_pam_advisory_enabled_overrides_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let anvil_dir = tmp.path().join(".anvil");
+    std::fs::create_dir_all(&anvil_dir).unwrap();
+    std::fs::write(anvil_dir.join("config"), "pam_advisory_enabled = false\n").unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PAM_AND_PHOTON_ENV_VARS.to_vec();
+    vars[0] = ("ANVIL_PAM_ADVISORY_ENABLED", Some("true"));
+    with_env(&vars, || {
+        let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            cfg.pam_advisory_enabled,
+            "env true must beat file false (env > file precedence)"
+        );
+    });
+}
+
+/// `ANVIL_PAM_ADVISORY_ENABLED=false` env var overrides a `true` (default-implied)
+/// file value when no file key is set.
+#[test]
+fn env_pam_advisory_enabled_false_overrides_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut vars: Vec<(&str, Option<&str>)> = PAM_AND_PHOTON_ENV_VARS.to_vec();
+    vars[0] = ("ANVIL_PAM_ADVISORY_ENABLED", Some("false"));
+    with_env(&vars, || {
+        let (cfg, _) = Config::load(minimal_args(tmp.path())).unwrap();
+        assert!(
+            !cfg.pam_advisory_enabled,
+            "env false must override implicit default true"
+        );
+    });
+}
+
+/// `load_env_config` reads `ANVIL_PAM_ADVISORY_ENABLED` into a
+/// `PartialConfig.pam_advisory_enabled = Some(true)` (env layer, no merge).
+#[test]
+fn env_config_reads_pam_advisory_enabled() {
+    with_env(&[("ANVIL_PAM_ADVISORY_ENABLED", Some("true"))], || {
+        let mut warnings: Vec<String> = Vec::new();
+        let cfg = load_env_config(&mut warnings);
+        assert_eq!(cfg.pam_advisory_enabled, Some(true));
+        assert!(warnings.is_empty(), "no warnings expected: {warnings:?}");
+    });
+}
+
+/// `merge_partial_configs` prefers the last source — same precedence as
+/// `photon_shadow_mode` / other bool flags (file → env → cli).
+#[test]
+fn merge_pam_advisory_enabled_prefers_later_sources() {
+    let merged = merge_partial_configs(&[
+        PartialConfig {
+            pam_advisory_enabled: Some(true),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            pam_advisory_enabled: Some(false),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(merged.pam_advisory_enabled, Some(false));
+
+    let merged_rev = merge_partial_configs(&[
+        PartialConfig {
+            pam_advisory_enabled: Some(false),
+            ..PartialConfig::default()
+        },
+        PartialConfig {
+            pam_advisory_enabled: Some(true),
+            ..PartialConfig::default()
+        },
+    ]);
+    assert_eq!(merged_rev.pam_advisory_enabled, Some(true));
+}
+
+/// `load_config_file` reads the file key `pam_advisory_enabled = false` into
+/// `PartialConfig.pam_advisory_enabled = Some(false)`.
+#[test]
+fn file_config_reads_pam_advisory_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config");
+    std::fs::write(&config_path, "pam_advisory_enabled = false\n").unwrap();
+    let mut warnings: Vec<String> = Vec::new();
+    let cfg = load_config_file(&config_path, &mut warnings).unwrap();
+    assert_eq!(cfg.pam_advisory_enabled, Some(false));
+    assert!(warnings.is_empty(), "no warnings expected: {warnings:?}");
 }
 
 #[test]

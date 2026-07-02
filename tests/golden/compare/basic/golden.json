@@ -1,6 +1,15 @@
 {
   "baseline_dir": "<REPO_ROOT>/tests/golden/compare/basic/baseline",
   "experiment_dir": "<REPO_ROOT>/tests/golden/compare/basic/experiment",
+  "failure_categories": {
+    "baseline": {
+      "completed": 2,
+      "unknown": 1
+    },
+    "experiment": {
+      "completed": 3
+    }
+  },
   "generated_at": "2026-01-01T00:00:00Z",
   "metrics": {
     "elapsed_s": {
@@ -70,6 +79,23 @@
         "n": 0
       },
       "verdict": "unchanged"
+    },
+    "postcheck_success": {
+      "baseline": {
+        "ci_high": 0.9385096847238393,
+        "ci_low": 0.20765495512648788,
+        "mean": 0.6666666666666666,
+        "n": 3
+      },
+      "delta": 0.33333333333333337,
+      "delta_pct": null,
+      "experiment": {
+        "ci_high": 1.0,
+        "ci_low": 0.4384939195509822,
+        "mean": 1.0,
+        "n": 3
+      },
+      "verdict": "improved"
     },
     "rc": {
       "baseline": {

@@ -1,0 +1,9 @@
+goal: Build a playable game.
+steps:
+  - id: game
+    kind: implement
+    instruction: Create a Canvas game loop with keyboard controls, enemies, collision, score, and lives.
+    expected_paths:
+      - src/app/page.tsx
+    verify:
+      - node smoke-check.js

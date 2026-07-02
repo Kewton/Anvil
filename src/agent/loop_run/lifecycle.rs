@@ -95,16 +95,22 @@ impl Agent {
     pub(super) fn disable_native_tools_for_session(&mut self) {
         self.native_tools_enabled = false;
         self.session.native_tools_disabled = true;
-        self.push_system_note(prompting::ToolProtocol::TaggedXml.parser_downgrade_notice());
+        super::message_push::push_system_note(
+            self,
+            prompting::ToolProtocol::TaggedXml.parser_downgrade_notice(),
+        );
     }
 
     fn apply_scaffold_root(&mut self, new_root: PathBuf) {
         self.work_root = new_root.clone();
         self.session.active_root = Some(new_root.clone());
-        self.push_system_note(format!(
-            "[Workspace Root Updated] Continue work inside {} and use relative paths from there.",
-            new_root.display()
-        ));
+        super::message_push::push_system_note(
+            self,
+            format!(
+                "[Workspace Root Updated] Continue work inside {} and use relative paths from there.",
+                new_root.display()
+            ),
+        );
     }
 }
 
@@ -648,6 +654,33 @@ impl Agent {
     pub(super) fn plan_is_approval_ready_with_fallback(&self, contents: &str) -> bool {
         plan_is_approval_ready(contents) || self.plan_stage_three_fallback_matches(contents)
     }
+}
+
+/// Extract bullet items under the `## Constraints` section of a plan
+/// markdown document. Trims leading `- ` markers and skips empty
+/// placeholders. Used by `refresh_working_memory` to keep the
+/// per-prompt constraint list in sync with the live plan.
+pub(super) fn extract_plan_constraints(contents: &str) -> Vec<String> {
+    let mut in_constraints = false;
+    let mut lines = Vec::new();
+    for raw_line in contents.lines() {
+        let trimmed = raw_line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            in_constraints = heading.trim() == "Constraints";
+            continue;
+        }
+        if !in_constraints {
+            continue;
+        }
+        if trimmed.is_empty() || trimmed == "-" {
+            continue;
+        }
+        let cleaned = trimmed.trim_start_matches("- ").trim().to_string();
+        if !cleaned.is_empty() {
+            lines.push(cleaned);
+        }
+    }
+    lines
 }
 
 #[cfg(test)]

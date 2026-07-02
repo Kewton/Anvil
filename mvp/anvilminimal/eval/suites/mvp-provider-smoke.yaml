@@ -1,0 +1,79 @@
+name: mvp-provider-smoke
+description: Provider semantic smoke before running broader cloud eval suites.
+parity_gate:
+  default_gate_level: network
+  provider_probe_required_for_prompt_sensitive_fix: true
+  require_same_condition_summary_for_comparative: false
+provider_probe:
+  required_for_prompt_sensitive_fix: true
+  command: ANVIL_PROVIDER_PROBE=1 ANVIL_PROVIDER_PROBE_OUT=/tmp/anvil-provider-probe.jsonl cargo test --manifest-path mvp/anvilminimal/Cargo.toml --test live_provider provider_probe -- --nocapture
+  probes:
+    - provider: openai
+      observes: [tool_args_shape, tool_args_recovery_classification]
+      classifies: [recoverable_tool_args, unsafe_tool_args]
+      credential: OPENAI_API_KEY
+      optional_without_credential: true
+    - provider: gemini
+      observes: [function_calling_schema, tool_args_recovery_classification]
+      classifies: [recoverable_tool_args, unsafe_tool_args]
+      credential: GEMINI_API_KEY
+      optional_without_credential: true
+    - provider: ollama
+      observes: [xml_fallback_tool_like_output, tool_args_recovery_classification]
+      classifies: [recoverable_tool_args, unsafe_tool_args]
+      optional_without_credential: true
+scenarios:
+  - id: write-one-file-small
+    size: small
+    category: provider-smoke
+    profile: generic
+    prompt: Create hello.txt containing exactly provider smoke ok.
+    expected_artifacts:
+      - hello.txt
+    postcheck:
+      commands:
+        - grep -qx "provider smoke ok" hello.txt
+    timeouts:
+      total_sec: 300
+      model_call_sec: 120
+    plan_constraints:
+      min_steps: 1
+      max_steps: 3
+      required_verify_keywords:
+        - hello.txt
+  - id: grep-existing-file-small
+    size: small
+    category: provider-smoke
+    profile: generic
+    prompt: Create notes.txt with two lines. One line must contain the exact token ANVIL_PROVIDER_SMOKE.
+    expected_artifacts:
+      - notes.txt
+    postcheck:
+      commands:
+        - grep -q ANVIL_PROVIDER_SMOKE notes.txt
+    timeouts:
+      total_sec: 300
+      model_call_sec: 120
+    plan_constraints:
+      min_steps: 1
+      max_steps: 3
+      required_verify_keywords:
+        - grep
+  - id: bash-echo-small
+    size: small
+    category: provider-smoke
+    profile: generic
+    prompt: Create echo.txt containing exactly echo smoke ok. You may use Bash or Write.
+    expected_artifacts:
+      - echo.txt
+    postcheck:
+      commands:
+        - grep -qx "echo smoke ok" echo.txt
+    timeouts:
+      total_sec: 300
+      model_call_sec: 120
+    plan_constraints:
+      min_steps: 1
+      max_steps: 3
+      required_verify_keywords:
+        - echo.txt

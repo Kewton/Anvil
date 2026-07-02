@@ -1,0 +1,3791 @@
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use anyhow::bail;
+use serde_json::{Value, json};
+
+use crate::config::Config;
+use crate::eval_events;
+use crate::mode::ExecutionMode;
+use crate::planner::verify::diagnose_verify_command;
+use crate::providers::ChatClient;
+use crate::state::{ConversationMessage, SessionSnapshot};
+use crate::tools::args_recovery::recover_tool_arguments;
+use crate::tools::path_guard::{
+    resolve_existing, resolve_optional_existing, validate_workspace_relative,
+};
+use crate::tools::registry::{
+    ToolContext, ToolRegistry, missing_arg_name, recoverable_tool_error, tool_error_kind,
+};
+use crate::tui::status::UiStatus;
+use crate::tui::{InteractionUi, NOOP_UI};
+
+use super::build_verifier::{BuildVerifierLifecycleObservation, BuildVerifierStatus};
+use super::compact::compact_if_needed;
+use super::completion::{CompletionContract, format_verify_feedback};
+use super::evidence::verify_runtime_acceptance;
+use super::import_scan::{format_missing_import_feedback, scan_relative_imports};
+use super::prompt::{ToolPromptMode, build_request_messages};
+use super::repair_progress::{
+    RepairProgressVerdict, VerificationSignature, classify_repair_progress,
+};
+use super::repair_target::{
+    RepairFollowThrough, RepairTarget, classify_repair_follow_through, classify_repair_target,
+};
+use super::verifier_bootstrap;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunStopReason {
+    AssistantFinal,
+    RequiredArtifactsSatisfiedAfterTool,
+    CompletionContractSatisfied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSessionOutcome {
+    pub final_text: String,
+    pub stop_reason: RunStopReason,
+    pub changed_paths: Vec<String>,
+    pub iterations: usize,
+    pub tool_calls: usize,
+    pub missing_required_paths: Vec<String>,
+    pub verify_attempts: usize,
+    pub last_blocking_reason: Option<String>,
+    pub last_provider_error: Option<String>,
+}
+
+const ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD: usize = 3;
+const ARTIFACT_RECOVERY_ATTEMPT_LIMIT: usize = 3;
+const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 1;
+const RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT: usize = 2;
+const MALFORMED_NATIVE_TOOL_RETRY_LIMIT: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptArtifactExtraction {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionContractPathMerge {
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionContractVerification {
+    Enabled,
+    DisabledDuringStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActionNoToolPolicy {
+    RequireWriteForActionPrompt,
+    RequireToolOnlyIfNoToolSeen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunSessionScope {
+    MinimalLoop,
+    PlanRunStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunSessionStepKind {
+    Inspect,
+    Setup,
+    Implement,
+    Verify,
+    Report,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunSessionOptions {
+    pub prompt_artifact_extraction: PromptArtifactExtraction,
+    pub completion_contract_path_merge: CompletionContractPathMerge,
+    pub completion_contract_verification: CompletionContractVerification,
+    pub action_no_tool_policy: ActionNoToolPolicy,
+    pub scope: RunSessionScope,
+    pub step_kind: Option<RunSessionStepKind>,
+}
+
+impl Default for RunSessionOptions {
+    fn default() -> Self {
+        Self {
+            prompt_artifact_extraction: PromptArtifactExtraction::Enabled,
+            completion_contract_path_merge: CompletionContractPathMerge::Enabled,
+            completion_contract_verification: CompletionContractVerification::Enabled,
+            action_no_tool_policy: ActionNoToolPolicy::RequireWriteForActionPrompt,
+            scope: RunSessionScope::MinimalLoop,
+            step_kind: None,
+        }
+    }
+}
+
+impl RunSessionOptions {
+    pub(crate) fn plan_step(step_kind: RunSessionStepKind) -> Self {
+        let completion_contract_enabled = step_kind == RunSessionStepKind::Implement;
+        Self {
+            prompt_artifact_extraction: PromptArtifactExtraction::Disabled,
+            completion_contract_path_merge: if completion_contract_enabled {
+                CompletionContractPathMerge::Enabled
+            } else {
+                CompletionContractPathMerge::Disabled
+            },
+            completion_contract_verification: if completion_contract_enabled {
+                CompletionContractVerification::Enabled
+            } else {
+                CompletionContractVerification::DisabledDuringStep
+            },
+            action_no_tool_policy: ActionNoToolPolicy::RequireToolOnlyIfNoToolSeen,
+            scope: RunSessionScope::PlanRunStep,
+            step_kind: Some(step_kind),
+        }
+    }
+
+    fn contract_runtime_enabled(self) -> bool {
+        self.completion_contract_verification == CompletionContractVerification::Enabled
+    }
+
+    fn contract_path_merge_enabled(self) -> bool {
+        self.completion_contract_path_merge == CompletionContractPathMerge::Enabled
+    }
+
+    fn prompt_artifact_extraction_enabled(self) -> bool {
+        self.prompt_artifact_extraction == PromptArtifactExtraction::Enabled
+    }
+
+    fn requires_action_tool_feedback(
+        self,
+        write_or_edit_seen: bool,
+        tool_call_count: usize,
+    ) -> bool {
+        match self.action_no_tool_policy {
+            ActionNoToolPolicy::RequireWriteForActionPrompt => !write_or_edit_seen,
+            ActionNoToolPolicy::RequireToolOnlyIfNoToolSeen => tool_call_count == 0,
+        }
+    }
+
+    fn allows_tool_only_step_completion(self) -> bool {
+        self.scope == RunSessionScope::PlanRunStep
+            && matches!(
+                self.step_kind,
+                Some(
+                    RunSessionStepKind::Inspect
+                        | RunSessionStepKind::Setup
+                        | RunSessionStepKind::Verify
+                )
+            )
+    }
+}
+
+impl RunSessionScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            RunSessionScope::MinimalLoop => "minimal-loop",
+            RunSessionScope::PlanRunStep => "plan-run-step",
+        }
+    }
+}
+
+impl RunSessionStepKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            RunSessionStepKind::Inspect => "inspect",
+            RunSessionStepKind::Setup => "setup",
+            RunSessionStepKind::Implement => "implement",
+            RunSessionStepKind::Verify => "verify",
+            RunSessionStepKind::Report => "report",
+            RunSessionStepKind::Unknown => "unknown",
+        }
+    }
+
+    fn bash_policy_purpose(self) -> &'static str {
+        match self {
+            RunSessionStepKind::Inspect => "runtime_inspection",
+            RunSessionStepKind::Setup => "runtime_setup",
+            RunSessionStepKind::Implement => "runtime_implementation",
+            RunSessionStepKind::Verify | RunSessionStepKind::Report => {
+                "deterministic_verifier_evidence"
+            }
+            RunSessionStepKind::Unknown => "runtime_unknown",
+        }
+    }
+
+    fn requires_verifier_bash_policy(self) -> bool {
+        matches!(
+            self,
+            RunSessionStepKind::Verify | RunSessionStepKind::Report
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeBashPolicyDecision {
+    step_kind: &'static str,
+    bash_policy_purpose: &'static str,
+    verifier_policy_checked: bool,
+    verifier_policy_ok: bool,
+    deterministic_verifier_evidence: bool,
+    blocked: bool,
+    policy_error_kind: &'static str,
+    violation_kind: &'static str,
+    reason: String,
+}
+
+impl RuntimeBashPolicyDecision {
+    fn for_step(step_kind: RunSessionStepKind, command: &str) -> Self {
+        let verifier_policy_checked = step_kind.requires_verifier_bash_policy();
+        if !verifier_policy_checked {
+            return Self {
+                step_kind: step_kind.as_str(),
+                bash_policy_purpose: step_kind.bash_policy_purpose(),
+                verifier_policy_checked: false,
+                verifier_policy_ok: true,
+                deterministic_verifier_evidence: false,
+                blocked: false,
+                policy_error_kind: "",
+                violation_kind: "",
+                reason: "runtime Bash is not deterministic verifier evidence".to_string(),
+            };
+        }
+        let diagnosis = diagnose_verify_command(command);
+        if let Some(violation) = diagnosis.violation {
+            let reason = diagnosis
+                .reason
+                .unwrap_or_else(|| violation.message().to_string());
+            return Self {
+                step_kind: step_kind.as_str(),
+                bash_policy_purpose: step_kind.bash_policy_purpose(),
+                verifier_policy_checked: true,
+                verifier_policy_ok: false,
+                deterministic_verifier_evidence: false,
+                blocked: true,
+                policy_error_kind: "verify_command_policy_error",
+                violation_kind: violation.as_str(),
+                reason,
+            };
+        }
+        Self {
+            step_kind: step_kind.as_str(),
+            bash_policy_purpose: step_kind.bash_policy_purpose(),
+            verifier_policy_checked: true,
+            verifier_policy_ok: true,
+            deterministic_verifier_evidence: true,
+            blocked: false,
+            policy_error_kind: "",
+            violation_kind: "",
+            reason: "runtime Bash admitted as deterministic verifier evidence".to_string(),
+        }
+    }
+}
+
+fn runtime_bash_policy_decision(
+    options: RunSessionOptions,
+    tool_name: &str,
+    arguments: &Value,
+) -> Option<RuntimeBashPolicyDecision> {
+    if tool_name != "Bash" {
+        return None;
+    }
+    let recovered = recover_tool_arguments(tool_name, arguments.clone());
+    let command = recovered.arguments.get("command").and_then(Value::as_str)?;
+    let step_kind = options.step_kind.unwrap_or(RunSessionStepKind::Unknown);
+    Some(RuntimeBashPolicyDecision::for_step(step_kind, command))
+}
+
+fn recovered_bash_command(tool_name: &str, arguments: &Value) -> Option<String> {
+    if tool_name != "Bash" {
+        return None;
+    }
+    let recovered = recover_tool_arguments(tool_name, arguments.clone());
+    recovered
+        .arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn emit_runtime_bash_policy(
+    path: Option<&Path>,
+    decision: &RuntimeBashPolicyDecision,
+    command: &str,
+) {
+    eval_events::emit(
+        path,
+        json!({
+            "event": "runtime_bash_policy",
+            "tool_name": "Bash",
+            "step_kind": decision.step_kind,
+            "bash_policy_purpose": decision.bash_policy_purpose,
+            "verifier_policy_checked": decision.verifier_policy_checked,
+            "verifier_policy_ok": decision.verifier_policy_ok,
+            "deterministic_verifier_evidence": decision.deterministic_verifier_evidence,
+            "blocked": decision.blocked,
+            "policy_error_kind": decision.policy_error_kind,
+            "verify_command_violation_kind": decision.violation_kind,
+            "reason": eval_events::body_snippet(&decision.reason),
+            "command_summary": eval_events::body_snippet(command),
+        }),
+    );
+}
+
+#[derive(Debug, Default)]
+struct VerifyRepairState {
+    pending_signature: Option<VerificationSignature>,
+    pending_target: Option<RepairTarget>,
+    changed_paths_at_failure: Vec<String>,
+    no_edit_turns: usize,
+}
+
+#[derive(Debug)]
+struct VerifyFailureFeedback {
+    feedback: String,
+    signature: VerificationSignature,
+    target: RepairTarget,
+}
+
+#[derive(Debug, Default)]
+struct ArtifactRecoveryState {
+    target_path: Option<String>,
+    target_attempts: usize,
+    last_model_action: Option<String>,
+}
+
+impl ArtifactRecoveryState {
+    fn sync_target(&mut self, required_paths: &[String], missing: &[String]) -> Option<String> {
+        let next = required_paths
+            .iter()
+            .find(|path| missing.contains(path))
+            .cloned()
+            .or_else(|| missing.first().cloned());
+        if self.target_path != next {
+            self.target_path = next.clone();
+            self.target_attempts = 0;
+        }
+        next
+    }
+
+    fn record_action(&mut self, action: &str) {
+        self.last_model_action = Some(action.to_string());
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecoverableToolErrorState {
+    key: Option<String>,
+    repeats: usize,
+}
+
+impl RecoverableToolErrorState {
+    fn record(&mut self, tool_name: &str, err: &anyhow::Error) -> usize {
+        let key = format!("{tool_name}:{}:{}", tool_error_kind(err), err);
+        if self.key.as_deref() == Some(key.as_str()) {
+            self.repeats += 1;
+        } else {
+            self.key = Some(key);
+            self.repeats = 1;
+        }
+        self.repeats
+    }
+
+    fn reset(&mut self) {
+        self.key = None;
+        self.repeats = 0;
+    }
+}
+
+pub fn run_session(
+    client: &mut dyn ChatClient,
+    session: &mut SessionSnapshot,
+    user_prompt: &str,
+    config: &Config,
+) -> anyhow::Result<String> {
+    run_session_with_required_paths(client, session, user_prompt, &[], config)
+}
+
+pub fn run_session_with_required_paths(
+    client: &mut dyn ChatClient,
+    session: &mut SessionSnapshot,
+    user_prompt: &str,
+    required_paths: &[String],
+    config: &Config,
+) -> anyhow::Result<String> {
+    run_session_with_required_paths_with_ui(
+        client,
+        session,
+        user_prompt,
+        required_paths,
+        config,
+        &NOOP_UI,
+    )
+}
+
+pub fn run_session_with_required_paths_with_ui(
+    client: &mut dyn ChatClient,
+    session: &mut SessionSnapshot,
+    user_prompt: &str,
+    required_paths: &[String],
+    config: &Config,
+    ui: &dyn InteractionUi,
+) -> anyhow::Result<String> {
+    Ok(
+        run_session_with_outcome_with_ui(client, session, user_prompt, required_paths, config, ui)?
+            .final_text,
+    )
+}
+
+pub fn run_session_with_outcome_with_ui(
+    client: &mut dyn ChatClient,
+    session: &mut SessionSnapshot,
+    user_prompt: &str,
+    required_paths: &[String],
+    config: &Config,
+    ui: &dyn InteractionUi,
+) -> anyhow::Result<RunSessionOutcome> {
+    run_session_with_outcome_with_options(
+        client,
+        session,
+        user_prompt,
+        required_paths,
+        config,
+        ui,
+        RunSessionOptions::default(),
+    )
+}
+
+pub(crate) fn run_session_with_outcome_with_options(
+    client: &mut dyn ChatClient,
+    session: &mut SessionSnapshot,
+    user_prompt: &str,
+    required_paths: &[String],
+    config: &Config,
+    ui: &dyn InteractionUi,
+    options: RunSessionOptions,
+) -> anyhow::Result<RunSessionOutcome> {
+    let registry = ToolRegistry::default();
+    let mut native_tools_enabled =
+        client.supports_native_tools(&config.model) && !session.native_tools_disabled;
+    let completion_contract =
+        if options.contract_runtime_enabled() || options.contract_path_merge_enabled() {
+            CompletionContract::load_for_config(config)?
+        } else {
+            None
+        };
+    let explicit_required_paths = !required_paths.is_empty();
+    let path_sources = effective_required_path_sources(
+        &config.workspace_root,
+        required_paths,
+        user_prompt,
+        completion_contract
+            .as_ref()
+            .map(|contract| contract.required_paths.as_slice())
+            .unwrap_or(&[]),
+        options,
+    );
+    let required_paths = path_sources.effective_required_paths.clone();
+    let initially_missing_paths = missing_paths(&config.workspace_root, &required_paths);
+    emit_step_obligation_scope(
+        config.eval_events_path.as_deref(),
+        options,
+        &path_sources,
+        &initially_missing_paths,
+    );
+    let mut pending_feedback: Option<String> = None;
+    let mut verify_attempts = 0usize;
+    let mut last_blocking_reason: Option<String> = None;
+    let last_provider_error: Option<String> = None;
+    let mut write_or_edit_seen = false;
+    let mut no_tool_feedbacks = 0usize;
+    let mut empty_feedbacks = 0usize;
+    let mut changed_paths: Vec<String> = Vec::new();
+    let mut tool_call_count = 0usize;
+    let contract_runtime_enabled = options.contract_runtime_enabled();
+    let artifact_recovery_enabled =
+        explicit_required_paths || (contract_runtime_enabled && completion_contract.is_some());
+    let mut artifact_non_edit_streak = 0usize;
+    let mut artifact_recovery_state = ArtifactRecoveryState::default();
+    let mut verify_repair_state = VerifyRepairState::default();
+    let mut recoverable_tool_error_state = RecoverableToolErrorState::default();
+    let mut malformed_native_tool_feedbacks = 0usize;
+    let step_capability_gate = StepCapabilityGate::from_prompt(user_prompt, options);
+    let iteration_limit = if contract_runtime_enabled && completion_contract.is_some() {
+        config.max_iterations
+            + ARTIFACT_RECOVERY_ATTEMPT_LIMIT.saturating_mul(required_paths.len().max(1))
+            + 1
+    } else {
+        config.max_iterations
+    };
+    session
+        .messages
+        .push(ConversationMessage::user(user_prompt.to_string()));
+    let profile_guidance = crate::planner::profile::profile_guidance(&config.profile, user_prompt);
+
+    for iteration in 0..iteration_limit {
+        if ui.interrupted() {
+            bail!("interrupted by user");
+        }
+        compact_if_needed(&mut session.messages, config.context_budget);
+        let specs = registry.specs().to_vec();
+        let request_tools = if native_tools_enabled {
+            specs.clone()
+        } else {
+            Vec::new()
+        };
+        let request_messages = build_request_messages(
+            &session.messages,
+            &specs,
+            &config.workspace_root,
+            pending_feedback.as_deref(),
+            profile_guidance.as_deref(),
+            if native_tools_enabled {
+                ToolPromptMode::Native
+            } else {
+                ToolPromptMode::XmlFallback
+            },
+        );
+        let label = format!("{} {}", client.label(), config.model);
+        let chat_result = {
+            let _guard = ui.before_model_call(&label);
+            client.chat(
+                &config.model,
+                &request_messages,
+                &request_tools,
+                native_tools_enabled,
+            )
+        };
+        let reply = match chat_result {
+            Ok(reply) => {
+                pending_feedback = None;
+                malformed_native_tool_feedbacks = 0;
+                reply
+            }
+            Err(err)
+                if native_tools_enabled
+                    && provider_error_allows_native_tool_retry(&err)
+                    && malformed_native_tool_feedbacks < MALFORMED_NATIVE_TOOL_RETRY_LIMIT =>
+            {
+                malformed_native_tool_feedbacks += 1;
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "native_tool_parse_retry_feedback",
+                        "attempt": malformed_native_tool_feedbacks,
+                        "attempt_limit": MALFORMED_NATIVE_TOOL_RETRY_LIMIT,
+                        "reason": eval_events::body_snippet(&err.to_string()),
+                    }),
+                );
+                pending_feedback = Some(super::feedback::malformed_tool_call(&err.to_string()));
+                continue;
+            }
+            Err(err)
+                if native_tools_enabled
+                    && client.allows_xml_fallback()
+                    && provider_error_allows_xml_fallback(&err) =>
+            {
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "fallback_decision",
+                        "from": "native_tools",
+                        "to": "xml_fallback",
+                        "allowed": true,
+                        "reason": eval_events::body_snippet(&err.to_string()),
+                    }),
+                );
+                native_tools_enabled = false;
+                session.native_tools_disabled = true;
+                pending_feedback = Some(super::feedback::malformed_tool_call(&err.to_string()));
+                continue;
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if native_tools_enabled && client.allows_xml_fallback() {
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "fallback_decision",
+                            "from": "native_tools",
+                            "to": "xml_fallback",
+                            "allowed": false,
+                            "reason": eval_events::body_snippet(&message),
+                        }),
+                    );
+                }
+                return Err(err);
+            }
+        };
+        ui.publish_status(UiStatus::for_model_reply(
+            config,
+            &config.model,
+            client.label(),
+            reply.prompt_tokens,
+            reply.completion_tokens,
+        ));
+        if ui.interrupted() {
+            bail!("interrupted by user");
+        }
+        let mut tool_calls = Vec::new();
+        for mut call in reply.tool_calls.clone() {
+            let raw_shape = eval_events::argument_shape(&call.arguments);
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "tool_call_raw",
+                    "name": call.name.as_str(),
+                    "arguments": raw_shape,
+                }),
+            );
+            let recovered = recover_tool_arguments(&call.name, call.arguments.clone());
+            if recovered.changed {
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "tool_args_recovered",
+                        "name": call.name.as_str(),
+                        "changes": recovered.changes,
+                        "arguments": eval_events::argument_shape(&recovered.arguments),
+                    }),
+                );
+                call.arguments = recovered.arguments;
+            }
+            tool_calls.push(call);
+        }
+        tool_call_count += tool_calls.len();
+        session.messages.push(ConversationMessage::assistant(
+            reply.content.clone(),
+            tool_calls.clone(),
+        ));
+        if tool_calls.is_empty() {
+            let missing = missing_paths(&config.workspace_root, &required_paths);
+            if !missing.is_empty() {
+                session.messages.pop();
+                artifact_non_edit_streak =
+                    artifact_non_edit_streak.saturating_add(ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD);
+                artifact_recovery_state.record_action("no_tool_missing_artifacts");
+                if let Some(feedback) = maybe_artifact_recovery_feedback(
+                    &mut artifact_recovery_state,
+                    &mut artifact_non_edit_streak,
+                    ArtifactRecoveryFeedbackContext {
+                        eval_events_path: config.eval_events_path.as_deref(),
+                        enabled: artifact_recovery_enabled,
+                        missing_paths: &missing,
+                        required_paths: &required_paths,
+                        contract: completion_contract
+                            .as_ref()
+                            .filter(|_| contract_runtime_enabled),
+                        root: &config.workspace_root,
+                    },
+                )? {
+                    last_blocking_reason = Some("artifact creation stalled".to_string());
+                    pending_feedback = Some(feedback);
+                    continue;
+                }
+                last_blocking_reason =
+                    Some(format!("missing required paths: {}", missing.join(", ")));
+                pending_feedback = Some(super::feedback::missing_artifacts(&missing));
+                continue;
+            }
+            if reply.content.trim().is_empty() && empty_feedbacks < 1 {
+                empty_feedbacks += 1;
+                session.messages.pop();
+                last_blocking_reason = Some("empty assistant response".to_string());
+                pending_feedback = Some(super::feedback::empty_response());
+                continue;
+            }
+            if options.requires_action_tool_feedback(write_or_edit_seen, tool_call_count)
+                && looks_like_action_prompt(user_prompt)
+            {
+                if no_tool_feedbacks < 1 {
+                    no_tool_feedbacks += 1;
+                    session.messages.pop();
+                    last_blocking_reason = Some("completion without write".to_string());
+                    pending_feedback = Some(super::feedback::completion_without_write());
+                    continue;
+                }
+                session.messages.pop();
+                bail!("missing tool call for action prompt after feedback");
+            }
+            if options.requires_action_tool_feedback(write_or_edit_seen, tool_call_count)
+                && looks_like_progress_without_tool(&reply.content)
+                && no_tool_feedbacks < 3
+            {
+                no_tool_feedbacks += 1;
+                session.messages.pop();
+                last_blocking_reason = Some("progress text without tool call".to_string());
+                pending_feedback = Some(super::feedback::no_tool_progress());
+                continue;
+            }
+            let mut import_scan_paths = changed_paths.clone();
+            import_scan_paths.extend(required_paths.iter().cloned());
+            let missing_imports =
+                scan_relative_imports(&config.workspace_root, &import_scan_paths)?;
+            if !missing_imports.is_empty() {
+                session.messages.pop();
+                last_blocking_reason = Some("missing relative imports".to_string());
+                pending_feedback = Some(format_missing_import_feedback(&missing_imports));
+                continue;
+            }
+            if let Some(contract) = completion_contract
+                .as_ref()
+                .filter(|_| contract_runtime_enabled)
+                .filter(|contract| contract.has_verify())
+            {
+                if let Some(feedback) = handle_verify_repair_no_edit(
+                    &config.workspace_root,
+                    config.eval_events_path.as_deref(),
+                    contract,
+                    user_prompt,
+                    &mut verify_repair_state,
+                    &changed_paths,
+                )? {
+                    session.messages.pop();
+                    last_blocking_reason = Some("verify repair missing edit".to_string());
+                    pending_feedback = Some(feedback);
+                    continue;
+                }
+                match verify_completion_contract(
+                    &config.workspace_root,
+                    config.eval_events_path.as_deref(),
+                    contract,
+                    user_prompt,
+                    &mut verify_attempts,
+                    verify_repair_state.pending_signature.as_ref(),
+                    verify_repair_state.pending_target,
+                    &verify_repair_state.changed_paths_at_failure,
+                    &changed_paths,
+                    &[],
+                    true,
+                ) {
+                    Ok(None) => {
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "loop_stop",
+                                "reason": "completion_contract_satisfied",
+                                "required_paths": required_paths,
+                                "verify_attempts": verify_attempts,
+                            }),
+                        );
+                        return Ok(RunSessionOutcome {
+                            final_text: reply.content,
+                            stop_reason: RunStopReason::CompletionContractSatisfied,
+                            changed_paths,
+                            iterations: iteration + 1,
+                            tool_calls: tool_call_count,
+                            missing_required_paths: Vec::new(),
+                            verify_attempts,
+                            last_blocking_reason,
+                            last_provider_error,
+                        });
+                    }
+                    Ok(Some(feedback)) => {
+                        session.messages.pop();
+                        last_blocking_reason = Some("completion verify failed".to_string());
+                        verify_repair_state.pending_signature = Some(feedback.signature);
+                        verify_repair_state.pending_target = Some(feedback.target);
+                        verify_repair_state.changed_paths_at_failure = changed_paths.clone();
+                        verify_repair_state.no_edit_turns = 0;
+                        pending_feedback = Some(feedback.feedback);
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err);
+                    }
+                }
+            }
+            return Ok(RunSessionOutcome {
+                final_text: reply.content,
+                stop_reason: RunStopReason::AssistantFinal,
+                changed_paths,
+                iterations: iteration + 1,
+                tool_calls: tool_call_count,
+                missing_required_paths: Vec::new(),
+                verify_attempts,
+                last_blocking_reason,
+                last_provider_error,
+            });
+        }
+
+        let context = ToolContext {
+            root: config.workspace_root.clone(),
+            mode: ExecutionMode::Act,
+            auto_approve: config.yes,
+            interactive_approval: false,
+            offline: config.offline,
+            workspace_policy: crate::tools::workspace_policy::WorkspacePolicy::for_task_request(),
+        };
+        let mut names_seen = BTreeSet::new();
+        let mut batch_had_edit = false;
+        let mut batch_changed_paths = Vec::new();
+        let mut batch_non_edit_tools = 0usize;
+        let mut batch_had_recoverable_tool_error = false;
+        let missing_before_batch = missing_paths(&config.workspace_root, &required_paths);
+        for call in tool_calls {
+            if ui.interrupted() {
+                bail!("interrupted by user");
+            }
+            let call_is_edit = matches!(call.name.as_str(), "Write" | "Edit");
+            if call_is_edit {
+                batch_had_edit = true;
+            } else {
+                batch_non_edit_tools += 1;
+            }
+            if !names_seen.insert(call.name.clone()) {
+                // Multiple same-tool calls are fine; this keeps clippy from seeing unused state.
+            }
+            if let (Some(command), Some(decision)) = (
+                recovered_bash_command(&call.name, &call.arguments),
+                runtime_bash_policy_decision(options, &call.name, &call.arguments),
+            ) {
+                emit_runtime_bash_policy(config.eval_events_path.as_deref(), &decision, &command);
+                if decision.blocked {
+                    batch_had_recoverable_tool_error = true;
+                    let policy_error =
+                        anyhow::anyhow!("{}: {}", decision.policy_error_kind, decision.reason);
+                    let repeats = recoverable_tool_error_state.record(&call.name, &policy_error);
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "tool_policy_error",
+                            "name": call.name.as_str(),
+                            "policy_error_kind": decision.policy_error_kind,
+                            "verify_command_violation_kind": decision.violation_kind,
+                            "bash_policy_purpose": decision.bash_policy_purpose,
+                            "step_kind": decision.step_kind,
+                            "deterministic_verifier_evidence": false,
+                            "repeat_count": repeats,
+                        }),
+                    );
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "tool_validation_error",
+                            "name": call.name.as_str(),
+                            "error_kind": decision.policy_error_kind,
+                            "missing_arg": null,
+                            "repeat_count": repeats,
+                        }),
+                    );
+                    if repeats > RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT {
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "loop_stop",
+                                "reason": "recoverable_tool_error_repeated",
+                                "name": call.name.as_str(),
+                                "error_kind": decision.policy_error_kind,
+                                "repeat_count": repeats - 1,
+                            }),
+                        );
+                        bail!(
+                            "recoverable tool error repeated: {}",
+                            decision.policy_error_kind
+                        );
+                    }
+                    let feedback = recoverable_tool_feedback(&call.name, &policy_error);
+                    session.messages.push(ConversationMessage::tool_result(
+                        call.name,
+                        Some(call.id),
+                        feedback,
+                    ));
+                    continue;
+                }
+            }
+            let result = {
+                let _guard = ui.before_tool_call(&call.name);
+                registry.execute(&call.name, &call.arguments, &context)
+            };
+            let result = match result {
+                Ok(result) => {
+                    recoverable_tool_error_state.reset();
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "tool_execute",
+                            "name": call.name.as_str(),
+                            "status": "ok",
+                        }),
+                    );
+                    if matches!(call.name.as_str(), "Write" | "Edit") {
+                        write_or_edit_seen = true;
+                        if let Some(path) =
+                            changed_path_from_call(&config.workspace_root, &call.arguments)
+                        {
+                            if !changed_paths.contains(&path) {
+                                changed_paths.push(path.clone());
+                            }
+                            if !batch_changed_paths.contains(&path) {
+                                batch_changed_paths.push(path);
+                            }
+                        }
+                    }
+                    result
+                }
+                Err(err) if recoverable_tool_error(&err) => {
+                    batch_had_recoverable_tool_error = true;
+                    let kind = tool_error_kind(&err);
+                    let repeats = recoverable_tool_error_state.record(&call.name, &err);
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "tool_validation_error",
+                            "name": call.name.as_str(),
+                            "error_kind": kind,
+                            "missing_arg": missing_arg_name(&err),
+                            "repeat_count": repeats,
+                        }),
+                    );
+                    if repeats > RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT {
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "loop_stop",
+                                "reason": "recoverable_tool_error_repeated",
+                                "name": call.name.as_str(),
+                                "error_kind": kind,
+                                "repeat_count": repeats - 1,
+                            }),
+                        );
+                        bail!("recoverable tool error repeated: {kind}");
+                    }
+                    recoverable_tool_feedback(&call.name, &err)
+                }
+                Err(err) => {
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "tool_execute",
+                            "name": call.name.as_str(),
+                            "status": "error",
+                            "error_kind": tool_error_kind(&err),
+                        }),
+                    );
+                    return Err(err);
+                }
+            };
+            session.messages.push(ConversationMessage::tool_result(
+                call.name,
+                Some(call.id),
+                result,
+            ));
+        }
+        let missing_after_batch = missing_paths(&config.workspace_root, &required_paths);
+        let batch_reduced_missing_paths = missing_after_batch.len() < missing_before_batch.len();
+        if batch_reduced_missing_paths {
+            artifact_non_edit_streak = 0;
+            artifact_recovery_state.record_action("required_artifact_progress");
+        } else {
+            artifact_non_edit_streak += if batch_non_edit_tools > 0 {
+                batch_non_edit_tools
+            } else if batch_had_edit {
+                1
+            } else {
+                0
+            };
+            if batch_had_edit {
+                artifact_recovery_state.record_action("edit_without_required_artifact_progress");
+            } else if batch_non_edit_tools > 0 {
+                artifact_recovery_state.record_action("non_edit_tool");
+            }
+        }
+        if required_paths.is_empty()
+            && options.allows_tool_only_step_completion()
+            && !batch_had_recoverable_tool_error
+        {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "loop_stop",
+                    "reason": "step_tool_observation_completed",
+                    "tool_calls": tool_call_count,
+                }),
+            );
+            return Ok(RunSessionOutcome {
+                final_text: "step tool observation completed".to_string(),
+                stop_reason: RunStopReason::AssistantFinal,
+                changed_paths,
+                iterations: iteration + 1,
+                tool_calls: tool_call_count,
+                missing_required_paths: Vec::new(),
+                verify_attempts,
+                last_blocking_reason,
+                last_provider_error,
+            });
+        }
+        if required_paths_satisfied_after_tool(
+            &config.workspace_root,
+            &required_paths,
+            &initially_missing_paths,
+            write_or_edit_seen,
+        ) {
+            let mut import_scan_paths = changed_paths.clone();
+            import_scan_paths.extend(required_paths.iter().cloned());
+            let missing_imports =
+                scan_relative_imports(&config.workspace_root, &import_scan_paths)?;
+            if !missing_imports.is_empty() {
+                last_blocking_reason = Some("missing relative imports".to_string());
+                pending_feedback = Some(format_missing_import_feedback(&missing_imports));
+                continue;
+            }
+            if let Some(contract) = completion_contract
+                .as_ref()
+                .filter(|_| contract_runtime_enabled)
+                .filter(|contract| contract.has_verify())
+            {
+                if !batch_had_edit
+                    && let Some(feedback) = handle_verify_repair_no_edit(
+                        &config.workspace_root,
+                        config.eval_events_path.as_deref(),
+                        contract,
+                        user_prompt,
+                        &mut verify_repair_state,
+                        &changed_paths,
+                    )?
+                {
+                    last_blocking_reason = Some("verify repair missing edit".to_string());
+                    pending_feedback = Some(feedback);
+                    continue;
+                }
+                match verify_completion_contract(
+                    &config.workspace_root,
+                    config.eval_events_path.as_deref(),
+                    contract,
+                    user_prompt,
+                    &mut verify_attempts,
+                    verify_repair_state.pending_signature.as_ref(),
+                    verify_repair_state.pending_target,
+                    &verify_repair_state.changed_paths_at_failure,
+                    &changed_paths,
+                    &batch_changed_paths,
+                    batch_had_edit,
+                ) {
+                    Ok(None) => {
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "loop_stop",
+                                "reason": "completion_contract_satisfied",
+                                "required_paths": required_paths,
+                                "verify_attempts": verify_attempts,
+                            }),
+                        );
+                        return Ok(RunSessionOutcome {
+                            final_text: format!(
+                                "completion contract satisfied: {}",
+                                required_paths.join(", ")
+                            ),
+                            stop_reason: RunStopReason::CompletionContractSatisfied,
+                            changed_paths,
+                            iterations: iteration + 1,
+                            tool_calls: tool_call_count,
+                            missing_required_paths: Vec::new(),
+                            verify_attempts,
+                            last_blocking_reason,
+                            last_provider_error,
+                        });
+                    }
+                    Ok(Some(feedback)) => {
+                        last_blocking_reason = Some("completion verify failed".to_string());
+                        verify_repair_state.pending_signature = Some(feedback.signature);
+                        verify_repair_state.pending_target = Some(feedback.target);
+                        verify_repair_state.changed_paths_at_failure = changed_paths.clone();
+                        verify_repair_state.no_edit_turns = 0;
+                        pending_feedback = Some(feedback.feedback);
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err);
+                    }
+                }
+            }
+            if let Some(gate) = step_capability_gate.as_ref()
+                && let Some(feedback) = gate.maybe_feedback(
+                    &config.workspace_root,
+                    config.eval_events_path.as_deref(),
+                    &required_paths,
+                )
+            {
+                last_blocking_reason = Some("capability evidence missing".to_string());
+                pending_feedback = Some(feedback);
+                continue;
+            }
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "loop_stop",
+                    "reason": "required_artifacts_satisfied_after_tool",
+                    "required_paths": required_paths,
+                }),
+            );
+            return Ok(RunSessionOutcome {
+                final_text: format!(
+                    "required artifacts satisfied: {}",
+                    required_paths.join(", ")
+                ),
+                stop_reason: RunStopReason::RequiredArtifactsSatisfiedAfterTool,
+                changed_paths,
+                iterations: iteration + 1,
+                tool_calls: tool_call_count,
+                missing_required_paths: Vec::new(),
+                verify_attempts,
+                last_blocking_reason,
+                last_provider_error,
+            });
+        }
+        let missing = missing_after_batch;
+        if let Some(feedback) = maybe_artifact_recovery_feedback(
+            &mut artifact_recovery_state,
+            &mut artifact_non_edit_streak,
+            ArtifactRecoveryFeedbackContext {
+                eval_events_path: config.eval_events_path.as_deref(),
+                enabled: artifact_recovery_enabled,
+                missing_paths: &missing,
+                required_paths: &required_paths,
+                contract: completion_contract
+                    .as_ref()
+                    .filter(|_| contract_runtime_enabled),
+                root: &config.workspace_root,
+            },
+        )? {
+            last_blocking_reason = Some("artifact creation stalled".to_string());
+            pending_feedback = Some(feedback);
+            continue;
+        }
+    }
+    let missing = missing_paths(&config.workspace_root, &required_paths);
+    let reason = if missing.is_empty() {
+        "max_iterations"
+    } else {
+        "required_artifacts_missing"
+    };
+    let loop_stop_event = json!({
+            "event": "loop_stop",
+            "reason": reason,
+            "missing_paths": missing,
+            "verify_attempts": verify_attempts,
+            "last_blocking_reason": last_blocking_reason,
+            "last_provider_error": last_provider_error.as_deref().map(eval_events::body_snippet),
+    });
+    eval_events::emit(config.eval_events_path.as_deref(), loop_stop_event);
+    bail!(
+        "minimal loop reached max_iterations ({})",
+        config.max_iterations
+    )
+}
+
+fn missing_paths(root: &std::path::Path, required_paths: &[String]) -> Vec<String> {
+    required_paths
+        .iter()
+        .filter(|path| resolve_existing(root, path).is_err())
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct StepCapabilityGate {
+    required_capabilities: Vec<String>,
+    required_evidence: Vec<String>,
+}
+
+impl StepCapabilityGate {
+    fn from_prompt(prompt: &str, options: RunSessionOptions) -> Option<Self> {
+        if options.scope != RunSessionScope::PlanRunStep
+            || options.step_kind != Some(RunSessionStepKind::Implement)
+        {
+            return None;
+        }
+        let required_capabilities =
+            parse_prompt_bullet_section(prompt, "Required final capabilities:");
+        let required_evidence = parse_prompt_bullet_section(prompt, "Required final evidence:")
+            .into_iter()
+            .filter(|evidence| capability_step_evidence(evidence))
+            .collect::<Vec<_>>();
+        if !required_capabilities
+            .iter()
+            .any(|capability| interactive_capability(capability))
+            && !required_evidence
+                .iter()
+                .any(|evidence| interactive_evidence(evidence))
+        {
+            return None;
+        }
+        Some(Self {
+            required_capabilities,
+            required_evidence,
+        })
+    }
+
+    fn maybe_feedback(
+        &self,
+        root: &Path,
+        eval_events_path: Option<&Path>,
+        required_paths: &[String],
+    ) -> Option<String> {
+        let report = verify_runtime_acceptance(
+            root,
+            required_paths,
+            &[],
+            &self.required_capabilities,
+            &self.required_evidence,
+            &["implementation".to_string()],
+            &[],
+        );
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "step_capability_evidence_check",
+                "ok": report.passed,
+                "required_capabilities": self.required_capabilities.clone(),
+                "required_evidence": self.required_evidence.clone(),
+                "missing_capabilities": report.missing_capabilities.clone(),
+                "missing_evidence": report.missing_evidence.clone(),
+                "missing_obligations": report.missing_obligations.clone(),
+                "weak_evidence": report.weak_evidence.clone(),
+                "browser_readiness_status": report.browser_readiness_status.clone(),
+                "browser_readiness_evidence_path": report.browser_readiness_evidence_path.clone(),
+                "interaction_evidence_status": report.interaction_evidence_status.clone(),
+                "interaction_evidence_path": report.interaction_evidence_path.clone(),
+                "primary_reason": eval_events::body_snippet(&report.primary_reason),
+            }),
+        );
+        if report.passed {
+            return None;
+        }
+        Some(super::feedback::missing_capability_evidence(
+            &report.missing_evidence,
+            &report.missing_capabilities,
+        ))
+    }
+}
+
+fn parse_prompt_bullet_section(prompt: &str, header: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if trimmed.is_empty() {
+            if out.is_empty() {
+                continue;
+            }
+            break;
+        }
+        let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        else {
+            break;
+        };
+        let item = item.trim();
+        if !item.is_empty() && item != "none" {
+            out.push(item.to_string());
+        }
+    }
+    out
+}
+
+fn interactive_capability(capability: &str) -> bool {
+    matches!(
+        capability.trim(),
+        "browser_interaction"
+            | "playable_ui"
+            | "stateful_interaction"
+            | "start_or_restart_flow"
+            | "player_control"
+            | "adversary_or_challenge"
+            | "progression_or_score"
+            | "failure_or_collision_rule"
+            | "user_input_or_action"
+            | "visible_state_change"
+    )
+}
+
+fn capability_step_evidence(evidence: &str) -> bool {
+    !matches!(
+        evidence.trim(),
+        "nextjs_route_evidence" | "build_command_or_dependency_missing_boundary"
+    )
+}
+
+fn interactive_evidence(evidence: &str) -> bool {
+    matches!(
+        evidence.trim(),
+        "interactive_ui_source_evidence"
+            | "non_static_screen_evidence"
+            | "visible_interactive_surface_evidence"
+            | "user_input_handler_evidence"
+            | "stateful_update_evidence"
+            | "challenge_or_adversary_evidence"
+            | "score_or_progression_evidence"
+            | "failure_or_collision_evidence"
+            | "restart_or_recoverable_state_evidence"
+    )
+}
+
+#[derive(Debug, Clone)]
+struct RequiredPathSources {
+    explicit_required_paths: Vec<String>,
+    prompt_extracted_paths: Vec<String>,
+    completion_contract_paths: Vec<String>,
+    effective_required_paths: Vec<String>,
+}
+
+fn effective_required_path_sources(
+    root: &Path,
+    explicit: &[String],
+    prompt: &str,
+    contract_paths: &[String],
+    options: RunSessionOptions,
+) -> RequiredPathSources {
+    let prompt_extracted_paths = if options.prompt_artifact_extraction_enabled() {
+        extract_requested_artifact_paths(root, prompt)
+    } else {
+        Vec::new()
+    };
+    let completion_contract_paths = if options.contract_path_merge_enabled() {
+        contract_paths.to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for path in explicit.iter().cloned() {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    for path in prompt_extracted_paths.iter().cloned() {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    for path in completion_contract_paths.iter().cloned() {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    RequiredPathSources {
+        explicit_required_paths: explicit.to_vec(),
+        prompt_extracted_paths,
+        completion_contract_paths,
+        effective_required_paths: out,
+    }
+}
+
+fn emit_step_obligation_scope(
+    eval_events_path: Option<&Path>,
+    options: RunSessionOptions,
+    sources: &RequiredPathSources,
+    initially_missing_paths: &[String],
+) {
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "step_obligation_scope",
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "explicit_required_paths": sources.explicit_required_paths.clone(),
+            "prompt_extracted_paths_enabled": options.prompt_artifact_extraction_enabled(),
+            "prompt_extracted_paths": sources.prompt_extracted_paths.clone(),
+            "completion_contract_path_merge_enabled": options.contract_path_merge_enabled(),
+            "completion_contract_verification_enabled": options.contract_runtime_enabled(),
+            "completion_contract_paths": sources.completion_contract_paths.clone(),
+            "effective_required_paths": sources.effective_required_paths.clone(),
+            "initially_missing_paths": initially_missing_paths,
+            "contract_paths_merged": options.contract_path_merge_enabled()
+                && !sources.completion_contract_paths.is_empty(),
+        }),
+    );
+}
+
+fn verify_completion_contract(
+    root: &Path,
+    eval_events_path: Option<&Path>,
+    contract: &CompletionContract,
+    goal: &str,
+    verify_attempts: &mut usize,
+    previous_signature: Option<&VerificationSignature>,
+    previous_target: Option<RepairTarget>,
+    changed_paths_before: &[String],
+    changed_paths_after: &[String],
+    repair_turn_changed_paths: &[String],
+    had_edit: bool,
+) -> anyhow::Result<Option<VerifyFailureFeedback>> {
+    *verify_attempts += 1;
+    let (report, build_verifier_lifecycles) = contract.verify_with_goal_observed(root, goal);
+    let build_verifier_observations = build_verifier_lifecycles
+        .iter()
+        .map(|lifecycle| lifecycle.final_observation().clone())
+        .collect::<Vec<_>>();
+    let runtime_acceptance = contract.runtime_acceptance_report(root);
+    let ok = report.is_pass();
+    let (signature, verdict) = classify_repair_progress(previous_signature, &report, had_edit);
+    let repair_target = classify_repair_target(&report);
+    let repair_follow_through = previous_target
+        .map(|target| classify_repair_follow_through(target, repair_turn_changed_paths));
+    let repair_follow_through_label = repair_follow_through
+        .map(RepairFollowThrough::as_str)
+        .unwrap_or("");
+    let repair_failure_kind = repair_follow_through
+        .and_then(RepairFollowThrough::failure_kind)
+        .unwrap_or("");
+    let repair_target_followed = repair_follow_through.map(RepairFollowThrough::followed);
+    let previous_repair_target = previous_target.map(RepairTarget::as_str).unwrap_or("");
+    let build_verifier_required = build_verifier_lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.requirement.required_for_completion);
+    let build_verifier_attempted = build_verifier_lifecycles.iter().any(|lifecycle| {
+        lifecycle.before_setup.attempted
+            || lifecycle
+                .after_setup
+                .as_ref()
+                .is_some_and(|observation| observation.attempted)
+            || lifecycle
+                .setup
+                .as_ref()
+                .is_some_and(|setup| setup.attempted)
+    });
+    let build_verifier_statuses = build_verifier_observations
+        .iter()
+        .map(|observation| format!("{}:{}", observation.command, observation.status_str()))
+        .collect::<Vec<_>>();
+    let dependency_setup_status = dependency_setup_status(&build_verifier_lifecycles);
+    let verifier_bootstrap_state = verifier_bootstrap::state_from_lifecycles(
+        build_verifier_required,
+        &build_verifier_lifecycles,
+    );
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "completion_verify",
+            "ok": ok,
+            "attempt": *verify_attempts,
+            "repair_cap": contract.verify_repair_cap,
+            "missing_paths": report.missing_paths.clone(),
+            "command_failures": report.command_failures.len(),
+            "dependency_missing": report.dependency_missing.clone(),
+            "profile": contract.profile.as_deref().unwrap_or(""),
+            "profile_failures": report.profile_failures.clone(),
+            "required_capabilities": contract.required_capabilities.clone(),
+            "required_evidence": contract.required_evidence.clone(),
+            "required_obligations": contract.required_obligations.clone(),
+            "missing_capabilities": runtime_acceptance.missing_capabilities.clone(),
+            "missing_evidence": runtime_acceptance.missing_evidence.clone(),
+            "missing_obligations": runtime_acceptance.missing_obligations.clone(),
+            "weak_evidence": runtime_acceptance.weak_evidence.clone(),
+            "artifact_obligations": runtime_acceptance.artifact_obligations.clone(),
+            "capability_evidence_bindings": runtime_acceptance.capability_evidence_bindings.clone(),
+            "obligation_repair_targets": runtime_acceptance.obligation_repair_targets.clone(),
+            "inconclusive_reasons": runtime_acceptance.inconclusive_reasons.clone(),
+            "browser_readiness_status": runtime_acceptance.browser_readiness_status.clone(),
+            "browser_readiness_evidence_path": runtime_acceptance.browser_readiness_evidence_path.clone(),
+            "interaction_evidence_status": runtime_acceptance.interaction_evidence_status.clone(),
+            "interaction_evidence_path": runtime_acceptance.interaction_evidence_path.clone(),
+            "runtime_acceptance_passed": runtime_acceptance.passed,
+            "runtime_acceptance_inconclusive": runtime_acceptance.inconclusive,
+            "runtime_acceptance_primary_reason": eval_events::body_snippet(&runtime_acceptance.primary_reason),
+            "deferred_verify_requirements": contract.deferred_status_summary(root, goal),
+            "build_verifier_required": build_verifier_required,
+            "build_verifier_attempted": build_verifier_attempted,
+            "build_verifier_statuses": build_verifier_statuses,
+            "build_verifier_observations": build_verifier_observations.clone(),
+            "build_verifier_lifecycle": build_verifier_lifecycles.clone(),
+            "dependency_setup_status": dependency_setup_status,
+            "verifier_bootstrap_state": verifier_bootstrap_state.as_str(),
+            "repair_target": repair_target.as_str(),
+            "primary_reason": eval_events::body_snippet(&report.primary_reason()),
+            "failure_signature": signature.label(),
+            "repair_progress": verdict.as_str(),
+        }),
+    );
+    if previous_target.is_some() {
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "step_verify_repair",
+                "mode": "minimal-loop",
+                "attempt": *verify_attempts,
+                "ok": ok,
+                "repair_target": repair_target.as_str(),
+                "previous_repair_target": previous_repair_target,
+                "repair_target_followed": repair_target_followed,
+                "target_relation": repair_follow_through_label,
+                "repair_follow_through": repair_follow_through_label,
+                "failure_kind": repair_failure_kind,
+                "changed_paths_before": changed_paths_before,
+                "changed_paths_after": changed_paths_after,
+                "repair_turn_changed_paths": repair_turn_changed_paths,
+                "allowed_action": previous_target.map(RepairTarget::allowed_action).unwrap_or(""),
+                "primary_reason": eval_events::body_snippet(&report.primary_reason()),
+            }),
+        );
+    }
+    for lifecycle in &build_verifier_lifecycles {
+        super::build_verifier::emit_dependency_build_lifecycle(
+            eval_events_path,
+            "minimal-loop",
+            None,
+            lifecycle,
+        );
+    }
+    if ok {
+        return Ok(None);
+    }
+    if previous_signature.is_some() {
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "verify_repair_progress",
+                "verdict": verdict.as_str(),
+                "previous_signature": previous_signature.map(VerificationSignature::label).unwrap_or_default(),
+                "current_signature": signature.label(),
+                "had_edit": had_edit,
+            }),
+        );
+    }
+    let effective_repair_cap =
+        if previous_signature.is_some() && matches!(verdict, RepairProgressVerdict::Improved) {
+            contract.verify_repair_cap.saturating_add(1)
+        } else {
+            contract.verify_repair_cap
+        };
+    if *verify_attempts >= effective_repair_cap {
+        let stop_reason = terminal_verify_stop_reason(
+            &report,
+            &signature,
+            previous_signature,
+            verdict,
+            repair_target,
+            repair_follow_through,
+        );
+        let recovery_paths = save_minimal_recovery_handoff(
+            root,
+            eval_events_path,
+            contract,
+            goal,
+            &stop_reason,
+            &report.primary_reason(),
+            &report,
+            changed_paths_after,
+            repair_target,
+        );
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "loop_stop",
+                "reason": stop_reason,
+                "verify_attempts": *verify_attempts,
+                "primary_reason": eval_events::body_snippet(&report.primary_reason()),
+                "missing_capabilities": runtime_acceptance.missing_capabilities.clone(),
+                "missing_evidence": runtime_acceptance.missing_evidence.clone(),
+                "missing_obligations": runtime_acceptance.missing_obligations.clone(),
+                "weak_evidence": runtime_acceptance.weak_evidence.clone(),
+                "inconclusive_reasons": runtime_acceptance.inconclusive_reasons.clone(),
+                "browser_readiness_status": runtime_acceptance.browser_readiness_status.clone(),
+                "browser_readiness_evidence_path": runtime_acceptance.browser_readiness_evidence_path.clone(),
+                "interaction_evidence_status": runtime_acceptance.interaction_evidence_status.clone(),
+                "interaction_evidence_path": runtime_acceptance.interaction_evidence_path.clone(),
+                "runtime_acceptance_inconclusive": runtime_acceptance.inconclusive,
+                "repair_progress": verdict.as_str(),
+                "failure_signature": signature.label(),
+                "repair_target": repair_target.as_str(),
+                "previous_repair_target": previous_repair_target,
+                "repair_target_followed": repair_target_followed,
+                "target_relation": repair_follow_through_label,
+                "repair_follow_through": repair_follow_through_label,
+                "changed_paths_before": changed_paths_before,
+                "changed_paths_after": changed_paths_after,
+                "repair_turn_changed_paths": repair_turn_changed_paths,
+                "dependency_setup_status": dependency_setup_status,
+                "verifier_bootstrap_state": verifier_bootstrap_state.as_str(),
+                "recovery_prompt_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.prompt_path.clone())
+                    .unwrap_or_default(),
+                "recovery_ultra_plan_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.yaml_path.clone())
+                    .unwrap_or_default(),
+                "recovery_yaml_missing": recovery_paths.is_none(),
+                "build_verifier_lifecycle": build_verifier_lifecycles.clone(),
+                "build_verifier_statuses": build_verifier_observations
+                    .iter()
+                    .map(|observation| format!("{}:{}", observation.command, observation.status_str()))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        bail!(
+            "completion contract verify failed after {} attempts: {}",
+            *verify_attempts,
+            report.primary_reason()
+        );
+    }
+    Ok(Some(VerifyFailureFeedback {
+        feedback: format_verify_feedback(&report),
+        signature,
+        target: repair_target,
+    }))
+}
+
+#[derive(Debug, Clone)]
+struct MinimalRecoveryPaths {
+    prompt_path: String,
+    yaml_path: String,
+}
+
+fn save_minimal_recovery_handoff(
+    root: &Path,
+    eval_events_path: Option<&Path>,
+    contract: &CompletionContract,
+    goal: &str,
+    failure_kind: &str,
+    primary_reason: &str,
+    report: &crate::planner::verify::VerificationReport,
+    changed_paths: &[String],
+    repair_target: RepairTarget,
+) -> Option<MinimalRecoveryPaths> {
+    let profile = contract
+        .profile
+        .clone()
+        .unwrap_or_else(|| "generic".to_string());
+    let original_goal = contract
+        .goal
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| goal.to_string());
+    let failure_evidence = std::iter::once(primary_reason.to_string())
+        .chain(report.dependency_missing.iter().cloned())
+        .chain(
+            report
+                .command_failures
+                .iter()
+                .map(|failure| format!("{}: {}", failure.command, failure.reason)),
+        )
+        .chain(report.profile_failures.iter().cloned())
+        .collect::<Vec<_>>();
+    let handoff = crate::planner::repair::RecoveryHandoff {
+        profile: profile.clone(),
+        original_goal,
+        failed_phase: Some("minimal-loop".to_string()),
+        failed_step: Some("completion-verify".to_string()),
+        failure_kind: failure_kind.to_string(),
+        failure_evidence,
+        missing_paths: report.missing_paths.clone(),
+        missing_capabilities: contract.required_capabilities.clone(),
+        verify_commands: contract.verify_commands.clone(),
+        changed_paths: changed_paths.to_vec(),
+        repair_targets: vec![repair_target.as_str().to_string()],
+    };
+    let prompt_path =
+        match crate::planner::repair::save_ultra_recovery_prompt(root, "minimal-loop", &handoff) {
+            Ok(path) => path,
+            Err(err) => {
+                eval_events::emit(
+                    eval_events_path,
+                    json!({
+                        "event": "recovery_prompt_save_failed",
+                        "recovery_handoff_kind": failure_kind,
+                        "reason": eval_events::body_snippet(&err.to_string()),
+                        "status": "incomplete",
+                    }),
+                );
+                return None;
+            }
+        };
+    let yaml_path =
+        match crate::planner::repair::save_recovery_ultra_plan(root, "minimal-loop", &handoff) {
+            Ok(path) => path,
+            Err(err) => {
+                eval_events::emit(
+                    eval_events_path,
+                    json!({
+                        "event": "recovery_ultra_plan_save_failed",
+                        "recovery_handoff_kind": failure_kind,
+                        "recovery_prompt_path": prompt_path.display().to_string(),
+                        "reason": eval_events::body_snippet(&err.to_string()),
+                        "recovery_yaml_missing": true,
+                        "status": "incomplete",
+                    }),
+                );
+                return None;
+            }
+        };
+    let suggested_prompt_command =
+        crate::planner::repair::suggested_ultra_recovery_command(&prompt_path, &profile);
+    let suggested_yaml_command =
+        crate::planner::repair::suggested_recovery_ultra_plan_command(&yaml_path);
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "recovery_prompt_saved",
+            "recovery_handoff_kind": failure_kind,
+            "recovery_prompt_path": prompt_path.display().to_string(),
+            "recovery_ultra_plan_path": yaml_path.display().to_string(),
+            "recovery_yaml_missing": false,
+            "recovery_yaml_roundtrip_ok": true,
+            "suggested_recovery_command": suggested_prompt_command,
+            "suggested_recovery_yaml_command": suggested_yaml_command,
+            "recovery_profile": profile,
+            "local_repair_exhausted": true,
+            "failure_kind": failure_kind,
+            "status": "incomplete",
+        }),
+    );
+    Some(MinimalRecoveryPaths {
+        prompt_path: prompt_path.display().to_string(),
+        yaml_path: yaml_path.display().to_string(),
+    })
+}
+
+fn dependency_setup_status(lifecycles: &[BuildVerifierLifecycleObservation]) -> &'static str {
+    if lifecycles.is_empty() {
+        return "not_required";
+    }
+    if lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.setup_status() == "passed")
+    {
+        return "ready";
+    }
+    if lifecycles
+        .iter()
+        .any(|lifecycle| matches!(lifecycle.setup_status(), "failed" | "timed_out"))
+    {
+        return "failed";
+    }
+    if lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.setup_status() == "blocked")
+    {
+        return "blocked";
+    }
+    if lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.final_status == BuildVerifierStatus::DependencyMissing)
+    {
+        return "missing";
+    }
+    if lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.final_status == BuildVerifierStatus::PolicyRejected)
+    {
+        return "policy_rejected";
+    }
+    if lifecycles
+        .iter()
+        .all(|lifecycle| lifecycle.final_status == BuildVerifierStatus::Passed)
+    {
+        return "ready";
+    }
+    "blocked"
+}
+
+fn handle_verify_repair_no_edit(
+    root: &Path,
+    eval_events_path: Option<&Path>,
+    contract: &CompletionContract,
+    goal: &str,
+    state: &mut VerifyRepairState,
+    changed_paths: &[String],
+) -> anyhow::Result<Option<String>> {
+    let Some(signature) = state.pending_signature.as_ref() else {
+        return Ok(None);
+    };
+    state.no_edit_turns += 1;
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "verify_repair_turn",
+            "has_edit": false,
+            "inspect_only": state.no_edit_turns == 1,
+            "failure_signature": signature.label(),
+            "repair_target": state.pending_target.map(RepairTarget::as_str).unwrap_or(""),
+            "no_edit_turns": state.no_edit_turns,
+        }),
+    );
+    if state.no_edit_turns >= VERIFY_REPAIR_NO_EDIT_LIMIT {
+        let repair_target = state.pending_target.unwrap_or(RepairTarget::Unknown);
+        let report = crate::planner::verify::VerificationReport::profile_failed(format!(
+            "verify_repair_no_change: no file changes after verifier failure {}",
+            signature.label()
+        ));
+        let recovery_paths = save_minimal_recovery_handoff(
+            root,
+            eval_events_path,
+            contract,
+            goal,
+            "verify_repair_no_change",
+            &report.primary_reason(),
+            &report,
+            changed_paths,
+            repair_target,
+        );
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "loop_stop",
+                "reason": "verify_repair_no_change",
+                "failure_signature": signature.label(),
+                "repair_target": state.pending_target.map(RepairTarget::as_str).unwrap_or(""),
+                "repair_target_followed": false,
+                "target_relation": "no_change",
+                "repair_follow_through": "no_change",
+                "changed_paths_before": state.changed_paths_at_failure.clone(),
+                "changed_paths_after": changed_paths,
+                "repair_turn_changed_paths": Vec::<String>::new(),
+                "recovery_prompt_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.prompt_path.clone())
+                    .unwrap_or_default(),
+                "recovery_ultra_plan_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.yaml_path.clone())
+                    .unwrap_or_default(),
+                "recovery_yaml_missing": recovery_paths.is_none(),
+                "no_edit_turns": state.no_edit_turns,
+            }),
+        );
+        bail!("completion contract verify repair made no file changes");
+    }
+    Ok(Some(super::feedback::verify_repair_edit_required(
+        &signature.label(),
+        state.no_edit_turns,
+        VERIFY_REPAIR_NO_EDIT_LIMIT,
+    )))
+}
+
+fn terminal_verify_stop_reason(
+    report: &crate::planner::verify::VerificationReport,
+    signature: &VerificationSignature,
+    previous_signature: Option<&VerificationSignature>,
+    verdict: RepairProgressVerdict,
+    repair_target: RepairTarget,
+    repair_follow_through: Option<RepairFollowThrough>,
+) -> String {
+    if let Some(kind) = repair_follow_through.and_then(RepairFollowThrough::failure_kind) {
+        return kind.to_string();
+    }
+    if !report.dependency_missing.is_empty() {
+        return "dependency_setup_missing".to_string();
+    }
+    if report.command_failures.iter().any(|failure| {
+        failure.reason.contains("build_verify_policy_rejected")
+            || failure.reason.contains("verify command may not")
+    }) {
+        return "verify_command_policy_error".to_string();
+    }
+    if report.command_failures.iter().any(|failure| {
+        failure.reason.contains("build_verify_failed")
+            || failure.command.contains("npm run build")
+            || failure.command.contains("next build")
+    }) {
+        return "build_verify_failed".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("build_verify_blocked"))
+    {
+        return "build_verify_blocked".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("missing_required_capabilities"))
+    {
+        return "missing_required_capabilities".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("missing_required_evidence"))
+    {
+        return "missing_required_evidence".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("weak_verification_evidence"))
+    {
+        return "weak_verification_evidence".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("tailwind_contract_failure"))
+    {
+        return "tailwind_contract_failure".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| !reason.contains("deferred verify requirement pending"))
+    {
+        return "profile_contract_failure".to_string();
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| reason.contains("deferred verify requirement pending"))
+    {
+        return "deferred_verify_requirement_pending".to_string();
+    }
+    if signature.has_test_discovery_failure() {
+        return "test_discovery_failure".to_string();
+    }
+    if signature.has_test_framework_mismatch() {
+        return "test_framework_mismatch".to_string();
+    }
+    if previous_signature.is_some() {
+        match verdict {
+            RepairProgressVerdict::Unchanged
+            | RepairProgressVerdict::Regressed
+            | RepairProgressVerdict::Invalid => {
+                if repair_target == RepairTarget::DependencySetup {
+                    return "dependency_setup_blocked".to_string();
+                }
+                return format!("verify_repair_progress_{}", verdict.as_str());
+            }
+            RepairProgressVerdict::Passed | RepairProgressVerdict::Improved => {}
+        }
+    }
+    "verify_repair_exhausted".to_string()
+}
+
+fn should_emit_artifact_recovery(
+    enabled: bool,
+    non_edit_streak: usize,
+    missing_paths: &[String],
+    contract: Option<&CompletionContract>,
+    root: &Path,
+) -> bool {
+    enabled
+        && !missing_paths.is_empty()
+        && non_edit_streak >= ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD
+        && !contract.is_some_and(|contract| contract.dependency_precondition_active(root))
+}
+
+struct ArtifactRecoveryFeedbackContext<'a> {
+    eval_events_path: Option<&'a Path>,
+    enabled: bool,
+    missing_paths: &'a [String],
+    required_paths: &'a [String],
+    contract: Option<&'a CompletionContract>,
+    root: &'a Path,
+}
+
+fn maybe_artifact_recovery_feedback(
+    state: &mut ArtifactRecoveryState,
+    non_edit_streak: &mut usize,
+    context: ArtifactRecoveryFeedbackContext<'_>,
+) -> anyhow::Result<Option<String>> {
+    if !should_emit_artifact_recovery(
+        context.enabled,
+        *non_edit_streak,
+        context.missing_paths,
+        context.contract,
+        context.root,
+    ) {
+        return Ok(None);
+    }
+    let target_path = state
+        .sync_target(context.required_paths, context.missing_paths)
+        .unwrap_or_default();
+    state.target_attempts += 1;
+    if state.target_attempts > ARTIFACT_RECOVERY_ATTEMPT_LIMIT {
+        eval_events::emit(
+            context.eval_events_path,
+            json!({
+                "event": "loop_stop",
+                "reason": "artifact_recovery_exhausted",
+                "missing_paths": context.missing_paths,
+                "non_edit_streak": *non_edit_streak,
+                "attempts": state.target_attempts - 1,
+                "last_target_path": target_path,
+                "last_model_action": state.last_model_action,
+            }),
+        );
+        bail!("artifact recovery exhausted");
+    }
+    eval_events::emit(
+        context.eval_events_path,
+        json!({
+            "event": "artifact_stagnation_feedback",
+            "missing_paths": context.missing_paths,
+            "attempt": state.target_attempts,
+            "attempt_limit": ARTIFACT_RECOVERY_ATTEMPT_LIMIT,
+            "non_edit_streak": *non_edit_streak,
+            "target_path": target_path,
+            "target_attempt": state.target_attempts,
+            "last_model_action": state.last_model_action,
+        }),
+    );
+    *non_edit_streak = 0;
+    Ok(Some(super::feedback::artifact_stagnation_for_target(
+        context.missing_paths,
+        &target_path,
+        state.target_attempts,
+        ARTIFACT_RECOVERY_ATTEMPT_LIMIT,
+    )))
+}
+
+fn provider_error_allows_xml_fallback(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    if lower.contains(" api failed:")
+        || lower.contains("http")
+        || lower.contains("status")
+        || lower.contains("network")
+        || lower.contains("timeout")
+    {
+        return false;
+    }
+    lower.contains("function_call")
+        || lower.contains("tool call")
+        || lower.contains("tool_call")
+        || lower.contains("provider parse")
+        || lower.contains("parse")
+}
+
+fn provider_error_allows_native_tool_retry(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    if lower.contains(" api failed:")
+        || lower.contains("http")
+        || lower.contains("status")
+        || lower.contains("network")
+        || lower.contains("timeout")
+    {
+        return false;
+    }
+    lower.contains("function_call")
+        || lower.contains("tool call")
+        || lower.contains("tool_call")
+        || lower.contains("provider parse")
+}
+
+pub(crate) fn extract_requested_artifact_paths(root: &Path, prompt: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut in_required_block = false;
+    for line in prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed
+            .to_ascii_lowercase()
+            .starts_with("required final artifacts")
+        {
+            in_required_block = true;
+            continue;
+        }
+        if in_required_block {
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !is_artifact_list_line(trimmed) && looks_like_section_boundary(trimmed) {
+                in_required_block = false;
+            } else if let Some(candidate) = artifact_candidate_from_line(trimmed)
+                && requested_artifact_path_allowed(root, &candidate)
+                && seen.insert(candidate.clone())
+            {
+                paths.push(candidate);
+                continue;
+            }
+        }
+        for candidate in backticked_candidates(trimmed) {
+            if looks_like_artifact_path(&candidate)
+                && requested_artifact_path_allowed(root, &candidate)
+                && seen.insert(candidate.clone())
+            {
+                paths.push(candidate);
+            }
+        }
+    }
+    paths
+}
+
+fn requested_artifact_path_allowed(root: &Path, raw: &str) -> bool {
+    if validate_workspace_relative(raw).is_err() {
+        return false;
+    }
+    let path = Path::new(raw);
+    let blocked = [".anvil", ".git", "target", "node_modules", ".next"];
+    if path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|part| blocked.contains(&part))
+    }) {
+        return false;
+    }
+    resolve_optional_existing(root, raw).is_ok()
+}
+
+fn required_paths_satisfied_after_tool(
+    root: &Path,
+    required_paths: &[String],
+    initially_missing_paths: &[String],
+    write_or_edit_seen: bool,
+) -> bool {
+    if required_paths.is_empty() || !missing_paths(root, required_paths).is_empty() {
+        return false;
+    }
+    write_or_edit_seen
+        || initially_missing_paths
+            .iter()
+            .any(|path| resolve_existing(root, path).is_ok())
+}
+
+fn is_artifact_list_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("- ")
+        || line.starts_with("* ")
+        || line.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+}
+
+fn looks_like_section_boundary(line: &str) -> bool {
+    line.ends_with(':') || line.starts_with('#')
+}
+
+fn artifact_candidate_from_line(line: &str) -> Option<String> {
+    let mut value = line.trim();
+    value = value
+        .trim_start_matches("- ")
+        .trim_start_matches("* ")
+        .trim_start();
+    if let Some((head, tail)) = value.split_once(". ")
+        && head.chars().all(|ch| ch.is_ascii_digit())
+    {
+        value = tail.trim_start();
+    }
+    let first = value.split_whitespace().next().unwrap_or_default();
+    let candidate = first
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_end_matches([',', ';']);
+    if looks_like_artifact_path(candidate) {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn backticked_candidates(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(start) = rest.find('`') {
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('`') else {
+            break;
+        };
+        out.push(after_start[..end].trim().to_string());
+        rest = &after_start[end + 1..];
+    }
+    out
+}
+
+fn looks_like_artifact_path(value: &str) -> bool {
+    if value.is_empty() || value.starts_with("http://") || value.starts_with("https://") {
+        return false;
+    }
+    if value.contains('/') {
+        return true;
+    }
+    matches!(
+        value,
+        "Cargo.toml"
+            | "README.md"
+            | "package.json"
+            | "tsconfig.json"
+            | "index.html"
+            | "pyproject.toml"
+    ) || Path::new(value).extension().is_some_and(|ext| {
+        matches!(
+            ext.to_str().unwrap_or_default(),
+            "js" | "jsx"
+                | "ts"
+                | "tsx"
+                | "rs"
+                | "py"
+                | "md"
+                | "txt"
+                | "csv"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "html"
+                | "css"
+        )
+    })
+}
+
+fn looks_like_progress_without_tool(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("i will")
+        || lower.contains("next")
+        || lower.contains("作成します")
+        || lower.contains("実装します")
+        || lower.contains("進めます")
+}
+
+fn looks_like_action_prompt(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("create")
+        || lower.contains("write")
+        || lower.contains("edit")
+        || lower.contains("fix")
+        || lower.contains("implement")
+        || lower.contains("add ")
+        || lower.contains("build")
+        || lower.contains("作成")
+        || lower.contains("実装")
+        || lower.contains("修正")
+        || lower.contains("追加")
+}
+
+fn recoverable_tool_feedback(name: &str, err: &anyhow::Error) -> String {
+    format!(
+        "Tool call `{name}` was rejected with a recoverable validation error: {err}. Retry with the same tool or another available tool using a valid JSON object that matches the tool schema."
+    )
+}
+
+fn changed_path_from_call(root: &Path, arguments: &serde_json::Value) -> Option<String> {
+    let raw = arguments.get("path")?.as_str()?;
+    let path = resolve_existing(root, raw).ok()?;
+    let root = root.canonicalize().ok()?;
+    Some(crate::tools::path_guard::relative_display(&root, &path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::AssistantReply;
+    use crate::state::ToolCall;
+    use serde_json::json;
+
+    struct Fake {
+        replies: Vec<anyhow::Result<AssistantReply>>,
+    }
+
+    impl ChatClient for Fake {
+        fn label(&self) -> &str {
+            "fake"
+        }
+        fn supports_native_tools(&self, _model: &str) -> bool {
+            true
+        }
+        fn chat(
+            &mut self,
+            _model: &str,
+            _messages: &[ConversationMessage],
+            _tools: &[crate::tools::registry::ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            self.replies.remove(0)
+        }
+    }
+
+    fn config(root: std::path::PathBuf) -> Config {
+        Config {
+            workspace_root: root,
+            state_dir: std::path::PathBuf::from("state"),
+            yes: true,
+            offline: false,
+            context_budget: 1000,
+            model: "m".to_string(),
+            provider: crate::config::Provider::Ollama,
+            planner_model: "m".to_string(),
+            planner_provider: crate::config::Provider::Ollama,
+            ollama_host: "http://localhost:11434".to_string(),
+            num_predict: 100,
+            max_iterations: 4,
+            chat_timeout_secs: 1,
+            chat_retries: 1,
+            eval_events_path: None,
+            completion_contract_path: None,
+            resume: None,
+            fresh_session: false,
+            no_footer: false,
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            action: crate::config::Action::Repl,
+        }
+    }
+
+    fn event_values(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn fake_write_then_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session_with_required_paths(
+            &mut fake,
+            &mut session,
+            "create a.txt",
+            &["a.txt".to_string()],
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "required artifacts satisfied: a.txt");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn default_run_session_options_preserve_prompt_artifact_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "Create the file.\n\nRequired final artifacts:\n- a.txt",
+            &[],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert!(dir.path().join("a.txt").is_file());
+    }
+
+    #[test]
+    fn plan_step_disables_prompt_required_artifact_extraction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply::text("workspace inspected"))],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Inspect workspace.\n\nRequired final artifacts:\n- README.md",
+            &[],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Inspect),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert!(!dir.path().join("README.md").exists());
+    }
+
+    #[test]
+    fn plan_step_disables_completion_contract_verification_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(&contract, "not json").unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply::text("workspace inspected"))],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Inspect workspace",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Inspect),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+    }
+
+    #[test]
+    fn implement_plan_step_keeps_completion_contract_authority_enabled() {
+        let implement = RunSessionOptions::plan_step(RunSessionStepKind::Implement);
+        assert!(implement.contract_runtime_enabled());
+        assert!(implement.contract_path_merge_enabled());
+
+        for kind in [
+            RunSessionStepKind::Inspect,
+            RunSessionStepKind::Setup,
+            RunSessionStepKind::Verify,
+            RunSessionStepKind::Report,
+        ] {
+            let options = RunSessionOptions::plan_step(kind);
+            assert!(!options.contract_runtime_enabled(), "{kind:?}");
+            assert!(!options.contract_path_merge_enabled(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn plan_step_interactive_completion_requires_capability_evidence_after_path_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let static_page = "export default function Page(){ return <main><canvas /></main>; }";
+        let interactive_page = r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  const [gameState,setGameState] = useState("playing");
+  const enemies = [{ x: 1, y: 2 }];
+  useEffect(() => {
+    const onKeyDown = () => setScore((value) => value + 1);
+    const frame = requestAnimationFrame(() => {
+      const collision = enemies.some((enemy) => enemy.x > 0);
+      if (collision) {
+        setScore((value) => value + 10);
+        setGameState("gameover");
+      }
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+  return <main tabIndex={0} onKeyDown={() => setScore(score + 1)}><canvas /><p>enemy collision score {score} {gameState}</p></main>;
+}
+"#;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":static_page}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":interactive_page}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let prompt = "Execute exactly one StepPlan step.\n\nCurrent step kind:\nimplement\n\nRequired final capabilities:\n- stateful_interaction\n- player_control\n- adversary_or_challenge\n- progression_or_score\n- failure_or_collision_rule\n\nRequired final evidence:\n- implementation_artifact\n- visible_interactive_surface_evidence\n- user_input_handler_evidence\n- stateful_update_evidence\n- challenge_or_adversary_evidence\n- score_or_progression_evidence\n- failure_or_collision_evidence\n\nExpected paths after this step:\n- src/app/page.tsx";
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            prompt,
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert_eq!(outcome.iterations, 2);
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"step_capability_evidence_check\""));
+        assert!(event_text.contains("\"ok\":false"));
+        assert!(event_text.contains("\"ok\":true"));
+        assert!(event_text.contains("stateful_update_evidence"));
+        assert!(event_text.contains("failure_or_collision_evidence"));
+    }
+
+    #[test]
+    fn plan_step_non_interactive_completion_preserves_path_only_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Execute one implement step.\n\nExpected paths after this step:\n- a.txt",
+            &["a.txt".to_string()],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert_eq!(outcome.iterations, 1);
+    }
+
+    #[test]
+    fn verify_step_with_bash_then_final_text_is_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Bash", json!({"command":"true"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("verification passed")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create app. Verify the current step.",
+            &[],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert_eq!(outcome.tool_calls, 1);
+    }
+
+    #[test]
+    fn verify_step_with_bash_only_can_delegate_to_runner() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command":"true"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create app. Verify the current step.",
+            &[],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert_eq!(outcome.final_text, "step tool observation completed");
+        assert_eq!(outcome.tool_calls, 1);
+    }
+
+    #[test]
+    fn verify_step_bash_shell_control_is_policy_error_not_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"scripts":{}}"#).unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path.clone());
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Bash",
+                        json!({"command":"grep -q 3011 package.json && echo \"Port 3011 configured\""}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Bash",
+                        json!({"command":"test -f package.json"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create app. Verify the current step.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert_eq!(outcome.final_text, "step tool observation completed");
+        let events = event_values(&events_path);
+        let policy_error = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("tool_policy_error"));
+        assert_eq!(
+            policy_error.and_then(|event| event.get("policy_error_kind")),
+            Some(&json!("verify_command_policy_error"))
+        );
+        assert_eq!(
+            policy_error.and_then(|event| event.get("verify_command_violation_kind")),
+            Some(&json!("shell_control_syntax"))
+        );
+        let blocked_policy = events.iter().find(|event| {
+            event.get("event").and_then(Value::as_str) == Some("runtime_bash_policy")
+                && event.get("blocked").and_then(Value::as_bool) == Some(true)
+        });
+        assert_eq!(
+            blocked_policy.and_then(|event| event.get("deterministic_verifier_evidence")),
+            Some(&json!(false))
+        );
+        let successful_bash_execs = events
+            .iter()
+            .filter(|event| {
+                event.get("event").and_then(Value::as_str) == Some("tool_execute")
+                    && event.get("name").and_then(Value::as_str) == Some("Bash")
+                    && event.get("status").and_then(Value::as_str) == Some("ok")
+            })
+            .count();
+        assert_eq!(successful_bash_execs, 1);
+    }
+
+    #[test]
+    fn setup_step_bash_shell_control_is_runtime_setup_not_verifier_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path.clone());
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Bash",
+                    json!({"command":"printf ok && printf done"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Set up the current step.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        let events = event_values(&events_path);
+        let policy = events.iter().find(|event| {
+            event.get("event").and_then(Value::as_str) == Some("runtime_bash_policy")
+        });
+        assert_eq!(
+            policy.and_then(|event| event.get("bash_policy_purpose")),
+            Some(&json!("runtime_setup"))
+        );
+        assert_eq!(
+            policy.and_then(|event| event.get("verifier_policy_checked")),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            policy.and_then(|event| event.get("blocked")),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            policy.and_then(|event| event.get("deterministic_verifier_evidence")),
+            Some(&json!(false))
+        );
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(Value::as_str) == Some("tool_execute")
+                && event.get("name").and_then(Value::as_str) == Some("Bash")
+                && event.get("status").and_then(Value::as_str) == Some("ok")
+        }));
+    }
+
+    #[test]
+    fn completion_contract_without_verify_preserves_early_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.txt"],"verify_commands":[]}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create the file",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+    }
+
+    #[test]
+    fn minimal_loop_nextjs_required_paths_only_does_not_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["package.json","src/app/page.tsx","src/app/layout.tsx","src/app/global.d.ts"],"verify_commands":[],"profile":"nextjs","goal":"Create a Next.js app","deferred_verify_requirements":[{"command":"npm run build","reason":"requires dependency setup","authority":"postcheck","profile":"nextjs","status":"blocked_by_dependency_setup"}],"verify_repair_cap":1}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![
+                    ToolCall::new("Write", json!({"path":"package.json","content":"{}"})),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main/>;}\n"}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/layout.tsx","content":"export default function RootLayout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>}\n"}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";\n"}),
+                    ),
+                ],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a Next.js app",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("completion contract verify failed"), "{err}");
+        assert!(dir.path().join("package.json").is_file());
+    }
+
+    #[test]
+    fn minimal_loop_repairs_after_completion_verify_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.py"],"verify_commands":["python3 -m py_compile a.py"],"verify_repair_cap":2}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.py","content":"def fixed():\n    return 1\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a.py",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::CompletionContractSatisfied
+        );
+        assert_eq!(outcome.verify_attempts, 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.py")).unwrap(),
+            "def fixed():\n    return 1\n"
+        );
+        assert!(!session.messages.iter().any(|message| {
+            message
+                .content
+                .contains("Deterministic completion verification failed")
+        }));
+    }
+
+    #[test]
+    fn minimal_loop_stops_with_verify_repair_exhausted_after_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.py"],"verify_commands":["python3 -m py_compile a.py"],"verify_repair_cap":1}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a.py",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("completion contract verify failed"));
+    }
+
+    #[test]
+    fn artifact_stagnation_feedback_then_write_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["date-helper.js"],"verify_commands":[]}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Glob", json!({"pattern":"**/*"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Grep", json!({"pattern":"date"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Bash", json!({"command":"ls"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"date-helper.js","content":"module.exports = {};\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create date-helper.js",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert!(dir.path().join("date-helper.js").is_file());
+    }
+
+    #[test]
+    fn artifact_recovery_exhausts_after_repeated_non_edit_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["date-helper.js"],"verify_commands":[]}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        cfg.max_iterations = 13;
+        let mut replies = Vec::new();
+        for _ in 0..12 {
+            replies.push(Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Glob", json!({"pattern":"**/*"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }));
+        }
+        let mut fake = Fake { replies };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create date-helper.js",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("artifact recovery exhausted"));
+    }
+
+    #[test]
+    fn verify_failure_requires_edit_after_repeated_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.py"],"verify_commands":["python3 -m py_compile a.py"],"verify_repair_cap":3}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 6;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Read", json!({"path":"a.py"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Bash",
+                        json!({"command":"python3 -m py_compile a.py"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Read", json!({"path":"a.py"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a.py",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("verify repair made no file changes"));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"reason\":\"verify_repair_no_change\""));
+        assert!(event_text.contains("\"repair_follow_through\":\"no_change\""));
+        assert!(event_text.contains("\"changed_paths_before\":[\"a.py\"]"));
+        assert!(event_text.contains("\"changed_paths_after\":[\"a.py\"]"));
+        assert!(event_text.contains("\"recovery_yaml_missing\":false"));
+        assert!(dir.path().join(".anvil/repairs").is_dir());
+        assert!(dir.path().join(".anvil/plans").is_dir());
+    }
+
+    #[test]
+    fn verify_repair_progress_unchanged_after_edit_still_exhausts() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.py"],"verify_commands":["python3 -m py_compile a.py"],"verify_repair_cap":2}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a.py",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("completion contract verify failed"));
+    }
+
+    #[test]
+    fn run_session_string_wrapper_preserves_existing_cli_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply::text("plain final"))],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "Summarize workspace",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "plain final");
+    }
+
+    #[test]
+    fn changed_paths_are_workspace_relative_after_tool_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":"export default function Page(){return null;}"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create page",
+            &["src/app/page.tsx".to_string()],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(outcome.changed_paths, vec!["src/app/page.tsx"]);
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+    }
+
+    #[test]
+    fn missing_tool_argument_feedback_allows_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Grep", json!({}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session_with_required_paths(
+            &mut fake,
+            &mut session,
+            "create a.txt",
+            &["a.txt".to_string()],
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "required artifacts satisfied: a.txt");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ok"
+        );
+        assert!(
+            session
+                .messages
+                .iter()
+                .any(|message| message.content.contains("recoverable validation error"))
+        );
+    }
+
+    #[test]
+    fn edit_anchor_mismatch_returns_recoverable_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "actual content").unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Edit",
+                        json!({"path":"a.txt","old_string":"missing anchor","new_string":"replacement"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("final")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "Summarize workspace",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "final");
+        assert!(
+            session.messages.iter().any(|message| message.role == "tool"
+                && message.content.contains("edit_anchor_not_found"))
+        );
+    }
+
+    #[test]
+    fn prompt_requested_artifact_feedback_then_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply::text("done")),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "Create the file.\n\nRequired final artifacts:\n- a.txt",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "required artifacts satisfied: a.txt");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ok"
+        );
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|message| message.role == "assistant" && message.content == "done")
+        );
+    }
+
+    #[test]
+    fn completion_without_write_feedback_then_write_then_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply::text("done")),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "create a.txt",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "done");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn empty_response_gets_one_retry_feedback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply::text("")),
+                Ok(AssistantReply::text("final")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "Summarize this workspace.",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "final");
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|message| message.role == "assistant" && message.content.is_empty())
+        );
+    }
+
+    #[test]
+    fn repeated_planned_action_without_tool_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply::text("I will create it.")),
+                Ok(AssistantReply::text("I will create it now.")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session(
+            &mut fake,
+            &mut session,
+            "create a.txt",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing tool call for action prompt"));
+    }
+
+    #[test]
+    fn provider_http_error_does_not_enable_xml_fallback() {
+        assert!(!provider_error_allows_xml_fallback(&anyhow::anyhow!(
+            "OpenAI Responses API failed: 500 Internal Server Error"
+        )));
+        assert!(provider_error_allows_xml_fallback(&anyhow::anyhow!(
+            "OpenAI function_call arguments are not valid JSON"
+        )));
+    }
+
+    struct ParseRetryFake {
+        replies: Vec<anyhow::Result<AssistantReply>>,
+        native_flags: Vec<bool>,
+    }
+
+    impl ChatClient for ParseRetryFake {
+        fn label(&self) -> &str {
+            "parse-retry-fake"
+        }
+
+        fn supports_native_tools(&self, _model: &str) -> bool {
+            true
+        }
+
+        fn allows_xml_fallback(&self) -> bool {
+            true
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            _messages: &[ConversationMessage],
+            _tools: &[crate::tools::registry::ToolSpec],
+            native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            self.native_flags.push(native_tools_enabled);
+            self.replies.remove(0)
+        }
+    }
+
+    #[test]
+    fn malformed_native_tool_call_retries_with_native_tools_before_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = ParseRetryFake {
+            replies: vec![
+                Err(anyhow::anyhow!(
+                    "OpenAI function_call arguments are not valid JSON"
+                )),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+            native_flags: Vec::new(),
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session_with_required_paths(
+            &mut fake,
+            &mut session,
+            "create a.txt",
+            &["a.txt".to_string()],
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(result, "required artifacts satisfied: a.txt");
+        assert_eq!(fake.native_flags, vec![true, true]);
+        assert!(!session.native_tools_disabled);
+    }
+
+    #[test]
+    fn repeated_malformed_native_tool_call_eventually_uses_xml_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = ParseRetryFake {
+            replies: vec![
+                Err(anyhow::anyhow!(
+                    "OpenAI function_call arguments are not valid JSON"
+                )),
+                Err(anyhow::anyhow!(
+                    "OpenAI function_call arguments are not valid JSON"
+                )),
+                Err(anyhow::anyhow!(
+                    "OpenAI function_call arguments are not valid JSON"
+                )),
+                Ok(AssistantReply::text("final")),
+            ],
+            native_flags: Vec::new(),
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "Summarize this workspace.",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(result, "final");
+        assert_eq!(fake.native_flags, vec![true, true, true, false]);
+        assert!(session.native_tools_disabled);
+    }
+
+    #[test]
+    fn requested_artifact_path_extraction_rejects_escape_and_metadata_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = "\
+Required final artifacts:
+- ../outside.txt
+- /tmp/out.txt
+- .anvil/session.json
+- target/debug/app
+- node_modules/pkg/index.js
+- package.json
+- src/app/page.tsx
+";
+        let paths = extract_requested_artifact_paths(dir.path(), prompt);
+        assert_eq!(paths, vec!["package.json", "src/app/page.tsx"]);
+    }
+
+    #[test]
+    fn requested_artifact_path_extraction_rejects_backticked_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = "Create `src/main.rs`, not `../main.rs` or `.anvil/log.json`.";
+        let paths = extract_requested_artifact_paths(dir.path(), prompt);
+        assert_eq!(paths, vec!["src/main.rs"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn requested_artifact_path_extraction_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/tmp", dir.path().join("out")).unwrap();
+        let prompt = "\
+Required final artifacts:
+- out/file.txt
+- safe/file.txt
+";
+        let paths = extract_requested_artifact_paths(dir.path(), prompt);
+        assert_eq!(paths, vec!["safe/file.txt"]);
+    }
+
+    #[test]
+    fn missing_relative_import_gets_repair_prompt_before_final() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/page.tsx","content":"import Widget from './Widget';\nexport default function Page(){return <Widget/>;}"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/Widget.tsx","content":"export default function Widget(){return <div/>;}"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "create a small Next.js page",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "done");
+        assert!(dir.path().join("src/Widget.tsx").is_file());
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == "assistant" && message.content == "done")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn required_artifact_success_waits_for_missing_relative_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":"import './layout.css';\nexport default function Page(){return <main/>;}"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/layout.css","content":"main { color: white; }\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a page",
+            &["src/app/page.tsx".to_string()],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert!(dir.path().join("src/app/layout.css").is_file());
+        assert_eq!(outcome.changed_paths.len(), 2);
+    }
+
+    #[test]
+    fn repeated_recoverable_tool_error_stops_before_max_iterations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "ok").unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.max_iterations = 8;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session(&mut fake, &mut session, "read a.txt", &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("recoverable tool error repeated"));
+    }
+
+    #[test]
+    fn unrelated_edits_do_not_reset_artifact_recovery_targeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.txt"],"verify_commands":[]}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        cfg.max_iterations = 6;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"scratch1.txt","content":"x"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"scratch2.txt","content":"x"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"scratch3.txt","content":"x"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a.txt",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+    }
+
+    #[test]
+    fn artifact_recovery_event_records_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["a.txt","b.txt"],"verify_commands":[]}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 13;
+        let mut replies = Vec::new();
+        for _ in 0..12 {
+            replies.push(Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Glob", json!({"pattern":"**/*"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }));
+        }
+        let mut fake = Fake { replies };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create required files",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("artifact recovery exhausted"));
+        let text = std::fs::read_to_string(events).unwrap();
+        assert!(text.contains("\"target_path\":\"a.txt\""));
+        assert!(text.contains("\"last_target_path\":\"a.txt\""));
+    }
+
+    #[test]
+    fn dangerous_command_remains_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command":"rm -rf /"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session(
+            &mut fake,
+            &mut session,
+            "run command",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("dangerous command blocked"));
+    }
+}

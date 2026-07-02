@@ -1,0 +1,10 @@
+{
+  "browser_executable": "/Users/maenokota/Library/Caches/ms-playwright/chromium_headless_shell-1208/chrome-headless-shell-mac-arm64/chrome-headless-shell",
+  "dom_ready": true,
+  "http_status": 200,
+  "ok": true,
+  "page_loaded": true,
+  "route_rendered": true,
+  "title_text_present": true,
+  "url": "http://127.0.0.1:3011/"
+}

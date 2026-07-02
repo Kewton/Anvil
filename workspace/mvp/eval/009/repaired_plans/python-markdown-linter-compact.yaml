@@ -1,0 +1,12 @@
+goal: "Build a Python markdown heading linter with Python unittest.TestCase coverage."
+steps:
+  - id: "implement-linter-and-tests"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create markdown_lint.py with a markdown heading linter function, and create test_markdown_lint.py using unittest.TestCase to verify valid headings, skipped heading levels, and malformed heading spacing."
+    expected_paths:
+      - "markdown_lint.py"
+      - "test_markdown_lint.py"
+    verify:
+      - "python -m unittest test_markdown_lint.py"
+

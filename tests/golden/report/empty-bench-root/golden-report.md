@@ -1,5 +1,5 @@
 # Benchmark Report: bench-root
-Generated: 2026-04-20T07:06:09+00:00
+Generated: 2026-06-02T03:27:36+00:00
 
 ## Run Summary
 

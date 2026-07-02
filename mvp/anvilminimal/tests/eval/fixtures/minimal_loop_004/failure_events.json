@@ -1,0 +1,42 @@
+[
+  {
+    "id": "fix-js-openai-artifact-stagnation",
+    "expected_failure_kind": "artifact_recovery_exhausted",
+    "events": [
+      {"event": "artifact_stagnation_feedback", "missing_paths": ["date-helper.js"], "attempt": 1, "attempt_limit": 2},
+      {"event": "loop_stop", "reason": "artifact_recovery_exhausted", "missing_paths": ["date-helper.js"]}
+    ]
+  },
+  {
+    "id": "python-openai-no-change-repair",
+    "expected_failure_kind": "verify_repair_no_change",
+    "events": [
+      {"event": "completion_verify", "ok": false, "repair_progress": "unchanged"},
+      {"event": "verify_repair_turn", "has_edit": false, "inspect_only": true},
+      {"event": "loop_stop", "reason": "verify_repair_no_change"}
+    ]
+  },
+  {
+    "id": "repair-openai-no-tests-ran",
+    "expected_failure_kind": "test_discovery_failure",
+    "events": [
+      {"event": "completion_verify", "ok": false, "primary_reason": "test_discovery_failure:no_tests_ran"},
+      {"event": "loop_stop", "reason": "test_discovery_failure", "primary_reason": "test_discovery_failure:no_tests_ran"}
+    ]
+  },
+  {
+    "id": "repair-gemini-progress-unchanged",
+    "expected_failure_kind": "verify_repair_progress_unchanged",
+    "events": [
+      {"event": "verify_repair_progress", "verdict": "unchanged"},
+      {"event": "loop_stop", "reason": "verify_repair_progress_unchanged", "repair_progress": "unchanged"}
+    ]
+  },
+  {
+    "id": "nextjs-openai-provider-transient",
+    "expected_failure_kind": "provider_transient_exhausted",
+    "events": [
+      {"event": "provider_error", "provider": "openai", "status": 500, "error_kind": "http_status", "attempt": 2}
+    ]
+  }
+]

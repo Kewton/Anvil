@@ -1,0 +1,23 @@
+[
+  {
+    "id": "grep-invalid-regex-fallback",
+    "expected_failure_kind": "diagnostic_skipped",
+    "events": [
+      {
+        "event": "tool_call_raw",
+        "name": "Grep",
+        "arguments": {
+          "arguments_type": "object",
+          "argument_keys": ["pattern"],
+          "argument_summaries": {
+            "pattern": {
+              "type": "string",
+              "string_len": 7,
+              "preview": "[needle"
+            }
+          }
+        }
+      }
+    ]
+  }
+]

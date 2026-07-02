@@ -1044,6 +1044,80 @@ pub(super) fn sanitize_tester_log(raw: &str, cap: usize) -> String {
 // ============================================================================
 
 // ============================================================================
+// Tester orchestration helpers (extracted from `turn.rs`, parent #680).
+// ============================================================================
+
+/// Pick the `ApprovalMode` for a tester smoke run based on the agent's
+/// `--yes` flag and whether stdin is an interactive terminal.
+pub(super) fn tester_approval_mode(yes_mode: bool, stdin_is_terminal: bool) -> ApprovalMode {
+    if yes_mode {
+        ApprovalMode::Auto
+    } else if stdin_is_terminal {
+        ApprovalMode::Interactive
+    } else {
+        ApprovalMode::Forbidden
+    }
+}
+
+/// Invoke the tester sidecar LLM, emit
+/// `agent.tester.llm_call_{started,completed,failed}` events for the
+/// observability pipeline, and convert the raw reply into a
+/// `Result<String, TesterLlmError>`. Reply text with tool_calls is
+/// rejected (tester replies are expected to be plain string content).
+pub(super) fn run_tester_llm_call(
+    tester_client: &crate::ollama::client::OllamaClient,
+    tester_main_model: &str,
+    session_id_for_log: &str,
+    prompt: &TesterPrompt,
+) -> Result<String, TesterLlmError> {
+    use crate::logging::log_llm_event;
+    use crate::session::store::ConversationMessage;
+
+    log_llm_event(
+        "agent.tester.llm_call_started",
+        serde_json::json!({
+            "session_id": session_id_for_log,
+            "stack": prompt.stack_label(),
+            "model": tester_main_model,
+            "prompt_len": prompt.body().len(),
+        }),
+    );
+    let messages = vec![ConversationMessage::user(prompt.body().to_string())];
+    match tester_client.chat_text(tester_main_model, &messages) {
+        Ok(reply) => {
+            log_llm_event(
+                "agent.tester.llm_call_completed",
+                serde_json::json!({
+                    "session_id": session_id_for_log,
+                    "stack": prompt.stack_label(),
+                    "model": tester_main_model,
+                    "reply_len": reply.content.len(),
+                    "tool_calls": reply.tool_calls.len(),
+                }),
+            );
+            if !reply.tool_calls.is_empty() {
+                return Err(TesterLlmError(
+                    "tester reply unexpectedly contained tool_calls".to_string(),
+                ));
+            }
+            Ok(reply.content)
+        }
+        Err(err) => {
+            log_llm_event(
+                "agent.tester.llm_call_failed",
+                serde_json::json!({
+                    "session_id": session_id_for_log,
+                    "stack": prompt.stack_label(),
+                    "model": tester_main_model,
+                    "error": sanitize_tester_log(&err, TESTER_LOG_CAP),
+                }),
+            );
+            Err(TesterLlmError(err))
+        }
+    }
+}
+
+// ============================================================================
 // 10. Tests (Task 1b.1 ~ 1b.6 の TDD ペイロード)
 // ============================================================================
 

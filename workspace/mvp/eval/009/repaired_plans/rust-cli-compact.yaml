@@ -1,0 +1,12 @@
+goal: "Create a small Rust CLI with one unit test and cargo test verification."
+steps:
+  - id: "implement-rust-cli"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create Cargo.toml and src/main.rs for a small Rust binary. src/main.rs must contain a main function plus one #[cfg(test)] unit test for a simple helper function."
+    expected_paths:
+      - "Cargo.toml"
+      - "src/main.rs"
+    verify:
+      - "cargo test"
+

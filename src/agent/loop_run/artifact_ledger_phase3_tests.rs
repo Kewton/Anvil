@@ -7,8 +7,8 @@
 //! - Task 3.1: the legacy field signature (`HashSet<String>`) and access
 //!   pattern are unchanged — compile-time contract test.
 //! - Task 3.2: `task_contract_artifact_states` keeps producing the same
-//!   `Vec<ArtifactState>` shape (legacy authority) and the new ledger
-//!   projection is computed in parallel without breaking the legacy result.
+//!   `Vec<ArtifactState>` shape and returns the ledger projection after the
+//!   legacy derivation seeds baseline evidence.
 //! - Task 3.3: `owned_test_artifacts_for_verifier` keeps returning
 //!   Issue #651-equivalent results and the caller signature
 //!   (`&mut self`, `&TaskContract`, `Vec<String>`) is preserved.
@@ -134,9 +134,24 @@ fn legacy_set_matches_ledger_projection() {
     std::fs::write(work_root.join("src/lib.rs"), "").unwrap();
 
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_repo_edit("tests/test_a.py", ArtifactRole::Test, &scope);
-    agent.seed_artifact_ledger_repo_edit("tests/test_b.py", ArtifactRole::Test, &scope);
-    agent.seed_artifact_ledger_repo_edit("src/lib.rs", ArtifactRole::Implementation, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_a.py",
+        ArtifactRole::Test,
+        &scope,
+    );
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_b.py",
+        ArtifactRole::Test,
+        &scope,
+    );
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "src/lib.rs",
+        ArtifactRole::Implementation,
+        &scope,
+    );
 
     let legacy: std::collections::BTreeSet<String> =
         agent.turn_edited_relative_paths.iter().cloned().collect();
@@ -166,7 +181,12 @@ fn caller_signature_unchanged_for_turn_edited_relative_paths() {
     std::fs::create_dir_all(work_root.join("tests")).unwrap();
     std::fs::write(work_root.join("tests/test_sig.py"), "").unwrap();
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_repo_edit("tests/test_sig.py", ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_sig.py",
+        ArtifactRole::Test,
+        &scope,
+    );
 
     // Compile-time witness: the field must keep its HashSet<String>
     // shape. If the type changes (e.g. to `BTreeSet<String>` or behind a
@@ -202,7 +222,9 @@ fn task_contract_artifact_states_returns_same_shape_as_before_empty() {
     // both derivations should be empty. (The Phase 3 implementation
     // delegates to legacy on divergence; the legacy and ledger
     // derivations must align for the empty case.)
-    let states = agent.task_contract_artifact_states_for_test(&contract);
+    let states = super::artifact_state_projection::task_contract_artifact_states_for_test(
+        &mut agent, &contract,
+    );
     assert!(
         states.is_empty(),
         "no required artifacts => no states; got {states:?}"
@@ -214,8 +236,8 @@ fn task_contract_artifact_states_returns_same_shape_as_before_empty() {
 /// ledger-projection helper (the internal switch consumer). The legacy
 /// derivation also produces the same row because the write-through
 /// adapter (Task 2.5) inserts into both sources; the test asserts the
-/// caller-facing helper returns the legacy row (authority) and that the
-/// ledger helper agrees with it.
+/// caller-facing helper returns the ledger row and that the legacy helper
+/// agrees with it in the no-divergence case.
 #[test]
 fn task_contract_artifact_states_uses_ledger_projection() {
     let session_id = unique_session_id("states-ledger");
@@ -224,7 +246,12 @@ fn task_contract_artifact_states_uses_ledger_projection() {
     std::fs::create_dir_all(work_root.join("tests")).unwrap();
     std::fs::write(work_root.join("tests/test_ledger.py"), "x = 1\n").unwrap();
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_repo_edit("tests/test_ledger.py", ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_ledger.py",
+        ArtifactRole::Test,
+        &scope,
+    );
 
     // Use a Build-class contract so `required_artifacts` includes Test.
     let contract =
@@ -234,8 +261,14 @@ fn task_contract_artifact_states_uses_ledger_projection() {
         "fixture contract must require a Test artifact"
     );
 
-    let legacy_states = agent.task_contract_artifact_states_legacy_for_test(&contract);
-    let ledger_states = agent.task_contract_artifact_states_from_ledger_for_test(&contract);
+    let legacy_states =
+        super::artifact_state_projection::task_contract_artifact_states_legacy_for_test(
+            &mut agent, &contract,
+        );
+    let ledger_states =
+        super::artifact_state_projection::task_contract_artifact_states_from_ledger_for_test(
+            &agent, &contract,
+        );
 
     let edit_test_state = |states: &[ArtifactState]| -> Option<ArtifactState> {
         states
@@ -258,6 +291,90 @@ fn task_contract_artifact_states_uses_ledger_projection() {
     );
 }
 
+#[test]
+fn explicit_evidence_gated_existing_candidate_counts_as_deliverable() {
+    let session_id = unique_session_id("states-explicit-existing");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    std::fs::create_dir_all(work_root.join("src")).unwrap();
+    std::fs::write(
+        work_root.join("src/lib.rs"),
+        "pub fn password_strength(_: &str) -> &'static str { \"weak\" }\n",
+    )
+    .unwrap();
+
+    let contract = TaskContract::from_request(
+        r#"STATE_CONTROL_PACKET
+{"objective":"Use TDD to add password_strength behavior and passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"tests/password_strength.rs","role":"test"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+    );
+    assert!(contract.objective_contract().requires_evidence());
+
+    let states = super::artifact_state_projection::task_contract_artifact_states_for_test(
+        &mut agent, &contract,
+    );
+    assert!(
+        states.iter().any(|state| {
+            state.role == ArtifactRole::Implementation
+                && state.path.as_deref() == Some("src/lib.rs")
+                && state.kind == ArtifactStateKind::ExistsButUnverified
+        }),
+        "explicit evidence-gated existing source must reach deliverable planning: {states:?}"
+    );
+
+    let evidence = super::completion_evidence::EvidenceSet::new();
+    let repair_state = super::task_contract::VerifierRepairState::None;
+    assert_eq!(
+        super::task_contract::plan_artifact_recovery(super::task_contract::ArtifactRecoveryInputs {
+            contract: &contract,
+            evidence: &evidence,
+            artifacts: &states,
+            repair_state: &repair_state,
+            artifact_excerpts: &super::task_contract::ArtifactExcerpts::new(),
+            missing_verifier_suppress_retry: false,
+            owned_test_artifacts: &[],
+        }),
+        super::task_contract::ArtifactRecoveryAction::Continue {
+            missing: vec![ArtifactRole::Test],
+            target_hint: Some(super::task_contract::RecoveryTargetHint {
+                role: ArtifactRole::Test,
+                path: "tests/password_strength.rs".to_string(),
+                reason: "required deliverable obligation is still missing: role=test, kind=file, path=tests/password_strength.rs".to_string(),
+            }),
+        }
+    );
+}
+
+#[test]
+fn explicit_evidence_gated_empty_existing_source_does_not_count_as_deliverable() {
+    let session_id = unique_session_id("states-explicit-empty-source");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    std::fs::create_dir_all(work_root.join("src")).unwrap();
+    std::fs::write(
+        work_root.join("src/lib.rs"),
+        "// Intentionally empty pending TDD implementation.\n",
+    )
+    .unwrap();
+
+    let contract = TaskContract::from_request(
+        r#"STATE_CONTROL_PACKET
+{"objective":"Use TDD to add password_strength behavior and passing evidence","next_required_action":"artifact","required_artifacts":[{"path":"tests/password_strength.rs","role":"test"},{"path":"src/lib.rs","role":"source"}],"evidence_command":"cargo test --manifest-path Cargo.toml"}"#,
+    );
+    assert!(contract.objective_contract().requires_evidence());
+
+    let states = super::artifact_state_projection::task_contract_artifact_states_for_test(
+        &mut agent, &contract,
+    );
+    assert!(
+        !states.iter().any(|state| {
+            state.role == ArtifactRole::Implementation
+                && state.path.as_deref() == Some("src/lib.rs")
+                && state.kind == ArtifactStateKind::ExistsButUnverified
+        }),
+        "comment-only source must remain a missing implementation deliverable: {states:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Task 3.3: owned_test_artifacts_for_verifier
 // ---------------------------------------------------------------------------
@@ -265,21 +382,31 @@ fn task_contract_artifact_states_uses_ledger_projection() {
 /// Issue #659 (Task 3.3): `owned_test_artifacts_for_verifier` keeps the
 /// Issue #651 behavior — seeded RepoEdit test paths surface in the
 /// returned slice. The legacy and ledger derivations agree under
-/// write-through, so the function returns the legacy slice without
-/// emitting the divergence event.
+/// write-through, so the function returns the ledger slice without emitting
+/// the divergence event.
 #[test]
 fn owned_test_artifacts_for_verifier_matches_issue651_behavior() {
     let session_id = unique_session_id("verifier-match");
     let (mut agent, dir) = build_agent(&session_id);
     let work_root = dir.path();
     std::fs::create_dir_all(work_root.join("tests")).unwrap();
-    std::fs::write(work_root.join("tests/test_match.py"), "x = 1\n").unwrap();
+    std::fs::write(
+        work_root.join("tests/test_match.py"),
+        "def test_fastapi_crud_api_contract():\n    assert 'FastAPI CRUD API README テスト'\n",
+    )
+    .unwrap();
     let scope = single_root_scope();
-    agent.seed_artifact_ledger_repo_edit("tests/test_match.py", ArtifactRole::Test, &scope);
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/test_match.py",
+        ArtifactRole::Test,
+        &scope,
+    );
 
     let contract =
         TaskContract::from_request("FastAPIでCRUD APIを作成してREADMEとテストも追加してください");
-    let owned = agent.owned_test_artifacts_for_verifier(&contract);
+    let owned =
+        super::owned_test_projection::owned_test_artifacts_for_verifier(&mut agent, &contract);
     assert!(
         owned.iter().any(|p| p == "tests/test_match.py"),
         "Issue #651 contract: seeded Test edit must surface in owned slice; got {owned:?}"
@@ -293,6 +420,124 @@ fn owned_test_artifacts_for_verifier_matches_issue651_behavior() {
     assert_eq!(
         owned, ledger_owned,
         "ledger projection must align with the legacy slice in the no-divergence case"
+    );
+}
+
+/// Contract-bound test identities are the verifier-binding authority when
+/// they exist on disk. This protects local-LLM recovery from keeping a stale
+/// ledger-only family default such as `tests/cli.rs` after the model has
+/// produced the profile-confirmed Python test path.
+#[test]
+fn owned_test_artifacts_for_verifier_prefers_existing_contract_test_identity() {
+    let session_id = unique_session_id("verifier-contract-test");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    std::fs::create_dir_all(work_root.join("tests")).unwrap();
+    std::fs::write(
+        work_root.join("Cargo.toml"),
+        "[package]\nname = \"ambient-rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        work_root.join("tests/cli.rs"),
+        r#"#[test]
+fn stale_family_default() {
+    assert!(false, "stale rust-family verifier target must not be bound");
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        work_root.join("tests/test_math_utils.py"),
+        r#"import unittest
+from math_utils import clamp
+
+
+class ClampTests(unittest.TestCase):
+    def test_clamps_below_minimum(self):
+        self.assertEqual(clamp(-1, 0, 10), 0)
+
+    def test_clamps_above_maximum(self):
+        self.assertEqual(clamp(11, 0, 10), 10)
+
+    def test_returns_value_inside_range(self):
+        self.assertEqual(clamp(5, 0, 10), 5)
+"#,
+    )
+    .unwrap();
+    let scope = single_root_scope();
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/cli.rs",
+        ArtifactRole::Test,
+        &scope,
+    );
+
+    let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+    let profile = super::project_profile::parse_project_profile_confirmation(
+        r#"{"language":"python","shape":"library","deliverable_kind":"code","primary_artifacts":["math_utils.py","tests/test_math_utils.py"],"forbidden_artifacts":[],"evidence_kind":"test_run","needs_environment_setup":false,"preferred_runner":"python -m unittest discover -s tests","confidence":0.96,"reason":"Python TDD task with explicit source and test files"}"#,
+    )
+    .expect("profile");
+    let contract =
+        TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+
+    assert!(
+        contract
+            .required_artifact_identities
+            .iter()
+            .any(|identity| identity.role == ArtifactRole::Test
+                && identity.path == "tests/test_math_utils.py"),
+        "fixture must bind the profile-confirmed Python test identity"
+    );
+
+    let owned =
+        super::owned_test_projection::owned_test_artifacts_for_verifier(&mut agent, &contract);
+
+    assert_eq!(owned, vec!["tests/test_math_utils.py".to_string()]);
+}
+
+#[test]
+fn owned_test_artifacts_for_verifier_drops_stale_fallback_when_contract_test_identity_missing() {
+    let session_id = unique_session_id("verifier-contract-test-missing");
+    let (mut agent, dir) = build_agent(&session_id);
+    let work_root = dir.path();
+    std::fs::create_dir_all(work_root.join("tests")).unwrap();
+    std::fs::write(
+        work_root.join("Cargo.toml"),
+        "[package]\nname = \"ambient-rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        work_root.join("tests/cli.rs"),
+        r#"#[test]
+fn stale_family_default() {
+    assert!(true);
+}
+"#,
+    )
+    .unwrap();
+    let scope = single_root_scope();
+    super::artifact_ledger_state::seed_artifact_ledger_repo_edit(
+        &mut agent,
+        "tests/cli.rs",
+        ArtifactRole::Test,
+        &scope,
+    );
+
+    let request = "Coding TDD task: create math_utils.py and tests/test_math_utils.py only. Implement clamp(value, minimum, maximum). Use Python unittest.";
+    let profile = super::project_profile::parse_project_profile_confirmation(
+        r#"{"language":"python","shape":"library","deliverable_kind":"code","primary_artifacts":["math_utils.py","tests/test_math_utils.py"],"forbidden_artifacts":[],"evidence_kind":"test_run","needs_environment_setup":false,"preferred_runner":"python -m unittest discover -s tests","confidence":0.96,"reason":"Python TDD task with explicit source and test files"}"#,
+    )
+    .expect("profile");
+    let contract =
+        TaskContract::from_request_with_kind_and_project_profile(request, None, Some(&profile));
+
+    let owned =
+        super::owned_test_projection::owned_test_artifacts_for_verifier(&mut agent, &contract);
+
+    assert!(
+        owned.is_empty(),
+        "stale fallback tests must not satisfy an explicit missing contract test identity: {owned:?}",
     );
 }
 
@@ -311,9 +556,11 @@ fn owned_test_artifacts_for_verifier_signature_unchanged() {
     // Compile-time witness via a function-pointer cast: the type ascribed
     // here is the Phase-2 signature. If `owned_test_artifacts_for_verifier`
     // changes to a different shape (different receiver mut-ness, different
-    // arg/return types), this assignment fails to compile.
+    // arg/return types), this assignment fails to compile. (Parent #680:
+    // the method was promoted to a free fn in `owned_test_projection`; the
+    // signature itself is unchanged.)
     let signature_witness: fn(&mut Agent, &TaskContract) -> Vec<String> =
-        Agent::owned_test_artifacts_for_verifier;
+        super::owned_test_projection::owned_test_artifacts_for_verifier;
     let result = signature_witness(&mut agent, &contract);
     // The fixture has no edits or workspace files, so the slice is empty.
     assert!(

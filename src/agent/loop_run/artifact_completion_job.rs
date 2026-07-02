@@ -7,9 +7,10 @@
 //!   + `artifact_ownership` SSOTs — never re-canonicalized here),
 //! - the role-specific retry budget (`ARTIFACT_COMPLETION_ATTEMPT_LIMIT`),
 //! - the failure attempt history (`WrongTarget` / `NoTool` / `ProseOnly` /
-//!   `RolePolicyViolation`) — each attempt's user-controlled strings are run
-//!   through the `mask_secrets` → length cap → control-char neutralization
-//!   pipeline at construction time so consumers never observe raw input.
+//!   `RolePolicyViolation` / `EvidenceFailed`) — each attempt's
+//!   user-controlled strings are run through the `mask_secrets` → length cap
+//!   → control-char neutralization pipeline at construction time so consumers
+//!   never observe raw input.
 //!
 //! ## Visibility (DR3-001)
 //!
@@ -55,7 +56,7 @@ use crate::session::feedback::mask_secrets;
 /// Role-specific retry budget. Externally immutable; the constructor pins
 /// this on every new `ArtifactCompletionJob` so user / LLM input can never
 /// inflate it (DR4-003).
-pub(super) const ARTIFACT_COMPLETION_ATTEMPT_LIMIT: usize = 3;
+pub(super) const ARTIFACT_COMPLETION_ATTEMPT_LIMIT: usize = 4;
 
 /// Upper bound on the number of `actual_actions` retained per recorded
 /// attempt. Extra elements are dropped at `ArtifactAttemptOutcome::new()`
@@ -160,6 +161,105 @@ pub(super) enum ArtifactAttemptOutcomeKind {
     /// Variant subdivision is intentionally kept in `actual_actions` rather
     /// than as separate enum variants (DR2-006 / design judgement #8).
     RolePolicyViolation,
+    /// A target artifact was produced but failed a contract obligation
+    /// diagnostic, such as structured-data schema mismatch or missing docs
+    /// sections. This is intentionally generic: the diagnostic authority
+    /// decides the domain-specific failure, while the job lifecycle only
+    /// records "evidence for this deliverable failed".
+    EvidenceFailed,
+}
+
+impl ArtifactAttemptOutcomeKind {
+    /// Issue #664 (AD10 / §6.2): stable snake_case wire label for the
+    /// structured report projection (`attempt_outcome_to_json_value`).
+    /// `kind` is emitted as a `kind: "..."` JSON field alongside `category`
+    /// and `actual_actions`.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            ArtifactAttemptOutcomeKind::WrongTarget => "wrong_target",
+            ArtifactAttemptOutcomeKind::NoTool => "no_tool",
+            ArtifactAttemptOutcomeKind::ProseOnly => "prose_only",
+            ArtifactAttemptOutcomeKind::RolePolicyViolation => "role_policy_violation",
+            ArtifactAttemptOutcomeKind::EvidenceFailed => "evidence_failed",
+        }
+    }
+}
+
+/// Issue #664 (AD10 / §4.4 / §6.2 / DR1-004 / OCP forward compatibility):
+/// fixed enum of `category` labels emitted by `attempt_outcome_to_json_value`
+/// for `RolePolicyViolation` outcomes. Private to the module; never
+/// re-exported. Adding a label is additive — `PAYLOAD_SCHEMA_VERSION = 1`
+/// stays unchanged. Removing / renaming a label requires a bump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BashPolicyViolationCategory {
+    /// Bash policy violation captured under an active SetupBootstrap or
+    /// artifact-directed Bash reject gate. Issue #664 iteration-2 (CB-003)
+    /// wires the production caller via
+    /// `ArtifactAttemptOutcome::new_bash_policy_violation`.
+    BashOutOfPolicy,
+    /// Non-Bash role policy violation (the legacy generic case).
+    OtherRoleViolation,
+}
+
+impl BashPolicyViolationCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            BashPolicyViolationCategory::BashOutOfPolicy => "bash_out_of_policy",
+            BashPolicyViolationCategory::OtherRoleViolation => "other_role_violation",
+        }
+    }
+}
+
+/// Issue #664 (AD10 / §4.4 / §6.2 / S3-006): project a single attempt
+/// outcome into the structured `agent.artifact_completion.report`
+/// `attempt_outcomes[i]` JSON object. Pure function.
+///
+/// **Output schema (`PAYLOAD_SCHEMA_VERSION = 1` 不変)**:
+/// ```jsonc
+/// {
+///   "kind": "wrong_target" | "no_tool" | "prose_only" | "role_policy_violation" | "evidence_failed",
+///   "category": "bash_out_of_policy" | "other_role_violation", // RolePolicyViolation only
+///   "actual_actions": ["<16-hex correlator>", ...]              // raw command / path NEVER included
+/// }
+/// ```
+///
+/// **Security (AD5 / CB-004)**: each `actual_action` is run through
+/// `mask_secrets` → `stable_path_hash` 16-hex correlator. Raw command /
+/// raw path NEVER appear in the projection. The 16-hex correlator is a
+/// deterministic non-cryptographic identifier suitable for dataset join
+/// keys without leaking the underlying string.
+pub(super) fn attempt_outcome_to_json_value(o: &ArtifactAttemptOutcome) -> serde_json::Value {
+    let actual_actions: Vec<String> = o
+        .actual_actions
+        .iter()
+        .map(|action| {
+            let masked = mask_secrets(action);
+            crate::logging::stable_path_hash(&masked)
+        })
+        .collect();
+    let mut obj = serde_json::json!({
+        "kind": o.kind.as_str(),
+        "actual_actions": actual_actions,
+    });
+    // `category` is only meaningful for `RolePolicyViolation`.
+    //
+    // Issue #664 iteration-2 (CB-003): the non-raw `bash_policy_violation`
+    // marker carried on `ArtifactAttemptOutcome` selects between
+    // `BashOutOfPolicy` and `OtherRoleViolation`. The marker is set ONLY
+    // by `ArtifactAttemptOutcome::new_bash_policy_violation` at the
+    // `turn.rs::effective_tool_policy_error_for_call_with_scope` Bash
+    // rejection chokepoint, so the projection cannot leak raw command
+    // bytes — `actual_actions` is still hashed via `stable_path_hash`
+    // (AD5 / CB-004).
+    if matches!(o.kind, ArtifactAttemptOutcomeKind::RolePolicyViolation) {
+        let category = if o.bash_policy_violation {
+            BashPolicyViolationCategory::BashOutOfPolicy
+        } else {
+            BashPolicyViolationCategory::OtherRoleViolation
+        };
+        obj["category"] = serde_json::Value::String(category.as_str().to_string());
+    }
+    obj
 }
 
 /// One recorded attempt against an `ArtifactCompletionJob`.
@@ -177,6 +277,18 @@ pub(super) struct ArtifactAttemptOutcome {
     actual_actions: Vec<String>,
     /// Masked / capped expected target path.
     expected_target: String,
+    /// Issue #664 iteration-2 (CB-003): non-raw classification marker
+    /// indicating that this attempt's `actual_actions` originated from a
+    /// **Bash policy rejection** (SetupBootstrap branch or artifact-directed
+    /// `Bash` reject). When set, `attempt_outcome_to_json_value` emits
+    /// `category = "bash_out_of_policy"` so the structured
+    /// `artifact_completion_report` consumer can identify Bash policy
+    /// violations without inspecting the raw command (which is hashed by
+    /// `stable_path_hash` before emit, AD5 / CB-004).
+    ///
+    /// The field is `pub(super)` for the projection accessor only —
+    /// consumers MUST NOT mutate it.
+    bash_policy_violation: bool,
 }
 
 impl ArtifactAttemptOutcome {
@@ -194,7 +306,71 @@ impl ArtifactAttemptOutcome {
             cluster_key: None,
             actual_actions: sanitize_actions(actual_actions),
             expected_target: sanitize_single(expected_target.into()),
+            bash_policy_violation: false,
         }
+    }
+
+    /// Issue #664 iteration-2 (CB-003): build a `RolePolicyViolation`
+    /// outcome that carries the **non-raw** Bash policy classification
+    /// marker (`bash_policy_violation = true`). Caller is the policy-
+    /// rejection chokepoint in `turn.rs::effective_tool_policy_error_*`
+    /// after the Bash command has been masked / hashed.
+    ///
+    /// Issue #664 iteration-3 (CB2-004): the raw Bash command is hashed
+    /// to a 16-hex correlator at record-time **before** entering
+    /// `actual_actions` — the underlying bytes never reach
+    /// `failure_snapshot`, the `artifact_completion_failed` system note,
+    /// the `agent.artifact_completion_failed` JSON event, or any other
+    /// downstream sink. Each raw command is wrapped as
+    /// `"BashOutOfPolicy:<16-hex>"` so the marker prefix preserves the
+    /// classification semantic for human / log inspection while the
+    /// payload bytes are reduced to a non-cryptographic correlator
+    /// (`stable_path_hash(mask_secrets(cmd))`).
+    ///
+    /// `attempt_outcome_to_json_value` re-hashes the marker as a
+    /// defensive second pass (`stable_path_hash` over the marker
+    /// string), which is idempotent — the hex digits inside are already
+    /// hash-shape, and `mask_secrets` is a no-op on them. Storing the
+    /// raw command and deferring hashing until projection-time would
+    /// leak the bytes through `failure_snapshot.actual_actions` (AD5
+    /// violation, CB2-004).
+    ///
+    /// `kind` is fixed to `RolePolicyViolation` so consumers retain the
+    /// same `kind` wire label (`role_policy_violation`); the marker only
+    /// refines the `category` field (`bash_out_of_policy` vs the default
+    /// `other_role_violation`).
+    pub(super) fn new_bash_policy_violation(
+        actual_actions: Vec<String>,
+        expected_target: impl Into<String>,
+    ) -> Self {
+        // CB2-004: hash each raw command BEFORE it enters the outcome
+        // ledger. Subsequent `sanitize_actions` is a no-op on the marker
+        // (mask_secrets + length cap on a hex correlator is idempotent),
+        // but we apply the full pipeline anyway so any caller that
+        // sneaks a non-hashed value through gets the same defensive
+        // treatment as `new()`.
+        let hashed_actions: Vec<String> = actual_actions
+            .into_iter()
+            .map(|cmd| {
+                let masked = mask_secrets(&cmd);
+                let correlator = crate::logging::stable_path_hash(&masked);
+                format!("BashOutOfPolicy:{correlator}")
+            })
+            .collect();
+        let mut out = Self::new(
+            ArtifactAttemptOutcomeKind::RolePolicyViolation,
+            hashed_actions,
+            expected_target,
+        );
+        out.bash_policy_violation = true;
+        out
+    }
+
+    /// Issue #664 iteration-2 (CB-003): non-raw classification accessor.
+    /// `attempt_outcome_to_json_value` is the only in-crate consumer.
+    #[allow(dead_code)] // surfaced via `attempt_outcome_to_json_value`; pinned by tests.
+    pub(super) fn bash_policy_violation(&self) -> bool {
+        self.bash_policy_violation
     }
 
     /// Build an attempt outcome carrying a deterministic
@@ -233,20 +409,43 @@ impl ArtifactAttemptOutcome {
 }
 
 /// Lifecycle state of an `ArtifactCompletionJob`.
+///
+/// Issue #663 (AD1 / NG4a): parent enum intentionally does NOT carry
+/// `#[non_exhaustive]` — exhaustive match across in-crate callers is the
+/// SSOT for variant-coverage compile-time enforcement (DR1-004 平行ポリシー).
+/// Variant additions in the future must update every in-crate match site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ArtifactCompletionStatus {
-    /// Budget not yet exhausted. `remaining_budget()` is computed from
-    /// `total_budget - attempts.len()` — there is no separate counter
-    /// field (DR1-008 / DR2-005).
-    InFlight,
-    /// Completion observed (admitted by `role_from_repo_edit` /
-    /// `task_contract_evidence_set_this_turn` SSOT in turn.rs). The
-    /// `record_completion` accessor is part of the state-machine surface
-    /// pinned by unit tests; #654 will wire it explicitly once the
-    /// persisted report contract lands.
+    /// `RecoveryTargetHint` absent — target not yet confirmed.
+    /// `remaining_budget()` is the full budget; `record_attempt` is a no-op
+    /// so PendingTarget → Exhausted is type-level impossible (R5 / DR1-005).
+    ///
+    /// Issue #663 (Phase A): variant reachable via the future
+    /// `new_pending_target()` constructor (added by Phase A.4 in the next
+    /// PR slice). Today the variant exists for state-machine completeness
+    /// and is pinned by `test_artifact_completion_status_five_variants_*`.
     #[allow(dead_code)]
-    // constructed only in tests today; #654 lands the production constructor.
-    Completed,
+    PendingTarget,
+    /// Target confirmed, no matching RepoEdit observed in the ledger yet.
+    /// `record_attempt` decrements the budget here (and only here / from
+    /// `EvidenceObserved`).
+    ///
+    /// Compatibility alias for the legacy `InFlight` variant — the
+    /// state-machine surface widens to 5 states in Issue #663 while keeping
+    /// the same default starting state for jobs constructed with a target.
+    AwaitingEdit,
+    /// Ledger has at least one matching RepoEdit event for `role`; the
+    /// `RequiredArtifactsProjection`-driven Satisfied check is the next
+    /// transition target. Budget still decrements on further attempts.
+    EvidenceObserved,
+    /// `ArtifactLedger::required_artifacts_completed_projection` has
+    /// reported the role `true`. This is the SSOT terminal state for
+    /// "completion observed" (Issue #663 AD2).
+    ///
+    /// `record_completion` is retained as a `#[deprecated]` adapter for the
+    /// implicit observation path that #654 inherited; production wiring
+    /// must now route through `record_satisfied_from_ledger`.
+    Satisfied,
     Exhausted {
         reason: ExhaustedReason,
     },
@@ -254,11 +453,15 @@ pub(super) enum ArtifactCompletionStatus {
 
 /// Reason an `ArtifactCompletionJob` exhausted its budget.
 ///
-/// Issue #652 ships exactly one variant (design judgement #9 / YAGNI). New
-/// variants must come with a designed detection condition; today's only
-/// detector is "budget consumed without completion".
+/// Issue #663 (AD1 / DR1-003): `#[non_exhaustive]` is intentionally
+/// applied so future reasons (e.g. ledger overflow, pending-target
+/// timeout) can be added additively without breaking in-crate match
+/// arms — OCP (Open-Closed Principle).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ExhaustedReason {
+    /// Budget (`ARTIFACT_COMPLETION_ATTEMPT_LIMIT`) consumed without
+    /// completion. Today the only detector.
     BudgetExceeded,
 }
 
@@ -325,6 +528,11 @@ impl ArtifactCompletionJob {
             edited_this_session,
             scaffold_changed,
             verifier_passed_in_scope: false,
+            // Keep generic artifact-target admission conservative. Current
+            // task repo edits are promoted by the artifact ledger/verifier
+            // projection, while pre-existing nested tests without evidence
+            // must not become owned just because they look like tests.
+            nested_test_admission: super::artifact_ownership::NestedTestAdmission::default(),
         });
         // CB-001: accept only `Owned` for an existing target, or treat
         // a missing leaf as a creation target after canonicalizing the
@@ -380,7 +588,10 @@ impl ArtifactCompletionJob {
             allowed_read_scope: AllowedReadScope::TargetOnly,
             attempts: Vec::new(),
             total_budget: ARTIFACT_COMPLETION_ATTEMPT_LIMIT,
-            status: ArtifactCompletionStatus::InFlight,
+            // Issue #663 (Phase A): a job built with a confirmed target starts
+            // in `AwaitingEdit` (the renamed `InFlight`). Jobs without a target
+            // are built via constructor variants in later Issues.
+            status: ArtifactCompletionStatus::AwaitingEdit,
         })
     }
 
@@ -420,28 +631,40 @@ impl ArtifactCompletionJob {
     }
 
     /// Remaining attempts before exhaustion. Returns `0` once the job has
-    /// reached `Completed` or `Exhausted` regardless of `attempts.len()`.
+    /// reached `Satisfied` / `Exhausted` regardless of `attempts.len()`.
+    ///
+    /// Issue #663 (AD1 / R5): `PendingTarget` returns the full budget —
+    /// `record_attempt` is a no-op in PendingTarget so the budget is never
+    /// consumed before a target is confirmed (type-level prevention of
+    /// PendingTarget → Exhausted direct transition).
     #[allow(dead_code)] // pinned by unit tests; turn.rs reads `status()` directly.
     pub(super) fn remaining_budget(&self) -> usize {
         match self.status {
-            ArtifactCompletionStatus::InFlight => {
+            ArtifactCompletionStatus::PendingTarget => self.total_budget,
+            ArtifactCompletionStatus::AwaitingEdit | ArtifactCompletionStatus::EvidenceObserved => {
                 self.total_budget.saturating_sub(self.attempts.len())
             }
-            _ => 0,
+            ArtifactCompletionStatus::Satisfied | ArtifactCompletionStatus::Exhausted { .. } => 0,
         }
     }
 
     /// Append `outcome` to the attempt history and possibly transition the
-    /// status. Returns the new status (`InFlight` or
-    /// `Exhausted { BudgetExceeded }`).
+    /// status. Returns the new status (`AwaitingEdit` /
+    /// `EvidenceObserved` / `Exhausted { BudgetExceeded }`).
     ///
-    /// A no-op on `Completed` / `Exhausted` jobs (returns the current
-    /// status). This keeps the state machine total / monotonic.
+    /// Issue #663 (AD1 / R5 / DR1-005): no-op when the status is NOT one of
+    /// `AwaitingEdit` / `EvidenceObserved`. Specifically PendingTarget is
+    /// rejected here so the budget never decrements before a target is
+    /// confirmed (type-level prevention of `PendingTarget → Exhausted` direct
+    /// transition). Also no-op for terminal states (Satisfied / Exhausted).
     pub(super) fn record_attempt(
         &mut self,
         outcome: ArtifactAttemptOutcome,
     ) -> ArtifactCompletionStatus {
-        if !matches!(self.status, ArtifactCompletionStatus::InFlight) {
+        if !matches!(
+            self.status,
+            ArtifactCompletionStatus::AwaitingEdit | ArtifactCompletionStatus::EvidenceObserved
+        ) {
             return self.status.clone();
         }
         self.attempts.push(outcome);
@@ -453,17 +676,82 @@ impl ArtifactCompletionJob {
         self.status.clone()
     }
 
-    /// Mark the job `Completed`. No-op on `Completed` / `Exhausted`.
+    /// Legacy adapter for the implicit-observation Satisfied transition.
     ///
-    /// Today `turn.rs` does not call this directly — completion is observed
-    /// implicitly via the existing `task_contract_evidence_set_this_turn`
-    /// SSOT (`role_from_repo_edit` admission). The method is part of the
-    /// state-machine API so #654 can move to an explicit "ack completion"
-    /// signal once the persisted report contract lands.
-    #[allow(dead_code)] // pinned by unit tests; #654 will consume this entry.
+    /// Issue #663 (AD2): the production Satisfied transition now flows
+    /// through `record_satisfied_from_ledger(&RequiredArtifactsProjection)`
+    /// — the ledger projection is the single source of truth (SSOT 1 本).
+    /// This method is retained as a legacy adapter for the existing unit
+    /// tests that pre-date #659 ledger projection wiring; new callers must
+    /// not use it. Removal is tracked in the legacy
+    /// `contract_completion_role_retries` follow-up Issue.
+    ///
+    /// Issue #663 (Codex CB-005 fix): `#[deprecated]` is applied so any
+    /// new production caller fails the
+    /// `cargo clippy --all-targets -- -D warnings` quality gate. The
+    /// `#[cfg(test)]` gate further confines the function to the test
+    /// build — production binaries will not link this code path. The
+    /// only sanctioned Satisfied-transition entry point is
+    /// `record_satisfied_from_ledger`.
+    #[cfg(test)]
+    #[deprecated(
+        since = "0.6.0",
+        note = "Use `record_satisfied_from_ledger(&RequiredArtifactsProjection)` instead. \
+                This adapter bypasses the ledger projection SSOT and is kept only \
+                for legacy unit-test fixtures (Issue #663 / CB-005)."
+    )]
     pub(super) fn record_completion(&mut self) {
-        if matches!(self.status, ArtifactCompletionStatus::InFlight) {
-            self.status = ArtifactCompletionStatus::Completed;
+        if matches!(
+            self.status,
+            ArtifactCompletionStatus::AwaitingEdit | ArtifactCompletionStatus::EvidenceObserved
+        ) {
+            self.status = ArtifactCompletionStatus::Satisfied;
+        }
+    }
+
+    /// AwaitingEdit → EvidenceObserved transition. Called by `turn.rs` when
+    /// the ledger records a RepoEdit event for this role. No-op for
+    /// non-progressive states (PendingTarget / EvidenceObserved /
+    /// Satisfied / Exhausted).
+    ///
+    /// Issue #663 (AD1): this is the intermediate evidence stage between
+    /// "target confirmed" and "ledger projection confirms role complete".
+    #[allow(dead_code)] // wired by turn.rs::observe_evidence_from_repo_edit in future caller.
+    pub(super) fn record_repo_edit_observed(&mut self) {
+        if matches!(self.status, ArtifactCompletionStatus::AwaitingEdit) {
+            self.status = ArtifactCompletionStatus::EvidenceObserved;
+        }
+    }
+
+    /// Issue #663 (AD2 / DR1-001): Satisfied transition SSOT.
+    ///
+    /// Accepts a `RequiredArtifactsProjection` borrowed from the
+    /// `ArtifactLedger`. status guard集約: this method is the single site
+    /// that pre-filters by status, so caller chokepoints (e.g.
+    /// `refresh_artifact_completion_satisfied`) do NOT replicate the
+    /// guard. Fail-closed on `projection.overflowed() == true`.
+    #[allow(dead_code)] // wired by turn.rs::refresh_artifact_completion_satisfied chokepoint.
+    pub(super) fn record_satisfied_from_ledger(
+        &mut self,
+        projection: &super::artifact_ledger::RequiredArtifactsProjection,
+    ) {
+        // status guard — record_satisfied_from_ledger is the SSOT for the
+        // 1-line `if !matches!(...) { return; }` filter (DR1-001 SSOT集約).
+        if !matches!(
+            self.status,
+            ArtifactCompletionStatus::AwaitingEdit
+                | ArtifactCompletionStatus::EvidenceObserved
+                | ArtifactCompletionStatus::Exhausted { .. }
+        ) {
+            return;
+        }
+        // fail-closed: when the ledger has overflowed, no role is
+        // considered satisfied (R1 / DR3-002).
+        if projection.overflowed() {
+            return;
+        }
+        if projection.is_satisfied(self.role) {
+            self.status = ArtifactCompletionStatus::Satisfied;
         }
     }
 
@@ -666,7 +954,12 @@ mod tests {
         .expect("valid target must be accepted");
         assert_eq!(job.role(), ArtifactRole::Test);
         assert_eq!(job.target_path(), "tests/test_foo.py");
-        assert!(matches!(job.status(), ArtifactCompletionStatus::InFlight));
+        // Issue #663 (Phase A): job with confirmed target starts in
+        // `AwaitingEdit` (renamed from `InFlight`).
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::AwaitingEdit
+        ));
         assert_eq!(job.remaining_budget(), ARTIFACT_COMPLETION_ATTEMPT_LIMIT);
     }
 
@@ -755,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_attempt_three_wrong_targets_exhausts_with_budget_exceeded() {
+    fn test_record_attempt_wrong_targets_exhausts_with_budget_exceeded() {
         let dir = tempfile::tempdir().unwrap();
         let scope = single_root_scope();
         let mut job = ArtifactCompletionJob::new(
@@ -781,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_attempt_three_no_tools_exhausts_with_budget_exceeded() {
+    fn test_record_attempt_no_tools_exhausts_with_budget_exceeded() {
         let dir = tempfile::tempdir().unwrap();
         let scope = single_root_scope();
         let mut job = ArtifactCompletionJob::new(
@@ -800,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_attempt_three_prose_only_exhausts_with_budget_exceeded() {
+    fn test_record_attempt_prose_only_exhausts_with_budget_exceeded() {
         let dir = tempfile::tempdir().unwrap();
         let scope = single_root_scope();
         let mut job = ArtifactCompletionJob::new(
@@ -848,7 +1141,11 @@ mod tests {
     }
 
     #[test]
-    fn test_record_completion_moves_to_completed_state() {
+    fn test_record_completion_moves_to_satisfied_state() {
+        // Issue #663 (Phase A): `Completed` is renamed to `Satisfied`.
+        // The legacy `record_completion()` adapter still operates on the
+        // new 5-state machine, transitioning `AwaitingEdit` →
+        // `Satisfied` for legacy test fixtures.
         let dir = tempfile::tempdir().unwrap();
         let scope = single_root_scope();
         let mut job = ArtifactCompletionJob::new(
@@ -859,9 +1156,269 @@ mod tests {
             false,
         )
         .unwrap();
+        // CB-005: deliberate use of the legacy adapter for pre-#659
+        // regression coverage. Production callers must use
+        // `record_satisfied_from_ledger`.
+        #[allow(deprecated)]
         job.record_completion();
-        assert!(matches!(job.status(), ArtifactCompletionStatus::Completed));
+        assert!(matches!(job.status(), ArtifactCompletionStatus::Satisfied));
         assert_eq!(job.remaining_budget(), 0);
+    }
+
+    /// Issue #663 (Phase A / Task A.1): regression — `ExhaustedReason` is
+    /// `#[non_exhaustive]` so future additive variants do not break in-crate
+    /// match arms (DR1-003 / OCP). The check is structural — adding a new
+    /// reason variant must not break this assertion.
+    ///
+    /// We intentionally include a wildcard arm to document that callers
+    /// outside the defining module would need one. Clippy's
+    /// `unreachable_patterns` lint is suppressed because today there is
+    /// exactly one variant, but the suppression is the regression anchor
+    /// for the `#[non_exhaustive]` policy.
+    #[test]
+    #[allow(unreachable_patterns)]
+    fn test_exhausted_reason_non_exhaustive_marker() {
+        let reason = ExhaustedReason::BudgetExceeded;
+        // Must compile against `_` arm because `#[non_exhaustive]` is in
+        // effect (parent enum still exhaustive — DR1-004 平行ポリシー).
+        let label = match reason {
+            ExhaustedReason::BudgetExceeded => "budget_exceeded",
+            _ => "future_variant",
+        };
+        assert_eq!(label, "budget_exceeded");
+    }
+
+    /// Issue #663 (Phase A / Task A.2): 5 variants are reachable
+    /// — `PendingTarget`, `AwaitingEdit`, `EvidenceObserved`, `Satisfied`,
+    /// `Exhausted`. Parent enum is exhaustive (DR1-004 平行ポリシー).
+    #[test]
+    fn test_artifact_completion_status_five_variants_exhaustive_match() {
+        for status in [
+            ArtifactCompletionStatus::PendingTarget,
+            ArtifactCompletionStatus::AwaitingEdit,
+            ArtifactCompletionStatus::EvidenceObserved,
+            ArtifactCompletionStatus::Satisfied,
+            ArtifactCompletionStatus::Exhausted {
+                reason: ExhaustedReason::BudgetExceeded,
+            },
+        ] {
+            let label: &'static str = match &status {
+                ArtifactCompletionStatus::PendingTarget => "pending_target",
+                ArtifactCompletionStatus::AwaitingEdit => "awaiting_edit",
+                ArtifactCompletionStatus::EvidenceObserved => "evidence_observed",
+                ArtifactCompletionStatus::Satisfied => "satisfied",
+                ArtifactCompletionStatus::Exhausted { .. } => "exhausted",
+            };
+            assert!(!label.is_empty());
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #663 Phase B: record_satisfied_from_ledger SSOT (AD2 / DR1-001)
+    // ----------------------------------------------------------------
+
+    /// Build a tiny `RequiredArtifactsProjection` via the public ledger
+    /// API. The `RequiredArtifactsProjection` constructor is private to
+    /// `artifact_ledger.rs` (DR4-001) — tests therefore route through the
+    /// real ledger to get a forge-safe projection.
+    fn projection_for(
+        role: ArtifactRole,
+        completed: bool,
+    ) -> crate::agent::loop_run::artifact_ledger::RequiredArtifactsProjection {
+        use crate::agent::loop_run::artifact_ledger::ArtifactLedger;
+        use crate::agent::loop_run::artifact_ledger::LedgerAdmissionContext;
+        use crate::agent::loop_run::task_workspace_scope::{ScopeMode, TaskWorkspaceScope};
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("tests/test_a.py"), "").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        let scope = TaskWorkspaceScope {
+            mode: ScopeMode::SingleProjectRoot,
+        };
+        let mut ledger = ArtifactLedger::new();
+        if completed {
+            // Issue #920: exhaustive (no `_ =>`) so a new role forces an
+            // intentional fixture-path decision. Behavior-preserving — every
+            // non-test role used the impl fixture file before and still does.
+            let path = match role {
+                ArtifactRole::Test => "tests/test_a.py",
+                ArtifactRole::Implementation
+                | ArtifactRole::UsageDocs
+                | ArtifactRole::Setup
+                | ArtifactRole::DataOutput => "src/lib.rs",
+            };
+            ledger.record_repo_edit_event(
+                &LedgerAdmissionContext::new(dir.path(), &scope),
+                path.to_string(),
+                role,
+                true,
+            );
+        }
+        let required_artifacts = vec![role];
+        let required_behavior =
+            crate::agent::loop_run::required_behavior::RequiredBehaviorContract {
+                operations: None,
+                domain_terms: None,
+                interface_hints: None,
+                required_artifacts: None,
+                verification: None,
+                confidence: 0.0,
+                test_execution_required: false,
+                behavior_goal: None,
+                required_capabilities: None,
+                verification_expectations: None,
+                non_goals: None,
+            };
+        let intent = super::super::task_contract::TaskIntent::Build;
+        let task_kind = super::super::task_contract::TaskKind::Coding;
+        let completion_policy = super::super::task_contract::CompletionPolicy::from_contract_parts(
+            task_kind,
+            intent,
+            &required_artifacts,
+            true,
+            &required_behavior,
+        );
+        let deliverables = required_artifacts
+            .iter()
+            .copied()
+            .map(|role| super::super::task_contract::TaskDeliverable {
+                kind: match role {
+                    ArtifactRole::Implementation => {
+                        super::super::task_contract::DeliverableKind::Code
+                    }
+                    ArtifactRole::Test => super::super::task_contract::DeliverableKind::Tests,
+                    ArtifactRole::UsageDocs => {
+                        super::super::task_contract::DeliverableKind::UsageDocs
+                    }
+                    ArtifactRole::Setup => super::super::task_contract::DeliverableKind::Setup,
+                    ArtifactRole::DataOutput => {
+                        super::super::task_contract::DeliverableKind::StructuredRecord
+                    }
+                },
+                role: Some(role),
+                path: None,
+                required_sections: Vec::new(),
+            })
+            .collect();
+        let contract = super::super::task_contract::TaskContract {
+            task_kind,
+            intent,
+            deliverables,
+            required_artifacts,
+            required_artifact_identities: vec![],
+            optional_artifacts: vec![],
+            forbidden_artifacts: vec![],
+            verification_required: true,
+            completion_policy,
+            required_behavior,
+            // Issue #917: synthetic test contract — neutral matched confidence.
+            classification_confidence: 1.0,
+            evidence_command_hint: None,
+            authoring_style_decision:
+                super::super::authoring_style::AuthoringStyleDecision::unspecified(),
+            objective_evidence_kind_override: None,
+            api_contract_expectations: Vec::new(),
+        };
+        ledger.required_artifacts_completed_projection(&contract)
+    }
+
+    #[test]
+    fn test_record_satisfied_from_ledger_transitions_to_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = single_root_scope();
+        let mut job = ArtifactCompletionJob::new(
+            dir.path(),
+            &scope,
+            make_hint("tests/test_foo.py"),
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::AwaitingEdit
+        ));
+        let p = projection_for(ArtifactRole::Test, true);
+        job.record_satisfied_from_ledger(&p);
+        assert!(matches!(job.status(), ArtifactCompletionStatus::Satisfied));
+    }
+
+    #[test]
+    fn test_record_satisfied_from_ledger_role_not_satisfied_remains_awaiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = single_root_scope();
+        let mut job = ArtifactCompletionJob::new(
+            dir.path(),
+            &scope,
+            make_hint("tests/test_foo.py"),
+            true,
+            false,
+        )
+        .unwrap();
+        let p = projection_for(ArtifactRole::Test, false);
+        job.record_satisfied_from_ledger(&p);
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::AwaitingEdit
+        ));
+    }
+
+    #[test]
+    fn test_record_satisfied_from_ledger_can_recover_exhausted_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = single_root_scope();
+        let mut job = ArtifactCompletionJob::new(
+            dir.path(),
+            &scope,
+            make_hint("tests/test_foo.py"),
+            true,
+            false,
+        )
+        .unwrap();
+        drive_to_exhaustion(
+            &mut job,
+            ArtifactAttemptOutcomeKind::EvidenceFailed,
+            vec!["schema mismatch".to_string()],
+        );
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::Exhausted { .. }
+        ));
+
+        let p = projection_for(ArtifactRole::Test, true);
+        job.record_satisfied_from_ledger(&p);
+
+        assert!(matches!(job.status(), ArtifactCompletionStatus::Satisfied));
+    }
+
+    /// Issue #663 (Phase A / Task A.4 / R5): `record_repo_edit_observed`
+    /// transitions `AwaitingEdit` → `EvidenceObserved`. Non-progressive
+    /// states are no-ops.
+    #[test]
+    fn test_record_repo_edit_observed_advances_awaiting_to_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = single_root_scope();
+        let mut job = ArtifactCompletionJob::new(
+            dir.path(),
+            &scope,
+            make_hint("tests/test_foo.py"),
+            true,
+            false,
+        )
+        .unwrap();
+        job.record_repo_edit_observed();
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::EvidenceObserved
+        ));
+        // Re-calling is a no-op (already EvidenceObserved).
+        job.record_repo_edit_observed();
+        assert!(matches!(
+            job.status(),
+            ArtifactCompletionStatus::EvidenceObserved
+        ));
     }
 
     #[test]
@@ -1022,7 +1579,7 @@ mod tests {
     }
 
     #[test]
-    fn test_artifact_attempt_outcome_kind_enum_is_4_variants_closed() {
+    fn test_artifact_attempt_outcome_kind_enum_is_5_variants_closed() {
         // Exhaustive match — adding a new variant requires updating this
         // arm (design judgement #8 / DR1-004 compile-time enforcement).
         for kind in [
@@ -1030,12 +1587,14 @@ mod tests {
             ArtifactAttemptOutcomeKind::NoTool,
             ArtifactAttemptOutcomeKind::ProseOnly,
             ArtifactAttemptOutcomeKind::RolePolicyViolation,
+            ArtifactAttemptOutcomeKind::EvidenceFailed,
         ] {
             let label: &'static str = match kind {
                 ArtifactAttemptOutcomeKind::WrongTarget => "wrong_target",
                 ArtifactAttemptOutcomeKind::NoTool => "no_tool",
                 ArtifactAttemptOutcomeKind::ProseOnly => "prose_only",
                 ArtifactAttemptOutcomeKind::RolePolicyViolation => "role_policy_violation",
+                ArtifactAttemptOutcomeKind::EvidenceFailed => "evidence_failed",
             };
             assert!(!label.is_empty());
         }
@@ -1367,5 +1926,109 @@ mod tests {
             assert!(!action.contains('\t'), "action contains tab: {action:?}");
             assert!(!action.contains('\r'), "action contains CR: {action:?}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664: `attempt_outcome_to_json_value` projection (Task 4.1).
+    // -----------------------------------------------------------------
+
+    /// `attempt_outcome_to_json_value` runs each `actual_action` through
+    /// `mask_secrets` + `stable_path_hash` (16-hex). Raw command never
+    /// appears in the projection. (AD5 / CB-004 / Acceptance (f))
+    #[test]
+    fn attempt_outcome_to_json_value_bash_violation_uses_stable_path_hash_correlator() {
+        let outcome = ArtifactAttemptOutcome::new(
+            ArtifactAttemptOutcomeKind::RolePolicyViolation,
+            vec!["bash:cargo install ripgrep".to_string()],
+            "src/lib.rs",
+        );
+        let value = attempt_outcome_to_json_value(&outcome);
+        let actions = value
+            .get("actual_actions")
+            .and_then(|v| v.as_array())
+            .expect("actual_actions must be array");
+        assert_eq!(actions.len(), 1);
+        let correlator = actions[0].as_str().expect("must be string");
+        assert_eq!(
+            correlator.len(),
+            16,
+            "stable_path_hash correlator must be 16 hex chars, got: {correlator:?}"
+        );
+        assert!(
+            correlator.chars().all(|c| c.is_ascii_hexdigit()),
+            "must be hex"
+        );
+        // Raw command MUST NOT leak into the payload.
+        let payload_text = value.to_string();
+        assert!(
+            !payload_text.contains("cargo install"),
+            "raw command must NOT appear in payload, got: {payload_text}"
+        );
+    }
+
+    /// `kind` field is the snake_case label.
+    #[test]
+    fn attempt_outcome_to_json_value_emits_kind_as_str() {
+        let outcome = ArtifactAttemptOutcome::new(
+            ArtifactAttemptOutcomeKind::WrongTarget,
+            vec!["edit:other/file.rs".to_string()],
+            "src/lib.rs",
+        );
+        let value = attempt_outcome_to_json_value(&outcome);
+        assert_eq!(
+            value.get("kind").and_then(|v| v.as_str()),
+            Some("wrong_target")
+        );
+    }
+
+    /// Acceptance (f): `category` field is exactly one of the fixed enum
+    /// values for `RolePolicyViolation` outcomes; absent for other kinds.
+    #[test]
+    fn attempt_outcome_category_label_is_fixed_enum() {
+        let role_policy = ArtifactAttemptOutcome::new(
+            ArtifactAttemptOutcomeKind::RolePolicyViolation,
+            vec!["focused_edit_batch_reject".to_string()],
+            "src/lib.rs",
+        );
+        let v = attempt_outcome_to_json_value(&role_policy);
+        let category = v
+            .get("category")
+            .and_then(|c| c.as_str())
+            .expect("RolePolicyViolation must have category");
+        assert!(
+            category == "bash_out_of_policy" || category == "other_role_violation",
+            "category must be fixed-enum, got: {category:?}"
+        );
+
+        // For non-RolePolicyViolation kinds the `category` field is absent.
+        let wrong_target = ArtifactAttemptOutcome::new(
+            ArtifactAttemptOutcomeKind::WrongTarget,
+            vec!["edit:other/file.rs".to_string()],
+            "src/lib.rs",
+        );
+        let v2 = attempt_outcome_to_json_value(&wrong_target);
+        assert!(
+            v2.get("category").is_none(),
+            "non-RolePolicyViolation should not emit category"
+        );
+    }
+
+    /// Acceptance (h): `PAYLOAD_SCHEMA_VERSION = 1` (set in `job_report.rs`)
+    /// remains stable; `attempt_outcome_to_json_value` only adds additive
+    /// fields.
+    #[test]
+    fn attempt_outcome_to_json_value_schema_v1_additive_only() {
+        let outcome = ArtifactAttemptOutcome::new(
+            ArtifactAttemptOutcomeKind::ProseOnly,
+            vec!["prose only attempt".to_string()],
+            "src/lib.rs",
+        );
+        let v = attempt_outcome_to_json_value(&outcome);
+        // Required keys present.
+        assert!(v.get("kind").is_some());
+        assert!(v.get("actual_actions").is_some());
+        // Existing top-level schema version is set externally; here we
+        // confirm the projection emits an object (not array / scalar).
+        assert!(v.is_object());
     }
 }

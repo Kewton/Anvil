@@ -1,0 +1,620 @@
+{
+  "anvildev_comparison": {
+    "acceptance_false_positive_delta": 3,
+    "acceptance_success_rate_delta_pp": 0.0,
+    "anvildev": {
+      "acceptance_false_positive_count": 3,
+      "acceptance_success_rate": 50.0,
+      "blank_failure_kind_count": 0,
+      "failure_kind_counts": {
+        "max_iterations": 1,
+        "postcheck_failure": 2,
+        "unclassified_process_failure": 17
+      },
+      "failure_layer_counts": {
+        "postcheck": 2,
+        "runtime": 18
+      },
+      "release_gate_status_counts": {},
+      "success": 28,
+      "success_rate": 58.33,
+      "summary_path": "/private/tmp/anvilminimal-eval-0229-anvildev-net-timeout/summary.eval.tsv",
+      "total": 48
+    },
+    "anvildev_summary_path": "/private/tmp/anvilminimal-eval-0229-anvildev-net-timeout/summary.eval.tsv",
+    "correct_failure_detection": false,
+    "failure_kind_regressions": [
+      {
+        "anvildev": 0,
+        "delta": 1,
+        "key": "missing_required_evidence",
+        "mvp": 1
+      },
+      {
+        "anvildev": 0,
+        "delta": 2,
+        "key": "phase_scaffold_error",
+        "mvp": 2
+      },
+      {
+        "anvildev": 0,
+        "delta": 3,
+        "key": "plan_final_contract_failure",
+        "mvp": 3
+      },
+      {
+        "anvildev": 0,
+        "delta": 2,
+        "key": "step_verify_failure",
+        "mvp": 2
+      },
+      {
+        "anvildev": 0,
+        "delta": 1,
+        "key": "verify_command_policy_error",
+        "mvp": 1
+      },
+      {
+        "anvildev": 0,
+        "delta": 3,
+        "key": "verify_repair_no_change",
+        "mvp": 3
+      }
+    ],
+    "intentional_difference_evidence_paths": [],
+    "mvp": {
+      "acceptance_false_positive_count": 6,
+      "acceptance_success_rate": 50.0,
+      "blank_failure_kind_count": 0,
+      "failure_kind_counts": {
+        "missing_required_evidence": 1,
+        "phase_scaffold_error": 2,
+        "plan_final_contract_failure": 3,
+        "step_verify_failure": 2,
+        "verify_command_policy_error": 1,
+        "verify_repair_no_change": 3
+      },
+      "failure_layer_counts": {
+        "bridge": 5,
+        "planning": 3,
+        "runtime": 4
+      },
+      "release_gate_status_counts": {},
+      "success": 36,
+      "success_rate": 75.0,
+      "summary_path": "/private/tmp/anvilminimal-eval-0229-mvp-net-timeout/summary.eval.tsv",
+      "total": 48
+    },
+    "mvp_summary_path": "/private/tmp/anvilminimal-eval-0229-mvp-net-timeout/summary.eval.tsv",
+    "stage_regressions": [
+      {
+        "anvildev": 0,
+        "delta": 5,
+        "key": "bridge",
+        "mvp": 5
+      },
+      {
+        "anvildev": 0,
+        "delta": 3,
+        "key": "planning",
+        "mvp": 3
+      }
+    ],
+    "status": "compared",
+    "success_rate_delta_pp": 16.67,
+    "threshold": {
+      "fail_delta_pp": 10.0,
+      "status": "pass",
+      "warn_delta_pp": 5.0
+    }
+  },
+  "errors": [
+    "runtime semantics gates failed: G-S01, G-S04, G-S05, G-S06, G-S07, G-S09, G-S10, G-S11, G-S12, G-S13, G-S15, G-S16"
+  ],
+  "failed_gate_ids": [
+    "G-S01",
+    "G-S04",
+    "G-S05",
+    "G-S06",
+    "G-S07",
+    "G-S09",
+    "G-S10",
+    "G-S11",
+    "G-S12",
+    "G-S13",
+    "G-S15",
+    "G-S16"
+  ],
+  "failure_kind_blank_count": 0,
+  "gate_level": "release",
+  "gate_statuses": [
+    {
+      "gate_id": "G-S01",
+      "mvp_event_count": 48,
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S02",
+      "mvp_event_count": 176,
+      "reason": "source_and_mvp_gate_observed",
+      "source_event_count": 48,
+      "status": "pass"
+    },
+    {
+      "gate_id": "G-S03",
+      "mvp_event_count": 293,
+      "reason": "source_and_mvp_gate_observed",
+      "source_event_count": 80,
+      "status": "pass"
+    },
+    {
+      "gate_id": "G-S04",
+      "mvp_event_count": 32,
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S05",
+      "mvp_event_count": 75,
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S06",
+      "mvp_event_count": 141,
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S07",
+      "mvp_event_count": 644,
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S08",
+      "mvp_event_count": 220,
+      "reason": "source_and_mvp_gate_observed",
+      "source_event_count": 82,
+      "status": "pass"
+    },
+    {
+      "gate_id": "G-S09",
+      "mvp_event_count": 14,
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S10",
+      "mvp_event_count": 20,
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S11",
+      "mvp_event_count": 30,
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S12",
+      "mvp_event_count": 117,
+      "reason": "source_and_mvp_gate_observed;release_browser_or_interaction_evidence_not_pass",
+      "source_event_count": 71,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S13",
+      "mvp_event_count": 9,
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S14",
+      "mvp_event_count": 68,
+      "reason": "source_and_mvp_gate_observed",
+      "source_event_count": 90,
+      "status": "pass"
+    },
+    {
+      "gate_id": "G-S15",
+      "mvp_event_count": 702,
+      "reason": "source_gate_not_observed_in_trace",
+      "source_event_count": 0,
+      "status": "fail"
+    },
+    {
+      "gate_id": "G-S16",
+      "mvp_event_count": 0,
+      "reason": "gate_not_observed_in_trace;release_tui_evidence_not_pass",
+      "source_event_count": 0,
+      "status": "fail"
+    }
+  ],
+  "intentionally_different_gate_ids": [],
+  "mvp_summary": {
+    "acceptance_false_positive_count": 6,
+    "acceptance_success_rate": 50.0,
+    "blank_failure_kind_count": 0,
+    "failure_kind_counts": {
+      "missing_required_evidence": 1,
+      "phase_scaffold_error": 2,
+      "plan_final_contract_failure": 3,
+      "step_verify_failure": 2,
+      "verify_command_policy_error": 1,
+      "verify_repair_no_change": 3
+    },
+    "failure_layer_counts": {
+      "bridge": 5,
+      "planning": 3,
+      "runtime": 4
+    },
+    "release_gate_status_counts": {},
+    "success": 36,
+    "success_rate": 75.0,
+    "summary_path": "/private/tmp/anvilminimal-eval-0229-mvp-net-timeout/summary.eval.tsv",
+    "total": 48
+  },
+  "normalized_trace_diff": {
+    "correct_failure_detection": [
+      {
+        "kind": "mvp_extra_failure_detection_stage",
+        "mvp": 10,
+        "source": 0,
+        "stage": "verify_failed"
+      }
+    ],
+    "extra_gate_ids_in_mvp": [
+      "G-S01",
+      "G-S04",
+      "G-S05",
+      "G-S06",
+      "G-S07",
+      "G-S09",
+      "G-S10",
+      "G-S11",
+      "G-S13",
+      "G-S15"
+    ],
+    "extra_stages_in_mvp": [
+      "dependency_boundary_checked",
+      "dependency_setup_attempted",
+      "phase_context_attached",
+      "phase_started",
+      "provider_observed",
+      "recovery_handoff_saved",
+      "repair_attempted",
+      "request_understood",
+      "scaffold_continuation_required",
+      "step_prompt_built",
+      "tool_executed",
+      "tool_requested",
+      "verify_failed"
+    ],
+    "failed_gate_ids": [
+      "G-S01",
+      "G-S04",
+      "G-S05",
+      "G-S06",
+      "G-S07",
+      "G-S09",
+      "G-S10",
+      "G-S11",
+      "G-S13",
+      "G-S15",
+      "G-S16"
+    ],
+    "gate_results": [
+      {
+        "gate_id": "G-S01",
+        "mvp_event_count": 48,
+        "mvp_stages": [
+          "request_understood"
+        ],
+        "reason": "source_gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      },
+      {
+        "gate_id": "G-S02",
+        "mvp_event_count": 176,
+        "mvp_stages": [
+          "contract_loaded"
+        ],
+        "reason": "source_and_mvp_gate_observed",
+        "source_event_count": 48,
+        "source_stages": [
+          "contract_loaded"
+        ],
+        "status": "pass"
+      },
+      {
+        "gate_id": "G-S03",
+        "mvp_event_count": 293,
+        "mvp_stages": [
+          "plan_generated",
+          "plan_linted"
+        ],
+        "reason": "source_and_mvp_gate_observed",
+        "source_event_count": 80,
+        "source_stages": [
+          "plan_generated",
+          "plan_linted"
+        ],
+        "status": "pass"
+      },
+      {
+        "gate_id": "G-S04",
+        "mvp_event_count": 32,
+        "mvp_stages": [
+          "phase_started"
+        ],
+        "reason": "source_gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      },
+      {
+        "gate_id": "G-S05",
+        "mvp_event_count": 75,
+        "mvp_stages": [
+          "phase_context_attached"
+        ],
+        "reason": "source_gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      },
+      {
+        "gate_id": "G-S06",
+        "mvp_event_count": 141,
+        "mvp_stages": [
+          "step_prompt_built"
+        ],
+        "reason": "source_gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      },
+      {
+        "gate_id": "G-S07",
+        "mvp_event_count": 644,
+        "mvp_stages": [
+          "tool_executed",
+          "tool_requested"
+        ],
+        "reason": "source_gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      },
+      {
+        "gate_id": "G-S08",
+        "mvp_event_count": 220,
+        "mvp_stages": [
+          "plan_linted",
+          "verify_failed",
+          "verify_started"
+        ],
+        "reason": "source_and_mvp_gate_observed",
+        "source_event_count": 82,
+        "source_stages": [
+          "plan_linted",
+          "verify_started"
+        ],
+        "status": "pass"
+      },
+      {
+        "gate_id": "G-S09",
+        "mvp_event_count": 14,
+        "mvp_stages": [
+          "dependency_boundary_checked",
+          "dependency_setup_attempted"
+        ],
+        "reason": "source_gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      },
+      {
+        "gate_id": "G-S10",
+        "mvp_event_count": 20,
+        "mvp_stages": [
+          "repair_attempted"
+        ],
+        "reason": "source_gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      },
+      {
+        "gate_id": "G-S11",
+        "mvp_event_count": 30,
+        "mvp_stages": [
+          "scaffold_continuation_required"
+        ],
+        "reason": "source_gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      },
+      {
+        "gate_id": "G-S12",
+        "mvp_event_count": 117,
+        "mvp_stages": [
+          "acceptance_failed",
+          "acceptance_passed",
+          "acceptance_started"
+        ],
+        "reason": "source_and_mvp_gate_observed",
+        "source_event_count": 71,
+        "source_stages": [
+          "acceptance_failed",
+          "acceptance_passed",
+          "acceptance_started"
+        ],
+        "status": "pass"
+      },
+      {
+        "gate_id": "G-S13",
+        "mvp_event_count": 9,
+        "mvp_stages": [
+          "recovery_handoff_saved"
+        ],
+        "reason": "source_gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      },
+      {
+        "gate_id": "G-S14",
+        "mvp_event_count": 68,
+        "mvp_stages": [
+          "diagnostic_emitted"
+        ],
+        "reason": "source_and_mvp_gate_observed",
+        "source_event_count": 90,
+        "source_stages": [
+          "diagnostic_emitted"
+        ],
+        "status": "pass"
+      },
+      {
+        "gate_id": "G-S15",
+        "mvp_event_count": 702,
+        "mvp_stages": [
+          "provider_observed"
+        ],
+        "reason": "source_gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      },
+      {
+        "gate_id": "G-S16",
+        "mvp_event_count": 0,
+        "mvp_stages": [],
+        "reason": "gate_not_observed_in_trace",
+        "source_event_count": 0,
+        "source_stages": [],
+        "status": "fail"
+      }
+    ],
+    "gate_status_counts": {
+      "fail": 11,
+      "pass": 5
+    },
+    "intentionally_different_gate_ids": [],
+    "missing_gate_ids_in_mvp": [],
+    "missing_stages_in_mvp": [],
+    "mvp_trace_available": true,
+    "mvp_trace_id": "mvp-0229-net-timeout",
+    "mvp_trace_report_path": "/private/tmp/anvilminimal-eval-0229-mvp-net-timeout/runtime-semantics-trace-report.json",
+    "partial_gate_ids": [],
+    "passed_gate_ids": [
+      "G-S02",
+      "G-S03",
+      "G-S08",
+      "G-S12",
+      "G-S14"
+    ],
+    "regressions": [],
+    "same_condition": {
+      "extra_in_mvp": [],
+      "missing_in_mvp": [],
+      "mvp_signature_count": 48,
+      "source_signature_count": 48,
+      "status": "match"
+    },
+    "schema_version": "1",
+    "source_trace_available": true,
+    "source_trace_id": "source-0229-net-timeout",
+    "source_trace_report_path": "/private/tmp/anvilminimal-eval-0229-anvildev-net-timeout/runtime-semantics-trace-report.json",
+    "status": "compared"
+  },
+  "partial_gate_ids": [],
+  "passed_gate_ids": [
+    "G-S02",
+    "G-S03",
+    "G-S08",
+    "G-S14"
+  ],
+  "required_gate_ids": [
+    "G-S01",
+    "G-S02",
+    "G-S03",
+    "G-S04",
+    "G-S05",
+    "G-S06",
+    "G-S07",
+    "G-S08",
+    "G-S09",
+    "G-S10",
+    "G-S11",
+    "G-S12",
+    "G-S13",
+    "G-S14",
+    "G-S15",
+    "G-S16"
+  ],
+  "rollback_policy": {
+    "blank_failure_kind_must_remain_blocked": true,
+    "build_only_false_positive_must_remain_blocked": true,
+    "threshold_can_be_downgraded_only_to_warning": true
+  },
+  "schema_version": "1",
+  "uat_equivalent": {
+    "browser_readiness_evidence_paths": [
+      "workspace/mvp/eval/022/evidence/2026-06-30/browser-readiness.json"
+    ],
+    "evidence_paths": [
+      "workspace/mvp/eval/022/latest_mvp_vs_anvildev_release_evidence_2026-06-30.md"
+    ],
+    "evidence_results": {
+      "browser_readiness": {
+        "failure_kind": "browser_http_500",
+        "http_status": 500,
+        "path": "workspace/mvp/eval/022/evidence/2026-06-30/browser-readiness.json",
+        "reason": "http_500",
+        "status": "fail"
+      },
+      "interaction": {
+        "failure_kind": "canvas_unavailable",
+        "path": "workspace/mvp/eval/022/evidence/2026-06-30/interaction-evidence.json",
+        "reason": "canvas_not_available",
+        "status": "fail"
+      },
+      "tui": {
+        "failure_kind": "tui_command_failed",
+        "path": "workspace/mvp/eval/022/evidence/2026-06-30/tui-events.jsonl",
+        "reason": "tui_command_failed",
+        "status": "fail"
+      },
+      "uat": {
+        "path": "workspace/mvp/eval/022/latest_mvp_vs_anvildev_release_evidence_2026-06-30.md",
+        "status": "pass"
+      }
+    },
+    "interaction_evidence_paths": [
+      "workspace/mvp/eval/022/evidence/2026-06-30/interaction-evidence.json"
+    ],
+    "missing_required_evidence": [],
+    "reason": "Release evidence content failed: browser_readiness:browser_http_500; interaction:canvas_unavailable; tui:tui_command_failed",
+    "status": "fail",
+    "tui_run_event_paths": [
+      "workspace/mvp/eval/022/evidence/2026-06-30/tui-events.jsonl"
+    ]
+  },
+  "warnings": []
+}

@@ -4,12 +4,14 @@ use std::fs;
 use std::path::Path;
 
 use crate::tools::registry::truncate_output;
+use crate::util::workspace_paths::WorkspacePolicy;
 
 pub fn run(
     root: &Path,
     pattern: &str,
     glob: Option<&str>,
     case_sensitive: bool,
+    workspace_policy: WorkspacePolicy,
 ) -> Result<String, String> {
     let regex = if case_sensitive {
         Regex::new(pattern).ok()
@@ -32,8 +34,22 @@ pub fn run(
         .map_err(|err| format!("invalid glob filter: {err}"))?;
     let matcher = matcher.map(|glob| glob.compile_matcher());
 
+    let walk_root = root.to_path_buf();
+    let filter_root = walk_root.clone();
     let mut matches = Vec::new();
-    for entry in WalkBuilder::new(root).hidden(false).build() {
+    for entry in WalkBuilder::new(&walk_root)
+        .hidden(false)
+        .filter_entry(move |entry| {
+            let path = entry.path();
+            if path == filter_root {
+                return true;
+            }
+            path.strip_prefix(&filter_root)
+                .map(|relative| workspace_policy.allows_model_read_relative_path(relative))
+                .unwrap_or(true)
+        })
+        .build()
+    {
         let entry = entry.map_err(|err| format!("walk error: {err}"))?;
         let path = entry.path();
         if !entry
@@ -43,7 +59,10 @@ pub fn run(
         {
             continue;
         }
-        let relative = path.strip_prefix(root).unwrap_or(path);
+        let relative = path.strip_prefix(&walk_root).unwrap_or(path);
+        if !workspace_policy.allows_model_read_relative_path(relative) {
+            continue;
+        }
         if let Some(matcher) = &matcher
             && !matcher.is_match(relative)
         {

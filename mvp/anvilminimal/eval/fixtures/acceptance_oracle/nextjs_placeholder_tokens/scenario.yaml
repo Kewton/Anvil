@@ -1,0 +1,4 @@
+profile: nextjs
+prompt: Create a Space Invaders game with keyboard controls and scoring.
+expected_artifacts:
+  - src/app/page.tsx

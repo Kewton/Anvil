@@ -640,7 +640,13 @@ pub(super) fn parse_semantic_failure_report(
 /// failure kind continues through semantic repair planning.
 pub(super) fn dispatch_target(report: &SemanticFailureReport) -> SemanticDispatchTarget {
     match report.failure_kind {
-        VerifierDiagnosticFailureKind::DependencyMissing
+        VerifierDiagnosticFailureKind::MissingFile
+        | VerifierDiagnosticFailureKind::EvidenceMissing
+        | VerifierDiagnosticFailureKind::SchemaMismatch
+        | VerifierDiagnosticFailureKind::WrongSemantics
+        | VerifierDiagnosticFailureKind::BadTest => SemanticDispatchTarget::SemanticRepair,
+        VerifierDiagnosticFailureKind::InvalidManifest
+        | VerifierDiagnosticFailureKind::DependencyMissing
         | VerifierDiagnosticFailureKind::ConfigOrVerifierError => {
             SemanticDispatchTarget::SetupRepair
         }
@@ -652,6 +658,12 @@ pub(super) fn dispatch_target(report: &SemanticFailureReport) -> SemanticDispatc
 /// existing SSOT (`loop_run.rs::VerifierDiagnosticFailureKind::as_str`).
 fn parse_failure_kind(v: &serde_json::Value) -> Option<VerifierDiagnosticFailureKind> {
     Some(match v.as_str()? {
+        "missing_file" => VerifierDiagnosticFailureKind::MissingFile,
+        "invalid_manifest" => VerifierDiagnosticFailureKind::InvalidManifest,
+        "bad_test" => VerifierDiagnosticFailureKind::BadTest,
+        "wrong_semantics" => VerifierDiagnosticFailureKind::WrongSemantics,
+        "evidence_missing" => VerifierDiagnosticFailureKind::EvidenceMissing,
+        "schema_mismatch" => VerifierDiagnosticFailureKind::SchemaMismatch,
         "dependency_missing" => VerifierDiagnosticFailureKind::DependencyMissing,
         "local_import_contract_mismatch" => {
             VerifierDiagnosticFailureKind::LocalImportContractMismatch
@@ -666,16 +678,13 @@ fn parse_failure_kind(v: &serde_json::Value) -> Option<VerifierDiagnosticFailure
     })
 }
 
-/// Parse the closed set of `ArtifactRole` labels from
-/// `task_contract::ArtifactRole::label`.
+/// Parse the closed set of canonical `ArtifactRole` labels.
+///
+/// Issue #920: delegates to the `ArtifactRole::from_label` SSOT (the strict
+/// reverse of `label()`), so `data_output` now round-trips here too (it was
+/// previously dropped). This is a strict-label-only parser — no LLM aliases.
 fn parse_artifact_role(s: &str) -> Option<ArtifactRole> {
-    Some(match s {
-        "implementation" => ArtifactRole::Implementation,
-        "test" => ArtifactRole::Test,
-        "usage_docs" => ArtifactRole::UsageDocs,
-        "setup" => ArtifactRole::Setup,
-        _ => return None,
-    })
+    ArtifactRole::from_label(s)
 }
 
 /// Emit a `SchemaError` validation failure with **metadata only** — never the

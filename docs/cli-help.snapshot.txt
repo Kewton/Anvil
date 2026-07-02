@@ -1,4 +1,4 @@
-local-first coding agent for Ollama
+local-first coding agent for local and API LLMs
 
 Usage: anvil [OPTIONS] [COMMAND]
 
@@ -11,12 +11,20 @@ Options:
           
   -m, --model <MODEL>
           
+      --provider <PROVIDER>
+          Provider used for the main execution model [possible values: ollama, gemini, openai]
+      --planner-model <PLANNER_MODEL>
+          LLM model used only for plan generation. Defaults to --model
+      --planner-provider <PLANNER_PROVIDER>
+          Provider used only for plan generation. Defaults to --provider [possible values: ollama, gemini, openai]
       --sidecar-model <SIDECAR_MODEL>
           
       --ollama-host <OLLAMA_HOST>
           
       --context-budget <CONTEXT_BUDGET>
           
+      --num-predict <NUM_PREDICT>
+          Override Ollama num_predict. Defaults to 2048 for legacy and 8192 for minimal
       --max-iterations <MAX_ITERATIONS>
           
       --chat-timeout-secs <CHAT_TIMEOUT_SECS>
@@ -37,10 +45,28 @@ Options:
           
       --auto-plan
           
+      --plan-steps <PROMPT>
+          Ask the minimal engine to draft a step plan and save it under .anvil/plans/
+      --plan-run <PROMPT>
+          Draft a step plan, save it, then run it immediately with the minimal engine
+      --run-plan <FILE>
+          Run a previously saved minimal step plan
+      --ultra-plan <PROMPT>
+          Draft a top-level phase plan for repeated minimal plan-runs
+      --ultra-plan-run <PROMPT>
+          Draft a top-level phase plan, save it, then run each phase with /plan-run
+      --run-ultra-plan <FILE>
+          Run a previously saved minimal ultra phase plan
+      --ultra-style <STYLE>
+          Planning style for --ultra-plan / --ultra-plan-run: default, tdd, or test-hardening
+      --profile <PROFILE>
+          Contract/verifier profile for --ultra-plan / --ultra-plan-run
       --offline
           
       --deterministic-fallback <DETERMINISTIC_FALLBACK>
           Control deterministic recovery. `hint-only` only nudges the model, `minimal-patch` writes support files only, and `full-template` preserves legacy full template recovery. `support-only` and `full` remain aliases [possible values: off, hint-only, minimal-patch, full-template]
+      --engine <ENGINE>
+          [possible values: legacy, minimal]
       --experimental-specialized-fallback <EXPERIMENTAL_SPECIALIZED_FALLBACK>
           Issue #634: experimental opt-in for specialized fallback paths (FastAPI scaffold / Python CSV / FizzBuzz / fixed arithmetic patch / qwen3.5 固有 deterministic edit). Default off. Template 系は `--deterministic-fallback full-template` との AND 条件で発火。 [possible values: true, false]
       --no-footer

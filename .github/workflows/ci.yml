@@ -139,13 +139,29 @@ jobs:
         with:
           python-version: "3.10"
       - name: install lint deps
-        run: pip install ruff==0.14.9
+        run: pip install ruff==0.14.9 pytest==8.4.2
       - name: install jq & yq
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
+      - name: ruff (complexity_report.py)
+        run: ruff check scripts/complexity_report.py tests/test_complexity_report.py
+      - name: complexity report tests
+        run: python3 -m unittest tests.test_complexity_report -v
+      - name: complexity report snapshot
+        run: |
+          python3 scripts/complexity_report.py --json --top 10 \
+            src/agent/loop_run/turn.rs \
+            src/agent/loop_run/repair_job.rs \
+            src/agent/loop_run/model_request.rs \
+            src/agent/loop_run/tool_execution.rs > /tmp/complexity-report.json
+          jq '.schema_version == 1 and (.top_functions | length > 0)' /tmp/complexity-report.json | grep true
+      - name: ruff (codex orchestrate)
+        run: ruff check scripts/codex_orchestrate.py tests/test_codex_orchestrate.py
+      - name: codex orchestrate tests
+        run: python3 -m pytest tests/test_codex_orchestrate.py -q
       - name: ruff check
         run: ruff check scripts/analyze_run.py
       - name: snapshot tests

@@ -64,9 +64,9 @@ use super::artifact_ownership::{
 };
 use super::task_contract::{ArtifactRole, TaskContract};
 use super::task_workspace_scope::TaskWorkspaceScope;
-use crate::logging::log_llm_event;
+use crate::logging::{log_llm_event, stable_path_hash};
 use crate::session::feedback::mask_secrets;
-use crate::util::file_classify::{is_setup_file, is_test_file};
+use crate::util::file_classify::{is_setup_file, is_structured_data_file, is_test_file};
 
 /// Per-turn cap on accepted events. New events past this cap are dropped
 /// (not FIFO-evicted) so legacy / projection consumers see a stable prefix.
@@ -156,6 +156,32 @@ impl<'a> LedgerAdmissionContext<'a> {
     }
 }
 
+/// Issue #659 PR-001: observability log context for `event_recorded` /
+/// `turn_summary` payloads. Stored inside the `ArtifactLedger` itself so
+/// existing record-call signatures stay untouched while turn-level dataset
+/// consumers (Issue #660 / #661 / #663) can join ledger events with the
+/// owning session / turn.
+///
+/// `session_id` defaults to an empty string and `turn_index` to `0` for
+/// tests and code paths that construct an `ArtifactLedger` directly without
+/// going through `turn.rs` (the production seed of the context happens in
+/// `clear_per_turn_ledger_state_for_turn`, the PR-002 helper that takes the
+/// upcoming turn index as an explicit argument).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ArtifactLedgerLogContext {
+    pub(super) session_id: String,
+    pub(super) turn_index: u32,
+}
+
+impl ArtifactLedgerLogContext {
+    pub(super) fn new(session_id: impl Into<String>, turn_index: u32) -> Self {
+        Self {
+            session_id: session_id.into(),
+            turn_index,
+        }
+    }
+}
+
 /// Append-only event. `path` is always present (never `Option<String>`); the
 /// `ArtifactState::changed(...)` rows that carry `path: None` are skipped at
 /// admission time (Issue #659 §3 / DR2-002).
@@ -205,6 +231,10 @@ pub(super) struct ArtifactLedger {
     dropped_count: u32,
     overflowed: bool,
     next_seq: u32,
+    /// Issue #659 PR-001: observability log context (session_id / turn_index)
+    /// propagated into every `event_recorded` / `turn_summary` payload so
+    /// dataset consumers can join per-turn (Section 7.1 of design policy).
+    log_context: ArtifactLedgerLogContext,
 }
 
 /// Summary returned by [`ArtifactLedger::turn_summary`] for end-of-turn
@@ -216,6 +246,41 @@ pub(super) struct TurnSummary {
     pub overflowed: bool,
 }
 
+/// Issue #663 (AD2 / DR1-002 / DR1-009 / DR4-001): forgeability-safe
+/// projection of `required_artifacts_completed` plus the ledger's
+/// `overflowed` flag.
+///
+/// Construction is restricted to
+/// [`ArtifactLedger::required_artifacts_completed_projection`] — fields are
+/// `pub(super)` strictly for in-module test helpers, never written from
+/// outside this module. External callers (e.g. `artifact_completion_job`)
+/// read via `is_satisfied(role)` / `overflowed()` accessors only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RequiredArtifactsProjection {
+    values: BTreeMap<ArtifactRole, bool>,
+    overflowed: bool,
+}
+
+impl RequiredArtifactsProjection {
+    /// Whether the given role has at least one Owned ledger event
+    /// recorded for it during the current turn.
+    ///
+    /// Fail-closed: returns `false` for every role when the ledger has
+    /// overflowed (mirrors the ledger projection's CB-002 contract).
+    pub(super) fn is_satisfied(&self, role: ArtifactRole) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        self.values.get(&role).copied().unwrap_or(false)
+    }
+
+    /// Whether the underlying ledger was in `overflowed=true` state when
+    /// this projection was built.
+    pub(super) fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+}
+
 impl ArtifactLedger {
     pub(super) fn new() -> Self {
         Self::default()
@@ -224,6 +289,12 @@ impl ArtifactLedger {
     /// Per-turn reset. Caller (`turn.rs::handle_user_message` head) must
     /// invoke this alongside the existing `turn_edited_relative_paths.clear()`
     /// / `turn_pre_tool_file_hashes.clear()` (CLAUDE.md per-turn rule).
+    ///
+    /// The observability `log_context` is intentionally **preserved** across
+    /// `clear()` — `turn.rs` calls `set_log_context()` separately so a new
+    /// turn's session_id / turn_index are stamped on the per-turn event
+    /// stream. Tests that reuse a ledger across virtual turns can call
+    /// `set_log_context()` themselves to mirror the production sequencing.
     pub(super) fn clear(&mut self) {
         self.events.clear();
         self.verifier_observations.clear();
@@ -232,12 +303,36 @@ impl ArtifactLedger {
         self.next_seq = 0;
     }
 
+    /// Issue #659 PR-001 / PR-002: stamp the observability log context for
+    /// the current turn. `turn.rs::clear_per_turn_ledger_state_for_turn`
+    /// calls this with `(session_store.session_id(), upcoming_turn_index)`
+    /// so subsequent `event_recorded` / `turn_summary` emits carry the
+    /// turn-level join keys defined in Section 7.1 of the design policy.
+    /// The upcoming index is passed explicitly (rather than read from
+    /// `current_turn_index`) so production sequencing — the increment
+    /// happens before the reset in `handle_user_message` — is decoupled
+    /// from stamp timing.
+    pub(super) fn set_log_context(&mut self, ctx: ArtifactLedgerLogContext) {
+        self.log_context = ctx;
+    }
+
+    /// Read-only accessor for the current observability log context. Test
+    /// helpers may use this to confirm the context propagated through a
+    /// turn-level wiring path.
+    #[allow(dead_code)]
+    pub(super) fn log_context(&self) -> &ArtifactLedgerLogContext {
+        &self.log_context
+    }
+
     // --- record helpers --------------------------------------------------
 
     /// `Existing` origin — workspace scan / task-contract candidate
     /// iteration. Idempotent on `(Existing, role, path)`: repeated baseline
     /// seeds during a single turn do NOT append duplicate rows (returns the
     /// already-stored event).
+    ///
+    /// Issue #661 (iteration-3 Task 3.2): non-verifier admission route —
+    /// stays on `NestedTestAdmission::default()` (= `disabled()`).
     pub(super) fn record_existing_event(
         &mut self,
         ctx: &LedgerAdmissionContext<'_>,
@@ -246,6 +341,7 @@ impl ArtifactLedger {
     ) -> Option<&ArtifactLedgerEvent> {
         self.record_internal(
             ctx,
+            super::artifact_ownership::NestedTestAdmission::default(),
             path,
             expected_role,
             ArtifactOrigin::Existing,
@@ -257,6 +353,9 @@ impl ArtifactLedger {
     /// on `(Scaffold, role, path)`; `post_scaffold_delta` is recomputed by
     /// the caller before the seed and a duplicate baseline does not produce
     /// multiple rows.
+    ///
+    /// Issue #661 (iteration-3 Task 3.2): non-verifier admission route —
+    /// stays on `NestedTestAdmission::default()` (= `disabled()`).
     pub(super) fn record_scaffold_event(
         &mut self,
         ctx: &LedgerAdmissionContext<'_>,
@@ -266,6 +365,7 @@ impl ArtifactLedger {
     ) -> Option<&ArtifactLedgerEvent> {
         self.record_internal(
             ctx,
+            super::artifact_ownership::NestedTestAdmission::default(),
             path,
             expected_role,
             ArtifactOrigin::Scaffold,
@@ -277,6 +377,17 @@ impl ArtifactLedger {
 
     /// `RepoEdit` origin — non-no-op Write/Edit tool call. Multiple real
     /// edits append multiple events; projections dedupe by `(role, path)`.
+    ///
+    /// Issue #661 (iteration-3 Task 3.4 / DR2-003 / 判断 #1): verifier-path
+    /// SSOT — passes `NestedTestAdmission::enabled()` so the underlying
+    /// `classify_ownership` SSOT can promote nested test subdirs (e.g.
+    /// `app/tests/foo.py`) to `Owned`. Production callers always pass
+    /// `edited_this_turn=true` which independently satisfies
+    /// `has_promotion_signal`, so the admission flip is observationally a
+    /// no-op for typical edit paths and acts purely as a SSOT-consistency
+    /// guard for the 4 propagation routes. Workspace-relative / symlink
+    /// containment (CB-001) / ignored_top_dir / role-confirm checks remain
+    /// authoritative and unaffected by the flag.
     pub(super) fn record_repo_edit_event(
         &mut self,
         ctx: &LedgerAdmissionContext<'_>,
@@ -286,6 +397,7 @@ impl ArtifactLedger {
     ) -> Option<&ArtifactLedgerEvent> {
         self.record_internal(
             ctx,
+            super::artifact_ownership::NestedTestAdmission::enabled(),
             path,
             expected_role,
             ArtifactOrigin::RepoEdit,
@@ -304,13 +416,25 @@ impl ArtifactLedger {
     /// ledger increments `dropped_count` and raises `overflowed` so the
     /// projection layer treats completion as untrusted (CB-002 fail-closed
     /// semantics).
+    ///
+    /// Issue #661 (iteration-3 Task 3.4 / DR2-003 / 判断 #1): verifier-path
+    /// SSOT — passes `NestedTestAdmission::enabled()` so a nested test path
+    /// observed by the structured verifier (e.g. `app/tests/foo.py` argv
+    /// element) is admitted into the secondary index for downstream
+    /// projection (`owned_test_artifacts` / verifier-binding callsites).
+    /// Workspace-relative / symlink containment / ignored_top_dir checks
+    /// remain authoritative (see `admit_path_only`).
     pub(super) fn record_verifier_observation(
         &mut self,
         ctx: &LedgerAdmissionContext<'_>,
         path: &str,
         observation: VerifierObservation,
     ) -> bool {
-        let Ok(accepted) = admit_path_only(ctx, path) else {
+        let Ok(accepted) = admit_path_only(
+            ctx,
+            super::artifact_ownership::NestedTestAdmission::enabled(),
+            path,
+        ) else {
             return false;
         };
         if !self.verifier_observations.contains_key(&accepted)
@@ -327,12 +451,19 @@ impl ArtifactLedger {
     fn record_internal(
         &mut self,
         ctx: &LedgerAdmissionContext<'_>,
+        nested_test_admission: super::artifact_ownership::NestedTestAdmission,
         path: String,
         expected_role: ArtifactRole,
         origin: ArtifactOrigin,
         origin_specific: AdmissionOriginInputs,
     ) -> Option<&ArtifactLedgerEvent> {
-        let admission = match admit_event(ctx, &path, expected_role, origin_specific) {
+        let admission = match admit_event(
+            ctx,
+            nested_test_admission,
+            &path,
+            expected_role,
+            origin_specific,
+        ) {
             Ok(accepted) => accepted,
             Err(_) => return None,
         };
@@ -378,7 +509,7 @@ impl ArtifactLedger {
         };
         self.events.push(event);
         let appended = self.events.last().expect("just pushed");
-        emit_event_recorded(appended, self.overflowed);
+        emit_event_recorded(appended, self.overflowed, &self.log_context);
         Some(appended)
     }
 
@@ -427,6 +558,11 @@ impl ArtifactLedger {
     /// Emit `agent.artifact_ledger.turn_summary`. Caller (`turn.rs`) is
     /// responsible for invoking this exactly once per turn at the
     /// SafeStop / Done confirmation point (Phase 2 task 2.2).
+    ///
+    /// Section 7.1 contract: payload carries `turn_index` / `session_id`
+    /// (from the stored `log_context`) plus `event_count` / `dropped_count`
+    /// / `overflowed` and per-{origin,role,ownership} counts. Raw paths are
+    /// never emitted.
     pub(super) fn emit_turn_summary(&self) {
         let summary = self.turn_summary();
         let mut origin_counts: BTreeMap<&'static str, u32> = BTreeMap::new();
@@ -442,6 +578,8 @@ impl ArtifactLedger {
         log_llm_event(
             "agent.artifact_ledger.turn_summary",
             json!({
+                "session_id": self.log_context.session_id,
+                "turn_index": self.log_context.turn_index,
                 "event_count": summary.event_count,
                 "dropped_count": summary.dropped_count,
                 "overflowed": summary.overflowed,
@@ -487,6 +625,25 @@ impl ArtifactLedger {
         projection::required_artifacts_completed(self, contract)
     }
 
+    /// Issue #663 (AD2 / DR1-002 / DR1-009 / DR4-001): forgeability-safe
+    /// projection wrapping the per-role completion view + the ledger's
+    /// `overflowed` flag. The constructor lives in this module only —
+    /// external callers cannot forge a `RequiredArtifactsProjection` and
+    /// must use this accessor.
+    ///
+    /// Fail-closed contract: when the ledger has overflowed, `is_satisfied`
+    /// returns `false` for every role and `overflowed()` returns `true`.
+    pub(super) fn required_artifacts_completed_projection(
+        &self,
+        contract: &TaskContract,
+    ) -> RequiredArtifactsProjection {
+        let values = projection::required_artifacts_completed(self, contract);
+        RequiredArtifactsProjection {
+            values,
+            overflowed: self.overflowed,
+        }
+    }
+
     /// Active job candidate roles. Anchor stub returning declaration order
     /// (full priority arbitration is Issue #660 scope).
     pub(super) fn active_job_candidates(&self, contract: &TaskContract) -> Vec<ArtifactRole> {
@@ -519,8 +676,20 @@ enum AdmissionOriginInputs {
 /// nearest_existing_ancestor_within_work_root` — PR-002 SSOT) so missing-
 /// leaf rows go through exactly the same workspace confinement gate as the
 /// `artifact_completion_job` write target.
+///
+/// Issue #661 (iteration-3 Task 3.2 / 3.4 / DR2-003): `nested_test_admission`
+/// is threaded through to `classify_ownership` so the 4 verifier-path SSOT
+/// callers (`record_repo_edit_event` / `record_verifier_observation` /
+/// `validate_bound_test_artifacts_for_execution` /
+/// `seed_artifact_ledger_verifier_observation`) can opt into recognising
+/// nested test subdirs (e.g. `app/tests/foo.py`) as `Owned`. Every other
+/// caller passes `NestedTestAdmission::default()` (= `disabled()`),
+/// preserving the legacy reject behaviour exactly. The flag never bypasses
+/// the workspace-relative / symlink containment / ignored_top_dir /
+/// role-confirm checks — those gates remain authoritative.
 fn admit_event(
     ctx: &LedgerAdmissionContext<'_>,
+    nested_test_admission: super::artifact_ownership::NestedTestAdmission,
     path: &str,
     expected_role: ArtifactRole,
     origin_specific: AdmissionOriginInputs,
@@ -548,6 +717,7 @@ fn admit_event(
             }
         ),
         verifier_passed_in_scope: false,
+        nested_test_admission,
     };
     let ownership = classify_ownership(inputs);
     if matches!(ownership, ArtifactOwnership::OutOfScope) {
@@ -579,8 +749,13 @@ fn admit_event(
 /// Path-only admission (no role / origin). Used by
 /// `record_verifier_observation` to share the workspace / scope / path
 /// validation pipeline without producing an `ArtifactLedgerEvent`.
+///
+/// Issue #661 (iteration-3 Task 3.2 / DR2-003): the same
+/// `nested_test_admission` SSOT propagation rule as `admit_event` applies;
+/// see its doc comment for the per-caller contract.
 fn admit_path_only(
     ctx: &LedgerAdmissionContext<'_>,
+    nested_test_admission: super::artifact_ownership::NestedTestAdmission,
     path: &str,
 ) -> Result<String, AdmissionRejection> {
     if path.is_empty() {
@@ -596,6 +771,7 @@ fn admit_path_only(
         edited_this_session: false,
         scaffold_changed: false,
         verifier_passed_in_scope: false,
+        nested_test_admission,
     };
     if matches!(classify_ownership(inputs), ArtifactOwnership::OutOfScope) {
         return Err(AdmissionRejection::OutOfScope);
@@ -630,6 +806,7 @@ fn role_matches_path(role: ArtifactRole, path: &str) -> bool {
         // injection vector we guard against here.
         ArtifactRole::Implementation => !is_test_file(p) && !is_setup_file(p),
         ArtifactRole::UsageDocs => !is_test_file(p) && !is_setup_file(p),
+        ArtifactRole::DataOutput => is_structured_data_file(p),
     }
 }
 
@@ -645,7 +822,11 @@ fn ownership_label(o: ArtifactOwnership) -> &'static str {
 // Observability hook (per Issue #659 §7.1)
 // ---------------------------------------------------------------------------
 
-fn emit_event_recorded(event: &ArtifactLedgerEvent, overflowed: bool) {
+fn emit_event_recorded(
+    event: &ArtifactLedgerEvent,
+    overflowed: bool,
+    ctx: &ArtifactLedgerLogContext,
+) {
     // path_hash is derived from the *masked* workspace-relative path so a
     // secret accidentally embedded in the path can never surface via the
     // hash. Raw path is NEVER included in the payload.
@@ -654,6 +835,8 @@ fn emit_event_recorded(event: &ArtifactLedgerEvent, overflowed: bool) {
     log_llm_event(
         "agent.artifact_ledger.event_recorded",
         json!({
+            "session_id": ctx.session_id,
+            "turn_index": ctx.turn_index,
             "seq": event.recorded_at_seq,
             "origin": event.origin.label(),
             "role": event.role.label(),
@@ -667,12 +850,40 @@ fn emit_event_recorded(event: &ArtifactLedgerEvent, overflowed: bool) {
     );
 }
 
-fn stable_path_hash(masked_path: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    masked_path.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+// Issue #661 DR1-002 / DR2-005: `stable_path_hash` was previously a private
+// duplicate in this module; it has been promoted to `crate::logging::
+// stable_path_hash` so all three former duplicate sites (this module +
+// `turn.rs::stable_path_hash_for_active_job` + `active_job_arbiter.rs`
+// `#[cfg(test)]` helper) share one SSOT and `agent.artifact_ledger.*`
+// event `path_hash` values remain a stable correlator with `agent.
+// active_job.selected` / `agent.verifier.invoked` payloads. Imported via
+// `use crate::logging::stable_path_hash;` at the top of this module so
+// in-module call sites (e.g. `emit_event_recorded`, `bounded_masked_path_hashes`)
+// resolve to the SSOT directly. Issue #666 `job_report.rs` consumers also
+// route through the same `crate::logging::stable_path_hash` SSOT.
+
+/// Issue #659 PR-001: bounded, masked path-hash projection helper. Each
+/// path is passed through `mask_secrets` and then `stable_path_hash` so the
+/// hash space matches `event_recorded.path_hash` exactly (dataset consumers
+/// can join the divergence list back to per-event rows). Output is hard-
+/// capped at `MAX_DIVERGENCE_PATH_HASHES = 16` entries to bound payload
+/// size — beyond the cap, additional paths are silently dropped (counts
+/// still reflect the true totals).
+pub(super) const MAX_DIVERGENCE_PATH_HASHES: usize = 16;
+
+/// Build a bounded list of masked path hashes for divergence payloads.
+/// Accepts any `IntoIterator<Item = &str>` so call sites can pass a
+/// `BTreeSet<String>` iterator (deterministic order) without intermediate
+/// allocation.
+pub(super) fn bounded_masked_path_hashes<'a, I>(paths: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    paths
+        .into_iter()
+        .take(MAX_DIVERGENCE_PATH_HASHES)
+        .map(|p| stable_path_hash(&mask_secrets(p)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -713,9 +924,10 @@ mod projection {
         out
     }
 
-    /// Per-required-role completion view. Minimal implementation: a role is
-    /// "completed" when at least one ledger event for that role has
-    /// `ownership == Owned`. Full arbitration is Issue #663 scope.
+    /// Per-required-role completion view. A role with explicit contract
+    /// identities is completed only when every required identity path has an
+    /// owned ledger event. Roles without identities keep the legacy role-level
+    /// completion rule.
     ///
     /// CB-002 fail-closed: when the ledger has overflowed, every role is
     /// reported as `false`. A turn cannot claim completion from a partial
@@ -727,11 +939,24 @@ mod projection {
         let mut out: BTreeMap<ArtifactRole, bool> = BTreeMap::new();
         let overflowed = ledger.overflowed;
         for role in &contract.required_artifacts {
+            let identities = contract.required_identities_for_role(*role);
             let completed = !overflowed
-                && ledger
-                    .events
-                    .iter()
-                    .any(|e| e.role == *role && matches!(e.ownership, ArtifactOwnership::Owned));
+                && if identities.is_empty() {
+                    ledger.events.iter().any(|event| {
+                        event.role == *role && matches!(event.ownership, ArtifactOwnership::Owned)
+                    })
+                } else {
+                    identities.iter().all(|identity| {
+                        ledger.events.iter().any(|event| {
+                            event.role == identity.role
+                                && matches!(event.ownership, ArtifactOwnership::Owned)
+                                && super::super::task_contract::normalized_artifact_path_eq(
+                                    &event.path,
+                                    &identity.path,
+                                )
+                        })
+                    })
+                };
             out.insert(*role, completed);
         }
         out
@@ -765,6 +990,35 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
+    // Issue #920 (DR4-001): accepting the `data_output` LLM role-label via
+    // `from_label` must NOT let a non-data path be admitted as a DataOutput
+    // artifact. `role_matches_path` is the Tier-B path-local admission guard and
+    // stays exhaustive (no `_ =>`): a DataOutput role only matches a data file.
+    #[test]
+    fn data_output_role_cannot_admit_non_data_path() {
+        // Non-data paths must NOT be admitted as DataOutput, even though the
+        // role label now round-trips through from_label.
+        assert!(!role_matches_path(ArtifactRole::DataOutput, "src/main.py"));
+        assert!(!role_matches_path(ArtifactRole::DataOutput, "app/main.py"));
+        assert!(!role_matches_path(
+            ArtifactRole::DataOutput,
+            "tests/test_x.py"
+        ));
+        assert!(!role_matches_path(ArtifactRole::DataOutput, "README.md"));
+        assert!(!role_matches_path(ArtifactRole::DataOutput, "package.json"));
+        assert!(!role_matches_path(
+            ArtifactRole::DataOutput,
+            "tsconfig.json"
+        ));
+        // Genuine data files are admitted.
+        assert!(role_matches_path(ArtifactRole::DataOutput, "out.csv"));
+        assert!(role_matches_path(ArtifactRole::DataOutput, "summary.json"));
+        assert!(role_matches_path(
+            ArtifactRole::DataOutput,
+            "data/records.jsonl"
+        ));
+    }
+
     fn single_root_scope() -> TaskWorkspaceScope {
         TaskWorkspaceScope {
             mode: ScopeMode::SingleProjectRoot,
@@ -788,6 +1042,68 @@ mod tests {
             verification: None,
             confidence: 0.0,
             test_execution_required: false,
+            // Issue #665: explicit None per DR2-006 (literal site policy).
+            behavior_goal: None,
+            required_capabilities: None,
+            verification_expectations: None,
+            non_goals: None,
+        }
+    }
+
+    fn test_contract(
+        required_artifacts: Vec<ArtifactRole>,
+        verification_required: bool,
+    ) -> super::super::task_contract::TaskContract {
+        let required_behavior = test_required_behavior();
+        let intent = super::super::task_contract::TaskIntent::Build;
+        let task_kind = super::super::task_contract::TaskKind::Coding;
+        let completion_policy = super::super::task_contract::CompletionPolicy::from_contract_parts(
+            task_kind,
+            intent,
+            &required_artifacts,
+            verification_required,
+            &required_behavior,
+        );
+        let deliverables = required_artifacts
+            .iter()
+            .copied()
+            .map(|role| super::super::task_contract::TaskDeliverable {
+                kind: match role {
+                    ArtifactRole::Implementation => {
+                        super::super::task_contract::DeliverableKind::Code
+                    }
+                    ArtifactRole::Test => super::super::task_contract::DeliverableKind::Tests,
+                    ArtifactRole::UsageDocs => {
+                        super::super::task_contract::DeliverableKind::UsageDocs
+                    }
+                    ArtifactRole::Setup => super::super::task_contract::DeliverableKind::Setup,
+                    ArtifactRole::DataOutput => {
+                        super::super::task_contract::DeliverableKind::StructuredRecord
+                    }
+                },
+                role: Some(role),
+                path: None,
+                required_sections: Vec::new(),
+            })
+            .collect();
+        super::super::task_contract::TaskContract {
+            task_kind,
+            intent,
+            deliverables,
+            required_artifacts,
+            required_artifact_identities: vec![],
+            optional_artifacts: vec![],
+            forbidden_artifacts: vec![],
+            verification_required,
+            completion_policy,
+            required_behavior,
+            // Issue #917: synthetic test contract — neutral matched confidence.
+            classification_confidence: 1.0,
+            evidence_command_hint: None,
+            authoring_style_decision:
+                super::super::authoring_style::AuthoringStyleDecision::unspecified(),
+            objective_evidence_kind_override: None,
+            api_contract_expectations: Vec::new(),
         }
     }
 
@@ -852,6 +1168,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "/etc/passwd",
             ArtifactRole::Implementation,
             AdmissionOriginInputs::Existing,
@@ -866,6 +1183,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "../sibling/x.py",
             ArtifactRole::Implementation,
             AdmissionOriginInputs::Existing,
@@ -880,6 +1198,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "tests/bad\u{0007}.py",
             ArtifactRole::Test,
             AdmissionOriginInputs::Existing,
@@ -894,6 +1213,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "node_modules/foo/index.js",
             ArtifactRole::Implementation,
             AdmissionOriginInputs::RepoEdit {
@@ -911,6 +1231,7 @@ mod tests {
         let big = "a/".repeat(MAX_ARTIFACT_LEDGER_PATH_BYTES) + "x.py";
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             &big,
             ArtifactRole::Implementation,
             AdmissionOriginInputs::Existing,
@@ -926,6 +1247,7 @@ mod tests {
         // `expected_role = Test` but path is clearly not a test file.
         let acc = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "src/lib.rs",
             ArtifactRole::Test,
             AdmissionOriginInputs::RepoEdit {
@@ -955,6 +1277,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(work.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "alias.py",
             ArtifactRole::Implementation,
             AdmissionOriginInputs::RepoEdit {
@@ -1175,13 +1498,7 @@ mod tests {
             ArtifactRole::Test,
             true,
         );
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Implementation, ArtifactRole::Test],
-            optional_artifacts: vec![],
-            verification_required: true,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(vec![ArtifactRole::Implementation, ArtifactRole::Test], true);
         let completed = ledger.required_artifacts_completed(&contract);
         assert_eq!(completed.get(&ArtifactRole::Test).copied(), Some(true));
         assert_eq!(
@@ -1197,13 +1514,10 @@ mod tests {
     #[test]
     fn active_job_candidates_returns_declaration_order_stub() {
         let ledger = ArtifactLedger::new();
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Implementation, ArtifactRole::Test],
-            optional_artifacts: vec![],
-            verification_required: false,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(
+            vec![ArtifactRole::Implementation, ArtifactRole::Test],
+            false,
+        );
         let got = ledger.active_job_candidates(&contract);
         assert_eq!(
             got,
@@ -1335,6 +1649,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(dir.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "",
             ArtifactRole::Test,
             AdmissionOriginInputs::RepoEdit {
@@ -1388,6 +1703,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(work.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "tests/new.py",
             ArtifactRole::Test,
             AdmissionOriginInputs::RepoEdit {
@@ -1412,6 +1728,7 @@ mod tests {
         let scope = single_root_scope();
         let acc = admit_event(
             &ctx(work.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "tests/new_test.py",
             ArtifactRole::Test,
             AdmissionOriginInputs::RepoEdit {
@@ -1441,6 +1758,7 @@ mod tests {
         let scope = single_root_scope();
         let err = admit_event(
             &ctx(work.path(), &scope),
+            super::super::artifact_ownership::NestedTestAdmission::default(),
             "tests/test_a.py",
             ArtifactRole::Test,
             AdmissionOriginInputs::RepoEdit {
@@ -1544,13 +1862,7 @@ mod tests {
             true,
         );
         assert!(ledger.overflowed());
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Test, ArtifactRole::Implementation],
-            optional_artifacts: vec![],
-            verification_required: true,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(vec![ArtifactRole::Test, ArtifactRole::Implementation], true);
         let completed = ledger.required_artifacts_completed(&contract);
         assert_eq!(completed.get(&ArtifactRole::Test).copied(), Some(false));
         assert_eq!(
@@ -1581,13 +1893,7 @@ mod tests {
             ArtifactRole::Test,
             true,
         );
-        let contract = TaskContract {
-            intent: super::super::task_contract::TaskIntent::Build,
-            required_artifacts: vec![ArtifactRole::Test, ArtifactRole::Implementation],
-            optional_artifacts: vec![],
-            verification_required: true,
-            required_behavior: test_required_behavior(),
-        };
+        let contract = test_contract(vec![ArtifactRole::Test, ArtifactRole::Implementation], true);
         assert_eq!(
             ledger.active_job_candidates(&contract),
             Vec::<ArtifactRole>::new(),
@@ -1657,6 +1963,171 @@ mod tests {
         assert_eq!(
             MAX_ARTIFACT_LEDGER_OBSERVATIONS, MAX_ARTIFACT_LEDGER_EVENTS,
             "observation cap and event cap must stay symmetric (CB-003 design contract)"
+        );
+    }
+
+    // ---- Issue #659 PR-001: log_context schema alignment -----------------
+    // Section 7.1 contract:
+    //   * `event_recorded` payload carries `turn_index` + `session_id`
+    //   * `turn_summary` payload carries `turn_index` + `session_id`
+    //   * `divergence_detected` payload carries bounded masked path-hash
+    //     lists (max 16, see `MAX_DIVERGENCE_PATH_HASHES`)
+    //
+    // The first two are exercised here at the module level; the third is
+    // exercised end-to-end from `artifact_ledger_phase2_tests` (it lives
+    // in `turn.rs`, not in this module).
+
+    #[test]
+    fn log_context_defaults_to_empty_then_set_log_context_updates_it() {
+        let mut ledger = ArtifactLedger::new();
+        let default_ctx = ledger.log_context().clone();
+        assert_eq!(default_ctx, ArtifactLedgerLogContext::default());
+        ledger.set_log_context(ArtifactLedgerLogContext::new("sess-abc", 7));
+        let got = ledger.log_context().clone();
+        assert_eq!(got.session_id, "sess-abc");
+        assert_eq!(got.turn_index, 7);
+    }
+
+    #[test]
+    fn clear_preserves_log_context_so_seed_call_order_is_independent() {
+        // `turn.rs::clear_per_turn_ledger_state_for_turn` calls `clear()`
+        // once per turn and `set_log_context()` separately. The order is
+        // documented in `clear()`'s doc comment — verify clear() does NOT
+        // wipe the context so callers can stamp it before or after the
+        // reset without changing the per-event payload.
+        let mut ledger = ArtifactLedger::new();
+        ledger.set_log_context(ArtifactLedgerLogContext::new("sess-keep", 9));
+        ledger.clear();
+        assert_eq!(ledger.log_context().session_id, "sess-keep");
+        assert_eq!(ledger.log_context().turn_index, 9);
+    }
+
+    #[test]
+    fn bounded_masked_path_hashes_caps_at_sixteen_and_masks() {
+        // 20 distinct paths -> 16 entries.
+        let inputs: Vec<String> = (0..20).map(|i| format!("tests/test_{i}.py")).collect();
+        let hashes = bounded_masked_path_hashes(inputs.iter().map(String::as_str));
+        assert_eq!(hashes.len(), MAX_DIVERGENCE_PATH_HASHES);
+        for h in &hashes {
+            assert_eq!(h.len(), 16, "stable_path_hash returns 16-char hex");
+            assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn bounded_masked_path_hashes_matches_event_recorded_path_hash_shape() {
+        // Hash space MUST match `event_recorded.path_hash` exactly so a
+        // dataset consumer can join divergence rows against per-event rows.
+        let path = "tests/test_join.py";
+        let expected = stable_path_hash(&mask_secrets(path));
+        let hashes = bounded_masked_path_hashes([path].iter().copied());
+        assert_eq!(hashes, vec![expected]);
+    }
+
+    // ---- Issue #663 Phase B: RequiredArtifactsProjection -----------------
+
+    #[test]
+    fn required_artifacts_projection_empty_ledger_reports_all_false() {
+        let ledger = ArtifactLedger::new();
+        let contract = test_contract(vec![ArtifactRole::Implementation, ArtifactRole::Test], true);
+        let p = ledger.required_artifacts_completed_projection(&contract);
+        assert!(!p.overflowed());
+        assert!(!p.is_satisfied(ArtifactRole::Implementation));
+        assert!(!p.is_satisfied(ArtifactRole::Test));
+    }
+
+    #[test]
+    fn required_artifacts_projection_marks_role_with_owned_event() {
+        // Issue #663 Phase B Task B.5 — when a role has at least one Owned
+        // RepoEdit event in the ledger, the projection's `is_satisfied`
+        // for that role MUST be `true`.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/test_a.py"), "").unwrap();
+        let scope = single_root_scope();
+        let mut ledger = ArtifactLedger::new();
+        ledger.record_repo_edit_event(
+            &ctx(dir.path(), &scope),
+            "tests/test_a.py".to_string(),
+            ArtifactRole::Test,
+            true,
+        );
+        let contract = test_contract(vec![ArtifactRole::Implementation, ArtifactRole::Test], true);
+        let p = ledger.required_artifacts_completed_projection(&contract);
+        assert!(p.is_satisfied(ArtifactRole::Test));
+        assert!(!p.is_satisfied(ArtifactRole::Implementation));
+        assert!(!p.overflowed());
+    }
+
+    #[test]
+    fn required_artifacts_projection_requires_explicit_identity_path_when_declared() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/cli.rs"), "stale rust test\n").unwrap();
+        let scope = single_root_scope();
+        let mut ledger = ArtifactLedger::new();
+        ledger.record_repo_edit_event(
+            &ctx(dir.path(), &scope),
+            "tests/cli.rs".to_string(),
+            ArtifactRole::Test,
+            true,
+        );
+        let contract = TaskContract::from_request(
+            "Create math_utils.py and tests/test_math_utils.py only. Use Python unittest.",
+        );
+
+        let stale_projection = ledger.required_artifacts_completed_projection(&contract);
+
+        assert!(
+            !stale_projection.is_satisfied(ArtifactRole::Test),
+            "owned stale test role path must not satisfy explicit test identity"
+        );
+
+        std::fs::write(
+            dir.path().join("tests/test_math_utils.py"),
+            "import unittest\n",
+        )
+        .unwrap();
+        ledger.record_repo_edit_event(
+            &ctx(dir.path(), &scope),
+            "tests/test_math_utils.py".to_string(),
+            ArtifactRole::Test,
+            true,
+        );
+        let satisfied_projection = ledger.required_artifacts_completed_projection(&contract);
+        assert!(satisfied_projection.is_satisfied(ArtifactRole::Test));
+    }
+
+    #[test]
+    fn required_artifacts_projection_fail_closed_on_overflow() {
+        // Issue #663 Phase B Task B.5 — when the ledger is overflowed,
+        // `is_satisfied` returns `false` for every role (fail-closed)
+        // regardless of any recorded events. DR1-002 / DR3-002 / R1.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/test_a.py"), "").unwrap();
+        let scope = single_root_scope();
+        let mut ledger = ArtifactLedger::new();
+        ledger.record_repo_edit_event(
+            &ctx(dir.path(), &scope),
+            "tests/test_a.py".to_string(),
+            ArtifactRole::Test,
+            true,
+        );
+        // Force overflowed state directly via append loop until the cap
+        // is exceeded.
+        for i in 0..(MAX_ARTIFACT_LEDGER_EVENTS + 2) {
+            let path = format!("tests/test_overflow_{i}.py");
+            std::fs::write(dir.path().join(&path), "").ok();
+            ledger.record_repo_edit_event(&ctx(dir.path(), &scope), path, ArtifactRole::Test, true);
+        }
+        assert!(ledger.overflowed(), "fixture: ledger must overflow");
+        let contract = test_contract(vec![ArtifactRole::Test], true);
+        let p = ledger.required_artifacts_completed_projection(&contract);
+        assert!(p.overflowed());
+        assert!(
+            !p.is_satisfied(ArtifactRole::Test),
+            "overflowed projection MUST be fail-closed for every role"
         );
     }
 }

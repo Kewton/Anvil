@@ -1,0 +1,8 @@
+profile: generic
+prompt: Create README.md with a clear usage heading and one command example.
+expected_artifacts:
+  - README.md
+functional_contract:
+  category: docs-content
+  required_capabilities:
+    - requested_content

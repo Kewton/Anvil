@@ -1,0 +1,389 @@
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from eval_lib.run_summary import SUMMARY_HEADER, write_summary
+
+
+class EvalCliContractTest(unittest.TestCase):
+    def test_speed_cloud_5x_and_provider_limit_override_are_recorded_in_matrix(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td) / "run"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-run.py",
+                    "--suite",
+                    "eval/suites/mvp-smoke.yaml",
+                    "--model-profile",
+                    "speed-cloud-5x",
+                    "--modes",
+                    "minimal-loop",
+                    "--runs",
+                    "1",
+                    "--parallel",
+                    "5",
+                    "--provider-limit",
+                    "4",
+                    "--run-root",
+                    str(run_root),
+                    "--dry-run",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            matrix = json.loads((run_root / "matrix.json").read_text(encoding="utf-8"))
+        self.assertTrue(matrix, "matrix should not be empty")
+        self.assertEqual({item["_model_profile"] for item in matrix}, {"speed-cloud-5x"})
+        self.assertEqual({item["_parallel_limit"] for item in matrix}, {5})
+        self.assertEqual({item["_provider_limit"] for item in matrix}, {4})
+
+    def test_anvildev_engine_minimal_is_rendered_in_child_command_not_eval_run_cli(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td) / "run"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-run.py",
+                    "--suite",
+                    "eval/suites/mvp-smoke.yaml",
+                    "--model-profile",
+                    "speed-cloud-5x",
+                    "--modes",
+                    "minimal-loop",
+                    "--scenario",
+                    "nextjs-space-invaders-large",
+                    "--runs",
+                    "1",
+                    "--binary",
+                    "anvildev",
+                    "--binary-kind",
+                    "anvildev",
+                    "--run-root",
+                    str(run_root),
+                    "--dry-run",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            commands = "\n".join(path.read_text(encoding="utf-8") for path in (run_root / "runs").glob("*/command.txt"))
+        self.assertIn('"--engine" "minimal"', commands)
+
+    def test_provider_smoke_suite_records_provider_probe_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td) / "run"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-run.py",
+                    "--suite",
+                    "eval/suites/mvp-provider-smoke.yaml",
+                    "--model-profile",
+                    "openai-only",
+                    "--modes",
+                    "minimal-loop",
+                    "--runs",
+                    "1",
+                    "--scenario",
+                    "write-one-file-small",
+                    "--run-root",
+                    str(run_root),
+                    "--dry-run",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            matrix = json.loads((run_root / "matrix.json").read_text(encoding="utf-8"))
+        probe = matrix[0]["provider_probe"]
+        self.assertTrue(probe["required_for_prompt_sensitive_fix"])
+        self.assertIn("provider_probe", probe["command"])
+        self.assertEqual(
+            {item["provider"] for item in probe["probes"]},
+            {"openai", "gemini", "ollama"},
+        )
+        for item in probe["probes"]:
+            self.assertIn("tool_args_recovery_classification", item["observes"])
+            self.assertEqual(
+                item["classifies"],
+                ["recoverable_tool_args", "unsafe_tool_args"],
+            )
+
+    def test_provider_probe_results_are_recorded_in_dry_run_summary(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            run_root = td_path / "run"
+            probe = td_path / "provider-probe.jsonl"
+            probe.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "event": "provider_probe",
+                                "provider": "openai",
+                                "probe": "tool_args_shape",
+                                "status": "passed",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "event": "provider_probe",
+                                "provider": "gemini",
+                                "probe": "function_calling_schema",
+                                "status": "skipped",
+                                "reason": "missing_gemini_api_key",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "event": "provider_probe",
+                                "provider": "openai",
+                                "probe": "tool_args_recovery_classification",
+                                "status": "passed",
+                                "recoverable_tool_args": "recovered_and_executed",
+                                "unsafe_tool_args": "rejected_nonrecoverable",
+                                "unsafe_error_kind": "path_confinement_error",
+                                "unsafe_shell_control": "rejected_nonrecoverable",
+                                "unsafe_shell_error_kind": "dangerous_command",
+                                "arguments_shape": "object_recovered",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-run.py",
+                    "--suite",
+                    "eval/suites/mvp-provider-smoke.yaml",
+                    "--model-profile",
+                    "openai-only",
+                    "--modes",
+                    "minimal-loop",
+                    "--runs",
+                    "1",
+                    "--scenario",
+                    "write-one-file-small",
+                    "--run-root",
+                    str(run_root),
+                    "--provider-probe-results",
+                    str(probe),
+                    "--dry-run",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = (run_root / "summary.eval.tsv").read_text(encoding="utf-8")
+            events = (run_root / "events.jsonl").read_text(encoding="utf-8")
+            provider_summary = json.loads(
+                (run_root / "provider_probe_summary.json").read_text(encoding="utf-8")
+            )
+        self.assertIn("provider_probe_status", summary)
+        self.assertIn("\tpassed\t2\t0\t1\t", summary)
+        self.assertIn('"event": "provider_probe"', events)
+        self.assertIn('"provider": "openai"', events)
+        self.assertEqual(provider_summary["status"], "passed")
+        self.assertEqual(provider_summary["passed"], 2)
+        self.assertEqual(provider_summary["skipped"], 1)
+        self.assertEqual(
+            provider_summary["probes_by_provider"]["openai"],
+            ["tool_args_recovery_classification", "tool_args_shape"],
+        )
+        self.assertEqual(provider_summary["unsafe_tool_args_rejected"], 1)
+        self.assertEqual(provider_summary["unsafe_shell_control_rejected"], 1)
+        self.assertEqual(provider_summary["recoverable_tool_args_classified"], 1)
+        self.assertEqual(
+            provider_summary["tool_args_recovery_classifications"][0]["unsafe_error_kind"],
+            "path_confinement_error",
+        )
+        self.assertEqual(
+            provider_summary["tool_args_recovery_classifications"][0][
+                "unsafe_shell_error_kind"
+            ],
+            "dangerous_command",
+        )
+
+    def test_eval_preflight_writes_comparative_parity_gate_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            run_root = td_path / "preflight"
+            mvp = td_path / "mvp.summary.eval.tsv"
+            source = td_path / "source.summary.eval.tsv"
+            mvp_trace = td_path / "mvp.trace.json"
+            source_trace = td_path / "source.trace.json"
+            report = td_path / "parity_gate_report.json"
+            write_summary(mvp, [summary_row(True), summary_row(True)])
+            write_summary(source, [summary_row(True), summary_row(True)])
+            write_trace_report(mvp_trace, "mvp")
+            write_trace_report(source_trace, "source")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-preflight.py",
+                    "--suite",
+                    "eval/suites/mvp-smoke.yaml",
+                    "--model-profile",
+                    "openai-only",
+                    "--modes",
+                    "minimal-loop",
+                    "--runs",
+                    "1",
+                    "--binary",
+                    "python3",
+                    "--offline-ok",
+                    "--gate-level",
+                    "comparative",
+                    "--mvp-summary",
+                    str(mvp),
+                    "--anvildev-summary",
+                    str(source),
+                    "--mvp-trace-report",
+                    str(mvp_trace),
+                    "--source-trace-report",
+                    str(source_trace),
+                    "--write-parity-gate-report",
+                    str(report),
+                    "--run-root",
+                    str(run_root),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            generated = json.loads(report.read_text(encoding="utf-8"))
+            preflight = json.loads((run_root / "preflight.json").read_text(encoding="utf-8"))
+        self.assertEqual(generated["anvildev_comparison"]["status"], "compared")
+        self.assertEqual(generated["anvildev_comparison"]["threshold"]["status"], "pass")
+        self.assertTrue(preflight["parity_gate"]["ok"])
+
+    def test_eval_preflight_fails_comparative_gate_threshold(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            mvp = td_path / "mvp.summary.eval.tsv"
+            source = td_path / "source.summary.eval.tsv"
+            write_summary(mvp, [summary_row(False), summary_row(False)])
+            write_summary(source, [summary_row(True), summary_row(True)])
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/eval-preflight.py",
+                    "--suite",
+                    "eval/suites/mvp-smoke.yaml",
+                    "--model-profile",
+                    "openai-only",
+                    "--modes",
+                    "minimal-loop",
+                    "--runs",
+                    "1",
+                    "--binary",
+                    "python3",
+                    "--offline-ok",
+                    "--gate-level",
+                    "comparative",
+                    "--mvp-summary",
+                    str(mvp),
+                    "--anvildev-summary",
+                    str(source),
+                    "--run-root",
+                    str(td_path / "preflight"),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(result.returncode, 5, result.stdout)
+
+
+def summary_row(success: bool):
+    row = {key: "" for key in SUMMARY_HEADER}
+    row.update(
+        {
+            "run_id": f"r-{success}",
+            "suite": "s",
+            "scenario": "case",
+            "mode": "minimal-loop",
+            "success": str(success).lower(),
+            "rc": "0" if success else "1",
+            "failure_kind": "" if success else "runtime_failure",
+            "failure_layer": "" if success else "runtime",
+            "acceptance_success": str(success).lower(),
+            "acceptance_false_positive": "false",
+        }
+    )
+    return row
+
+
+def write_trace_report(path: Path, trace_id: str):
+    rows = [
+        {
+            "suite": "s",
+            "scenario": "case",
+            "mode": "minimal-loop",
+            "provider_model_pair": "openai:gpt planner=gemini:flash",
+        }
+    ]
+    gate_counts = {f"G-S{index:02d}": 1 for index in range(1, 17)}
+    is_source = trace_id == "source"
+    normalized_events = [
+        {
+            "stage": "phase_context_attached",
+            "gate_ids": ["G-S05"],
+            "source_event": "source_phase_context_observed"
+            if is_source
+            else "ultra_phase_context_attached",
+            "phase_index": 1,
+            "has_ultra_goal": True,
+            "has_current_phase": True,
+            "has_workspace_snapshot": True,
+            "has_profile_contract": True,
+        },
+        {
+            "stage": "step_prompt_built",
+            "gate_ids": ["G-S06"],
+            "source_event": "source_step_prompt_observed"
+            if is_source
+            else "step_prompt_contract",
+            "has_overall_goal": True,
+            "has_expected_paths": True,
+            "has_verify_commands": True,
+            "has_expected_result": True,
+        },
+    ]
+    path.write_text(
+        json.dumps(
+            {
+                "trace_id": trace_id,
+                "normalized_event_count": len(normalized_events),
+                "manifest_rows": rows,
+                "stage_counts": {
+                    "plan_generated": 1,
+                    "phase_context_attached": 1,
+                    "step_prompt_built": 1,
+                },
+                "gate_counts": gate_counts,
+                "normalized_events": normalized_events,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+if __name__ == "__main__":
+    unittest.main()

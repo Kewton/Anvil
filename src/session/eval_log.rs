@@ -17,6 +17,7 @@ use crate::logging::mask_payload_inplace;
 use crate::session::anvil_score::AnvilScore;
 use crate::session::feedback::mask_secrets;
 use crate::session::precaution::{Precaution, PrecautionStatus};
+use crate::terminal_outcome::generic_label_for_legacy_terminal;
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -32,6 +33,8 @@ pub const MAX_EVAL_VERIFY_CMD_BYTES: usize = 4096;
 pub const MAX_PHOTON_EVAL_FIELD_BYTES: usize = 256;
 pub const MAX_PHOTON_EVAL_WARNINGS: usize = 8;
 pub const MAX_PHOTON_EVAL_WARNING_BYTES: usize = 512;
+pub const MAX_EVAL_COMPLETION_REASON_BYTES: usize = 256;
+pub const MAX_PAM_EVAL_TARGETS: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -55,6 +58,11 @@ pub struct EvalRecord {
     pub verify_commands: Vec<String>,
     pub case_retrieval_result: Option<CaseRetrievalSummary>,
     pub photon_eval: Option<PhotonEvalSummary>,
+    /// Issue #857: turn-level PAM advisory impact summary. This intentionally
+    /// records categorical decision impact only; PAM context text and per-item
+    /// adoption reasons stay in `agent.memory.report.pam_decision`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pam_eval: Option<PamEvalSummary>,
     /// Photon canary value (0-1000) recorded at turn time.
     /// 0 = disabled, 1000 = full traffic.
     #[serde(default)]
@@ -67,7 +75,51 @@ pub struct EvalRecord {
     /// schema invariant).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_promote: Option<AutoPromoteOutcomeSummary>,
+    /// Issue #848: obligation-level diagnosis for `final_outcome`.
+    ///
+    /// Additive eval-log field so downstream evaluators can classify terminal
+    /// failures without reconstructing model/control/verifier state from free
+    /// text or sibling event streams. Job-report and safe-stop schemas are
+    /// intentionally unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_diagnostics: Option<TerminalDiagnosticsSummary>,
+    /// RWP-1: shadow projection derived from typed terminal obligations.
+    ///
+    /// This is diagnostic-only. It intentionally does not change
+    /// `final_outcome`, `completion_reason`, or `evaluation_taxonomy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_terminal_projection: Option<ShadowTerminalProjectionSummary>,
+    /// Issue #950: distinct controller recovery strategies attempted during
+    /// delegated local-LLM persistence. Labels are static controller-owned
+    /// strings, never raw commands, paths, tool args, or approval details.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub recovery_strategy_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_strategies: Vec<String>,
+    /// Issue #904: machine-readable evaluation taxonomy for no-PAM/PAM
+    /// aggregation. External postcheck agreement is intentionally explicit:
+    /// the in-process turn log cannot know the harness result unless a future
+    /// evaluator enriches the record.
+    pub evaluation_taxonomy: EvaluationTaxonomySummary,
+    /// Issue #866: bounded terminal reason for completion authority.
+    ///
+    /// For successful turns this explains which evidence class made `done`
+    /// admissible. For non-success terminal outcomes it mirrors the outcome
+    /// family so downstream evals do not need to infer completion authority
+    /// from free-text summaries.
+    pub completion_reason: String,
     pub final_outcome: String,
+    /// Issue #925 (P8): the agent's CLASSIFIED task_kind for this turn
+    /// (`TaskContract.task_kind.as_str()`), post-set from the agent layer.
+    ///
+    /// DR3-002: the session layer never imports the agent `TaskKind` enum; the
+    /// agent passes a plain string. `evaluation_taxonomy.task_kind` prefers this
+    /// value when present and falls back to the eval-side prompt heuristic when
+    /// no per-turn classification authority existed (e.g. answer-only / plan
+    /// turns). `analyze_run.py` also reads this top-level field for the R5
+    /// misroute gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classified_task_kind: Option<String>,
 }
 
 /// Summary of a single LLM-requested tool call (no result).
@@ -202,6 +254,119 @@ pub struct PhotonEvalSummary {
     pub outcome_detail_emitted: Option<String>,
 }
 
+/// Issue #857: bounded eval-log projection of the PAM advisory decision.
+///
+/// `advisory_only=true` and `completion_judgement_override=false` are explicit
+/// audit fields: PAM can explain or filter prompt context, but it must not be
+/// terminal completion authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PamEvalSummary {
+    pub mode: String,
+    pub decision_type: String,
+    pub decision_types: Vec<String>,
+    #[serde(default = "default_pam_availability")]
+    pub availability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_targets: Vec<PamEvalTarget>,
+    pub actual_injected_count: u32,
+    pub suppressed_count: u32,
+    pub would_inject_in_live_count: u32,
+    pub advisory_only: bool,
+    pub completion_judgement_override: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unused_reason: Option<String>,
+}
+
+impl PamEvalSummary {
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        let unused_reason = reason.into();
+        let availability =
+            Self::derive_availability("not_used", 0, 0, 0, Some(unused_reason.as_str()));
+        let failure_phase = Self::derive_failure_phase(Some(unused_reason.as_str()));
+        Self {
+            mode: "not_used".to_string(),
+            decision_type: "not_used".to_string(),
+            decision_types: vec!["not_used".to_string()],
+            availability: availability.to_string(),
+            failure_phase: failure_phase.map(str::to_string),
+            affected_targets: Vec::new(),
+            actual_injected_count: 0,
+            suppressed_count: 0,
+            would_inject_in_live_count: 0,
+            advisory_only: true,
+            completion_judgement_override: false,
+            unused_reason: Some(unused_reason),
+        }
+    }
+
+    pub fn derive_availability(
+        mode: &str,
+        actual_injected_count: u32,
+        suppressed_count: u32,
+        _would_inject_in_live_count: u32,
+        unused_reason: Option<&str>,
+    ) -> &'static str {
+        match unused_reason {
+            Some("disabled") | Some("plan_mode") => return "disabled",
+            Some("photon_unavailable") => return "failed",
+            Some(reason) if reason.starts_with("context_pack_failed") => return "failed",
+            Some("shadow_mode") => return "not_injected",
+            Some("canary_gate") => return "not_injected",
+            Some(_) if mode == "not_used" => return "not_injected",
+            _ => {}
+        }
+        if actual_injected_count > 0 {
+            "injected"
+        } else if suppressed_count > 0 {
+            "blocked_warning"
+        } else {
+            "not_injected"
+        }
+    }
+
+    pub fn derive_failure_phase(unused_reason: Option<&str>) -> Option<&'static str> {
+        match unused_reason {
+            Some("disabled") => Some("disabled"),
+            Some("plan_mode") => Some("plan_mode"),
+            Some("photon_unavailable") => Some("photon_availability"),
+            Some("shadow_mode") | Some("canary_gate") => Some("send_gate"),
+            Some("context_pack_failed") => Some("context_pack_call"),
+            Some(reason) if reason.starts_with("context_pack_failed:") => reason
+                .split_once(':')
+                .map(|(_, phase)| phase)
+                .map(|phase| match phase {
+                    "sidecar_call" => "sidecar_call",
+                    "empty_response" => "empty_response",
+                    "parse_failure" => "parse_failure",
+                    "timeout" => "timeout",
+                    "input_empty" => "input_empty",
+                    _ => "context_pack_call",
+                }),
+            _ => None,
+        }
+    }
+}
+
+fn default_pam_availability() -> String {
+    "unknown".to_string()
+}
+
+/// Issue #867: bounded PAM advisory attribution target for eval logs.
+///
+/// These entries identify where PAM advice was allowed to matter. They are
+/// intentionally not completion evidence: `completion_judgement_override`
+/// remains false and completion still comes from task-contract/verifier state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PamEvalTarget {
+    pub target_type: String,
+    pub target: String,
+    pub decision_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_id: Option<String>,
+}
+
 /// Issue #604 (Task 4.1 / DR2-007): 3-field flat summary attached to
 /// `EvalRecord.auto_promote`. SSOT for the post-loop auto-promote hook's
 /// per-turn outcome carrier.
@@ -226,6 +391,214 @@ pub struct AutoPromoteOutcomeSummary {
     /// Sanitized photon `summary_id` for the promoted / scrubbed /
     /// rejected_by_photon cases. `None` for non-HTTP skip paths.
     pub summary_id: Option<String>,
+}
+
+/// Issue #848: structured terminal-outcome classification for eval logs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalDiagnosticsSummary {
+    /// Legacy terminal label, kept compatible with `EvalRecord.final_outcome`.
+    pub outcome: String,
+    /// Generic lifecycle terminal label used by new reporting surfaces.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub generic_outcome: String,
+    pub classification: String,
+    pub satisfied_obligations: Vec<String>,
+    pub missing_obligations: Vec<String>,
+    pub verifier_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_signature: Option<String>,
+    pub obligations: Vec<TerminalObligationDiagnostic>,
+}
+
+/// One obligation status within a terminal outcome.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalObligationDiagnostic {
+    pub id: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_domain: Option<String>,
+    pub detail: String,
+}
+
+/// RWP-1 diagnostic-only terminal projection from typed obligations.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShadowTerminalProjectionSummary {
+    pub class: String,
+    pub current_terminal_class: String,
+    pub conflict: bool,
+    pub satisfied_evidence_ids: Vec<String>,
+    pub missing_evidence_ids: Vec<String>,
+    pub failed_evidence_ids: Vec<String>,
+    pub source: String,
+    pub reason: String,
+}
+
+/// Issue #904: bounded taxonomy for offline quality reports.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EvaluationTaxonomySummary {
+    pub pam_variant: String,
+    pub task_kind: String,
+    pub anvil_terminal_class: String,
+    pub outcome_agreement: String,
+    pub failure_authority: String,
+}
+
+impl EvalRecord {
+    pub fn refresh_evaluation_taxonomy(&mut self) {
+        self.evaluation_taxonomy = build_evaluation_taxonomy(
+            &self.task,
+            &self.final_outcome,
+            &self.changed_file_classes,
+            self.terminal_diagnostics.as_ref(),
+            self.shadow_terminal_projection.as_ref(),
+            self.classified_task_kind.as_deref(),
+            self.pam_eval.as_ref(),
+        );
+    }
+
+    pub fn refresh_completion_reason(&mut self) {
+        self.completion_reason = truncate_bytes(
+            &completion_reason_for_eval(
+                &self.final_outcome,
+                &self.changed_file_classes,
+                self.verify_commands.len(),
+                self.classified_task_kind.as_deref(),
+                &self.tool_calls,
+            ),
+            MAX_EVAL_COMPLETION_REASON_BYTES,
+        );
+    }
+
+    pub fn refresh_terminal_diagnostics(&mut self) {
+        if self.final_outcome != "done"
+            || !non_coding_artifact_tool_observed(
+                self.classified_task_kind.as_deref(),
+                &self.tool_calls,
+            )
+        {
+            return;
+        }
+        let Some(diagnostics) = self.terminal_diagnostics.as_mut() else {
+            return;
+        };
+        diagnostics.outcome = self.final_outcome.clone();
+        diagnostics.generic_outcome =
+            generic_label_for_legacy_terminal(&self.final_outcome).to_string();
+        diagnostics.classification = "success".to_string();
+        set_obligation(
+            &mut diagnostics.obligations,
+            "repo_edit",
+            "satisfied",
+            None,
+            "repository artifact edit was recorded through a non-coding tool call",
+        );
+        set_obligation(
+            &mut diagnostics.obligations,
+            "verification_environment",
+            "not_applicable",
+            None,
+            "command verifier was not required because controller artifact evidence completed the turn",
+        );
+        set_obligation(
+            &mut diagnostics.obligations,
+            "verification_evidence",
+            "not_applicable",
+            None,
+            "command verifier evidence was not required because artifact evidence completed the turn",
+        );
+        upsert_obligation(
+            &mut diagnostics.obligations,
+            obligation(
+                "artifact_evidence",
+                "satisfied",
+                None,
+                "non-coding artifact evidence was satisfied by the controller completion gate",
+            ),
+        );
+        if non_coding_command_observation_tool_observed(
+            self.classified_task_kind.as_deref(),
+            &self.tool_calls,
+        ) {
+            upsert_obligation(
+                &mut diagnostics.obligations,
+                obligation(
+                    "command_observation_evidence",
+                    "satisfied",
+                    None,
+                    "ops command-observation evidence was recorded through a Bash tool call",
+                ),
+            );
+        }
+        set_obligation(
+            &mut diagnostics.obligations,
+            "repair_convergence",
+            "not_applicable",
+            None,
+            "completed objective-bound evidence superseded artifact repair exhaustion",
+        );
+        refresh_terminal_obligation_indexes(diagnostics);
+        self.refresh_shadow_terminal_projection();
+    }
+
+    pub fn refresh_shadow_terminal_projection(&mut self) {
+        self.shadow_terminal_projection = self
+            .terminal_diagnostics
+            .as_ref()
+            .map(|diagnostics| build_shadow_terminal_projection(&self.final_outcome, diagnostics));
+    }
+
+    pub fn mark_artifact_evidence_repair_exhausted(&mut self) {
+        let Some(diagnostics) = self.terminal_diagnostics.as_mut() else {
+            return;
+        };
+        diagnostics.generic_outcome = "evidence_repair_exhausted".to_string();
+        diagnostics.classification = "evidence_repair_exhausted".to_string();
+        if non_coding_artifact_tool_observed(self.classified_task_kind.as_deref(), &self.tool_calls)
+        {
+            set_obligation(
+                &mut diagnostics.obligations,
+                "repo_edit",
+                "satisfied",
+                None,
+                "repository artifact edit was recorded through a non-coding tool call",
+            );
+        }
+        set_obligation(
+            &mut diagnostics.obligations,
+            "verification_environment",
+            "not_applicable",
+            None,
+            "verification environment was not the artifact evidence blocker",
+        );
+        set_obligation(
+            &mut diagnostics.obligations,
+            "verification_evidence",
+            "not_applicable",
+            None,
+            "verifier evidence was not the artifact evidence blocker",
+        );
+        set_obligation(
+            &mut diagnostics.obligations,
+            "repair_convergence",
+            "unsatisfied",
+            Some("evidence_repair_exhausted"),
+            "artifact evidence repair reached its controlled exhaustion terminal",
+        );
+        upsert_obligation(
+            &mut diagnostics.obligations,
+            obligation(
+                "artifact_evidence",
+                "unsatisfied",
+                Some("evidence_repair_exhausted"),
+                "artifact exists but failed its required evidence obligation repeatedly",
+            ),
+        );
+        refresh_terminal_obligation_indexes(diagnostics);
+    }
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -327,12 +700,74 @@ pub fn build_eval_record(
     auto_promote: Option<AutoPromoteOutcomeSummary>,
     final_outcome: &str,
 ) -> EvalRecord {
+    build_eval_record_with_terminal_context(
+        session_id,
+        ts_ms,
+        task,
+        model,
+        mode,
+        tool_protocol,
+        tool_calls,
+        feedback_frame,
+        active_precautions,
+        anvil_score,
+        changed_file_classes,
+        verify_commands,
+        case_retrieval_result,
+        photon_eval,
+        auto_promote,
+        final_outcome,
+        None,
+    )
+}
+
+/// Variant of [`build_eval_record`] for callers that have verifier-repair
+/// terminal context available at the turn boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn build_eval_record_with_terminal_context(
+    session_id: &str,
+    ts_ms: u64,
+    task: &str,
+    model: &str,
+    mode: &str,
+    tool_protocol: &str,
+    tool_calls: &[ToolCallSummary],
+    feedback_frame: Option<FeedbackFrameSummary>,
+    active_precautions: &[EvalPrecautionSnapshot],
+    anvil_score: Option<AnvilScoreSummary>,
+    changed_file_classes: ChangedFileClasses,
+    verify_commands: &[String],
+    case_retrieval_result: Option<CaseRetrievalSummary>,
+    photon_eval: Option<PhotonEvalSummary>,
+    auto_promote: Option<AutoPromoteOutcomeSummary>,
+    final_outcome: &str,
+    last_failure_signature: Option<&str>,
+) -> EvalRecord {
     // DR4-002: mask_secrets → truncate for free-text fields
     let task = truncate_bytes(&mask_secrets(task), MAX_EVAL_TASK_BYTES);
     let verify_commands: Vec<String> = verify_commands
         .iter()
         .map(|c| truncate_bytes(&mask_secrets(c), MAX_EVAL_VERIFY_CMD_BYTES))
         .collect();
+    let terminal_diagnostics = Some(build_terminal_diagnostics_with_context(
+        final_outcome,
+        &changed_file_classes,
+        verify_commands.len(),
+        last_failure_signature,
+    ));
+    let shadow_terminal_projection = terminal_diagnostics
+        .as_ref()
+        .map(|diagnostics| build_shadow_terminal_projection(final_outcome, diagnostics));
+    let completion_reason = truncate_bytes(
+        &completion_reason_for_eval(
+            final_outcome,
+            &changed_file_classes,
+            verify_commands.len(),
+            None,
+            tool_calls,
+        ),
+        MAX_EVAL_COMPLETION_REASON_BYTES,
+    );
 
     // Precautions: cap count
     let active_precautions: Vec<EvalPrecautionSnapshot> = active_precautions
@@ -340,6 +775,16 @@ pub fn build_eval_record(
         .take(MAX_EVAL_PRECAUTIONS)
         .cloned()
         .collect();
+
+    let evaluation_taxonomy = build_evaluation_taxonomy(
+        &task,
+        final_outcome,
+        &changed_file_classes,
+        terminal_diagnostics.as_ref(),
+        shadow_terminal_projection.as_ref(),
+        None,
+        None,
+    );
 
     EvalRecord {
         schema_version: 1,
@@ -357,10 +802,668 @@ pub fn build_eval_record(
         verify_commands,
         case_retrieval_result,
         photon_eval,
+        pam_eval: None,
         photon_canary: 0,
         auto_promote,
+        terminal_diagnostics,
+        shadow_terminal_projection,
+        recovery_strategy_count: 0,
+        recovery_strategies: Vec::new(),
+        evaluation_taxonomy,
+        completion_reason,
         final_outcome: final_outcome.to_string(),
+        // Issue #925: post-set by the agent layer (actor_loop_flow), like
+        // `pam_eval`. The session layer cannot derive the classified kind
+        // (DR3-002), so the builder leaves it `None`.
+        classified_task_kind: None,
     }
+}
+
+pub fn build_terminal_diagnostics(
+    final_outcome: &str,
+    changed_file_classes: &ChangedFileClasses,
+    verify_command_count: usize,
+) -> TerminalDiagnosticsSummary {
+    build_terminal_diagnostics_with_context(
+        final_outcome,
+        changed_file_classes,
+        verify_command_count,
+        None,
+    )
+}
+
+pub fn build_terminal_diagnostics_with_context(
+    final_outcome: &str,
+    changed_file_classes: &ChangedFileClasses,
+    verify_command_count: usize,
+    last_failure_signature: Option<&str>,
+) -> TerminalDiagnosticsSummary {
+    let changed_count = changed_file_classes
+        .test
+        .saturating_add(changed_file_classes.impl_files)
+        .saturating_add(changed_file_classes.setup);
+    let classification =
+        classify_terminal_outcome_with_context(final_outcome, changed_count, verify_command_count);
+    let repo_edit_status = if changed_count > 0 {
+        ("satisfied", "repository edits were recorded")
+    } else {
+        ("not_observed", "no repository edits were recorded")
+    };
+    let verifier_status = if verify_command_count > 0 {
+        ("satisfied", "verifier command evidence was recorded")
+    } else {
+        ("not_observed", "no verifier command evidence was recorded")
+    };
+
+    let mut obligations = vec![
+        obligation(
+            "model_output_format",
+            "satisfied",
+            None,
+            "model output was parseable enough to reach terminal handling",
+        ),
+        obligation("repo_edit", repo_edit_status.0, None, repo_edit_status.1),
+        obligation(
+            "verification_environment",
+            verifier_status.0,
+            None,
+            verifier_status.1,
+        ),
+        obligation(
+            "verification_evidence",
+            verifier_status.0,
+            None,
+            verifier_status.1,
+        ),
+        obligation(
+            "repair_convergence",
+            "not_applicable",
+            None,
+            "repair loop was not the terminal authority",
+        ),
+    ];
+
+    match final_outcome {
+        "done" => {
+            if changed_count == 0 {
+                set_obligation(
+                    &mut obligations,
+                    "repo_edit",
+                    "not_applicable",
+                    None,
+                    "no repository edit obligation was observed for this successful turn",
+                );
+            }
+            if verify_command_count == 0 {
+                set_obligation(
+                    &mut obligations,
+                    "verification_environment",
+                    "not_applicable",
+                    None,
+                    "no verifier obligation was observed for this successful turn",
+                );
+                set_obligation(
+                    &mut obligations,
+                    "verification_evidence",
+                    "not_applicable",
+                    None,
+                    "no verifier evidence obligation was observed for this successful turn",
+                );
+            }
+        }
+        "missing_repo_edits" => {
+            set_obligation(
+                &mut obligations,
+                "repo_edit",
+                "unsatisfied",
+                Some("model_output_failure"),
+                "terminal outcome reports that required repository edits were not produced",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_environment",
+                "not_applicable",
+                None,
+                "verification environment was not the terminal blocker",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_evidence",
+                "not_applicable",
+                None,
+                "verification evidence was not reached because repository edits were missing",
+            );
+        }
+        "tool_call_format_error" => {
+            set_obligation(
+                &mut obligations,
+                "model_output_format",
+                "unsatisfied",
+                Some("model_output_failure"),
+                "assistant emitted malformed or truncated tool calls repeatedly",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_environment",
+                "not_applicable",
+                None,
+                "verification environment was not the terminal blocker",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_evidence",
+                "not_applicable",
+                None,
+                "verification evidence was not reached because tool-call parsing failed",
+            );
+        }
+        "missing_verification" if verify_command_count == 0 => {
+            set_obligation(
+                &mut obligations,
+                "verification_environment",
+                "unsatisfied",
+                Some("verification_environment_failure"),
+                "required verifier evidence was not observed before terminal handling",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_evidence",
+                "unsatisfied",
+                Some("verification_environment_failure"),
+                "verification evidence is absent because no verifier command was recorded",
+            );
+        }
+        "missing_verification" => {
+            set_obligation(
+                &mut obligations,
+                "verification_evidence",
+                "unsatisfied",
+                Some("verification_failure"),
+                "required verifier evidence remained incomplete after verifier execution",
+            );
+        }
+        "safe_stop_verifier_missing" => {
+            set_obligation(
+                &mut obligations,
+                "verification_environment",
+                "unsatisfied",
+                Some("verification_environment_failure"),
+                "requested verification could not run because no authoritative verifier was available",
+            );
+            set_obligation(
+                &mut obligations,
+                "verification_evidence",
+                "unsatisfied",
+                Some("verification_environment_failure"),
+                "verification evidence is absent because verifier setup is missing",
+            );
+        }
+        "repair_exhausted" => {
+            if changed_count == 0 {
+                set_obligation(
+                    &mut obligations,
+                    "repo_edit",
+                    "unsatisfied",
+                    Some("model_output_failure"),
+                    "repair exhausted before a repository edit was recorded",
+                );
+            }
+            if verify_command_count == 0 {
+                set_obligation(
+                    &mut obligations,
+                    "verification_environment",
+                    "unsatisfied",
+                    Some("verification_environment_failure"),
+                    "repair exhausted without verifier command evidence",
+                );
+                set_obligation(
+                    &mut obligations,
+                    "verification_evidence",
+                    "unsatisfied",
+                    Some("verification_environment_failure"),
+                    "repair exhausted before verifier evidence could be recorded",
+                );
+            }
+            set_obligation(
+                &mut obligations,
+                "repair_convergence",
+                "unsatisfied",
+                Some(classification),
+                "verifier repair reached its controlled exhaustion terminal",
+            );
+        }
+        _ => {}
+    }
+
+    let satisfied_obligations = obligations
+        .iter()
+        .filter(|obligation| obligation.status == "satisfied")
+        .map(|obligation| obligation.id.clone())
+        .collect();
+    let missing_obligations = obligations
+        .iter()
+        .filter(|obligation| obligation.status == "unsatisfied")
+        .map(|obligation| obligation.id.clone())
+        .collect();
+    let verifier_status = terminal_verifier_status(final_outcome, verify_command_count);
+    let last_failure_signature = last_failure_signature
+        .map(|signature| truncate_bytes(&mask_secrets(signature), MAX_PHOTON_EVAL_WARNING_BYTES));
+
+    TerminalDiagnosticsSummary {
+        outcome: final_outcome.to_string(),
+        generic_outcome: generic_label_for_legacy_terminal(final_outcome).to_string(),
+        classification: classification.to_string(),
+        satisfied_obligations,
+        missing_obligations,
+        verifier_status: verifier_status.to_string(),
+        last_failure_signature,
+        obligations,
+    }
+}
+
+fn build_shadow_terminal_projection(
+    final_outcome: &str,
+    diagnostics: &TerminalDiagnosticsSummary,
+) -> ShadowTerminalProjectionSummary {
+    let mut satisfied = Vec::new();
+    let mut missing = Vec::new();
+    let mut failed = Vec::new();
+    for item in diagnostics
+        .obligations
+        .iter()
+        .filter(|item| is_evidence_obligation(&item.id))
+    {
+        match item.status.as_str() {
+            "satisfied" => push_unique_string(&mut satisfied, item.id.clone()),
+            "unsatisfied" if is_failure_domain(item.failure_domain.as_deref()) => {
+                push_unique_string(&mut failed, item.id.clone())
+            }
+            "unsatisfied" => push_unique_string(&mut missing, item.id.clone()),
+            _ => {}
+        }
+    }
+
+    let class = if !failed.is_empty() {
+        "evidence_failed"
+    } else if !missing.is_empty() {
+        "missing_evidence"
+    } else if diagnostics
+        .obligations
+        .iter()
+        .any(|item| item.id == "repair_convergence" && item.status == "unsatisfied")
+    {
+        "evidence_repair_exhausted"
+    } else if diagnostics
+        .obligations
+        .iter()
+        .any(|item| item.id == "repo_edit" && item.status == "unsatisfied")
+    {
+        "missing_deliverable"
+    } else if !satisfied.is_empty() || diagnostics.classification == "success" {
+        "success"
+    } else {
+        "not_observed"
+    };
+    let current_terminal_class = if final_outcome == "done" {
+        "success"
+    } else {
+        diagnostics.generic_outcome.as_str()
+    };
+    let conflict = (current_terminal_class == "success") != (class == "success");
+    ShadowTerminalProjectionSummary {
+        class: class.to_string(),
+        current_terminal_class: current_terminal_class.to_string(),
+        conflict,
+        satisfied_evidence_ids: satisfied,
+        missing_evidence_ids: missing,
+        failed_evidence_ids: failed,
+        source: "terminal_diagnostics".to_string(),
+        reason: shadow_terminal_reason(class, conflict).to_string(),
+    }
+}
+
+fn is_evidence_obligation(id: &str) -> bool {
+    id.contains("evidence") || id == "artifact_evidence" || id == "command_observation_evidence"
+}
+
+fn is_failure_domain(domain: Option<&str>) -> bool {
+    matches!(
+        domain,
+        Some("verification_failure") | Some("evidence_failure")
+    )
+}
+
+fn shadow_terminal_reason(class: &str, conflict: bool) -> &'static str {
+    match (class, conflict) {
+        ("success", true) => {
+            "shadow evidence indicates success while current terminal is non-success"
+        }
+        ("success", false) => "typed evidence obligations indicate success",
+        ("missing_evidence", true) => {
+            "shadow evidence indicates missing evidence while current terminal is success"
+        }
+        ("missing_evidence", false) => "typed evidence obligations indicate missing evidence",
+        ("evidence_failed", true) => {
+            "shadow evidence indicates failed evidence while current terminal is success"
+        }
+        ("evidence_failed", false) => "typed evidence obligations indicate failed evidence",
+        ("evidence_repair_exhausted", _) => "typed repair-convergence obligation is unsatisfied",
+        ("missing_deliverable", _) => "typed deliverable obligation is unsatisfied",
+        _ => "typed evidence obligations were not observed",
+    }
+}
+
+fn push_unique_string(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn classify_terminal_outcome_with_context(
+    final_outcome: &str,
+    changed_count: usize,
+    verify_command_count: usize,
+) -> &'static str {
+    match final_outcome {
+        "done" => "success",
+        "missing_repo_edits" | "tool_call_format_error" => "model_output_failure",
+        "safe_stop_verifier_missing" => "verification_environment_failure",
+        "repair_exhausted" if verify_command_count == 0 => "verification_environment_failure",
+        "repair_exhausted" if changed_count == 0 => "model_output_failure",
+        "repair_exhausted" => "control_loop_failure",
+        "missing_verification" if verify_command_count == 0 => "verification_environment_failure",
+        "missing_verification" | "verifier_failed" | "safe_stop_verifier_weak" => {
+            "verification_failure"
+        }
+        "transport_error" => "transport_failure",
+        "interrupted" => "interrupted",
+        _ => "control_loop_failure",
+    }
+}
+
+fn terminal_verifier_status(final_outcome: &str, verify_command_count: usize) -> &'static str {
+    if verify_command_count == 0 {
+        return "not_observed";
+    }
+    if final_outcome == "done" {
+        "satisfied"
+    } else {
+        "failed_or_incomplete"
+    }
+}
+
+fn build_evaluation_taxonomy(
+    task: &str,
+    final_outcome: &str,
+    changed_file_classes: &ChangedFileClasses,
+    terminal_diagnostics: Option<&TerminalDiagnosticsSummary>,
+    shadow_terminal_projection: Option<&ShadowTerminalProjectionSummary>,
+    classified_task_kind: Option<&str>,
+    pam_eval: Option<&PamEvalSummary>,
+) -> EvaluationTaxonomySummary {
+    let failure_authority =
+        failure_authority_for_eval(final_outcome, changed_file_classes, terminal_diagnostics);
+    let shadow_conflict = shadow_terminal_projection
+        .map(|projection| projection.conflict)
+        .unwrap_or(false);
+    let anvil_terminal_class = if shadow_conflict {
+        shadow_terminal_projection
+            .map(|projection| format!("shadow_{}", projection.class))
+            .unwrap_or_else(|| "shadow_conflict".to_string())
+    } else if final_outcome == "done" {
+        "success".to_string()
+    } else {
+        "non_success".to_string()
+    };
+    let failure_authority = if shadow_conflict && final_outcome == "done" {
+        shadow_terminal_projection
+            .map(|projection| projection.class.as_str())
+            .unwrap_or(failure_authority)
+    } else {
+        failure_authority
+    };
+    EvaluationTaxonomySummary {
+        pam_variant: pam_variant_for_eval(pam_eval).to_string(),
+        task_kind: classified_task_kind
+            .and_then(normalize_classified_task_kind_for_eval)
+            .unwrap_or_else(|| infer_eval_task_kind(task))
+            .to_string(),
+        anvil_terminal_class,
+        outcome_agreement: "external_postcheck_unavailable".to_string(),
+        failure_authority: failure_authority.to_string(),
+    }
+}
+
+fn normalize_classified_task_kind_for_eval(raw: &str) -> Option<&'static str> {
+    match raw {
+        "coding" => Some("coding"),
+        "docs" => Some("docs"),
+        "data" => Some("data"),
+        "research" => Some("research"),
+        "ops" => Some("ops"),
+        "authoring" => Some("authoring"),
+        _ => None,
+    }
+}
+
+fn failure_authority_for_eval(
+    final_outcome: &str,
+    changed_file_classes: &ChangedFileClasses,
+    terminal_diagnostics: Option<&TerminalDiagnosticsSummary>,
+) -> &'static str {
+    if final_outcome == "done" {
+        return "success";
+    }
+    let classification = terminal_diagnostics
+        .map(|diagnostics| diagnostics.classification.as_str())
+        .unwrap_or_else(|| classify_terminal_outcome_with_context(final_outcome, 0, 0));
+    if changed_file_classes.test > 0
+        && changed_file_classes.impl_files == 0
+        && changed_file_classes.setup == 0
+        && matches!(
+            classification,
+            "verification_failure" | "control_loop_failure"
+        )
+    {
+        return "generated_test_bug";
+    }
+    match classification {
+        "success" => "success",
+        "model_output_failure" => "contract_extraction",
+        "verification_environment_failure" => "verifier_setup",
+        "verification_failure" => "implementation_bug",
+        "evidence_repair_exhausted" => "artifact_evidence",
+        "control_loop_failure" => "repair_routing",
+        "transport_failure" | "interrupted" => "repair_routing",
+        _ => "repair_routing",
+    }
+}
+
+fn pam_variant_for_eval(pam_eval: Option<&PamEvalSummary>) -> &'static str {
+    match pam_eval {
+        Some(summary) if summary.availability == "failed" => "pam_unavailable",
+        Some(summary) if summary.mode != "not_used" => "pam_on",
+        Some(_) => "pam_off",
+        None => "unknown",
+    }
+}
+
+fn infer_eval_task_kind(task: &str) -> &'static str {
+    let lower = task.to_ascii_lowercase();
+    // Issue #919 (P2): heuristic eval labels (production authority is
+    // `TaskContract`; this second classifier approximates from text). DR3-002:
+    // this fn does NOT import `crate::agent`.
+    //
+    // Mentions an explicit output file/path token (a recognized extension)?
+    let mentions_output_path = lower.contains(".md")
+        || lower.contains(".txt")
+        || lower.contains(".rst")
+        || lower.contains(".mdx");
+    let is_research = lower.contains("research")
+        || lower.contains("compare")
+        || lower.contains("sources")
+        || task.contains("調査");
+    // `answer_only`: pure-answer prose with no output path and not research.
+    // Placed first so it precedes the docs branch; the research gate keeps
+    // "summarize sources" on research.
+    if !mentions_output_path
+        && !is_research
+        && (lower.contains("explain")
+            || lower.contains("summarize")
+            || task.contains("説明")
+            || task.contains("要約"))
+    {
+        return "answer_only";
+    }
+    // `authoring`: translation / rewriting / proofreading. Placed before docs
+    // so "rewrite docs/x.md" maps to authoring (matches the production
+    // Authoring-before-Docs order intent).
+    if lower.contains("translate")
+        || lower.contains("rewrite")
+        || lower.contains("proofread")
+        || task.contains("翻訳")
+        || task.contains("校正")
+    {
+        return "authoring";
+    }
+    if lower.contains("readme")
+        || lower.contains("documentation")
+        || lower.contains("docs")
+        || task.contains("ドキュメント")
+        || task.contains("手順")
+    {
+        return "docs";
+    }
+    if lower.contains("csv")
+        || lower.contains("tsv")
+        || lower.contains("jsonl")
+        || lower.contains("ndjson")
+        || lower.contains("schema")
+        || task.contains("列")
+    {
+        return "data";
+    }
+    if is_research {
+        return "research";
+    }
+    if lower.contains("runbook")
+        || lower.contains("deploy")
+        || lower.contains("rollback")
+        || lower.contains("ops")
+        || task.contains("運用")
+    {
+        return "ops";
+    }
+    "coding"
+}
+
+fn completion_reason_for_eval(
+    final_outcome: &str,
+    changed_file_classes: &ChangedFileClasses,
+    verify_command_count: usize,
+    classified_task_kind: Option<&str>,
+    tool_calls: &[ToolCallSummary],
+) -> String {
+    if final_outcome != "done" {
+        return final_outcome.to_string();
+    }
+    if verify_command_count > 0 {
+        return "verifier_evidence_satisfied".to_string();
+    }
+    if non_coding_command_observation_tool_observed(classified_task_kind, tool_calls) {
+        return "command_observation_evidence_satisfied".to_string();
+    }
+    let changed_count = changed_file_classes
+        .test
+        .saturating_add(changed_file_classes.impl_files)
+        .saturating_add(changed_file_classes.setup);
+    if changed_count > 0 || non_coding_artifact_tool_observed(classified_task_kind, tool_calls) {
+        "artifact_obligations_satisfied".to_string()
+    } else {
+        "answer_or_plan_completion".to_string()
+    }
+}
+
+fn non_coding_artifact_tool_observed(
+    classified_task_kind: Option<&str>,
+    tool_calls: &[ToolCallSummary],
+) -> bool {
+    let Some(kind) = classified_task_kind.and_then(normalize_classified_task_kind_for_eval) else {
+        return false;
+    };
+    if kind == "coding" {
+        return false;
+    }
+    tool_calls
+        .iter()
+        .any(|call| matches!(call.name.as_str(), "Write" | "Edit"))
+}
+
+fn non_coding_command_observation_tool_observed(
+    classified_task_kind: Option<&str>,
+    tool_calls: &[ToolCallSummary],
+) -> bool {
+    matches!(
+        classified_task_kind.and_then(normalize_classified_task_kind_for_eval),
+        Some("ops")
+    ) && tool_calls.iter().any(|call| call.name == "Bash")
+}
+
+fn obligation(
+    id: &str,
+    status: &str,
+    failure_domain: Option<&str>,
+    detail: &str,
+) -> TerminalObligationDiagnostic {
+    TerminalObligationDiagnostic {
+        id: id.to_string(),
+        status: status.to_string(),
+        failure_domain: failure_domain.map(str::to_string),
+        detail: detail.to_string(),
+    }
+}
+
+fn set_obligation(
+    obligations: &mut [TerminalObligationDiagnostic],
+    id: &str,
+    status: &str,
+    failure_domain: Option<&str>,
+    detail: &str,
+) {
+    if let Some(obligation) = obligations.iter_mut().find(|o| o.id == id) {
+        obligation.status = status.to_string();
+        obligation.failure_domain = failure_domain.map(str::to_string);
+        obligation.detail = detail.to_string();
+    }
+}
+
+fn upsert_obligation(
+    obligations: &mut Vec<TerminalObligationDiagnostic>,
+    new_obligation: TerminalObligationDiagnostic,
+) {
+    if let Some(existing) = obligations
+        .iter_mut()
+        .find(|obligation| obligation.id == new_obligation.id)
+    {
+        *existing = new_obligation;
+    } else {
+        obligations.push(new_obligation);
+    }
+}
+
+fn refresh_terminal_obligation_indexes(diagnostics: &mut TerminalDiagnosticsSummary) {
+    diagnostics.satisfied_obligations = diagnostics
+        .obligations
+        .iter()
+        .filter(|obligation| obligation.status == "satisfied")
+        .map(|obligation| obligation.id.clone())
+        .collect();
+    diagnostics.missing_obligations = diagnostics
+        .obligations
+        .iter()
+        .filter(|obligation| obligation.status == "unsatisfied")
+        .map(|obligation| obligation.id.clone())
+        .collect();
 }
 
 /// Replace absolute paths in a JSON string with `<path>` (opt-in via
@@ -437,9 +1540,67 @@ mod tests {
             verify_commands: vec!["cargo test".to_string()],
             case_retrieval_result: None,
             photon_eval: None,
+            pam_eval: None,
             photon_canary: 0,
             auto_promote: None,
+            terminal_diagnostics: Some(build_terminal_diagnostics(
+                "done",
+                &ChangedFileClasses {
+                    test: 1,
+                    impl_files: 2,
+                    setup: 0,
+                },
+                1,
+            )),
+            shadow_terminal_projection: Some(build_shadow_terminal_projection(
+                "done",
+                &build_terminal_diagnostics(
+                    "done",
+                    &ChangedFileClasses {
+                        test: 1,
+                        impl_files: 2,
+                        setup: 0,
+                    },
+                    1,
+                ),
+            )),
+            recovery_strategy_count: 0,
+            recovery_strategies: Vec::new(),
+            evaluation_taxonomy: build_evaluation_taxonomy(
+                "fix the bug",
+                "done",
+                &ChangedFileClasses {
+                    test: 1,
+                    impl_files: 2,
+                    setup: 0,
+                },
+                Some(&build_terminal_diagnostics(
+                    "done",
+                    &ChangedFileClasses {
+                        test: 1,
+                        impl_files: 2,
+                        setup: 0,
+                    },
+                    1,
+                )),
+                Some(&build_shadow_terminal_projection(
+                    "done",
+                    &build_terminal_diagnostics(
+                        "done",
+                        &ChangedFileClasses {
+                            test: 1,
+                            impl_files: 2,
+                            setup: 0,
+                        },
+                        1,
+                    ),
+                )),
+                None,
+                None,
+            ),
+            completion_reason: "verifier_evidence_satisfied".to_string(),
             final_outcome: "done".to_string(),
+            classified_task_kind: None,
         }
     }
 
@@ -476,6 +1637,966 @@ mod tests {
         assert_eq!(rec.model, "qwen3:14b");
         assert_eq!(rec.tool_calls.len(), 1);
         assert_eq!(rec.final_outcome, "done");
+        assert_eq!(rec.completion_reason, "verifier_evidence_satisfied");
+        assert_eq!(
+            rec.shadow_terminal_projection
+                .as_ref()
+                .map(|projection| projection.class.as_str()),
+            Some("success")
+        );
+        assert_eq!(
+            rec.terminal_diagnostics
+                .as_ref()
+                .map(|d| d.classification.as_str()),
+            Some("success")
+        );
+        let diag = rec.terminal_diagnostics.as_ref().unwrap();
+        assert_eq!(diag.verifier_status, "satisfied");
+        assert!(
+            diag.satisfied_obligations
+                .contains(&"repo_edit".to_string())
+        );
+        assert_eq!(rec.evaluation_taxonomy.pam_variant, "unknown");
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "coding");
+        assert_eq!(rec.evaluation_taxonomy.anvil_terminal_class, "success");
+        assert_eq!(
+            rec.evaluation_taxonomy.outcome_agreement,
+            "external_postcheck_unavailable"
+        );
+    }
+
+    #[test]
+    fn shadow_terminal_projection_marks_failed_evidence_conflict_on_done() {
+        let mut diagnostics = build_terminal_diagnostics(
+            "done",
+            &ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            0,
+        );
+        upsert_obligation(
+            &mut diagnostics.obligations,
+            obligation(
+                "schema_evidence",
+                "unsatisfied",
+                Some("verification_failure"),
+                "schema mismatch was observed",
+            ),
+        );
+        refresh_terminal_obligation_indexes(&mut diagnostics);
+
+        let projection = build_shadow_terminal_projection("done", &diagnostics);
+
+        assert_eq!(projection.class, "evidence_failed");
+        assert!(projection.conflict);
+        assert_eq!(projection.failed_evidence_ids, vec!["schema_evidence"]);
+    }
+
+    #[test]
+    fn shadow_terminal_projection_marks_missing_evidence() {
+        let diagnostics = build_terminal_diagnostics(
+            "safe_stop_verifier_missing",
+            &ChangedFileClasses {
+                test: 1,
+                impl_files: 1,
+                setup: 0,
+            },
+            0,
+        );
+
+        let projection =
+            build_shadow_terminal_projection("safe_stop_verifier_missing", &diagnostics);
+
+        assert_eq!(projection.class, "missing_evidence");
+        assert!(!projection.conflict);
+        assert_eq!(
+            projection.missing_evidence_ids,
+            vec!["verification_evidence"]
+        );
+    }
+
+    #[test]
+    fn shadow_terminal_projection_marks_success_without_conflict() {
+        let diagnostics = build_terminal_diagnostics(
+            "done",
+            &ChangedFileClasses {
+                test: 1,
+                impl_files: 1,
+                setup: 0,
+            },
+            1,
+        );
+
+        let projection = build_shadow_terminal_projection("done", &diagnostics);
+
+        assert_eq!(projection.class, "success");
+        assert!(!projection.conflict);
+        assert_eq!(
+            projection.satisfied_evidence_ids,
+            vec!["verification_evidence"]
+        );
+    }
+
+    #[test]
+    fn evaluation_taxonomy_adopts_shadow_conflict_for_done() {
+        let mut rec = build_eval_record(
+            "sess-shadow-conflict",
+            12345,
+            "Read input/orders.csv and create output/order-summary.csv",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        let diagnostics = rec.terminal_diagnostics.as_mut().expect("diagnostics");
+        upsert_obligation(
+            &mut diagnostics.obligations,
+            obligation(
+                "schema_evidence",
+                "unsatisfied",
+                Some("verification_failure"),
+                "schema mismatch was observed",
+            ),
+        );
+        refresh_terminal_obligation_indexes(diagnostics);
+        rec.refresh_shadow_terminal_projection();
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.final_outcome, "done");
+        assert_eq!(
+            rec.shadow_terminal_projection
+                .as_ref()
+                .map(|projection| projection.conflict),
+            Some(true)
+        );
+        assert_eq!(
+            rec.evaluation_taxonomy.anvil_terminal_class,
+            "shadow_evidence_failed"
+        );
+        assert_eq!(rec.evaluation_taxonomy.failure_authority, "evidence_failed");
+    }
+
+    #[test]
+    fn evaluation_taxonomy_records_pam_variant_and_task_kind() {
+        let mut rec = build_eval_record(
+            "sess-001",
+            12345,
+            "Update README.md with usage documentation",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "safe_stop_verifier_missing",
+        );
+        rec.pam_eval = Some(PamEvalSummary::skipped("disabled"));
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.pam_variant, "pam_off");
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "docs");
+        assert_eq!(rec.evaluation_taxonomy.anvil_terminal_class, "non_success");
+        assert_eq!(rec.evaluation_taxonomy.failure_authority, "verifier_setup");
+    }
+
+    #[test]
+    fn pam_eval_summary_reports_availability_separately_from_terminal_authority() {
+        assert_eq!(PamEvalSummary::skipped("disabled").availability, "disabled");
+        assert_eq!(
+            PamEvalSummary::skipped("disabled").failure_phase.as_deref(),
+            Some("disabled")
+        );
+        assert_eq!(
+            PamEvalSummary::skipped("photon_unavailable").availability,
+            "failed"
+        );
+        assert_eq!(
+            PamEvalSummary::skipped("photon_unavailable")
+                .failure_phase
+                .as_deref(),
+            Some("photon_availability")
+        );
+        assert_eq!(
+            PamEvalSummary::skipped("context_pack_failed:sidecar_call").availability,
+            "failed"
+        );
+        assert_eq!(
+            PamEvalSummary::skipped("context_pack_failed:sidecar_call")
+                .failure_phase
+                .as_deref(),
+            Some("sidecar_call")
+        );
+        assert_eq!(
+            PamEvalSummary::derive_availability("live", 1, 0, 0, None),
+            "injected"
+        );
+        assert_eq!(
+            PamEvalSummary::derive_availability("live", 0, 2, 0, None),
+            "blocked_warning"
+        );
+        assert_eq!(
+            PamEvalSummary::derive_availability("shadow", 0, 0, 1, None),
+            "not_injected"
+        );
+    }
+
+    #[test]
+    fn evaluation_taxonomy_separates_pam_unavailable_from_no_pam() {
+        let mut rec = build_eval_record(
+            "sess-pam-unavailable",
+            12345,
+            "Update README.md with usage documentation",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        rec.pam_eval = Some(PamEvalSummary::skipped("context_pack_failed"));
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.pam_variant, "pam_unavailable");
+        assert_eq!(
+            rec.pam_eval.as_ref().map(|pam| pam.availability.as_str()),
+            Some("failed")
+        );
+    }
+
+    // Issue #922 (P5): eval research case — a research/report task is recorded
+    // with `task_kind = "research"` in the evaluation taxonomy.
+    #[test]
+    fn evaluation_taxonomy_records_research_task_kind() {
+        let mut rec = build_eval_record(
+            "sess-922",
+            12345,
+            "Research and compare the HTTP client libraries and report sources",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "success",
+        );
+        rec.pam_eval = Some(PamEvalSummary::skipped("disabled"));
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "research");
+    }
+
+    #[test]
+    fn evaluation_taxonomy_records_data_task_kind() {
+        // Issue #921 (P4): eval data case. Drives the real `infer_eval_task_kind`
+        // + `refresh_evaluation_taxonomy` so the emitted `task_kind` is asserted
+        // (not a hand-written fixture row). P8/#925 owns per-kind pass-rate
+        // aggregation; this case only pins that a structured-data request is
+        // classified as "data" in the eval taxonomy.
+        let mut rec = build_eval_record(
+            "sess-data-001",
+            12345,
+            "Generate output.csv with columns id and score from the input data",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "success",
+        );
+        rec.pam_eval = Some(PamEvalSummary::skipped("disabled"));
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "data");
+    }
+
+    #[test]
+    fn evaluation_taxonomy_prefers_classified_task_kind_when_available() {
+        let mut rec = build_eval_record(
+            "sess-data-002",
+            12345,
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create a JSON summary file.","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data"}]}"#,
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "coding");
+
+        rec.classified_task_kind = Some("data".to_string());
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "data");
+    }
+
+    #[test]
+    fn evaluation_taxonomy_ignores_unknown_classified_task_kind() {
+        let mut rec = build_eval_record(
+            "sess-docs-001",
+            12345,
+            "Update README.md with usage documentation",
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+
+        rec.classified_task_kind = Some("not-a-kind".to_string());
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.evaluation_taxonomy.task_kind, "docs");
+    }
+
+    #[test]
+    fn completion_reason_uses_classified_non_coding_artifact_write() {
+        let tool_calls = vec![ToolCallSummary {
+            name: "Write".to_string(),
+            args_summary: r#"{"path":"summary.json"}"#.to_string(),
+        }];
+        let mut rec = build_eval_record(
+            "sess-data-003",
+            12345,
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create a JSON summary file.","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data"}]}"#,
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        assert_eq!(rec.completion_reason, "answer_or_plan_completion");
+
+        rec.classified_task_kind = Some("data".to_string());
+        rec.refresh_completion_reason();
+
+        assert_eq!(rec.completion_reason, "artifact_obligations_satisfied");
+    }
+
+    #[test]
+    fn completion_reason_does_not_use_unknown_classified_kind() {
+        let tool_calls = vec![ToolCallSummary {
+            name: "Write".to_string(),
+            args_summary: r#"{"path":"summary.json"}"#.to_string(),
+        }];
+        let mut rec = build_eval_record(
+            "sess-unknown-001",
+            12345,
+            "Create summary.json",
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+
+        rec.classified_task_kind = Some("not-a-kind".to_string());
+        rec.refresh_completion_reason();
+
+        assert_eq!(rec.completion_reason, "answer_or_plan_completion");
+    }
+
+    #[test]
+    fn terminal_diagnostics_mark_non_coding_artifact_write_as_repo_edit() {
+        let tool_calls = vec![ToolCallSummary {
+            name: "Write".to_string(),
+            args_summary: r#"{"path":"summary.json"}"#.to_string(),
+        }];
+        let mut rec = build_eval_record(
+            "sess-data-004",
+            12345,
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create a JSON summary file.","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data"}]}"#,
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        let repo_edit_before = rec
+            .terminal_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.obligations.iter().find(|o| o.id == "repo_edit"))
+            .expect("repo_edit obligation before");
+        assert_eq!(repo_edit_before.status, "not_applicable");
+
+        rec.classified_task_kind = Some("data".to_string());
+        rec.refresh_terminal_diagnostics();
+
+        let diag = rec.terminal_diagnostics.as_ref().expect("diagnostics");
+        let repo_edit_after = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "repo_edit")
+            .expect("repo_edit obligation after");
+        assert_eq!(repo_edit_after.status, "satisfied");
+        assert!(
+            diag.satisfied_obligations
+                .contains(&"repo_edit".to_string())
+        );
+        assert!(
+            diag.satisfied_obligations
+                .contains(&"artifact_evidence".to_string())
+        );
+        assert!(!diag.missing_obligations.contains(&"repo_edit".to_string()));
+        let artifact_evidence = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "artifact_evidence")
+            .expect("artifact evidence obligation");
+        assert_eq!(artifact_evidence.status, "satisfied");
+        let verifier_evidence = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "verification_evidence")
+            .expect("verification evidence obligation");
+        assert_eq!(verifier_evidence.status, "not_applicable");
+    }
+
+    #[test]
+    fn terminal_diagnostics_marks_ops_command_observation_evidence() {
+        let tool_calls = vec![
+            ToolCallSummary {
+                name: "Write".to_string(),
+                args_summary: r#"{"path":"ops/observation.md"}"#.to_string(),
+            },
+            ToolCallSummary {
+                name: "Bash".to_string(),
+                args_summary: r#"{"command":"pwd"}"#.to_string(),
+            },
+        ];
+        let mut rec = build_eval_record(
+            "sess-ops-001",
+            12345,
+            "Run pwd and create ops/observation.md with the observed output.",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        rec.classified_task_kind = Some("ops".to_string());
+        rec.refresh_completion_reason();
+        rec.refresh_terminal_diagnostics();
+
+        assert_eq!(
+            rec.completion_reason,
+            "command_observation_evidence_satisfied"
+        );
+        let diag = rec.terminal_diagnostics.as_ref().expect("diagnostics");
+        assert!(
+            diag.satisfied_obligations
+                .contains(&"command_observation_evidence".to_string())
+        );
+        let command_evidence = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "command_observation_evidence")
+            .expect("command observation evidence obligation");
+        assert_eq!(command_evidence.status, "satisfied");
+    }
+
+    #[test]
+    fn terminal_diagnostics_reconciles_completed_ops_after_artifact_repair_exhaustion() {
+        let tool_calls = vec![
+            ToolCallSummary {
+                name: "Write".to_string(),
+                args_summary: r#"{"path":"ops/observation.md"}"#.to_string(),
+            },
+            ToolCallSummary {
+                name: "Bash".to_string(),
+                args_summary: r#"{"command":"ls -la"}"#.to_string(),
+            },
+        ];
+        let mut rec = build_eval_record(
+            "sess-ops-002",
+            12345,
+            "Run ls and create ops/observation.md with the observed output.",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+        rec.classified_task_kind = Some("ops".to_string());
+        rec.mark_artifact_evidence_repair_exhausted();
+        let exhausted = rec.terminal_diagnostics.as_ref().expect("diagnostics");
+        assert_eq!(exhausted.classification, "evidence_repair_exhausted");
+        assert!(
+            exhausted
+                .missing_obligations
+                .contains(&"repair_convergence".to_string())
+        );
+
+        rec.refresh_completion_reason();
+        rec.refresh_terminal_diagnostics();
+
+        assert_eq!(
+            rec.completion_reason,
+            "command_observation_evidence_satisfied"
+        );
+        let diag = rec.terminal_diagnostics.as_ref().expect("diagnostics");
+        assert_eq!(diag.classification, "success");
+        assert_eq!(diag.generic_outcome, "completed");
+        assert!(
+            !diag
+                .missing_obligations
+                .contains(&"repair_convergence".to_string())
+        );
+        let repair_convergence = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "repair_convergence")
+            .expect("repair convergence obligation");
+        assert_eq!(repair_convergence.status, "not_applicable");
+        assert_eq!(repair_convergence.failure_domain, None);
+        let command_evidence = diag
+            .obligations
+            .iter()
+            .find(|o| o.id == "command_observation_evidence")
+            .expect("command observation evidence obligation");
+        assert_eq!(command_evidence.status, "satisfied");
+    }
+
+    #[test]
+    fn terminal_diagnostics_project_artifact_evidence_repair_exhausted() {
+        let tool_calls = vec![ToolCallSummary {
+            name: "Write".to_string(),
+            args_summary: r#"{"path":"summary.json"}"#.to_string(),
+        }];
+        let mut rec = build_eval_record(
+            "sess-data-005",
+            12345,
+            r#"STATE_CONTROL_PACKET
+{"objective":"Create a JSON summary file.","next_required_action":"artifact","required_artifacts":[{"path":"summary.json","role":"data"}]}"#,
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "missing_repo_edits",
+        );
+        rec.classified_task_kind = Some("data".to_string());
+        rec.mark_artifact_evidence_repair_exhausted();
+        rec.refresh_evaluation_taxonomy();
+
+        assert_eq!(rec.final_outcome, "missing_repo_edits");
+        assert_eq!(
+            rec.terminal_diagnostics
+                .as_ref()
+                .map(|diag| diag.classification.as_str()),
+            Some("evidence_repair_exhausted")
+        );
+        assert_eq!(
+            rec.terminal_diagnostics
+                .as_ref()
+                .map(|diag| diag.generic_outcome.as_str()),
+            Some("evidence_repair_exhausted")
+        );
+        assert_eq!(
+            rec.evaluation_taxonomy.failure_authority,
+            "artifact_evidence"
+        );
+        let diag = rec.terminal_diagnostics.as_ref().expect("diagnostics");
+        assert!(
+            diag.satisfied_obligations
+                .contains(&"repo_edit".to_string())
+        );
+        assert!(
+            diag.missing_obligations
+                .contains(&"artifact_evidence".to_string())
+        );
+        let artifact_evidence = diag
+            .obligations
+            .iter()
+            .find(|obligation| obligation.id == "artifact_evidence")
+            .expect("artifact evidence obligation");
+        assert_eq!(artifact_evidence.status, "unsatisfied");
+        assert_eq!(
+            artifact_evidence.failure_domain.as_deref(),
+            Some("evidence_repair_exhausted")
+        );
+    }
+
+    #[test]
+    fn terminal_diagnostics_project_legacy_outcome_to_generic_lifecycle_outcome() {
+        let changed = ChangedFileClasses {
+            test: 0,
+            impl_files: 0,
+            setup: 0,
+        };
+        let diag = build_terminal_diagnostics("missing_repo_edits", &changed, 0);
+        assert_eq!(diag.outcome, "missing_repo_edits");
+        assert_eq!(diag.generic_outcome, "missing_deliverable");
+    }
+
+    #[test]
+    fn terminal_diagnostics_ignore_unknown_classified_artifact_write() {
+        let tool_calls = vec![ToolCallSummary {
+            name: "Write".to_string(),
+            args_summary: r#"{"path":"summary.json"}"#.to_string(),
+        }];
+        let mut rec = build_eval_record(
+            "sess-unknown-002",
+            12345,
+            "Create summary.json",
+            "qwen3:14b",
+            "Act",
+            "xml",
+            &tool_calls,
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "done",
+        );
+
+        rec.classified_task_kind = Some("not-a-kind".to_string());
+        rec.refresh_terminal_diagnostics();
+
+        let repo_edit = rec
+            .terminal_diagnostics
+            .as_ref()
+            .and_then(|diag| diag.obligations.iter().find(|o| o.id == "repo_edit"))
+            .expect("repo_edit obligation");
+        assert_eq!(repo_edit.status, "not_applicable");
+    }
+
+    #[test]
+    fn evaluation_taxonomy_keeps_generated_test_bug_separate() {
+        let rec = build_eval_record(
+            "sess-001",
+            12345,
+            "Add a generated regression test for the parser",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 1,
+                impl_files: 0,
+                setup: 0,
+            },
+            &["cargo test".to_string()],
+            None,
+            None,
+            None,
+            "verifier_failed",
+        );
+
+        assert_eq!(
+            rec.terminal_diagnostics
+                .as_ref()
+                .map(|d| d.classification.as_str()),
+            Some("verification_failure")
+        );
+        assert_eq!(
+            rec.evaluation_taxonomy.failure_authority,
+            "generated_test_bug"
+        );
+    }
+
+    #[test]
+    fn terminal_diagnostics_classifies_issue_848_outcomes() {
+        let changed = ChangedFileClasses {
+            test: 1,
+            impl_files: 1,
+            setup: 0,
+        };
+        for (outcome, classification, failed_obligation, failure_domain) in [
+            ("done", "success", None, None),
+            (
+                "missing_repo_edits",
+                "model_output_failure",
+                Some("repo_edit"),
+                Some("model_output_failure"),
+            ),
+            (
+                "safe_stop_verifier_missing",
+                "verification_environment_failure",
+                Some("verification_environment"),
+                Some("verification_environment_failure"),
+            ),
+            (
+                "repair_exhausted",
+                "control_loop_failure",
+                Some("repair_convergence"),
+                Some("control_loop_failure"),
+            ),
+            (
+                "tool_call_format_error",
+                "model_output_failure",
+                Some("model_output_format"),
+                Some("model_output_failure"),
+            ),
+        ] {
+            let diag = build_terminal_diagnostics(outcome, &changed, 1);
+            assert_eq!(diag.outcome, outcome);
+            assert_eq!(diag.classification, classification);
+            if let Some(id) = failed_obligation {
+                let obligation = diag
+                    .obligations
+                    .iter()
+                    .find(|o| o.id == id)
+                    .unwrap_or_else(|| panic!("{outcome} missing obligation {id}"));
+                assert_eq!(obligation.status, "unsatisfied");
+                assert_eq!(obligation.failure_domain.as_deref(), failure_domain);
+                assert!(diag.missing_obligations.contains(&id.to_string()));
+            } else {
+                assert!(
+                    diag.obligations.iter().all(|o| o.status != "unsatisfied"),
+                    "done should not contain an unsatisfied obligation: {:?}",
+                    diag.obligations
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_diagnostics_distinguishes_repair_exhausted_domains() {
+        let changed = ChangedFileClasses {
+            test: 1,
+            impl_files: 1,
+            setup: 0,
+        };
+        let control =
+            build_terminal_diagnostics_with_context("repair_exhausted", &changed, 1, Some("sig"));
+        assert_eq!(control.classification, "control_loop_failure");
+        assert_eq!(control.last_failure_signature.as_deref(), Some("sig"));
+        assert_eq!(control.verifier_status, "failed_or_incomplete");
+
+        let model_output = build_terminal_diagnostics_with_context(
+            "repair_exhausted",
+            &ChangedFileClasses {
+                test: 0,
+                impl_files: 0,
+                setup: 0,
+            },
+            1,
+            None,
+        );
+        assert_eq!(model_output.classification, "model_output_failure");
+        assert!(
+            model_output
+                .missing_obligations
+                .contains(&"repo_edit".to_string())
+        );
+
+        let verifier_env =
+            build_terminal_diagnostics_with_context("repair_exhausted", &changed, 0, None);
+        assert_eq!(
+            verifier_env.classification,
+            "verification_environment_failure"
+        );
+        assert_eq!(verifier_env.verifier_status, "not_observed");
+        assert!(
+            verifier_env
+                .missing_obligations
+                .contains(&"verification_environment".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_verification_without_command_is_verifier_setup_authority() {
+        let rec = build_eval_record(
+            "sess-verify-missing",
+            12345,
+            "Use TDD for a Python scorer",
+            "qwen3:14b",
+            "Act",
+            "native",
+            &[],
+            None,
+            &[],
+            None,
+            ChangedFileClasses {
+                test: 1,
+                impl_files: 1,
+                setup: 1,
+            },
+            &[],
+            None,
+            None,
+            None,
+            "missing_verification",
+        );
+
+        let diagnostics = rec.terminal_diagnostics.as_ref().unwrap();
+        assert_eq!(
+            diagnostics.classification,
+            "verification_environment_failure"
+        );
+        assert_eq!(diagnostics.verifier_status, "not_observed");
+        assert!(
+            diagnostics
+                .missing_obligations
+                .contains(&"verification_environment".to_string())
+        );
+        assert_eq!(rec.evaluation_taxonomy.failure_authority, "verifier_setup");
     }
 
     #[test]
@@ -759,5 +2880,32 @@ mod tests {
         let truncated_jp = truncate_bytes(jp, 7);
         // 7 bytes: 日(3) + 本(3) = 6 < 7, テ(3) would overflow → truncate at 6
         assert!(std::str::from_utf8(truncated_jp.trim_end_matches('…').as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn infer_eval_task_kind_authoring_and_answer_only() {
+        // Issue #919: heuristic eval labels.
+        assert_eq!(
+            infer_eval_task_kind("Translate README.ja.md into English and write README.md"),
+            "authoring"
+        );
+        assert_eq!(
+            infer_eval_task_kind("Rewrite docs/intro.md to be clearer"),
+            "authoring"
+        );
+        assert_eq!(
+            infer_eval_task_kind("Explain how the auth flow works"),
+            "answer_only"
+        );
+        // "summarize sources" stays research (research gate wins).
+        assert_eq!(
+            infer_eval_task_kind("Research local LLM options and summarize sources"),
+            "research"
+        );
+        // Plain docs maintenance stays docs.
+        assert_eq!(
+            infer_eval_task_kind("Update README.md with usage documentation"),
+            "docs"
+        );
     }
 }

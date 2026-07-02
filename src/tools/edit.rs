@@ -16,6 +16,10 @@ pub fn run(path: &Path, old: &str, new: &str, replace_all: bool) -> Result<Strin
     let contents = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
 
+    if !replace_all && edit_already_applied(&contents, old, new) {
+        return Ok(format!("edit already applied {}", path.display()));
+    }
+
     let (updated, fallback_label) = if contents.contains(old) {
         let updated = if replace_all {
             contents.replace(old, new)
@@ -41,6 +45,31 @@ pub fn run(path: &Path, old: &str, new: &str, replace_all: bool) -> Result<Strin
         .map(|label| format!(" ({label})"))
         .unwrap_or_default();
     Ok(format!("edited {}{}", path.display(), suffix))
+}
+
+fn edit_already_applied(contents: &str, old: &str, new: &str) -> bool {
+    let new_ranges = match_ranges(contents, new);
+    if new_ranges.is_empty() {
+        return false;
+    }
+    let old_ranges = match_ranges(contents, old);
+    old_ranges.is_empty()
+        || old_ranges.iter().all(|old_range| {
+            new_ranges
+                .iter()
+                .any(|new_range| range_contains(*new_range, *old_range))
+        })
+}
+
+fn match_ranges(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
+    haystack
+        .match_indices(needle)
+        .map(|(start, matched)| (start, start + matched.len()))
+        .collect()
+}
+
+fn range_contains(container: (usize, usize), candidate: (usize, usize)) -> bool {
+    container.0 <= candidate.0 && candidate.1 <= container.1
 }
 
 pub fn apply_exact_once(contents: &str, old: &str, new: &str) -> Result<String, String> {
@@ -261,6 +290,34 @@ mod tests {
         let err = run_exact_once(&path, "fn main() {\nprintln!(\"bye\");\n}", "fn main() {}")
             .unwrap_err();
         assert!(err.contains("not found"));
+    }
+
+    #[test]
+    fn repeated_prefix_edit_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        let old = "[package]\nname = \"password_strength\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"password_strength\"\npath = \"src/lib.rs\"";
+        let new = "[package]\nname = \"password_strength\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"password_strength\"\npath = \"src/lib.rs\"\n\n[[test]]\nname = \"password_strength_tests\"\npath = \"tests/password_strength.rs\"";
+        fs::write(&path, old).unwrap();
+
+        run(&path, old, new, false).unwrap();
+        let result = run(&path, old, new, false).unwrap();
+
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(result.contains("already applied"));
+        assert_eq!(updated.matches("[[test]]").count(), 1);
+    }
+
+    #[test]
+    fn repeated_edit_still_allows_separate_old_match() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        fs::write(&path, "done\npending\n").unwrap();
+
+        run(&path, "pending", "done", false).unwrap();
+
+        let updated = fs::read_to_string(&path).unwrap();
+        assert_eq!(updated, "done\ndone\n");
     }
 
     #[test]

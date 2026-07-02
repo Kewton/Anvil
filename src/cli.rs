@@ -2,22 +2,35 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use crate::config::DeterministicFallbackMode;
+use crate::agent::planner_llm::PlannerProvider;
+use crate::config::{DeterministicFallbackMode, Engine};
 
 #[derive(Debug, Clone, Parser)]
 #[command(name = "anvil")]
-#[command(about = "local-first coding agent for Ollama")]
+#[command(about = "local-first coding agent for local and API LLMs")]
 pub struct CliArgs {
     #[arg(short = 'p', long = "prompt")]
     pub prompt: Option<String>,
     #[arg(short = 'm', long = "model")]
     pub model: Option<String>,
+    /// Provider used for the main execution model.
+    #[arg(long = "provider", value_enum)]
+    pub provider: Option<PlannerProvider>,
+    /// LLM model used only for plan generation. Defaults to --model.
+    #[arg(long = "planner-model")]
+    pub planner_model: Option<String>,
+    /// Provider used only for plan generation. Defaults to --provider.
+    #[arg(long = "planner-provider", value_enum)]
+    pub planner_provider: Option<PlannerProvider>,
     #[arg(long = "sidecar-model")]
     pub sidecar_model: Option<String>,
     #[arg(long = "ollama-host")]
     pub ollama_host: Option<String>,
     #[arg(long = "context-budget")]
     pub context_budget: Option<usize>,
+    /// Override Ollama num_predict. Defaults to 2048 for legacy and 8192 for minimal.
+    #[arg(long = "num-predict")]
+    pub num_predict: Option<usize>,
     #[arg(long = "max-iterations")]
     pub max_iterations: Option<usize>,
     #[arg(long = "chat-timeout-secs")]
@@ -41,6 +54,30 @@ pub struct CliArgs {
     pub oneshot: bool,
     #[arg(long = "auto-plan")]
     pub auto_plan: bool,
+    /// Ask the minimal engine to draft a step plan and save it under .anvil/plans/.
+    #[arg(long = "plan-steps", value_name = "PROMPT")]
+    pub plan_steps: Option<String>,
+    /// Draft a step plan, save it, then run it immediately with the minimal engine.
+    #[arg(long = "plan-run", value_name = "PROMPT")]
+    pub plan_run: Option<String>,
+    /// Run a previously saved minimal step plan.
+    #[arg(long = "run-plan", value_name = "FILE")]
+    pub run_plan: Option<PathBuf>,
+    /// Draft a top-level phase plan for repeated minimal plan-runs.
+    #[arg(long = "ultra-plan", value_name = "PROMPT")]
+    pub ultra_plan: Option<String>,
+    /// Draft a top-level phase plan, save it, then run each phase with /plan-run.
+    #[arg(long = "ultra-plan-run", value_name = "PROMPT")]
+    pub ultra_plan_run: Option<String>,
+    /// Run a previously saved minimal ultra phase plan.
+    #[arg(long = "run-ultra-plan", value_name = "FILE")]
+    pub run_ultra_plan: Option<PathBuf>,
+    /// Planning style for --ultra-plan / --ultra-plan-run: default, tdd, or test-hardening.
+    #[arg(long = "ultra-style", value_name = "STYLE")]
+    pub ultra_style: Option<String>,
+    /// Contract/verifier profile for --ultra-plan / --ultra-plan-run.
+    #[arg(long = "profile", alias = "ultra-profile", value_name = "PROFILE")]
+    pub ultra_profile: Option<String>,
     #[arg(long = "offline")]
     pub offline: bool,
     /// Control deterministic recovery. `hint-only` only nudges the model,
@@ -48,6 +85,8 @@ pub struct CliArgs {
     /// legacy full template recovery. `support-only` and `full` remain aliases.
     #[arg(long = "deterministic-fallback", value_enum)]
     pub deterministic_fallback: Option<DeterministicFallbackMode>,
+    #[arg(long = "engine", value_enum)]
+    pub engine: Option<Engine>,
     /// Issue #634: experimental opt-in for specialized fallback paths
     /// (FastAPI scaffold / Python CSV / FizzBuzz / fixed arithmetic patch /
     /// qwen3.5 固有 deterministic edit). Default off. Template 系は
@@ -224,6 +263,39 @@ impl CliArgs {
         if resume_on && (self.prompt.is_some() || self.oneshot) {
             return Err("--resume cannot be combined with --prompt / --oneshot".to_string());
         }
+        let step_modes = self.plan_steps.is_some() as u8
+            + self.plan_run.is_some() as u8
+            + self.run_plan.is_some() as u8
+            + self.ultra_plan.is_some() as u8
+            + self.ultra_plan_run.is_some() as u8
+            + self.run_ultra_plan.is_some() as u8;
+        if step_modes > 1 {
+            return Err(
+                "--plan-steps, --plan-run, --run-plan, --ultra-plan, --ultra-plan-run, and --run-ultra-plan are mutually exclusive".to_string(),
+            );
+        }
+        let planning_mode = self.plan_steps.is_some()
+            || self.plan_run.is_some()
+            || self.run_plan.is_some()
+            || self.ultra_plan.is_some()
+            || self.ultra_plan_run.is_some()
+            || self.run_ultra_plan.is_some();
+        if planning_mode && (self.prompt.is_some() || self.oneshot || resume_on) {
+            return Err(
+                "--plan-steps / --plan-run / --run-plan / --ultra-plan / --ultra-plan-run / --run-ultra-plan cannot be combined with --prompt, --oneshot, or --resume"
+                    .to_string(),
+            );
+        }
+        if self.ultra_style.is_some() && self.ultra_plan.is_none() && self.ultra_plan_run.is_none()
+        {
+            return Err("--ultra-style requires --ultra-plan or --ultra-plan-run".to_string());
+        }
+        if self.ultra_profile.is_some()
+            && self.ultra_plan.is_none()
+            && self.ultra_plan_run.is_none()
+        {
+            return Err("--profile requires --ultra-plan or --ultra-plan-run".to_string());
+        }
         Ok(())
     }
 }
@@ -271,9 +343,13 @@ mod tests {
         CliArgs {
             prompt: None,
             model: None,
+            provider: None,
+            planner_model: None,
+            planner_provider: None,
             sidecar_model: None,
             ollama_host: None,
             context_budget: None,
+            num_predict: None,
             max_iterations: None,
             chat_timeout_secs: None,
             chat_retries: None,
@@ -285,8 +361,17 @@ mod tests {
             fresh_session: false,
             oneshot: false,
             auto_plan: false,
+            plan_steps: None,
+            plan_run: None,
+            run_plan: None,
+            ultra_plan: None,
+            ultra_plan_run: None,
+            run_ultra_plan: None,
+            ultra_style: None,
+            ultra_profile: None,
             offline: false,
             deterministic_fallback: None,
+            engine: None,
             experimental_specialized_fallback: None,
             no_footer: false,
             resume: None,
@@ -299,6 +384,40 @@ mod tests {
     #[test]
     fn validate_accepts_default() {
         assert!(base_args().validate().is_ok());
+    }
+
+    #[test]
+    fn planner_flags_parse_and_default_to_none() {
+        let default_args = CliArgs::parse_from(["anvil"]);
+        assert_eq!(default_args.provider, None);
+        assert_eq!(default_args.planner_model, None);
+        assert_eq!(default_args.planner_provider, None);
+
+        let args = CliArgs::parse_from([
+            "anvil",
+            "--provider",
+            "gemini",
+            "--planner-model",
+            "gemini-3.5-flash",
+            "--planner-provider",
+            "gemini",
+        ]);
+        assert_eq!(args.provider, Some(PlannerProvider::Gemini));
+        assert_eq!(args.planner_model.as_deref(), Some("gemini-3.5-flash"));
+        assert_eq!(args.planner_provider, Some(PlannerProvider::Gemini));
+
+        let args = CliArgs::parse_from([
+            "anvil",
+            "--provider",
+            "gpt",
+            "--planner-provider",
+            "openai",
+            "--planner-model",
+            "gpt-5.4-mini",
+        ]);
+        assert_eq!(args.provider, Some(PlannerProvider::Openai));
+        assert_eq!(args.planner_provider, Some(PlannerProvider::Openai));
+        assert_eq!(args.planner_model.as_deref(), Some("gpt-5.4-mini"));
     }
 
     #[test]
@@ -323,6 +442,47 @@ mod tests {
         args.resume = Some(String::new());
         args.oneshot = true;
         assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_step_plan_conflicts() {
+        let mut args = base_args();
+        args.plan_steps = Some("build app".to_string());
+        args.run_plan = Some(PathBuf::from(".anvil/plans/plan.yaml"));
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.plan_run = Some("build app".to_string());
+        args.run_plan = Some(PathBuf::from(".anvil/plans/plan.yaml"));
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.ultra_plan_run = Some("build app".to_string());
+        args.plan_run = Some("build app".to_string());
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.plan_steps = Some("build app".to_string());
+        args.prompt = Some("hello".to_string());
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.ultra_style = Some("tdd".to_string());
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.ultra_style = Some("tdd".to_string());
+        args.ultra_plan_run = Some("build app".to_string());
+        assert!(args.validate().is_ok());
+
+        let mut args = base_args();
+        args.ultra_profile = Some("data-analysis".to_string());
+        assert!(args.validate().is_err());
+
+        let mut args = base_args();
+        args.ultra_profile = Some("data-analysis".to_string());
+        args.ultra_plan_run = Some("analyze data".to_string());
+        assert!(args.validate().is_ok());
     }
 
     #[test]
@@ -356,6 +516,24 @@ mod tests {
 
         let parsed = CliArgs::parse_from(["anvil", "--auto-plan"]);
         assert!(parsed.auto_plan);
+    }
+
+    #[test]
+    fn engine_flag_defaults_none_and_parses_minimal() {
+        let args = base_args();
+        assert_eq!(args.engine, None);
+
+        let parsed = CliArgs::parse_from(["anvil", "--engine", "minimal"]);
+        assert_eq!(parsed.engine, Some(Engine::Minimal));
+    }
+
+    #[test]
+    fn num_predict_flag_defaults_none_and_parses_value() {
+        let args = base_args();
+        assert_eq!(args.num_predict, None);
+
+        let parsed = CliArgs::parse_from(["anvil", "--num-predict", "8192"]);
+        assert_eq!(parsed.num_predict, Some(8192));
     }
 
     #[test]

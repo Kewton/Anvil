@@ -8,6 +8,7 @@ use crate::modes::plan_act::{ExecutionMode, PlanStage};
 use crate::safety::path_guard::resolve_user_path;
 use crate::tools::bash::BashExecutionOutcome;
 use crate::tools::{bash, edit, glob, grep, read, write};
+use crate::util::workspace_paths::WorkspacePolicy;
 
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -31,6 +32,10 @@ pub struct ToolContext {
     /// path is resolved (keeping the check on the raw `tmp-tests/<rel>`
     /// prefix rather than the post-resolution absolute path).
     pub tester_active: bool,
+    /// Shared workspace policy for hiding controller metadata from ordinary
+    /// model reads/discovery. Log-analysis tasks may opt into protected
+    /// metadata reads, but writes stay blocked elsewhere.
+    pub workspace_policy: WorkspacePolicy,
 }
 
 impl ToolContext {
@@ -133,7 +138,14 @@ impl ToolRegistry {
                 };
                 let start_line = get_optional_usize(arguments, "start_line");
                 let end_line = get_optional_usize(arguments, "end_line");
-                read::run(&path, start_line, end_line)
+                enforce_workspace_read_policy(&context.root, &path, context.workspace_policy)?;
+                read::run(
+                    &context.root,
+                    &path,
+                    start_line,
+                    end_line,
+                    context.workspace_policy,
+                )
             }
             "Write" => {
                 let raw_path = get_required_string(arguments, "path")?;
@@ -173,7 +185,7 @@ impl ToolRegistry {
             }
             "Glob" => {
                 let pattern = get_required_string(arguments, "pattern")?;
-                glob::run(&context.root, pattern)
+                glob::run(&context.root, pattern, context.workspace_policy)
             }
             "Grep" => {
                 let pattern = get_required_string(arguments, "pattern")?;
@@ -182,7 +194,13 @@ impl ToolRegistry {
                     .get("case_sensitive")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                grep::run(&context.root, pattern, glob, case_sensitive)
+                grep::run(
+                    &context.root,
+                    pattern,
+                    glob,
+                    case_sensitive,
+                    context.workspace_policy,
+                )
             }
             other => Err(format!("unknown tool: {other}")),
         }
@@ -269,6 +287,28 @@ fn preflight_bash_command(arguments: &Value) -> Option<String> {
     Some(bash::render_block_error(&reason))
 }
 
+fn enforce_workspace_read_policy(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    workspace_policy: WorkspacePolicy,
+) -> Result<(), String> {
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let relative = path
+        .strip_prefix(&canonical_root)
+        .or_else(|_| path.strip_prefix(root));
+    let Ok(relative) = relative else {
+        return Ok(());
+    };
+    if relative.as_os_str().is_empty() || workspace_policy.allows_model_read_relative_path(relative)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "protected workspace metadata rejected Read; explicit log-analysis permission is required: {}",
+        relative.display()
+    ))
+}
+
 /// CB2-001: how a bash dispatch failed when no `BashExecutionOutcome` was
 /// produced. Only `DangerousBlock` should be surfaced as
 /// `FeedbackKind::UnsafeCommandBlocked` per design 5.2 / 11.2; the other
@@ -343,7 +383,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
     vec![
         tool(
             "Bash",
-            "Run a shell command in the project directory. Runtime classifies commands as read-only, build-test, or general, and offline mode blocks networked or general shell commands.",
+            "Run read-only inspection, build/test, or local script validation commands in the project directory. Do not use Bash to create files or directories; use Write for file creation because Write creates parent directories automatically. Offline mode blocks networked, mutating, or general shell commands.",
             serde_json::json!({
                 "type": "object",
                 "properties": { "command": { "type": "string" } },
@@ -352,7 +392,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Read",
-            "Read a text file or list a directory. Absolute paths are preferred.",
+            "Read a text file or list a directory. Use repository-relative paths.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -365,7 +405,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Write",
-            "Create or overwrite a file. Absolute paths are preferred.",
+            "Create or overwrite a file. Parent directories are created automatically. Use repository-relative paths.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -377,7 +417,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Edit",
-            "Replace exact text in an existing file. Absolute paths are preferred.",
+            "Replace exact text in an existing file. Use repository-relative paths.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -488,7 +528,38 @@ fn resolve_write_path(
     {
         return Ok(path);
     }
+    reject_nested_absolute_like_write_path(root, raw)?;
     resolve_user_path(root, raw)
+}
+
+fn reject_nested_absolute_like_write_path(root: &std::path::Path, raw: &str) -> Result<(), String> {
+    let input = std::path::Path::new(raw);
+    if input.is_absolute() || raw.starts_with("tmp-tests/") {
+        return Ok(());
+    }
+
+    let root_normals = normal_components(root);
+    let input_normals = normal_components(input);
+    if root_normals.is_empty()
+        || input_normals.len() <= root_normals.len()
+        || !input_normals.starts_with(&root_normals)
+    {
+        return Ok(());
+    }
+
+    let relative = input_normals[root_normals.len()..].join("/");
+    Err(format!(
+        "Write/Edit path looks like an absolute project path without a leading slash: {raw}. Use repository-relative paths such as {relative}."
+    ))
+}
+
+fn normal_components(path: &std::path::Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Issue #458: resolve a `tmp-tests/<rel>` request to the session-scoped
@@ -830,12 +901,153 @@ pub fn truncate_output(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ToolContext, ToolRegistry, canonicalize_with_missing_tail, enforce_plan_stage_scope,
-        resolve_plan_mode_write_target,
+        ToolContext, ToolRegistry, canonicalize_with_missing_tail, default_tool_specs,
+        enforce_plan_stage_scope, resolve_plan_mode_write_target,
     };
     use crate::modes::plan_act::{ExecutionMode, PlanStage};
+    use crate::util::workspace_paths::WorkspacePolicy;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn file_tool_descriptions_prefer_repository_relative_paths() {
+        let specs = default_tool_specs();
+        for tool_name in ["Read", "Write", "Edit"] {
+            let description = specs
+                .iter()
+                .find(|spec| spec.function.name == tool_name)
+                .map(|spec| spec.function.description.as_str())
+                .expect("tool spec");
+            assert!(
+                description.contains("repository-relative paths"),
+                "{tool_name} description should reinforce repository-relative paths: {description}"
+            );
+            assert!(
+                !description.contains("Absolute paths are preferred"),
+                "{tool_name} description must not contradict the system prompt: {description}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_tool_description_mentions_parent_directory_creation() {
+        let specs = default_tool_specs();
+        let description = specs
+            .iter()
+            .find(|spec| spec.function.name == "Write")
+            .map(|spec| spec.function.description.as_str())
+            .expect("Write tool spec");
+        assert!(
+            description.contains("Parent directories are created automatically"),
+            "Write description should tell the model not to call Bash mkdir first: {description}"
+        );
+    }
+
+    #[test]
+    fn bash_tool_description_discourages_file_creation() {
+        let specs = default_tool_specs();
+        let description = specs
+            .iter()
+            .find(|spec| spec.function.name == "Bash")
+            .map(|spec| spec.function.description.as_str())
+            .expect("Bash tool spec");
+        assert!(
+            description.contains("Do not use Bash to create files or directories"),
+            "Bash description should route file creation away from shell mkdir/cat: {description}"
+        );
+        assert!(
+            description.contains("Write creates parent directories automatically"),
+            "Bash description should name Write as the directory-creation affordance: {description}"
+        );
+    }
+
+    #[test]
+    fn write_rejects_absolute_path_text_missing_leading_slash() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
+        };
+        let raw_root = root
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        let raw_path = format!("{raw_root}/reports/sales-analysis.md");
+
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path": raw_path, "content": "x"}),
+                &context,
+            )
+            .unwrap_err();
+
+        assert!(err.contains("absolute project path"), "got: {err}");
+        assert!(err.contains("repository-relative paths"), "got: {err}");
+        assert!(err.contains("reports/sales-analysis.md"), "got: {err}");
+        assert!(!root.join(raw_root).exists());
+    }
+
+    #[test]
+    fn write_path_validation_keeps_relative_and_root_absolute_paths() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
+        };
+
+        registry
+            .execute(
+                "Write",
+                &json!({"path": "reports/sales-analysis.md", "content": "relative"}),
+                &context,
+            )
+            .unwrap();
+        registry
+            .execute(
+                "Write",
+                &json!({"path": root.join("reports/absolute.md").to_string_lossy(), "content": "absolute"}),
+                &context,
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("reports/sales-analysis.md")).unwrap(),
+            "relative"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("reports/absolute.md")).unwrap(),
+            "absolute"
+        );
+    }
 
     #[test]
     fn plan_mode_write_target_accepts_same_filename_alias() {
@@ -912,6 +1124,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let out = registry
             .execute(
@@ -955,6 +1168,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let err = enforce_plan_stage_scope(
             "Write",
@@ -988,6 +1202,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         enforce_plan_stage_scope(
             "Edit",
@@ -1025,6 +1240,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         ToolRegistry::default()
             .execute(
@@ -1067,6 +1283,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         ToolRegistry::default()
             .execute(
@@ -1107,6 +1324,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "printf hello"}), &context);
@@ -1136,6 +1354,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "rm -rf /"}), &context);
@@ -1163,6 +1382,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
         let (_msg, class) = text_result.expect_err("missing command must error");
@@ -1188,6 +1408,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
@@ -1214,6 +1435,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "curl example.com"}), &context);
@@ -1240,6 +1462,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
@@ -1265,6 +1488,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: tmp_tests_root.map(|p| p.to_path_buf()),
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         }
     }
 
@@ -1339,6 +1563,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: Some(tmp_tests.clone()),
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         registry
             .execute(
@@ -1371,6 +1596,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let err = registry
             .execute(
@@ -1402,6 +1628,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: Some(tmp_tests),
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let out = registry
             .execute("Read", &json!({"path": "tmp-tests/src/foo.rs"}), &context)
@@ -1427,6 +1654,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: Some(tmp_tests_root.to_path_buf()),
             tester_active,
+            workspace_policy: WorkspacePolicy::default(),
         }
     }
 
@@ -1570,6 +1798,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "shutdown -h now"}), &context);
@@ -1602,6 +1831,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "iptables -F"}), &context);
@@ -1628,6 +1858,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let err = registry
             .execute("Bash", &json!({"command": "reboot"}), &context)
@@ -1662,6 +1893,7 @@ mod tests {
             cancel_flag: None,
             tmp_tests_root: None,
             tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
         };
         let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
         let (_msg, class) = text_result.expect_err("missing command must error");

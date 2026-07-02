@@ -1,0 +1,181 @@
+name: mvp-smoke
+description: Short eval suite for PR and local smoke checks.
+parity_gate:
+  default_gate_level: comparative
+  source_binary_kind: anvildev
+  source_engine: minimal
+  warn_delta_pp: 5
+  fail_delta_pp: 10
+  require_same_condition_summary: true
+  required_release_evidence:
+    - browser_readiness
+    - interaction
+    - tui_run_events
+scenarios:
+  - id: fix-js-date-helper-small
+    size: small
+    category: fix-code
+    profile: generic
+    prompt: Fix a JavaScript date helper and add a deterministic node smoke check.
+    functional_contract:
+      category: library-with-tests
+      required_capabilities:
+        - implementation
+        - deterministic_test
+    expected_artifacts:
+      - date-helper.js
+    postcheck:
+      commands:
+        - node date-helper.js
+    timeouts:
+      total_sec: 600
+      model_call_sec: 180
+    plan_constraints:
+      min_steps: 2
+      max_steps: 5
+      required_verify_keywords:
+        - node
+  - id: docs-heading-update-small
+    size: small
+    category: data-docs
+    profile: generic
+    prompt: Create README.md with a clear usage heading and one command example.
+    functional_contract:
+      category: docs-content
+      required_capabilities:
+        - requested_content
+    expected_artifacts:
+      - README.md
+    postcheck:
+      commands: []
+    timeouts:
+      total_sec: 600
+      model_call_sec: 180
+    plan_constraints:
+      min_steps: 1
+      max_steps: 4
+      required_verify_keywords:
+        - README.md
+  - id: python-markdown-linter-medium
+    size: medium
+    category: fix-code
+    profile: generic
+    prompt: Build a Python markdown heading linter with Python unittest.TestCase coverage.
+    functional_contract:
+      category: library-with-tests
+      required_capabilities:
+        - implementation
+        - deterministic_test
+    expected_artifacts:
+      - markdown_lint.py
+      - test_markdown_lint.py
+    postcheck:
+      commands:
+        - python3 -m unittest test_markdown_lint.py
+    timeouts:
+      total_sec: 1200
+      model_call_sec: 240
+    plan_constraints:
+      min_steps: 3
+      max_steps: 7
+      required_verify_keywords:
+        - python3 -m unittest
+  - id: rust-cli-medium
+    size: medium
+    category: new-code
+    profile: generic
+    prompt: Create a small Rust CLI with one unit test and cargo test verification.
+    functional_contract:
+      category: cli-tool
+      required_capabilities:
+        - entrypoint
+        - deterministic_check
+    expected_artifacts:
+      - Cargo.toml
+      - src/main.rs
+    postcheck:
+      commands:
+        - cargo test
+    timeouts:
+      total_sec: 1200
+      model_call_sec: 240
+    plan_constraints:
+      min_steps: 3
+      max_steps: 8
+      required_verify_keywords:
+        - cargo test
+  - id: nextjs-space-invaders-large
+    size: large
+    category: new-code
+    profile: nextjs
+    prompt: Create a Next.js Space Invaders game that can run on port 3011.
+    functional_contract:
+      category: interactive-game
+      required_capabilities:
+        - stateful_interaction
+        - start_or_restart_flow
+        - player_control
+        - adversary_or_challenge
+        - progression_or_score
+        - failure_or_collision_rule
+      forbidden_minimal_outputs:
+        - static_title_only
+    interaction_contract:
+      keyboard: true
+      pointer: optional
+    quality_contract:
+      minimum_acceptance: playable_core_loop
+    oracle_contract:
+      deterministic_oracles:
+        - source_semantic
+        - browser_interaction
+    expected_artifacts:
+      - package.json
+      - src/app/page.tsx
+      - src/app/layout.tsx
+      - src/app/global.d.ts
+    postcheck:
+      commands:
+        - npm install --ignore-scripts
+        - npm run build
+      dev_server:
+        command: env -u NODE_ENV npm run dev
+        port: 3011
+        readiness:
+          url: http://127.0.0.1:3011/
+          expect_status: 200
+          timeout_sec: 60
+        shutdown: signal
+    timeouts:
+      total_sec: 3600
+      model_call_sec: 300
+    plan_constraints:
+      min_steps: 3
+      max_steps: 8
+      required_verify_keywords:
+        - npm run build
+        - 3011
+  - id: repair-exhausted-report-large
+    size: large
+    category: recovery
+    profile: generic
+    prompt: Create a multi-file tool that reports repair exhaustion with deterministic Python unittest.TestCase tests.
+    functional_contract:
+      category: library-with-tests
+      required_capabilities:
+        - implementation
+        - deterministic_test
+    expected_artifacts:
+      - repair_report.py
+      - test_repair_report.py
+    postcheck:
+      commands:
+        - python3 -m unittest test_repair_report.py
+    timeouts:
+      total_sec: 2400
+      model_call_sec: 300
+    plan_constraints:
+      min_steps: 4
+      max_steps: 9
+      required_verify_keywords:
+        - python3 -m unittest

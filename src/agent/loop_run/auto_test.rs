@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -6,8 +7,12 @@ use std::time::{Duration, Instant};
 use crate::agent::prompting::load_project_instructions;
 use crate::logging::log_llm_event;
 use crate::session::feedback::FeedbackKind;
+use crate::util::workspace_paths::is_ignored_workspace_display_path;
 
+use super::completion_evidence::is_completion_verifier_command;
+use super::project_probe::ProjectUnit;
 use super::task_workspace_scope::TaskWorkspaceScope;
+use super::verifier_command_policy::PythonProjectUnitVerifierFlavor;
 
 /// Maximum bytes of combined stdout+stderr the auto_test path keeps in its
 /// `AutoTestResult.output`. Issue #459 / DR2-009 keeps this private to the
@@ -74,7 +79,7 @@ pub(super) enum VerifierCandidateSource {
 }
 
 impl VerifierCandidateSource {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::ProjectInstruction => "project_instruction",
             Self::RecentSuccessfulBash => "recent_successful_bash",
@@ -83,6 +88,15 @@ impl VerifierCandidateSource {
             Self::NativeNodeFramework => "native_node_framework",
             Self::PythonTests => "python_tests",
             Self::PythonCompileFallback => "python_compile_fallback",
+        }
+    }
+
+    fn from_project_unit_source(source: &str) -> Option<Self> {
+        match source {
+            "cargo_manifest" => Some(Self::CargoManifest),
+            "package_json_scripts" => Some(Self::PackageJsonScripts),
+            "python_tests" => Some(Self::PythonTests),
+            _ => None,
         }
     }
 }
@@ -118,6 +132,1060 @@ impl VerifierCandidate {
 /// pass through `crate::session::feedback::redact_verifier_command_for_storage`
 /// before landing in any persisted payload (DR4-004).
 ///
+/// Issue #661 Task 2.2 (DR1-008 OCP 拡張口 / DR2-004 serialize 戦略):
+/// `OwnedTestVerifierPlan::Runnable` 内の runner kind 表現。`as_str()` is
+/// the **only** serialization path for the `agent.verifier.invoked` event
+/// payload `runner` field. `#[non_exhaustive]` blocks external `match`
+/// wildcard arms — new variants (Mocha / Vitest / ...) require an explicit
+/// `as_str()` arm so payload schema drift is caught at compile time.
+///
+/// Security gate (DR4-004): runnable authorization is also discriminated on
+/// `RunnerKind`. A new variant MUST land together with (1) the matching
+/// `VerifierCommand::from_<runner>` constructor, (2) the
+/// `append_bound_path_args_for_runner` / execution-time validator match
+/// arm, and (3) the runner-hijack validation test. Until those land the
+/// variant must not appear in production-emitting paths.
+///
+/// Phase A scope (#661 iteration-2): the enum is defined and the
+/// `as_str()` mapping is pinned. Wiring into `OwnedTestVerifierPlan` and
+/// into the pre-spawn snapshot follows in iteration-3.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Iteration-3 instantiates these variants when wiring `OwnedTestVerifierPlan::Runnable` and the `agent.verifier.invoked` payload. Until then only unit tests construct them.
+pub(super) enum RunnerKind {
+    Cargo,
+    Python3,
+    Npm,
+}
+
+impl RunnerKind {
+    /// Payload schema strings. Must match Section 8-1 of the design doc and
+    /// the `runner` field documented for the `agent.verifier.invoked` event.
+    #[allow(dead_code)] // Iteration-3 wires the production caller (`agent.verifier.invoked` payload emit); until then only unit tests consume this.
+    pub(super) fn as_str(&self) -> &'static str {
+        match self {
+            RunnerKind::Cargo => "cargo",
+            RunnerKind::Python3 => "python3",
+            RunnerKind::Npm => "npm",
+        }
+    }
+
+    /// Issue #661 iteration-4 (Task 2.5 + 5.2): map a `VerifierCommand.runner()`
+    /// string back to its `RunnerKind` discriminant. Returns `None` for runners
+    /// that have no `RunnerKind` variant yet (e.g. `pytest` bare invocations
+    /// constructed in unit tests only, or future runners landing through a
+    /// `from_*` constructor before their `RunnerKind` arm and security gate
+    /// are added together, DR4-004). Production `OwnedTestVerifierPlan::Runnable`
+    /// only yields `cargo` / `python3` today, so this stays a total function over
+    /// the production runner string set while the security gate keeps unknown
+    /// runners out of `agent.verifier.invoked` payloads.
+    #[allow(dead_code)] // wired by `VerifierInvokedSnapshot::from_command_and_env` (iteration-4 Task 5.2 producer site)
+    pub(super) fn from_runner_str(runner: &str) -> Option<Self> {
+        match runner {
+            "cargo" => Some(RunnerKind::Cargo),
+            "python3" => Some(RunnerKind::Python3),
+            "npm" => Some(RunnerKind::Npm),
+            _ => None,
+        }
+    }
+}
+
+/// Issue #661 Task 2.3 (DR1-012 / DR2-007): 16-hex `stable_path_hash`
+/// 出力の newtype wrapper。`from_relative_str` 経由でしか構築できないため、
+/// raw path がそのまま `agent.verifier.invoked` の `bound_artifacts[].path_hash`
+/// に流れ込むことをコンパイル時にブロックする。SSOT は
+/// `crate::logging::stable_path_hash`（`mask_secrets` 前置で 16-hex
+/// `DefaultHasher` 出力に統一）。#659 / #660 / #661 はすべて同じ representation
+/// を共有する (iteration-1 で SSOT 昇格済)。
+#[derive(Debug, Clone)]
+pub(super) struct PathHashHex(String);
+
+impl PathHashHex {
+    /// workspace-relative path 文字列を `mask_secrets` で前処理した上で
+    /// `crate::logging::stable_path_hash` に流す。caller の raw path
+    /// (絶対 path / .. / secret-bearing) は mask 後でも 16-hex 出力に均一化
+    /// される。
+    #[allow(dead_code)] // Iteration-3 wires the production caller (`VerifierInvokedSnapshot.bound_artifacts`); until then only unit tests consume this.
+    pub(super) fn from_relative_str(s: &str) -> Self {
+        Self(crate::logging::stable_path_hash(
+            &crate::session::feedback::mask_secrets(s),
+        ))
+    }
+
+    /// 16-hex の borrowed view。caller は payload に直接埋めるだけで、独自
+    /// に format したり raw path を交ぜたりしない。
+    #[allow(dead_code)] // Iteration-3 wires the production caller (`agent.verifier.invoked` payload emit); until then only unit tests consume this.
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Issue #661 iteration-4 Task 2.4 (DR1-001 SRP) /
+/// iteration-5 Task 6.3 (Phase B 実値 populate):
+/// `HermeticEnvPlan` の `summary()` が返す観測値。`agent.verifier.invoked`
+/// event の `env_summary` field と root-level `cwd_inside_work_root` を
+/// 構築するための純粋な観測 view。
+///
+/// Phase B 観測実値:
+/// - `allowlist_keys`: `filter_env_for_tester(std::env::vars())` で実際に
+///   注入された key の `'static str` 列 (DR1-009: `TESTER_ENV_ALLOWLIST_EXACT`
+///   の slice は直接参照しない — `filter_env_for_tester` の戻り値 key 名を
+///   `TESTER_ENV_ALLOWLIST_EXACT` の対応する `'static str` に解決する経路でのみ
+///   `&'static str` に昇格する)
+/// - `pythonpath_root`: `pythonpath_root: Option<PathBuf>` が `Some` か
+/// - `cwd_inside_work_root`: `self.cwd == self.work_root_for_summary`
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired by `VerifierInvokedSnapshot::from_command_and_env`
+pub(super) struct HermeticEnvSummary {
+    pub allowlist_keys: Vec<&'static str>,
+    pub pythonpath_root: bool,
+    pub cwd_inside_work_root: bool,
+}
+
+/// Issue #661 iteration-5 Task 7.1 (pre-execution PYTHONPATH 検査):
+/// `build_hermetic_env_plan` が PYTHONPATH に work_root 外の path を発見した
+/// 場合、`HermeticEnvPlan` 内に rejection signal を保持する。raw path は
+/// payload には出さず、emit site で `external_pythonpath_rejected` reason
+/// として再構成する。
+///
+/// Phase B 構築不変条件 (DR1-001 SRP):
+/// - `allow_entries`: `filter_env_for_tester(std::env::vars())` を `apply_to`
+///   時に毎回 fresh に評価する (caller process env を snapshot として hold する
+///   設計だが、`build_hermetic_env_plan` 時点で評価して `Vec<(String, String)>`
+///   に固定する。caller env の途中変更は反映しない、これは hermetic 観点で
+///   むしろ望ましい invariant)
+/// - `extras`: caller (Python adapter / Cargo adapter) が決める固定 closed slice
+/// - `pythonpath_root`: `apply_to` が `cmd.env("PYTHONPATH", root)` で挿入。
+///   `None` のときは `apply_to` が `cmd.env_remove("PYTHONPATH")` を呼ぶ
+/// - `cwd`: `work_root` 自身
+/// - `rejected_pythonpath`: PYTHONPATH に外部 path を発見した場合の signal。
+///   `apply_to` 自体は依然として work_root cwd / allowlist 再注入の副作用を
+///   適用するが、caller (`run_structured` / event emit) が rejection を観測する
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired by `run_structured` and `VerifierInvokedSnapshot::from_command_and_env`
+pub(super) struct HermeticEnvPlan {
+    allow_entries: Vec<(String, String)>,
+    extras: Vec<(&'static str, &'static str)>,
+    pythonpath_root: Option<PathBuf>,
+    cwd: PathBuf,
+    /// PYTHONPATH に work_root 外の path を発見した場合に raw substring
+    /// (mask 前) を保持。raw value は `apply_to` では使われず、emit site で
+    /// `external_pythonpath_rejected` event の detected_modules に hash 化
+    /// される。Phase B Task 7.1 で導入。
+    rejected_pythonpath: Option<String>,
+}
+
+impl HermeticEnvPlan {
+    /// `Command` への副作用適用 (SRP)。Phase B 本実装:
+    /// 1. `cmd.env_clear()` で parent env を baseline reset
+    /// 2. `allow_entries` で allowlist key 群を再注入 (PATH / HOME / LANG / ...)
+    /// 3. `extras` で runner-specific extra key (PYTHONDONTWRITEBYTECODE 等)
+    /// 4. PYTHONPATH 制御: `pythonpath_root` が `Some` なら `cmd.env("PYTHONPATH", root)`、
+    ///    `None` なら `cmd.env_remove("PYTHONPATH")` で明示的に drop
+    /// 5. `cmd.current_dir(&self.cwd)` で work_root に固定
+    ///
+    /// DR1-009 invariant: `allow_entries` の中身は `build_hermetic_env_plan`
+    /// で `filter_env_for_tester` 経由のみで構築。`apply_to` 自身は slice の
+    /// key 名を直接参照しない。
+    #[allow(dead_code)] // wired by `run_structured` and Phase B verifier_skill execution
+    pub(super) fn apply_to(&self, cmd: &mut std::process::Command) {
+        cmd.env_clear();
+        for (k, v) in &self.allow_entries {
+            cmd.env(k, v);
+        }
+        for (k, v) in &self.extras {
+            cmd.env(k, v);
+        }
+        match &self.pythonpath_root {
+            Some(root) => {
+                cmd.env("PYTHONPATH", root);
+            }
+            None => {
+                cmd.env_remove("PYTHONPATH");
+            }
+        }
+        cmd.current_dir(&self.cwd);
+    }
+
+    /// event payload 用 summary を純関数で返す (SRP)。Phase B 観測実値:
+    /// - `allowlist_keys`: `allow_entries` の key 名を `&'static str` に昇格
+    ///   (DR1-009: `crate::tools::bash::tester_allowlist_static_key` 経由で
+    ///   SSOT を bash.rs に閉じる — `TESTER_ENV_ALLOWLIST_EXACT` の slice を
+    ///   直接参照しない)
+    /// - `pythonpath_root`: `self.pythonpath_root` が Some か
+    /// - `cwd_inside_work_root`: build 時に `cwd = work_root` で常に true
+    #[allow(dead_code)] // wired by `VerifierInvokedSnapshot::from_command_and_env`
+    pub(super) fn summary(&self) -> HermeticEnvSummary {
+        // DR1-009: `allow_entries` の `String` key 名から `&'static str`
+        // への昇格は `crate::tools::bash::tester_allowlist_static_key` 経由
+        // のみで実行する (SSOT は bash.rs 側に閉じる)。`filter_env_for_tester`
+        // の戻り値 key は allowlist 通過済みなので常に `Some(...)` を返す
+        // 経路だが、defense-in-depth で `None` 時は drop する。
+        let allowlist_keys: Vec<&'static str> = self
+            .allow_entries
+            .iter()
+            .filter_map(|(k, _)| crate::tools::bash::tester_allowlist_static_key(k.as_str()))
+            .collect();
+        let pythonpath_root = self.pythonpath_root.is_some();
+        // build path always sets `cwd = work_root` (see `build_hermetic_env_plan`).
+        let cwd_inside_work_root = true;
+        HermeticEnvSummary {
+            allowlist_keys,
+            pythonpath_root,
+            cwd_inside_work_root,
+        }
+    }
+
+    /// Phase B Task 7.1: PYTHONPATH に external path が発見された場合の
+    /// rejection summary。raw substring は出さず、`source_kind=pythonpath`
+    /// の検出が発生したか否か (bool) と detected_count を返す。
+    #[allow(dead_code)] // wired by `run_structured` / event emit site
+    pub(super) fn rejected_pythonpath_hash(&self) -> Option<String> {
+        self.rejected_pythonpath.as_ref().map(|raw| {
+            crate::logging::stable_path_hash(&crate::session::feedback::mask_secrets(raw))
+        })
+    }
+
+    /// Phase B Task 6.4: hermetic env の planned PATH を borrow して返す。
+    /// `VerifierCommand::resolved_runner_program` で runner 絶対 path 解決に
+    /// 使う。`allow_entries` 経由 (DR1-009: `TESTER_ENV_ALLOWLIST_EXACT` を
+    /// 直接参照しない) で PATH を抽出する。
+    #[allow(dead_code)] // wired by `run_structured` / verifier_skill spawn site
+    pub(super) fn planned_path(&self) -> Option<&str> {
+        self.allow_entries
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Issue #661 iteration-5 Task 6.2 (DR1-006 Phase B): Python verifier path
+/// extras. `PYTHONDONTWRITEBYTECODE=1` disables `.pyc` file generation
+/// (avoid `__pycache__` pollution under work_root), `PYTHONNOUSERSITE=1`
+/// blocks `~/.local/lib/python*/site-packages` from polluting `sys.path`,
+/// and `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` prevents unrelated third-party
+/// pytest plugins from mutating collection/import behavior.
+///
+/// Cargo path uses `&[]` (empty extras). The slice is a private const so
+/// no LLM/recent-shell input can flow into the extras list (DR4-002).
+#[allow(dead_code)] // wired by `from_python3_pytest_stdlib` adapter (iteration-5 Task 6.2)
+pub(super) const VERIFIER_ENV_PYTHON_EXTRA: &[(&str, &str)] = &[
+    ("PYTHONDONTWRITEBYTECODE", "1"),
+    ("PYTHONNOUSERSITE", "1"),
+    ("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1"),
+];
+
+/// Issue #661 iteration-5 Task 6.1 (Phase B hermetic env 本実装):
+/// 純粋に hermetic env plan を構築する。
+///
+/// Phase B 動作:
+/// - `allow_entries` を `filter_env_for_tester(std::env::vars())` で構築
+/// - `extras` を caller-provided closed slice からコピー (Phase B では Python
+///   adapter が `VERIFIER_ENV_PYTHON_EXTRA` を渡し、Cargo adapter は `&[]`)
+/// - `pythonpath_root` は parent PYTHONPATH と runner extras から Some/None。
+///   - PYTHONPATH 未設定 or 空かつ non-Python runner → `None` (child から remove)
+///   - Python verifier extras がある → `Some(work_root)` に固定
+///   - PYTHONPATH に external (work_root 外) component を発見 → `Some(work_root)`
+///     に上書きしつつ、`rejected_pythonpath` に raw substring を保持
+///   - PYTHONPATH 全要素が work_root 配下 → `Some(work_root)`
+/// - `cwd` は `work_root` 自身
+#[allow(dead_code)] // wired by `VerifierInvokedSnapshot::from_command_and_env`
+pub(super) fn build_hermetic_env_plan(
+    work_root: &Path,
+    extras: &[(&'static str, &'static str)],
+) -> HermeticEnvPlan {
+    let allow_entries = crate::tools::bash::filter_env_for_tester(std::env::vars());
+    let extras_vec: Vec<(&'static str, &'static str)> = extras.to_vec();
+    // Phase B Task 7.1: pre-execution PYTHONPATH 検査。parent process env から
+    // PYTHONPATH を読み取り、各要素が work_root 配下かを判定。
+    let (mut pythonpath_root, rejected_pythonpath) = evaluate_pythonpath_for_hermetic_env(
+        work_root,
+        std::env::var("PYTHONPATH").ok().as_deref(),
+    );
+    if pythonpath_root.is_none()
+        && extras
+            .iter()
+            .any(|(key, _)| *key == "PYTHONNOUSERSITE" || *key == "PYTEST_DISABLE_PLUGIN_AUTOLOAD")
+    {
+        pythonpath_root = Some(work_root.to_path_buf());
+    }
+    HermeticEnvPlan {
+        allow_entries,
+        extras: extras_vec,
+        pythonpath_root,
+        cwd: work_root.to_path_buf(),
+        rejected_pythonpath,
+    }
+}
+
+/// Issue #661 iteration-5 Task 7.1: pure function over a PYTHONPATH string.
+/// Returns `(pythonpath_root, rejected_pythonpath)`:
+/// - `pythonpath_root = Some(work_root)` if any PYTHONPATH component is set
+///   (including external ones — we still pin PYTHONPATH to work_root so the
+///   child cannot import from the external paths)
+/// - `pythonpath_root = None` if PYTHONPATH was unset/empty
+/// - `rejected_pythonpath = Some(raw_substring)` if any component resolves
+///   outside `work_root` (excluding well-known safe roots like `~/.pyenv`,
+///   `~/.local/share/uv`, target/cache dirs which never appear in PYTHONPATH
+///   in normal projects but are kept here defensively)
+///
+/// The raw substring is mask_secrets'd at emit time; this function returns
+/// the unmasked form so the caller can apply mask_secrets in the same pass
+/// as stable_path_hash.
+#[allow(dead_code)] // wired by `build_hermetic_env_plan`
+fn evaluate_pythonpath_for_hermetic_env(
+    work_root: &Path,
+    raw_pythonpath: Option<&str>,
+) -> (Option<PathBuf>, Option<String>) {
+    // CB-010 (Codex iteration-5 medium): use the platform separator instead
+    // of a hard-coded `:` so Windows PYTHONPATH (`;`-separated) is parsed
+    // correctly and drive letters (`C:`) are not split. On Unix the
+    // separator is still `:`.
+    evaluate_pythonpath_with_separator(work_root, raw_pythonpath, pythonpath_separator())
+}
+
+/// Returns the platform PYTHONPATH separator character. On Unix this is
+/// `:`; on Windows it is `;`. Mirrors `std::env::join_paths` semantics.
+fn pythonpath_separator() -> char {
+    if cfg!(windows) { ';' } else { ':' }
+}
+
+/// CB-010 (Codex iteration-5 medium): pure parser variant of
+/// `evaluate_pythonpath_for_hermetic_env` that takes the separator as a
+/// parameter so unit tests can drive both POSIX (`:`) and Windows (`;`)
+/// shapes deterministically without touching the host platform.
+///
+/// Behavioral invariant identical to the production wrapper:
+/// - Empty / unset PYTHONPATH → `(None, None)`
+/// - Any component present → `pythonpath_root = Some(work_root)` so the
+///   child cannot inherit external paths
+/// - First external (non-work_root) component → `rejected = Some(raw)`
+/// - Empty components (e.g. trailing `:`) are skipped, `.` is treated as
+///   work_root
+#[allow(dead_code)] // wired by `evaluate_pythonpath_for_hermetic_env` + unit tests
+fn evaluate_pythonpath_with_separator(
+    work_root: &Path,
+    raw_pythonpath: Option<&str>,
+    separator: char,
+) -> (Option<PathBuf>, Option<String>) {
+    let raw = match raw_pythonpath {
+        Some(s) if !s.is_empty() => s,
+        _ => return (None, None),
+    };
+    // Canonicalize work_root once for prefix comparison. Falls back to the
+    // raw `to_path_buf` form if canonicalize fails (e.g. tempdir cleanup
+    // race) — the comparison stays strict-equality / starts_with-based.
+    let work_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let mut rejected: Option<String> = None;
+    for component in raw.split(separator) {
+        let trimmed = component.trim();
+        if trimmed.is_empty() || trimmed == "." {
+            continue;
+        }
+        // Treat relative paths as relative to work_root.
+        let path = if Path::new(trimmed).is_absolute() {
+            PathBuf::from(trimmed)
+        } else {
+            work_canon.join(trimmed)
+        };
+        let canon = std::fs::canonicalize(&path).unwrap_or(path);
+        if !canon.starts_with(&work_canon) {
+            // First external component wins; raw substring retained for hash.
+            rejected = Some(trimmed.to_string());
+            break;
+        }
+    }
+    // Always pin PYTHONPATH to work_root once any component is present —
+    // child cannot reach external imports through PYTHONPATH even if the
+    // hermetic env rejection signal is observed asynchronously.
+    (Some(work_root.to_path_buf()), rejected)
+}
+
+/// Issue #661 iteration-5 Task 6.4 (DR4-001 PATH hijack 防止) /
+/// CB-008 (Codex iteration-5 high): resolve a runner binary against a
+/// **sanitized** `PATH` string and return the absolute path of the first
+/// executable hit. CB-008 hardens this to fail-closed: callers SHOULD
+/// route through `resolve_runner_in_sanitized_path` (which applies
+/// `sanitize_path_for_runner_resolution` before scanning) so a hostile
+/// component in the parent PATH cannot hijack the runner.
+///
+/// The lookup follows `:`-separated POSIX semantics; on Windows callers
+/// should not use this (Phase B target platforms are Unix-only for the
+/// hermetic verifier path).
+#[allow(dead_code)] // wired by `VerifierCommand::resolved_runner_path`
+fn resolve_runner_in_path(path_value: &str, runner: &str) -> Option<PathBuf> {
+    if runner.is_empty() || runner.contains('/') {
+        // Already-absolute or contains-slash runner names are not subject to
+        // PATH search; return as-is when absolute, otherwise reject.
+        let p = Path::new(runner);
+        if p.is_absolute() {
+            return Some(p.to_path_buf());
+        }
+        return None;
+    }
+    for dir in path_value.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(dir).join(runner);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// CB-008 (Codex iteration-5 high, DR4-001 fail-closed): sanitize a raw
+/// `PATH` string so only `absolute + canonicalize-able` components that
+/// do NOT live under `work_root` survive. Empty / relative / work_root-
+/// anchored components are dropped. The output is joined back with
+/// `:` (POSIX) so callers can keep their `:`-split lookup unchanged.
+///
+/// Rationale: trusting the parent process PATH for runner resolution
+/// allows a hostile workspace-local binary (e.g. `<work_root>/bin/python3`)
+/// to hijack the verifier when the parent CWD inadvertently placed
+/// `<work_root>/bin` ahead of `/usr/bin`. The sanitized PATH never
+/// contains such components — even if the absolute path resolves under
+/// `work_root`, it is removed. `CARGO_HOME` / `RUSTUP_HOME` / `HOME`-rooted
+/// bins are accepted implicitly because they are absolute and outside
+/// `work_root`.
+#[allow(dead_code)] // wired by `resolved_runner_program_fail_closed`
+fn sanitize_path_for_runner_resolution(path_value: &str, work_root: Option<&Path>) -> String {
+    let work_root_canon =
+        work_root.map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+    let mut accepted: Vec<String> = Vec::new();
+    for raw in path_value.split(':') {
+        if raw.is_empty() {
+            continue;
+        }
+        let p = Path::new(raw);
+        if !p.is_absolute() {
+            // CB-008: relative components are never trusted — CWD-relative
+            // resolution could pick up a hostile `./bin/python3`.
+            continue;
+        }
+        if let Some(ref work_canon) = work_root_canon {
+            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if canon.starts_with(work_canon) {
+                // CB-008: a workspace-local PATH component MUST NOT win the
+                // runner search. Drop it.
+                continue;
+            }
+        }
+        accepted.push(raw.to_string());
+    }
+    accepted.join(":")
+}
+
+/// CB-008 (Codex iteration-5 high, DR4-001 fail-closed): resolve a runner
+/// inside the sanitized PATH. Returns `None` when no absolute resolution
+/// is possible (caller MUST then surface a TransportError rather than
+/// falling back to the relative runner name).
+#[allow(dead_code)] // wired by `VerifierCommand::resolved_runner_program_fail_closed`
+fn resolve_runner_in_sanitized_path(
+    path_value: &str,
+    runner: &str,
+    work_root: Option<&Path>,
+) -> Option<PathBuf> {
+    if runner.is_empty() {
+        return None;
+    }
+    if runner.contains('/') {
+        let p = Path::new(runner);
+        if !p.is_absolute() {
+            return None;
+        }
+        if let Some(work_root) = work_root {
+            let work_canon =
+                std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if canon.starts_with(&work_canon) {
+                return None;
+            }
+        }
+        return Some(p.to_path_buf());
+    }
+    let sanitized = sanitize_path_for_runner_resolution(path_value, work_root);
+    resolve_runner_in_path(&sanitized, runner)
+}
+
+#[cfg(unix)]
+fn is_executable_file(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(p) {
+        Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// Issue #661 iteration-5 Task 7.2 / CB-009 (Codex iteration-5 medium):
+/// result of post-execution external import detection. Carries the
+/// (capped) entries that will be hashed into the event payload alongside
+/// the **pre-cap** `total_count` and a `truncated` flag derived from
+/// `total_count > EXTERNAL_IMPORT_DETECTED_CAP`. Section 8-2's contract is
+/// "上限 8 件に truncate しつつ full count/truncated を伝える"; computing
+/// `detected_count` from the capped list (the pre-CB-009 shape) collapsed
+/// the true total onto `len() <= cap`, so the caller could not tell
+/// "exactly 8" from "many more". `truncated` only flips when the full
+/// total strictly exceeds the cap.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired by post-execution emit site in Phase B
+pub(super) struct DetectedExternalImports {
+    /// Detected raw path tokens, capped at `EXTERNAL_IMPORT_DETECTED_CAP`.
+    pub entries: Vec<String>,
+    /// Full pre-cap count (every detection that passed the safe-path /
+    /// work_root filters, regardless of how many fit in `entries`).
+    pub total_count: usize,
+    /// `true` iff `total_count > EXTERNAL_IMPORT_DETECTED_CAP`.
+    pub truncated: bool,
+}
+
+/// Issue #661 iteration-5 Task 7.2 (post-execution external import
+/// detection): pattern-match stdout/stderr for external-workspace imports.
+/// Returns the set of detected (raw) module identifiers; caller hashes
+/// before emit. The list is capped at `EXTERNAL_IMPORT_DETECTED_CAP=8` per
+/// DR4-005 / cardinality bound; the caller is responsible for propagating
+/// `detected_count` / `detected_truncated`.
+///
+/// CB-009 (Codex iteration-5 medium): the function walks every candidate
+/// line/token to count the pre-cap total even after the per-emit cap is
+/// reached. Only the first `EXTERNAL_IMPORT_DETECTED_CAP` distinct raw
+/// strings are retained in `entries`; subsequent unique hits still bump
+/// `total_count` so the caller can carry a faithful `detected_count`.
+///
+/// Safe-path filter: paths under common toolchain cache roots
+/// (`~/.cargo`, `~/.pyenv/versions`, `~/.rustup`, `~/.local/share/uv`,
+/// pip cache, npm cache, cargo target dirs) are NOT signaled as external.
+/// They are infrastructure for the build, not project source.
+///
+/// Pattern coverage:
+/// - Python `ImportError: ... '/external/...'` (lines containing `ImportError`
+///   + an absolute path component outside work_root)
+/// - Python `ModuleNotFoundError: ... '/external/...'`
+/// - Python `from /external/... import ...` style (rare in real logs)
+/// - Cargo `error: could not find ... /external/...` (rare; cargo normally
+///   resolves through Cargo.toml)
+#[allow(dead_code)] // wired by post-execution emit site in Phase B
+pub(super) fn detect_external_imports_in_output(
+    work_root: &Path,
+    stdout: &str,
+    stderr: &str,
+) -> DetectedExternalImports {
+    let work_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let mut entries: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut total_count: usize = 0;
+    let combined = format!("{stdout}\n{stderr}");
+    for line in combined.lines() {
+        if !line.contains("ImportError")
+            && !line.contains("ModuleNotFoundError")
+            && !line.contains("from /")
+        {
+            continue;
+        }
+        // Extract candidate absolute paths from the line (very loose tokenizer:
+        // split on whitespace, single-quote, double-quote and inspect tokens
+        // that look like absolute filesystem paths).
+        for raw in line
+            .split(|c: char| {
+                c.is_whitespace()
+                    || c == '\''
+                    || c == '"'
+                    || c == ','
+                    || c == '('
+                    || c == ')'
+                    || c == '['
+                    || c == ']'
+            })
+            .filter(|s| s.starts_with('/'))
+        {
+            let candidate = Path::new(raw);
+            if !candidate.is_absolute() {
+                continue;
+            }
+            if path_is_known_safe_external(candidate, &work_canon) {
+                continue;
+            }
+            // Resolve symlinks if possible; fall back to the raw path.
+            let canon =
+                std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+            if canon.starts_with(&work_canon) {
+                continue;
+            }
+            let raw_owned = raw.to_string();
+            if !seen.insert(raw_owned.clone()) {
+                // Already counted on a previous match — neither bump total
+                // nor consider for entries.
+                continue;
+            }
+            total_count += 1;
+            if entries.len() < EXTERNAL_IMPORT_DETECTED_CAP {
+                entries.push(raw_owned);
+            }
+        }
+    }
+    let truncated = total_count > EXTERNAL_IMPORT_DETECTED_CAP;
+    DetectedExternalImports {
+        entries,
+        total_count,
+        truncated,
+    }
+}
+
+pub(super) fn python_package_marker_candidates_for_external_import(
+    work_root: &Path,
+    stdout: &str,
+    stderr: &str,
+) -> Vec<String> {
+    let work_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let mut candidates = BTreeSet::new();
+    let combined = format!("{stdout}\n{stderr}");
+    for line in combined.lines() {
+        if !line.contains("ImportError") && !line.contains("ModuleNotFoundError") {
+            continue;
+        }
+        for module in quoted_module_tokens(line) {
+            let Some(top) = module.split('.').next() else {
+                continue;
+            };
+            if !is_safe_python_module_segment(top) || matches!(top, "test" | "tests") {
+                continue;
+            }
+            let package_dir = work_root.join(top);
+            if !package_dir.is_dir() || package_dir.join("__init__.py").exists() {
+                continue;
+            }
+            let package_canon =
+                std::fs::canonicalize(&package_dir).unwrap_or_else(|_| package_dir.clone());
+            if !package_canon.starts_with(&work_canon) {
+                continue;
+            }
+            let has_direct_python_file = std::fs::read_dir(&package_dir)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(Result::ok))
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "py"));
+            if has_direct_python_file {
+                candidates.insert(format!("{top}/__init__.py"));
+            }
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+pub(super) fn python_package_marker_candidates_for_owned_test_imports(
+    work_root: &Path,
+    owned_test_artifacts: &[String],
+) -> Vec<String> {
+    let work_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let mut candidates = BTreeSet::new();
+    for relative_path in owned_test_artifacts {
+        if !safe_relative_workspace_path(relative_path) {
+            continue;
+        }
+        let test_path = work_root.join(relative_path);
+        let Ok(test_canon) = std::fs::canonicalize(&test_path) else {
+            continue;
+        };
+        if !test_canon.starts_with(&work_canon) {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&test_canon) else {
+            continue;
+        };
+        for module in imported_python_modules(&contents) {
+            for candidate in python_package_marker_candidates_for_module(work_root, &module) {
+                candidates.insert(candidate);
+            }
+        }
+    }
+    candidates.into_iter().collect()
+}
+
+fn safe_relative_workspace_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.chars().any(|ch| ch.is_control())
+        && !Path::new(path).is_absolute()
+        && !Path::new(path)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn imported_python_modules(contents: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("from ") {
+            let module = rest.split_whitespace().next().unwrap_or_default();
+            if !module.starts_with('.') {
+                modules.push(module.trim_end_matches(',').to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("import ") {
+            for part in rest.split(',') {
+                let module = part.split_whitespace().next().unwrap_or_default();
+                if !module.starts_with('.') {
+                    modules.push(module.to_string());
+                }
+            }
+        }
+    }
+    modules
+}
+
+fn python_package_marker_candidates_for_module(work_root: &Path, module: &str) -> Vec<String> {
+    let work_canon = std::fs::canonicalize(work_root).unwrap_or_else(|_| work_root.to_path_buf());
+    let components: Vec<&str> = module
+        .split('.')
+        .filter(|part| is_safe_python_module_segment(part))
+        .collect();
+    if components.is_empty() || matches!(components[0], "test" | "tests") {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    let mut prefix = PathBuf::new();
+    for component in components {
+        prefix.push(component);
+        let package_dir = work_root.join(&prefix);
+        if !package_dir.is_dir() {
+            break;
+        }
+        if package_dir.join("__init__.py").exists() {
+            continue;
+        }
+        let package_canon =
+            std::fs::canonicalize(&package_dir).unwrap_or_else(|_| package_dir.clone());
+        if !package_canon.starts_with(&work_canon) {
+            break;
+        }
+        if python_dir_has_source_signal(&package_dir) {
+            candidates.push(format!(
+                "{}/__init__.py",
+                prefix.to_string_lossy().replace('\\', "/")
+            ));
+        }
+    }
+    candidates
+}
+
+fn python_dir_has_source_signal(package_dir: &Path) -> bool {
+    std::fs::read_dir(package_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .any(|entry| {
+            let path = entry.path();
+            path.extension().is_some_and(|ext| ext == "py") || path.is_dir()
+        })
+}
+
+fn quoted_module_tokens(line: &str) -> Vec<&str> {
+    line.split(['\'', '"'])
+        .enumerate()
+        .filter_map(|(idx, token)| {
+            if idx % 2 == 1 && token.contains('.') {
+                Some(token)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn is_safe_python_module_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// Issue #661 iteration-5 Task 7.2: cap on `detected_modules` carried in
+/// the `agent.verifier.external_import_rejected` event payload. Excess
+/// detections are dropped and the caller sets `detected_truncated=true`
+/// (see Section 8-2). Mirrors `VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP` style.
+#[allow(dead_code)] // wired by emit site
+pub(super) const EXTERNAL_IMPORT_DETECTED_CAP: usize = 8;
+
+/// Issue #661 iteration-5 Task 7.2 / CB-011 (Codex iteration-5 medium):
+/// well-known safe external roots that the pattern matcher must NOT flag
+/// as external imports. Mirrors the design Section 6 security table
+/// ("cargo registry / pip cache / pyenv versions などは false positive 回避").
+///
+/// CB-011 narrows the original substring-only filter: a substring like
+/// `/lib/python` or any `target` component (at arbitrary depth) was too
+/// permissive — `/tmp/other/lib/python/...` and `/tmp/target/...` were
+/// hidden from detection. The CB-011 fix anchors safe paths to either:
+/// - HOME-anchored toolchain / package caches (`$HOME/.cargo/`,
+///   `$HOME/.rustup/`, `$HOME/.pyenv/`, `$HOME/.local/share/uv/`, etc.);
+///   the HOME prefix is required so an arbitrary `/tmp/.cargo/...` does
+///   NOT pass the filter, and
+/// - canonical Python toolchain trees recognised by an explicit prefix
+///   match (`/usr/lib/python`, `/usr/local/lib/python`, `/opt/...lib/python`,
+///   `/Library/Frameworks/Python.framework/`,
+///   system-wide `/lib/python` and `/lib64/python`). These are the only
+///   well-known absolute paths that Python sys.path inhabits without
+///   project sources and are kept narrow enough that
+///   `/tmp/other/lib/python/...` does NOT match.
+/// - the canonical CARGO_TARGET_DIR (when set) or `<work_root>/target/`;
+///   arbitrary `target` components elsewhere are NO LONGER safe.
+fn path_is_known_safe_external(p: &Path, work_root_canon: &Path) -> bool {
+    let s = p.to_string_lossy();
+    // CB-011 (pass 2): canonicalize the candidate first so symlinked /tmp/.cargo
+    // → real cache locations are evaluated against the canonical anchor.
+    let p_canon: PathBuf = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+
+    // Helper: anchor a candidate to a canonical root using component-boundary
+    // path semantics (avoids `/home/u2` matching `/home/u`).
+    fn descends_from(candidate: &Path, root_canon: &Path) -> bool {
+        candidate.strip_prefix(root_canon).is_ok()
+    }
+
+    // CB-011 (pass 2): canonicalize HOME so /tmp-symlinked HOME caches do not
+    // bypass the anchor, then require component-boundary descent.
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_raw = PathBuf::from(home);
+        let home_canon = std::fs::canonicalize(&home_raw).unwrap_or(home_raw);
+        if descends_from(&p_canon, &home_canon) {
+            // After the HOME prefix, the suffix must look like one of the
+            // known cache roots, evaluated component-wise (not as a raw
+            // string prefix, so `.cargooverride` cannot impersonate `.cargo`).
+            const HOME_RELATIVE_SAFE_FIRST_COMPONENTS: &[&[&str]] = &[
+                &[".cargo"],
+                &[".rustup"],
+                &[".pyenv"],
+                &[".local", "share", "uv"],
+                &[".local", "share", "virtualenvs"],
+                &[".cache", "pip"],
+                &[".cache", "pypoetry"],
+                &[".cache", "uv"],
+                &[".npm"],
+            ];
+            if let Ok(rel) = p_canon.strip_prefix(&home_canon) {
+                let rel_components: Vec<_> = rel
+                    .components()
+                    .filter_map(|c| match c {
+                        std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+                        _ => None,
+                    })
+                    .collect();
+                for safe in HOME_RELATIVE_SAFE_FIRST_COMPONENTS {
+                    if rel_components.len() >= safe.len()
+                        && rel_components.iter().zip(safe.iter()).all(|(a, b)| a == *b)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    // CB-011 (pass 2): also anchor to canonical CARGO_HOME / RUSTUP_HOME if
+    // they are set outside HOME (e.g. CI runners with `CARGO_HOME=/cache/.cargo`).
+    for env_key in ["CARGO_HOME", "RUSTUP_HOME"] {
+        if let Some(raw) = std::env::var_os(env_key) {
+            let raw_path = PathBuf::from(raw);
+            let canon = std::fs::canonicalize(&raw_path).unwrap_or(raw_path);
+            if descends_from(&p_canon, &canon) {
+                return true;
+            }
+        }
+    }
+    // CB-011: explicit absolute prefixes for system-wide Python toolchain
+    // trees. These are bound to known absolute roots — they do NOT match
+    // arbitrary `/tmp/.../lib/python` / `/whatever/site-packages` paths.
+    const ABSOLUTE_PYTHON_TOOLCHAIN_PREFIXES: &[&str] = &[
+        "/usr/lib/python",
+        "/usr/lib64/python",
+        "/usr/local/lib/python",
+        "/usr/local/lib64/python",
+        "/opt/homebrew/lib/python",
+        "/Library/Frameworks/Python.framework/",
+        "/Applications/Xcode.app/Contents/Developer/",
+        "/Library/Developer/CommandLineTools/",
+        // Wide POSIX system libs (only at /lib and /lib64 root, NOT
+        // `/tmp/.../lib/python`).
+        "/lib/python",
+        "/lib64/python",
+    ];
+    for prefix in ABSOLUTE_PYTHON_TOOLCHAIN_PREFIXES {
+        if s.starts_with(prefix) {
+            return true;
+        }
+    }
+    // CB-011: cpython-tagged interpreter installs (e.g. uv-managed
+    // `/.../cpython-3.12.1-...`). Restricted to HOME-anchored matches via
+    // the HOME branch above; standalone `/tmp/cpython-...` is NOT safe.
+    // (Intentional drop of the legacy "/cpython-" anywhere substring.)
+    //
+    // CB-011: `target` directory containment is anchored to either
+    // `<work_root>/target/` or the canonical `CARGO_TARGET_DIR`. Bare
+    // `target` components elsewhere are detected as external.
+    if let Ok(rel) = p.strip_prefix(work_root_canon)
+        && rel
+            .components()
+            .next()
+            .map(|c| matches!(c, std::path::Component::Normal(n) if n == "target"))
+            .unwrap_or(false)
+    {
+        return true;
+    }
+    if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        let target_dir_canon =
+            std::fs::canonicalize(&target_dir).unwrap_or(PathBuf::from(target_dir));
+        if p.starts_with(&target_dir_canon) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Issue #661 iteration-4 Task 2.5 (DR1-005 / DR1-012 / DR2-007):
+/// pre-spawn `agent.verifier.invoked` event の構造化 snapshot。`turn.rs`
+/// facade と `verifier_skill::execute_with_invocation_observer` が
+/// `run_structured` 直前にこの snapshot を構築し、emit ownership は
+/// `TurnState::last_verifier_invoked_payload_digest` を持つ caller に閉じる
+/// (DR1-005 emit ownership facade plumbing)。
+///
+/// 型レベル invariant:
+/// - `runner: RunnerKind` — string 値経路を許さない (DR4-004 security gate)
+/// - `bound_artifacts: Vec<PathHashHex>` — raw path がそのまま流れ込むことを
+///   コンパイル時にブロック (DR1-012 / DR2-007)
+/// - `bound_artifacts_truncated` — `bound_artifacts.len() <= 16` の cap 後の
+///   フラグ。`bound_test_artifacts_count` は cap 前の full count を保持する
+///   (Section 8-1 / 6 セキュリティ表 payload size explosion 対策)
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // wired by `turn.rs::run_task_contract_verifier_once` (iteration-4 Task 5.2 producer site) + `verifier_skill::execute_with_invocation_observer` (Task 5.3)
+pub(super) struct VerifierInvokedSnapshot {
+    pub runner: RunnerKind,
+    pub bound_artifacts: Vec<PathHashHex>,
+    pub bound_test_artifacts_count: usize,
+    pub bound_artifacts_truncated: bool,
+    pub env_summary: HermeticEnvSummary,
+}
+
+/// Issue #661 iteration-4: maximum number of `bound_artifacts` entries the
+/// `agent.verifier.invoked` payload carries. Excess entries are truncated and
+/// `bound_artifacts_truncated=true` is set so log consumers can detect the
+/// cap. `bound_test_artifacts_count` keeps the full pre-cap count
+/// (Section 8-1 / セキュリティ表 payload size explosion 対策)。
+#[allow(dead_code)] // wired by `VerifierInvokedSnapshot::from_command_and_env` (iteration-4 Task 5.2 producer site)
+pub(super) const VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP: usize = 16;
+
+impl VerifierInvokedSnapshot {
+    /// Construct the snapshot from a `VerifierCommand` and a built
+    /// `HermeticEnvPlan`. Only callable for runners with a `RunnerKind`
+    /// variant — production `OwnedTestVerifierPlan::Runnable` yields
+    /// `cargo` / `python3` / `npm` today, so this returns `None` for any future or
+    /// unsupported runner (DR4-004 security gate: unknown runner string
+    /// cannot reach the event payload).
+    ///
+    /// `bound_artifacts` are hashed via `PathHashHex::from_relative_str`
+    /// (which goes through `crate::logging::stable_path_hash` SSOT after
+    /// `mask_secrets`) and capped at `VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP`.
+    /// The cap-front truncation deliberately preserves the order callers
+    /// provided so the path_hash sequence is reproducible across re-emits.
+    #[allow(dead_code)] // wired by `turn.rs::run_task_contract_verifier_once` (iteration-4 Task 5.2 producer site)
+    pub(super) fn from_command_and_env(
+        command: &VerifierCommand,
+        env_plan: &HermeticEnvPlan,
+    ) -> Option<Self> {
+        let runner = RunnerKind::from_runner_str(command.runner())?;
+        let bound_paths = command.bound_test_artifacts();
+        let bound_test_artifacts_count = bound_paths.len();
+        let bound_artifacts_truncated =
+            bound_test_artifacts_count > VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP;
+        let bound_artifacts: Vec<PathHashHex> = bound_paths
+            .iter()
+            .take(VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP)
+            .map(|p| PathHashHex::from_relative_str(p))
+            .collect();
+        Some(Self {
+            runner,
+            bound_artifacts,
+            bound_test_artifacts_count,
+            bound_artifacts_truncated,
+            env_summary: env_plan.summary(),
+        })
+    }
+}
+
+/// Pure builder for the `agent.verifier.invoked` event payload.
+///
+/// `cwd_inside_work_root` is intentionally root-level even though
+/// `HermeticEnvSummary` carries it. `env_summary` only carries
+/// `allowlist_keys` and `pythonpath_root`.
+pub(super) fn build_agent_verifier_invoked_payload(
+    session_id: &str,
+    turn_index: usize,
+    iteration_seq: usize,
+    snapshot: &VerifierInvokedSnapshot,
+) -> serde_json::Value {
+    let bound_artifacts: Vec<serde_json::Value> = snapshot
+        .bound_artifacts
+        .iter()
+        .map(|h| serde_json::json!({ "path_hash": h.as_str() }))
+        .collect();
+    let env_summary = serde_json::json!({
+        "allowlist_keys": snapshot.env_summary.allowlist_keys,
+        "pythonpath_root": snapshot.env_summary.pythonpath_root,
+    });
+    serde_json::json!({
+        "session_id": session_id,
+        "turn_index": turn_index,
+        "iteration_seq": iteration_seq,
+        "runner": snapshot.runner.as_str(),
+        "bound_artifacts": bound_artifacts,
+        "bound_test_artifacts_count": snapshot.bound_test_artifacts_count,
+        "bound_artifacts_truncated": snapshot.bound_artifacts_truncated,
+        "env_summary": env_summary,
+        "cwd_inside_work_root": snapshot.env_summary.cwd_inside_work_root,
+    })
+}
+
+/// Pure builder for the `agent.verifier.external_import_rejected` event
+/// payload. The caller passes only pre-hashed strings; raw module names,
+/// filesystem paths, and executable paths must not enter this payload.
+pub(super) fn build_agent_verifier_external_import_rejected_payload(
+    session_id: &str,
+    turn_index: usize,
+    runner: &str,
+    reason: &str,
+    detected_hashes: &[(&str, &'static str)],
+    detected_count: usize,
+    detected_truncated: bool,
+) -> serde_json::Value {
+    let detected_modules: Vec<serde_json::Value> = detected_hashes
+        .iter()
+        .take(EXTERNAL_IMPORT_DETECTED_CAP)
+        .map(|(hash, source_kind)| {
+            serde_json::json!({
+                "module_hash": *hash,
+                "path_hash": *hash,
+                "source_kind": *source_kind,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "session_id": session_id,
+        "turn_index": turn_index,
+        "runner": runner,
+        "reason": reason,
+        "detected_count": detected_count,
+        "detected_truncated": detected_truncated,
+        "detected_modules": detected_modules,
+    })
+}
+
 /// `bound_test_artifacts` stores the (already scope-validated) test
 /// artifact paths that were appended to `args`. Phase 2.3
 /// (`validate_bound_test_artifacts_for_execution`) re-checks them at
@@ -134,7 +1202,7 @@ pub(super) struct VerifierCommand {
 /// in this module. Any new entry must come with a `from_*` constructor
 /// below and (where required) a Phase 2.3 execution-time path validator.
 const VERIFIER_RUNNER_ALLOWLIST: &[&str] = &[
-    "cargo", "python3", "python", "pytest", "uv", "poetry", "hatch", "npm", "pnpm", "yarn",
+    "cargo", "python3", "python", "pytest", "uv", "poetry", "hatch", "node", "npm", "pnpm", "yarn",
 ];
 
 impl VerifierCommand {
@@ -162,6 +1230,17 @@ impl VerifierCommand {
                 return None;
             }
         }
+        // Issue #661 iteration-5 Task 6.4 (DR4-002 leading-dash argv injection
+        // 防止): bound test artifact paths that begin with `-` would be parsed
+        // as command-line options by pytest / cargo / npm etc. Reject the
+        // construction so the caller can fall back to `Weak` rather than
+        // silently rewriting argv with a `--` separator (which could still
+        // misfire if the runner doesn't honor `--`).
+        for path in &bound_test_artifacts {
+            if path.starts_with('-') {
+                return None;
+            }
+        }
         Some(Self {
             runner: runner.to_string(),
             args,
@@ -169,21 +1248,61 @@ impl VerifierCommand {
         })
     }
 
-    /// `cargo test --test <name> ...` structured constructor.
+    /// Issue #661 iteration-5 Task 6.4 (DR4-001 PATH hijack 防止): resolve
+    /// the runner binary to an absolute path under the planned PATH and
+    /// return it. Returns the relative `runner` name unchanged when the
+    /// lookup fails (best-effort fallback per Task 6.4: "which が利用できない
+    /// 場合は relative argv 維持") so production CI without `cargo`/`python3`
+    /// in PATH does not crash spawn — child process error reporting takes
+    /// over.
     ///
-    /// Issue #651 (CB-001 / CB-002): cargo positional args are
-    /// test-name filters, **not** file paths. Passing `tests/test_a.rs`
-    /// directly produces 0 tests matched and a misleading exit 0. We
-    /// therefore convert each owned test artifact to a
-    /// `--test <name>` flag for top-level `tests/<name>.rs` integration
-    /// tests. Any path we cannot safely convert (`src/...` unit tests,
-    /// nested integration paths, paths without a `.rs` stem) makes the
-    /// constructor return `None` so the caller falls back to `Weak`.
+    /// Caller MUST pass the env plan's effective PATH (post-`filter_env_for_tester`)
+    /// so the resolution honors the hermetic boundary. raw executable path
+    /// is not exposed in any event payload (Section 6 / DR4-005).
+    #[allow(dead_code)]
+    pub(super) fn resolved_runner_program(&self, planned_path_value: Option<&str>) -> String {
+        if let Some(path_value) = planned_path_value
+            && let Some(abs) = resolve_runner_in_path(path_value, &self.runner)
+        {
+            return abs.to_string_lossy().into_owned();
+        }
+        self.runner.clone()
+    }
+
+    /// CB-008 (Codex iteration-5 high, DR4-001 fail-closed): resolve the
+    /// runner via the **sanitized** PATH (no relative / empty / work_root-
+    /// anchored components survive). Returns `None` when no absolute
+    /// resolution is possible — callers MUST then surface a TransportError
+    /// rather than letting the child process inherit the bare runner name
+    /// and re-resolve through whatever PATH the parent shell carried.
+    ///
+    /// The legacy best-effort `resolved_runner_program` is retained for
+    /// callers that intentionally accept a degraded resolution (spawning
+    /// with the bare runner name) — `run_structured` instead uses the
+    /// fail-closed variant.
+    #[allow(dead_code)]
+    pub(super) fn resolved_runner_program_fail_closed(
+        &self,
+        planned_path_value: Option<&str>,
+        work_root: Option<&Path>,
+    ) -> Option<String> {
+        let path_value = planned_path_value?;
+        let abs = resolve_runner_in_sanitized_path(path_value, &self.runner, work_root)?;
+        Some(abs.to_string_lossy().into_owned())
+    }
+
+    /// Full `cargo test` structured constructor.
+    ///
+    /// Issue #865: Rust task final success must be the full suite, not a
+    /// partial `cargo test --test <name>` run. The owned test artifacts are
+    /// still retained in `bound_test_artifacts` so planning/execution can
+    /// prove that task-owned tests exist and are in scope before spawning the
+    /// verifier, but they are intentionally not forwarded as cargo filters.
     ///
     /// CB-001 defense in depth: empty `owned_test_artifacts` is also a
     /// hard reject. An unbound cargo verifier could otherwise execute
     /// the entire test suite without satisfying the design contract
-    /// that the *current task's* test artifact actually ran.
+    /// that the current task owns at least one test artifact.
     ///
     /// `args_prefix` lets the detector inject flags like `--no-fail-fast`
     /// when needed; today the cargo path passes an empty prefix.
@@ -195,16 +1314,9 @@ impl VerifierCommand {
         if owned_test_artifacts.is_empty() {
             return None;
         }
-        let mut test_flags: Vec<String> = Vec::with_capacity(owned_test_artifacts.len() * 2);
-        for path in owned_test_artifacts {
-            let name = cargo_integration_test_name(path)?;
-            test_flags.push("--test".to_string());
-            test_flags.push(name);
-        }
-        let mut args = Vec::with_capacity(args_prefix.len() + 1 + test_flags.len());
+        let mut args = Vec::with_capacity(args_prefix.len() + 1);
         args.push("test".to_string());
         args.extend(args_prefix);
-        args.extend(test_flags);
         Self::new_allowlisted("cargo", args, owned_test_artifacts.to_vec())
     }
 
@@ -231,30 +1343,89 @@ impl VerifierCommand {
         Self::new_allowlisted("pytest", args, owned_test_artifacts.to_vec())
     }
 
-    /// `python3 -B -m pytest -p no:cacheprovider [<owned_test_artifacts>]`
-    /// structured constructor for the stdlib-Python toolchain detected by
-    /// `python_pytest_command`. Toolchain-specific runners (`uv run` etc.)
-    /// still go through Weak in Phase 2.2 because parsing their shell
-    /// shape is out of scope.
+    /// `python3 -m pytest -q -p no:cacheprovider` structured constructor for
+    /// the stdlib-Python toolchain detected by `python_pytest_command`.
+    /// Toolchain-specific runners (`uv run` etc.) still go through Weak in
+    /// Phase 2.2 because parsing their shell shape is out of scope.
     ///
     /// Issue #651 CB-001 defense in depth: empty `owned_test_artifacts`
-    /// is rejected — pytest with no positional path scans the entire
-    /// rootdir, which means the verifier may pass even when zero tests
-    /// from the current task ran.
+    /// is rejected. The verifier intentionally runs the full pytest suite,
+    /// while retaining owned artifacts as binding metadata. This matches the
+    /// Cargo/npm contract: a task-owned test must exist and be in scope, but
+    /// existing regression tests are still part of completion evidence.
     #[allow(dead_code)]
     pub(super) fn from_python3_pytest_stdlib(owned_test_artifacts: &[String]) -> Option<Self> {
         if owned_test_artifacts.is_empty() {
             return None;
         }
-        let mut args = vec![
-            "-B".to_string(),
+        let args = vec![
             "-m".to_string(),
             "pytest".to_string(),
+            "-q".to_string(),
             "-p".to_string(),
             "no:cacheprovider".to_string(),
         ];
-        args.extend(owned_test_artifacts.iter().cloned());
         Self::new_allowlisted("python3", args, owned_test_artifacts.to_vec())
+    }
+
+    /// `python3 -m unittest discover -s tests` structured constructor for
+    /// explicit stdlib-unittest requests. Like the pytest stdlib constructor,
+    /// it runs the discovered suite while retaining owned test artifacts as
+    /// binding metadata.
+    #[allow(dead_code)]
+    pub(super) fn from_python3_unittest_discover(owned_test_artifacts: &[String]) -> Option<Self> {
+        if owned_test_artifacts.is_empty() {
+            return None;
+        }
+        let args = vec![
+            "-m".to_string(),
+            "unittest".to_string(),
+            "discover".to_string(),
+            "-s".to_string(),
+            "tests".to_string(),
+        ];
+        Self::new_allowlisted("python3", args, owned_test_artifacts.to_vec())
+    }
+
+    /// Full `npm test` structured constructor.
+    ///
+    /// Issue #865: package-script verification should accept `npm test` as
+    /// completion evidence. Owned test artifacts are validated before spawn
+    /// but are not passed as argv filters because package scripts own their
+    /// test discovery contract.
+    #[allow(dead_code)]
+    pub(super) fn from_npm_test(owned_test_artifacts: &[String]) -> Option<Self> {
+        if owned_test_artifacts.is_empty() {
+            return None;
+        }
+        Self::new_allowlisted(
+            "npm",
+            vec!["test".to_string()],
+            owned_test_artifacts.to_vec(),
+        )
+    }
+
+    /// `node --test <owned_test_artifacts>` structured constructor.
+    ///
+    /// Node's built-in test runner accepts file paths as positional args after
+    /// `--test`, so this preserves the bound-test invariant without parsing or
+    /// trusting package.json script bodies. TypeScript/Jest/Vitest shapes return
+    /// `None` and remain Weak until a dedicated structured adapter exists.
+    #[allow(dead_code)]
+    pub(super) fn from_node_test(owned_test_artifacts: &[String]) -> Option<Self> {
+        if owned_test_artifacts.is_empty() {
+            return None;
+        }
+        if owned_test_artifacts
+            .iter()
+            .any(|path| !node_test_artifact_path_is_directly_runnable(path))
+        {
+            return None;
+        }
+        let mut args = Vec::with_capacity(1 + owned_test_artifacts.len());
+        args.push("--test".to_string());
+        args.extend(owned_test_artifacts.iter().cloned());
+        Self::new_allowlisted("node", args, owned_test_artifacts.to_vec())
     }
 
     /// Returns the runner program name (allowlist member).
@@ -332,6 +1503,17 @@ fn cargo_integration_test_name(path: &str) -> Option<String> {
     Some(stem)
 }
 
+fn node_test_artifact_path_is_directly_runnable(path: &str) -> bool {
+    let p = Path::new(path);
+    if !crate::util::file_classify::is_test_file(p) {
+        return false;
+    }
+    matches!(
+        p.extension().and_then(|ext| ext.to_str()),
+        Some("js" | "mjs" | "cjs")
+    )
+}
+
 /// Issue #651 Task 2.2: structured outcome of "given owned test
 /// artifacts, what verifier can we actually run?". Distinct from
 /// `Option<AutoTestPlan>` because Phase 4.1 needs to distinguish "found
@@ -376,19 +1558,39 @@ pub(super) struct AutoTestResult {
 pub(super) struct AutoTestRunner;
 
 impl AutoTestRunner {
+    pub(super) fn plan_from_evidence_command_hint(command: &str) -> Option<AutoTestPlan> {
+        let command = command.trim();
+        if command.is_empty() || command.len() > 300 {
+            return None;
+        }
+        if !is_completion_verifier_command(command) {
+            return None;
+        }
+        if !super::verifier_command_policy::is_evidence_command_hint_allowed(command) {
+            return None;
+        }
+        Some(AutoTestPlan {
+            command: command.to_string(),
+            reason: "controller evidence command".to_string(),
+        })
+    }
+
     pub(super) fn detect(work_root: &Path, changed_files: &[String]) -> Option<AutoTestPlan> {
         Self::detect_candidate(work_root, changed_files).map(VerifierCandidate::into_plan)
     }
 
-    pub(super) fn detect_with_recent_successes(
+    pub(super) fn detect_with_project_unit(
         work_root: &Path,
         changed_files: &[String],
         recent_successful_bash_commands: &[String],
+        project_unit: Option<&ProjectUnit>,
     ) -> Option<AutoTestPlan> {
-        Self::detect_candidate_with_recent_successes(
+        let project_unit = project_unit?;
+        Self::detect_candidate_with_project_unit(
             work_root,
             changed_files,
             recent_successful_bash_commands,
+            Some(project_unit),
         )
         .map(VerifierCandidate::into_plan)
     }
@@ -407,6 +1609,43 @@ impl AutoTestRunner {
     ) -> Option<VerifierCandidate> {
         let candidates =
             detect_verifier_candidates(work_root, changed_files, recent_successful_bash_commands);
+        let selected = select_verifier_candidate(candidates.clone());
+        emit_verifier_candidate_telemetry(&candidates, selected.as_ref());
+        selected
+    }
+
+    pub(super) fn detect_candidate_with_project_unit(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+        project_unit: Option<&ProjectUnit>,
+    ) -> Option<VerifierCandidate> {
+        let candidates = verifier_candidates_for_selection(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+            &[],
+            project_unit,
+        );
+        let selected = select_verifier_candidate(candidates.clone());
+        emit_verifier_candidate_telemetry(&candidates, selected.as_ref());
+        selected
+    }
+
+    fn detect_candidate_with_project_unit_and_owned_test_artifacts(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+        owned_test_artifacts: &[String],
+        project_unit: Option<&ProjectUnit>,
+    ) -> Option<VerifierCandidate> {
+        let candidates = verifier_candidates_for_selection(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+            owned_test_artifacts,
+            project_unit,
+        );
         let selected = select_verifier_candidate(candidates.clone());
         emit_verifier_candidate_telemetry(&candidates, selected.as_ref());
         selected
@@ -436,7 +1675,7 @@ impl AutoTestRunner {
     ///
     /// - `Runnable` when the source has an allowlisted structured
     ///   constructor (currently `CargoManifest` → cargo test and
-    ///   `PythonTests` stdlib → `python3 -B -m pytest`).
+    ///   `PythonTests` stdlib → `python3 -m pytest -q`).
     /// - `Weak` when a candidate exists but cannot be expressed as a
     ///   structured `VerifierCommand` (free-form shell strings from
     ///   ProjectInstruction / RecentSuccessfulBash, npm/pnpm/yarn or
@@ -454,6 +1693,22 @@ impl AutoTestRunner {
         recent_successful_bash_commands: &[String],
         owned_test_artifacts: &[String],
     ) -> OwnedTestVerifierPlan {
+        Self::detect_with_owned_test_artifacts_and_project_unit(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+            owned_test_artifacts,
+            None,
+        )
+    }
+
+    pub(super) fn detect_with_owned_test_artifacts_and_project_unit(
+        work_root: &Path,
+        changed_files: &[String],
+        recent_successful_bash_commands: &[String],
+        owned_test_artifacts: &[String],
+        project_unit: Option<&ProjectUnit>,
+    ) -> OwnedTestVerifierPlan {
         // CB-001 (high): Without any owned test artifact, there is
         // nothing for the verifier to bind to. Issue #651 design treats
         // this as `Missing` rather than `Weak` — the semantic problem is
@@ -463,16 +1718,19 @@ impl AutoTestRunner {
         if owned_test_artifacts.is_empty() {
             return OwnedTestVerifierPlan::Missing;
         }
-        let Some(candidate) = Self::detect_candidate_with_recent_successes(
+        let changed_files_with_owned_tests =
+            changed_files_with_owned_test_artifacts(changed_files, owned_test_artifacts);
+        let Some(candidate) = Self::detect_candidate_with_project_unit_and_owned_test_artifacts(
             work_root,
-            changed_files,
+            &changed_files_with_owned_tests,
             recent_successful_bash_commands,
+            owned_test_artifacts,
+            project_unit,
         ) else {
             return OwnedTestVerifierPlan::Missing;
         };
         let display_command = candidate.plan.command.clone();
         let source = candidate.source;
-        let evidence = candidate.evidence.clone();
         let plan = candidate.into_plan();
         match source {
             VerifierCandidateSource::CargoManifest => {
@@ -481,29 +1739,47 @@ impl AutoTestRunner {
                 {
                     return OwnedTestVerifierPlan::Runnable { plan, command };
                 }
-                // CB-002: `from_cargo_test` returns `None` when an owned
-                // test artifact cannot be safely mapped to
-                // `cargo test --test <name>` (src/... internal paths,
-                // nested integration paths, non-`tests/<stem>.rs`
-                // shapes). The allowlist may also have rejected an arg.
-                // Either way we fall back to `Weak` rather than fabricate
-                // a positional filter that would match 0 tests.
+                // `from_cargo_test` returns `None` only when the allowlist
+                // rejects the command shape. Rust final success uses full
+                // `cargo test`, so owned artifacts are validated as binding
+                // metadata rather than converted to partial test filters.
                 OwnedTestVerifierPlan::Weak {
-                    reason: "cargo runner cannot bind owned test artifacts as --test flag",
+                    reason: "cargo runner cannot bind owned test artifacts",
                     detected_source: source.as_str(),
                     display_command: Some(display_command),
                 }
             }
             VerifierCandidateSource::PythonTests => {
-                // Only the stdlib toolchain has a structured constructor
-                // today. uv/poetry/hatch/pip-install paths fall through
-                // to Weak so an LLM-edited shell string can never become
-                // a structured execution path.
-                let is_stdlib = evidence.iter().any(|e| e == "python-toolchain:stdlib");
-                if is_stdlib
-                    && let Some(command) =
+                // For task-contract verification, binding the current task's
+                // owned test artifact is stronger than replaying a detected
+                // shell-shaped setup command. Even when pyproject.toml would
+                // make the generic detector prefer a `pip install && pytest`
+                // string, run the allowlisted stdlib pytest constructor with
+                // explicit owned test paths. Missing dependencies then surface
+                // as normal verifier failures instead of collapsing the task
+                // into VerifierWeak.
+                let verifier_flavor =
+                    super::verifier_command_policy::python_project_unit_verifier_flavor(Some(
+                        &display_command,
+                    ));
+                let authoring_style_decision =
+                    super::authoring_style::decide_python_authoring_style(
+                        super::authoring_style::PythonAuthoringStyleSignals::default(),
+                        verifier_flavor,
+                    );
+                debug_assert_eq!(
+                    authoring_style_decision.style,
+                    super::authoring_style::AuthoringStyle::Unspecified
+                );
+                let command = match verifier_flavor {
+                    PythonProjectUnitVerifierFlavor::UnittestDiscover => {
+                        VerifierCommand::from_python3_unittest_discover(owned_test_artifacts)
+                    }
+                    PythonProjectUnitVerifierFlavor::PytestStdlib => {
                         VerifierCommand::from_python3_pytest_stdlib(owned_test_artifacts)
-                {
+                    }
+                };
+                if let Some(command) = command {
                     return OwnedTestVerifierPlan::Runnable { plan, command };
                 }
                 OwnedTestVerifierPlan::Weak {
@@ -512,9 +1788,18 @@ impl AutoTestRunner {
                     display_command: Some(display_command),
                 }
             }
+            VerifierCandidateSource::PackageJsonScripts => {
+                if let Some(command) = VerifierCommand::from_npm_test(owned_test_artifacts) {
+                    return OwnedTestVerifierPlan::Runnable { plan, command };
+                }
+                OwnedTestVerifierPlan::Weak {
+                    reason: "package.json test script cannot be structurally bound to owned test artifacts",
+                    detected_source: source.as_str(),
+                    display_command: Some(display_command),
+                }
+            }
             VerifierCandidateSource::ProjectInstruction
             | VerifierCandidateSource::RecentSuccessfulBash
-            | VerifierCandidateSource::PackageJsonScripts
             | VerifierCandidateSource::NativeNodeFramework
             | VerifierCandidateSource::PythonCompileFallback => OwnedTestVerifierPlan::Weak {
                 reason: "verifier source has no allowlisted structured constructor",
@@ -525,13 +1810,28 @@ impl AutoTestRunner {
     }
 
     pub(super) fn run(work_root: &Path, plan: &AutoTestPlan) -> Result<AutoTestResult, String> {
-        let output = Command::new("sh")
+        Self::run_with_timeout(
+            work_root,
+            plan,
+            Duration::from_secs(AUTO_TEST_RUN_TIMEOUT_SECS),
+        )
+    }
+
+    fn run_with_timeout(
+        work_root: &Path,
+        plan: &AutoTestPlan,
+        timeout: Duration,
+    ) -> Result<AutoTestResult, String> {
+        let mut command = Command::new("sh");
+        command
             .arg("-lc")
             .arg(&plan.command)
             .current_dir(work_root)
             .stdin(Stdio::null())
-            .output()
-            .map_err(|err| format!("failed to run auto test command: {err}"))?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::tools::bash::apply_unix_pgroup(&mut command);
+        let output = wait_with_auto_test_timeout(&mut command, timeout)?;
         // Always lossy-decode: invalid UTF-8 must not panic FeedbackFrame
         // creation downstream (Issue #450 / R5).
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -582,16 +1882,111 @@ impl AutoTestRunner {
         scope: &TaskWorkspaceScope,
         command: &VerifierCommand,
         display_command: &str,
+        task_kind: super::task_contract::TaskKind,
     ) -> Result<AutoTestResult, String> {
+        // Issue #918 (P1): fail-closed process-spawn gate. Only the Coding
+        // capability may spawn a structured-verifier child process. This is a
+        // defense-in-depth backstop — the §5.1 invariant (the verification gate
+        // in CompletionPolicy::from_contract_parts) already prevents a non-coding
+        // task from ever requiring test execution and reaching here. The guard is
+        // PROFILE-SYMMETRIC (a real `Err` in both debug and release, no
+        // `debug_assert!`) so it is observable in the repo's debug `cargo test` CI
+        // and a §5.1 regression fails closed rather than panicking / spawning.
+        if !super::verifier::capability_for(task_kind).allows_process_exec() {
+            tracing::error!(
+                target: "agent.verifier",
+                ?task_kind,
+                "non-coding verifier process spawn blocked; failing closed"
+            );
+            return Err(format!(
+                "structured verifier process spawn is not permitted for task kind {task_kind:?} \
+                 (only Coding may spawn a verifier process)"
+            ));
+        }
         validate_bound_test_artifacts_for_execution(work_root, scope, command)?;
 
-        let mut child_cmd = Command::new(command.runner());
+        // Issue #661 iteration-5 Task 6.1 / 6.2 / 6.4 + CB-008 fail-closed:
+        // build hermetic env plan with runner-specific extras (Python
+        // adapter gets VERIFIER_ENV_PYTHON_EXTRA, others &[]), then
+        // resolve runner argv[0] inside the **sanitized** planned PATH so
+        // (a) relative / empty PATH components cannot inject a workspace-
+        //     local hijack via cwd resolution, and
+        // (b) any absolute component under work_root is removed before the
+        //     search runs.
+        // CB-008 hardens the resolver to fail-closed: if no absolute
+        // resolution survives the sanitization filter, return an explicit
+        // `Err(...)` rather than letting the child
+        // process inherit the bare runner name and re-resolve through
+        // the parent process PATH (which the previous best-effort
+        // fallback exposed). The caller classifies this Err as either a
+        // verifier timeout failure or a transport error.
+        let extras: &[(&'static str, &'static str)] = match command.runner() {
+            "python3" => VERIFIER_ENV_PYTHON_EXTRA,
+            _ => &[],
+        };
+        let env_plan = build_hermetic_env_plan(work_root, extras);
+        let runner_program = command
+            .resolved_runner_program_fail_closed(env_plan.planned_path(), Some(work_root))
+            .ok_or_else(|| {
+                format!(
+                    "verifier runner {runner:?} could not be resolved against the sanitized PATH \
+                     (work_root-local / relative / empty PATH components are rejected by CB-008)",
+                    runner = command.runner()
+                )
+            })?;
+
+        if let Some(preflight_result) = run_structured_generated_test_preflight(
+            &runner_program,
+            &env_plan,
+            work_root,
+            command,
+            display_command,
+        )? {
+            return Ok(preflight_result);
+        }
+
+        let dependency_site =
+            match structured_python_pytest_dependency_setup_packages(work_root, command) {
+                Some(packages) => {
+                    let dependency_site = structured_python_dependency_site_dir(work_root);
+                    if let Some(result) = run_structured_python_dependency_setup(
+                        &runner_program,
+                        &env_plan,
+                        &dependency_site,
+                        &packages,
+                        display_command,
+                    )? {
+                        return Ok(result);
+                    }
+                    Some(dependency_site)
+                }
+                None => None,
+            };
+
+        if structured_node_dependency_setup_required(work_root, command)
+            && let Some(result) =
+                run_structured_node_dependency_setup(&runner_program, &env_plan, display_command)?
+        {
+            return Ok(result);
+        }
+
+        let mut child_cmd = Command::new(runner_program);
         child_cmd
             .args(command.args())
-            .current_dir(work_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Apply hermetic env after args / stdio so caller's `current_dir`
+        // and env overrides land in a single SSOT (env_clear + allowlist
+        // re-inject + extras + PYTHONPATH + cwd).
+        env_plan.apply_to(&mut child_cmd);
+        if let Some(dependency_site) = dependency_site.as_deref() {
+            apply_structured_python_dependency_site_pythonpath(
+                &mut child_cmd,
+                work_root,
+                dependency_site,
+            )?;
+        }
         // PR-003: put the verifier in its own process group on Unix so
         // `wait_with_auto_test_timeout` can SIGKILL the whole descendant
         // tree on timeout. On non-Unix this is a no-op. SSOT lives in
@@ -599,7 +1994,7 @@ impl AutoTestRunner {
         crate::tools::bash::apply_unix_pgroup(&mut child_cmd);
         let output = wait_with_auto_test_timeout(
             &mut child_cmd,
-            Duration::from_secs(AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS),
+            Duration::from_secs(AUTO_TEST_RUN_TIMEOUT_SECS),
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -625,10 +2020,318 @@ impl AutoTestRunner {
     }
 }
 
-/// Issue #651 Task 2.3: upper bound on a structured verifier process.
-/// 300s mirrors the value used by the legacy `auto_test::run` path's
-/// implicit wait (kept conservative to avoid breaking long test suites).
-const AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS: u64 = 300;
+fn run_structured_generated_test_preflight(
+    runner_program: &str,
+    env_plan: &HermeticEnvPlan,
+    work_root: &Path,
+    command: &VerifierCommand,
+    display_command: &str,
+) -> Result<Option<AutoTestResult>, String> {
+    match command.runner() {
+        "python3" | "python" => {
+            let python_tests = command
+                .bound_test_artifacts()
+                .iter()
+                .filter(|path| Path::new(path).extension().is_some_and(|ext| ext == "py"))
+                .cloned()
+                .collect::<Vec<_>>();
+            if python_tests.is_empty() {
+                return Ok(None);
+            }
+            let mut args = vec!["-B".to_string(), "-m".to_string(), "py_compile".to_string()];
+            args.extend(python_tests);
+            run_structured_preflight_command(
+                runner_program,
+                env_plan,
+                args,
+                &format!("python3 -B -m py_compile + {display_command}"),
+            )
+        }
+        "cargo" => {
+            let mut args = vec!["test".to_string(), "--no-run".to_string()];
+            for path in command.bound_test_artifacts() {
+                let Some(name) = cargo_integration_test_name_for_manifest(work_root, path)
+                    .or_else(|| cargo_integration_test_name(path))
+                else {
+                    return Ok(None);
+                };
+                args.push("--test".to_string());
+                args.push(name);
+            }
+            if args.len() == 2 {
+                return Ok(None);
+            }
+            run_structured_preflight_command(
+                runner_program,
+                env_plan,
+                args,
+                &format!("cargo test --no-run + {display_command}"),
+            )
+        }
+        _ => Ok(None),
+    }
+}
+
+fn run_structured_preflight_command(
+    runner_program: &str,
+    env_plan: &HermeticEnvPlan,
+    args: Vec<String>,
+    display_command: &str,
+) -> Result<Option<AutoTestResult>, String> {
+    let mut preflight_cmd = Command::new(runner_program);
+    preflight_cmd
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    env_plan.apply_to(&mut preflight_cmd);
+    crate::tools::bash::apply_unix_pgroup(&mut preflight_cmd);
+    let output = wait_with_auto_test_timeout(
+        &mut preflight_cmd,
+        Duration::from_secs(AUTO_TEST_RUN_TIMEOUT_SECS),
+    )
+    .map_err(|err| format!("generated test preflight {err}"))?;
+    if output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut combined = String::new();
+    combined.push_str(&stdout);
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    let formatted = crate::tools::test_output::format_for_tool_result(&combined);
+    let redacted = crate::session::feedback::redact_verifier_command_for_storage(display_command);
+    Ok(Some(AutoTestResult {
+        command: redacted,
+        passed: false,
+        output: truncate(&formatted, MAX_OUTPUT_BYTES),
+        exit_code: output.status.code(),
+        stdout,
+        stderr,
+    }))
+}
+
+fn structured_python_pytest_dependency_setup_packages(
+    work_root: &Path,
+    command: &VerifierCommand,
+) -> Option<Vec<String>> {
+    if command.runner() != "python3" || !command_invokes_python_pytest_module(command) {
+        return None;
+    }
+    let pyproject_path = work_root.join("pyproject.toml");
+    let packages = if pyproject_path.is_file() {
+        python_pyproject_test_packages(&PythonProjectEvidence::from_file(work_root))
+    } else {
+        python_inferred_test_packages_from_sources(work_root)
+    };
+    if packages.is_empty() {
+        None
+    } else {
+        Some(packages)
+    }
+}
+
+fn command_invokes_python_pytest_module(command: &VerifierCommand) -> bool {
+    command
+        .args()
+        .windows(2)
+        .any(|window| window[0] == "-m" && window[1] == "pytest")
+}
+
+fn structured_python_dependency_site_dir(work_root: &Path) -> PathBuf {
+    work_root
+        .join(".anvil-state")
+        .join("verifier-python")
+        .join("site")
+}
+
+fn structured_node_dependency_setup_required(work_root: &Path, command: &VerifierCommand) -> bool {
+    if command.runner() != "npm" || !command.args().iter().any(|arg| arg == "test") {
+        return false;
+    }
+    if work_root.join("node_modules").is_dir() {
+        return false;
+    }
+    let Ok(raw) = std::fs::read_to_string(work_root.join("package.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    package_json_declares_dependency_table(&value)
+}
+
+fn package_json_declares_dependency_table(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ]
+    .iter()
+    .any(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|deps| !deps.is_empty())
+    })
+}
+
+fn run_structured_node_dependency_setup(
+    runner_program: &str,
+    env_plan: &HermeticEnvPlan,
+    display_command: &str,
+) -> Result<Option<AutoTestResult>, String> {
+    let mut setup_cmd = Command::new(runner_program);
+    setup_cmd
+        .args(["install", "--ignore-scripts"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    env_plan.apply_to(&mut setup_cmd);
+    crate::tools::bash::apply_unix_pgroup(&mut setup_cmd);
+
+    let output = wait_with_auto_test_timeout(
+        &mut setup_cmd,
+        Duration::from_secs(AUTO_TEST_DEPENDENCY_SETUP_TIMEOUT_SECS),
+    )
+    .map_err(|err| format!("structured Node dependency setup {err}"))?;
+    if output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut combined = String::new();
+    combined.push_str(&stdout);
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    let formatted = crate::tools::test_output::format_for_tool_result(&combined);
+    let setup_display = format!("npm install --ignore-scripts + {display_command}");
+    let redacted = crate::session::feedback::redact_verifier_command_for_storage(&setup_display);
+    Ok(Some(AutoTestResult {
+        command: redacted,
+        passed: false,
+        output: truncate(&formatted, MAX_OUTPUT_BYTES),
+        exit_code: output.status.code(),
+        stdout,
+        stderr,
+    }))
+}
+
+fn run_structured_python_dependency_setup(
+    runner_program: &str,
+    env_plan: &HermeticEnvPlan,
+    dependency_site: &Path,
+    packages: &[String],
+    display_command: &str,
+) -> Result<Option<AutoTestResult>, String> {
+    std::fs::create_dir_all(dependency_site).map_err(|err| {
+        format!(
+            "failed to create structured Python verifier dependency directory {}: {err}",
+            dependency_site.display()
+        )
+    })?;
+
+    let mut setup_cmd = Command::new(runner_program);
+    setup_cmd
+        .args([
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--upgrade",
+            "--target",
+        ])
+        .arg(dependency_site)
+        .args(packages)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    env_plan.apply_to(&mut setup_cmd);
+    crate::tools::bash::apply_unix_pgroup(&mut setup_cmd);
+
+    let output = wait_with_auto_test_timeout(
+        &mut setup_cmd,
+        Duration::from_secs(AUTO_TEST_DEPENDENCY_SETUP_TIMEOUT_SECS),
+    )
+    .map_err(|err| format!("structured Python dependency setup {err}"))?;
+    if output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let mut combined = String::new();
+    combined.push_str(&stdout);
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&stderr);
+    }
+    let formatted = crate::tools::test_output::format_for_tool_result(&combined);
+    let setup_display = format!(
+        "python3 -m pip install --target <workspace>/.anvil-state/verifier-python/site {} + {}",
+        packages.join(" "),
+        display_command
+    );
+    let redacted = crate::session::feedback::redact_verifier_command_for_storage(&setup_display);
+    Ok(Some(AutoTestResult {
+        command: redacted,
+        passed: false,
+        output: truncate(&formatted, MAX_OUTPUT_BYTES),
+        exit_code: output.status.code(),
+        stdout,
+        stderr,
+    }))
+}
+
+fn apply_structured_python_dependency_site_pythonpath(
+    command: &mut Command,
+    work_root: &Path,
+    dependency_site: &Path,
+) -> Result<(), String> {
+    let pythonpath = structured_python_dependency_site_pythonpath(work_root, dependency_site)?;
+    command.env("PYTHONPATH", pythonpath);
+    Ok(())
+}
+
+fn structured_python_dependency_site_pythonpath(
+    work_root: &Path,
+    dependency_site: &Path,
+) -> Result<OsString, String> {
+    std::env::join_paths([work_root, dependency_site]).map_err(|err| {
+        format!(
+            "failed to build structured Python verifier PYTHONPATH for {}: {err}",
+            dependency_site.display()
+        )
+    })
+}
+
+/// Upper bound for one verifier evidence command.
+///
+/// Local-first repair needs verifier hangs to become typed failure evidence
+/// quickly enough for the next repair turn. Dependency installation keeps a
+/// separate, longer bound below because network / cache setup is a different
+/// evidence phase from running generated or project tests.
+const AUTO_TEST_RUN_TIMEOUT_SECS: u64 = 60;
+
+/// Upper bound for structured dependency setup before the actual verifier run.
+const AUTO_TEST_DEPENDENCY_SETUP_TIMEOUT_SECS: u64 = 300;
 
 /// Issue #651 Task 2.3: execution-time validator for
 /// `VerifierCommand.bound_test_artifacts`.
@@ -644,7 +2347,15 @@ const AUTO_TEST_RUN_STRUCTURED_TIMEOUT_SECS: u64 = 300;
 /// - paths whose `std::fs::canonicalize` fails (missing file) — at
 ///   execution time a missing test artifact is a hard reject
 /// - canonical targets that escape canonical `work_root` (symlink swap)
-/// - paths the `TaskWorkspaceScope::contains` SSOT does not admit
+/// - paths the `classify_ownership` SSOT does not admit (Issue #661
+///   iteration-3 Task 3.4 path #3 / 判断 #1 / DR2-003): switched from
+///   `TaskWorkspaceScope::contains` to `classify_ownership` so the
+///   verifier-path SSOT propagates `NestedTestAdmission::enabled()`
+///   into the same security gate used by `record_repo_edit_event` /
+///   `record_verifier_observation`. Workspace-relative / symlink
+///   containment / ignored_top_dir checks remain authoritative and
+///   the explicit manual checks above are kept as defense in depth
+///   (their error messages stay stable for downstream observability)
 #[allow(dead_code)]
 pub(super) fn validate_bound_test_artifacts_for_execution(
     work_root: &Path,
@@ -707,7 +2418,27 @@ pub(super) fn validate_bound_test_artifacts_for_execution(
                  ({ignored}): {path:?}"
             ));
         }
-        if !scope.contains(path) {
+        // Issue #661 (iteration-3 Task 3.4 path #3 / 判断 #1 / DR2-003):
+        // route through `classify_ownership` with
+        // `NestedTestAdmission::enabled()` so the verifier-path SSOT
+        // is one of the 4 propagation sites (record_repo_edit_event /
+        // record_verifier_observation / this function /
+        // seed_artifact_ledger_verifier_observation).
+        let ownership = super::artifact_ownership::classify_ownership(
+            super::artifact_ownership::OwnershipInputs {
+                work_root,
+                relative_path: path,
+                scope,
+                edited_this_session: false,
+                scaffold_changed: false,
+                verifier_passed_in_scope: false,
+                nested_test_admission: super::artifact_ownership::NestedTestAdmission::enabled(),
+            },
+        );
+        if matches!(
+            ownership,
+            super::artifact_ownership::ArtifactOwnership::OutOfScope
+        ) {
             return Err(format!(
                 "bound test artifact path is not in TaskWorkspaceScope: {path:?}"
             ));
@@ -904,6 +2635,8 @@ fn detect_verifier_candidates(
     changed_files: &[String],
     recent_successful_bash_commands: &[String],
 ) -> Vec<VerifierCandidate> {
+    let visible_changed_files = visible_changed_files(changed_files);
+    let changed_files = visible_changed_files.as_slice();
     let mut candidates = Vec::new();
     if let Some(candidate) = detect_project_instruction_test(work_root, changed_files) {
         candidates.push(candidate);
@@ -935,6 +2668,125 @@ fn select_verifier_candidate(candidates: Vec<VerifierCandidate>) -> Option<Verif
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| source_priority(a.source).cmp(&source_priority(b.source)))
     })
+}
+
+fn verifier_candidates_from_project_unit(project_unit: &ProjectUnit) -> Vec<VerifierCandidate> {
+    project_unit
+        .verifier_candidates
+        .iter()
+        .filter_map(|candidate| {
+            let source = VerifierCandidateSource::from_project_unit_source(candidate.source)?;
+            Some(VerifierCandidate {
+                plan: AutoTestPlan {
+                    command: candidate.command_preview.clone(),
+                    reason: format!(
+                        "ProjectUnit verifier candidate selected from {}",
+                        candidate.source
+                    ),
+                },
+                source,
+                confidence: 0.9,
+                evidence: vec![
+                    format!("project-unit-root:{}", project_unit.root),
+                    format!("project-unit-source:{}", candidate.source),
+                    format!("project-unit-timeout:{}", candidate.timeout_class.as_str()),
+                ],
+            })
+        })
+        .collect()
+}
+
+fn verifier_candidates_for_selection(
+    work_root: &Path,
+    changed_files: &[String],
+    recent_successful_bash_commands: &[String],
+    owned_test_artifacts: &[String],
+    project_unit: Option<&ProjectUnit>,
+) -> Vec<VerifierCandidate> {
+    let Some(project_unit) = project_unit else {
+        return detect_verifier_candidates(
+            work_root,
+            changed_files,
+            recent_successful_bash_commands,
+        );
+    };
+    let candidates = verifier_candidates_from_project_unit(project_unit);
+    if !candidates.is_empty() || !project_unit_allows_owned_test_fallback(project_unit) {
+        return candidates;
+    }
+    let owned_changed_files =
+        changed_files_with_owned_test_artifacts(changed_files, owned_test_artifacts);
+    detect_verifier_candidates(
+        work_root,
+        &owned_changed_files,
+        recent_successful_bash_commands,
+    )
+    .into_iter()
+    .filter(|candidate| {
+        project_unit_candidate_matches_observed_stack(project_unit, candidate.source)
+            && candidate_source_matches_owned_test_artifacts(candidate.source, owned_test_artifacts)
+    })
+    .collect()
+}
+
+fn project_unit_allows_owned_test_fallback(project_unit: &ProjectUnit) -> bool {
+    project_unit
+        .artifact_roles
+        .contains(&super::task_contract::ArtifactRole::Test)
+}
+
+fn project_unit_candidate_matches_observed_stack(
+    project_unit: &ProjectUnit,
+    source: VerifierCandidateSource,
+) -> bool {
+    match source {
+        VerifierCandidateSource::PythonTests | VerifierCandidateSource::PythonCompileFallback => {
+            project_unit.observed_stacks.contains(&"python")
+        }
+        VerifierCandidateSource::CargoManifest => project_unit.observed_stacks.contains(&"rust"),
+        VerifierCandidateSource::PackageJsonScripts
+        | VerifierCandidateSource::NativeNodeFramework => {
+            project_unit.observed_stacks.contains(&"node")
+                || project_unit.observed_stacks.contains(&"typescript")
+        }
+        VerifierCandidateSource::ProjectInstruction
+        | VerifierCandidateSource::RecentSuccessfulBash => false,
+    }
+}
+
+fn candidate_source_matches_owned_test_artifacts(
+    source: VerifierCandidateSource,
+    owned_test_artifacts: &[String],
+) -> bool {
+    match source {
+        VerifierCandidateSource::PythonTests => owned_test_artifacts
+            .iter()
+            .any(|path| path.ends_with(".py")),
+        VerifierCandidateSource::CargoManifest => owned_test_artifacts
+            .iter()
+            .any(|path| path.ends_with(".rs")),
+        VerifierCandidateSource::PackageJsonScripts
+        | VerifierCandidateSource::NativeNodeFramework => owned_test_artifacts.iter().any(|path| {
+            matches!(
+                Path::new(path).extension().and_then(|ext| ext.to_str()),
+                Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs")
+            )
+        }),
+        VerifierCandidateSource::ProjectInstruction
+        | VerifierCandidateSource::RecentSuccessfulBash
+        | VerifierCandidateSource::PythonCompileFallback => false,
+    }
+}
+
+fn changed_files_with_owned_test_artifacts(
+    changed_files: &[String],
+    owned_test_artifacts: &[String],
+) -> Vec<String> {
+    let mut out = changed_files.to_vec();
+    out.extend(owned_test_artifacts.iter().cloned());
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn emit_verifier_candidate_telemetry(
@@ -982,35 +2834,11 @@ impl PackageJsonEvidence {
     }
 
     fn from_str(raw: &str) -> Option<Self> {
-        let json = serde_json::from_str::<serde_json::Value>(raw).ok()?;
-        let scripts = json
-            .get("scripts")
-            .and_then(serde_json::Value::as_object)
-            .map(|scripts| {
-                scripts
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        value
-                            .as_str()
-                            .map(str::trim)
-                            .filter(|script| !script.is_empty())
-                            .map(|script| (name.to_ascii_lowercase(), script.to_string()))
-                    })
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .unwrap_or_default();
-        let mut packages = BTreeSet::new();
-        for section in [
-            "dependencies",
-            "devDependencies",
-            "peerDependencies",
-            "optionalDependencies",
-        ] {
-            if let Some(deps) = json.get(section).and_then(serde_json::Value::as_object) {
-                packages.extend(deps.keys().map(|name| name.to_ascii_lowercase()));
-            }
-        }
-        Some(Self { scripts, packages })
+        let summary = super::package_manifest_summary::parse_package_manifest_summary(raw).ok()?;
+        Some(Self {
+            scripts: summary.scripts,
+            packages: summary.packages,
+        })
     }
 
     fn has_script(&self, name: &str) -> bool {
@@ -1120,18 +2948,101 @@ struct CargoManifestEvidence {
     has_explicit_test_target: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CargoTestTarget {
+    name: String,
+    path: String,
+}
+
 impl CargoManifestEvidence {
     fn from_str(raw: &str) -> Self {
         Self {
-            has_explicit_test_target: raw
-                .lines()
-                .map(str::trim_start)
-                .filter(|line| !line.starts_with('#'))
-                .any(|line| {
-                    parse_toml_array_section(line).is_some_and(|section| section == "test")
-                }),
+            has_explicit_test_target: cargo_test_targets_from_manifest(raw).has_explicit_section,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CargoTestTargets {
+    has_explicit_section: bool,
+    targets: Vec<CargoTestTarget>,
+}
+
+fn cargo_test_targets_from_manifest(raw: &str) -> CargoTestTargets {
+    let mut parsed = CargoTestTargets::default();
+    let mut in_test_section = false;
+    let mut current_name: Option<String> = None;
+    let mut current_path: Option<String> = None;
+
+    for line in raw.lines().map(str::trim_start) {
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(section) = parse_toml_array_section(line) {
+            push_cargo_test_target(&mut parsed.targets, &mut current_name, &mut current_path);
+            in_test_section = section == "test";
+            if in_test_section {
+                parsed.has_explicit_section = true;
+            }
+            continue;
+        }
+        if parse_toml_section(line).is_some() {
+            push_cargo_test_target(&mut parsed.targets, &mut current_name, &mut current_path);
+            in_test_section = false;
+            continue;
+        }
+        if !in_test_section {
+            continue;
+        }
+        if let Some(value) = parse_toml_string_value(line, "name") {
+            current_name = Some(value);
+        } else if let Some(value) = parse_toml_string_value(line, "path") {
+            current_path = Some(value);
+        }
+    }
+    push_cargo_test_target(&mut parsed.targets, &mut current_name, &mut current_path);
+    parsed
+}
+
+fn push_cargo_test_target(
+    targets: &mut Vec<CargoTestTarget>,
+    name: &mut Option<String>,
+    path: &mut Option<String>,
+) {
+    let (Some(name_value), Some(path_value)) = (name.take(), path.take()) else {
+        return;
+    };
+    if name_value.is_empty() || path_value.is_empty() {
+        return;
+    }
+    targets.push(CargoTestTarget {
+        name: name_value,
+        path: path_value,
+    });
+}
+
+fn parse_toml_string_value(line: &str, key: &str) -> Option<String> {
+    let (raw_key, raw_value) = line.split_once('=')?;
+    if raw_key.trim() != key {
+        return None;
+    }
+    let value = raw_value.trim();
+    let quote = value.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &value[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+fn cargo_integration_test_name_for_manifest(work_root: &Path, path: &str) -> Option<String> {
+    let manifest = std::fs::read_to_string(work_root.join("Cargo.toml")).ok()?;
+    cargo_test_targets_from_manifest(&manifest)
+        .targets
+        .into_iter()
+        .find(|target| target.path == path)
+        .map(|target| target.name)
 }
 
 fn parse_toml_section(trimmed: &str) -> Option<String> {
@@ -1561,7 +3472,7 @@ fn python_pytest_command(work_root: &Path) -> PythonPytestCommand {
         let packages = python_pyproject_test_packages(&pyproject);
         return PythonPytestCommand {
             command: format!(
-                "python3 -m pip install {} && PYTHONPATH=src:. python3 -B -m pytest -p no:cacheprovider",
+                "python3 -m pip install {} && PYTHONPATH=src:. python3 -m pytest -q -p no:cacheprovider",
                 packages.join(" ")
             ),
             reason: "Python tests detected with pyproject.toml; installing declared test dependencies before pytest".to_string(),
@@ -1570,7 +3481,7 @@ fn python_pytest_command(work_root: &Path) -> PythonPytestCommand {
         };
     }
     PythonPytestCommand {
-        command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
+        command: "python3 -m pytest -q -p no:cacheprovider".to_string(),
         reason: "Python tests detected".to_string(),
         confidence: 0.78,
         evidence: vec!["python-toolchain:stdlib".to_string()],
@@ -1586,6 +3497,225 @@ fn python_pyproject_test_packages(pyproject: &PythonProjectEvidence) -> Vec<Stri
         .collect();
     packages.insert("pytest".to_string());
     packages.into_iter().collect()
+}
+
+fn python_inferred_test_packages_from_sources(work_root: &Path) -> Vec<String> {
+    const MAX_PYTHON_SOURCE_FILES: usize = 64;
+    const MAX_PYTHON_SOURCE_BYTES: u64 = 256 * 1024;
+    const MAX_INFERRED_PACKAGES: usize = 24;
+
+    let mut local_modules = python_local_top_level_modules(work_root);
+    local_modules.insert("tests".to_string());
+
+    let mut packages = BTreeSet::new();
+    packages.insert("pytest".to_string());
+    let mut stack = vec![work_root.to_path_buf()];
+    let mut visited_files = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            if python_dependency_scan_ignored_name(&name) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("py") {
+                continue;
+            }
+            if visited_files >= MAX_PYTHON_SOURCE_FILES {
+                break;
+            }
+            visited_files = visited_files.saturating_add(1);
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.len() > MAX_PYTHON_SOURCE_BYTES {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for import in python_imported_top_level_names(&contents) {
+                if local_modules.contains(&import) || python_stdlib_top_level_name(&import) {
+                    continue;
+                }
+                let package = normalize_dependency_name(&import);
+                if is_safe_python_package_name(&package) {
+                    packages.insert(package);
+                }
+            }
+            if contents.contains("fastapi.testclient") {
+                packages.insert("httpx".to_string());
+            }
+        }
+    }
+
+    packages.into_iter().take(MAX_INFERRED_PACKAGES).collect()
+}
+
+fn python_local_top_level_modules(work_root: &Path) -> BTreeSet<String> {
+    let mut modules = BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(work_root) else {
+        return modules;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if python_dependency_scan_ignored_name(&name) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_file() {
+            if path.extension().and_then(|ext| ext.to_str()) == Some("py")
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+            {
+                modules.insert(stem.to_string());
+            }
+            continue;
+        }
+        if file_type.is_dir() && python_dir_contains_python_source(&path) {
+            modules.insert(name);
+        }
+    }
+    modules
+}
+
+fn python_dir_contains_python_source(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.extension().and_then(|ext| ext.to_str()) == Some("py")
+    })
+}
+
+fn python_dependency_scan_ignored_name(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "__pycache__"
+                | ".anvil-state"
+                | ".git"
+                | ".hg"
+                | ".mypy_cache"
+                | ".pytest_cache"
+                | ".ruff_cache"
+                | ".tox"
+                | ".venv"
+                | "dist"
+                | "node_modules"
+                | "target"
+                | "venv"
+        )
+}
+
+fn python_imported_top_level_names(contents: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in contents.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || trimmed.starts_with("from .") {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("import ") {
+            for part in rest.split(',') {
+                let candidate = part
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .split('.')
+                    .next()
+                    .unwrap_or("");
+                if python_import_name_is_safe(candidate) {
+                    names.insert(candidate.to_string());
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("from ") {
+            let candidate = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .split('.')
+                .next()
+                .unwrap_or("");
+            if python_import_name_is_safe(candidate) {
+                names.insert(candidate.to_string());
+            }
+        }
+    }
+    names
+}
+
+fn python_import_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 80
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+}
+
+fn python_stdlib_top_level_name(name: &str) -> bool {
+    matches!(
+        name,
+        "__future__"
+            | "abc"
+            | "argparse"
+            | "asyncio"
+            | "base64"
+            | "collections"
+            | "contextlib"
+            | "csv"
+            | "dataclasses"
+            | "datetime"
+            | "decimal"
+            | "enum"
+            | "functools"
+            | "glob"
+            | "hashlib"
+            | "http"
+            | "importlib"
+            | "inspect"
+            | "io"
+            | "itertools"
+            | "json"
+            | "logging"
+            | "math"
+            | "os"
+            | "pathlib"
+            | "random"
+            | "re"
+            | "shutil"
+            | "sqlite3"
+            | "statistics"
+            | "string"
+            | "subprocess"
+            | "sys"
+            | "tempfile"
+            | "time"
+            | "traceback"
+            | "types"
+            | "typing"
+            | "unittest"
+            | "uuid"
+    )
 }
 
 fn is_safe_python_package_name(name: &str) -> bool {
@@ -1856,7 +3986,9 @@ fn command_references_existing_local_file(command: &str, work_root: &Path) -> bo
 /// to `pub(super)` for Issue #459 so Tester can reuse the same heuristic
 /// (DR1-001).
 pub(super) fn has_python_surface(work_root: &Path, changed_files: &[String]) -> bool {
-    changed_files.iter().any(|path| path.ends_with(".py"))
+    changed_files
+        .iter()
+        .any(|path| path.ends_with(".py") && !is_ignored_workspace_display_path(path))
         || work_root.join("pyproject.toml").is_file()
         || work_root.join("requirements.txt").is_file()
 }
@@ -1868,9 +4000,20 @@ pub(super) fn first_python_script(changed_files: &[String]) -> Option<PathBuf> {
     changed_files
         .iter()
         .find(|path| {
-            path.ends_with(".py") && !path.starts_with("tests/") && !path.starts_with("test_")
+            path.ends_with(".py")
+                && !path.starts_with("tests/")
+                && !path.starts_with("test_")
+                && !is_ignored_workspace_display_path(path)
         })
         .map(PathBuf::from)
+}
+
+fn visible_changed_files(changed_files: &[String]) -> Vec<String> {
+    changed_files
+        .iter()
+        .filter(|path| !is_ignored_workspace_display_path(path))
+        .cloned()
+        .collect()
 }
 
 /// Returns true when `work_root/Cargo.toml` exists and the workspace has
@@ -1963,8 +4106,38 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::task_contract::TaskKind;
     use super::*;
     use tempfile::tempdir;
+
+    // Issue #918 (P1) Task 6+7: the structured-verifier process-spawn gate.
+    // Every non-coding kind must fail closed with an Err (no process spawned),
+    // observable in the repo's DEBUG `cargo test` CI (the gate is a real `Err`,
+    // not a `debug_assert!` panic). This is the security backstop for High gap #2.
+    #[test]
+    fn run_structured_blocks_non_coding_process_spawn_fail_closed() {
+        let dir = tempdir().expect("tempdir");
+        let scope = TaskWorkspaceScope::detect(dir.path(), "");
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&["tests/test_main.py".to_string()])
+                .expect("pytest command");
+
+        for kind in [
+            TaskKind::Docs,
+            TaskKind::Data,
+            TaskKind::Research,
+            TaskKind::Ops,
+            TaskKind::Authoring,
+        ] {
+            let result =
+                AutoTestRunner::run_structured(dir.path(), &scope, &command, "pytest -q", kind);
+            let err = result.expect_err("non-coding kind must fail closed at the spawn gate");
+            assert!(
+                err.contains("not permitted for task kind"),
+                "{kind:?}: expected spawn-gate Err, got: {err}"
+            );
+        }
+    }
 
     #[test]
     fn detects_cargo_test_first() {
@@ -1991,7 +4164,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
         let plan = AutoTestRunner::detect(dir.path(), &["app.py".to_string()]).expect("plan");
-        assert_eq!(plan.command, "python3 -B -m pytest -p no:cacheprovider");
+        assert_eq!(plan.command, "python3 -m pytest -q -p no:cacheprovider");
     }
 
     #[test]
@@ -2239,6 +4412,41 @@ mod tests {
         assert_ne!(plan.unwrap().command, "rm -rf .");
     }
 
+    #[test]
+    fn evidence_command_hint_accepts_safe_project_verifier() {
+        let plan = AutoTestRunner::plan_from_evidence_command_hint(
+            "cargo test --manifest-path Cargo.toml",
+        )
+        .expect("safe cargo test hint");
+
+        assert_eq!(plan.command, "cargo test --manifest-path Cargo.toml");
+        assert_eq!(plan.reason, "controller evidence command");
+    }
+
+    #[test]
+    fn evidence_command_hint_accepts_stdlib_unittest_verifier() {
+        let plan = AutoTestRunner::plan_from_evidence_command_hint(
+            "python3 -m unittest discover -s tests",
+        )
+        .expect("safe unittest hint");
+
+        assert_eq!(plan.command, "python3 -m unittest discover -s tests");
+        assert_eq!(plan.reason, "controller evidence command");
+    }
+
+    #[test]
+    fn evidence_command_hint_rejects_shell_control() {
+        assert!(
+            AutoTestRunner::plan_from_evidence_command_hint("cargo test || true").is_none(),
+            "controller hints must not be able to mask verifier failures"
+        );
+    }
+
+    #[test]
+    fn evidence_command_hint_rejects_non_verifier_command() {
+        assert!(AutoTestRunner::plan_from_evidence_command_hint("echo ok").is_none());
+    }
+
     // --- Issue #450 AC1 / AC2 / NoVerifierAvailable -----------------------
 
     fn cargo_plan() -> AutoTestPlan {
@@ -2250,7 +4458,7 @@ mod tests {
 
     fn pytest_plan() -> AutoTestPlan {
         AutoTestPlan {
-            command: "python3 -B -m pytest -p no:cacheprovider".to_string(),
+            command: "python3 -m pytest -q -p no:cacheprovider".to_string(),
             reason: "test".to_string(),
         }
     }
@@ -2430,6 +4638,42 @@ mod tests {
         assert!(has_cargo_manifest(dir.path()));
     }
 
+    #[test]
+    fn cargo_test_targets_from_manifest_maps_explicit_path_to_name() {
+        let parsed = cargo_test_targets_from_manifest(
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\n\n[[test]]\nname = \"password_strength_tests\"\npath = \"tests/password_strength.rs\"\n",
+        );
+
+        assert!(parsed.has_explicit_section);
+        assert_eq!(
+            parsed.targets,
+            vec![CargoTestTarget {
+                name: "password_strength_tests".to_string(),
+                path: "tests/password_strength.rs".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn cargo_manifest_target_name_precedes_path_stem_for_preflight() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"password_strength\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[[test]]\nname = \"password_strength_tests\"\npath = \"tests/password_strength.rs\"\n",
+        )
+        .expect("write");
+
+        assert_eq!(
+            cargo_integration_test_name_for_manifest(dir.path(), "tests/password_strength.rs")
+                .as_deref(),
+            Some("password_strength_tests")
+        );
+        assert_eq!(
+            cargo_integration_test_name("tests/password_strength.rs").as_deref(),
+            Some("password_strength")
+        );
+    }
+
     /// `package_json_has_test_script` is true iff `scripts.test` is a real
     /// non-empty string.
     #[test]
@@ -2491,7 +4735,7 @@ mod tests {
         let plan = AutoTestRunner::detect(dir.path(), &["src/app.py".to_string()]).expect("plan");
         assert_eq!(
             plan.command,
-            "python3 -m pip install pytest && PYTHONPATH=src:. python3 -B -m pytest -p no:cacheprovider"
+            "python3 -m pip install pytest && PYTHONPATH=src:. python3 -m pytest -q -p no:cacheprovider"
         );
         assert!(plan.reason.contains("pytest-dependency"));
         assert!(plan.reason.contains("python-toolchain:pip-direct-deps"));
@@ -2523,6 +4767,36 @@ dev = [
             python_pyproject_test_packages(&pyproject),
             vec!["fastapi", "httpx", "pytest", "uvicorn"]
         );
+    }
+
+    #[test]
+    fn python_pytest_without_pyproject_infers_safe_import_packages_for_structured_setup() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests");
+        std::fs::write(
+            dir.path().join("main.py"),
+            "from fastapi import FastAPI\nfrom pydantic import BaseModel\nfrom uuid import uuid4\nimport types\n",
+        )
+        .expect("main");
+        std::fs::write(
+            dir.path().join("tests/test_main.py"),
+            "from fastapi.testclient import TestClient\nfrom main import app\n",
+        )
+        .expect("test");
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&["tests/test_main.py".to_string()])
+                .expect("pytest command");
+
+        let packages =
+            structured_python_pytest_dependency_setup_packages(dir.path(), &command).unwrap();
+
+        assert!(packages.contains(&"fastapi".to_string()));
+        assert!(packages.contains(&"httpx".to_string()));
+        assert!(packages.contains(&"pydantic".to_string()));
+        assert!(packages.contains(&"pytest".to_string()));
+        assert!(!packages.contains(&"main".to_string()));
+        assert!(!packages.contains(&"types".to_string()));
+        assert!(!packages.contains(&"uuid".to_string()));
     }
 
     #[test]
@@ -2722,25 +4996,14 @@ dev = [
 
     #[test]
     fn verifier_command_from_cargo_test_binds_artifact_paths() {
-        // CB-002: `tests/<name>.rs` paths convert to `--test <name>`
-        // flags rather than passing the file path verbatim (which cargo
-        // would interpret as a test-name filter, not a file path).
         let owned = vec!["tests/test_a.rs".to_string()];
         let command =
             VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo is allowlisted");
         assert_eq!(command.runner(), "cargo");
-        assert_eq!(
-            command.args(),
-            vec![
-                "test".to_string(),
-                "--test".to_string(),
-                "test_a".to_string()
-            ]
-            .as_slice()
-        );
+        assert_eq!(command.args(), vec!["test".to_string()].as_slice());
         assert_eq!(command.bound_test_artifacts(), owned.as_slice());
         // Display string joins with single spaces — no `shlex`.
-        assert_eq!(command.to_display_string(), "cargo test --test test_a");
+        assert_eq!(command.to_display_string(), "cargo test");
     }
 
     #[test]
@@ -2811,17 +5074,7 @@ dev = [
             OwnedTestVerifierPlan::Runnable { command, .. } => {
                 assert_eq!(command.runner(), "cargo");
                 assert_eq!(command.bound_test_artifacts(), owned.as_slice());
-                // CB-002: positional `tests/test_a.rs` becomes
-                // `--test test_a` so cargo runs the integration test.
-                assert_eq!(
-                    command.args(),
-                    vec![
-                        "test".to_string(),
-                        "--test".to_string(),
-                        "test_a".to_string()
-                    ]
-                    .as_slice()
-                );
+                assert_eq!(command.args(), vec!["test".to_string()].as_slice());
             }
             other => panic!("expected Runnable, got {other:?}"),
         }
@@ -2842,14 +5095,428 @@ dev = [
             OwnedTestVerifierPlan::Runnable { command, .. } => {
                 assert_eq!(command.runner(), "python3");
                 assert!(command.args().contains(&"pytest".to_string()));
+                assert!(command.args().contains(&"-q".to_string()));
+                assert_eq!(
+                    command.bound_test_artifacts(),
+                    &["tests/test_x.py".to_string()],
+                    "owned test artifact must be retained as binding metadata"
+                );
                 assert!(
-                    command.args().contains(&"tests/test_x.py".to_string()),
-                    "owned test artifact must be appended to args, got {:?}",
-                    command.args()
+                    !command.args().contains(&"tests/test_x.py".to_string()),
+                    "python verifier should run the full suite instead of filtering to owned tests"
                 );
             }
             other => panic!("expected Runnable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detect_owned_for_pyproject_python_project_prefers_bound_stdlib_pytest() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("tests")).expect("tests dir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = ['fastapi', 'pytest']\n",
+        )
+        .expect("pyproject");
+        let owned = vec!["tests/test_main.py".to_string()];
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(
+            dir.path(),
+            &["main.py".to_string()],
+            &[],
+            &owned,
+        );
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "python3");
+                assert!(command.args().contains(&"pytest".to_string()));
+                assert_eq!(
+                    command.bound_test_artifacts(),
+                    &["tests/test_main.py".to_string()],
+                    "pyproject verifier must keep owned test artifacts as binding metadata"
+                );
+                assert!(
+                    !command.args().contains(&"tests/test_main.py".to_string()),
+                    "python verifier should run the full suite instead of filtering to owned tests"
+                );
+                assert!(
+                    !command.to_display_string().contains("pip install"),
+                    "structured task-contract verifier must not rely on shell setup"
+                );
+            }
+            other => panic!("expected Runnable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_unit_filters_owned_verifier_to_current_task_stack() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='outer'\nversion='0.0.0'\n",
+        )
+        .expect("cargo manifest");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests dir");
+
+        let owned = vec!["tests/test_main.py".to_string()];
+        let unfiltered = AutoTestRunner::detect_with_owned_test_artifacts(
+            dir.path(),
+            &["app/main.py".to_string(), "tests/test_main.py".to_string()],
+            &[],
+            &owned,
+        );
+        match unfiltered {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "cargo");
+                assert_eq!(command.args(), vec!["test".to_string()].as_slice());
+            }
+            other => panic!("expected unfiltered cargo verifier, got {other:?}"),
+        }
+
+        let mut artifact_roles = BTreeSet::new();
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Implementation);
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Test);
+        let project_unit = super::super::project_probe::ProjectUnit {
+            root: ".".to_string(),
+            manifests: Vec::new(),
+            artifact_roles,
+            verifier_candidates: vec![super::super::project_probe::ProjectUnitVerifierCandidate {
+                command_preview: "python3 -m pytest -q -p no:cacheprovider".to_string(),
+                source: "python_tests",
+                timeout_class: super::super::project_probe::ProjectUnitTimeoutClass::ShortUnitTest,
+            }],
+            observed_stacks: vec!["python"],
+            confidence: super::super::project_probe::ProjectUnitConfidence::High,
+        };
+
+        let filtered = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+            dir.path(),
+            &["app/main.py".to_string(), "tests/test_main.py".to_string()],
+            &[],
+            &owned,
+            Some(&project_unit),
+        );
+        match filtered {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "python3");
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+            }
+            other => panic!("expected project-unit filtered python verifier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_unit_unittest_preview_builds_structured_unittest_verifier() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests dir");
+
+        let owned = vec!["tests/test_math_utils.py".to_string()];
+        let mut artifact_roles = BTreeSet::new();
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Implementation);
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Test);
+        let project_unit = super::super::project_probe::ProjectUnit {
+            root: ".".to_string(),
+            manifests: Vec::new(),
+            artifact_roles,
+            verifier_candidates: vec![super::super::project_probe::ProjectUnitVerifierCandidate {
+                command_preview: "python3 -m unittest discover -s tests".to_string(),
+                source: "python_tests",
+                timeout_class: super::super::project_probe::ProjectUnitTimeoutClass::ShortUnitTest,
+            }],
+            observed_stacks: vec!["python"],
+            confidence: super::super::project_probe::ProjectUnitConfidence::High,
+        };
+
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+            dir.path(),
+            &[
+                "math_utils.py".to_string(),
+                "tests/test_math_utils.py".to_string(),
+            ],
+            &[],
+            &owned,
+            Some(&project_unit),
+        );
+
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "python3");
+                assert_eq!(
+                    command.args(),
+                    vec![
+                        "-m".to_string(),
+                        "unittest".to_string(),
+                        "discover".to_string(),
+                        "-s".to_string(),
+                        "tests".to_string(),
+                    ]
+                    .as_slice()
+                );
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+            }
+            other => panic!("expected structured unittest verifier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_unit_without_verifier_candidates_does_not_fall_back_to_root_guess() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='outer'\nversion='0.0.0'\n",
+        )
+        .expect("cargo manifest");
+        let mut artifact_roles = BTreeSet::new();
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::UsageDocs);
+        let project_unit = super::super::project_probe::ProjectUnit {
+            root: ".".to_string(),
+            manifests: Vec::new(),
+            artifact_roles,
+            verifier_candidates: Vec::new(),
+            observed_stacks: Vec::new(),
+            confidence: super::super::project_probe::ProjectUnitConfidence::Low,
+        };
+
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+            dir.path(),
+            &["README.md".to_string()],
+            &[],
+            &["tests/test_main.py".to_string()],
+            Some(&project_unit),
+        );
+        assert_eq!(plan, OwnedTestVerifierPlan::Missing);
+    }
+
+    #[test]
+    fn owned_python_test_fallback_restores_runnable_when_project_unit_lost_candidate() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests dir");
+        std::fs::write(
+            dir.path().join("password_strength.py"),
+            "def password_score(password: str) -> int:\n    return 0\n",
+        )
+        .expect("impl");
+        std::fs::write(
+            dir.path().join("tests/test_password_strength.py"),
+            "from password_strength import password_score\n\ndef test_empty():\n    assert password_score('') == 0\n",
+        )
+        .expect("test");
+        std::fs::write(
+            dir.path().join("pytest.ini"),
+            "[pytest]\ntestpaths = tests\n",
+        )
+        .expect("pytest");
+
+        let mut artifact_roles = BTreeSet::new();
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Implementation);
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Test);
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Setup);
+        let project_unit = super::super::project_probe::ProjectUnit {
+            root: ".".to_string(),
+            manifests: Vec::new(),
+            artifact_roles,
+            verifier_candidates: Vec::new(),
+            observed_stacks: vec!["python"],
+            confidence: super::super::project_probe::ProjectUnitConfidence::Medium,
+        };
+        let owned = vec!["tests/test_password_strength.py".to_string()];
+
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+            dir.path(),
+            &["pytest.ini".to_string()],
+            &[],
+            &owned,
+            Some(&project_unit),
+        );
+
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "python3");
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+            }
+            other => panic!("expected owned python test fallback runnable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn owned_test_fallback_does_not_cross_stack_or_extension() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("tests")).expect("tests dir");
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='outer'\nversion='0.0.0'\n",
+        )
+        .expect("manifest");
+        std::fs::write(dir.path().join("src.rs"), "pub fn value()->u8{1}\n").expect("rust");
+        std::fs::write(
+            dir.path().join("tests/test_main.py"),
+            "def test_x(): pass\n",
+        )
+        .expect("python test");
+
+        let mut artifact_roles = BTreeSet::new();
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Implementation);
+        artifact_roles.insert(super::super::task_contract::ArtifactRole::Test);
+        let project_unit = super::super::project_probe::ProjectUnit {
+            root: ".".to_string(),
+            manifests: vec!["Cargo.toml".to_string()],
+            artifact_roles,
+            verifier_candidates: Vec::new(),
+            observed_stacks: vec!["rust"],
+            confidence: super::super::project_probe::ProjectUnitConfidence::Medium,
+        };
+
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts_and_project_unit(
+            dir.path(),
+            &["pytest.ini".to_string()],
+            &[],
+            &["tests/test_main.py".to_string()],
+            Some(&project_unit),
+        );
+
+        assert_eq!(plan, OwnedTestVerifierPlan::Missing);
+    }
+
+    #[test]
+    fn changed_files_ignore_controller_owned_state_for_verifier_detection() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".anvil-state/generated")).expect("state dir");
+        std::fs::write(
+            dir.path().join(".anvil-state/generated/test_generated.py"),
+            "def test_generated(): pass\n",
+        )
+        .expect("state file");
+
+        let changed = vec![".anvil-state/generated/test_generated.py".to_string()];
+        assert!(!has_python_surface(dir.path(), &changed));
+        assert_eq!(first_python_script(&changed), None);
+        assert!(
+            AutoTestRunner::detect_candidates(dir.path(), &changed).is_empty(),
+            "controller-owned changed files must not create verifier candidates"
+        );
+    }
+
+    #[test]
+    fn structured_python_verifier_preflights_generated_test_syntax() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".anvil-state/generated")).expect("state dir");
+        std::fs::write(
+            dir.path().join(".anvil-state/generated/test_generated.py"),
+            "def test_generated(:\n    pass\n",
+        )
+        .expect("generated test");
+        let owned = vec![".anvil-state/generated/test_generated.py".to_string()];
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 pytest command");
+        let env_plan = build_hermetic_env_plan(dir.path(), VERIFIER_ENV_PYTHON_EXTRA);
+
+        let result = run_structured_generated_test_preflight(
+            "python3",
+            &env_plan,
+            dir.path(),
+            &command,
+            &command.to_display_string(),
+        )
+        .expect("preflight should run")
+        .expect("syntax failure should be returned before pytest");
+
+        assert!(!result.passed);
+        assert!(result.command.contains("py_compile"), "{}", result.command);
+        assert!(
+            result.output.contains("SyntaxError") || result.output.contains("syntax"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn structured_python_pytest_dependency_setup_packages_reads_pyproject() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = ['fastapi', 'httpx']\n",
+        )
+        .expect("pyproject");
+        let owned = vec!["tests/test_main.py".to_string()];
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 pytest command");
+
+        assert_eq!(
+            structured_python_pytest_dependency_setup_packages(dir.path(), &command),
+            Some(vec![
+                "fastapi".to_string(),
+                "httpx".to_string(),
+                "pytest".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn structured_python_pytest_dependency_setup_packages_bootstraps_pytest_without_pyproject() {
+        let dir = tempdir().expect("tempdir");
+        let owned = vec!["tests/test_main.py".to_string()];
+        let pytest_command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 pytest command");
+        assert_eq!(
+            structured_python_pytest_dependency_setup_packages(dir.path(), &pytest_command),
+            Some(vec!["pytest".to_string()])
+        );
+
+        std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname = 'x'\n")
+            .expect("pyproject");
+        let cargo_command =
+            VerifierCommand::from_cargo_test(Vec::new(), &["tests/test_main.rs".to_string()])
+                .expect("cargo command");
+        assert_eq!(
+            structured_python_pytest_dependency_setup_packages(dir.path(), &cargo_command),
+            None
+        );
+    }
+
+    #[test]
+    fn structured_node_dependency_setup_required_for_npm_test_dependencies_without_node_modules() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"vitest run"},"devDependencies":{"vitest":"^1.0.0"}}"#,
+        )
+        .expect("package");
+        let owned = vec!["tests/index.test.js".to_string()];
+        let command = VerifierCommand::from_npm_test(&owned).expect("npm test");
+
+        assert!(structured_node_dependency_setup_required(
+            dir.path(),
+            &command
+        ));
+    }
+
+    #[test]
+    fn structured_node_dependency_setup_skips_when_dependencies_absent_or_installed() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node tests/index.test.js"}}"#,
+        )
+        .expect("package");
+        let owned = vec!["tests/index.test.js".to_string()];
+        let command = VerifierCommand::from_npm_test(&owned).expect("npm test");
+
+        assert!(!structured_node_dependency_setup_required(
+            dir.path(),
+            &command
+        ));
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"vitest run"},"dependencies":{"vitest":"^1.0.0"}}"#,
+        )
+        .expect("package with deps");
+        std::fs::create_dir(dir.path().join("node_modules")).expect("node_modules");
+
+        assert!(!structured_node_dependency_setup_required(
+            dir.path(),
+            &command
+        ));
     }
 
     #[test]
@@ -2991,9 +5658,35 @@ dev = [
         let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest");
         let result = validate_bound_test_artifacts_for_execution(work.path(), &scope, &command);
         let err = result.expect_err("symlink escape must reject");
+        // Issue #661 iteration-3 Task 3.4 path #3: the scope/symlink
+        // gate is now routed through `classify_ownership` which fires
+        // `OutOfScope` (workspace-relative / canonical_escape SSOT)
+        // before the explicit canonicalize-strip-prefix backstop below.
+        // Either error message satisfies the regression (symlink
+        // escape must reject), with the classify_ownership path being
+        // the primary route after the SSOT switch.
         assert!(
-            err.contains("canonicalization escapes work_root"),
+            err.contains("not in TaskWorkspaceScope")
+                || err.contains("canonicalization escapes work_root"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_shell_auto_test_is_bounded_by_timeout() {
+        let dir = tempdir().expect("tempdir");
+        let plan = AutoTestPlan {
+            command: "sleep 60".to_string(),
+            reason: "timeout regression".to_string(),
+        };
+
+        let result = AutoTestRunner::run_with_timeout(dir.path(), &plan, Duration::from_millis(50));
+
+        let err = result.expect_err("legacy shell verifier must be bounded");
+        assert!(
+            err.contains("auto test command timed out after"),
+            "expected timeout error, got: {err}"
         );
     }
 
@@ -3166,66 +5859,84 @@ dev = [
     }
 
     // -----------------------------------------------------------------
-    // Issue #651 CB-002: cargo positional arg is a name filter, not
-    // a path. `from_cargo_test` must convert `tests/<stem>.rs` →
-    // `--test <stem>` and reject paths it cannot safely convert.
+    // Issue #865: Rust final success verifier is full `cargo test`.
     // -----------------------------------------------------------------
 
     #[test]
-    fn verifier_command_from_cargo_test_converts_tests_dir_to_test_flag() {
+    fn verifier_command_from_cargo_test_runs_full_suite() {
         let owned = vec!["tests/integration_one.rs".to_string()];
         let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
         assert_eq!(
             command.args(),
-            vec![
-                "test".to_string(),
-                "--test".to_string(),
-                "integration_one".to_string()
-            ]
-            .as_slice(),
-            "tests/<stem>.rs must map to `--test <stem>` (CB-002)"
+            vec!["test".to_string()].as_slice(),
+            "Rust final success verifier must be full cargo test"
         );
     }
 
     #[test]
-    fn verifier_command_from_cargo_test_rejects_src_internal_path_returns_none() {
-        // src/... is a unit-test module path; cargo cannot run an
-        // arbitrary file under `src/` as an integration test, so the
-        // constructor must return None (and the caller falls back to
-        // Weak).
+    fn verifier_command_from_cargo_test_accepts_src_internal_test_artifact() {
         let owned = vec!["src/lib/foo.rs".to_string()];
-        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned);
-        assert!(command.is_none(), "src/... path must not be convertible");
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        assert_eq!(command.args(), vec!["test".to_string()].as_slice());
+        assert_eq!(command.bound_test_artifacts(), owned.as_slice());
     }
 
     #[test]
-    fn verifier_command_from_cargo_test_rejects_non_rs_extension_returns_none() {
-        // `.py`, `.toml`, etc. cannot be an integration test file —
-        // the helper must refuse to fabricate a `--test <stem>` flag.
+    fn verifier_command_from_cargo_test_accepts_owned_artifact_without_filtering() {
         let owned = vec!["tests/test_a.py".to_string()];
-        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned);
-        assert!(command.is_none(), "non-.rs path must not be convertible");
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        assert_eq!(command.args(), vec!["test".to_string()].as_slice());
     }
 
     #[test]
-    fn verifier_command_from_cargo_test_rejects_nested_tests_path_returns_none() {
-        // tests/sub/dir.rs is a sub-directory integration file. cargo's
-        // `--test <name>` flag does not address those; reject so the
-        // caller drops to Weak rather than fabricate a misleading flag.
-        let owned = vec!["tests/sub/dir.rs".to_string()];
-        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned);
+    fn verifier_command_from_node_test_binds_direct_js_test_paths() {
+        let owned = vec!["tests/index.test.js".to_string()];
+        let command = VerifierCommand::from_node_test(&owned).expect("node");
+        assert_eq!(
+            command.args(),
+            vec!["--test".to_string(), "tests/index.test.js".to_string()].as_slice()
+        );
+        assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+    }
+
+    #[test]
+    fn verifier_command_from_node_test_rejects_typescript_paths() {
+        let owned = vec!["tests/index.test.ts".to_string()];
         assert!(
-            command.is_none(),
-            "nested tests/<sub>/<file>.rs must not be convertible"
+            VerifierCommand::from_node_test(&owned).is_none(),
+            "plain node --test must not claim TypeScript test artifacts"
         );
     }
 
     #[test]
-    fn detect_owned_for_cargo_project_with_unconvertible_path_returns_weak() {
-        // A Cargo project with an owned test artifact under src/...
-        // means `from_cargo_test` returns None. The detector must
-        // surface this as `Weak` so the caller never executes an
-        // unbound `cargo test` (CB-002).
+    fn detect_owned_for_package_json_script_returns_npm_test_runnable() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"node --test tests/*.test.js"}}"#,
+        )
+        .expect("package");
+        let owned = vec!["tests/index.test.js".to_string()];
+        let plan = AutoTestRunner::detect_with_owned_test_artifacts(dir.path(), &[], &[], &owned);
+        match plan {
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "npm");
+                assert_eq!(command.args(), vec!["test".to_string()].as_slice());
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
+            }
+            other => panic!("expected Runnable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verifier_command_from_cargo_test_accepts_nested_tests_path_for_full_suite() {
+        let owned = vec!["tests/sub/dir.rs".to_string()];
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        assert_eq!(command.args(), vec!["test".to_string()].as_slice());
+    }
+
+    #[test]
+    fn detect_owned_for_cargo_project_with_src_test_returns_runnable() {
         let dir = tempdir().expect("tempdir");
         std::fs::write(
             dir.path().join("Cargo.toml"),
@@ -3235,12 +5946,12 @@ dev = [
         let owned = vec!["src/lib/foo.rs".to_string()];
         let plan = AutoTestRunner::detect_with_owned_test_artifacts(dir.path(), &[], &[], &owned);
         match plan {
-            OwnedTestVerifierPlan::Weak {
-                detected_source, ..
-            } => {
-                assert_eq!(detected_source, "cargo_manifest");
+            OwnedTestVerifierPlan::Runnable { command, .. } => {
+                assert_eq!(command.runner(), "cargo");
+                assert_eq!(command.args(), vec!["test".to_string()].as_slice());
+                assert_eq!(command.bound_test_artifacts(), owned.as_slice());
             }
-            other => panic!("expected Weak, got {other:?}"),
+            other => panic!("expected Runnable, got {other:?}"),
         }
     }
 
@@ -3365,10 +6076,12 @@ dev = [
         evidence.push(CompletionEvidence::RepoEdit {
             category: RepoEditCategory::Impl,
             count: 1,
+            path: None,
         });
         evidence.push(CompletionEvidence::RepoEdit {
             category: RepoEditCategory::Test,
             count: 1,
+            path: None,
         });
         evidence.push(CompletionEvidence::VerifierExitZero {
             class: crate::tools::bash::BashCommandClass::BuildTest,
@@ -3380,6 +6093,7 @@ dev = [
             decision,
             CompletionDecision::SafeStop {
                 reason: SafeStopReason::VerifierMissing,
+                weak_reason: None,
             },
             "py_compile + required-tests + empty owned must SafeStop, got {decision:?}"
         );
@@ -3495,5 +6209,993 @@ dev = [
                 "args with shell control must be rejected: {args:?}"
             );
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 Task 2.2: RunnerKind enum contract (OCP 拡張口 / serialize
+    // 戦略 DR2-004)。as_str() is the **only** serialize path — adding a new
+    // variant without updating the match must fail to compile.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn runner_kind_cargo_serializes_as_cargo_string() {
+        assert_eq!(RunnerKind::Cargo.as_str(), "cargo");
+    }
+
+    #[test]
+    fn runner_kind_python3_serializes_as_python3_string() {
+        assert_eq!(RunnerKind::Python3.as_str(), "python3");
+    }
+
+    #[test]
+    fn runner_kind_npm_serializes_as_npm_string() {
+        assert_eq!(RunnerKind::Npm.as_str(), "npm");
+    }
+
+    #[test]
+    fn runner_kind_is_copy_clone_eq() {
+        // Compile-time: Copy + Clone + PartialEq + Eq (required for
+        // downstream payload dedup and value passing).
+        let kind = RunnerKind::Cargo;
+        let copy = kind;
+        let clone = kind;
+        assert_eq!(kind, copy);
+        assert_eq!(copy, clone);
+    }
+
+    /// CB-007 regression: every `RunnerKind` variant must round-trip through
+    /// `from_runner_str(as_str())`. Adding a new variant without updating
+    /// `from_runner_str` will silently fall through to `None` at runtime;
+    /// this test makes that case fail at test time (next-best guard since
+    /// `#[non_exhaustive]` + free function `from_runner_str` cannot enforce
+    /// it at compile time).
+    #[test]
+    fn runner_kind_as_str_from_runner_str_round_trip_covers_all_variants() {
+        // List every variant explicitly. When a new variant is added, this
+        // test forces the author to extend both the list and `from_runner_str`.
+        let all = [RunnerKind::Cargo, RunnerKind::Python3, RunnerKind::Npm];
+        for kind in all {
+            let serialized = kind.as_str();
+            let parsed = RunnerKind::from_runner_str(serialized).unwrap_or_else(|| {
+                panic!(
+                    "RunnerKind::{:?}.as_str() = {:?} must round-trip via from_runner_str",
+                    kind, serialized
+                )
+            });
+            assert_eq!(parsed, kind, "round-trip mismatch for {:?}", kind);
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 Task 2.3: PathHashHex newtype contract (DR1-012 / DR2-007)。
+    // - raw path を渡したら mask_secrets 後の文字列を入力に stable_path_hash で
+    //   16-hex に統一化。同じ入力には deterministic な出力。
+    // - 異なる入力は別 hash。
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn path_hash_hex_returns_sixteen_hex_chars() {
+        let hash = PathHashHex::from_relative_str("src/foo.rs");
+        let s = hash.as_str();
+        assert_eq!(
+            s.len(),
+            16,
+            "PathHashHex must always be 16 hex chars, got {s:?}"
+        );
+        assert!(
+            s.chars().all(|c| c.is_ascii_hexdigit()),
+            "PathHashHex must contain only ASCII hex digits, got {s:?}"
+        );
+    }
+
+    #[test]
+    fn path_hash_hex_is_deterministic_for_identical_inputs() {
+        let a = PathHashHex::from_relative_str("app/tests/test_a.py");
+        let b = PathHashHex::from_relative_str("app/tests/test_a.py");
+        assert_eq!(
+            a.as_str(),
+            b.as_str(),
+            "identical inputs must hash to identical 16-hex strings"
+        );
+    }
+
+    #[test]
+    fn path_hash_hex_differs_for_different_inputs() {
+        let a = PathHashHex::from_relative_str("app/tests/test_a.py");
+        let b = PathHashHex::from_relative_str("app/tests/test_b.py");
+        assert_ne!(
+            a.as_str(),
+            b.as_str(),
+            "distinct paths must hash to distinct 16-hex strings (collision unlikely with DefaultHasher)"
+        );
+    }
+
+    #[test]
+    fn path_hash_hex_matches_logging_ssot() {
+        // PathHashHex MUST go through `crate::logging::stable_path_hash`
+        // applied to `mask_secrets(input)` so the per-Issue path_hash
+        // representations stay byte-identical across #659/#660/#661.
+        let input = "src/foo.rs";
+        let masked = crate::session::feedback::mask_secrets(input);
+        let expected = crate::logging::stable_path_hash(&masked);
+        assert_eq!(
+            PathHashHex::from_relative_str(input).as_str(),
+            expected.as_str(),
+            "PathHashHex must reuse logging::stable_path_hash SSOT after mask_secrets"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 (iteration-3 Task 3.4 path #3): execution-time
+    // validator now consults `classify_ownership` with
+    // `NestedTestAdmission::enabled()` so nested test subdirs are
+    // admitted via the SSOT propagation route.
+    //
+    // The validator already rejected absolute / symlink-escape /
+    // ignored-top-dir paths via independent manual checks; the
+    // classify_ownership call replaces the older `scope.contains` step
+    // and adds workspace-relative / role-confirm coverage as defense
+    // in depth.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn validate_bound_artifacts_accepts_nested_test_subdir_with_admission() {
+        // `app/tests/test_a.py` must pass execution-time validation
+        // when the file exists and the path is in scope. Iteration-3
+        // pins the new SSOT route: `classify_ownership` with
+        // `NestedTestAdmission::enabled()`.
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("app/tests")).unwrap();
+        std::fs::write(dir.path().join("app/tests/test_a.py"), "").unwrap();
+        let scope = single_root_scope_for_validation();
+        let owned = vec!["app/tests/test_a.py".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest");
+        let result = validate_bound_test_artifacts_for_execution(dir.path(), &scope, &command);
+        assert!(
+            result.is_ok(),
+            "nested-test-subdir path must pass with admission enabled, got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_bound_artifacts_rejects_symlink_escape_via_classify_ownership() {
+        // SSOT consistency: when a symlinked leaf escapes work_root,
+        // the classify_ownership-based gate fires first and produces
+        // the canonical-escape error. The defense-in-depth canonicalize
+        // step at the bottom of the helper remains as a backstop, but
+        // the classify_ownership path must reject the same input shape
+        // so the same gate covers both record_* helpers and the
+        // execution-time validator.
+        use std::os::unix::fs::symlink;
+        let outside = tempdir().expect("outside");
+        std::fs::write(outside.path().join("escape_test.py"), "").unwrap();
+        let work = tempdir().expect("work");
+        symlink(
+            outside.path().join("escape_test.py"),
+            work.path().join("test_escape.py"),
+        )
+        .expect("symlink");
+        let scope = single_root_scope_for_validation();
+        let owned = vec!["test_escape.py".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest");
+        let result = validate_bound_test_artifacts_for_execution(work.path(), &scope, &command);
+        assert!(
+            result.is_err(),
+            "symlink-escape must reject regardless of which gate fires first"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 iteration-5 Phase B: HermeticEnvPlan / HermeticEnvSummary
+    // 本実装 (Task 6.1 apply_to + Task 6.2 VERIFIER_ENV_PYTHON_EXTRA +
+    // Task 6.3 summary 実値 + Task 7.1 PYTHONPATH 検査)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn build_hermetic_env_plan_phase_b_sets_cwd_to_work_root() {
+        let work = tempdir().expect("work");
+        let plan = build_hermetic_env_plan(work.path(), &[]);
+        let summary = plan.summary();
+        assert!(
+            summary.cwd_inside_work_root,
+            "build_hermetic_env_plan must set cwd to work_root itself"
+        );
+    }
+
+    #[test]
+    fn build_hermetic_env_plan_python_extras_pin_pythonpath_to_work_root() {
+        let work = tempdir().expect("work");
+        let plan = build_hermetic_env_plan(work.path(), VERIFIER_ENV_PYTHON_EXTRA);
+        let summary = plan.summary();
+        assert!(
+            summary.pythonpath_root,
+            "Python verifier extras must pin PYTHONPATH to work_root even when parent PYTHONPATH is absent"
+        );
+    }
+
+    #[test]
+    fn structured_python_dependency_site_is_controller_state_and_second_on_pythonpath() {
+        let work = tempdir().expect("work");
+        let dependency_site = structured_python_dependency_site_dir(work.path());
+        let relative_site = dependency_site
+            .strip_prefix(work.path())
+            .expect("site under work root");
+        assert!(
+            crate::util::workspace_paths::is_ignored_workspace_relative_path(relative_site),
+            "structured dependency site must remain controller-owned ignored state"
+        );
+
+        let pythonpath =
+            structured_python_dependency_site_pythonpath(work.path(), &dependency_site)
+                .expect("pythonpath");
+        let entries: Vec<PathBuf> = std::env::split_paths(&pythonpath).collect();
+        assert_eq!(entries.first().map(PathBuf::as_path), Some(work.path()));
+        assert_eq!(entries.get(1), Some(&dependency_site));
+        assert_eq!(
+            entries.len(),
+            2,
+            "user workspace must be searched before verifier dependency site, with no extra parent PYTHONPATH"
+        );
+    }
+
+    /// Phase B Task 6.1: `apply_to` MUST `env_clear()` + re-inject allowlist
+    /// keys. We spawn `printenv` (Unix) and check that a non-allowlist key
+    /// (`API_KEY_FAKE`) is dropped while PATH is preserved.
+    #[cfg(unix)]
+    #[test]
+    fn hermetic_env_plan_apply_to_drops_secret_like_keys_phase_b() {
+        let work = tempdir().expect("work");
+        let plan = build_hermetic_env_plan(work.path(), &[]);
+        // Use a fresh Command without inheriting our test's env via
+        // `Command::new("sh")`-then-`env_clear` already happens in apply_to.
+        // We set the secret on the child via cmd.env() to prove apply_to's
+        // env_clear actually wipes it (env_clear must run before re-inject).
+        let mut cmd = Command::new("sh");
+        cmd.env("API_KEY_FAKE", "supersecret");
+        cmd.args([
+            "-c",
+            "printf 'API_KEY_FAKE=%s\\n' \"${API_KEY_FAKE:-MISSING}\"",
+        ]);
+        plan.apply_to(&mut cmd);
+        let output = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn shell");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("API_KEY_FAKE=MISSING"),
+            "apply_to must env_clear + re-inject allowlist only; got stdout={stdout:?}"
+        );
+    }
+
+    /// Phase B Task 6.1: PATH MUST stay inherited (it's on the allowlist).
+    #[cfg(unix)]
+    #[test]
+    fn hermetic_env_plan_apply_to_preserves_path_phase_b() {
+        let work = tempdir().expect("work");
+        let plan = build_hermetic_env_plan(work.path(), &[]);
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf '%s' \"$PATH\""]);
+        plan.apply_to(&mut cmd);
+        let output = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn sh");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.trim().is_empty(),
+            "Phase B: PATH must remain inherited via filter_env_for_tester allowlist"
+        );
+    }
+
+    /// Phase B Task 6.1 / DR1-009: `CARGO_HOME` / `RUSTUP_HOME` must remain
+    /// inherited via `TESTER_ENV_ALLOWLIST_EXACT` so cargo cache warmup is
+    /// not destroyed by hermetic env. This is the regression guard for the
+    /// design decision in セクション 4 判断 #2 (allowlist 通過 inherit) and
+    /// CB-008 (PATH hijack 防止後の cargo path 解決を実用範囲に保つ).
+    #[cfg(unix)]
+    #[test]
+    fn hermetic_env_plan_apply_to_preserves_cargo_home_phase_b() {
+        // `apply_to` always re-injects from `filter_env_for_tester(std::env::vars())`
+        // which reads the **parent** (test runner) process env. CARGO_HOME is
+        // virtually always set in the cargo test runtime, so we use the parent
+        // value as the source of truth and assert it round-trips into the child.
+        let parent_cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| String::new());
+        if parent_cargo_home.is_empty() {
+            // Skip on the rare environment that does not set CARGO_HOME at all
+            // (e.g. a minimal sandbox); the regression target is "inherit when
+            // present", not "synthesise from nothing".
+            return;
+        }
+        let work = tempdir().expect("work");
+        let plan = build_hermetic_env_plan(work.path(), &[]);
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf 'CARGO_HOME=%s\\n' \"${CARGO_HOME:-MISSING}\""]);
+        plan.apply_to(&mut cmd);
+        let output = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn sh");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected = format!("CARGO_HOME={parent_cargo_home}");
+        assert!(
+            stdout.contains(&expected),
+            "Phase B: CARGO_HOME (from parent {parent_cargo_home:?}) must survive env_clear via TESTER_ENV_ALLOWLIST_EXACT inherit; got stdout={stdout:?}"
+        );
+        assert!(
+            !stdout.contains("CARGO_HOME=MISSING"),
+            "Phase B: apply_to MUST NOT strip CARGO_HOME (cargo cache warmup would break)"
+        );
+    }
+
+    /// Phase B Task 6.3: `HermeticEnvSummary` direct construction shape.
+    #[test]
+    fn hermetic_env_summary_phase_b_shape() {
+        let summary = HermeticEnvSummary {
+            allowlist_keys: vec!["PATH", "HOME"],
+            pythonpath_root: true,
+            cwd_inside_work_root: true,
+        };
+        assert_eq!(summary.allowlist_keys, vec!["PATH", "HOME"]);
+        assert!(summary.pythonpath_root);
+        assert!(summary.cwd_inside_work_root);
+    }
+
+    /// CB-006 (Phase B 移行 signal flipped): `summary.allowlist_keys` is
+    /// populated with the actual `filter_env_for_tester` outcome once the
+    /// hermetic env implementation is in place. The Phase A invariant that
+    /// kept the field empty has been retired; we now require PATH to be
+    /// present (it is essentially always set on any CI / dev shell).
+    #[test]
+    fn build_hermetic_env_plan_phase_b_summary_carries_real_allowlist_keys() {
+        let work = tempdir().expect("work");
+        let plan = build_hermetic_env_plan(work.path(), &[]);
+        let summary = plan.summary();
+        // PATH should always be present in any reasonable env we test under.
+        assert!(
+            summary.allowlist_keys.contains(&"PATH"),
+            "Phase B: summary.allowlist_keys must include PATH from filter_env_for_tester; got {:?}",
+            summary.allowlist_keys
+        );
+        assert!(
+            summary.cwd_inside_work_root,
+            "Phase B: cwd_inside_work_root must remain true (cwd == work_root)"
+        );
+    }
+
+    /// Phase B Task 6.2 + v0.4.8 verifier sandbox: Python verifier extras
+    /// must contain cache suppression, user-site suppression, and pytest
+    /// third-party plugin autoload suppression.
+    #[test]
+    fn verifier_env_python_extra_contains_expected_keys() {
+        let mut keys: Vec<&str> = VERIFIER_ENV_PYTHON_EXTRA.iter().map(|(k, _)| *k).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+                "PYTHONDONTWRITEBYTECODE",
+                "PYTHONNOUSERSITE"
+            ]
+        );
+        for (_, v) in VERIFIER_ENV_PYTHON_EXTRA {
+            assert_eq!(*v, "1");
+        }
+    }
+
+    /// Phase B Task 6.4 (DR4-002 leading-dash argv injection): a path that
+    /// begins with `-` MUST reject `VerifierCommand` construction. Both
+    /// `from_pytest` (forwards path verbatim) and `from_cargo_test` (stores
+    /// bound metadata for full `cargo test`) must refuse.
+    #[test]
+    fn verifier_command_rejects_leading_dash_bound_path_from_pytest() {
+        let owned = vec!["-malicious_test.py".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned);
+        assert!(
+            command.is_none(),
+            "Phase B DR4-002: leading-dash bound path must reject construction"
+        );
+    }
+
+    #[test]
+    fn verifier_command_accepts_normal_relative_path() {
+        // Regression guard: ensure the leading-dash check did not over-fire.
+        let owned = vec!["tests/test_a.py".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned);
+        assert!(command.is_some());
+    }
+
+    /// Phase B Task 6.4 (DR4-001 PATH hijack): `resolved_runner_program`
+    /// must return an absolute path when the planned PATH contains a real
+    /// `sh` (always present on Unix). On non-Unix or missing-binary cases
+    /// it falls back to the relative runner string.
+    #[cfg(unix)]
+    #[test]
+    fn resolved_runner_program_returns_absolute_path_under_planned_path() {
+        // Build a VerifierCommand with `python3` as runner; even if python3
+        // isn't installed on the test runner, the resolver returns the bare
+        // "python3" string. To deterministically exercise the success path,
+        // we synthesize a tempdir with an executable file and inject it.
+        use std::os::unix::fs::PermissionsExt;
+        let work = tempdir().expect("work");
+        let bin_dir = work.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let fake_runner = bin_dir.join("python3");
+        std::fs::write(&fake_runner, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&fake_runner).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_runner, perms).unwrap();
+        let path_value = bin_dir.to_string_lossy().into_owned();
+        let owned = vec!["tests/test_a.py".to_string()];
+        let command = VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 command");
+        let resolved = command.resolved_runner_program(Some(&path_value));
+        assert_eq!(resolved, fake_runner.to_string_lossy());
+    }
+
+    #[test]
+    fn resolved_runner_program_falls_back_to_relative_when_unresolved() {
+        let owned = vec!["tests/test_a.py".to_string()];
+        let command = VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 command");
+        // Empty PATH → no candidate; relative argv is the best-effort fallback.
+        let resolved = command.resolved_runner_program(Some(""));
+        assert_eq!(resolved, "python3");
+        // None planned PATH → same fallback.
+        let resolved_none = command.resolved_runner_program(None);
+        assert_eq!(resolved_none, "python3");
+    }
+
+    /// CB-008 (Codex iteration-5 high, DR4-001): a sanitized PATH must
+    /// reject relative components and empty components. The hermetic
+    /// runner-resolution path must NOT trust those — otherwise a process
+    /// CWD with a hostile binary could hijack `python3` / `cargo`.
+    #[cfg(unix)]
+    #[test]
+    fn sanitize_path_for_runner_resolution_drops_relative_and_empty() {
+        let dropped =
+            sanitize_path_for_runner_resolution("/usr/bin:relative/path::./also-relative", None);
+        assert!(
+            dropped.contains("/usr/bin"),
+            "absolute /usr/bin must survive sanitization; got {dropped:?}"
+        );
+        for forbidden in ["relative/path", "./also-relative"] {
+            assert!(
+                !dropped.split(':').any(|c| c == forbidden),
+                "relative component {forbidden:?} must be removed; got {dropped:?}"
+            );
+        }
+        for component in dropped.split(':') {
+            assert!(
+                !component.is_empty(),
+                "empty PATH components must be removed; got {dropped:?}"
+            );
+            assert!(
+                std::path::Path::new(component).is_absolute(),
+                "every surviving PATH component must be absolute; got {component:?} from {dropped:?}"
+            );
+        }
+    }
+
+    /// CB-008 (Codex iteration-5 high): a PATH component pointing inside
+    /// `work_root` must be removed even if it is absolute, so a hostile
+    /// `work_root/bin/python3` cannot hijack the runner. The sanitizer
+    /// removes the work_root-anchored component but keeps `/usr/bin`.
+    #[cfg(unix)]
+    #[test]
+    fn sanitize_path_for_runner_resolution_drops_work_root_anchored_components() {
+        let work = tempdir().expect("work");
+        let hostile_bin = work.path().join("bin");
+        std::fs::create_dir_all(&hostile_bin).unwrap();
+        let path = format!(
+            "{hostile_bin}:/usr/bin",
+            hostile_bin = hostile_bin.to_string_lossy()
+        );
+        let sanitized = sanitize_path_for_runner_resolution(&path, Some(work.path()));
+        for component in sanitized.split(':') {
+            assert!(
+                !std::path::Path::new(component).starts_with(work.path()),
+                "PATH component under work_root must be removed; got {component:?} from {sanitized:?}"
+            );
+        }
+        assert!(
+            sanitized.split(':').any(|c| c == "/usr/bin"),
+            "/usr/bin must survive sanitization when work_root is supplied; got {sanitized:?}"
+        );
+    }
+
+    /// CB-008 (Codex iteration-5 high, fail-closed): if the sanitized PATH
+    /// has zero usable components, `resolved_runner_program` MUST return
+    /// `None` (fail-closed) so the caller can surface a TransportError
+    /// rather than spawning with a bare runner name that the parent PATH
+    /// could then resolve to a hostile binary.
+    #[cfg(unix)]
+    #[test]
+    fn resolved_runner_program_fail_closed_returns_none_when_no_resolution() {
+        let owned = vec!["tests/test_a.py".to_string()];
+        let command = VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 command");
+        // A PATH made entirely of relative / empty components: every entry
+        // must be sanitized out. fail_closed must return None.
+        let result = command.resolved_runner_program_fail_closed(Some("relative:./also:"), None);
+        assert!(
+            result.is_none(),
+            "all-relative PATH must produce a fail-closed None; got {result:?}"
+        );
+    }
+
+    /// CB-008 (Codex iteration-5 high): CARGO_HOME / RUSTUP_HOME bins must
+    /// be allowed by the sanitizer. We just check they survive when
+    /// supplied as absolute paths; the toolchain root allowance is encoded
+    /// implicitly by absolute-path acceptance (no extra denylist).
+    #[cfg(unix)]
+    #[test]
+    fn sanitize_path_for_runner_resolution_keeps_absolute_toolchain_roots() {
+        let cargo_bin = "/Users/me/.cargo/bin";
+        let rustup_bin = "/Users/me/.rustup/bin";
+        let path = format!("{cargo_bin}:{rustup_bin}");
+        let sanitized = sanitize_path_for_runner_resolution(&path, None);
+        assert!(
+            sanitized.split(':').any(|c| c == cargo_bin),
+            "CARGO_HOME bin must survive sanitization; got {sanitized:?}"
+        );
+        assert!(
+            sanitized.split(':').any(|c| c == rustup_bin),
+            "RUSTUP_HOME bin must survive sanitization; got {sanitized:?}"
+        );
+    }
+
+    /// Phase B Task 7.1: `evaluate_pythonpath_for_hermetic_env` is a pure
+    /// function over (work_root, raw PYTHONPATH) — exercising it directly
+    /// avoids relying on the parent process's PYTHONPATH.
+    #[test]
+    fn evaluate_pythonpath_external_component_is_rejected() {
+        let work = tempdir().expect("work");
+        let (root, rejected) = evaluate_pythonpath_for_hermetic_env(
+            work.path(),
+            Some("/external/path:/another/external"),
+        );
+        assert!(
+            root.is_some(),
+            "PYTHONPATH presence must pin pythonpath_root to work_root"
+        );
+        assert!(
+            rejected.is_some(),
+            "external PYTHONPATH component must be flagged"
+        );
+    }
+
+    #[test]
+    fn evaluate_pythonpath_workspace_relative_is_accepted() {
+        let work = tempdir().expect("work");
+        let (root, rejected) = evaluate_pythonpath_for_hermetic_env(work.path(), Some("src:lib"));
+        assert!(root.is_some());
+        assert!(
+            rejected.is_none(),
+            "relative components must resolve under work_root without rejection"
+        );
+    }
+
+    #[test]
+    fn evaluate_pythonpath_empty_returns_none() {
+        let work = tempdir().expect("work");
+        let (root, rejected) = evaluate_pythonpath_for_hermetic_env(work.path(), None);
+        assert!(
+            root.is_none(),
+            "no PYTHONPATH must result in env_remove (None)"
+        );
+        assert!(rejected.is_none());
+        let (root_empty, rejected_empty) =
+            evaluate_pythonpath_for_hermetic_env(work.path(), Some(""));
+        assert!(root_empty.is_none());
+        assert!(rejected_empty.is_none());
+    }
+
+    /// CB-010 (Codex iteration-5 medium): use the platform's path separator
+    /// via `std::env::split_paths` rather than hard-coded `:` so callers on
+    /// Windows do not get drive letters (`C:`) split incorrectly. The pure
+    /// parser variant takes a `separator: char` so unit tests can drive
+    /// both POSIX (`:`) and Windows (`;`) cases deterministically.
+    #[test]
+    fn evaluate_pythonpath_with_separator_handles_unix_colon() {
+        let work = tempdir().expect("work");
+        let (root, rejected) = evaluate_pythonpath_with_separator(
+            work.path(),
+            Some("/external/path:/another/external"),
+            ':',
+        );
+        assert!(root.is_some());
+        assert!(
+            rejected.is_some(),
+            "POSIX colon-separated external PYTHONPATH must flag the first external component"
+        );
+    }
+
+    #[test]
+    fn evaluate_pythonpath_with_separator_does_not_split_drive_letter() {
+        let work = tempdir().expect("work");
+        // Two-component Windows-shape PYTHONPATH separated by `;`. With the
+        // CB-010 fix, the parser splits on `;` (NOT `:`), so the drive
+        // letter `C:` survives in the first component and the external
+        // POSIX path `/external/repo` is reachable as the second component
+        // and gets flagged. Pre-fix, the legacy parser split on `:` and
+        // would have produced spurious bare-letter components.
+        let (root, rejected) = evaluate_pythonpath_with_separator(
+            work.path(),
+            Some("C:\\projects\\inside;/external/repo"),
+            ';',
+        );
+        assert!(root.is_some());
+        assert!(
+            rejected.is_some(),
+            "Windows ';'-separated external POSIX component must still be flagged when the parser does not split on `:`"
+        );
+        let raw = rejected.unwrap();
+        // The flagged raw must be one of the real components — NOT a
+        // single bare letter caused by erroneous `:` splitting.
+        assert!(
+            raw.len() > 1,
+            "rejected raw must be a real path component, not a single-letter remnant of `:` splitting; got {raw:?}"
+        );
+    }
+
+    #[test]
+    fn evaluate_pythonpath_with_separator_handles_unix_trailing_colon() {
+        let work = tempdir().expect("work");
+        // Trailing `:` produces an empty component; it MUST be skipped without
+        // either flagging it as external or panicking.
+        let (root, rejected) =
+            evaluate_pythonpath_with_separator(work.path(), Some("src:lib:"), ':');
+        assert!(root.is_some());
+        assert!(rejected.is_none());
+    }
+
+    /// Phase B Task 7.2: post-execution import detection must signal an
+    /// external module path while ignoring known-safe toolchain caches.
+    #[test]
+    fn detect_external_imports_picks_up_python_import_error() {
+        let work = tempdir().expect("work");
+        // Make the external path appear in an ImportError-style line. The
+        // canonicalize fallback path keeps the comparison defensive even when
+        // the path does not physically exist.
+        let stderr = "ImportError: cannot import name 'X' from '/external/repo/app/main.py'";
+        let detected = detect_external_imports_in_output(work.path(), "", stderr);
+        assert!(
+            !detected.entries.is_empty(),
+            "external /external/repo/.. path must be detected; got {detected:?}"
+        );
+    }
+
+    #[test]
+    fn detect_external_imports_picks_up_import_error_parenthesized_path() {
+        let work = tempdir().expect("work");
+        let stderr =
+            "E   ImportError: cannot import name 'X' from 'app.main' (/external/repo/app/main.py)";
+        let detected = detect_external_imports_in_output(work.path(), "", stderr);
+        assert!(
+            !detected.entries.is_empty(),
+            "parenthesized ImportError path must be detected; got {detected:?}"
+        );
+    }
+
+    #[test]
+    fn python_package_marker_candidates_detects_local_namespace_package() {
+        let work = tempdir().expect("work");
+        std::fs::create_dir_all(work.path().join("app")).expect("app dir");
+        std::fs::write(work.path().join("app/main.py"), "x = 1\n").expect("main");
+        let stderr =
+            "E   ImportError: cannot import name 'X' from 'app.main' (/external/repo/app/main.py)";
+        let candidates =
+            python_package_marker_candidates_for_external_import(work.path(), "", stderr);
+        assert_eq!(candidates, vec!["app/__init__.py"]);
+    }
+
+    #[test]
+    fn python_package_marker_candidates_for_owned_test_imports_detects_app_import() {
+        let work = tempdir().expect("work");
+        std::fs::create_dir_all(work.path().join("app")).expect("app dir");
+        std::fs::write(work.path().join("app/main.py"), "x = 1\n").expect("main");
+        std::fs::create_dir_all(work.path().join("tests")).expect("tests dir");
+        std::fs::write(
+            work.path().join("tests/test_main.py"),
+            "from app.main import app\n",
+        )
+        .expect("test");
+        let candidates = python_package_marker_candidates_for_owned_test_imports(
+            work.path(),
+            &["tests/test_main.py".to_string()],
+        );
+        assert_eq!(candidates, vec!["app/__init__.py"]);
+    }
+
+    #[test]
+    fn python_package_marker_candidates_for_owned_test_imports_detects_nested_packages() {
+        let work = tempdir().expect("work");
+        std::fs::create_dir_all(work.path().join("src/app")).expect("src app dir");
+        std::fs::write(work.path().join("src/app/main.py"), "x = 1\n").expect("main");
+        std::fs::create_dir_all(work.path().join("tests")).expect("tests dir");
+        std::fs::write(
+            work.path().join("tests/test_main.py"),
+            "import src.app.main as subject\n",
+        )
+        .expect("test");
+        let candidates = python_package_marker_candidates_for_owned_test_imports(
+            work.path(),
+            &["tests/test_main.py".to_string()],
+        );
+        assert_eq!(candidates, vec!["src/__init__.py", "src/app/__init__.py"]);
+    }
+
+    #[test]
+    fn python_package_marker_candidates_skip_tests_and_existing_init() {
+        let work = tempdir().expect("work");
+        std::fs::create_dir_all(work.path().join("tests")).expect("tests dir");
+        std::fs::write(work.path().join("tests/test_main.py"), "x = 1\n").expect("test");
+        std::fs::create_dir_all(work.path().join("app")).expect("app dir");
+        std::fs::write(work.path().join("app/main.py"), "x = 1\n").expect("main");
+        std::fs::write(work.path().join("app/__init__.py"), "").expect("init");
+        let stderr = "ImportError: cannot import name 'X' from 'tests.test_main' (/external/tests/test_main.py)\n\
+             ImportError: cannot import name 'Y' from 'app.main' (/external/app/main.py)";
+        let candidates =
+            python_package_marker_candidates_for_external_import(work.path(), "", stderr);
+        assert!(
+            candidates.is_empty(),
+            "tests package and already-initialized app package must be skipped"
+        );
+    }
+
+    #[test]
+    fn detect_external_imports_ignores_cargo_home_cache() {
+        let work = tempdir().expect("work");
+        // CB-011: the safe-path filter requires the substring to actually be
+        // anchored to the resolved HOME. Use the live HOME (always set on
+        // POSIX and on macOS CI) so the test exercises the production code
+        // path; if HOME is unset, fall back to a literal `/root` prefix.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let stderr = format!(
+            "error[E0432]: unresolved import `serde` (looked at {home}/.cargo/registry/src/...)"
+        );
+        let detected = detect_external_imports_in_output(work.path(), "", &stderr);
+        assert!(
+            detected.entries.is_empty(),
+            "~/.cargo cache paths must NOT be flagged; got {detected:?}"
+        );
+    }
+
+    #[test]
+    fn detect_external_imports_ignores_pyenv_versions() {
+        let work = tempdir().expect("work");
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        let stderr = format!(
+            "ModuleNotFoundError: No module named 'foo' (sys.path=['{home}/.pyenv/versions/3.11.0/lib/python3.11/site-packages'])"
+        );
+        let detected = detect_external_imports_in_output(work.path(), "", &stderr);
+        assert!(
+            detected.entries.is_empty(),
+            "~/.pyenv/versions paths must NOT be flagged; got {detected:?}"
+        );
+    }
+
+    /// CB-011 (Codex iteration-5 medium): a substring filter on `/lib/python`
+    /// is too permissive — an external workspace `/tmp/other/lib/python/...`
+    /// must be flagged because it is NOT under a known cache root.
+    #[test]
+    fn detect_external_imports_flags_external_lib_python_outside_cache() {
+        let work = tempdir().expect("work");
+        let stderr = "ImportError: cannot import name 'X' from '/tmp/other/lib/python/app/main.py'";
+        let detected = detect_external_imports_in_output(work.path(), "", stderr);
+        assert!(
+            !detected.entries.is_empty(),
+            "external workspace /tmp/other/lib/python/... MUST be detected; got {detected:?}"
+        );
+    }
+
+    /// CB-011 (Codex iteration-5 medium): an arbitrary `target` component
+    /// outside of CARGO_TARGET_DIR / work_root MUST be detected; only
+    /// `<work_root>/target/...` or `$CARGO_TARGET_DIR/...` should be safe.
+    #[test]
+    fn detect_external_imports_flags_external_target_outside_work_root() {
+        let work = tempdir().expect("work");
+        let stderr = "ImportError: cannot import 'X' from '/tmp/target/app/main.py'";
+        let detected = detect_external_imports_in_output(work.path(), "", stderr);
+        assert!(
+            !detected.entries.is_empty(),
+            "external `target` component outside CARGO_TARGET_DIR / work_root MUST be detected; got {detected:?}"
+        );
+    }
+
+    #[test]
+    fn detect_external_imports_caps_detected_count() {
+        let work = tempdir().expect("work");
+        // Generate cap + 3 distinct external paths in stderr.
+        let mut stderr = String::new();
+        for i in 0..(EXTERNAL_IMPORT_DETECTED_CAP + 3) {
+            stderr.push_str(&format!(
+                "ImportError: cannot import X from '/external/path_{i}/mod.py'\n"
+            ));
+        }
+        let detected = detect_external_imports_in_output(work.path(), "", &stderr);
+        assert_eq!(detected.entries.len(), EXTERNAL_IMPORT_DETECTED_CAP);
+    }
+
+    /// CB-009 (Codex iteration-5 medium): `DetectedExternalImports.total_count`
+    /// MUST reflect the pre-cap total even when the per-emit cap drops
+    /// excess entries. `truncated` reflects total > cap.
+    #[test]
+    fn detect_external_imports_total_count_preserves_pre_cap_count() {
+        let work = tempdir().expect("work");
+        let excess = EXTERNAL_IMPORT_DETECTED_CAP + 3;
+        let mut stderr = String::new();
+        for i in 0..excess {
+            stderr.push_str(&format!(
+                "ImportError: cannot import X from '/external/path_{i}/mod.py'\n"
+            ));
+        }
+        let detected = detect_external_imports_in_output(work.path(), "", &stderr);
+        assert_eq!(detected.entries.len(), EXTERNAL_IMPORT_DETECTED_CAP);
+        assert_eq!(detected.total_count, excess);
+        assert!(detected.truncated);
+    }
+
+    /// CB-009 (Codex iteration-5 medium): exactly-at-cap input MUST NOT
+    /// set `truncated=true`. truncated only flips when total_count > cap.
+    #[test]
+    fn detect_external_imports_at_cap_is_not_truncated() {
+        let work = tempdir().expect("work");
+        let mut stderr = String::new();
+        for i in 0..EXTERNAL_IMPORT_DETECTED_CAP {
+            stderr.push_str(&format!(
+                "ImportError: cannot import X from '/external/path_{i}/mod.py'\n"
+            ));
+        }
+        let detected = detect_external_imports_in_output(work.path(), "", &stderr);
+        assert_eq!(detected.entries.len(), EXTERNAL_IMPORT_DETECTED_CAP);
+        assert_eq!(detected.total_count, EXTERNAL_IMPORT_DETECTED_CAP);
+        assert!(
+            !detected.truncated,
+            "exactly-at-cap input MUST NOT set truncated=true"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Issue #661 iteration-4 Task 2.5: VerifierInvokedSnapshot
+    // - runner: RunnerKind (string でない、DR4-004 security gate)
+    // - bound_artifacts: Vec<PathHashHex> (raw path 漏洩を型でブロック)
+    // - bound_artifacts_truncated: true when len > VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP
+    // - bound_test_artifacts_count: pre-cap full count
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn verifier_invoked_snapshot_maps_cargo_runner_to_runnerkind_cargo() {
+        let work = tempdir().expect("work");
+        let owned = vec!["tests/test_a.rs".to_string()];
+        let command = VerifierCommand::from_cargo_test(Vec::new(), &owned).expect("cargo");
+        let env_plan = build_hermetic_env_plan(work.path(), &[]);
+        let snapshot = VerifierInvokedSnapshot::from_command_and_env(&command, &env_plan)
+            .expect("cargo runner must map to RunnerKind::Cargo");
+        assert_eq!(snapshot.runner, RunnerKind::Cargo);
+        assert_eq!(snapshot.runner.as_str(), "cargo");
+        assert_eq!(snapshot.bound_test_artifacts_count, 1);
+        assert!(!snapshot.bound_artifacts_truncated);
+        assert_eq!(snapshot.bound_artifacts.len(), 1);
+    }
+
+    #[test]
+    fn verifier_invoked_snapshot_maps_python3_runner_to_runnerkind_python3() {
+        let work = tempdir().expect("work");
+        let owned = vec!["app/tests/test_a.py".to_string()];
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 stdlib pytest");
+        let env_plan = build_hermetic_env_plan(work.path(), &[]);
+        let snapshot = VerifierInvokedSnapshot::from_command_and_env(&command, &env_plan)
+            .expect("python3 runner must map to RunnerKind::Python3");
+        assert_eq!(snapshot.runner, RunnerKind::Python3);
+        assert_eq!(snapshot.runner.as_str(), "python3");
+        assert_eq!(snapshot.bound_test_artifacts_count, 1);
+        assert!(!snapshot.bound_artifacts_truncated);
+        // bound_artifacts must reuse the PathHashHex SSOT (`mask_secrets` +
+        // `crate::logging::stable_path_hash`).
+        let expected = crate::logging::stable_path_hash(&crate::session::feedback::mask_secrets(
+            "app/tests/test_a.py",
+        ));
+        assert_eq!(snapshot.bound_artifacts[0].as_str(), expected);
+    }
+
+    #[test]
+    fn verifier_invoked_snapshot_maps_npm_runner_to_runnerkind_npm() {
+        let work = tempdir().expect("work");
+        let owned = vec!["tests/index.test.js".to_string()];
+        let command = VerifierCommand::from_npm_test(&owned).expect("npm test");
+        let env_plan = build_hermetic_env_plan(work.path(), &[]);
+        let snapshot = VerifierInvokedSnapshot::from_command_and_env(&command, &env_plan)
+            .expect("npm runner must map to RunnerKind::Npm");
+        assert_eq!(snapshot.runner, RunnerKind::Npm);
+        assert_eq!(snapshot.runner.as_str(), "npm");
+        assert_eq!(snapshot.bound_test_artifacts_count, 1);
+    }
+
+    #[test]
+    fn verifier_invoked_snapshot_returns_none_for_unknown_runner() {
+        // DR4-004 security gate: an unknown runner string (e.g. `pytest`
+        // bare — production never produces this, but unit tests do) must
+        // NOT yield a VerifierInvokedSnapshot. The event emit site can
+        // then skip emitting rather than synthesize a label that bypasses
+        // the closed `RunnerKind` set.
+        let work = tempdir().expect("work");
+        let owned = vec!["app/tests/test_a.py".to_string()];
+        let command = VerifierCommand::from_pytest(Vec::new(), &owned).expect("pytest");
+        let env_plan = build_hermetic_env_plan(work.path(), &[]);
+        let snapshot = VerifierInvokedSnapshot::from_command_and_env(&command, &env_plan);
+        assert!(
+            snapshot.is_none(),
+            "bare `pytest` runner has no RunnerKind variant — snapshot must be None"
+        );
+    }
+
+    #[test]
+    fn verifier_invoked_snapshot_truncates_bound_artifacts_above_cap() {
+        // Generate `VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP + 3` owned test
+        // paths and assert bound_artifacts is capped while
+        // bound_test_artifacts_count keeps the full pre-cap count.
+        let work = tempdir().expect("work");
+        let owned: Vec<String> = (0..(VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP + 3))
+            .map(|i| format!("app/tests/test_{i}.py"))
+            .collect();
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 stdlib pytest");
+        let env_plan = build_hermetic_env_plan(work.path(), &[]);
+        let snapshot = VerifierInvokedSnapshot::from_command_and_env(&command, &env_plan)
+            .expect("python3 runner");
+        assert_eq!(snapshot.bound_test_artifacts_count, owned.len());
+        assert_eq!(
+            snapshot.bound_artifacts.len(),
+            VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP,
+            "bound_artifacts must be capped at VERIFIER_INVOKED_BOUND_ARTIFACTS_CAP entries"
+        );
+        assert!(
+            snapshot.bound_artifacts_truncated,
+            "bound_artifacts_truncated must be true when count > cap"
+        );
+    }
+
+    #[test]
+    fn verifier_invoked_snapshot_phase_b_env_summary_observable_values() {
+        let work = tempdir().expect("work");
+        let owned = vec!["app/tests/test_a.py".to_string()];
+        let command =
+            VerifierCommand::from_python3_pytest_stdlib(&owned).expect("python3 stdlib pytest");
+        let env_plan = build_hermetic_env_plan(work.path(), &[]);
+        let snapshot = VerifierInvokedSnapshot::from_command_and_env(&command, &env_plan)
+            .expect("python3 runner");
+        // Phase B invariant: env_clear + allowlist re-inject populates
+        // `allowlist_keys` with the real filter_env_for_tester outcome.
+        // PATH should always be present.
+        assert!(
+            snapshot.env_summary.allowlist_keys.contains(&"PATH"),
+            "Phase B: snapshot.env_summary.allowlist_keys must include PATH"
+        );
+        assert!(snapshot.env_summary.cwd_inside_work_root);
+    }
+
+    #[test]
+    fn runner_kind_from_runner_str_maps_known_runners() {
+        assert_eq!(
+            RunnerKind::from_runner_str("cargo"),
+            Some(RunnerKind::Cargo)
+        );
+        assert_eq!(
+            RunnerKind::from_runner_str("python3"),
+            Some(RunnerKind::Python3)
+        );
+        assert_eq!(RunnerKind::from_runner_str("npm"), Some(RunnerKind::Npm));
+        // Unknown / future runners MUST return None so they cannot reach
+        // the `agent.verifier.invoked` payload without an explicit
+        // `RunnerKind` variant + constructor + validator (DR4-004).
+        assert!(RunnerKind::from_runner_str("pytest").is_none());
+        assert!(RunnerKind::from_runner_str("").is_none());
     }
 }

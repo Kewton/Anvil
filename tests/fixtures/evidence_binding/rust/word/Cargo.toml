@@ -1,0 +1,11 @@
+# Issue #989 fixture: Rust executable-handle binding mismatch (word counter).
+#
+# Read-only fixture data — NOT a workspace member (excluded via
+# `[workspace] exclude = ["tests/fixtures"]`). The package/default bin is
+# `wordcount`, but `tests/word.rs` references `CARGO_BIN_EXE_word_counter`, so
+# the binary handle does not bind.
+[package]
+name = "wordcount"
+version = "0.1.0"
+edition = "2021"
+publish = false

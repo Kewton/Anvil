@@ -10,6 +10,8 @@ struct RequestOptions {
     temperature: f32,
     num_ctx: usize,
     num_predict: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -50,6 +52,8 @@ struct ChatRequest<'a> {
     think: bool,
     keep_alive: i32,
     options: RequestOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ChatToolDefinition>>,
 }
@@ -102,16 +106,18 @@ impl<'a> GenerateTransport<'a> {
             temperature,
             num_ctx: self.context_window,
             num_predict: self.max_predict,
+            seed: bench_seed_from_env(),
         }
     }
 
-    pub(crate) fn send_chat_request(
+    pub(crate) fn send_chat_request_with_format(
         &self,
         model: &str,
         messages: &[ConversationMessage],
         tools: &[ToolSpec],
         stream: bool,
         temperature: f32,
+        response_format: Option<&str>,
     ) -> Result<Response, reqwest::Error> {
         let request = ChatRequest {
             model,
@@ -120,6 +126,7 @@ impl<'a> GenerateTransport<'a> {
             think: false,
             keep_alive: -1,
             options: self.request_options(temperature),
+            format: response_format,
             tools: (!tools.is_empty()).then(|| to_chat_tool_definitions(tools)),
         };
         self.http
@@ -127,6 +134,12 @@ impl<'a> GenerateTransport<'a> {
             .json(&request)
             .send()
     }
+}
+
+fn bench_seed_from_env() -> Option<u64> {
+    std::env::var("ANVIL_BENCH_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 fn to_chat_messages(messages: &[ConversationMessage]) -> Vec<ChatMessage> {
@@ -173,12 +186,58 @@ pub fn should_use_native_tool_calls(model: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::should_use_native_tool_calls;
+    use super::{RequestOptions, bench_seed_from_env, should_use_native_tool_calls};
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn native_tool_allowlist_is_narrow() {
         assert!(should_use_native_tool_calls("qwen3.6:27b-coding-nvfp4"));
         assert!(!should_use_native_tool_calls("qwen3.5:122b"));
         assert!(!should_use_native_tool_calls("qwen3.5:9b"));
+    }
+
+    #[test]
+    fn bench_seed_is_read_only_from_explicit_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("ANVIL_BENCH_SEED");
+        }
+        assert_eq!(bench_seed_from_env(), None);
+
+        unsafe {
+            std::env::set_var("ANVIL_BENCH_SEED", "12345");
+        }
+        assert_eq!(bench_seed_from_env(), Some(12_345));
+
+        unsafe {
+            std::env::set_var("ANVIL_BENCH_SEED", "not-a-number");
+        }
+        assert_eq!(bench_seed_from_env(), None);
+
+        unsafe {
+            std::env::remove_var("ANVIL_BENCH_SEED");
+        }
+    }
+
+    #[test]
+    fn request_options_serialize_seed_only_when_present() {
+        let seeded = serde_json::to_value(RequestOptions {
+            temperature: 0.3,
+            num_ctx: 24_000,
+            num_predict: 2_048,
+            seed: Some(42),
+        })
+        .unwrap();
+        assert_eq!(seeded["seed"], 42);
+
+        let unseeded = serde_json::to_value(RequestOptions {
+            temperature: 0.3,
+            num_ctx: 24_000,
+            num_predict: 2_048,
+            seed: None,
+        })
+        .unwrap();
+        assert!(unseeded.get("seed").is_none());
     }
 }

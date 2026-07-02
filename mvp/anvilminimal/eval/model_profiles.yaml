@@ -1,0 +1,84 @@
+profiles:
+  speed-cloud:
+    description: Cloud-only speed profile. No local LLM is used.
+    parallel: true
+    provider_limit: 2
+    chat_retries: 2
+    runs:
+      - main: openai:gpt-5.4-mini
+        planner: gemini:gemini-3.5-flash
+      - main: gemini:gemini-3.1-flash-lite
+        planner: openai:gpt-5.4-mini
+  speed-cloud-5x:
+    description: Cloud-only high-throughput profile. No local LLM is used; provider lanes default to 5.
+    parallel: true
+    provider_limit: 5
+    chat_retries: 2
+    runs:
+      - main: openai:gpt-5.4-mini
+        planner: gemini:gemini-3.5-flash
+      - main: gemini:gemini-3.1-flash-lite
+        planner: openai:gpt-5.4-mini
+  openai-only:
+    parallel: true
+    provider_limit: 2
+    runs:
+      - main: openai:gpt-5.4-mini
+        planner: openai:gpt-5.4-mini
+  gemini-only:
+    parallel: true
+    provider_limit: 2
+    runs:
+      - main: gemini:gemini-3.1-flash-lite
+        planner: gemini:gemini-3.5-flash
+  openai-main-gemini-plan:
+    parallel: true
+    provider_limit: 2
+    runs:
+      - main: openai:gpt-5.4-mini
+        planner: gemini:gemini-3.5-flash
+  gemini-main-openai-plan:
+    parallel: true
+    provider_limit: 2
+    runs:
+      - main: gemini:gemini-3.1-flash-lite
+        planner: openai:gpt-5.4-mini
+  local-only:
+    serial: true
+    runs:
+      - main: ollama:qwen3.6:27b-coding-nvfp4
+        planner: ollama:qwen3.6:27b-coding-nvfp4
+  local-main-gemini-plan:
+    serial: true
+    runs:
+      - main: ollama:qwen3.6:27b-coding-nvfp4
+        planner: gemini:gemini-3.5-flash
+  local-main-openai-plan:
+    serial: true
+    runs:
+      - main: ollama:qwen3.6:27b-coding-nvfp4
+        planner: openai:gpt-5.4-mini
+  openai-main-local-plan:
+    serial: true
+    runs:
+      - main: openai:gpt-5.4-mini
+        planner: ollama:qwen3.6:27b-coding-nvfp4
+  gemini-main-local-plan:
+    serial: true
+    runs:
+      - main: gemini:gemini-3.1-flash-lite
+        planner: ollama:qwen3.6:27b-coding-nvfp4
+  full:
+    parallel: true
+    provider_limit: 2
+    runs:
+      - main: openai:gpt-5.4-mini
+        planner: openai:gpt-5.4-mini
+      - main: gemini:gemini-3.1-flash-lite
+        planner: gemini:gemini-3.5-flash
+      - main: openai:gpt-5.4-mini
+        planner: gemini:gemini-3.5-flash
+      - main: gemini:gemini-3.1-flash-lite
+        planner: openai:gpt-5.4-mini
+      - main: ollama:qwen3.6:27b-coding-nvfp4
+        planner: ollama:qwen3.6:27b-coding-nvfp4

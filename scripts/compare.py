@@ -39,13 +39,14 @@ from typing import Any, Callable, Literal
 SCHEMA_VERSION = 1
 DEFAULT_THRESHOLD_PCT = 0.05  # continuous metrics: relative-delta threshold (5%)
 DEFAULT_THRESHOLD_ABS = 0.05  # bool_rate metrics: absolute-delta threshold (5pt)
-MAX_RUNS = 100  # DoS guard
+MAX_RUNS = 500  # DoS guard; supports 20-30 scenarios x 5 runs x engine matrices.
 MIN_VALID_RUNS = 3  # below this -> exit 3
 ALPHA = 0.05  # 95% CI
 UMASK = 0o077
 
 # metric-name aliases -> canonical metric key
 ALIASES: dict[str, str] = {
+    "postcheck": "postcheck_success",
     "rc0": "rc",
     "page_game": "page_tsx_has_game_keywords",
 }
@@ -53,6 +54,7 @@ ALIASES: dict[str, str] = {
 # canonical key -> aggregation spec
 METRIC_TYPE_SPEC: dict[str, dict[str, Any]] = {
     "rc": {"type": "bool_rate", "direction": "up"},
+    "postcheck_success": {"type": "bool_rate", "direction": "up"},
     "page_tsx_has_game_keywords": {"type": "bool_rate", "direction": "up"},
     "we_total": {"type": "informational", "direction": None},
     "elapsed_s": {"type": "continuous", "direction": "down"},
@@ -104,6 +106,7 @@ class CompareResult:
     generated_at: str
     threshold: float
     metrics: dict[str, MetricResult] = field(default_factory=dict)
+    failure_categories: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -214,39 +217,87 @@ def _find_model_slug(baseline: Path, experiment: Path) -> str:
     return b_slug
 
 
+def _find_single_model_slug(root: Path) -> str:
+    try:
+        entries = [p for p in sorted(root.iterdir()) if p.is_dir() and not p.is_symlink()]
+    except OSError as e:
+        _die(f"bench root listing failed: {e}", 1)
+        raise
+    slugs = [p.name for p in entries]
+    if len(slugs) == 0:
+        _die(f"BENCH_ROOT contains no model_slug directory: {root}", 1)
+    if len(slugs) > 1:
+        _die(
+            f"BENCH_ROOT contains multiple model_slug directories "
+            f"({', '.join(slugs)}); engine comparison supports a single slug only",
+            1,
+        )
+    return slugs[0]
+
+
 def _collect_run_dirs(root: Path, slug: str) -> list[Path]:
     """Collect run-* directories under root/<slug>/.
 
     - symlinks are skipped (with a warning)
     - if resulting count > MAX_RUNS -> exit 1 (security)
+    - supports both flat model/run-N and nested model/case/pam/run-N layouts
     """
     slug_dir = root / slug
     runs: list[Path] = []
-    try:
-        entries = sorted(slug_dir.iterdir())
-    except OSError as e:
-        _die(f"cannot list {slug_dir}: {e}", 2)
-        raise  # unreachable
-    for p in entries:
+
+    def _append_if_run(p: Path) -> None:
         if not p.name.startswith("run-"):
-            continue
-        # require "run-<digits>" to avoid matching arbitrary run-abc dirs
+            return
         suffix = p.name[len("run-") :]
         if not suffix.isdigit():
             _warn(f"skipping non-numeric run-dir: {p}")
-            continue
+            return
         if p.is_symlink():
             _warn(f"skipping symlink run-dir: {p}")
-            continue
+            return
         if not p.is_dir():
-            continue
+            return
         runs.append(p)
+
+    def _walk(p: Path, depth: int) -> None:
+        if depth > 5:
+            return
+        try:
+            entries = sorted(p.iterdir())
+        except OSError as e:
+            _warn(f"cannot list {p}: {e}")
+            return
+        for child in entries:
+            if child.name.startswith("run-"):
+                _append_if_run(child)
+                continue
+            if child.is_symlink() or not child.is_dir():
+                continue
+            _walk(child, depth + 1)
+
+    _walk(slug_dir, 0)
     if len(runs) > MAX_RUNS:
         _die(
             f"run-dir count {len(runs)} exceeds MAX_RUNS={MAX_RUNS} for {slug_dir}",
             1,
         )
     return runs
+
+
+def _failure_category_counts(runs: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for run in runs:
+        category = run.get("generic_terminal_state")
+        if not isinstance(category, str) or not category:
+            observation = run.get("failure_observation")
+            if isinstance(observation, dict):
+                raw = observation.get("failure_class")
+                if isinstance(raw, str) and raw:
+                    category = raw
+        if not isinstance(category, str) or not category:
+            category = "unknown"
+        counts[category] = counts.get(category, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _now() -> str:
@@ -424,6 +475,13 @@ def _analyze_one(
         _warn(f"analyze_run.py spawn failed for {run_dir}: {e}")
         return None
     if result.returncode != 0:
+        fallback = _analyze_meta_only(run_dir)
+        if fallback is not None:
+            _warn(
+                f"analyze_run.py rc={result.returncode} for {run_dir}; "
+                "using meta.json fallback"
+            )
+            return fallback
         _warn(
             f"analyze_run.py rc={result.returncode} for {run_dir}: "
             f"{(result.stderr or '').strip()}"
@@ -442,6 +500,56 @@ def _analyze_one(
         _warn(f"analyze_run.py schema_version={sv} for {run_dir}, skipping")
         return None
     return data
+
+
+def _analyze_meta_only(run_dir: Path) -> dict[str, Any] | None:
+    """Build minimal comparable metrics from run-dir/meta.json.
+
+    Some failed Anvil runs exit before a session.json is copied. Those runs are
+    still valid benchmark failures and must count toward rc / elapsed /
+    postcheck rates.
+    """
+    meta_path = run_dir / "meta.json"
+    if not _is_regular_file(meta_path):
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+
+    rc = meta.get("rc")
+    elapsed_s = meta.get("elapsed_s")
+    success = meta.get("success_check_success")
+    failure_kind = meta.get("failure_kind")
+    failure_class = failure_kind if isinstance(failure_kind, str) and failure_kind else "run_error"
+    terminal_state = "completed" if rc == 0 else "failed"
+
+    return {
+        "schema_version": 1,
+        "run_id": run_dir.name,
+        "rc": rc,
+        "elapsed_s": elapsed_s,
+        "iter_count": None,
+        "error_500_count": 0,
+        "we_total": 0,
+        "postcheck_success": success,
+        "postcheck_reason": meta.get("success_check_reason"),
+        "success_check_success": success,
+        "success_check_reason": meta.get("success_check_reason"),
+        "engine": meta.get("engine"),
+        "task_kind": meta.get("task_kind"),
+        "pam_variant": meta.get("pam_variant"),
+        "failure_kind": failure_kind,
+        "generic_terminal_state": terminal_state,
+        "failure_observation": {
+            "failure_class": failure_class,
+            "terminal_state": terminal_state,
+            "postcheck_success": success,
+        },
+        "page_tsx_has_game_keywords": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +809,18 @@ def _render_markdown(result: CompareResult) -> str:
         lines.append(
             f"| {key} | {b_cell} | {e_cell} | {delta_s} | {dp_s} | {verdict_s} |"
         )
+    if result.failure_categories:
+        lines.append("")
+        lines.append("## failure categories")
+        lines.append("")
+        lines.append("| category | baseline | experiment |")
+        lines.append("|---|---:|---:|")
+        baseline_counts = result.failure_categories.get("baseline", {})
+        experiment_counts = result.failure_categories.get("experiment", {})
+        for category in sorted(set(baseline_counts) | set(experiment_counts)):
+            lines.append(
+                f"| {category} | {baseline_counts.get(category, 0)} | {experiment_counts.get(category, 0)} |"
+            )
     lines.append("")
     return "\n".join(lines)
 
@@ -733,6 +853,7 @@ def _render_json(result: CompareResult) -> str:
         "generated_at": result.generated_at,
         "threshold": result.threshold,
         "metrics": {k: _mr_to_json(v) for k, v in sorted(result.metrics.items())},
+        "failure_categories": result.failure_categories,
     }
     return json.dumps(out, sort_keys=True, ensure_ascii=False, indent=2) + "\n"
 
@@ -747,8 +868,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         prog="compare.py",
         description="A/B comparison of two bench BENCH_ROOTs.",
     )
-    parser.add_argument("baseline_dir", help="baseline BENCH_ROOT")
-    parser.add_argument("experiment_dir", help="experiment BENCH_ROOT")
+    parser.add_argument("baseline_dir", help="baseline BENCH_ROOT, or BENCH_ROOT with --engines")
+    parser.add_argument("experiment_dir", nargs="?", help="experiment BENCH_ROOT")
     parser.add_argument(
         "--metric",
         default=None,
@@ -766,6 +887,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_THRESHOLD_PCT,
         help="delta threshold (default: 0.05)",
     )
+    parser.add_argument(
+        "--engines",
+        default=None,
+        help="compare two engines within one BENCH_ROOT, e.g. legacy,minimal",
+    )
     return parser.parse_args(argv)
 
 
@@ -779,6 +905,67 @@ def main(argv: list[str]) -> int:
     analyze_path = _resolve_analyze_run_path()
 
     baseline_dir = _validate_input(Path(ns.baseline_dir))
+
+    if ns.engines:
+        if ns.experiment_dir is not None:
+            _die("--engines mode accepts exactly one BENCH_ROOT positional argument", 1)
+        raw_engines = [e.strip() for e in ns.engines.split(",") if e.strip()]
+        if len(raw_engines) != 2:
+            _die("--engines must contain exactly two engine names", 1)
+        baseline_engine, experiment_engine = raw_engines
+        slug = _find_single_model_slug(baseline_dir)
+        run_dirs = _collect_run_dirs(baseline_dir, slug)
+        if len(run_dirs) == 0:
+            _die(f"zero run-dirs for slug={slug!r}", 2)
+
+        grouped: dict[str, list[dict[str, Any]]] = {
+            baseline_engine: [],
+            experiment_engine: [],
+        }
+        for rd in run_dirs:
+            analyzed = _analyze_one(rd, analyze_path)
+            if analyzed is None:
+                continue
+            engine = analyzed.get("engine")
+            if engine in grouped:
+                grouped[engine].append(analyzed)
+
+        b_filtered = _filter_runs(grouped[baseline_engine])
+        e_filtered = _filter_runs(grouped[experiment_engine])
+        if len(b_filtered) < MIN_VALID_RUNS or len(e_filtered) < MIN_VALID_RUNS:
+            _die(
+                f"insufficient valid runs "
+                f"({baseline_engine}={len(b_filtered)}, {experiment_engine}={len(e_filtered)}; "
+                f"MIN_VALID_RUNS={MIN_VALID_RUNS})",
+                3,
+            )
+
+        metric_list = _resolve_metric_keys(
+            [s for s in (ns.metric or "").split(",") if s.strip()] if ns.metric else None
+        )
+        metrics = _compare(b_filtered, e_filtered, metric_list, ns.threshold)
+        result = CompareResult(
+            schema_version=SCHEMA_VERSION,
+            baseline_dir=baseline_dir,
+            experiment_dir=baseline_dir,
+            model_slug=f"{slug}:{baseline_engine}->{experiment_engine}",
+            generated_at=_now(),
+            threshold=ns.threshold,
+            metrics=metrics,
+            failure_categories={
+                "baseline": _failure_category_counts(b_filtered),
+                "experiment": _failure_category_counts(e_filtered),
+            },
+        )
+        if ns.format == "json":
+            sys.stdout.write(_render_json(result))
+        else:
+            sys.stdout.write(_render_markdown(result))
+        return 0
+
+    if ns.experiment_dir is None:
+        _die("experiment_dir is required unless --engines is used", 1)
+
     experiment_dir = _validate_input(Path(ns.experiment_dir))
 
     slug = _find_model_slug(baseline_dir, experiment_dir)
@@ -829,6 +1016,10 @@ def main(argv: list[str]) -> int:
         generated_at=_now(),
         threshold=ns.threshold,
         metrics=metrics,
+        failure_categories={
+            "baseline": _failure_category_counts(b_filtered),
+            "experiment": _failure_category_counts(e_filtered),
+        },
     )
 
     if ns.format == "json":

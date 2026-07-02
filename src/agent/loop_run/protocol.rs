@@ -4,15 +4,19 @@ use crate::util::file_classify::{is_setup_file, is_test_file};
 
 use super::completion_evidence::{CompletionEvidence, EvidenceSet, RepoEditCategory};
 use super::summary::LoopStats;
+use super::task_contract::{
+    ArtifactRole, CompletionPolicy, CompletionProjectIntent, TaskContract, TaskKind,
+};
 
 /// Issue #607: judgment context extracted from the active request text.
 /// Bundled in a struct (instead of two bool params) so future flags
 /// (`request_is_docs_only`, `request_is_bench_only`, …) can be added with
 /// a field append rather than a breaking signature change (DR1-003 OCP).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct RequestContext {
     pub requires_tests: bool,
     pub is_env_setup_only: bool,
+    pub completion_policy: CompletionPolicy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +24,7 @@ pub(super) enum ProtocolKind {
     TypeScriptUi,
     Python,
     Docs,
+    Data,
     AnswerOnly,
     GenericCode,
 }
@@ -33,6 +38,7 @@ impl ProtocolKind {
             ProtocolKind::Python => "python",
             ProtocolKind::TypeScriptUi => "typescript_ui",
             ProtocolKind::Docs => "docs",
+            ProtocolKind::Data => "data",
             ProtocolKind::AnswerOnly => "answer_only",
             ProtocolKind::GenericCode => "generic_code",
         }
@@ -91,6 +97,9 @@ impl ProtocolKind {
                     ..
                 },
             ) => true,
+            (ProtocolKind::Docs, CompletionEvidence::RequiredSectionsPass { .. }) => true,
+            (ProtocolKind::Docs, CompletionEvidence::ReportCompletenessPass { .. }) => true,
+            (ProtocolKind::Data, CompletionEvidence::StructuredDataPass { .. }) => true,
             _ => false,
         }
     }
@@ -118,12 +127,17 @@ impl ProtocolKind {
         set: &EvidenceSet,
         ctx: &RequestContext,
     ) -> bool {
-        // Repo-edit / AnswerOnly evidence retain their context-free semantics.
+        // Repo-edit / AnswerOnly evidence are judged through the
+        // request-derived completion policy. This keeps docs-only,
+        // artifact-only, impl+test, and impl-without-test completion
+        // semantics in one place instead of spreading them across
+        // WorkMode-specific protocol branches.
         let has_non_env_setup_evidence = set.iter().any(|ev| match ev {
             CompletionEvidence::VerifierExitZero { class, .. } => {
-                *class != BashCommandClass::EnvSetup && self.accepts(ev)
+                *class != BashCommandClass::EnvSetup
+                    && self.accepts_request_policy_evidence(&ctx.completion_policy, ev)
             }
-            _ => self.accepts(ev),
+            _ => self.accepts_request_policy_evidence(&ctx.completion_policy, ev),
         });
         if has_non_env_setup_evidence {
             return true;
@@ -152,6 +166,49 @@ impl ProtocolKind {
             self,
             ProtocolKind::Python | ProtocolKind::TypeScriptUi | ProtocolKind::GenericCode
         )
+    }
+
+    fn accepts_request_policy_evidence(
+        self,
+        policy: &CompletionPolicy,
+        evidence: &CompletionEvidence,
+    ) -> bool {
+        if !policy.accepts_evidence(evidence) {
+            return false;
+        }
+        match self {
+            ProtocolKind::Docs => {
+                // Issue #919 (§3.4 / OR-6): admit multi-role Authoring
+                // (ArtifactOnly) but ONLY for docs-shaped passes
+                // (`RequiredSectionsPass`/`ReportCompletenessPass`), so a
+                // non-docs ArtifactOnly evidence (e.g. `StructuredDataPass`) that
+                // somehow reached the Docs protocol is NOT newly admitted. The
+                // dominant single-role docs case stays DocsOnly (unchanged).
+                self.accepts(evidence)
+                    && (policy.project_intent
+                        == super::task_contract::CompletionProjectIntent::DocsOnly
+                        || (policy.project_intent
+                            == super::task_contract::CompletionProjectIntent::ArtifactOnly
+                            && matches!(
+                                evidence,
+                                CompletionEvidence::RequiredSectionsPass { .. }
+                                    | CompletionEvidence::ReportCompletenessPass { .. }
+                            )))
+            }
+            ProtocolKind::Data => matches!(evidence, CompletionEvidence::StructuredDataPass { .. }),
+            ProtocolKind::AnswerOnly => {
+                matches!(
+                    evidence,
+                    CompletionEvidence::VerifierExitZero {
+                        class: BashCommandClass::BuildTest,
+                        ..
+                    }
+                ) || (policy.project_intent
+                    == super::task_contract::CompletionProjectIntent::AnswerOnly
+                    && self.accepts(evidence))
+            }
+            ProtocolKind::Python | ProtocolKind::TypeScriptUi | ProtocolKind::GenericCode => true,
+        }
     }
 
     /// Issue #607: context-aware missing-shapes report. When tests/code are
@@ -280,10 +337,19 @@ impl ProtocolKind {
                         CompletionEvidence::RepoEdit {
                             category: RepoEditCategory::Docs,
                             ..
-                        }
+                        } | CompletionEvidence::RequiredSectionsPass { .. }
+                            | CompletionEvidence::ReportCompletenessPass { .. }
                     )
                 }) {
-                    missing.push("repo_edit_docs");
+                    missing.push("repo_edit_docs_or_deliverable_pass");
+                }
+            }
+            ProtocolKind::Data => {
+                if !set
+                    .iter()
+                    .any(|ev| matches!(ev, CompletionEvidence::StructuredDataPass { .. }))
+                {
+                    missing.push("structured_data_pass");
                 }
             }
         }
@@ -334,6 +400,18 @@ impl ExecutionProtocol {
             WorkMode::Auto | WorkMode::GenericCode | WorkMode::Unknown => ProtocolKind::GenericCode,
         };
         Self { kind }
+    }
+
+    pub(super) fn from_work_mode_with_contract(
+        mode: WorkMode,
+        contract: Option<&TaskContract>,
+    ) -> Self {
+        if let Some(contract) = contract {
+            return Self {
+                kind: protocol_kind_from_contract(mode, contract),
+            };
+        }
+        Self::from_work_mode(mode)
     }
 
     #[allow(dead_code)] // Issue #466: 一時的に call site が VerifierSkill 経由になり
@@ -394,6 +472,7 @@ impl ExecutionProtocol {
                 &evidence,
                 "docs protocol requires a documentation artifact",
             ),
+            ProtocolKind::Data => Some("data protocol requires structured data validation".into()),
             ProtocolKind::Python => {
                 if let Some(issue) = requested_path_issue(&evidence) {
                     return Some(issue);
@@ -449,6 +528,9 @@ impl ExecutionProtocol {
             ProtocolKind::Docs => relevant_docs_suffix(stats, &[".md", ".mdx", ".txt", ".rst"])
                 .map(|reason| (true, Some(reason)))
                 .unwrap_or((false, None)),
+            ProtocolKind::Data => relevant_suffix(stats, &[".csv", ".json", ".jsonl", ".tsv"])
+                .map(|reason| (true, Some(reason)))
+                .unwrap_or((false, None)),
             ProtocolKind::Python => {
                 if stats.changed_impl_count > 0 {
                     (true, Some("impl_file_category"))
@@ -488,6 +570,29 @@ impl ExecutionProtocol {
             deterministic_only,
             total_changed: stats.total_changed,
         }
+    }
+}
+
+fn protocol_kind_from_contract(mode: WorkMode, contract: &TaskContract) -> ProtocolKind {
+    if contract.completion_policy.project_intent == CompletionProjectIntent::AnswerOnly {
+        return ProtocolKind::AnswerOnly;
+    }
+    match contract.task_kind {
+        TaskKind::Coding => match mode {
+            WorkMode::TypeScriptUi => ProtocolKind::TypeScriptUi,
+            WorkMode::Python => ProtocolKind::Python,
+            _ => ProtocolKind::GenericCode,
+        },
+        TaskKind::Docs | TaskKind::Authoring => ProtocolKind::Docs,
+        TaskKind::Research
+            if contract
+                .required_artifacts
+                .contains(&ArtifactRole::UsageDocs) =>
+        {
+            ProtocolKind::Docs
+        }
+        TaskKind::Data => ProtocolKind::Data,
+        TaskKind::Ops | TaskKind::Research => ProtocolKind::GenericCode,
     }
 }
 
@@ -633,6 +738,7 @@ mod tests {
             iter_used: 1,
             iter_max: 50,
             duration_secs: 0,
+            terminal_outcome_label: None,
             changed_files: files
                 .iter()
                 .map(|file| file.to_string())
@@ -986,6 +1092,56 @@ mod tests {
         assert!(requested_paths_from_text("../secret.py /tmp/x.py https://x/y.py").is_empty());
     }
 
+    #[test]
+    fn coding_contract_prevents_docs_protocol_from_negated_docs_text() {
+        let request = "Create password_strength.py and tests/test_password_strength.py. Use Python unittest and run the tests. Do not add documentation files.";
+        let contract = TaskContract::from_request(request);
+
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert_eq!(
+            ExecutionProtocol::from_work_mode_with_contract(WorkMode::Docs, Some(&contract)).kind(),
+            ProtocolKind::GenericCode
+        );
+    }
+
+    #[test]
+    fn coding_contract_keeps_specific_code_protocol_when_work_mode_is_specific() {
+        let contract = TaskContract::from_request(
+            "Create calculator.py and tests/test_calculator.py. Use Python unittest.",
+        );
+
+        assert_eq!(contract.task_kind, TaskKind::Coding);
+        assert_eq!(
+            ExecutionProtocol::from_work_mode_with_contract(WorkMode::Python, Some(&contract))
+                .kind(),
+            ProtocolKind::Python
+        );
+    }
+
+    #[test]
+    fn data_contract_prevents_docs_protocol_from_negated_docs_text() {
+        let request = "Create output.csv with columns id,name and rows 1,Ada and 2,Linus. Do not add documentation files.";
+        let contract = TaskContract::from_request(request);
+
+        assert_eq!(contract.task_kind, TaskKind::Data);
+        assert_eq!(
+            ExecutionProtocol::from_work_mode_with_contract(WorkMode::Docs, Some(&contract)).kind(),
+            ProtocolKind::Data
+        );
+    }
+
+    #[test]
+    fn docs_contract_keeps_docs_protocol() {
+        let contract =
+            TaskContract::from_request("Create README.md with Overview and Usage sections.");
+
+        assert_eq!(contract.task_kind, TaskKind::Docs);
+        assert_eq!(
+            ExecutionProtocol::from_work_mode_with_contract(WorkMode::Docs, Some(&contract)).kind(),
+            ProtocolKind::Docs
+        );
+    }
+
     // ----------------------------- Issue #606 T-1.4 -----------------------
 
     use crate::tools::bash::BashCommandClass;
@@ -999,7 +1155,23 @@ mod tests {
     }
 
     fn ev_repo_edit(category: RepoEditCategory) -> CompletionEvidence {
-        CompletionEvidence::RepoEdit { category, count: 1 }
+        CompletionEvidence::RepoEdit {
+            category,
+            count: 1,
+            path: None,
+        }
+    }
+
+    fn ev_required_sections() -> CompletionEvidence {
+        CompletionEvidence::RequiredSectionsPass {
+            path: Some("README.md".to_string()),
+        }
+    }
+
+    fn ev_report_completeness() -> CompletionEvidence {
+        CompletionEvidence::ReportCompletenessPass {
+            path: Some("README.md".to_string()),
+        }
     }
 
     /// U-09 — 5 ProtocolKind × evidence variant matrix smoke.
@@ -1011,6 +1183,8 @@ mod tests {
         let docs_edit = ev_repo_edit(RepoEditCategory::Docs);
         let setup_edit = ev_repo_edit(RepoEditCategory::Setup);
         let other_edit = ev_repo_edit(RepoEditCategory::Other);
+        let sections_pass = ev_required_sections();
+        let report_pass = ev_report_completeness();
         let answer_only = CompletionEvidence::AnswerOnly;
 
         // Python
@@ -1020,6 +1194,8 @@ mod tests {
         assert!(!ProtocolKind::Python.accepts(&docs_edit));
         assert!(!ProtocolKind::Python.accepts(&setup_edit));
         assert!(!ProtocolKind::Python.accepts(&other_edit));
+        assert!(!ProtocolKind::Python.accepts(&sections_pass));
+        assert!(!ProtocolKind::Python.accepts(&report_pass));
         assert!(!ProtocolKind::Python.accepts(&answer_only));
 
         // TypeScriptUi
@@ -1027,6 +1203,8 @@ mod tests {
         assert!(ProtocolKind::TypeScriptUi.accepts(&impl_edit));
         assert!(!ProtocolKind::TypeScriptUi.accepts(&test_edit));
         assert!(!ProtocolKind::TypeScriptUi.accepts(&docs_edit));
+        assert!(!ProtocolKind::TypeScriptUi.accepts(&sections_pass));
+        assert!(!ProtocolKind::TypeScriptUi.accepts(&report_pass));
 
         // GenericCode — any RepoEdit, plus VerifierExitZero
         assert!(ProtocolKind::GenericCode.accepts(&verifier));
@@ -1035,6 +1213,8 @@ mod tests {
         assert!(ProtocolKind::GenericCode.accepts(&docs_edit));
         assert!(ProtocolKind::GenericCode.accepts(&setup_edit));
         assert!(ProtocolKind::GenericCode.accepts(&other_edit));
+        assert!(!ProtocolKind::GenericCode.accepts(&sections_pass));
+        assert!(!ProtocolKind::GenericCode.accepts(&report_pass));
         assert!(!ProtocolKind::GenericCode.accepts(&answer_only));
 
         // AnswerOnly
@@ -1042,9 +1222,13 @@ mod tests {
         assert!(ProtocolKind::AnswerOnly.accepts(&answer_only));
         assert!(!ProtocolKind::AnswerOnly.accepts(&impl_edit));
         assert!(!ProtocolKind::AnswerOnly.accepts(&docs_edit));
+        assert!(!ProtocolKind::AnswerOnly.accepts(&sections_pass));
+        assert!(!ProtocolKind::AnswerOnly.accepts(&report_pass));
 
         // Docs
         assert!(ProtocolKind::Docs.accepts(&docs_edit));
+        assert!(ProtocolKind::Docs.accepts(&sections_pass));
+        assert!(ProtocolKind::Docs.accepts(&report_pass));
         assert!(!ProtocolKind::Docs.accepts(&verifier));
         assert!(!ProtocolKind::Docs.accepts(&impl_edit));
         assert!(!ProtocolKind::Docs.accepts(&answer_only));
@@ -1137,7 +1321,7 @@ mod tests {
         );
         assert_eq!(
             ProtocolKind::Docs.evidence_set_missing_shapes(&empty),
-            vec!["repo_edit_docs"]
+            vec!["repo_edit_docs_or_deliverable_pass"]
         );
 
         // Partial — a Test edit satisfies Python's repo-edit slot but
@@ -1163,6 +1347,65 @@ mod tests {
         let mut set = EvidenceSet::new();
         set.push(ev_verifier());
         assert!(ProtocolKind::GenericCode.evidence_set_satisfies(&set));
+    }
+
+    #[test]
+    fn completion_policy_docs_only_readme_satisfies_generic_protocol() {
+        let ctx = RequestContext {
+            requires_tests: false,
+            is_env_setup_only: false,
+            completion_policy: CompletionPolicy::from_request("READMEを更新してください"),
+        };
+        let mut set = EvidenceSet::new();
+        set.push(ev_repo_edit(RepoEditCategory::Docs));
+
+        assert!(ProtocolKind::GenericCode.evidence_set_satisfies_with_context(&set, &ctx));
+    }
+
+    #[test]
+    fn negated_docs_only_policy_context_completes_without_tests() {
+        let request = "Create README.md with validation steps. Do not create code or tests.";
+        let completion_policy = CompletionPolicy::from_request(request);
+        let ctx = RequestContext {
+            requires_tests: completion_policy.test_execution_required(),
+            is_env_setup_only: false,
+            completion_policy,
+        };
+        let mut set = EvidenceSet::new();
+        set.push(CompletionEvidence::RequiredSectionsPass {
+            path: Some("README.md".to_string()),
+        });
+
+        assert!(!ctx.requires_tests);
+        assert!(ProtocolKind::GenericCode.evidence_set_satisfies_with_context(&set, &ctx));
+    }
+
+    #[test]
+    fn completion_policy_pytest_pass_artifact_only_avoids_missing_repo_edits() {
+        let ctx = RequestContext {
+            requires_tests: true,
+            is_env_setup_only: false,
+            completion_policy: CompletionPolicy::from_request(
+                "pytest を実行してテストを通してください",
+            ),
+        };
+        let mut set = EvidenceSet::new();
+        set.push(ev_verifier());
+
+        assert!(ProtocolKind::GenericCode.evidence_set_satisfies_with_context(&set, &ctx));
+    }
+
+    #[test]
+    fn completion_policy_rejects_docs_only_for_implementation_request() {
+        let ctx = RequestContext {
+            requires_tests: false,
+            is_env_setup_only: false,
+            completion_policy: CompletionPolicy::from_request("Implement feature X"),
+        };
+        let mut set = EvidenceSet::new();
+        set.push(ev_repo_edit(RepoEditCategory::Docs));
+
+        assert!(!ProtocolKind::GenericCode.evidence_set_satisfies_with_context(&set, &ctx));
     }
 
     #[test]
@@ -1202,6 +1445,9 @@ mod tests {
         RequestContext {
             requires_tests: false,
             is_env_setup_only: true,
+            completion_policy: CompletionPolicy::from_request(
+                "Install the dependencies listed in requirements.txt.",
+            ),
         }
     }
 
@@ -1209,6 +1455,7 @@ mod tests {
         RequestContext {
             requires_tests: true,
             is_env_setup_only: false,
+            completion_policy: CompletionPolicy::from_request("Implement feature X and add tests"),
         }
     }
 
@@ -1317,5 +1564,63 @@ mod tests {
         let tests_missing = ProtocolKind::GenericCode
             .evidence_set_missing_shapes_with_context(&env_only, &tests_required_ctx());
         assert!(tests_missing.contains(&"verifier_exit_zero"));
+    }
+
+    // ----- Issue #919: ProtocolKind::Docs multi-role Authoring (§3.4 / OR-6) -----
+
+    fn authoring_multi_role_policy() -> CompletionPolicy {
+        use crate::agent::loop_run::task_contract::{ArtifactRole, TaskIntent, TaskKind};
+        let rb = crate::agent::loop_run::required_behavior::extract("translate and bundle setup");
+        // UsageDocs + Setup → more than one role → ArtifactOnly.
+        CompletionPolicy::from_contract_parts(
+            TaskKind::Authoring,
+            TaskIntent::Build,
+            &[ArtifactRole::UsageDocs, ArtifactRole::Setup],
+            false,
+            &rb,
+        )
+    }
+
+    fn data_artifact_only_policy() -> CompletionPolicy {
+        use crate::agent::loop_run::task_contract::{ArtifactRole, TaskIntent, TaskKind};
+        let rb = crate::agent::loop_run::required_behavior::extract("generate output.csv");
+        CompletionPolicy::from_contract_parts(
+            TaskKind::Data,
+            TaskIntent::Build,
+            &[ArtifactRole::DataOutput],
+            false,
+            &rb,
+        )
+    }
+
+    #[test]
+    fn protocol_docs_admits_multi_file_authoring_artifactonly() {
+        use crate::agent::loop_run::task_contract::CompletionProjectIntent;
+        let policy = authoring_multi_role_policy();
+        assert_eq!(policy.project_intent, CompletionProjectIntent::ArtifactOnly);
+        // Docs-shaped pass is admitted under the relaxed ArtifactOnly branch.
+        assert!(
+            ProtocolKind::Docs.accepts_request_policy_evidence(&policy, &ev_report_completeness())
+        );
+        assert!(
+            ProtocolKind::Docs.accepts_request_policy_evidence(&policy, &ev_required_sections())
+        );
+    }
+
+    #[test]
+    fn protocol_docs_rejects_data_structured_pass() {
+        use crate::agent::loop_run::task_contract::CompletionProjectIntent;
+        let policy = data_artifact_only_policy();
+        assert_eq!(policy.project_intent, CompletionProjectIntent::ArtifactOnly);
+        // OR-6 regression: a StructuredDataPass ArtifactOnly must NOT be admitted
+        // by ProtocolKind::Docs (evidence-variant guard rejects it).
+        let structured = CompletionEvidence::StructuredDataPass {
+            path: Some("output.csv".to_string()),
+            columns: Vec::new(),
+        };
+        assert!(
+            !ProtocolKind::Docs.accepts_request_policy_evidence(&policy, &structured),
+            "Data StructuredDataPass must not be admitted by ProtocolKind::Docs"
+        );
     }
 }

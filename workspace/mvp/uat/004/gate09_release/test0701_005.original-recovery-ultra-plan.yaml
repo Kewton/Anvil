@@ -1,0 +1,11 @@
+goal: "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。"
+profile: "nextjs"
+style: "recovery"
+intent: "recover"
+phases:
+  - id: "inspect-current-state"
+    prompt: "Inspect the current workspace before changing files. Original goal: あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。. Failed phase: build-and-verify. Failed step: unknown. Failure kind: phase_scaffold_error. Preserve useful existing artifacts and identify the smallest remaining implementation gap."
+  - id: "repair-build-and-verify"
+    prompt: "Repair the incomplete work for the failed phase without restarting from scratch.\nOriginal goal: あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。\nFailed phase: build-and-verify\nFailed step: unknown\nMissing capability or artifact signals:\n- missing capability: phase_scaffold\nFailure evidence:\n- invalid StepPlan after corrective retries: Next.js build verify requires an entrypoint expected path first\nRepair targets:\n- phase_scaffold\nCreate or update the task-specific implementation artifacts needed to satisfy the original goal. Do not treat scaffold-only, setup-only, style-only, or build-only output as complete."
+  - id: "verify-recovery"
+    prompt: "Verify the recovered output with deterministic checks and repair only targeted failures.\nOriginal goal: あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。\nFailed phase: build-and-verify\nVerify preference:\n- use deterministic file existence, build, route, and capability evidence checks\n- avoid shell control syntax and interactive dev-server-only verification\nExpected recovery result: runnable task-specific output, not only a saved plan or diagnostic report."

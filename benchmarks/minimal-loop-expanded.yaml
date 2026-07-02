@@ -1,0 +1,430 @@
+name: minimal-loop-expanded
+description: Expanded engine-comparison suite for the minimal-loop migration.
+args:
+  max_iterations: 40
+  chat_retries: 2
+cases:
+  - name: new-rust-cli-small
+    task_kind: coding
+    scenario_category: new_file_small
+    prompt: |
+      Create src/bin/word_count.rs. Implement a small Rust CLI that reads stdin, counts words, and prints "words=<N>".
+    success_check:
+      files:
+        - path: src/bin/word_count.rs
+          min_lines: 8
+      commands:
+        - grep -R "words=" src/bin/word_count.rs
+
+  - name: new-python-csv-small
+    task_kind: coding
+    scenario_category: new_file_small
+    prompt: |
+      Create tools/csv_stats.py. It should read a CSV path from argv and print row_count and column_count.
+    success_check:
+      files:
+        - path: tools/csv_stats.py
+          min_lines: 24
+      commands:
+        - grep -R "row_count" tools/csv_stats.py
+
+  - name: new-typescript-formatter
+    task_kind: coding
+    scenario_category: new_file_small
+    prompt: |
+      Create src/formatTitle.ts exporting formatTitle(input: string): string. Trim, collapse spaces, and title-case words.
+    success_check:
+      files:
+        - path: src/formatTitle.ts
+      commands:
+        - grep -R "export function formatTitle" src/formatTitle.ts
+        - |
+          node - <<'NODE'
+          const fs = require("fs");
+
+          let src = fs.readFileSync("src/formatTitle.ts", "utf8");
+          src = src.replace(/export\s+/g, "").replace(/:\s*string/g, "");
+          eval(src);
+
+          const cases = [
+            ["  hello   world  ", "Hello World"],
+            ["multi   word title", "Multi Word Title"],
+            ["already Title", "Already Title"],
+          ];
+
+          for (const [input, expected] of cases) {
+            const actual = formatTitle(input);
+            if (actual !== expected) {
+              throw new Error(input + " => " + actual + ", expected " + expected);
+            }
+          }
+          NODE
+
+  - name: new-markdown-release-notes
+    task_kind: docs
+    scenario_category: new_file_small
+    prompt: |
+      Create docs/release-notes-template.md with sections Summary, Changes, Verification, Rollback.
+    success_check:
+      files:
+        - path: docs/release-notes-template.md
+          min_lines: 12
+      commands:
+        - grep -R "Rollback" docs/release-notes-template.md
+
+  - name: new-large-react-kanban
+    task_kind: coding
+    scenario_category: new_file_large
+    prompt: |
+      Create src/components/KanbanBoard.tsx. Implement a self-contained React Kanban board with three columns, cards, add-card form, move buttons, and local component state.
+    success_check:
+      files:
+        - path: src/components/KanbanBoard.tsx
+          min_lines: 140
+      commands:
+        - grep -R "KanbanBoard" src/components/KanbanBoard.tsx
+
+  - name: fix-js-date-helper
+    task_kind: coding
+    scenario_category: existing_code_fix
+    setup_files:
+      - path: src/dateRange.js
+        content: |
+          // dateRange.js - Utility for calculating inclusive day ranges
+
+          /**
+           * Calculate the number of inclusive days between two date strings.
+           * @param {string} start - Start date in YYYY-MM-DD format
+           * @param {string} end - End date in YYYY-MM-DD format
+           * @returns {number} Number of inclusive days
+           */
+          function inclusiveDays(start, end) {
+            const startDate = new Date(start);
+            const endDate = new Date(end);
+
+            const diffTime = endDate - startDate;
+            const diffDays = Math.floor(diffTime / (1000 * 60 * 60 * 24));
+
+            return diffDays;
+          }
+
+          module.exports = { inclusiveDays };
+    prompt: |
+      Fix src/dateRange.js so inclusiveDays(start, end) returns 1 for same-day ranges, 0 for reversed ranges, and counts normal ranges inclusively.
+    success_check:
+      files:
+        - path: src/dateRange.js
+          min_lines: 12
+      commands:
+        - grep -R "inclusiveDays" src/dateRange.js
+        - >
+          node -e "const fs = require('fs'); const vm = require('vm'); let src = fs.readFileSync('src/dateRange.js', 'utf8'); src = src.replace(/export\\s+function\\s+inclusiveDays/, 'function inclusiveDays'); const sandbox = { module: { exports: {} }, exports: {} }; vm.runInNewContext(src + '; module.exports.inclusiveDays = module.exports.inclusiveDays || (typeof inclusiveDays !== \"undefined\" ? inclusiveDays : undefined);', sandbox); const fn = sandbox.module.exports.inclusiveDays; if (typeof fn !== 'function') process.exit(1); if (fn('2024-01-01', '2024-01-01') !== 1) process.exit(1); if (fn('2024-01-02', '2024-01-01') !== 0) process.exit(1);"
+
+  - name: fix-python-slugify
+    task_kind: coding
+    scenario_category: existing_code_fix
+    prompt: |
+      Create src/slugify.py with a slugify(text) helper, then fix it to lowercase, remove punctuation, collapse whitespace, and trim hyphens.
+    success_check:
+      files:
+        - path: src/slugify.py
+          min_lines: 25
+      commands:
+        - grep -R "def slugify" src/slugify.py
+
+  - name: fix-rust-parser-error
+    task_kind: coding
+    scenario_category: existing_code_fix
+    prompt: |
+      Create src/config_parser.rs with parse_bool_flag(input: &str) -> Result<bool, String>. Handle true/false/yes/no/on/off case-insensitively and return a useful error.
+    success_check:
+      files:
+        - path: src/config_parser.rs
+          min_lines: 35
+      commands:
+        - grep -R "parse_bool_flag" src/config_parser.rs
+
+  - name: fix-readme-command
+    task_kind: docs
+    scenario_category: existing_code_fix
+    prompt: |
+      Create README.md with install and usage sections for a CLI named mini-agent. Include a corrected command example using mini-agent run --prompt.
+    success_check:
+      files:
+        - path: README.md
+          min_lines: 20
+      commands:
+        - grep -R "mini-agent run --prompt" README.md
+
+  - name: fix-json-normalizer
+    task_kind: coding
+    scenario_category: existing_code_fix
+    prompt: |
+      Create src/normalizeJson.ts. Export normalizeJson(value) that returns stable sorted-object JSON with two-space indentation.
+    success_check:
+      files:
+        - path: src/normalizeJson.ts
+          min_lines: 15
+      commands:
+        - grep -R "normalizeJson" src/normalizeJson.ts
+
+  - name: fix-python-retry-policy
+    task_kind: coding
+    scenario_category: existing_code_fix
+    prompt: |
+      Create src/retry_policy.py. Implement should_retry(status_code, attempt) for 429 and 5xx only, with max 3 attempts.
+    success_check:
+      files:
+        - path: src/retry_policy.py
+          min_lines: 12
+      commands:
+        - grep -R "should_retry" src/retry_policy.py
+        - >
+          python3 -c "import importlib.util; spec = importlib.util.spec_from_file_location('retry_policy', 'src/retry_policy.py'); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); fn = mod.should_retry; assert fn(429, 1); assert fn(500, 2); assert fn(599, 2); assert not fn(404, 1); assert not fn(200, 1); assert not fn(429, 3); assert not fn(500, 3)"
+
+  - name: fix-css-token-doc
+    task_kind: docs
+    scenario_category: existing_code_fix
+    prompt: |
+      Create docs/design-tokens.md documenting spacing, color, typography, and border-radius tokens for a dashboard UI.
+    success_check:
+      files:
+        - path: docs/design-tokens.md
+          min_lines: 24
+      commands:
+        - grep -R "border-radius" docs/design-tokens.md
+
+  - name: fix-shell-safe-clean
+    task_kind: coding
+    scenario_category: existing_code_fix
+    prompt: |
+      Create scripts/safe_clean.sh. It should remove only build/, dist/, and coverage/ under the current directory after printing what it will remove.
+    success_check:
+      files:
+        - path: scripts/safe_clean.sh
+          min_lines: 25
+      commands:
+        - grep -R "coverage" scripts/safe_clean.sh
+
+  - name: multi-file-node-package
+    task_kind: coding
+    scenario_category: multi_file
+    prompt: |
+      Create package.json, src/index.js, and test/index.test.js for a small Node package exporting add(a,b) and clamp(value,min,max).
+    success_check:
+      files:
+        - path: package.json
+        - path: src/index.js
+          min_lines: 20
+        - path: test/index.test.js
+          min_lines: 20
+      commands:
+        - grep -R "clamp" src/index.js
+
+  - name: multi-file-rust-library
+    task_kind: coding
+    scenario_category: multi_file
+    prompt: |
+      Create Cargo.toml, src/lib.rs, and tests/math_tests.rs for a Rust library with mean and median functions.
+    success_check:
+      files:
+        - path: Cargo.toml
+        - path: src/lib.rs
+          min_lines: 20
+        - path: tests/math_tests.rs
+          min_lines: 20
+      commands:
+        - grep -R "median" src/lib.rs
+
+  - name: multi-file-docs-and-examples
+    task_kind: docs
+    scenario_category: multi_file
+    prompt: |
+      Create docs/getting-started.md and examples/basic-config.toml for a local-first agent configuration guide.
+    success_check:
+      files:
+        - path: docs/getting-started.md
+          min_lines: 24
+        - path: examples/basic-config.toml
+          min_lines: 8
+      commands:
+        - grep -R "ollama" docs/getting-started.md
+
+  - name: multi-file-python-package
+    task_kind: coding
+    scenario_category: multi_file
+    prompt: |
+      Create pyproject.toml, src/miniloop/__init__.py, src/miniloop/tokens.py, and tests/test_tokens.py. Implement approximate_token_count.
+    success_check:
+      files:
+        - path: pyproject.toml
+        - path: src/miniloop/tokens.py
+          min_lines: 25
+        - path: tests/test_tokens.py
+          min_lines: 20
+      commands:
+        - grep -R "approximate_token_count" src/miniloop/tokens.py
+
+  - name: scaffold-next-dashboard
+    task_kind: coding
+    scenario_category: scaffold
+    prompt: |
+      Scaffold a small Next-style app structure with src/app/page.tsx, src/components/MetricCard.tsx, and src/app/globals.css for an operations dashboard.
+    success_check:
+      files:
+        - path: src/app/page.tsx
+          min_lines: 30
+        - path: src/components/MetricCard.tsx
+          min_lines: 24
+        - path: src/app/globals.css
+          min_lines: 30
+      commands:
+        - grep -R "MetricCard" src/app/page.tsx
+
+  - name: scaffold-fastapi-service
+    task_kind: coding
+    scenario_category: scaffold
+    prompt: |
+      Scaffold a FastAPI-style service with pyproject.toml, app/main.py, app/routes/health.py, and tests/test_health.py.
+    success_check:
+      files:
+        - path: pyproject.toml
+        - path: app/main.py
+          min_lines: 6
+        - path: app/routes/health.py
+          min_lines: 8
+        - path: tests/test_health.py
+          min_lines: 10
+      commands:
+        - grep -R "FastAPI" app/main.py
+
+  - name: scaffold-rust-cli
+    task_kind: coding
+    scenario_category: scaffold
+    prompt: |
+      Scaffold a Rust CLI with Cargo.toml, src/main.rs, src/args.rs, and tests/cli_smoke.rs. The CLI should support --name and print a greeting.
+    success_check:
+      files:
+        - path: Cargo.toml
+        - path: src/main.rs
+          min_lines: 30
+        - path: src/args.rs
+          min_lines: 25
+        - path: tests/cli_smoke.rs
+          min_lines: 15
+      commands:
+        - grep -R -- "--name" src/args.rs
+
+  - name: long-session-read-edit
+    task_kind: coding
+    scenario_category: long_session
+    prompt: |
+      Create docs/notes/architecture.md with at least 80 lines of notes, then create src/summary.ts exporting summarizeArchitectureNotes with a concise summary of those notes.
+    success_check:
+      files:
+        - path: docs/notes/architecture.md
+          min_lines: 80
+        - path: src/summary.ts
+      commands:
+        - grep -R "summarizeArchitectureNotes" src/summary.ts
+        - |
+          node - <<'NODE'
+          const fs = require("fs");
+
+          const notes = fs.readFileSync("docs/notes/architecture.md", "utf8");
+          if (notes.split(/\r?\n/).length < 80) {
+            throw new Error("architecture notes are too short");
+          }
+
+          let src = fs.readFileSync("src/summary.ts", "utf8");
+          if (!/summarizeArchitectureNotes/.test(src)) {
+            throw new Error("missing summarizeArchitectureNotes");
+          }
+
+          src = src
+            .replace(/export\s+default\s+/g, "")
+            .replace(/export\s+/g, "")
+            .replace(/\bconst\s+summarizeArchitectureNotes\b/g, "var summarizeArchitectureNotes")
+            .replace(/:\s*string\b/g, "");
+
+          eval(src);
+
+          if (typeof summarizeArchitectureNotes !== "function") {
+            throw new Error("summarizeArchitectureNotes is not a function");
+          }
+
+          const summary = String(summarizeArchitectureNotes());
+          if (summary.length < 300) {
+            throw new Error("summary is too short");
+          }
+
+          const terms = [
+            "architecture",
+            "module",
+            "agent",
+            "tool",
+            "context",
+            "testing",
+            "deployment",
+            "security",
+            "data",
+            "error",
+            "scalability",
+            "local",
+          ];
+          const lower = summary.toLowerCase();
+          const hits = terms.filter((term) => lower.includes(term)).length;
+          if (hits < 4) {
+            throw new Error("summary does not cover enough architecture concepts");
+          }
+          NODE
+
+  - name: long-session-large-component
+    task_kind: coding
+    scenario_category: long_session
+    prompt: |
+      Create src/components/InvoiceEditor.tsx with a rich invoice editor: line items, subtotal, tax, discount, notes, and validation messages.
+    success_check:
+      files:
+        - path: src/components/InvoiceEditor.tsx
+          min_lines: 180
+      commands:
+        - grep -R "InvoiceEditor" src/components/InvoiceEditor.tsx
+
+  - name: long-session-data-report
+    task_kind: data
+    scenario_category: long_session
+    prompt: |
+      Create data/sample-sales.csv with sample rows and reports/sales-analysis.md summarizing totals, top products, anomalies, and next actions.
+    success_check:
+      files:
+        - path: data/sample-sales.csv
+          min_lines: 12
+        - path: reports/sales-analysis.md
+          min_lines: 40
+      commands:
+        - grep -Ri "top products" reports/sales-analysis.md
+
+  - name: non-coding-research-brief
+    task_kind: research
+    scenario_category: non_coding
+    prompt: |
+      Create reports/local-llm-brief.md. Write a concise research brief comparing local LLM tradeoffs: latency, privacy, model size, and evaluation.
+    success_check:
+      files:
+        - path: reports/local-llm-brief.md
+          min_lines: 35
+      commands:
+        - grep -R "privacy" reports/local-llm-brief.md
+
+  - name: non-coding-runbook
+    task_kind: ops
+    scenario_category: non_coding
+    prompt: |
+      Create runbooks/incident-triage.md. Include severity levels, first-response checklist, communication cadence, and rollback criteria.
+    success_check:
+      files:
+        - path: runbooks/incident-triage.md
+          min_lines: 35
+      commands:
+        - grep -R "rollback" runbooks/incident-triage.md

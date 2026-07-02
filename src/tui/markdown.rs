@@ -387,14 +387,27 @@ pub(crate) fn sanitize(s: &str) -> String {
 
 /// True when `ANVIL_NO_MARKDOWN` is set to any non-empty value (complete bypass).
 pub(crate) fn markdown_fully_disabled() -> bool {
-    std::env::var_os("ANVIL_NO_MARKDOWN").is_some_and(|v| !v.is_empty())
+    markdown_fully_disabled_with(|key| {
+        std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
+    })
+}
+
+fn markdown_fully_disabled_with(get_env: impl Fn(&str) -> Option<String>) -> bool {
+    get_env("ANVIL_NO_MARKDOWN").is_some_and(|value| !value.is_empty())
 }
 
 /// True when ANSI color should be emitted: `NO_COLOR` unset/empty **and**
 /// stdout is a TTY. Reuses the existing POSIX-compliant
 /// `no_color_requested` helper from `turn.rs`.
 pub(crate) fn color_enabled_for_markdown() -> bool {
-    !crate::agent::loop_run::no_color_requested() && std::io::stdout().is_terminal()
+    color_enabled_for_markdown_with(
+        crate::agent::loop_run::no_color_requested(),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+fn color_enabled_for_markdown_with(no_color_requested: bool, stdout_is_terminal: bool) -> bool {
+    !no_color_requested && stdout_is_terminal
 }
 
 /// True when unicode-enabled symbols (e.g. `●`) should be used. Reuses the
@@ -744,55 +757,19 @@ mod tests {
     // -------- Caller-side helpers --------
     #[test]
     fn markdown_fully_disabled_reads_env() {
-        // Env-mutating: serialize with the global ENV_MUTEX.
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let prior = std::env::var_os("ANVIL_NO_MARKDOWN");
-        // SAFETY: test-only env mutation, serialized by ENV_MUTEX.
-        unsafe {
-            std::env::remove_var("ANVIL_NO_MARKDOWN");
-        }
-        assert!(!markdown_fully_disabled());
-        // SAFETY: same.
-        unsafe {
-            std::env::set_var("ANVIL_NO_MARKDOWN", "");
-        }
-        assert!(!markdown_fully_disabled());
-        // SAFETY: same.
-        unsafe {
-            std::env::set_var("ANVIL_NO_MARKDOWN", "1");
-        }
-        assert!(markdown_fully_disabled());
-        // Restore.
-        // SAFETY: same.
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var("ANVIL_NO_MARKDOWN", v),
-                None => std::env::remove_var("ANVIL_NO_MARKDOWN"),
-            }
-        }
+        assert!(!markdown_fully_disabled_with(|_| None));
+        assert!(!markdown_fully_disabled_with(|key| {
+            (key == "ANVIL_NO_MARKDOWN").then(String::new)
+        }));
+        assert!(markdown_fully_disabled_with(|key| {
+            (key == "ANVIL_NO_MARKDOWN").then(|| "1".to_string())
+        }));
     }
 
     #[test]
     fn color_enabled_for_markdown_is_false_under_cargo_non_tty() {
-        // `cargo test` runs with stdout captured → `is_terminal()` is false, so
-        // this helper must always return false regardless of NO_COLOR.
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let prior = std::env::var_os("NO_COLOR");
-        // SAFETY: test-only env mutation, serialized by ENV_MUTEX.
-        unsafe {
-            std::env::remove_var("NO_COLOR");
-        }
-        assert!(!color_enabled_for_markdown());
-        // Restore.
-        // SAFETY: same.
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var("NO_COLOR", v),
-                None => std::env::remove_var("NO_COLOR"),
-            }
-        }
+        assert!(!color_enabled_for_markdown_with(false, false));
+        assert!(!color_enabled_for_markdown_with(true, true));
+        assert!(color_enabled_for_markdown_with(false, true));
     }
-
-    // Mutex for env-mutating tests, mirrors commands.rs / turn.rs convention.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

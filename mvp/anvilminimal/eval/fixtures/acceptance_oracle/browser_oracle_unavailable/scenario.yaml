@@ -1,0 +1,13 @@
+profile: nextjs
+prompt: Create an interactive keyboard browser game.
+functional_contract:
+  category: interactive-game
+  required_capabilities:
+    - stateful_interaction
+    - player_control
+expected_artifacts:
+  - src/app/page.tsx
+oracle_contract:
+  deterministic_oracles:
+    - source_semantic
+    - browser_interaction

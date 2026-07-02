@@ -197,35 +197,74 @@ pub(super) fn repo_change_request_text(
     active_task: Option<&str>,
     messages: &[ConversationMessage],
 ) -> Option<String> {
-    active_task
+    let latest_user_request = latest_explicit_user_request(messages);
+    let active_request = active_task
         .map(str::trim)
         .filter(|task| !task.is_empty())
-        .and_then(extract_original_user_request)
+        .and_then(|task| restore_truncated_active_task(task, messages))
         .or_else(|| {
             active_task
                 .map(str::trim)
                 .filter(|task| !task.is_empty())
+                .and_then(extract_original_user_request)
+        })
+        .or_else(|| {
+            active_task
+                .map(str::trim)
+                .filter(|task| !task.is_empty())
+                .filter(|task| !stored_active_task_looks_truncated(task))
                 .filter(|task| !is_plan_wrapper_or_approval_text(task))
                 .map(ToString::to_string)
-        })
-        .or_else(|| {
-            messages
-                .iter()
-                .rev()
-                .filter(|message| message.role == "user")
-                .filter_map(|message| extract_original_user_request(&message.content))
-                .next()
-        })
-        .or_else(|| {
-            messages
-                .iter()
-                .rev()
-                .filter(|message| message.role == "user")
-                .filter(|message| !is_plan_wrapper_or_approval_text(&message.content))
-                .find(|message| message.role == "user")
-                .map(|message| message.content.trim().to_string())
+        });
+
+    match (latest_user_request, active_request) {
+        (Some(latest), Some(active)) if latest != active => Some(latest),
+        (Some(latest), _) => Some(latest),
+        (None, active) => active,
+    }
+}
+
+fn latest_explicit_user_request(messages: &[ConversationMessage]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        if message.role != "user" {
+            return None;
+        }
+        extract_original_user_request(&message.content).or_else(|| {
+            (!is_plan_wrapper_or_approval_text(&message.content))
+                .then(|| message.content.trim().to_string())
                 .filter(|content| !content.is_empty())
         })
+    })
+}
+
+fn restore_truncated_active_task(
+    active_task: &str,
+    messages: &[ConversationMessage],
+) -> Option<String> {
+    if !stored_active_task_looks_truncated(active_task) {
+        return None;
+    }
+    let prefix = active_task.strip_suffix("...")?.trim_end();
+    if prefix.is_empty() {
+        return None;
+    }
+
+    messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .filter_map(|message| {
+            extract_original_user_request(&message.content).or_else(|| {
+                (!is_plan_wrapper_or_approval_text(&message.content))
+                    .then(|| message.content.trim().to_string())
+                    .filter(|content| !content.is_empty())
+            })
+        })
+        .find(|candidate| candidate.trim_start().starts_with(prefix))
+}
+
+fn stored_active_task_looks_truncated(active_task: &str) -> bool {
+    active_task.ends_with("...") && active_task.chars().count() >= 240
 }
 
 fn extract_original_user_request(text: &str) -> Option<String> {
@@ -1159,7 +1198,11 @@ pub(super) fn workspace_has_unsupported_ui_framework(work_root: &Path) -> bool {
 
 pub(super) fn request_explicitly_requires_tests(request: &str) -> bool {
     let lower = request.to_ascii_lowercase();
-    lower.contains("test")
+    if super::task_contract::request_negates_test_artifacts(request, &lower) {
+        return false;
+    }
+    super::task_contract::request_asks_for_test_artifact(request, &lower)
+        || lower.contains("test")
         || lower.contains("pytest")
         || lower.contains("unittest")
         || request.contains("テスト")
@@ -3696,6 +3739,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repo_change_request_text_restores_truncated_active_task_from_messages() {
+        let full = format!(
+            r#"STATE_CONTROL_PACKET
+{{"objective":"slugify library with passing evidence","next_required_action":"artifact","required_artifacts":[{{"path":"Cargo.toml","role":"manifest"}},{{"path":"src/lib.rs","role":"source"}}],"evidence_command":"cargo test --manifest-path Cargo.toml","completion_condition":"{}"}}"#,
+            "all required artifacts exist and evidence succeeds ".repeat(8)
+        );
+        let active = crate::session::store::truncate_entry(full.clone(), 240);
+        assert!(active.ends_with("..."));
+
+        let messages = vec![
+            ConversationMessage::user(full.clone()),
+            ConversationMessage::user("yes".to_string()),
+        ];
+
+        assert_eq!(
+            repo_change_request_text(Some(&active), &messages),
+            Some(full)
+        );
+    }
+
+    #[test]
     fn feature_profile_classifies_abstract_business_primitives() {
         let profile = FeatureProfile::from_request(
             "売上シミュレーターを入力値の異常値チェック、目標達成判定、グラフ風表示、保存付きで改善して下さい。",
@@ -4415,6 +4479,19 @@ export default function App(){
         let both_signals = "install and test";
         assert!(!request_is_env_setup_only(both_signals));
         assert!(request_explicitly_requires_tests(both_signals));
+    }
+
+    #[test]
+    fn request_explicitly_requires_tests_respects_negated_test_artifacts() {
+        assert!(!request_explicitly_requires_tests(
+            "Create README.md with validation steps. Do not create code or tests."
+        ));
+        assert!(!request_explicitly_requires_tests(
+            "READMEを作成してください。テストは作成しないでください。"
+        ));
+        assert!(request_explicitly_requires_tests(
+            "Implement the parser and add pytest coverage"
+        ));
     }
 
     // ---------------------------------------------------------------------

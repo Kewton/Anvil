@@ -28,9 +28,23 @@ scripts/compare.py --metric rc,elapsed_s --format json baseline/ experiment/
 
 # しきい値を 10% に緩める
 scripts/compare.py --threshold 0.10 baseline/ experiment/
+
+# PAM advisory A/B 用の固定 suite を同一 prompt set で実行
+scripts/bench.sh pam-ab-general --model qwen3.5:122b --runs 5 --pam-ab
 ```
 
 出力は stdout、警告は stderr。`--output` は v1 で提供しない。
+
+`--pam-ab` は各 benchmark case を `pam_on` /
+`pam_off` の 2 variant で実行し、`summary.tsv` に `case` と
+`pam_variant` を記録する。PAM 採用 context と suppression 理由は
+各 run の `logs/eval.jsonl` / `logs/llm-io.jsonl` から追跡する。
+`scripts/report.py` は `task_kind` 別に terminal success (`rc==0`) と
+artifact-level postcheck (`postcheck_success`) を分離集計し、PAM variant 別の
+比較表も出力する。各表には Anvil 判定と postcheck の
+`true_positive` / `false_positive` / `false_negative` / `true_negative`
+件数を含め、`--format json` では同じ taxonomy を機械可読 summary として
+出力する。
 
 ## 2. 期待する入力レイアウト
 
@@ -45,6 +59,18 @@ scripts/compare.py --threshold 0.10 baseline/ experiment/
     └── ...
 ```
 
+suite/PAM run の場合は以下の入れ子 layout もサポートする。
+
+```
+<baseline_dir>/
+└── <model_slug>/
+    └── <case_slug>/
+        └── <pam_variant>/
+            ├── run-1/
+            ├── run-2/
+            └── ...
+```
+
 - `model_slug` ディレクトリは各 root 直下に 1 個のみ（複数/0 個は exit 1）
 - `baseline` と `experiment` の `model_slug` は一致必須（不一致は exit 1）
 - `run-*` はシンボリックリンクならスキップ
@@ -54,6 +80,7 @@ scripts/compare.py --threshold 0.10 baseline/ experiment/
 | alias | 正式キー |
 |---|---|
 | `rc0` | `rc` |
+| `postcheck` | `postcheck_success` |
 | `page_game` | `page_tsx_has_game_keywords` |
 
 正式キーは `analyze_run.py` 出力のキー。現時点で対応しているもの:
@@ -61,6 +88,7 @@ scripts/compare.py --threshold 0.10 baseline/ experiment/
 | 正式キー | 集計種別 | 改善方向 |
 |---|---|---|
 | `rc` | bool_rate (rc==0 を成功) | up |
+| `postcheck_success` | bool_rate | up |
 | `page_tsx_has_game_keywords` | bool_rate | up |
 | `we_total` | informational | - |
 | `elapsed_s` | continuous | down |
@@ -125,7 +153,7 @@ scripts/compare.py --threshold 0.10 baseline/ experiment/
 - 入力パスは `Path.resolve(strict=True)` 後に top-level symlink を拒否
 - `scripts/analyze_run.py` は compare.py と同一 repo の regular file のみ許可
 - `subprocess.run` 呼び出しは `shell=False`、`PYTHONPATH` 等を遮断した env、`-I` で isolated mode
-- `run-*` は `MAX_RUNS = 100` で上限、超過は exit 1
+- `run-*` は `MAX_RUNS = 500` で上限、超過は exit 1
 - `os.umask(0o077)` を `main` の先頭で設定
 
 ## 8. バージョン管理

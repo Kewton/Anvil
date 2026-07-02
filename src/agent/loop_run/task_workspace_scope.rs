@@ -48,25 +48,13 @@ const MONOREPO_PARENT_DIRS: &[&str] =
 /// - `artifact_ownership::path_in_ignored_top_dir`
 /// - `turn::collect_meaningful_workspace_files` (workspace walker)
 ///
-/// Always extend by editing this list; do NOT duplicate the names elsewhere.
-pub(super) const IGNORED_TOP_DIRS: &[&str] = &[
-    ".git",
-    ".anvil",
-    ".anvil-state",
-    "node_modules",
-    "target",
-    ".venv",
-    "venv",
-    "dist",
-    "build",
-    "__pycache__",
-];
-
+/// The backing list lives in `util::workspace_paths` so repo snapshots,
+/// summary construction, and workspace-scope detection share one predicate.
 /// SSOT predicate: returns `true` when `name` is the file-name component of
 /// a directory that is never part of the active workspace (dependency
 /// cache, VCS metadata, build output).
 pub(super) fn is_workspace_ignored_dir(name: &str) -> bool {
-    IGNORED_TOP_DIRS.contains(&name)
+    crate::util::workspace_paths::is_workspace_ignored_dir_name(name)
 }
 
 /// Mode of the active scope. Three deterministic states; the planner reads

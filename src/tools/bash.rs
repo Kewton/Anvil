@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,6 +70,25 @@ where
             }
         })
         .collect()
+}
+
+/// Issue #661 iteration-5 (DR1-009 SSOT bridge): promote a runtime-known
+/// allowlist key (typically obtained from `filter_env_for_tester` output)
+/// back to its `'static str` representation from `TESTER_ENV_ALLOWLIST_EXACT`.
+/// Returns `None` when the key is not on the allowlist — this is a safety
+/// fall-through, not a normal path (callers MUST first run keys through
+/// `filter_env_for_tester`).
+///
+/// This is the **only** sanctioned bridge between `String`-shaped allow
+/// entries and the `&'static str` representation `HermeticEnvSummary` /
+/// `agent.verifier.invoked` payload schema requires. The auto_test path
+/// MUST go through this helper rather than reference the const slice
+/// directly so the SSOT stays in `bash.rs` (DR1-009).
+pub fn tester_allowlist_static_key(key: &str) -> Option<&'static str> {
+    TESTER_ENV_ALLOWLIST_EXACT
+        .iter()
+        .find(|allowed| **allowed == key)
+        .copied()
 }
 
 /// Internal Bash outcome bag exposed for FeedbackFrame generation in
@@ -459,7 +478,11 @@ pub fn run_with_outcome(
     if let Some(reason) = check_blocked_command(&normalized) {
         return Err(render_block_error(&reason));
     }
-    let class = classify_command(&normalized);
+    let classification = classify_command_for_execution(&normalized, cwd);
+    if let Some(cd_wrapper) = classification.cd_wrapper.as_ref() {
+        log_cd_wrapper_reclassified(cd_wrapper, classification.class);
+    }
+    let class = classification.class;
     enforce_offline_policy(&normalized, class, offline)?;
 
     let mut cmd = Command::new("sh");
@@ -515,7 +538,7 @@ pub fn run_with_outcome(
             // Issue #608 AP-08: BuildTest output bodies get the
             // pytest/cargo/npm summary + tail trim formatter applied before
             // the byte cap (design §4.6 ordering). Other classes pass through.
-            let body = apply_test_output_formatter_if_build_test(class, &combined);
+            let body = format_bash_tool_body(class, &normalized, &combined);
             return Ok((
                 format!(
                     "exit_code=-1\ninterrupted=true\n{}",
@@ -542,7 +565,7 @@ pub fn run_with_outcome(
                 class,
             };
             // Issue #608 AP-08: BuildTest body formatter (see above).
-            let body = apply_test_output_formatter_if_build_test(class, &combined);
+            let body = format_bash_tool_body(class, &normalized, &combined);
             return Ok((
                 format!(
                     "exit_code=-1\ntimed_out=true\ntimeout_secs={}\n{}",
@@ -576,7 +599,7 @@ pub fn run_with_outcome(
     // Issue #608 AP-08: BuildTest output bodies get the test_output
     // formatter applied before the byte cap (design §4.6 ordering invariant).
     // Bash metadata (`exit_code=`) stays at the head of the tool result.
-    let body = apply_test_output_formatter_if_build_test(class, &combined);
+    let body = format_bash_tool_body(class, &normalized, &combined);
     Ok((
         format!(
             "exit_code={}\n{}",
@@ -585,6 +608,18 @@ pub fn run_with_outcome(
         ),
         outcome,
     ))
+}
+
+const LARGE_CAT_OUTPUT_THRESHOLD_CHARS: usize = 6_000;
+const LARGE_CAT_EXCERPT_LINES: usize = 30;
+
+fn format_bash_tool_body(class: BashCommandClass, command: &str, combined: &str) -> String {
+    let body = apply_test_output_formatter_if_build_test(class, combined);
+    if matches!(class, BashCommandClass::ReadOnly) {
+        summarize_large_cat_output(command, &body)
+    } else {
+        body
+    }
 }
 
 /// Issue #608 AP-08 helper: apply the `test_output` formatter only when the
@@ -601,6 +636,54 @@ fn apply_test_output_formatter_if_build_test(class: BashCommandClass, combined: 
     } else {
         combined.to_string()
     }
+}
+
+fn summarize_large_cat_output(command: &str, combined: &str) -> String {
+    let char_count = combined.chars().count();
+    if char_count <= LARGE_CAT_OUTPUT_THRESHOLD_CHARS || !is_plain_cat_dump_command(command) {
+        return combined.to_string();
+    }
+
+    let lines = combined.lines().collect::<Vec<_>>();
+    let line_count = lines.len();
+    let head = lines
+        .iter()
+        .take(LARGE_CAT_EXCERPT_LINES)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tail_start = line_count.saturating_sub(LARGE_CAT_EXCERPT_LINES);
+    let tail = lines
+        .iter()
+        .skip(tail_start)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "[anvil] Large `cat` output summarized to keep the session context small.\n\
+command: {command}\n\
+chars: {char_count}\n\
+lines: {line_count}\n\
+Use Read with start_line/end_line, rg, sed -n, head, or tail for focused inspection.\n\
+--- head ({}) ---\n{head}\n\
+--- tail ({}) ---\n{tail}",
+        LARGE_CAT_EXCERPT_LINES.min(line_count),
+        line_count.saturating_sub(tail_start)
+    )
+}
+
+fn is_plain_cat_dump_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    trimmed.starts_with("cat ")
+        && !trimmed.contains("&&")
+        && !trimmed.contains("||")
+        && !trimmed.contains('|')
+        && !trimmed.contains(';')
+        && !trimmed.contains('>')
+        && !trimmed.contains('<')
+        && !trimmed.contains("`")
+        && !trimmed.contains("$(")
 }
 
 pub fn classify_command(command: &str) -> BashCommandClass {
@@ -625,6 +708,165 @@ pub fn classify_command(command: &str) -> BashCommandClass {
     } else {
         BashCommandClass::General
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BashExecutionClassification {
+    class: BashCommandClass,
+    cd_wrapper: Option<CdWrapperClassification>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CdWrapperClassification {
+    tail_class: BashCommandClass,
+}
+
+fn classify_command_for_execution(command: &str, cwd: &Path) -> BashExecutionClassification {
+    if let Some(cd_wrapper) = classify_cd_wrapper_command(command, cwd) {
+        return BashExecutionClassification {
+            class: cd_wrapper.tail_class,
+            cd_wrapper: Some(cd_wrapper),
+        };
+    }
+    BashExecutionClassification {
+        class: classify_command(command),
+        cd_wrapper: None,
+    }
+}
+
+fn classify_cd_wrapper_command(command: &str, cwd: &Path) -> Option<CdWrapperClassification> {
+    let parts = split_shell_control_segments(command);
+    if parts.len() != 3 || parts[1] != "&&" {
+        return None;
+    }
+
+    let cd_dir = parse_cd_dir(parts[0])?;
+    if !cd_dir_is_cwd_or_descendant(cwd, &cd_dir) {
+        return None;
+    }
+
+    let tail_class = classify_command(parts[2]);
+    Some(CdWrapperClassification { tail_class })
+}
+
+fn parse_cd_dir(segment: &str) -> Option<PathBuf> {
+    let words = split_simple_shell_words(segment.trim())?;
+    if words.len() != 2 || words[0] != "cd" {
+        return None;
+    }
+    let dir = &words[1];
+    if dir.is_empty() || dir == "-" {
+        return None;
+    }
+    Some(PathBuf::from(dir))
+}
+
+fn cd_dir_is_cwd_or_descendant(cwd: &Path, dir: &Path) -> bool {
+    let cwd_canon = std::fs::canonicalize(cwd).ok();
+    let target = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        cwd.join(dir)
+    };
+    let target_canon = std::fs::canonicalize(target).ok();
+    match (cwd_canon, target_canon) {
+        (Some(cwd_canon), Some(target_canon)) => {
+            target_canon == cwd_canon || target_canon.starts_with(&cwd_canon)
+        }
+        _ => false,
+    }
+}
+
+fn split_simple_shell_words(input: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_word = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                in_word = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                in_word = true;
+            }
+            '\\' if !in_single => {
+                let next = chars.next()?;
+                current.push(next);
+                in_word = true;
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            c => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+
+    if in_single || in_double {
+        return None;
+    }
+    if in_word {
+        words.push(current);
+    }
+    Some(words)
+}
+
+fn log_cd_wrapper_reclassified(
+    cd_wrapper: &CdWrapperClassification,
+    effective_class: BashCommandClass,
+) {
+    crate::logging::log_llm_event(
+        "tool.bash.cd_wrapper_reclassified",
+        serde_json::json!({
+            "shape": "cd_and_tail",
+            "tail_class": cd_wrapper.tail_class.as_str(),
+            "effective_class": effective_class.as_str(),
+            "offline_allowed_class": matches!(
+                effective_class,
+                BashCommandClass::ScriptRun | BashCommandClass::BuildTest
+            ),
+        }),
+    );
+}
+
+/// Issue #664 (AD2 / AD12 / DR1-001 案 B): thin wrapper over
+/// `classify_command` for the SetupBootstrap policy projection.
+///
+/// Logical equivalence: `is_setup_command(cmd)` ↔
+/// `classify_command(cmd) == BashCommandClass::EnvSetup`. This is the
+/// **only** SSOT consulted by the SetupBootstrap policy enforcement path
+/// (`turn.rs::effective_tool_policy_error_for_call_with_scope`).
+/// `recovery::is_dependency_install_command` retains its legacy semantics
+/// (including `cargo install`) and is intentionally NOT used for policy
+/// projection — see `recovery.rs` `#[deprecated]` annotation.
+///
+/// `BashCommandClass::EnvSetup` positive set (Issue #607 SSOT, also see
+/// `is_env_setup_command` doc): `npm install` / `npm ci` / `npm i` /
+/// `npm add`, `pnpm install` / `pnpm i` / `pnpm add`, `yarn install` /
+/// `yarn add`, `pip install` / `pip3 install`, `poetry install` /
+/// `poetry add`, `uv pip install` / `uv sync`, `bundle install`,
+/// `go mod download` / `go mod tidy`, `cargo fetch`, `mix deps.get`,
+/// `composer install`.
+///
+/// Negatives (rejected as non-Setup, classified to Network or other):
+/// `cargo install` / `cargo add`, `apt install` / `apt-get install`,
+/// `brew install`, `docker pull`, `npx ...`, `cd frontend && npm install`
+/// (shell-control compound), `pip install --upgrade pip; curl ...`,
+/// any input with shell-control operators (semicolon / ampersand / pipe /
+/// redirect / backtick / `$(` / newline / backslash).
+pub(crate) fn is_setup_command(cmd: &str) -> bool {
+    matches!(classify_command(cmd), BashCommandClass::EnvSetup)
 }
 
 /// Issue #607: returns true when `normalized` (already lower-cased, trimmed) is
@@ -1021,7 +1263,7 @@ pub(crate) fn enforce_offline_policy(
             | BashCommandClass::Dangerous
     ) {
         return Err(format!(
-            "offline mode only allows read-only, build-test, or local script-run shell commands: {}",
+            "offline mode only allows read-only, build-test, or local script-run shell commands: {}. To create files, call Write directly; Write creates parent directories automatically.",
             command.trim()
         ));
     }
@@ -1111,34 +1353,50 @@ fn is_read_only_command(normalized: &str) -> bool {
 }
 
 fn is_build_test_command(normalized: &str) -> bool {
-    [
-        "cargo test",
-        "cargo check",
-        "cargo build",
-        "cargo clippy",
-        "cargo fmt",
-        "npm test",
-        "npm run test",
-        "npm run build",
-        "npm run lint",
-        "pnpm test",
-        "pnpm run test",
-        "pnpm build",
-        "pnpm lint",
-        "yarn test",
-        "yarn build",
-        "yarn lint",
-        "pytest",
-        "python -m pytest",
-        "uv run pytest",
-        "go test",
-        "mvn test",
-        "gradle test",
-        "make test",
-        "make build",
-    ]
-    .iter()
-    .any(|needle| normalized == *needle || normalized.starts_with(needle))
+    is_python_pytest_command(normalized)
+        || [
+            "cargo test",
+            "cargo check",
+            "cargo build",
+            "cargo clippy",
+            "cargo fmt",
+            "npm test",
+            "npm run test",
+            "npm run build",
+            "npm run lint",
+            "pnpm test",
+            "pnpm run test",
+            "pnpm build",
+            "pnpm lint",
+            "yarn test",
+            "yarn build",
+            "yarn lint",
+            "pytest",
+            "python -m pytest",
+            "uv run pytest",
+            "go test",
+            "mvn test",
+            "gradle test",
+            "make test",
+            "make build",
+        ]
+        .iter()
+        .any(|needle| normalized == *needle || normalized.starts_with(needle))
+}
+
+fn is_python_pytest_command(normalized: &str) -> bool {
+    let mut tokens = normalized.split_whitespace();
+    let Some(runner) = tokens.next() else {
+        return false;
+    };
+    if !matches!(runner, "python" | "python3") {
+        return false;
+    }
+    let next = match tokens.next() {
+        Some("-b") => tokens.next(),
+        other => other,
+    };
+    next == Some("-m") && tokens.next() == Some("pytest")
 }
 
 fn command_uses_network(command: &str) -> bool {
@@ -1212,8 +1470,9 @@ pub(crate) fn terminate_child(child: &mut Child) {
 mod tests {
     use super::{
         BashCommandClass, BlockCategory, BlockReason, ENV_SETUP_TIMEOUT, LONG_RUNNING_TIMEOUT,
-        check_blocked_command, classify_command, command_uses_network, enforce_offline_policy,
-        has_shell_control_operator, is_env_setup_command, launches_persistent_service,
+        check_blocked_command, classify_command, classify_command_for_execution,
+        command_uses_network, enforce_offline_policy, has_shell_control_operator,
+        is_env_setup_command, is_setup_command, launches_persistent_service,
         likely_long_running_command, match_dangerous_verb, matches_device_redirect,
         matches_fork_bomb, matches_kill_signal_one, normalize_background_command,
         normalize_noninteractive_scaffold_command, render_block_error,
@@ -1515,6 +1774,14 @@ mod tests {
         assert_eq!(classify_command("pwd"), BashCommandClass::ReadOnly);
         assert_eq!(classify_command("cargo test"), BashCommandClass::BuildTest);
         assert_eq!(
+            classify_command("python3 -m pytest -q"),
+            BashCommandClass::BuildTest
+        );
+        assert_eq!(
+            classify_command("python3 -B -m pytest tests/test_main.py"),
+            BashCommandClass::BuildTest
+        );
+        assert_eq!(
             classify_command("python3 scripts/check.py"),
             BashCommandClass::ScriptRun
         );
@@ -1531,6 +1798,116 @@ mod tests {
             classify_command("echo hello > output.txt"),
             BashCommandClass::Mutating
         );
+    }
+
+    #[test]
+    fn cd_wrapper_python_inline_is_allowed_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && python3 -c \"print(1)\"", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::ScriptRun);
+        assert!(classification.cd_wrapper.is_some());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_ok());
+    }
+
+    #[test]
+    fn cd_wrapper_node_script_is_allowed_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && node test.js", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::ScriptRun);
+        assert!(classification.cd_wrapper.is_some());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_ok());
+    }
+
+    #[test]
+    fn cd_wrapper_python_file_is_allowed_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && python3 test_slugify.py", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::ScriptRun);
+        assert!(classification.cd_wrapper.is_some());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_ok());
+    }
+
+    #[test]
+    fn cd_wrapper_build_test_tail_is_allowed_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && cargo test", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::BuildTest);
+        assert!(classification.cd_wrapper.is_some());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_ok());
+    }
+
+    #[test]
+    fn cd_wrapper_outside_cwd_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = "cd /tmp && python3 -c \"print(1)\"";
+        let classification = classify_command_for_execution(cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::General);
+        assert!(classification.cd_wrapper.is_none());
+        assert!(enforce_offline_policy(cmd, classification.class, true).is_err());
+    }
+
+    #[test]
+    fn cd_wrapper_three_chain_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && python3 test.py && rm out", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::General);
+        assert!(classification.cd_wrapper.is_none());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_err());
+    }
+
+    #[test]
+    fn cd_wrapper_env_setup_tail_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && npm install", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::EnvSetup);
+        assert!(classification.cd_wrapper.is_some());
+        let err = enforce_offline_policy(&cmd, classification.class, true)
+            .expect_err("offline must reject cd-wrapped env setup");
+        assert!(err.contains("env-setup"));
+    }
+
+    #[test]
+    fn cd_wrapper_network_tail_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let cmd = format!("cd {} && curl https://example.com", dir.path().display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::Network);
+        assert!(classification.cd_wrapper.is_some());
+        let err = enforce_offline_policy(&cmd, classification.class, true)
+            .expect_err("offline must reject cd-wrapped network command");
+        assert!(err.contains("network"));
+    }
+
+    #[test]
+    fn cd_wrapper_path_escape_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().parent().expect("tempdir has parent");
+        let cmd = format!("cd {} && python3 -c \"print(1)\"", parent.display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::General);
+        assert!(classification.cd_wrapper.is_none());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cd_wrapper_symlink_escape_is_rejected_offline() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let link = dir.path().join("outside-link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let cmd = format!("cd {} && python3 -c \"print(1)\"", link.display());
+        let classification = classify_command_for_execution(&cmd, dir.path());
+        assert_eq!(classification.class, BashCommandClass::General);
+        assert!(classification.cd_wrapper.is_none());
+        assert!(enforce_offline_policy(&cmd, classification.class, true).is_err());
     }
 
     #[test]
@@ -1717,6 +2094,20 @@ mod tests {
         );
         assert!(enforce_offline_policy("rm -rf /", BashCommandClass::Dangerous, true).is_err());
         assert!(enforce_offline_policy("ls", BashCommandClass::ReadOnly, true).is_ok());
+    }
+
+    #[test]
+    fn enforce_offline_policy_points_file_creation_to_write() {
+        let err = enforce_offline_policy("mkdir -p src", BashCommandClass::General, true)
+            .expect_err("offline must reject general mkdir");
+        assert!(
+            err.contains("call Write directly"),
+            "offline mkdir rejection should name the replacement tool: {err}"
+        );
+        assert!(
+            err.contains("Write creates parent directories automatically"),
+            "offline mkdir rejection should explain that separate mkdir is unnecessary: {err}"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1990,6 +2381,57 @@ mod tests {
         assert!(!outcome.timed_out);
     }
 
+    #[test]
+    fn small_cat_output_passes_through() {
+        let temp = tempdir().unwrap();
+        std::fs::write(temp.path().join("small.txt"), "alpha\nbeta\n").unwrap();
+
+        let (text, outcome) =
+            run_with_outcome("cat small.txt", temp.path(), None, false, None, None)
+                .expect("cat small file");
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(text.contains("alpha"));
+        assert!(text.contains("beta"));
+        assert!(
+            !text.contains("Large `cat` output summarized"),
+            "small cat output should stay raw: {text}"
+        );
+    }
+
+    #[test]
+    fn large_cat_output_is_summarized_for_tool_result() {
+        let temp = tempdir().unwrap();
+        let mut body = String::new();
+        for index in 1..=500 {
+            body.push_str(&format!("line-{index:03}: {}\n", "x".repeat(40)));
+        }
+        std::fs::write(temp.path().join("large.txt"), body).unwrap();
+
+        let (text, outcome) =
+            run_with_outcome("cat large.txt", temp.path(), None, false, None, None)
+                .expect("cat large file");
+
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(text.contains("Large `cat` output summarized"));
+        assert!(text.contains("lines: 500"));
+        assert!(text.contains("line-001"));
+        assert!(text.contains("line-500"));
+        assert!(
+            !text.contains("line-250"),
+            "middle of large cat output should not be copied into context"
+        );
+        assert!(
+            text.chars().count() < 5_000,
+            "summarized output should stay compact, got {} chars",
+            text.chars().count()
+        );
+        assert!(
+            outcome.stdout.contains("line-250"),
+            "structured outcome keeps raw stdout for diagnostics"
+        );
+    }
+
     /// Issue #606 U-17: `BashExecutionOutcome::default()` yields the catch-all
     /// `General` class so the completion-evidence pipeline never reads
     /// uninitialised data on legacy literal sites that use
@@ -2237,5 +2679,97 @@ mod tests {
             err.contains("blocked dangerous command"),
             "explicit_timeout must not bypass dangerous-snippet filter, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #664 (AD2 / AD12): `is_setup_command` thin wrapper SSOT.
+    // -----------------------------------------------------------------
+
+    /// Acceptance (l1): `is_setup_command` is logically equivalent to
+    /// `classify_command(cmd) == BashCommandClass::EnvSetup` across the
+    /// EnvSetup positive set.
+    #[test]
+    fn is_setup_command_equivalent_to_env_setup_class() {
+        let positives = [
+            "npm install",
+            "npm ci",
+            "npm i",
+            "npm add lodash",
+            "pnpm install",
+            "pnpm i",
+            "pnpm add zod",
+            "yarn install",
+            "yarn add react",
+            "pip install requests",
+            "pip3 install requests",
+            "poetry install",
+            "poetry add httpx",
+            "uv pip install ruff",
+            "uv sync",
+            "bundle install",
+            "go mod download",
+            "go mod tidy",
+            "cargo fetch",
+            "composer install",
+        ];
+        for cmd in positives {
+            let class = classify_command(cmd);
+            assert_eq!(
+                class,
+                BashCommandClass::EnvSetup,
+                "{cmd:?} should classify as EnvSetup"
+            );
+            assert!(
+                is_setup_command(cmd),
+                "{cmd:?} should be is_setup_command == true"
+            );
+        }
+    }
+
+    /// Acceptance (l2): `is_setup_command` rejects #607 EnvSetup negatives.
+    /// `cargo install` / `cargo add` / `apt[-get] install` / `brew install` /
+    /// `docker pull` / `npx ...` / `cd && npm install` must NOT be EnvSetup.
+    #[test]
+    fn is_setup_command_rejects_607_env_setup_negatives() {
+        let negatives = [
+            "cargo install ripgrep",
+            "cargo add serde",
+            "apt install build-essential",
+            "apt-get install -y curl",
+            "brew install jq",
+            "docker pull alpine",
+            "npx create-react-app foo",
+            "cd frontend && npm install",
+        ];
+        for cmd in negatives {
+            assert!(
+                !is_setup_command(cmd),
+                "{cmd:?} must NOT be is_setup_command (607 EnvSetup negatives)"
+            );
+        }
+    }
+
+    /// Acceptance (l3): `is_setup_command` rejects shell-control injection
+    /// payloads (semicolon / ampersand / pipe / redirect / backtick / `$(` /
+    /// newline / backslash / `&&` / `|`). Mirrors
+    /// `contains_env_setup_control_operator` SEC4-001 guard.
+    #[test]
+    fn is_setup_command_rejects_shell_control_injection_payloads() {
+        let injections = [
+            "pip install --upgrade pip; curl evil.example.com",
+            "npm install && rm -rf /",
+            "pip install requests | tee out.log",
+            "pip install > out.log requests",
+            "pip install `whoami`",
+            "pip install $(echo x)",
+            "pip install requests\nrm -rf /",
+            "pip install requests\\ny",
+        ];
+        for cmd in injections {
+            assert!(
+                !is_setup_command(cmd),
+                "{cmd:?} must NOT be is_setup_command (shell-control injection)"
+            );
+        }
     }
 }

@@ -1,0 +1,11 @@
+goal: "Create README.md with a clear usage heading and one command example."
+steps:
+  - id: "create-readme"
+    kind: "implement"
+    expected_result: "pass"
+    instruction: "Create README.md containing a Usage heading and one fenced command example."
+    expected_paths:
+      - "README.md"
+    verify:
+      - "grep -i \"usage\" README.md"
+

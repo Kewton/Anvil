@@ -1,0 +1,141 @@
+# UAT004 Source-first Gate Runbook
+
+作成日: 2026-07-02
+
+## Purpose
+
+UAT004 の各 gate で、実行した検証、skip evidence、rollback 条件、次回再実行手順を同じ形式で残す。
+
+## Common Commands
+
+| command | when | expected handling |
+| --- | --- | --- |
+| `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` | each implementation gate | must pass before the gate is closed, unless a concrete blocker is recorded |
+| `pytest mvp/anvilminimal/tests/eval` | each implementation gate with eval fixtures | must pass before the gate is closed, unless a concrete blocker is recorded |
+| targeted `cargo test ... <fixture_name>` | before full test runs | records the positive/negative fixture tied to the gate |
+| provider probe | only for provider/prompt-sensitive changes or UAT004-GATE-07/GATE-09 | skip is allowed when no provider-sensitive behavior changed or credentials/network are unavailable |
+| browser/manual UAT | GATE-05/GATE-08/GATE-09 | skip is allowed outside those gates with explicit impact and next timing |
+
+## UAT004-GATE-02 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/minimal_step_runner.rs`, `profile.rs`, `plan_lint.rs`, `verify.rs`, `repair.rs`, `profiles/nextjs.rs` |
+| MVP refs | `mvp/anvilminimal/src/planner/lint.rs`, `mvp/anvilminimal/src/planner/runner.rs` |
+| targeted fixtures | `workspace_manifest_and_entrypoint_allow_final_nextjs_verify`, `workspace_manifest_without_entrypoint_still_rejects_nextjs_build`, `generated_final_verify_uses_existing_workspace_nextjs_artifacts`, `invalid_ultra_plan_generation_does_not_save_plan_file` |
+| full local verification | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed; `pytest mvp/anvilminimal/tests/eval` passed with 222 passed / 1 skipped |
+| provider probe | skipped; no provider request schema, parser, tool-call shape, or prompt text changed |
+| browser/manual UAT | skipped; final browser readiness and interaction acceptance remain G-S12/G-S16 |
+| anvildev comparison | skipped; final comparative source/MVP run remains GATE-09 |
+| rollback guard | do not accept deterministic fallback UltraPlan as success; do not reject final verify solely for plan-local entrypoint re-ownership when manifest+entrypoint exist; do not relax shell control rejection |
+
+## UAT004-GATE-03 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/loop_run/node_request_helpers.rs`, `node_runner_manifest.rs`, `project_probe.rs`, `project_verifier.rs`, `verifier_command_policy.rs`, `node_test_evidence_quality.rs`, `actor_loop_flow.rs` |
+| MVP refs | `mvp/anvilminimal/src/minimal_loop/dependency_setup.rs`, `minimal_loop/build_verifier.rs`, `planner/verify.rs`, `planner/lint.rs`, `planner/runner.rs` |
+| targeted fixtures | `workspace_entrypoint_without_manifest_routes_build_to_dependency_boundary`, `workspace_node_test_without_manifest_routes_test_to_dependency_boundary`, `next_build_without_manifest_reports_manifest_boundary_before_execution`, `nextjs_build_missing_manifest_is_dependency_boundary_not_command_execution`; existing setup blocked/allowed/build rerun and G-S08 verify policy fixtures rerun in full test suite |
+| full local verification | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 438 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 222 passed / 1 skipped |
+| network install | skipped; no real network install was executed, and setup remains gated by authority/workspace/profile contract |
+| browser/manual UAT | skipped; final browser readiness and interaction acceptance remain G-S12/G-S16 |
+| anvildev comparison | skipped; final comparative source/MVP run remains GATE-09 |
+| rollback guard | do not execute dependency setup without authority; do not let setup-only, manifest-only, build-only, or dependency handoff-only output become task success; do not relax verifier shell-control/workspace-escape rejection |
+
+## UAT004-GATE-04 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/loop_run/repair_job.rs`, `repair_lifecycle.rs`, `repair_job_dispatch.rs`, `verifier_repair_targeting.rs`, `scaffold_pipeline.rs`, `no_progress_recovery.rs`, `safe_stop_emit.rs`, `safe_stop_payload.rs`, `actor_loop_flow.rs`, `verifier_driver.rs`, `src/agent/minimal_step_runner/repair.rs` |
+| MVP refs | `mvp/anvilminimal/src/minimal_loop/repair_target.rs`, `minimal_loop/repair_progress.rs`, `minimal_loop/loop_run.rs`, `planner/repair.rs`, `planner/runner.rs`, `eval_events.rs` |
+| targeted fixtures | `browser_http_500_route_failure_targets_framework_config`, `browser_route_failure_targets_test_or_evidence`; existing missing-entrypoint, no-change, target-not-followed, unrelated-change, scaffold-continuation, recovery-handoff, and saved-recovery-run fixtures rerun in full cargo |
+| full local verification | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 440 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 222 passed / 1 skipped |
+| source/anvildev comparison | skipped; source `RepairJob` was inspected but not run under a same-condition anvildev trace. Comparative normalized source/MVP lifecycle trace remains GATE-09. |
+| browser/manual UAT | skipped; browser route failures are covered by deterministic fixtures, while release-grade browser/interaction execution remains GATE-05/GATE-09 |
+| provider probe | skipped; no provider request schema, parser, tool-call shape, or prompt text changed |
+| rollback guard | do not allow no-change repair, target-misdirected repair, scaffold-only output, or recovery handoff persistence to become task success; browser route failures must remain repair/recovery targets |
+
+## UAT004-GATE-05 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/loop_run/verifier.rs`, `verifier_driver.rs`, `project_probe.rs`, `project_verifier.rs`, `task_contract_completion_policy.rs`, `actor_loop_flow.rs`, `emit_verifier_events.rs` |
+| MVP refs | `mvp/anvilminimal/src/planner/runner.rs`, `minimal_loop/evidence.rs`, `minimal_loop/completion.rs`, `minimal_loop/build_verifier.rs`, `planner/profiles/nextjs.rs`, `scripts/eval_lib/browser_oracle.py`, `scripts/eval_lib/parity_gate.py` |
+| implementation | `planner/runner.rs` now writes dev-server lifecycle stages and probe environment into `dev_server_lifecycle` events and browser readiness evidence; final acceptance continues to require valid browser readiness plus interaction evidence content for release-grade pass |
+| targeted fixtures | `nextjs_dev_route_probe_disabled_records_lifecycle_stages`, `plan_run_nextjs_interactive_app_records_partial_release_gate`, `plan_run_nextjs_browser_http_500_fails_final_contract`, `plan_run_nextjs_browser_ready_without_interaction_is_partial`, `plan_run_nextjs_browser_and_interaction_evidence_passes_release_gate`; title/static/build-only, malformed evidence, missing interaction, and final acceptance repair/recovery fixtures rerun in full suites |
+| full local verification | `cargo fmt --manifest-path mvp/anvilminimal/Cargo.toml -- --check` passed; `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 440 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 222 passed / 1 skipped |
+| browser/manual UAT | live browser/manual execution skipped; browser/Playwright/dev-server must not be required by normal unit tests. Deterministic fixtures cover unavailable/failed/pass classification and evidence content. |
+| source/anvildev comparison | skipped; final comparative source/MVP browser and manual release trace remains GATE-09 |
+| rollback guard | do not allow build-only/title-only/static-only output, evidence path existence alone, malformed evidence, missing interaction evidence, browser unavailable, or browser HTTP 500 to become release-grade full success; keep browser unavailable `partial` and HTTP 500 `failed` |
+
+## UAT004-GATE-06 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/minimal_step_runner.rs`, `src/agent/minimal_step_runner/profile.rs`, `src/agent/minimal_step_runner/repair.rs` |
+| MVP refs | `mvp/anvilminimal/scripts/eval_lib/runtime_trace.py`, `mvp/anvilminimal/tests/eval/test_runtime_semantics_trace.py`, `mvp/anvilminimal/tests/eval/test_eval_cli_contract.py` |
+| implementation | `runtime_trace.py` normalizes source runtime prompt logs from `.anvil/state/sessions/*/logs/llm-io.jsonl` into phase-context and step-prompt trace events, keeps source/MVP prompt contract booleans in normalized events, fails G-S05/G-S06 for missing semantic fields, and treats trace absence as non-pass. |
+| trace commands | `python3 mvp/anvilminimal/scripts/eval-trace.py --run-root /private/tmp/anvilminimal-eval-0229-anvildev-net-timeout --subject source-anvildev ... --output-dir workspace/mvp/uat/004/gate06_trace/source`; same command for `/private/tmp/anvilminimal-eval-0229-mvp-net-timeout`; then `--compare-source-report ... --compare-mvp-report ... --diff-output workspace/mvp/uat/004/gate06_trace/runtime-semantics-trace-diff.json` |
+| normalized comparison | `same_condition.status=match`, source signatures 48, MVP signatures 48, `semantic_findings=[]`; G-S05 source/MVP counts 94/75 and G-S06 source/MVP counts 100/141 both pass with `source_and_mvp_gate_observed` |
+| targeted fixtures | `test_source_anvildev_llm_prompts_produce_phase_and_step_trace`, `test_compare_reports_detects_missing_phase_context`, `test_compare_reports_detects_missing_expected_result_and_verify`, `test_compare_reports_does_not_pass_gate_counts_without_prompt_trace`, and comparative preflight fixture update for normalized G-S05/G-S06 events |
+| full local verification | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 440 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 226 passed / 1 skipped |
+| provider/browser/manual UAT | skipped; GATE-06 uses existing same-condition runtime traces and does not require new provider calls, browser readiness, or manual TUI execution |
+| remaining unrelated gates | overall diff still has unrelated failed gate ids outside G-S05/G-S06; they remain assigned to later UAT004 gates |
+| rollback guard | do not allow trace-missing reports, missing phase context, missing expected result, or missing verify commands to pass G-S05/G-S06; do not remove source prompt-log normalization unless source emits equivalent native runtime trace events |
+
+## UAT004-GATE-07 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/ollama/client.rs`, `src/ollama/xml_fallback.rs`, `src/agent/minimal_step_runner.rs`, `src/agent/minimal_step_runner/repair.rs` |
+| MVP refs | `mvp/anvilminimal/src/providers/xml_fallback.rs`, `providers/openai.rs`, `providers/gemini.rs`, `providers/ollama.rs`, `tools/args_recovery.rs`, `tools/registry.rs`, `tests/live_provider.rs`, `scripts/eval-run.py` |
+| implementation | MVP XML fallback now accepts source-style XML/function tag variants and relaxed JSON while preserving tool policy enforcement; provider probe summary now records unsafe shell-control rejection. |
+| provider probe | `ANVIL_PROVIDER_PROBE=1 ANVIL_PROVIDER_PROBE_OUT=/Users/maenokota/share/work/github_kewton/Anvil-develop/workspace/mvp/uat/004/gate07_provider_probe/provider-probe-live.jsonl cargo test --manifest-path mvp/anvilminimal/Cargo.toml --test live_provider provider_probe -- --nocapture` passed with 5 provider probe tests. Initial sandbox network failure was rerun with network approval. |
+| provider probe result | `provider_probe_summary.json` status `passed`: 7 passed, 0 failed, 0 skipped; OpenAI live tool args shape passed, Gemini live function-calling schema passed, Ollama XML fallback passed, recoverable provider args 3, unsafe path rejection 3, unsafe shell-control rejection 3. |
+| eval attachment | `python3 scripts/eval-run.py --suite eval/suites/mvp-provider-smoke.yaml --model-profile openai-only --modes minimal-loop --runs 1 --scenario write-one-file-small --run-root .../gate07_provider_probe/eval-summary --provider-probe-results .../provider-probe-live.jsonl --dry-run` wrote summary/events with provider probe status `passed`. |
+| targeted fixtures | `providers::xml_fallback`, `provider_probe_tool_args_recovery_classification_by_provider`, `test_provider_probe_results_are_recorded_in_dry_run_summary` |
+| full local verification | `cargo fmt --manifest-path mvp/anvilminimal/Cargo.toml -- --check` passed; `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 446 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 226 passed / 1 skipped |
+| skip evidence | no provider probe skip in this run; API keys were available. Future no-key runs must record `missing_openai_api_key` / `missing_gemini_api_key` skip reasons instead of failing normal unit tests. |
+| full source port escalation | not required for G-S07/G-S15; no provider/tool diff remained after XML fallback parity and live provider probe evidence. |
+| rollback guard | do not treat provider parse/network/HTTP failures as runtime success; do not recover workspace escapes, hidden metadata access, or dangerous shell commands; do not close provider-sensitive changes with fake fixtures alone. |
+
+## UAT004-GATE-08 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/loop_run/summary.rs`, `safe_stop_emit.rs`, `safe_stop_payload.rs`, `emit_verifier_events.rs` |
+| MVP refs | `mvp/anvilminimal/src/eval_events.rs`, `src/lib.rs`, `src/tui/slash.rs`, `scripts/eval_lib/runtime_trace.py`, `tests/tui_integration.rs`, `tests/eval/test_runtime_semantics_trace.py` |
+| implementation | Completion projection now renders and emits command status, task status, session/REPL status, and recovery next action separately. `run_stop` and `tui_command_stop` carry `task_status`, `session_status`, `repl_status`, and `recovery_next_action`; source safe-stop/verifier diagnostic events are normalized into G-S14 trace. |
+| normalized comparison | `workspace/mvp/uat/004/gate08_trace/runtime-semantics-trace-diff.json` has same-condition `match`; G-S14 and G-S16 both pass with `source_and_mvp_gate_observed`. Other gates are intentionally unobserved in this scoped trace and remain covered by their own gate artifacts. |
+| manual/TUI evidence | `workspace/mvp/uat/004/gate08_trace/manual_tui_run/.anvil/runs/gate08-manual/events.jsonl` and `summary.md` prove events are stored under `.anvil/runs/<run-id>/events.jsonl`, failed task status is not overwritten by `repl_ready`, and recovery YAML path plus suggested command are present. |
+| targeted fixtures | `tui_slash_failure_records_run_events_and_failure_stage`, `tui_slash_success_with_partial_release_gate_is_not_complete_only`, `run_lifecycle_records_incomplete_stop_reason`, `run_lifecycle_writes_events_and_summary_for_tui_exit`, `test_source_and_mvp_diagnostics_trace_can_pass_gs14`, `test_run_start_without_eval_override_is_manual_trace_evidence` |
+| verification | `cargo fmt --manifest-path mvp/anvilminimal/Cargo.toml -- --check` passed; `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 446 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 227 passed / 1 skipped. Targeted GATE-08 Rust and runtime trace fixtures also passed. |
+| live manual UAT | deferred to GATE-09. GATE-08 registers deterministic manual trace evidence; full terminal/browser/manual release UAT remains the final comparative gate. |
+| rollback guard | do not collapse command completion, task status, and REPL/session readiness into a single `complete` label; do not drop failure kind, stop reason, recovery next action, recovery YAML path, or suggested recovery command from events/summary. |
+
+## Re-run Notes
+
+Before closing an implementation gate, update:
+
+- `source_first_gate_status.md` with gate status, evidence, remaining issue, next action, rollback condition.
+- `source_mvp_trace_manifest.md` with source/MVP refs, trace or skip evidence, provider/browser/anvildev status.
+- `source_runtime_module_inventory.md` with source authority applied and MVP implementation.
+- `test0701_005_regression_fixture.md` when a baseline fixture gains executable assertions.
+
+## UAT004-GATE-09 Run Record
+
+| item | result |
+| --- | --- |
+| release build | `cargo build --release --manifest-path mvp/anvilminimal/Cargo.toml` passed; release binary used for MVP comparative eval |
+| cargo verification | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 446 lib tests plus integration/doc tests |
+| eval verification | `pytest mvp/anvilminimal/tests/eval` passed with 227 passed / 1 skipped |
+| MVP targeted eval | `python3 scripts/eval-run.py --suite eval/suites/mvp-provider-smoke.yaml --model-profile openai-only --modes minimal-loop --runs 1 --scenario write-one-file-small --binary .../target/release/anvilminimal --binary-kind anvilminimal --run-root /private/tmp/anvil-uat004-gate09/mvp-provider-smoke-live --parallel 1 --provider-limit 1 --timeout-sec 420` ran with network approval and failed as `verify_repair_no_change` |
+| anvildev comparison | same suite/profile/mode/scenario with `--binary anvildev --binary-kind anvildev --run-root /private/tmp/anvil-uat004-gate09/anvildev-provider-smoke-live`; command used `anvildev --engine minimal`; result passed |
+| trace comparison | `python3 scripts/eval-trace.py --compare-source-report .../anvildev-provider-smoke-live/runtime-semantics-trace-report.json --compare-mvp-report .../mvp-provider-smoke-live/runtime-semantics-trace-report.json --diff-output /private/tmp/anvil-uat004-gate09/source-mvp-runtime-trace-diff.json` |
+| release parity report | Generated `workspace/mvp/uat/004/gate09_release/parity_gate_report.json` with `build_parity_gate_report(gate_level="release")`; schema validation errors `[]`; release result is open/fail, not pass |
+| manual browser UAT | Copied original `test0701_005` workspace to `/private/tmp/anvil-uat004-gate09/test0701_005_browser_uat`; `env -u NODE_ENV npm run dev` started on 3011 after approval; `curl` returned HTTP 200; Playwright with cached Chromium clicked `DIFF 1` and observed canvas state change |
+| manual TUI UAT | Original `test0701_005` events/summary were fixed as failure evidence in `gate09_release/test0701_005.original-events.jsonl` and `.summary.md`; parity gate treats it as `tui_command_failed`, so release UAT does not pass |
+| recovery run | Saved MVP recovery YAML from provider-smoke run was executed with release binary and dotenv-loaded OpenAI key. It failed concretely as `phase_scaffold_error` because generated StepPlan verify command violated shell-control policy. Evidence: `recovery-run.events.jsonl`, `.summary.md`, `.stderr.log` |
+| correct failure detection vs regression | MVP did not falsely pass after bad artifact content, but anvildev produced accepted artifact. Classification: `release_quality_blocker_detected`, runtime/artifact quality gap relative to source; not an intentional non-port candidate |
+| full eval | Skipped; targeted same-condition comparative eval already exposed a release blocker. Re-run full eval after provider-smoke and release/TUI blockers are fixed. |
+| rollback guard | Do not permit blank failure kind, build-only/path-only release pass, missing recovery handoff, recovery handoff as success, or failed TUI task hidden behind REPL readiness. |

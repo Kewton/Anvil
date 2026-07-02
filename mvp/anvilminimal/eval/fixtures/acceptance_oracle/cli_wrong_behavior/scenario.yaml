@@ -1,0 +1,9 @@
+profile: generic
+prompt: Create a small Rust CLI with one unit test and cargo test verification.
+expected_artifacts:
+  - src/main.rs
+functional_contract:
+  category: cli-tool
+  required_capabilities:
+    - entrypoint
+    - deterministic_check

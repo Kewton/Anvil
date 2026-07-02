@@ -177,6 +177,51 @@ pub fn should_request_confirmation(c: &ModeClassification, raw_input: &str) -> b
     c.ambiguity || c.confidence < WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD
 }
 
+/// Issue #922 (PR2-001): SSOT for detecting an explicit "do not edit /
+/// read-only" instruction. Imperative prohibitive phrases only (not the bare
+/// substring "no changes", which matches descriptive text — CB2-001). Reused by
+/// the WorkMode classifier and the research report-intent gate so an explicit
+/// no-edit request can never be upgraded to an editing mode nor forced into a
+/// file obligation.
+pub fn request_has_explicit_no_edit(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "do not modify files",
+            "do not modify any files",
+            "do not modify the file",
+            "do not modify this file",
+            "do not modify anything",
+            "do not modify the repository",
+            "do not modify the workspace",
+            "don't modify files",
+            "don't modify any files",
+            "don't modify the file",
+            "don't modify this file",
+            "don't modify anything",
+            "do not edit",
+            "don't edit",
+            "do not change",
+            "don't change",
+            "no edits",
+            "no changes please",
+            "make no changes",
+            "without changes",
+            "no file changes",
+            "without changing files",
+            "read only",
+            "read-only",
+            "変更しない",
+            "編集しない",
+            "ファイルは変更しない",
+            "変更せず",
+            "編集せず",
+            "読み取り専用",
+        ],
+    )
+}
+
 pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
     let lower = raw.to_ascii_lowercase();
     let explicit_edit = contains_any(
@@ -211,31 +256,7 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
     // contexts like "the app says no changes detected" and incorrectly route
     // legitimate edit requests to `AnswerOnly`. The phrases below all encode an
     // imperative "do not make changes" intent.
-    let explicit_no_edit = contains_any(
-        &lower,
-        &[
-            "do not modify",
-            "don't modify",
-            "do not edit",
-            "don't edit",
-            "do not change",
-            "don't change",
-            "no edits",
-            "no changes please",
-            "make no changes",
-            "without changes",
-            "no file changes",
-            "without changing files",
-            "read only",
-            "read-only",
-            "変更しない",
-            "編集しない",
-            "ファイルは変更しない",
-            "変更せず",
-            "編集せず",
-            "読み取り専用",
-        ],
-    );
+    let explicit_no_edit = request_has_explicit_no_edit(raw);
     let answer_request = contains_any(
         &lower,
         &[
@@ -275,14 +296,13 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             "web app",
             "frontend",
             "front-end",
-            "ui",
-            "ux",
             "画面",
             "アプリ",
             "ゲーム",
             "フロントエンド",
         ],
-    );
+    ) || contains_ascii_token(&lower, "ui")
+        || contains_ascii_token(&lower, "ux");
     let explicit_ui_framework = contains_any(
         &lower,
         &["next.js", "nextjs", "react", "nuxt", "vue", "vite", "tsx"],
@@ -354,6 +374,7 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
         ],
     );
     let primary_code_task = request_has_primary_code_task(raw, &lower);
+    let generic_code_stack_signal = request_has_generic_code_stack_signal(raw, &lower);
 
     let mut candidates = Vec::<WorkModeCandidate>::new();
     if explicit_no_edit || (answer_request && !explicit_edit) {
@@ -379,8 +400,12 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
             confidence += 0.03;
             evidence.push("edit-intent");
         }
-        if primary_code_task && (explicit_python_artifact || explicit_ui_framework) {
-            confidence = confidence.min(0.55);
+        if primary_code_task {
+            confidence = confidence.min(if explicit_python_artifact || explicit_ui_framework {
+                0.55
+            } else {
+                0.62
+            });
             evidence.push("secondary-docs-for-code-task");
         }
         candidates.push(WorkModeCandidate {
@@ -425,11 +450,17 @@ pub fn classify_work_mode_json(raw: &str) -> ModeClassification {
         });
     }
     if explicit_edit {
+        let mut confidence: f32 = 0.7;
+        let mut evidence = vec!["edit-intent"];
+        if generic_code_stack_signal && !explicit_python_artifact && !explicit_ui_framework {
+            confidence = 0.92;
+            evidence.push("generic-code-stack-signal");
+        }
         candidates.push(WorkModeCandidate {
             work_mode: WorkMode::GenericCode,
-            intent: "code",
-            confidence: 0.7,
-            evidence: vec!["edit-intent"],
+            intent: "generic-edit",
+            confidence,
+            evidence,
         });
     }
     if candidates.is_empty() {
@@ -493,7 +524,7 @@ fn mode_reason(mode: WorkMode) -> &'static str {
             "UI, frontend, TypeScript, or browser app signals outscore alternatives"
         }
         WorkMode::GenericCode => {
-            "request has edit intent without a specific language or artifact mode"
+            "request has generic file-edit or artifact intent without a more specific mode"
         }
         WorkMode::Unknown | WorkMode::Auto => "request lacks enough mode-specific signals",
     }
@@ -530,6 +561,12 @@ fn request_has_primary_code_task(raw: &str, lower: &str) -> bool {
             "component",
             "service",
             "module",
+            "library",
+            "crate",
+            "package",
+            "tool",
+            "program",
+            "command",
         ],
     ) || contains_ascii_token(lower, "api")
         || contains_any(
@@ -541,11 +578,39 @@ fn request_has_primary_code_task(raw: &str, lower: &str) -> bool {
                 "フロントエンド",
                 "アプリ",
                 "機能",
+                "ライブラリ",
+                "クレート",
+                "パッケージ",
+                "ツール",
+                "コマンド",
             ],
         )
         || mentions_stack_as_build_target(raw, lower);
 
     production_action && code_subject
+}
+
+fn request_has_generic_code_stack_signal(raw: &str, lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "cargo test",
+            "cargo.toml",
+            "rust",
+            ".rs",
+            "src/lib.rs",
+            "go test",
+            "golang",
+            "maven",
+            "gradle",
+            "java",
+            "kotlin",
+            "swift",
+            "node --test",
+            "node.js",
+            "nodejs",
+        ],
+    ) || contains_any(raw, &["Rustで", "Cargo.toml", "標準入力"])
 }
 
 fn contains_ascii_token(haystack: &str, needle: &str) -> bool {
@@ -577,11 +642,15 @@ fn mentions_stack_as_build_target(raw: &str, lower: &str) -> bool {
             "with django",
             "using django",
             "django app",
+            "rust library",
+            "rust crate",
+            "rust package",
+            "cargo project",
         ],
     ) || contains_any(
         raw,
         &["FastAPIで", "Flaskで", "Djangoで", "Pythonで", "Rustで"],
-    )
+    ) || (raw.contains("Rust") && contains_any(raw, &["ライブラリ", "クレート", "パッケージ"]))
 }
 
 fn request_requires_tests(lower: &str, raw: &str) -> bool {
@@ -718,6 +787,42 @@ mod tests {
             infer_work_mode_from_text("Next.jsアプリを作成してREADMEも追加してください"),
             WorkMode::TypeScriptUi
         );
+        assert_eq!(
+            infer_work_mode_from_text(
+                "Node.jsでToDo管理CLIを開発してください。README.mdとテストコードも作成してください。"
+            ),
+            WorkMode::GenericCode
+        );
+        assert_eq!(
+            infer_work_mode_from_text(
+                "Rustで標準入力を読むCLIを開発してください。README.mdとテストコードも実装してください。"
+            ),
+            WorkMode::GenericCode
+        );
+        let rust_library = classify_work_mode_json(
+            "文字列スラッグ生成用のRustライブラリを開発してください。README.mdとcargo testで動くテストも実装してください。",
+        );
+        assert_eq!(rust_library.work_mode, WorkMode::GenericCode);
+        assert!(rust_library.requires_tests);
+        assert!(rust_library.evidence.contains(&"edit-intent"));
+        assert!(rust_library.evidence.contains(&"generic-code-stack-signal"));
+        assert!(
+            rust_library.confidence >= WORK_MODE_CONFIRM_CONFIDENCE_THRESHOLD,
+            "Rust/Cargo generic-code signals should not need LLM mode confirmation: {:?}",
+            rust_library
+        );
+
+        let rust_tdd = classify_work_mode_json(
+            "TDDで進めてください。まず tests/password_strength.rs に失敗するテストを書き、その後 src/lib.rs に password_score(password: &str) -> u8 を実装してください。cargo test --manifest-path Cargo.toml が成功するまで進めてください。",
+        );
+        assert_eq!(rust_tdd.work_mode, WorkMode::GenericCode);
+        assert!(rust_tdd.requires_tests);
+        assert!(rust_tdd.evidence.contains(&"generic-code-stack-signal"));
+        assert!(
+            !should_request_confirmation(&rust_tdd, ""),
+            "Rust/Cargo TDD request should stay controller-classified without second-pass override: {:?}",
+            rust_tdd
+        );
     }
 
     #[test]
@@ -768,6 +873,32 @@ mod tests {
             infer_work_mode_from_text("docs/ui-guidelines.mdを更新してください"),
             WorkMode::Docs
         );
+    }
+
+    #[test]
+    fn mode_classifier_does_not_treat_required_artifacts_as_ui_signal() {
+        let classification = classify_work_mode_json(
+            r#"Create summary.json only. STATE_CONTROL_PACKET {"required_artifacts":[{"path":"summary.json","role":"data"}]}. Write valid JSON."#,
+        );
+
+        assert_eq!(classification.work_mode, WorkMode::GenericCode);
+        assert_eq!(classification.intent, "generic-edit");
+        assert!(
+            !classification
+                .alternatives
+                .iter()
+                .any(|candidate| candidate.work_mode == WorkMode::TypeScriptUi),
+            "unexpected UI candidate from required_artifacts: {:?}",
+            classification.alternatives
+        );
+    }
+
+    #[test]
+    fn mode_classifier_still_detects_explicit_ui_token() {
+        let classification = classify_work_mode_json("UI artifactを作成してください");
+
+        assert_eq!(classification.work_mode, WorkMode::TypeScriptUi);
+        assert!(classification.evidence.contains(&"ui-or-frontend-signal"));
     }
 
     #[test]
@@ -830,6 +961,7 @@ mod tests {
     #[test]
     fn classifier_detects_english_negated_edit_phrases() {
         for phrase in [
+            "Please review the code but do not modify any files.",
             "Please review the code but do not edit anything.",
             "Read the file, don't edit it.",
             "Summarize the architecture; no edits.",
@@ -897,5 +1029,17 @@ mod tests {
                 "phrase missing explicit-no-edit evidence: {phrase}",
             );
         }
+    }
+
+    #[test]
+    fn classifier_does_not_treat_no_code_edits_as_global_no_edit() {
+        let classification =
+            classify_work_mode_json("Investigate options and write report.md. Do not modify code.");
+
+        assert_ne!(classification.work_mode, WorkMode::AnswerOnly);
+        assert!(
+            !classification.evidence.contains(&"explicit-no-edit"),
+            "code-only prohibition must not disable non-code artifacts"
+        );
     }
 }

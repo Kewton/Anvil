@@ -40,6 +40,22 @@ Ollama 直結の local-first コーディングエージェント。multi-provid
 - 読み取り専用の Plan mode 制御
 - live Ollama E2E を含む unit / integration / ignored E2E tests
 
+## 複雑性レポート
+
+大きい制御フローの退行確認には、軽量な rough complexity レポートを使う。
+
+```bash
+python3 scripts/complexity_report.py --top 10 \
+  src/agent/loop_run/turn.rs \
+  src/agent/loop_run/repair_job.rs \
+  src/agent/loop_run/model_request.rs \
+  src/agent/loop_run/tool_execution.rs
+```
+
+- JSON が必要なら `--json` を付ける
+- 現在の baseline は `workspace/v0.4.25/complexity-baseline.json`
+- CI では script / fixture / snapshot command の実行可能性だけを確認し、現行 debt 自体では fail させない
+
 ## クイックスタート
 
 ### 1. Ollama を起動
@@ -155,7 +171,7 @@ LLM 推論中・ツール実行中は stderr に 80ms 間隔のスピナーを�
 
 Act-mode で `AutoTestRunner::detect == None`（明示的な test verifier が無い repo）かつ Rust / Node / Python のいずれかが検出されたとき、main model を 1 回だけ同期呼び出し（`tools=None`、JSON-only、`<think>` strip + first JSON object 抽出、`tool_calls` 非空は abort）して smoke test を生成し、`state_root/sessions/<id>/tmp-tests/files/` に保存したうえで固定テンプレートの Bash（Rust: `cargo test --manifest-path ...`、Node: `node --check`、Python: `python3 -m py_compile`）を 30 秒の明示 timeout 付きで実行する。Rust 経路は `tester-runs/<run_id>/` に transient harness（path dependency = workspace package）を書き出して走らせ、終了後に best-effort cleanup する。結果は `FeedbackFrame` として `WorkingMemory.last_feedback` に記録され、Reminder Sidecar 経路と接続して `Precaution` の自動生成に繋がる。
 
-`AutoTestRunner` は verifier を単一キーワードで即決せず、`ANVIL.md` の安全な preferred command、Cargo manifest、`package.json` の `scripts.*`、Python test surface、`py_compile` fallback を候補化して confidence / evidence 付きで選択する。`package.json` は JSON として読み、トップレベルの `"test"` 文字列だけでは `npm test` を選ばない。
+`AutoTestRunner` は verifier を単一キーワードで即決せず、`ANVIL.md` の安全な preferred command、Cargo manifest、`package.json` の `scripts.*`、Python test surface、`py_compile` fallback を候補化して confidence / evidence 付きで選択する。task-kind verifier adapter は coding / docs / data の境界で completion evidence と repair packet を正規化する。coding adapter の最終 success verifier は Rust では full `cargo test`、Python では `python3 -m pytest -q`、Node では `npm test` を completion evidence として扱う。`package.json` は JSON として読み、トップレベルの `"test"` 文字列だけでは `npm test` を選ばない。
 
 Protocol success は work mode ごとに判定される。deterministic fallback はローカル LLM が詰まったときの recovery context として扱い、ファイルが生成されてもそれ単体では完了扱いにしない。完了には model-produced work、または protocol に合う成果物と verifier の通過が必要になる。
 
@@ -164,7 +180,7 @@ Protocol success は work mode ごとに判定される。deterministic fallback
 - per-turn cap = 1（`tester_called_this_turn` で同一ターン内 2 回目以降を抑止）
 - Plan モード中（`/plan` 解除前は smoke test 生成・実行とも行わない）
 - `ANVIL_NO_TESTER` が非空値で設定: Tester Skill を一切起動しない
-- `AutoTestRunner::detect` が `Some(_)` を返す repo（`npm test` / `cargo test` with `tests/` / `pytest` 等の明示 verifier が既にある場合は従来の auto_test 経路を使う）
+- `AutoTestRunner::detect` が `Some(_)` を返す repo（`npm test` / full `cargo test` / `python3 -m pytest -q` 等の明示 verifier が既にある場合は従来の auto_test 経路を使う）
 
 承認モードは runtime から派生する: `--yes` 起動時は Auto、TTY 環境では Interactive（`y` / `yes` 以外は abort）、それ以外（CI / 非 TTY）は Forbidden で即 abort。Tester 起動中は registry 層で `ToolContext.tester_active = true` が立ち、Edit / Write の対象 path が `tmp-tests/` 配下でない場合は reject される。Logging は `agent.tester.{llm_call_started,llm_call_completed,llm_call_failed,completed,failed,skipped}` を `llm-io.jsonl` へ追記する。
 

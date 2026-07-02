@@ -1,0 +1,185 @@
+use std::path::Path;
+
+use crate::planner::verify::VerificationReport;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileQualityExpectations {
+    pub required_artifacts: Vec<String>,
+    pub preferred_verify: Vec<String>,
+    pub forbidden_verify: Vec<String>,
+    pub dependency_order_hint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProfileSnapshot {
+    Data(crate::planner::profiles::data::ProfileSnapshot),
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhaseVerificationMode {
+    IntermediateInvariant,
+    FinalAcceptance,
+}
+
+pub fn verify_profile(root: &Path, profile: &str, goal: &str) -> VerificationReport {
+    verify_profile_final(root, profile, goal)
+}
+
+pub fn verify_profile_final(root: &Path, profile: &str, goal: &str) -> VerificationReport {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => crate::planner::profiles::nextjs::verify(root, goal),
+        "data" | "data-analysis" | "data-pipeline" => crate::planner::profiles::data::verify(root),
+        _ => VerificationReport::pass(),
+    }
+}
+
+pub fn verify_profile_invariant(
+    root: &Path,
+    profile: &str,
+    goal: &str,
+    snapshot: &ProfileSnapshot,
+) -> VerificationReport {
+    let snapshot_report = profile_after_phase(root, profile, snapshot);
+    if !snapshot_report.is_pass() {
+        return snapshot_report;
+    }
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::verify_invariant(root, goal)
+        }
+        _ => VerificationReport::pass(),
+    }
+}
+
+pub fn profile_before_phase(root: &Path, profile: &str) -> anyhow::Result<ProfileSnapshot> {
+    match profile {
+        "data" | "data-analysis" | "data-pipeline" => Ok(ProfileSnapshot::Data(
+            crate::planner::profiles::data::before_phase(root)?,
+        )),
+        _ => Ok(ProfileSnapshot::None),
+    }
+}
+
+pub fn profile_after_phase(
+    root: &Path,
+    profile: &str,
+    snapshot: &ProfileSnapshot,
+) -> VerificationReport {
+    match (profile, snapshot) {
+        ("data" | "data-analysis" | "data-pipeline", ProfileSnapshot::Data(snapshot)) => {
+            crate::planner::profiles::data::after_phase(root, snapshot)
+        }
+        _ => VerificationReport::pass(),
+    }
+}
+
+pub fn profile_guidance(profile: &str, goal: &str) -> Option<String> {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => Some(crate::planner::profiles::nextjs::guidance(goal)),
+        _ => None,
+    }
+}
+
+pub fn profile_runtime_contract(profile: &str, intent: &str, goal: &str) -> String {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::runtime_contract(intent, goal)
+        }
+        "rust" => "- Preserve Cargo.toml and crate entrypoints.\n\
+- Prefer cargo check or cargo test for deterministic verification.\n\
+- Do not weaken tests or public behavior to hide failures."
+            .to_string(),
+        "python" => "- Preserve the existing Python package/import layout.\n\
+- Keep dependency setup separate from deterministic verification.\n\
+- Prefer pytest, unittest, or python -m py_compile checks after source files exist."
+            .to_string(),
+        "docs" | "documentation" => "- Produce or update documentation artifacts.\n\
+- Keep claims grounded in inspected files.\n\
+- Avoid source-code changes unless the phase explicitly requires them."
+            .to_string(),
+        "data" | "data-analysis" | "data-pipeline" => "- Preserve raw input data.\n\
+- Write derived outputs to explicit output artifacts.\n\
+- Use deterministic checks for generated files when practical."
+            .to_string(),
+        _ => "- Keep changes scoped to the current phase and workspace.".to_string(),
+    }
+}
+
+pub fn profile_generation_rules(profile: &str, intent: &str) -> Option<&'static str> {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            Some(crate::planner::profiles::nextjs::generation_rules(intent))
+        }
+        "rust" => Some(
+            "- Profile rust: preserve Cargo project semantics. Keep Cargo.toml before cargo check/test verification, do not weaken scripts or tests to hide failures, and end with cargo check or cargo test when practical.\n",
+        ),
+        "python" => Some(
+            "- Profile python: keep dependency setup separate from deterministic verification. Prefer python -m py_compile, pytest, or unittest checks after source files exist. Do not put package installation in verify commands.\n",
+        ),
+        _ => None,
+    }
+}
+
+pub fn profile_expected_paths(root: &Path, profile: &str, goal: &str) -> Vec<String> {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::expected_paths(root, goal)
+        }
+        _ => Vec::new(),
+    }
+}
+
+pub fn profile_quality_expectations(
+    root: &Path,
+    profile: &str,
+    goal: &str,
+) -> ProfileQualityExpectations {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::quality_expectations(root, goal)
+        }
+        _ => ProfileQualityExpectations::default(),
+    }
+}
+
+pub fn profile_repair_prompt(
+    root: &Path,
+    profile: &str,
+    goal: &str,
+    report: &VerificationReport,
+) -> Option<String> {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => Some(crate::planner::profiles::nextjs::repair_prompt(
+            root, goal, report,
+        )),
+        _ => None,
+    }
+}
+
+pub fn profile_auto_repair(
+    root: &Path,
+    profile: &str,
+    goal: &str,
+    report: &VerificationReport,
+) -> anyhow::Result<bool> {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::auto_repair(root, goal, report)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub fn profile_post_step_repair(root: &Path, profile: &str, goal: &str) -> anyhow::Result<bool> {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::repair_manifest_coherence(root, goal)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub fn profile_failure(reason: impl Into<String>) -> VerificationReport {
+    VerificationReport::profile_failed(reason)
+}
