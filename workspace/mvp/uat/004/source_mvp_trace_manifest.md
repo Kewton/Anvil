@@ -160,12 +160,29 @@ GATE-00 では実装変更、provider probe、browser run、anvildev 比較を�
 | required local tests | passed | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`: passed with 440 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval`: passed with 226 passed, 1 skipped |
 | new provider/browser run | skipped | GATE-06 is trace normalization/comparison over existing same-condition anvildev/MVP run roots. It does not require a new provider call, browser, or manual run. |
 
+## UAT004-GATE-07 Trace Update
+
+| item | status | evidence |
+| --- | --- | --- |
+| source refs inspected | complete | `src/ollama/client.rs`, `src/ollama/xml_fallback.rs`, `src/agent/minimal_step_runner.rs`, `src/agent/minimal_step_runner/repair.rs` |
+| MVP refs changed | complete | `mvp/anvilminimal/src/providers/xml_fallback.rs`, `mvp/anvilminimal/tests/live_provider.rs`, `mvp/anvilminimal/scripts/eval-run.py`, `mvp/anvilminimal/tests/eval/test_eval_cli_contract.py` |
+| provider probe JSONL | passed | `workspace/mvp/uat/004/gate07_provider_probe/provider-probe-live.jsonl`: 7 provider probe events, 0 failed, 0 skipped |
+| provider probe summary | attached | `workspace/mvp/uat/004/gate07_provider_probe/eval-summary/provider_probe_summary.json`: `status=passed`, `passed=7`, `failed=0`, `skipped=0`, `recoverable_tool_args_classified=3`, `unsafe_tool_args_rejected=3`, `unsafe_shell_control_rejected=3` |
+| eval summary attachment | passed | `workspace/mvp/uat/004/gate07_provider_probe/eval-summary/summary.eval.tsv` records `provider_probe_required=true`, `provider_probe_status=passed`, `provider_probe_passed=7`, `provider_probe_failed=0`, `provider_probe_skipped=0` |
+| OpenAI probe | passed | Live `tool_args_shape` returned one `Write` tool call with object arguments; provider parser fixtures also recover JSON-string aliased args. |
+| Gemini probe | passed | Live `function_calling_schema` returned one `Write` function call with object arguments; provider parser fixtures also recover JSON-string aliased args. |
+| Ollama/XML probe | passed | Local XML fallback probe recovers source-style function-call output. Source parity fixtures cover source-style named tags, `<function=...>`, inferred unambiguous tool names, closed unterminated blocks, and relaxed JSON payloads. |
+| unsafe args policy | passed | Provider-shaped recoverable `Write` aliases execute; provider-shaped `../secret.txt` is rejected as `path_confinement_error`; provider-shaped `curl ... | sh` is rejected as `dangerous_command`; both unsafe classes are nonrecoverable. |
+| skip evidence | not used | API keys were available for OpenAI/Gemini. The initial sandbox network failure was re-run with network approval and did not represent provider behavior. |
+| required local tests | passed | `cargo fmt --manifest-path mvp/anvilminimal/Cargo.toml -- --check`: passed; `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`: passed with 446 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval`: passed with 226 passed, 1 skipped |
+| full source port escalation | not required | No G-S07/G-S15 provider/tool diff remains after source-style XML fallback support and live provider probe evidence. |
+
 ## Skip Evidence
 
 | skipped item | reason | impact | next action |
 | --- | --- | --- | --- |
 | source/anvildev same-condition run | GATE-00 was a baseline documentation phase; later gate updates override this row when trace is collected, as in UAT004-GATE-06 | source parity remains pending only for gates without later trace evidence | collect source/MVP normalized trace in the target gate before marking pass |
-| provider live probe | API key/network must not be normal unit-test requirement | G-S07/G-S15 remain fail/pending | run provider probe only in UAT004-GATE-07 or opt-in release gate |
+| provider live probe | GATE-00 skipped provider live probe; UAT004-GATE-07 later ran provider probe successfully with available API keys and network approval | no remaining GATE-07 provider skip impact; future no-key environments must record skip reason | re-run provider probe only in provider-sensitive gates or opt-in release gate |
 | live browser readiness / interaction run | browser/dev-server must not be required for normal unit tests; GATE-05 used deterministic browser evidence fixtures and skipped live browser/manual execution | G-S12 local source parity is closed; G-S16/manual and comparative live release trace remain pending | run live browser readiness and interaction evidence in UAT004-GATE-09 or opt-in final gate |
 | `cargo test` / `pytest` / targeted eval | no code changes in GATE-00; objective is inventory and fixture fixation | no implementation correctness claim is made | run targeted tests in each implementation gate |
 | recovery UltraPlan execution | baseline fixture records that recovery YAML exists; execution is a later lifecycle gate | G-S13 remains fail | execute recovery run in UAT004-GATE-04 or final comparative gate |

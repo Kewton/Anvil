@@ -298,6 +298,10 @@ def provider_probe_observation_summary(events: list[dict]) -> dict:
                     "recoverable_tool_args": str(event.get("recoverable_tool_args", "")),
                     "unsafe_tool_args": str(event.get("unsafe_tool_args", "")),
                     "unsafe_error_kind": str(event.get("unsafe_error_kind", "")),
+                    "unsafe_shell_control": str(event.get("unsafe_shell_control", "")),
+                    "unsafe_shell_error_kind": str(
+                        event.get("unsafe_shell_error_kind", "")
+                    ),
                     "arguments_shape": str(event.get("arguments_shape", "")),
                 }
             )
@@ -316,6 +320,11 @@ def provider_probe_observation_summary(events: list[dict]) -> dict:
             1
             for item in classifications
             if item.get("unsafe_tool_args") == "rejected_nonrecoverable"
+        ),
+        "unsafe_shell_control_rejected": sum(
+            1
+            for item in classifications
+            if item.get("unsafe_shell_control") == "rejected_nonrecoverable"
         ),
     }
 

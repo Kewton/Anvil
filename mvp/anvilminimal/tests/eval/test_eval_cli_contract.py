@@ -154,6 +154,8 @@ class EvalCliContractTest(unittest.TestCase):
                                 "recoverable_tool_args": "recovered_and_executed",
                                 "unsafe_tool_args": "rejected_nonrecoverable",
                                 "unsafe_error_kind": "path_confinement_error",
+                                "unsafe_shell_control": "rejected_nonrecoverable",
+                                "unsafe_shell_error_kind": "dangerous_command",
                                 "arguments_shape": "object_recovered",
                             }
                         ),
@@ -204,10 +206,17 @@ class EvalCliContractTest(unittest.TestCase):
             ["tool_args_recovery_classification", "tool_args_shape"],
         )
         self.assertEqual(provider_summary["unsafe_tool_args_rejected"], 1)
+        self.assertEqual(provider_summary["unsafe_shell_control_rejected"], 1)
         self.assertEqual(provider_summary["recoverable_tool_args_classified"], 1)
         self.assertEqual(
             provider_summary["tool_args_recovery_classifications"][0]["unsafe_error_kind"],
             "path_confinement_error",
+        )
+        self.assertEqual(
+            provider_summary["tool_args_recovery_classifications"][0][
+                "unsafe_shell_error_kind"
+            ],
+            "dangerous_command",
         )
 
     def test_eval_preflight_writes_comparative_parity_gate_report(self):

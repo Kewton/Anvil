@@ -1,0 +1,147 @@
+{
+  "events": [
+    {
+      "event": "provider_probe",
+      "probe": "tool_argument_parser_shapes",
+      "provider": "fixture",
+      "providers": [
+        "openai",
+        "gemini",
+        "ollama_xml_fallback"
+      ],
+      "status": "passed"
+    },
+    {
+      "arguments_shape": "object_recovered",
+      "event": "provider_probe",
+      "live": false,
+      "probe": "xml_fallback_tool_like_output",
+      "provider": "ollama",
+      "status": "passed",
+      "tool_calls": 1,
+      "tool_names": [
+        "Write"
+      ]
+    },
+    {
+      "arguments_shape": "object_recovered",
+      "event": "provider_probe",
+      "probe": "tool_args_recovery_classification",
+      "provider": "openai",
+      "recoverable_tool_args": "recovered_and_executed",
+      "status": "passed",
+      "unsafe_error_kind": "path_confinement_error",
+      "unsafe_shell_control": "rejected_nonrecoverable",
+      "unsafe_shell_error_kind": "dangerous_command",
+      "unsafe_tool_args": "rejected_nonrecoverable"
+    },
+    {
+      "arguments_shape": "object_recovered",
+      "event": "provider_probe",
+      "probe": "tool_args_recovery_classification",
+      "provider": "gemini",
+      "recoverable_tool_args": "recovered_and_executed",
+      "status": "passed",
+      "unsafe_error_kind": "path_confinement_error",
+      "unsafe_shell_control": "rejected_nonrecoverable",
+      "unsafe_shell_error_kind": "dangerous_command",
+      "unsafe_tool_args": "rejected_nonrecoverable"
+    },
+    {
+      "arguments_shape": "object_recovered",
+      "event": "provider_probe",
+      "probe": "tool_args_recovery_classification",
+      "provider": "ollama",
+      "recoverable_tool_args": "recovered_and_executed",
+      "status": "passed",
+      "unsafe_error_kind": "path_confinement_error",
+      "unsafe_shell_control": "rejected_nonrecoverable",
+      "unsafe_shell_error_kind": "dangerous_command",
+      "unsafe_tool_args": "rejected_nonrecoverable"
+    },
+    {
+      "arguments_shape": "object",
+      "event": "provider_probe",
+      "model": "gpt-5.4-mini",
+      "probe": "tool_args_shape",
+      "provider": "openai",
+      "status": "passed",
+      "tool_calls": 1,
+      "tool_names": [
+        "Write"
+      ]
+    },
+    {
+      "arguments_shape": "object",
+      "event": "provider_probe",
+      "model": "gemini-3.5-flash",
+      "probe": "function_calling_schema",
+      "provider": "gemini",
+      "status": "passed",
+      "tool_calls": 1,
+      "tool_names": [
+        "Write"
+      ]
+    }
+  ],
+  "failed": 0,
+  "missing_paths": [],
+  "passed": 7,
+  "probes_by_provider": {
+    "fixture": [
+      "tool_argument_parser_shapes"
+    ],
+    "gemini": [
+      "function_calling_schema",
+      "tool_args_recovery_classification"
+    ],
+    "ollama": [
+      "tool_args_recovery_classification",
+      "xml_fallback_tool_like_output"
+    ],
+    "openai": [
+      "tool_args_recovery_classification",
+      "tool_args_shape"
+    ]
+  },
+  "recoverable_tool_args_classified": 3,
+  "result_paths": [
+    "/Users/maenokota/share/work/github_kewton/Anvil-develop/workspace/mvp/uat/004/gate07_provider_probe/provider-probe-live.jsonl"
+  ],
+  "skipped": 0,
+  "status": "passed",
+  "tool_args_recovery_classifications": [
+    {
+      "arguments_shape": "object_recovered",
+      "provider": "openai",
+      "recoverable_tool_args": "recovered_and_executed",
+      "status": "passed",
+      "unsafe_error_kind": "path_confinement_error",
+      "unsafe_shell_control": "rejected_nonrecoverable",
+      "unsafe_shell_error_kind": "dangerous_command",
+      "unsafe_tool_args": "rejected_nonrecoverable"
+    },
+    {
+      "arguments_shape": "object_recovered",
+      "provider": "gemini",
+      "recoverable_tool_args": "recovered_and_executed",
+      "status": "passed",
+      "unsafe_error_kind": "path_confinement_error",
+      "unsafe_shell_control": "rejected_nonrecoverable",
+      "unsafe_shell_error_kind": "dangerous_command",
+      "unsafe_tool_args": "rejected_nonrecoverable"
+    },
+    {
+      "arguments_shape": "object_recovered",
+      "provider": "ollama",
+      "recoverable_tool_args": "recovered_and_executed",
+      "status": "passed",
+      "unsafe_error_kind": "path_confinement_error",
+      "unsafe_shell_control": "rejected_nonrecoverable",
+      "unsafe_shell_error_kind": "dangerous_command",
+      "unsafe_tool_args": "rejected_nonrecoverable"
+    }
+  ],
+  "unsafe_shell_control_rejected": 3,
+  "unsafe_tool_args_rejected": 3
+}

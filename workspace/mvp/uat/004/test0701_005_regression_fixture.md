@@ -229,6 +229,17 @@ Expected future behavior:
 | missing expected result / verify must fail | `test_compare_reports_detects_missing_expected_result_and_verify` marks G-S06 `semantic_trace_contract_missing` with `missing_expected_result` and `missing_verify` | correct failure detection preserved |
 | source prompt trace must be runtime evidence | `test_source_anvildev_llm_prompts_produce_phase_and_step_trace` proves source `llm-io.jsonl` request prompts are normalized into G-S05/G-S06 trace events; `test_compare_reports_does_not_pass_gate_counts_without_prompt_trace` and `test_eval_preflight_writes_comparative_parity_gate_report` require normalized phase/step events instead of gate counts only | regression fixed: gate counts alone cannot satisfy phase/prompt trace comparison |
 
+## UAT004-GATE-07 Executable Fixture Binding
+
+| baseline fixture | executable assertion | expected classification |
+| --- | --- | --- |
+| provider/tool args trace missing | `provider_probe_openai_tool_args_shape_skips_without_key`, `provider_probe_gemini_function_calling_schema_skips_without_key`, `provider_probe_ollama_xml_fallback_tool_like_output`, and `provider_probe_parser_fixtures_cover_tool_argument_shapes` produced `provider-probe-live.jsonl` with 7 passed / 0 failed / 0 skipped | G-S15 provider behavior is observed, not closed by fake fixtures only |
+| recoverable provider args | `provider_probe_tool_args_recovery_classification_by_provider` parses OpenAI/Gemini/Ollama-shaped `Write` aliases and executes them through `ToolRegistry` | recoverable alias/wrapper/json drift is accepted only after policy validation |
+| unsafe provider path args | the same fixture parses `../secret.txt` provider-shaped `Write` args and rejects them as `path_confinement_error`, with `recoverable_tool_error=false` | unsafe workspace escape remains a hard rejection |
+| unsafe provider shell args | the same fixture parses provider-shaped Bash `cmd` with `curl ... | sh` and rejects it as `dangerous_command`, with `recoverable_tool_error=false` | shell-control / installer pipe remains a hard rejection |
+| source XML fallback parity | `providers::xml_fallback` tests cover source-style named tags, `<function=...>`, inferred unambiguous tool names, closed unterminated blocks, relaxed JSON, and ambiguous inference rejection | source-style Ollama/XML fallback is recovered without loosening unsafe execution policy |
+| eval summary attachment | `test_provider_probe_results_are_recorded_in_dry_run_summary` verifies probe result paths, status, skipped count, recoverable count, unsafe path rejection, and unsafe shell-control rejection are recorded | provider probe skip/pass/fail evidence is connected to gate reporting |
+
 ## Fixture Reproduction Notes
 
 No new executable tests are created in GATE-00. The fixed baseline is document-level and must be converted into targeted automated fixtures in later gates.

@@ -83,6 +83,22 @@ UAT004 の各 gate で、実行した検証、skip evidence、rollback 条件、
 | remaining unrelated gates | overall diff still has unrelated failed gate ids outside G-S05/G-S06; they remain assigned to later UAT004 gates |
 | rollback guard | do not allow trace-missing reports, missing phase context, missing expected result, or missing verify commands to pass G-S05/G-S06; do not remove source prompt-log normalization unless source emits equivalent native runtime trace events |
 
+## UAT004-GATE-07 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/ollama/client.rs`, `src/ollama/xml_fallback.rs`, `src/agent/minimal_step_runner.rs`, `src/agent/minimal_step_runner/repair.rs` |
+| MVP refs | `mvp/anvilminimal/src/providers/xml_fallback.rs`, `providers/openai.rs`, `providers/gemini.rs`, `providers/ollama.rs`, `tools/args_recovery.rs`, `tools/registry.rs`, `tests/live_provider.rs`, `scripts/eval-run.py` |
+| implementation | MVP XML fallback now accepts source-style XML/function tag variants and relaxed JSON while preserving tool policy enforcement; provider probe summary now records unsafe shell-control rejection. |
+| provider probe | `ANVIL_PROVIDER_PROBE=1 ANVIL_PROVIDER_PROBE_OUT=/Users/maenokota/share/work/github_kewton/Anvil-develop/workspace/mvp/uat/004/gate07_provider_probe/provider-probe-live.jsonl cargo test --manifest-path mvp/anvilminimal/Cargo.toml --test live_provider provider_probe -- --nocapture` passed with 5 provider probe tests. Initial sandbox network failure was rerun with network approval. |
+| provider probe result | `provider_probe_summary.json` status `passed`: 7 passed, 0 failed, 0 skipped; OpenAI live tool args shape passed, Gemini live function-calling schema passed, Ollama XML fallback passed, recoverable provider args 3, unsafe path rejection 3, unsafe shell-control rejection 3. |
+| eval attachment | `python3 scripts/eval-run.py --suite eval/suites/mvp-provider-smoke.yaml --model-profile openai-only --modes minimal-loop --runs 1 --scenario write-one-file-small --run-root .../gate07_provider_probe/eval-summary --provider-probe-results .../provider-probe-live.jsonl --dry-run` wrote summary/events with provider probe status `passed`. |
+| targeted fixtures | `providers::xml_fallback`, `provider_probe_tool_args_recovery_classification_by_provider`, `test_provider_probe_results_are_recorded_in_dry_run_summary` |
+| full local verification | `cargo fmt --manifest-path mvp/anvilminimal/Cargo.toml -- --check` passed; `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 446 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 226 passed / 1 skipped |
+| skip evidence | no provider probe skip in this run; API keys were available. Future no-key runs must record `missing_openai_api_key` / `missing_gemini_api_key` skip reasons instead of failing normal unit tests. |
+| full source port escalation | not required for G-S07/G-S15; no provider/tool diff remained after XML fallback parity and live provider probe evidence. |
+| rollback guard | do not treat provider parse/network/HTTP failures as runtime success; do not recover workspace escapes, hidden metadata access, or dangerous shell commands; do not close provider-sensitive changes with fake fixtures alone. |
+
 ## Re-run Notes
 
 Before closing an implementation gate, update:
