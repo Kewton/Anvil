@@ -103,6 +103,40 @@ impl EvidenceKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SatisfactionChannel {
+    SourceScan,
+    TestArtifact,
+    RuntimeArtifact,
+}
+
+pub fn evidence_satisfaction_channel(key: &str) -> SatisfactionChannel {
+    let key = key
+        .trim()
+        .strip_prefix("unsupported_required_evidence:")
+        .unwrap_or_else(|| key.trim())
+        .split_once(':')
+        .map_or_else(|| key.trim(), |(head, _)| head.trim());
+    match key {
+        "implementation_artifact"
+        | "interactive_ui_source_evidence"
+        | "non_static_screen_evidence"
+        | "visible_interactive_surface_evidence"
+        | "user_input_handler_evidence"
+        | "stateful_update_evidence"
+        | "challenge_or_adversary_evidence"
+        | "score_or_progression_evidence"
+        | "failure_or_collision_evidence"
+        | "restart_or_recoverable_state_evidence"
+        | "nextjs_route_evidence" => SatisfactionChannel::SourceScan,
+        "test_artifact"
+        | "bound_verify_command"
+        | "non_zero_test_or_assertion_evidence"
+        | "requested_content_evidence" => SatisfactionChannel::TestArtifact,
+        _ => SatisfactionChannel::RuntimeArtifact,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArtifactRoleLite {
     Setup,
     Scaffold,
@@ -530,6 +564,7 @@ pub fn verify_runtime_acceptance(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn verify_runtime_acceptance_with_browser_dirs(
     root: &Path,
     required_paths: &[String],
@@ -941,8 +976,6 @@ fn implementation_repair_path(
         .unwrap_or_else(|| {
             if workspace.package_json.is_some() {
                 "src/app/page.tsx".to_string()
-            } else if workspace.cargo_toml {
-                "src/main.rs".to_string()
             } else {
                 "src/main.rs".to_string()
             }
@@ -1188,7 +1221,7 @@ fn has_test_artifact(workspace: &WorkspaceEvidence) -> bool {
         || workspace
             .source_files
             .iter()
-            .any(|file| has_inline_test_or_self_test(file))
+            .any(has_inline_test_or_self_test)
 }
 
 fn has_assertion_or_test_evidence(workspace: &WorkspaceEvidence) -> bool {
@@ -1870,6 +1903,57 @@ fn source_file_has_restart_or_recoverable_state(file: &SourceFile) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_scanned_evidence_keys_report_source_channel() {
+        for key in [
+            "implementation_artifact",
+            "interactive_ui_source_evidence",
+            "non_static_screen_evidence",
+            "visible_interactive_surface_evidence",
+            "user_input_handler_evidence",
+            "stateful_update_evidence",
+            "challenge_or_adversary_evidence",
+            "score_or_progression_evidence",
+            "failure_or_collision_evidence",
+            "restart_or_recoverable_state_evidence",
+            "nextjs_route_evidence",
+        ] {
+            assert_eq!(
+                evidence_satisfaction_channel(key),
+                SatisfactionChannel::SourceScan,
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_source_evidence_keys_report_test_or_runtime_channels() {
+        for key in [
+            "test_artifact",
+            "bound_verify_command",
+            "non_zero_test_or_assertion_evidence",
+            "requested_content_evidence",
+        ] {
+            assert_eq!(
+                evidence_satisfaction_channel(key),
+                SatisfactionChannel::TestArtifact,
+                "{key}"
+            );
+        }
+        for key in [
+            "build_command_or_dependency_missing_boundary",
+            "browser_readiness_failed:http_500",
+            "interaction_evidence_missing",
+            "unknown_future_runtime_evidence",
+        ] {
+            assert_eq!(
+                evidence_satisfaction_channel(key),
+                SatisfactionChannel::RuntimeArtifact,
+                "{key}"
+            );
+        }
+    }
 
     #[test]
     fn js_exports_only_missing_deterministic_test() {

@@ -381,13 +381,7 @@ pub fn step_plan_quality_report(
             "weak_code_verify",
             "code task lacks test, build, smoke, or compile verification",
             None,
-            Some(
-                verify_commands
-                    .iter()
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ),
+            Some(verify_commands.to_vec().join(", ")),
         );
     }
 
@@ -397,13 +391,7 @@ pub fn step_plan_quality_report(
             "weak_docs_verify",
             "docs task has no content assertion for requested text or headings",
             None,
-            Some(
-                verify_commands
-                    .iter()
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ),
+            Some(verify_commands.to_vec().join(", ")),
         );
     }
 

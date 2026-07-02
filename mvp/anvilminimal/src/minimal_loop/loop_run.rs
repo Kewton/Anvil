@@ -22,7 +22,9 @@ use crate::tui::{InteractionUi, NOOP_UI};
 
 use super::build_verifier::{BuildVerifierLifecycleObservation, BuildVerifierStatus};
 use super::compact::compact_if_needed;
-use super::completion::{CompletionContract, format_verify_feedback};
+use super::completion::{
+    CompletionContract, format_verify_feedback_with_contract, repair_target_allowed_paths,
+};
 use super::evidence::verify_runtime_acceptance;
 use super::import_scan::{format_missing_import_feedback, scan_relative_imports};
 use super::prompt::{ToolPromptMode, build_request_messages};
@@ -337,6 +339,7 @@ struct VerifyRepairState {
     pending_target: Option<RepairTarget>,
     changed_paths_at_failure: Vec<String>,
     no_edit_turns: usize,
+    follow_through_grace_used: bool,
 }
 
 #[derive(Debug)]
@@ -344,6 +347,7 @@ struct VerifyFailureFeedback {
     feedback: String,
     signature: VerificationSignature,
     target: RepairTarget,
+    follow_through_grace_used: bool,
 }
 
 #[derive(Debug, Default)]
@@ -757,6 +761,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     &changed_paths,
                     &[],
                     true,
+                    verify_repair_state.follow_through_grace_used,
                 ) {
                     Ok(None) => {
                         eval_events::emit(
@@ -787,6 +792,8 @@ pub(crate) fn run_session_with_outcome_with_options(
                         verify_repair_state.pending_target = Some(feedback.target);
                         verify_repair_state.changed_paths_at_failure = changed_paths.clone();
                         verify_repair_state.no_edit_turns = 0;
+                        verify_repair_state.follow_through_grace_used |=
+                            feedback.follow_through_grace_used;
                         pending_feedback = Some(feedback.feedback);
                         continue;
                     }
@@ -1060,6 +1067,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     &changed_paths,
                     &batch_changed_paths,
                     batch_had_edit,
+                    verify_repair_state.follow_through_grace_used,
                 ) {
                     Ok(None) => {
                         eval_events::emit(
@@ -1092,6 +1100,8 @@ pub(crate) fn run_session_with_outcome_with_options(
                         verify_repair_state.pending_target = Some(feedback.target);
                         verify_repair_state.changed_paths_at_failure = changed_paths.clone();
                         verify_repair_state.no_edit_turns = 0;
+                        verify_repair_state.follow_through_grace_used |=
+                            feedback.follow_through_grace_used;
                         pending_feedback = Some(feedback.feedback);
                         continue;
                     }
@@ -1406,6 +1416,7 @@ fn emit_step_obligation_scope(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_completion_contract(
     root: &Path,
     eval_events_path: Option<&Path>,
@@ -1418,6 +1429,7 @@ fn verify_completion_contract(
     changed_paths_after: &[String],
     repair_turn_changed_paths: &[String],
     had_edit: bool,
+    follow_through_grace_used: bool,
 ) -> anyhow::Result<Option<VerifyFailureFeedback>> {
     *verify_attempts += 1;
     let (report, build_verifier_lifecycles) = contract.verify_with_goal_observed(root, goal);
@@ -1558,6 +1570,40 @@ fn verify_completion_contract(
             contract.verify_repair_cap
         };
     if *verify_attempts >= effective_repair_cap {
+        if should_grant_follow_through_grace(
+            previous_signature,
+            verdict,
+            repair_follow_through,
+            follow_through_grace_used,
+        ) {
+            let target_for_paths = previous_target.unwrap_or(repair_target);
+            let allowed_paths =
+                repair_target_allowed_paths(target_for_paths, &report, Some(contract));
+            eval_events::emit(
+                eval_events_path,
+                json!({
+                    "event": "verify_repair_follow_through_grace",
+                    "attempt": *verify_attempts,
+                    "repair_target": repair_target.as_str(),
+                    "previous_repair_target": previous_repair_target,
+                    "repair_follow_through": repair_follow_through_label,
+                    "allowed_paths": allowed_paths.clone(),
+                    "repair_progress": verdict.as_str(),
+                    "failure_signature": signature.label(),
+                }),
+            );
+            let mut feedback = format_verify_feedback_with_contract(&report, Some(contract));
+            feedback.push_str("\nRepair follow-through warning: the last edit improved verification but did not follow the requested repair target.");
+            feedback.push_str("\nYou must edit one of: ");
+            feedback.push_str(&allowed_paths.join(", "));
+            feedback.push_str(". One additional bounded repair turn is allowed; a second target violation will stop with repair_target_not_followed.");
+            return Ok(Some(VerifyFailureFeedback {
+                feedback,
+                signature,
+                target: repair_target,
+                follow_through_grace_used: true,
+            }));
+        }
         let stop_reason = terminal_verify_stop_reason(
             &report,
             &signature,
@@ -1629,9 +1675,10 @@ fn verify_completion_contract(
         );
     }
     Ok(Some(VerifyFailureFeedback {
-        feedback: format_verify_feedback(&report),
+        feedback: format_verify_feedback_with_contract(&report, Some(contract)),
         signature,
         target: repair_target,
+        follow_through_grace_used: false,
     }))
 }
 
@@ -1641,6 +1688,7 @@ struct MinimalRecoveryPaths {
     yaml_path: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn save_minimal_recovery_handoff(
     root: &Path,
     eval_events_path: Option<&Path>,
@@ -1860,6 +1908,18 @@ fn handle_verify_repair_no_edit(
         state.no_edit_turns,
         VERIFY_REPAIR_NO_EDIT_LIMIT,
     )))
+}
+
+fn should_grant_follow_through_grace(
+    previous_signature: Option<&VerificationSignature>,
+    verdict: RepairProgressVerdict,
+    repair_follow_through: Option<RepairFollowThrough>,
+    follow_through_grace_used: bool,
+) -> bool {
+    previous_signature.is_some()
+        && verdict == RepairProgressVerdict::Improved
+        && repair_follow_through == Some(RepairFollowThrough::TargetNotFollowed)
+        && !follow_through_grace_used
 }
 
 fn terminal_verify_stop_reason(
@@ -2266,6 +2326,7 @@ fn changed_path_from_call(root: &Path, arguments: &serde_json::Value) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::planner::verify::VerificationReport;
     use crate::providers::AssistantReply;
     use crate::state::ToolCall;
     use serde_json::json;
@@ -3140,6 +3201,165 @@ export default function Page(){
         .unwrap_err()
         .to_string();
         assert!(err.contains("completion contract verify failed"));
+    }
+
+    #[test]
+    fn improved_target_not_followed_gets_one_reanchored_repair_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main(){ assert_eq!(1, 1); }\n",
+        )
+        .unwrap();
+        let events = dir.path().join("events.jsonl");
+        let contract = CompletionContract {
+            required_paths: vec!["src/main.rs".to_string()],
+            verify_commands: Vec::new(),
+            profile: None,
+            goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: vec![
+                "test_artifact".to_string(),
+                "non_zero_test_or_assertion_evidence".to_string(),
+            ],
+            required_obligations: Vec::new(),
+            deferred_verify_requirements: Vec::new(),
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap();
+        let mut previous_report = VerificationReport::pass();
+        previous_report.push_profile_failure(
+            "missing_required_evidence:test_artifact,non_zero_test_or_assertion_evidence",
+        );
+        let previous_signature = VerificationSignature::from_report(&previous_report);
+        let previous_target = classify_repair_target(&previous_report);
+        assert_eq!(previous_target, RepairTarget::RequiredEvidenceMissing);
+
+        let mut verify_attempts = 2;
+        let feedback = verify_completion_contract(
+            dir.path(),
+            Some(&events),
+            &contract,
+            "write a Rust program",
+            &mut verify_attempts,
+            Some(&previous_signature),
+            Some(previous_target),
+            &["src/main.rs".to_string()],
+            &["src/main.rs".to_string()],
+            &["src/main.rs".to_string()],
+            true,
+            false,
+        )
+        .unwrap()
+        .expect("grace feedback");
+        assert!(feedback.follow_through_grace_used);
+        assert!(feedback.feedback.contains("You must edit one of:"));
+        assert!(feedback.feedback.contains("tests/acceptance-evidence.md"));
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"event\":\"verify_repair_follow_through_grace\""));
+        assert!(!event_text.contains("\"event\":\"loop_stop\""));
+
+        let mut verify_attempts = 3;
+        let err = verify_completion_contract(
+            dir.path(),
+            Some(&events),
+            &contract,
+            "write a Rust program",
+            &mut verify_attempts,
+            Some(&feedback.signature),
+            Some(feedback.target),
+            &["src/main.rs".to_string()],
+            &["src/main.rs".to_string()],
+            &["src/main.rs".to_string()],
+            true,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("completion contract verify failed"));
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"reason\":\"repair_target_not_followed\""));
+    }
+
+    #[test]
+    fn uat_0702_source_scan_gameplay_repair_editing_page_is_target_matched() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["src/app/page.tsx"],"required_evidence":["challenge_or_adversary_evidence","failure_or_collision_evidence","restart_or_recoverable_state_evidence"],"verify_repair_cap":2}"#,
+        )
+        .unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        cfg.eval_events_path = Some(events.clone());
+        let partial_page = r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score,setScore] = useState(0);
+  return <main><button onClick={() => setScore(score + 1)}>Start</button><p>score {score}</p></main>;
+}
+"#;
+        let repaired_page = r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [gameState,setGameState] = useState("ready");
+  const [score,setScore] = useState(0);
+  const enemies = [{ x: 1, y: 1 }];
+  const fire = () => {
+    const collision = enemies.some((enemy) => enemy.x > 0);
+    if (collision) {
+      setGameState("gameover");
+      setScore((value) => value + 10);
+    }
+  };
+  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button><button onClick={fire}>Fire</button><p>enemy collision score {score} {gameState}</p></main>;
+}
+"#;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":partial_page}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":repaired_page}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "create a game page",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::CompletionContractSatisfied
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"repair_target\":\"capability_missing\""));
+        assert!(event_text.contains("\"repair_follow_through\":\"target_matched\""));
+        assert!(!event_text.contains("repair_target_not_followed"));
     }
 
     #[test]

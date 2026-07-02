@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -229,7 +230,7 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
     events
         .iter()
         .filter_map(snapshot_from_completion_event)
-        .last()
+        .next_back()
         .map(|mut snapshot| {
             snapshot.planner_verify_normalization_count = diagnostics.verify_normalization_count;
             snapshot.planner_retry_count = diagnostics.retry_count;
@@ -391,6 +392,153 @@ pub fn render_tui_completion_output(output: &str, projection: &CompletionProject
         }
     }
     output
+}
+
+pub fn render_tui_command_failure_block(
+    path: Option<&Path>,
+    stop_reason: &str,
+    projection: &CompletionProjection,
+) -> String {
+    let events = read_event_values(path);
+    let failed_phase = latest_event_field(
+        &events,
+        &["failed_phase_id", "failed_phase", "phase_id", "step_id"],
+    )
+    .unwrap_or_else(|| "unknown".to_string());
+    let missing_evidence = latest_missing_evidence_keys(&events, stop_reason);
+    let missing_evidence = if missing_evidence.is_empty() {
+        "none recorded".to_string()
+    } else {
+        missing_evidence.join(", ")
+    };
+    let recovery_prompt_path = latest_event_field(&events, &["recovery_prompt_path"])
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| projection.recovery_prompt_path.clone());
+    let recovery_ultra_plan_path = latest_event_field(&events, &["recovery_ultra_plan_path"])
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| projection.recovery_ultra_plan_path.clone());
+    let suggested_recovery_command = latest_event_field(&events, &["suggested_recovery_command"])
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| projection.suggested_recovery_command.clone());
+    let suggested_recovery_yaml_command =
+        latest_event_field(&events, &["suggested_recovery_yaml_command"])
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| projection.suggested_recovery_yaml_command.clone());
+    [
+        "=== TUI Command Failed ===".to_string(),
+        format!("Task status: {}", projection.task_status),
+        format!("Failed phase: {failed_phase}"),
+        format!("Missing evidence keys: {missing_evidence}"),
+        format!(
+            "Recovery prompt: {}",
+            missing_if_empty(&recovery_prompt_path)
+        ),
+        format!(
+            "Recovery prompt command: {}",
+            missing_if_empty(&suggested_recovery_command)
+        ),
+        format!(
+            "Recovery UltraPlan: {}",
+            missing_if_empty(&recovery_ultra_plan_path)
+        ),
+        format!(
+            "Recovery UltraPlan command: {}",
+            missing_if_empty(&suggested_recovery_yaml_command)
+        ),
+    ]
+    .join("\n")
+}
+
+fn read_event_values(path: Option<&Path>) -> Vec<Value> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+fn latest_event_field(events: &[Value], keys: &[&str]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        keys.iter().find_map(|key| {
+            event
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+    })
+}
+
+fn latest_missing_evidence_keys(events: &[Value], stop_reason: &str) -> Vec<String> {
+    for event in events.iter().rev() {
+        let mut keys = event
+            .get("missing_evidence")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if keys.is_empty()
+            && let Some(profile_failures) = event.get("profile_failures").and_then(Value::as_array)
+        {
+            for failure in profile_failures.iter().filter_map(Value::as_str) {
+                keys.extend(missing_evidence_keys_from_text(failure));
+            }
+        }
+        if keys.is_empty()
+            && let Some(reason) = event.get("primary_reason").and_then(Value::as_str)
+        {
+            keys.extend(missing_evidence_keys_from_text(reason));
+        }
+        if keys.is_empty()
+            && let Some(reason) = event.get("stop_reason").and_then(Value::as_str)
+        {
+            keys.extend(missing_evidence_keys_from_text(reason));
+        }
+        keys = normalize_unique_strings(keys);
+        if !keys.is_empty() {
+            return keys;
+        }
+    }
+    normalize_unique_strings(missing_evidence_keys_from_text(stop_reason))
+}
+
+fn missing_evidence_keys_from_text(text: &str) -> Vec<String> {
+    let Some((_, rest)) = text.split_once("missing_required_evidence:") else {
+        return Vec::new();
+    };
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | ')' | ']'))
+        .unwrap_or(rest.len());
+    rest[..end]
+        .split(',')
+        .map(|value| {
+            value
+                .trim()
+                .trim_matches(|ch: char| matches!(ch, '.' | ':'))
+        })
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_unique_strings(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
@@ -1033,6 +1181,50 @@ mod tests {
         assert!(summary.contains("Planner release risk: true"));
         assert!(summary.contains(
             "Planner diagnostics: normalizations=1 retries=1 quality_warnings=1 quality_issues=0"
+        ));
+    }
+
+    #[test]
+    fn tui_failure_block_renders_phase_evidence_and_recovery_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "completion_verify",
+                "missing_evidence": [
+                    "challenge_or_adversary_evidence",
+                    "failure_or_collision_evidence",
+                    "restart_or_recoverable_state_evidence"
+                ],
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_partial_artifact_summary",
+                "failed_phase_id": "project-setup",
+                "recovery_prompt_path": ".anvil/repairs/repair-project-setup.md",
+                "recovery_ultra_plan_path": ".anvil/plans/recovery-ultra-plan-project-setup.yaml",
+                "suggested_recovery_command": "/ultra-plan-run --profile nextjs \"$(cat .anvil/repairs/repair-project-setup.md)\"",
+                "suggested_recovery_yaml_command": "/run-ultra-plan .anvil/plans/recovery-ultra-plan-project-setup.yaml",
+            }),
+        );
+        let projection = project_completion(false, &CompletionSnapshot::empty());
+        let block = render_tui_command_failure_block(
+            Some(&path),
+            "phase project-setup failed",
+            &projection,
+        );
+        assert!(block.contains("=== TUI Command Failed ==="));
+        assert!(block.contains("Task status: failed"));
+        assert!(block.contains("Failed phase: project-setup"));
+        assert!(block.contains("challenge_or_adversary_evidence"));
+        assert!(block.contains("failure_or_collision_evidence"));
+        assert!(block.contains("restart_or_recoverable_state_evidence"));
+        assert!(block.contains("Recovery prompt command: /ultra-plan-run --profile nextjs"));
+        assert!(block.contains(
+            "Recovery UltraPlan command: /run-ultra-plan .anvil/plans/recovery-ultra-plan-project-setup.yaml"
         ));
     }
 }

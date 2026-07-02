@@ -1,3 +1,4 @@
+use crate::minimal_loop::evidence::{SatisfactionChannel, evidence_satisfaction_channel};
 use crate::planner::verify::VerificationReport;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +190,13 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
         )
     }) {
         return RepairTarget::EmptyApp;
+    }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| missing_required_evidence_includes_source_scan(reason))
+    {
+        return RepairTarget::CapabilityMissing;
     }
     if report.profile_failures.iter().any(|reason| {
         contains_any(
@@ -426,6 +434,25 @@ fn contains_any(value: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| lower.contains(needle))
 }
 
+fn missing_required_evidence_includes_source_scan(reason: &str) -> bool {
+    missing_required_evidence_keys(reason)
+        .into_iter()
+        .any(|key| evidence_satisfaction_channel(key) == SatisfactionChannel::SourceScan)
+}
+
+fn missing_required_evidence_keys(reason: &str) -> Vec<&str> {
+    let Some((_, rest)) = reason.split_once("missing_required_evidence:") else {
+        return Vec::new();
+    };
+    rest.split(',')
+        .map(|key| {
+            key.trim()
+                .trim_matches(|ch: char| matches!(ch, '.' | ';' | ')' | ']'))
+        })
+        .filter(|key| !key.is_empty())
+        .collect()
+}
+
 fn repair_change_is_related_to_task_artifact(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     if lower.starts_with(".anvil/")
@@ -650,6 +677,32 @@ mod tests {
         assert_eq!(
             classify_repair_target(&report),
             RepairTarget::CapabilityMissing
+        );
+    }
+
+    #[test]
+    fn source_scanned_missing_gameplay_evidence_targets_capability_implementation() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "missing_required_evidence:failure_or_collision_evidence,restart_or_recoverable_state_evidence",
+        );
+        let target = classify_repair_target(&report);
+        assert_eq!(target, RepairTarget::CapabilityMissing);
+        assert_eq!(
+            classify_repair_follow_through(target, &["src/app/page.tsx".to_string()]),
+            RepairFollowThrough::TargetMatched
+        );
+    }
+
+    #[test]
+    fn test_artifact_only_missing_evidence_keeps_evidence_target() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure("missing_required_evidence:test_artifact,bound_verify_command");
+        let target = classify_repair_target(&report);
+        assert_eq!(target, RepairTarget::RequiredEvidenceMissing);
+        assert_eq!(
+            classify_repair_follow_through(target, &["src/app/page.tsx".to_string()]),
+            RepairFollowThrough::TargetNotFollowed
         );
     }
 

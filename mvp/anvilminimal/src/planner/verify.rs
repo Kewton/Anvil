@@ -329,14 +329,14 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
             None,
         );
     }
-    if let Some(path) = manifest_path_arg(&normalized) {
-        if let Err(err) = validate_workspace_relative(path) {
-            return verify_command_violation(
-                normalized,
-                VerifyCommandViolationKind::WorkspaceEscape,
-                Some(err.to_string()),
-            );
-        }
+    if let Some(path) = manifest_path_arg(&normalized)
+        && let Err(err) = validate_workspace_relative(path)
+    {
+        return verify_command_violation(
+            normalized,
+            VerifyCommandViolationKind::WorkspaceEscape,
+            Some(err.to_string()),
+        );
     }
     VerifyCommandDiagnosis {
         normalized,

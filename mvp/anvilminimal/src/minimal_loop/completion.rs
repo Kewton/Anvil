@@ -11,7 +11,7 @@ use crate::minimal_loop::build_verifier::{
 };
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::evidence::{RuntimeAcceptanceReport, required_evidence_for_capability};
-use crate::minimal_loop::repair_target::classify_repair_target;
+use crate::minimal_loop::repair_target::{RepairTarget, classify_repair_target};
 use crate::planner::verify::{VerificationReport, validate_verify_command};
 use crate::tools::path_guard::{
     resolve_existing, resolve_optional_existing, validate_workspace_relative,
@@ -490,6 +490,13 @@ fn setup_authority_for_deferred(
 }
 
 pub fn format_verify_feedback(report: &VerificationReport) -> String {
+    format_verify_feedback_with_contract(report, None)
+}
+
+pub(crate) fn format_verify_feedback_with_contract(
+    report: &VerificationReport,
+    contract: Option<&CompletionContract>,
+) -> String {
     let mut lines = vec![
         "Deterministic completion verification failed. Fix the implementation and retry."
             .to_string(),
@@ -500,6 +507,15 @@ pub fn format_verify_feedback(report: &VerificationReport) -> String {
         target.as_str(),
         target.guidance()
     ));
+    if matches!(
+        target,
+        RepairTarget::CapabilityMissing | RepairTarget::EmptyApp | RepairTarget::Implementation
+    ) {
+        lines.push(format!(
+            "Target implementation files: {}",
+            target_implementation_files(report, contract).join(", ")
+        ));
+    }
     if !report.missing_paths.is_empty() {
         lines.push(format!(
             "Missing required paths: {}",
@@ -572,6 +588,117 @@ pub fn format_verify_feedback(report: &VerificationReport) -> String {
     lines.join("\n")
 }
 
+pub(crate) fn repair_target_allowed_paths(
+    target: RepairTarget,
+    report: &VerificationReport,
+    contract: Option<&CompletionContract>,
+) -> Vec<String> {
+    match target {
+        RepairTarget::DependencySetup => contract
+            .map(|contract| {
+                contract
+                    .required_paths
+                    .iter()
+                    .filter(|path| looks_like_setup_target_path(path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| vec!["package.json".to_string(), "Cargo.toml".to_string()]),
+        RepairTarget::PackageConfig => vec!["package.json".to_string()],
+        RepairTarget::FrameworkConfig => contract
+            .map(|contract| {
+                contract
+                    .required_paths
+                    .iter()
+                    .filter(|path| looks_like_framework_target_path(path))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    "src/app/layout.tsx".to_string(),
+                    "src/app/global.d.ts".to_string(),
+                    "tsconfig.json".to_string(),
+                ]
+            }),
+        RepairTarget::MissingEntrypoint
+        | RepairTarget::EmptyApp
+        | RepairTarget::CapabilityMissing
+        | RepairTarget::Implementation => target_implementation_files(report, contract),
+        RepairTarget::RequiredEvidenceMissing | RepairTarget::TestOrEvidence => {
+            target_evidence_files(report, contract)
+        }
+        RepairTarget::Unknown => target_implementation_files(report, contract),
+    }
+}
+
+pub(crate) fn target_implementation_files(
+    report: &VerificationReport,
+    contract: Option<&CompletionContract>,
+) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    if let Some(contract) = contract {
+        paths.extend(
+            contract
+                .required_paths
+                .iter()
+                .filter(|path| looks_like_implementation_target_path(path))
+                .cloned(),
+        );
+    }
+    if paths.is_empty() {
+        paths.extend(
+            report
+                .missing_paths
+                .iter()
+                .filter(|path| looks_like_implementation_target_path(path))
+                .cloned(),
+        );
+    }
+    if paths.is_empty() {
+        for failure in &report.command_failures {
+            paths.extend(
+                target_candidates_from_failure(&failure.command, &failure.reason)
+                    .into_iter()
+                    .filter(|path| looks_like_implementation_target_path(path)),
+            );
+        }
+    }
+    if paths.is_empty() {
+        paths.insert("src/app/page.tsx".to_string());
+    }
+    paths.into_iter().collect()
+}
+
+fn target_evidence_files(
+    report: &VerificationReport,
+    contract: Option<&CompletionContract>,
+) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    if let Some(contract) = contract {
+        paths.extend(
+            contract
+                .required_paths
+                .iter()
+                .filter(|path| looks_like_evidence_target_path(path))
+                .cloned(),
+        );
+    }
+    paths.extend(
+        report
+            .missing_paths
+            .iter()
+            .filter(|path| looks_like_evidence_target_path(path))
+            .cloned(),
+    );
+    if paths.is_empty() {
+        paths.insert("tests/acceptance-evidence.md".to_string());
+    }
+    paths.into_iter().collect()
+}
+
 fn normalize_unique_list(values: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
@@ -632,6 +759,42 @@ fn evidence_repair_guidance(failure: &str) -> Vec<String> {
                 .to_string(),
         );
     }
+    if failure.contains("challenge_or_adversary_evidence") {
+        lines.push(
+            "For challenge_or_adversary_evidence, edit the task implementation artifact to implement a concrete adversary, obstacle, wave, hazard, target, or challenge that affects gameplay."
+                .to_string(),
+        );
+    }
+    if failure.contains("failure_or_collision_evidence") {
+        lines.push(
+            "For failure_or_collision_evidence, edit the task implementation artifact to implement bullet/enemy collision or damage detection and a real failure or game-over state transition."
+                .to_string(),
+        );
+    }
+    if failure.contains("restart_or_recoverable_state_evidence") {
+        lines.push(
+            "For restart_or_recoverable_state_evidence, edit the task implementation artifact to implement start/restart/reset behavior that returns the game to a playable recoverable state."
+                .to_string(),
+        );
+    }
+    if failure.contains("score_or_progression_evidence") {
+        lines.push(
+            "For score_or_progression_evidence, edit the task implementation artifact to implement score, level, wave, lives, health, or progress updates driven by gameplay events."
+                .to_string(),
+        );
+    }
+    if failure.contains("stateful_update_evidence") {
+        lines.push(
+            "For stateful_update_evidence, edit the task implementation artifact to implement state mutations over time or in response to input, such as React state updates, reducer dispatch, timers, or animation-frame updates."
+                .to_string(),
+        );
+    }
+    if failure.contains("user_input_handler_evidence") {
+        lines.push(
+            "For user_input_handler_evidence, edit the task implementation artifact to wire keyboard, pointer, click, touch, or form handlers to gameplay state changes."
+                .to_string(),
+        );
+    }
     lines
 }
 
@@ -683,6 +846,66 @@ fn looks_like_source_or_test_file(candidate: &str) -> bool {
         path.extension().and_then(|ext| ext.to_str()),
         Some("py" | "js" | "jsx" | "ts" | "tsx" | "rs" | "go" | "java")
     )
+}
+
+fn looks_like_implementation_target_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    looks_like_source_or_test_file(path)
+        && !looks_like_setup_target_path(&lower)
+        && !looks_like_framework_target_path(&lower)
+        && !looks_like_evidence_target_path(&lower)
+        && !lower.ends_with(".md")
+        && !lower.ends_with(".css")
+        && !lower.ends_with(".scss")
+        && !lower.ends_with(".sass")
+        && !lower.ends_with(".less")
+        && !lower.ends_with(".d.ts")
+        && !lower.ends_with("layout.tsx")
+        && !lower.ends_with("layout.jsx")
+}
+
+fn looks_like_setup_target_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "cargo.toml"
+            | "cargo.lock"
+            | "pyproject.toml"
+            | "requirements.txt"
+    ) || lower.ends_with("/package.json")
+        || lower.ends_with("/package-lock.json")
+        || lower.ends_with("/pnpm-lock.yaml")
+        || lower.ends_with("/yarn.lock")
+        || lower.ends_with("/cargo.toml")
+        || lower.ends_with("/cargo.lock")
+        || lower.ends_with("/pyproject.toml")
+        || lower.ends_with("/requirements.txt")
+}
+
+fn looks_like_framework_target_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("tsconfig")
+        || lower.contains("next.config")
+        || lower.contains("tailwind")
+        || lower.contains("postcss")
+        || lower.ends_with("global.d.ts")
+        || lower.ends_with("globals.css")
+        || lower.ends_with("layout.tsx")
+        || lower.ends_with("layout.jsx")
+}
+
+fn looks_like_evidence_target_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("test")
+        || lower.contains("spec")
+        || lower.contains("__tests__")
+        || lower.ends_with(".snap")
+        || lower.contains("evidence")
+        || lower.ends_with("readme.md")
 }
 
 fn assertion_excerpt(reason: &str) -> Option<String> {
@@ -1094,6 +1317,43 @@ mod tests {
         let feedback = format_verify_feedback(&report);
         assert!(feedback.contains("declare module \"*.css\";"));
         assert!(feedback.contains("first non-empty statement"));
+    }
+
+    #[test]
+    fn verify_feedback_anchors_gameplay_evidence_to_implementation_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = CompletionContract {
+            required_paths: vec![
+                "package.json".to_string(),
+                "src/app/page.tsx".to_string(),
+                "src/app/layout.tsx".to_string(),
+                "src/app/global.d.ts".to_string(),
+                "tests/gameplay.test.ts".to_string(),
+            ],
+            verify_commands: Vec::new(),
+            profile: Some("nextjs".to_string()),
+            goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
+            required_obligations: Vec::new(),
+            deferred_verify_requirements: Vec::new(),
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap();
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "missing_required_evidence:challenge_or_adversary_evidence,failure_or_collision_evidence,restart_or_recoverable_state_evidence,score_or_progression_evidence,stateful_update_evidence,user_input_handler_evidence",
+        );
+        let feedback = format_verify_feedback_with_contract(&report, Some(&contract));
+        assert!(feedback.contains("Target implementation files: src/app/page.tsx"));
+        assert!(feedback.contains("adversary, obstacle, wave, hazard, target, or challenge"));
+        assert!(feedback.contains("bullet/enemy collision or damage detection"));
+        assert!(feedback.contains("start/restart/reset behavior"));
+        assert!(feedback.contains("score, level, wave, lives, health, or progress updates"));
+        assert!(feedback.contains("state mutations over time or in response to input"));
+        assert!(feedback.contains("wire keyboard, pointer, click, touch, or form handlers"));
     }
 
     #[test]

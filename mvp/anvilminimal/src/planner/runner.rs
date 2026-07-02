@@ -671,6 +671,7 @@ impl StepPlanRunError {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn run_step_plan_with_session_with_ui(
     client: &mut dyn ChatClient,
     session: &mut SessionSnapshot,
@@ -757,15 +758,15 @@ fn run_step_plan_with_session_with_ui(
         }
         merge_unique_strings(&mut prior_expected_paths, &step.expected_paths);
     }
-    if verify_final_contract {
-        if let Err(err) = verify_plan_final_contract(
+    if verify_final_contract
+        && let Err(err) = verify_plan_final_contract(
             plan,
             &required_final_artifacts,
             config,
             bound_contract.as_ref(),
-        ) {
-            return Err(StepPlanRunError::from_error(err.to_string(), outcome));
-        }
+        )
+    {
+        return Err(StepPlanRunError::from_error(err.to_string(), outcome));
     }
     outcome.summary = format!("plan-run complete: {} steps", plan.steps.len());
     Ok(outcome)
@@ -780,6 +781,7 @@ struct StepPromptContext {
     completion_contract_path: Option<PathBuf>,
 }
 
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn run_step(
     client: &mut dyn ChatClient,
     session: &mut SessionSnapshot,
@@ -799,10 +801,10 @@ fn run_step(
         return Ok(StepRunOutcome::default());
     }
     let mut step_config = capped_config(config, STEP_TURN_MAX_ITERATIONS);
-    if step.step_kind() == StepKind::Implement {
-        if let Some(path) = prompt_context.completion_contract_path.clone() {
-            step_config.completion_contract_path = Some(path);
-        }
+    if step.step_kind() == StepKind::Implement
+        && let Some(path) = prompt_context.completion_contract_path.clone()
+    {
+        step_config.completion_contract_path = Some(path);
     }
     let step_options = step_run_session_options(step);
     let initial = run_session_with_outcome_with_options(
@@ -1303,6 +1305,7 @@ fn required_final_artifacts(plan: &StepPlan, root: &Path) -> Vec<String> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_completion_contract_for_acceptance(
     config: &Config,
     scope: &str,
@@ -3819,12 +3822,11 @@ fn script_contains_next_dev(script: &str) -> bool {
 fn parse_next_dev_port(script: &str) -> Option<u16> {
     let tokens = script.split_whitespace().collect::<Vec<_>>();
     for (index, token) in tokens.iter().enumerate() {
-        if matches!(*token, "-p" | "--port") {
-            if let Some(raw) = tokens.get(index + 1)
-                && let Ok(port) = raw.parse::<u16>()
-            {
-                return Some(port);
-            }
+        if matches!(*token, "-p" | "--port")
+            && let Some(raw) = tokens.get(index + 1)
+            && let Ok(port) = raw.parse::<u16>()
+        {
+            return Some(port);
         }
         if let Some(raw) = token.strip_prefix("-p")
             && !raw.is_empty()
@@ -4248,38 +4250,33 @@ fn classify_release_evidence_json(
     }
     if let Some(status) =
         numeric_field_deep(value, details, &["http_status", "status", "status_code"])
+        && status >= 400
     {
-        if status >= 400 {
-            return ReleaseEvidenceStatus::Failed(evidence_http_failure_reason(
-                value, details, status,
-            ));
-        }
+        return ReleaseEvidenceStatus::Failed(evidence_http_failure_reason(value, details, status));
     }
     if let Some(success) = bool_field_deep(
         value,
         details,
         &["ok", "success", "browser_success", "interaction_success"],
-    ) {
-        if !success {
-            return ReleaseEvidenceStatus::Failed(evidence_failure_reason(value, details));
-        }
+    ) && !success
+    {
+        return ReleaseEvidenceStatus::Failed(evidence_failure_reason(value, details));
     }
     if let Some(reason) = explicit_release_evidence_failure(kind, value, details) {
         return ReleaseEvidenceStatus::Failed(reason);
     }
-    if let Some(status) = text_status.as_deref() {
-        if matches!(status, "failed" | "fail" | "error") {
-            return ReleaseEvidenceStatus::Failed(evidence_failure_reason(value, details));
-        }
+    if let Some(status) = text_status.as_deref()
+        && matches!(status, "failed" | "fail" | "error")
+    {
+        return ReleaseEvidenceStatus::Failed(evidence_failure_reason(value, details));
     }
     if let Some(kind_value) = text_field_deep(
         value,
         details,
         &["browser_failure_kind", "failure_kind", "error_kind"],
-    ) {
-        if !kind_value.is_empty() {
-            return ReleaseEvidenceStatus::Failed(kind_value);
-        }
+    ) && !kind_value.is_empty()
+    {
+        return ReleaseEvidenceStatus::Failed(kind_value);
     }
     if release_evidence_has_required_detail(kind, value, details) {
         return ReleaseEvidenceStatus::Passed;
@@ -4773,6 +4770,7 @@ fn dedup_strings(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_ultra_phase_event(
     config: &Config,
     event: &str,

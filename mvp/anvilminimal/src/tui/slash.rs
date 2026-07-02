@@ -91,6 +91,16 @@ pub fn handle_command(
         other => bail!("unknown slash command: {other}"),
     })();
     let completion = emit_tui_command_stop(&config, &parsed.command, &result);
+    if let Err(err) = &result {
+        eprintln!(
+            "{}",
+            crate::eval_events::render_tui_command_failure_block(
+                config.eval_events_path.as_deref(),
+                &err.to_string(),
+                &completion,
+            )
+        );
+    }
     result.map(|output| crate::eval_events::render_tui_completion_output(&output, &completion))
 }
 
