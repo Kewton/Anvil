@@ -70,6 +70,7 @@ dependencies = [
  "crossterm",
  "globset",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "rustyline",

@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use crate::config::Config;
 use crate::eval_events;
 use crate::minimal_loop::browser_probe::{
@@ -72,6 +75,9 @@ const NEXTJS_DEV_SERVER_DEFAULT_PORT: u16 = 3011;
 const NEXTJS_DEV_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const NEXTJS_DEV_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const NEXTJS_DEV_SERVER_WAIT_INTERVAL: Duration = Duration::from_millis(250);
+const DEV_SERVER_CLEANUP_TERM_TIMEOUT: Duration = Duration::from_secs(5);
+const DEV_SERVER_CLEANUP_KILL_TIMEOUT: Duration = Duration::from_secs(1);
+const DEV_SERVER_LOG_EXCERPT_BYTES: usize = 24_000;
 const DEV_SERVER_ROUTE: &str = "/";
 const DEV_SERVER_LIFECYCLE_STAGES: [&str; 4] = ["start", "wait", "probe", "cleanup"];
 const PROFILE_REPAIR_FILE_EXCERPT_MAX_CHARS: usize = 2_400;
@@ -4474,15 +4480,19 @@ fn nextjs_dev_route_release_evidence(config: &Config) -> ReleaseEvidence {
     let path = nextjs_dev_route_evidence_path(config);
     let value = run_nextjs_dev_route_probe(config, &path);
     let status = classify_release_evidence_json(ReleaseEvidenceKind::BrowserReadiness, &value);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(text) = serde_json::to_string_pretty(&value) {
-        let _ = std::fs::write(&path, format!("{text}\n"));
-    }
+    write_release_evidence_json(&path, &value);
     ReleaseEvidence {
         status,
         path: path.display().to_string(),
+    }
+}
+
+fn write_release_evidence_json(path: &Path, value: &Value) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(value) {
+        let _ = std::fs::write(path, format!("{text}\n"));
     }
 }
 
@@ -4499,7 +4509,23 @@ fn nextjs_dev_route_evidence_path(config: &Config) -> PathBuf {
 }
 
 fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
-    if !dev_server_probe_runtime_enabled() {
+    run_nextjs_dev_route_probe_with_runtime(
+        config,
+        evidence_path,
+        dev_server_probe_runtime_enabled(config),
+        cleanup_dev_server_child,
+    )
+}
+
+type DevServerCleanupFn = fn(Child, &DevServerLogPaths) -> DevServerCleanup;
+
+fn run_nextjs_dev_route_probe_with_runtime(
+    config: &Config,
+    evidence_path: &Path,
+    runtime_enabled: bool,
+    cleanup_fn: DevServerCleanupFn,
+) -> Value {
+    if !runtime_enabled {
         let failure_kind = if cfg!(test) {
             "browser_unavailable:dev_server_probe_disabled_in_tests"
         } else {
@@ -4545,6 +4571,7 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
 
     if localhost_port_accepts_connection(spec.port) {
         let failure_kind = "port_in_use";
+        let output_excerpt = dev_server_output_excerpt_for_port(failure_kind, "", spec.port);
         emit_dev_server_unavailable_lifecycle(
             config,
             spec.port,
@@ -4558,9 +4585,31 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
             &spec.route,
             &spec.command_display,
             failure_kind,
-            "",
+            &output_excerpt,
         );
     }
+
+    let (logs, stdout_log, stderr_log) = match open_dev_server_log_files(evidence_path) {
+        Ok(logs) => logs,
+        Err(err) => {
+            let failure_kind = "browser_unavailable:dev_server_log_open_failed";
+            emit_dev_server_unavailable_lifecycle(
+                config,
+                spec.port,
+                &spec.route,
+                &spec.command_display,
+                failure_kind,
+                evidence_path,
+            );
+            return dev_server_unavailable_evidence(
+                spec.port,
+                &spec.route,
+                &spec.command_display,
+                failure_kind,
+                &err.to_string(),
+            );
+        }
+    };
 
     let mut command =
         verifier_env::normalized_command_at_root(&spec.package_manager, &config.workspace_root);
@@ -4568,9 +4617,11 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
         .args(&spec.args)
         .current_dir(&config.workspace_root)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_log))
+        .stderr(Stdio::from(stderr_log))
         .env("PORT", spec.port.to_string());
+    #[cfg(unix)]
+    command.process_group(0);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -4652,15 +4703,13 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_status)) => {
-                let output = child.wait_with_output().ok();
-                let output_excerpt = output
-                    .as_ref()
-                    .map(output_excerpt)
+                let output_excerpt = dev_server_logs_excerpt(&logs)
                     .unwrap_or_else(|| "dev server exited before readiness".to_string());
                 let failure_kind = classify_dev_server_startup_failure(&output_excerpt)
                     .unwrap_or_else(|| "browser_unavailable:dev_server_exited".to_string());
                 let failure_kind = classify_dev_server_env_conflict(&failure_kind, &output_excerpt);
-                let output_excerpt = dev_server_output_excerpt(&failure_kind, &output_excerpt);
+                let output_excerpt =
+                    dev_server_output_excerpt_for_port(&failure_kind, &output_excerpt, spec.port);
                 emit_dev_server_lifecycle_stage(
                     config,
                     "wait",
@@ -4685,60 +4734,17 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                     evidence_path,
                     Some(pid),
                 );
-                emit_dev_server_lifecycle_stage(
-                    config,
-                    "cleanup",
-                    true,
-                    spec.port,
-                    &spec.route,
-                    &spec.command_display,
-                    Some(&failure_kind),
-                    None,
-                    evidence_path,
-                    Some(pid),
-                );
-                return dev_server_unavailable_evidence(
+                let evidence = dev_server_unavailable_evidence(
                     spec.port,
                     &spec.route,
                     &spec.command_display,
                     &failure_kind,
                     &output_excerpt,
                 );
-            }
-            Ok(None) => {}
-            Err(err) => {
-                let failure_kind = "browser_unavailable:dev_server_status_unreadable";
-                let cleanup = cleanup_dev_server_child(child);
-                let combined = format!("{} {}", err, cleanup.output_excerpt);
-                let failure_kind = classify_dev_server_env_conflict(failure_kind, &combined);
-                let output_excerpt = dev_server_output_excerpt(&failure_kind, &combined);
-                emit_dev_server_lifecycle_stage(
+                write_release_evidence_json(evidence_path, &evidence);
+                let cleanup = cleanup_fn(child, &logs);
+                emit_dev_server_cleanup_lifecycle_stage(
                     config,
-                    "wait",
-                    false,
-                    spec.port,
-                    &spec.route,
-                    &spec.command_display,
-                    Some(&failure_kind),
-                    None,
-                    evidence_path,
-                    Some(pid),
-                );
-                emit_dev_server_lifecycle_stage(
-                    config,
-                    "probe",
-                    false,
-                    spec.port,
-                    &spec.route,
-                    &spec.command_display,
-                    Some(&failure_kind),
-                    None,
-                    evidence_path,
-                    Some(pid),
-                );
-                emit_dev_server_lifecycle_stage(
-                    config,
-                    "cleanup",
                     cleanup.ok,
                     spec.port,
                     &spec.route,
@@ -4747,14 +4753,64 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                     None,
                     evidence_path,
                     Some(pid),
+                    &cleanup,
                 );
-                return dev_server_unavailable_evidence(
+                return evidence;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let failure_kind = "browser_unavailable:dev_server_status_unreadable";
+                let log_excerpt = dev_server_logs_excerpt(&logs).unwrap_or_default();
+                let combined = format!("{} {}", err, log_excerpt);
+                let failure_kind = classify_dev_server_env_conflict(failure_kind, &combined);
+                let output_excerpt =
+                    dev_server_output_excerpt_for_port(&failure_kind, &combined, spec.port);
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "wait",
+                    false,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    Some(&failure_kind),
+                    None,
+                    evidence_path,
+                    Some(pid),
+                );
+                emit_dev_server_lifecycle_stage(
+                    config,
+                    "probe",
+                    false,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    Some(&failure_kind),
+                    None,
+                    evidence_path,
+                    Some(pid),
+                );
+                let evidence = dev_server_unavailable_evidence(
                     spec.port,
                     &spec.route,
                     &spec.command_display,
                     &failure_kind,
                     &output_excerpt,
                 );
+                write_release_evidence_json(evidence_path, &evidence);
+                let cleanup = cleanup_fn(child, &logs);
+                emit_dev_server_cleanup_lifecycle_stage(
+                    config,
+                    cleanup.ok,
+                    spec.port,
+                    &spec.route,
+                    &spec.command_display,
+                    Some(&failure_kind),
+                    None,
+                    evidence_path,
+                    Some(pid),
+                    &cleanup,
+                );
+                return evidence;
             }
         }
 
@@ -4775,19 +4831,21 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                 let failure_kind =
                     classify_dev_route_failure_kind(response.status, &response.body_excerpt);
                 let probe_ok = failure_kind.is_none();
-                let cleanup = cleanup_dev_server_child(child);
+                let log_excerpt = dev_server_logs_excerpt(&logs).unwrap_or_default();
                 let failure_kind = failure_kind.map(|kind| {
-                    let combined = format!("{}\n{}", response.body_excerpt, cleanup.output_excerpt);
+                    let combined = format!("{}\n{}", response.body_excerpt, log_excerpt);
                     classify_dev_server_env_conflict(&kind, &combined)
                 });
                 let body_excerpt = failure_kind
                     .as_deref()
-                    .map(|kind| dev_server_output_excerpt(kind, &response.body_excerpt))
+                    .map(|kind| {
+                        dev_server_output_excerpt_for_port(kind, &response.body_excerpt, spec.port)
+                    })
                     .unwrap_or_else(|| response.body_excerpt.clone());
                 let output_excerpt = failure_kind
                     .as_deref()
-                    .map(|kind| dev_server_output_excerpt(kind, &cleanup.output_excerpt))
-                    .unwrap_or_else(|| cleanup.output_excerpt.clone());
+                    .map(|kind| dev_server_output_excerpt_for_port(kind, &log_excerpt, spec.port))
+                    .unwrap_or_else(|| log_excerpt.clone());
                 emit_dev_server_lifecycle_stage(
                     config,
                     "probe",
@@ -4800,9 +4858,29 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                     evidence_path,
                     Some(pid),
                 );
-                emit_dev_server_lifecycle_stage(
+                let evidence = if let Some(failure_kind) = failure_kind.as_deref() {
+                    dev_server_failed_evidence(
+                        spec.port,
+                        &spec.route,
+                        &spec.command_display,
+                        response.status,
+                        failure_kind,
+                        &body_excerpt,
+                        &output_excerpt,
+                    )
+                } else {
+                    dev_server_passed_evidence(
+                        spec.port,
+                        &spec.route,
+                        &spec.command_display,
+                        response.status,
+                        &response.body_excerpt,
+                    )
+                };
+                write_release_evidence_json(evidence_path, &evidence);
+                let cleanup = cleanup_fn(child, &logs);
+                emit_dev_server_cleanup_lifecycle_stage(
                     config,
-                    "cleanup",
                     cleanup.ok,
                     spec.port,
                     &spec.route,
@@ -4811,25 +4889,9 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                     Some(response.status),
                     evidence_path,
                     Some(pid),
+                    &cleanup,
                 );
-                if let Some(failure_kind) = failure_kind {
-                    return dev_server_failed_evidence(
-                        spec.port,
-                        &spec.route,
-                        &spec.command_display,
-                        response.status,
-                        &failure_kind,
-                        &body_excerpt,
-                        &output_excerpt,
-                    );
-                }
-                return dev_server_passed_evidence(
-                    spec.port,
-                    &spec.route,
-                    &spec.command_display,
-                    response.status,
-                    &response.body_excerpt,
-                );
+                return evidence;
             }
             Err(_) => {
                 std::thread::sleep(NEXTJS_DEV_SERVER_WAIT_INTERVAL);
@@ -4838,9 +4900,9 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
     }
 
     let failure_kind = "startup_timeout";
-    let cleanup = cleanup_dev_server_child(child);
-    let failure_kind = classify_dev_server_env_conflict(failure_kind, &cleanup.output_excerpt);
-    let output_excerpt = dev_server_output_excerpt(&failure_kind, &cleanup.output_excerpt);
+    let log_excerpt = dev_server_logs_excerpt(&logs).unwrap_or_default();
+    let failure_kind = classify_dev_server_env_conflict(failure_kind, &log_excerpt);
+    let output_excerpt = dev_server_output_excerpt_for_port(&failure_kind, &log_excerpt, spec.port);
     emit_dev_server_lifecycle_stage(
         config,
         "wait",
@@ -4865,9 +4927,17 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
         evidence_path,
         Some(pid),
     );
-    emit_dev_server_lifecycle_stage(
+    let evidence = dev_server_unavailable_evidence(
+        spec.port,
+        &spec.route,
+        &spec.command_display,
+        &failure_kind,
+        &output_excerpt,
+    );
+    write_release_evidence_json(evidence_path, &evidence);
+    let cleanup = cleanup_fn(child, &logs);
+    emit_dev_server_cleanup_lifecycle_stage(
         config,
-        "cleanup",
         cleanup.ok,
         spec.port,
         &spec.route,
@@ -4876,21 +4946,23 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
         None,
         evidence_path,
         Some(pid),
+        &cleanup,
     );
-    dev_server_unavailable_evidence(
-        spec.port,
-        &spec.route,
-        &spec.command_display,
-        &failure_kind,
-        &output_excerpt,
-    )
+    evidence
 }
 
-fn dev_server_probe_runtime_enabled() -> bool {
+fn dev_server_probe_runtime_enabled(config: &Config) -> bool {
     if env_flag_is_false("ANVIL_DEV_SERVER_PROBE") {
         return false;
     }
-    if cfg!(test) && !env_flag_is_true("ANVIL_TEST_DEV_SERVER_PROBE") {
+    if cfg!(test)
+        && !env_flag_is_true("ANVIL_TEST_DEV_SERVER_PROBE")
+        && !config
+            .workspace_root
+            .join(".anvil")
+            .join("enable-dev-server-probe-tests")
+            .is_file()
+    {
         return false;
     }
     true
@@ -5105,11 +5177,29 @@ fn classify_dev_server_env_conflict(failure_kind: &str, output: &str) -> String 
     }
 }
 
+#[cfg(test)]
 fn dev_server_output_excerpt(failure_kind: &str, output: &str) -> String {
+    dev_server_output_excerpt_for_port(failure_kind, output, NEXTJS_DEV_SERVER_DEFAULT_PORT)
+}
+
+fn dev_server_output_excerpt_for_port(failure_kind: &str, output: &str, port: u16) -> String {
     if failure_kind == verifier_env::ENV_NODE_ENV_CONFLICT_KIND {
         verifier_env::with_env_node_env_remediation(output)
+    } else if failure_kind == "port_in_use" {
+        port_in_use_remediation(output, port)
     } else {
         output.to_string()
+    }
+}
+
+fn port_in_use_remediation(output: &str, port: u16) -> String {
+    let remediation = format!(
+        "Port {port} is already accepting connections. This may be a leftover dev server from a previous run. Inspect it with `lsof -nP -iTCP:{port} -sTCP:LISTEN` and stop the stale process before retrying."
+    );
+    if output.trim().is_empty() {
+        remediation
+    } else {
+        format!("{output}\n{remediation}")
     }
 }
 
@@ -5121,30 +5211,259 @@ fn tailwind_dev_pipeline_failure(lower_text: &str) -> bool {
             || lower_text.contains("tailwind"))
 }
 
+#[derive(Debug, Clone)]
+struct DevServerLogPaths {
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+fn open_dev_server_log_files(
+    evidence_path: &Path,
+) -> std::io::Result<(DevServerLogPaths, std::fs::File, std::fs::File)> {
+    let dir = evidence_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let paths = DevServerLogPaths {
+        stdout: dir.join("dev-server.out"),
+        stderr: dir.join("dev-server.err"),
+    };
+    let stdout = std::fs::File::create(&paths.stdout)?;
+    let stderr = std::fs::File::create(&paths.stderr)?;
+    Ok((paths, stdout, stderr))
+}
+
+fn dev_server_logs_excerpt(paths: &DevServerLogPaths) -> Option<String> {
+    let stdout = read_dev_server_log_excerpt(&paths.stdout).unwrap_or_default();
+    let stderr = read_dev_server_log_excerpt(&paths.stderr).unwrap_or_default();
+    let combined = format!("{stdout}\n{stderr}");
+    let excerpt = eval_events::body_snippet(combined.trim());
+    if excerpt.trim().is_empty() {
+        None
+    } else {
+        Some(excerpt)
+    }
+}
+
+fn read_dev_server_log_excerpt(path: &Path) -> std::io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    let start = bytes.len().saturating_sub(DEV_SERVER_LOG_EXCERPT_BYTES);
+    Ok(String::from_utf8_lossy(&bytes[start..]).to_string())
+}
+
 #[derive(Debug)]
 struct DevServerCleanup {
     ok: bool,
+    failure_kind: Option<String>,
     output_excerpt: String,
 }
 
-fn cleanup_dev_server_child(mut child: Child) -> DevServerCleanup {
-    let _ = child.kill();
-    match child.wait_with_output() {
-        Ok(output) => DevServerCleanup {
+fn cleanup_dev_server_child(mut child: Child, logs: &DevServerLogPaths) -> DevServerCleanup {
+    #[cfg(unix)]
+    {
+        cleanup_dev_server_child_unix(&mut child, logs)
+    }
+    #[cfg(not(unix))]
+    {
+        cleanup_dev_server_child_non_unix(&mut child, logs)
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_dev_server_child_unix(child: &mut Child, logs: &DevServerLogPaths) -> DevServerCleanup {
+    let pid = child.id();
+    let mut notes = Vec::new();
+    if let Err(err) = signal_dev_server_process_group(pid, libc::SIGTERM) {
+        notes.push(format!("SIGTERM process group failed: {err}"));
+    }
+    match wait_for_dev_server_process_group_exit(
+        child,
+        pid,
+        Instant::now() + DEV_SERVER_CLEANUP_TERM_TIMEOUT,
+    ) {
+        Ok(true) => {
+            return DevServerCleanup {
+                ok: true,
+                failure_kind: None,
+                output_excerpt: dev_server_logs_excerpt(logs).unwrap_or_default(),
+            };
+        }
+        Ok(false) => {}
+        Err(err) => notes.push(format!("wait after SIGTERM failed: {err}")),
+    }
+
+    if let Err(err) = signal_dev_server_process_group(pid, libc::SIGKILL) {
+        notes.push(format!("SIGKILL process group failed: {err}"));
+    }
+    match wait_for_dev_server_process_group_exit(
+        child,
+        pid,
+        Instant::now() + DEV_SERVER_CLEANUP_KILL_TIMEOUT,
+    ) {
+        Ok(true) => DevServerCleanup {
             ok: true,
-            output_excerpt: output_excerpt(&output),
+            failure_kind: None,
+            output_excerpt: dev_server_logs_excerpt(logs).unwrap_or_default(),
         },
-        Err(err) => DevServerCleanup {
+        Ok(false) => DevServerCleanup {
             ok: false,
-            output_excerpt: err.to_string(),
+            failure_kind: Some("dev_server_cleanup_timeout".to_string()),
+            output_excerpt: cleanup_timeout_excerpt(logs, &notes),
+        },
+        Err(err) => {
+            notes.push(format!("wait after SIGKILL failed: {err}"));
+            DevServerCleanup {
+                ok: false,
+                failure_kind: Some("dev_server_cleanup_timeout".to_string()),
+                output_excerpt: cleanup_timeout_excerpt(logs, &notes),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_dev_server_process_group(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    let pid =
+        i32::try_from(pid).map_err(|_| std::io::Error::other("child pid does not fit pid_t"))?;
+    // SAFETY: `kill` is called with a process-group id derived from the child
+    // pid returned by `std::process::Child` and a libc signal constant.
+    let rc = unsafe { libc::kill(-pid, signal) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_dev_server_process_group_exit(
+    child: &mut Child,
+    pid: u32,
+    deadline: Instant,
+) -> std::io::Result<bool> {
+    let mut child_exited = false;
+    loop {
+        if !child_exited && child.try_wait()?.is_some() {
+            let _ = child.wait();
+            child_exited = true;
+        }
+        if child_exited && !dev_server_process_group_exists(pid) {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+fn dev_server_process_group_exists(pgid: u32) -> bool {
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs existence/permission checking only, using
+    // a process-group id derived from a child process spawned by this probe.
+    let rc = unsafe { libc::kill(-pgid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error();
+    err.raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn cleanup_dev_server_child_non_unix(
+    child: &mut Child,
+    logs: &DevServerLogPaths,
+) -> DevServerCleanup {
+    let _ = child.kill();
+    match wait_for_dev_server_child_exit(child, Instant::now() + DEV_SERVER_CLEANUP_TERM_TIMEOUT) {
+        Ok(true) => DevServerCleanup {
+            ok: true,
+            failure_kind: None,
+            output_excerpt: dev_server_logs_excerpt(logs).unwrap_or_default(),
+        },
+        Ok(false) | Err(_) => DevServerCleanup {
+            ok: false,
+            failure_kind: Some("dev_server_cleanup_timeout".to_string()),
+            output_excerpt: cleanup_timeout_excerpt(logs, &[]),
         },
     }
 }
 
-fn output_excerpt(output: &std::process::Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    eval_events::body_snippet(&format!("{stdout}\n{stderr}"))
+#[cfg(not(unix))]
+fn wait_for_dev_server_child_exit(child: &mut Child, deadline: Instant) -> std::io::Result<bool> {
+    loop {
+        if child.try_wait()?.is_some() {
+            let _ = child.wait();
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn cleanup_timeout_excerpt(logs: &DevServerLogPaths, notes: &[String]) -> String {
+    let mut parts = notes.to_vec();
+    if let Some(log_excerpt) = dev_server_logs_excerpt(logs) {
+        parts.push(log_excerpt);
+    }
+    if parts.is_empty() {
+        "dev server cleanup timed out".to_string()
+    } else {
+        eval_events::body_snippet(&parts.join("\n"))
+    }
+}
+
+fn cleanup_stage_failure_kind<'a>(
+    original_failure_kind: Option<&'a str>,
+    cleanup: &'a DevServerCleanup,
+) -> Option<&'a str> {
+    if !cleanup.ok {
+        cleanup.failure_kind.as_deref().or(original_failure_kind)
+    } else {
+        original_failure_kind
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_dev_server_cleanup_lifecycle_stage(
+    config: &Config,
+    ok: bool,
+    port: u16,
+    route: &str,
+    command: &str,
+    failure_kind: Option<&str>,
+    http_status: Option<i64>,
+    evidence_path: &Path,
+    pid: Option<u32>,
+    cleanup: &DevServerCleanup,
+) {
+    let stage_failure_kind = cleanup_stage_failure_kind(failure_kind, cleanup);
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "dev_server_lifecycle",
+            "profile": "nextjs",
+            "stage": "cleanup",
+            "ok": ok,
+            "port": port,
+            "route": route,
+            "command": command,
+            "failure_kind": stage_failure_kind.unwrap_or(""),
+            "http_status": http_status,
+            "pid": pid,
+            "evidence_path": evidence_path.display().to_string(),
+            "output_excerpt": eval_events::body_snippet(&cleanup.output_excerpt),
+            "lifecycle_stages": DEV_SERVER_LIFECYCLE_STAGES,
+            "probe_environment": dev_server_probe_environment(port),
+        }),
+    );
 }
 
 fn emit_dev_server_unavailable_lifecycle(
@@ -10443,6 +10762,259 @@ export default function Page(){
     }
 
     #[test]
+    #[cfg(unix)]
+    fn dev_server_cleanup_kills_grandchild_process_group_without_pipe_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join("events.jsonl");
+        write_fake_nextjs_dev_workspace(dir.path(), port, true);
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let evidence_path = nextjs_dev_route_evidence_path(&cfg);
+
+        let started = Instant::now();
+        let evidence = run_nextjs_dev_route_probe_with_runtime(
+            &cfg,
+            &evidence_path,
+            true,
+            cleanup_dev_server_child,
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "cleanup should be bounded and fast"
+        );
+        assert_eq!(evidence.get("ok").and_then(Value::as_bool), Some(true));
+        assert!(evidence_path.is_file(), "browser readiness evidence");
+        assert!(evidence_path.with_file_name("dev-server.out").is_file());
+        assert!(evidence_path.with_file_name("dev-server.err").is_file());
+        let events_json = read_jsonl_events(&events);
+        assert_eq!(
+            dev_server_stage_names(&events_json),
+            vec!["start", "wait", "probe", "cleanup"]
+        );
+        let cleanup = events_json
+            .iter()
+            .find(|event| {
+                event.get("event").and_then(Value::as_str) == Some("dev_server_lifecycle")
+                    && event.get("stage").and_then(Value::as_str) == Some("cleanup")
+            })
+            .expect("cleanup event");
+        assert_eq!(cleanup.get("ok").and_then(Value::as_bool), Some(true));
+        let pid = events_json
+            .iter()
+            .find(|event| {
+                event.get("event").and_then(Value::as_str) == Some("dev_server_lifecycle")
+                    && event.get("stage").and_then(Value::as_str) == Some("start")
+            })
+            .and_then(|event| event.get("pid"))
+            .and_then(Value::as_u64)
+            .expect("dev server pid") as u32;
+        assert!(
+            wait_until_process_group_gone(pid, Duration::from_secs(2)),
+            "process group {pid} should be gone"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dev_server_writes_readiness_before_forced_cleanup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join("events.jsonl");
+        write_fake_nextjs_dev_workspace(dir.path(), port, false);
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let evidence_path = nextjs_dev_route_evidence_path(&cfg);
+
+        let evidence = run_nextjs_dev_route_probe_with_runtime(
+            &cfg,
+            &evidence_path,
+            true,
+            forced_cleanup_timeout_after_real_cleanup,
+        );
+
+        assert_eq!(evidence.get("ok").and_then(Value::as_bool), Some(true));
+        let readiness_text =
+            std::fs::read_to_string(&evidence_path).expect("readiness evidence written");
+        assert!(readiness_text.contains("\"route_rendered\": true"));
+        let events_json = read_jsonl_events(&events);
+        assert_eq!(
+            dev_server_stage_names(&events_json),
+            vec!["start", "wait", "probe", "cleanup"]
+        );
+        let cleanup = events_json
+            .iter()
+            .find(|event| {
+                event.get("event").and_then(Value::as_str) == Some("dev_server_lifecycle")
+                    && event.get("stage").and_then(Value::as_str) == Some("cleanup")
+            })
+            .expect("cleanup event");
+        assert_eq!(cleanup.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            cleanup.get("failure_kind").and_then(Value::as_str),
+            Some("dev_server_cleanup_timeout")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn slash_ultra_final_flow_reaches_stop_after_fake_dev_server_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/fake/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        write_fake_nextjs_package_manager(dir.path(), false);
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "build".to_string(),
+                    prompt: "Create the final interactive app".to_string(),
+                },
+                UltraPhase {
+                    id: "final".to_string(),
+                    prompt: "Verify final acceptance evidence".to_string(),
+                },
+            ],
+        };
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(render_ultra_plan(&plan)),
+            AssistantReply::text(generated_nextjs_artifact_plan_json_with_build_verify(
+                "Create the final interactive app",
+            )),
+            AssistantReply::text(generated_nextjs_artifact_plan_json_with_build_verify(
+                "Verify final acceptance evidence",
+            )),
+        ]);
+        let package = format!(
+            r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}}}"#
+        );
+        let mut tool_calls = nextjs_interactive_app_tool_calls(interactive_game_page_source());
+        tool_calls[0] = crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({"path":"package.json","content":package}),
+        );
+        tool_calls.push(crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({
+                "path":"interaction-evidence.json",
+                "content":"{\"ok\":true,\"interaction_performed\":true,\"input_event_observed\":true,\"state_changed\":true,\"canvas_found\":true}"
+            }),
+        ));
+        let mut execution_replies = vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({
+                        "path":"interaction-evidence.json",
+                        "content":"{\"ok\":true,\"interaction_performed\":true,\"input_event_observed\":true,\"state_changed\":true,\"canvas_found\":true}"
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ];
+        execution_replies.extend(
+            (0..8).map(|_| AssistantReply::text("final app artifacts and evidence are ready")),
+        );
+        let mut execution = FakeClient::new(execution_replies);
+
+        let result = crate::tui::slash::handle_command(
+            "/ultra-plan-run --profile nextjs \"Create an interactive browser game\"",
+            &cfg,
+            &mut planner,
+            &mut execution,
+            &NOOP_UI,
+        );
+        let output = match result {
+            Ok(output) => output,
+            Err(err) => {
+                let event_text = std::fs::read_to_string(&events).unwrap_or_default();
+                panic!(
+                    "slash command failed: {err}; planner_requests={}; execution_requests={}; events={event_text}",
+                    planner.messages.len(),
+                    execution.messages.len()
+                );
+            }
+        };
+
+        assert!(output.contains("ultra-plan-run complete: 2 phases"));
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"event\":\"ultra_phase_complete\""));
+        assert!(event_text.contains("\"event\":\"dev_server_lifecycle\""));
+        assert!(event_text.contains("\"stage\":\"probe\""));
+        assert!(event_text.contains("\"stage\":\"cleanup\""));
+        assert!(event_text.contains("\"event\":\"ultra_final_acceptance\""));
+        assert!(event_text.contains("\"event\":\"tui_command_stop\""));
+        assert!(
+            dir.path()
+                .join(".anvil/runs/fake/browser-readiness.json")
+                .is_file()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    #[cfg(unix)]
+    fn fake_dev_server_package_manager_child() {
+        if std::env::var("ANVIL_FAKE_DEV_SERVER_CHILD").ok().as_deref() != Some("1") {
+            return;
+        }
+        if std::env::var("ANVIL_FAKE_DEV_SERVER_GRANDCHILD")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg("sleep 300")
+                .spawn()
+                .expect("spawn grandchild");
+        }
+        let port = std::env::var("PORT")
+            .expect("PORT")
+            .parse::<u16>()
+            .expect("PORT number");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind fake server");
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request);
+                    let body = "<html><body>fake next ready</body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("fake server accept failed: {err}"),
+            }
+        }
+    }
+
+    #[test]
     fn plan_run_nextjs_browser_ready_without_interaction_is_partial() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -11702,6 +12274,147 @@ export default function Page(){
             .env("NODE_ENV", "production")
             .status()
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn forced_cleanup_timeout_after_real_cleanup(
+        child: Child,
+        logs: &DevServerLogPaths,
+    ) -> DevServerCleanup {
+        let _ = cleanup_dev_server_child(child, logs);
+        DevServerCleanup {
+            ok: false,
+            failure_kind: Some("dev_server_cleanup_timeout".to_string()),
+            output_excerpt: cleanup_timeout_excerpt(
+                logs,
+                &["forced cleanup timeout for test".to_string()],
+            ),
+        }
+    }
+
+    #[cfg(unix)]
+    fn enable_dev_server_probe_test_override(root: &Path) {
+        std::fs::create_dir_all(root.join(".anvil")).unwrap();
+        std::fs::write(root.join(".anvil/enable-dev-server-probe-tests"), "1").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_fake_nextjs_dev_workspace(root: &Path, port: u16, spawn_grandchild: bool) {
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{"scripts":{{"dev":"next dev -p {port}","build":"next build"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}}}"#
+            ),
+        )
+        .unwrap();
+        write_fake_nextjs_package_manager(root, spawn_grandchild);
+    }
+
+    #[cfg(unix)]
+    fn write_fake_nextjs_package_manager(root: &Path, spawn_grandchild: bool) {
+        let bin = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/next")).unwrap();
+        let exe = shell_quote(&std::env::current_exe().unwrap().display().to_string());
+        let grandchild = if spawn_grandchild { "1" } else { "0" };
+        let script = format!(
+            "#!/bin/sh\n\
+if [ \"$1\" = \"run\" ] && [ \"$2\" = \"build\" ]; then\n\
+  echo \"fake build ok\"\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"run\" ] && [ \"$2\" = \"dev\" ]; then\n\
+  ANVIL_FAKE_DEV_SERVER_CHILD=1 ANVIL_FAKE_DEV_SERVER_GRANDCHILD={grandchild} exec {exe} --ignored --exact planner::runner::tests::fake_dev_server_package_manager_child --nocapture\n\
+fi\n\
+echo \"unexpected fake npm args: $*\" >&2\n\
+exit 2\n"
+        );
+        let path = bin.join("npm");
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let next_path = bin.join("next");
+        std::fs::write(&next_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&next_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(next_path, permissions).unwrap();
+    }
+
+    fn generated_nextjs_artifact_plan_json_with_build_verify(goal: &str) -> String {
+        serde_json::to_string(&StepPlan {
+            goal: goal.to_string(),
+            steps: vec![PlanStep {
+                id: "create-nextjs-artifacts".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create package.json, src/app/page.tsx, src/app/layout.tsx, and src/app/global.d.ts".to_string(),
+                expected_paths: vec![
+                    "package.json".to_string(),
+                    "src/app/page.tsx".to_string(),
+                    "src/app/layout.tsx".to_string(),
+                    "src/app/global.d.ts".to_string(),
+                ],
+                verify: vec!["npm run build".to_string()],
+            }],
+        })
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    #[cfg(unix)]
+    fn free_local_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn read_jsonl_events(path: &Path) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect()
+    }
+
+    fn dev_server_stage_names<'a>(events: &'a [Value]) -> Vec<&'a str> {
+        events
+            .iter()
+            .filter(|event| {
+                event.get("event").and_then(Value::as_str) == Some("dev_server_lifecycle")
+            })
+            .filter_map(|event| event.get("stage").and_then(Value::as_str))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn wait_until_process_group_gone(pgid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if !process_group_exists(pgid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        !process_group_exists(pgid)
+    }
+
+    #[cfg(unix)]
+    fn process_group_exists(pgid: u32) -> bool {
+        let Ok(pgid) = i32::try_from(pgid) else {
+            return false;
+        };
+        // SAFETY: signal 0 performs existence/permission checking only, using
+        // a process-group id originally emitted from a spawned child pid.
+        let rc = unsafe { libc::kill(-pgid, 0) };
+        if rc == 0 {
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        err.raw_os_error() != Some(libc::ESRCH)
     }
 
     fn config(root: PathBuf) -> Config {
