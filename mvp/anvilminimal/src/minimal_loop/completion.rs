@@ -231,7 +231,7 @@ impl CompletionContract {
                 build_verifier_observations.push(lifecycle);
                 continue;
             }
-            match crate::tools::bash::run_checked(command, root, false) {
+            match crate::minimal_loop::verifier_env::run_checked(command, root, false) {
                 Ok(output) => {
                     if command.contains("npm") && output.contains("0 tests") {
                         report.push_command_failure(command.clone(), "Node 0 tests rejected");

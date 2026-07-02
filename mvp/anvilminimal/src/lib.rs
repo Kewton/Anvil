@@ -101,6 +101,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
 }
 
 fn emit_run_start(config: &Config) {
+    let host_env_contamination = minimal_loop::verifier_env::host_env_contamination();
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -116,16 +117,34 @@ fn emit_run_start(config: &Config) {
             "eval_events_override": eval_events::is_eval_events_override(),
         }),
     );
+    if !host_env_contamination.is_empty() {
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "host_env_contamination",
+                "contamination": host_env_contamination.clone(),
+                "lifecycle_stage": "process",
+            }),
+        );
+    }
     let events_path = config
         .eval_events_path
         .as_ref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "unavailable".to_string());
+    let host_env_line = if host_env_contamination.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nInfo: host_env_contamination: {}",
+            host_env_contamination.join(", ")
+        )
+    };
     eval_events::write_run_summary(
         config.eval_events_path.as_deref(),
         &format!(
-            "Status: running\nAction: {:?}\nEvents: {}",
-            config.action, events_path
+            "Status: running\nAction: {:?}\nEvents: {}{}",
+            config.action, events_path, host_env_line
         ),
     );
 }
@@ -262,6 +281,40 @@ mod tests {
     }
 
     #[test]
+    fn run_start_reports_host_env_contamination_once() {
+        let status = run_ignored_self_test(
+            "tests::run_start_reports_host_env_contamination_once_child",
+            &[("NODE_ENV", "production")],
+        );
+        assert!(status.success(), "{status}");
+    }
+
+    #[test]
+    #[ignore]
+    fn run_start_reports_host_env_contamination_once_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/test-run/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+
+        emit_run_start(&cfg);
+
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert_eq!(
+            event_text
+                .matches("\"event\":\"host_env_contamination\"")
+                .count(),
+            1
+        );
+        assert!(event_text.contains("NODE_ENV=production"), "{event_text}");
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(
+            summary.contains("Info: host_env_contamination: NODE_ENV=production"),
+            "{summary}"
+        );
+    }
+
+    #[test]
     fn run_lifecycle_records_incomplete_stop_reason() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join(".anvil/runs/test-run/events.jsonl");
@@ -363,5 +416,15 @@ mod tests {
         assert!(summary.contains("Release gate: failed"));
         assert!(summary.contains("- browser_readiness_failed:http_500"));
         assert!(!summary.contains("\nStatus: complete\nAction: Repl\nStop reason: completed"));
+    }
+
+    fn run_ignored_self_test(test_name: &str, envs: &[(&str, &str)]) -> std::process::ExitStatus {
+        let exe = std::env::current_exe().unwrap();
+        let mut command = std::process::Command::new(exe);
+        command.args(["--ignored", "--exact", test_name, "--nocapture"]);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.status().unwrap()
     }
 }

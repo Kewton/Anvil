@@ -1075,6 +1075,13 @@ fn render_completion_summary(
         format!("Recovery next action: {}", projection.next_action),
         format!("Stop reason: {stop_reason}"),
     ]);
+    let host_env_contamination = crate::minimal_loop::verifier_env::host_env_contamination();
+    if !host_env_contamination.is_empty() {
+        lines.push(format!(
+            "Info: host_env_contamination: {}",
+            host_env_contamination.join(", ")
+        ));
+    }
     if !projection.recovery_prompt_path.is_empty()
         || !projection.recovery_ultra_plan_path.is_empty()
         || !projection.suggested_recovery_command.is_empty()

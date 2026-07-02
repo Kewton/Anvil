@@ -6,8 +6,8 @@ use crate::eval_events;
 use crate::minimal_loop::dependency_setup::{
     self, NodeDependencySetupAuthority, NodeDependencySetupObservation, NodeDependencySetupStatus,
 };
+use crate::minimal_loop::verifier_env;
 use crate::planner::verify::validate_verify_command;
-use crate::tools::bash;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BuildVerifierRequirement {
@@ -260,7 +260,7 @@ pub fn observe_requirement(
             output_snippet: String::new(),
         };
     }
-    match bash::run_checked(&requirement.command, root, false) {
+    match verifier_env::run_checked(&requirement.command, root, false) {
         Ok(output) => BuildVerifierObservation {
             command: requirement.command.clone(),
             profile: requirement.profile.clone(),

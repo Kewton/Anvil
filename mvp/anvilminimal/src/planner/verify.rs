@@ -4,6 +4,7 @@ use crate::minimal_loop::build_verifier::{
     self, BuildVerifierLifecycleObservation, BuildVerifierStatus,
 };
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
+use crate::minimal_loop::verifier_env;
 use crate::planner::step_plan::{ExpectedResult, PlanStep};
 use crate::tools::path_guard::{resolve_existing, validate_workspace_relative};
 
@@ -265,7 +266,7 @@ fn verify_step_with_setup_observed_with_options(
             }
             continue;
         }
-        match crate::tools::bash::run_checked(command, root, false) {
+        match verifier_env::run_checked(command, root, false) {
             Ok(output) => {
                 if step.expected_result_kind() == ExpectedResult::Fail {
                     report.push_command_failure(
@@ -812,6 +813,40 @@ mod tests {
     }
 
     #[test]
+    fn raw_verify_command_uses_normalized_env() {
+        let status = run_ignored_verify_harness(
+            "planner::verify::tests::raw_verify_command_uses_normalized_env_child",
+        );
+        assert!(status.success(), "{status}");
+    }
+
+    #[test]
+    #[ignore]
+    fn raw_verify_command_uses_normalized_env_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let checker = dir.path().join("check-env.sh");
+        write_executable(
+            &checker,
+            "#!/bin/sh\n\
+             test -z \"${NODE_ENV+x}\" || exit 42\n\
+             test -z \"${NODE_OPTIONS+x}\" || exit 43\n\
+             test \"$NEXT_TELEMETRY_DISABLED\" = \"1\" || exit 44\n\
+             exit 0\n",
+        );
+        let step = PlanStep {
+            id: "env".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "verify normalized env".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["./check-env.sh".to_string()],
+        };
+
+        let report = verify_step(dir.path(), &step);
+        assert!(report.is_pass(), "{report:?}");
+    }
+
+    #[test]
     fn nextjs_build_missing_next_binary_is_dependency_missing() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -972,6 +1007,16 @@ mod tests {
             classify_repair_target(&report),
             RepairTarget::DependencySetup
         );
+    }
+
+    fn run_ignored_verify_harness(test_name: &str) -> std::process::ExitStatus {
+        let exe = std::env::current_exe().unwrap();
+        std::process::Command::new(exe)
+            .args(["--ignored", "--exact", test_name, "--nocapture"])
+            .env("NODE_ENV", "production")
+            .env("NODE_OPTIONS", "--require ./host-hook.js")
+            .status()
+            .unwrap()
     }
 
     #[test]

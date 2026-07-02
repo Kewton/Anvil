@@ -12,5 +12,6 @@ pub mod reachability;
 pub mod repair_progress;
 pub mod repair_target;
 pub mod verifier_bootstrap;
+pub mod verifier_env;
 
 pub use loop_run::run_session;

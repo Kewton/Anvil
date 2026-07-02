@@ -1,11 +1,12 @@
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::eval_events;
+use crate::minimal_loop::verifier_env;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -524,7 +525,7 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
     let before_lock = root.join("package-lock.json").exists();
     let before_missing = setup_missing_dependency_labels(root, requirement.setup_kind);
     let started = Instant::now();
-    let mut child = match Command::new(npm_program)
+    let mut child = match verifier_env::normalized_command(npm_program)
         .args(["install", "--ignore-scripts"])
         .current_dir(root)
         .stdin(Stdio::null())

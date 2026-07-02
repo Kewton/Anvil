@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::eval_events;
 use crate::minimal_loop::build_verifier::{self, BuildVerifierStatus};
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
+use crate::minimal_loop::verifier_env;
 
 const DEFAULT_ROUTE: &str = "/";
 const DEFAULT_NEXTJS_PORT: u16 = 3000;
@@ -178,7 +179,7 @@ fn probe_browser_readiness_with_options(
         );
     }
 
-    let mut command = Command::new(&spec.command.program);
+    let mut command = verifier_env::normalized_command(&spec.command.program);
     command
         .args(&spec.command.args)
         .current_dir(root)
@@ -521,6 +522,9 @@ fn finish_with_cleanup(
     child_reaped: bool,
 ) -> BrowserReadinessObservation {
     let ok = http_status == Some(200) && failure_kind.is_empty();
+    let adjusted_failure_kind = browser_probe_failure_kind(failure_kind, output_excerpt);
+    let adjusted_output_excerpt =
+        browser_probe_output_excerpt(&adjusted_failure_kind, output_excerpt);
     let observation = BrowserReadinessObservation {
         ok,
         status: if ok { "ready" } else { "failed" }.to_string(),
@@ -529,10 +533,10 @@ fn finish_with_cleanup(
         route: spec.route.clone(),
         command: spec.command.display.clone(),
         http_status,
-        failure_kind: failure_kind.to_string(),
+        failure_kind: adjusted_failure_kind,
         evidence_path: evidence_path.to_path_buf(),
         elapsed_ms: started.elapsed().as_millis(),
-        output_excerpt: eval_events::body_snippet(output_excerpt),
+        output_excerpt: eval_events::body_snippet(&adjusted_output_excerpt),
         child_spawned,
         child_reaped,
     };
@@ -596,6 +600,22 @@ fn first_non_empty(primary: &str, fallback: &str) -> String {
         fallback.to_string()
     } else {
         primary.to_string()
+    }
+}
+
+fn browser_probe_failure_kind(failure_kind: &str, output_excerpt: &str) -> String {
+    if !failure_kind.is_empty() && verifier_env::is_env_node_env_conflict_output(output_excerpt) {
+        verifier_env::ENV_NODE_ENV_CONFLICT_KIND.to_string()
+    } else {
+        failure_kind.to_string()
+    }
+}
+
+fn browser_probe_output_excerpt(failure_kind: &str, output_excerpt: &str) -> String {
+    if failure_kind == verifier_env::ENV_NODE_ENV_CONFLICT_KIND {
+        verifier_env::with_env_node_env_remediation(output_excerpt)
+    } else {
+        output_excerpt.to_string()
     }
 }
 
@@ -798,6 +818,58 @@ mod tests {
     }
 
     #[test]
+    fn mock_server_succeeds_with_parent_node_env_production() {
+        let status = run_ignored_browser_probe_harness(
+            "minimal_loop::browser_probe::tests::browser_probe_normalized_env_harness",
+        );
+        assert!(status.success(), "{status}");
+    }
+
+    #[test]
+    #[ignore]
+    fn browser_probe_normalized_env_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port();
+        let observation =
+            probe_with_mock_child(dir.path(), port, "env-sensitive", 0, Duration::from_secs(5));
+        assert!(observation.ok, "{observation:?}");
+        assert_eq!(observation.http_status, Some(200));
+    }
+
+    #[test]
+    fn next_node_env_marker_with_contamination_reports_env_conflict() {
+        let status = run_ignored_browser_probe_harness(
+            "minimal_loop::browser_probe::tests::browser_probe_env_conflict_harness",
+        );
+        assert!(status.success(), "{status}");
+    }
+
+    #[test]
+    #[ignore]
+    fn browser_probe_env_conflict_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port();
+        let observation = probe_with_mock_child(
+            dir.path(),
+            port,
+            "node-env-marker",
+            0,
+            Duration::from_secs(5),
+        );
+        assert!(!observation.ok, "{observation:?}");
+        assert_eq!(
+            observation.failure_kind,
+            verifier_env::ENV_NODE_ENV_CONFLICT_KIND
+        );
+        assert!(
+            observation
+                .output_excerpt
+                .contains(verifier_env::ENV_NODE_ENV_REMEDIATION),
+            "{observation:?}"
+        );
+    }
+
+    #[test]
     #[ignore]
     fn browser_probe_mock_server_child() {
         if std::env::var("ANVIL_BROWSER_PROBE_MOCK_CHILD")
@@ -827,11 +899,24 @@ mod tests {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0u8; 512];
         let _ = stream.read(&mut request);
-        let code = if status == "500" { 500 } else { 200 };
-        if code == 500 {
+        let code = if status == "500" || status == "node-env-marker" {
+            500
+        } else if status == "env-sensitive"
+            && (std::env::var_os("NODE_ENV").is_some()
+                || std::env::var_os("NODE_OPTIONS").is_some())
+        {
+            500
+        } else {
+            200
+        };
+        if status == "node-env-marker" {
+            eprintln!("Next.js detected a non-standard \"NODE_ENV\" value.");
+        } else if code == 500 {
             eprintln!("Module parse failed: Unexpected character '@' (1:0)");
         }
-        let body = if code == 500 {
+        let body = if status == "node-env-marker" {
+            "Next.js detected a non-standard \"NODE_ENV\" value."
+        } else if code == 500 {
             "Module parse failed: Unexpected character '@'"
         } else {
             "ok"
@@ -895,5 +980,15 @@ mod tests {
     fn free_port() -> u16 {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.local_addr().unwrap().port()
+    }
+
+    fn run_ignored_browser_probe_harness(test_name: &str) -> std::process::ExitStatus {
+        let exe = std::env::current_exe().unwrap();
+        Command::new(exe)
+            .args(["--ignored", "--exact", test_name, "--nocapture"])
+            .env("NODE_ENV", "production")
+            .env("NODE_OPTIONS", "--require ./host-hook.js")
+            .status()
+            .unwrap()
     }
 }

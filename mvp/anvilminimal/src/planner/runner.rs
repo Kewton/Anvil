@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -28,6 +28,7 @@ use crate::minimal_loop::reachability::{
 use crate::minimal_loop::repair_target::{
     RepairFollowThrough, classify_repair_follow_through, classify_repair_target,
 };
+use crate::minimal_loop::verifier_env;
 use crate::planner::intent::detect_intent;
 use crate::planner::lint::{
     PlanLintReport, PlanQualityContext, PlanQualityReport, lint_step_plan_report_with_workspace,
@@ -4402,7 +4403,7 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
         );
     }
 
-    let mut command = Command::new(&spec.package_manager);
+    let mut command = verifier_env::normalized_command(&spec.package_manager);
     command
         .args(&spec.args)
         .current_dir(&config.workspace_root)
@@ -4498,6 +4499,8 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                     .unwrap_or_else(|| "dev server exited before readiness".to_string());
                 let failure_kind = classify_dev_server_startup_failure(&output_excerpt)
                     .unwrap_or_else(|| "browser_unavailable:dev_server_exited".to_string());
+                let failure_kind = classify_dev_server_env_conflict(&failure_kind, &output_excerpt);
+                let output_excerpt = dev_server_output_excerpt(&failure_kind, &output_excerpt);
                 emit_dev_server_lifecycle_stage(
                     config,
                     "wait",
@@ -4546,6 +4549,9 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
             Err(err) => {
                 let failure_kind = "browser_unavailable:dev_server_status_unreadable";
                 let cleanup = cleanup_dev_server_child(child);
+                let combined = format!("{} {}", err, cleanup.output_excerpt);
+                let failure_kind = classify_dev_server_env_conflict(failure_kind, &combined);
+                let output_excerpt = dev_server_output_excerpt(&failure_kind, &combined);
                 emit_dev_server_lifecycle_stage(
                     config,
                     "wait",
@@ -4553,7 +4559,7 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                     spec.port,
                     &spec.route,
                     &spec.command_display,
-                    Some(failure_kind),
+                    Some(&failure_kind),
                     None,
                     evidence_path,
                     Some(pid),
@@ -4565,7 +4571,7 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                     spec.port,
                     &spec.route,
                     &spec.command_display,
-                    Some(failure_kind),
+                    Some(&failure_kind),
                     None,
                     evidence_path,
                     Some(pid),
@@ -4577,7 +4583,7 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                     spec.port,
                     &spec.route,
                     &spec.command_display,
-                    Some(failure_kind),
+                    Some(&failure_kind),
                     None,
                     evidence_path,
                     Some(pid),
@@ -4586,8 +4592,8 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                     spec.port,
                     &spec.route,
                     &spec.command_display,
-                    failure_kind,
-                    &format!("{} {}", err, cleanup.output_excerpt),
+                    &failure_kind,
+                    &output_excerpt,
                 );
             }
         }
@@ -4609,10 +4615,23 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                 let failure_kind =
                     classify_dev_route_failure_kind(response.status, &response.body_excerpt);
                 let probe_ok = failure_kind.is_none();
+                let cleanup = cleanup_dev_server_child(child);
+                let failure_kind = failure_kind.map(|kind| {
+                    let combined = format!("{}\n{}", response.body_excerpt, cleanup.output_excerpt);
+                    classify_dev_server_env_conflict(&kind, &combined)
+                });
+                let body_excerpt = failure_kind
+                    .as_deref()
+                    .map(|kind| dev_server_output_excerpt(kind, &response.body_excerpt))
+                    .unwrap_or_else(|| response.body_excerpt.clone());
+                let output_excerpt = failure_kind
+                    .as_deref()
+                    .map(|kind| dev_server_output_excerpt(kind, &cleanup.output_excerpt))
+                    .unwrap_or_else(|| cleanup.output_excerpt.clone());
                 emit_dev_server_lifecycle_stage(
                     config,
                     "probe",
-                    probe_ok,
+                    probe_ok && failure_kind.is_none(),
                     spec.port,
                     &spec.route,
                     &spec.command_display,
@@ -4621,7 +4640,6 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                     evidence_path,
                     Some(pid),
                 );
-                let cleanup = cleanup_dev_server_child(child);
                 emit_dev_server_lifecycle_stage(
                     config,
                     "cleanup",
@@ -4641,8 +4659,8 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
                         &spec.command_display,
                         response.status,
                         &failure_kind,
-                        &response.body_excerpt,
-                        &cleanup.output_excerpt,
+                        &body_excerpt,
+                        &output_excerpt,
                     );
                 }
                 return dev_server_passed_evidence(
@@ -4661,6 +4679,8 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
 
     let failure_kind = "startup_timeout";
     let cleanup = cleanup_dev_server_child(child);
+    let failure_kind = classify_dev_server_env_conflict(failure_kind, &cleanup.output_excerpt);
+    let output_excerpt = dev_server_output_excerpt(&failure_kind, &cleanup.output_excerpt);
     emit_dev_server_lifecycle_stage(
         config,
         "wait",
@@ -4668,7 +4688,7 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
         spec.port,
         &spec.route,
         &spec.command_display,
-        Some(failure_kind),
+        Some(&failure_kind),
         None,
         evidence_path,
         Some(pid),
@@ -4680,7 +4700,7 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
         spec.port,
         &spec.route,
         &spec.command_display,
-        Some(failure_kind),
+        Some(&failure_kind),
         None,
         evidence_path,
         Some(pid),
@@ -4692,7 +4712,7 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
         spec.port,
         &spec.route,
         &spec.command_display,
-        Some(failure_kind),
+        Some(&failure_kind),
         None,
         evidence_path,
         Some(pid),
@@ -4701,8 +4721,8 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
         spec.port,
         &spec.route,
         &spec.command_display,
-        failure_kind,
-        &cleanup.output_excerpt,
+        &failure_kind,
+        &output_excerpt,
     )
 }
 
@@ -4917,6 +4937,22 @@ fn classify_dev_route_failure_kind(status: i64, body_excerpt: &str) -> Option<St
     Some(format!("http_{status}"))
 }
 
+fn classify_dev_server_env_conflict(failure_kind: &str, output: &str) -> String {
+    if verifier_env::is_env_node_env_conflict_output(output) {
+        verifier_env::ENV_NODE_ENV_CONFLICT_KIND.to_string()
+    } else {
+        failure_kind.to_string()
+    }
+}
+
+fn dev_server_output_excerpt(failure_kind: &str, output: &str) -> String {
+    if failure_kind == verifier_env::ENV_NODE_ENV_CONFLICT_KIND {
+        verifier_env::with_env_node_env_remediation(output)
+    } else {
+        output.to_string()
+    }
+}
+
 fn tailwind_dev_pipeline_failure(lower_text: &str) -> bool {
     lower_text.contains("@tailwind")
         && (lower_text.contains("module parse failed")
@@ -5044,8 +5080,11 @@ fn emit_dev_server_lifecycle_stage(
 
 fn dev_server_probe_environment(port: u16) -> Value {
     json!({
-        "NODE_ENV": std::env::var("NODE_ENV").unwrap_or_default(),
+        "NODE_ENV": "",
+        "NODE_OPTIONS": "",
+        "NEXT_TELEMETRY_DISABLED": "1",
         "PORT": port.to_string(),
+        "host_env_contamination": verifier_env::host_env_contamination(),
         "ANVIL_DEV_SERVER_PROBE": std::env::var("ANVIL_DEV_SERVER_PROBE").unwrap_or_default(),
         "ANVIL_TEST_DEV_SERVER_PROBE": std::env::var("ANVIL_TEST_DEV_SERVER_PROBE").unwrap_or_default(),
     })
@@ -5558,6 +5597,16 @@ fn release_recovery_failure_kind(
     if release_gate.status == "failed" {
         if release_gate
             .browser_readiness_status
+            .contains(verifier_env::ENV_NODE_ENV_CONFLICT_KIND)
+            || release_gate
+                .reasons
+                .iter()
+                .any(|reason| reason.contains(verifier_env::ENV_NODE_ENV_CONFLICT_KIND))
+        {
+            return verifier_env::ENV_NODE_ENV_CONFLICT_KIND.to_string();
+        }
+        if release_gate
+            .browser_readiness_status
             .contains("tailwind_dev_pipeline_failure")
         {
             return "tailwind_dev_pipeline_failure".to_string();
@@ -5619,6 +5668,19 @@ fn release_recovery_failure_evidence(
         "browser readiness: {}",
         release_gate.browser_readiness_status
     ));
+    if release_gate
+        .browser_readiness_status
+        .contains(verifier_env::ENV_NODE_ENV_CONFLICT_KIND)
+        || release_gate
+            .reasons
+            .iter()
+            .any(|reason| reason.contains(verifier_env::ENV_NODE_ENV_CONFLICT_KIND))
+    {
+        evidence.push(format!(
+            "host environment remediation: {}",
+            verifier_env::ENV_NODE_ENV_REMEDIATION
+        ));
+    }
     if !release_gate.browser_readiness_evidence_path.is_empty() {
         evidence.push(format!(
             "browser readiness evidence: {}",
@@ -7600,6 +7662,26 @@ mod tests {
     use crate::providers::{AssistantReply, ChatClient};
     use crate::state::ConversationMessage;
     use crate::tools::registry::ToolSpec;
+
+    #[test]
+    fn dev_server_marker_with_contamination_is_env_node_env_conflict() {
+        let status = run_ignored_runner_harness(
+            "planner::runner::tests::dev_server_marker_with_contamination_is_env_node_env_conflict_child",
+        );
+        assert!(status.success(), "{status}");
+    }
+
+    #[test]
+    #[ignore]
+    fn dev_server_marker_with_contamination_is_env_node_env_conflict_child() {
+        let output = "warn - You are using a non-standard \"NODE_ENV\" value.";
+        let kind = classify_dev_server_env_conflict("http_500", output);
+        assert_eq!(kind, verifier_env::ENV_NODE_ENV_CONFLICT_KIND);
+        assert!(
+            dev_server_output_excerpt(&kind, output)
+                .contains(verifier_env::ENV_NODE_ENV_REMEDIATION)
+        );
+    }
 
     #[test]
     fn plan_artifact_saved() {
@@ -11231,6 +11313,15 @@ export default function Page(){
         )
         .unwrap();
         port
+    }
+
+    fn run_ignored_runner_harness(test_name: &str) -> std::process::ExitStatus {
+        let exe = std::env::current_exe().unwrap();
+        std::process::Command::new(exe)
+            .args(["--ignored", "--exact", test_name, "--nocapture"])
+            .env("NODE_ENV", "production")
+            .status()
+            .unwrap()
     }
 
     fn config(root: PathBuf) -> Config {
