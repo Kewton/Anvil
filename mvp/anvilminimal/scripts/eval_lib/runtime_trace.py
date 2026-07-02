@@ -49,6 +49,8 @@ STAGE_TO_GATE_IDS: dict[str, list[str]] = {
 }
 
 SOURCE_EVENT_STAGE: dict[str, str] = {
+    "source_phase_context_observed": "phase_context_attached",
+    "source_step_prompt_observed": "step_prompt_built",
     "task_contract_created": "contract_loaded",
     "task_contract_updated": "contract_loaded",
     "task_contract_completion": "acceptance_started",
@@ -202,6 +204,11 @@ def build_trace_report(
         run_dir = run_root / "runs" / run_id
         events = load_run_events(run_root, row)
         normalized.extend(normalize_events(events, row=row, subject=subject))
+        if subject == "source-anvildev":
+            source_prompt_events = load_source_prompt_trace_events(run_root, row)
+            normalized.extend(
+                normalize_events(source_prompt_events, row=row, subject=subject)
+            )
         silent = silent_exit_event(row=row, run_dir=run_dir, events=events, subject=subject)
         if silent:
             normalized.append(silent)
@@ -248,6 +255,123 @@ def load_run_events(run_root: Path, row: dict[str, Any]) -> list[dict[str, Any]]
         return events
     aggregate = read_jsonl(run_root / "events.jsonl")
     return [event for event in aggregate if str(event.get("run_id", "")) == run_id]
+
+
+def load_source_prompt_trace_events(
+    run_root: Path,
+    row: dict[str, Any],
+) -> list[dict[str, Any]]:
+    run_id = str(row.get("run_id", ""))
+    if not run_id:
+        return []
+    run_dir = run_root / "runs" / run_id
+    events: list[dict[str, Any]] = []
+    phase_index = 0
+    seen_prompt_bodies: set[str] = set()
+    for log_path in source_llm_io_logs(run_dir):
+        for raw in read_jsonl(log_path):
+            if not str(raw.get("event", "")).endswith(".request"):
+                continue
+            payload = raw.get("payload", {}) or {}
+            if not isinstance(payload, dict):
+                continue
+            for message in payload.get("messages", []) or []:
+                if not isinstance(message, dict):
+                    continue
+                if str(message.get("role", "")) != "user":
+                    continue
+                content = str(message.get("content", ""))
+                prompt_body = content.strip()
+                if not prompt_body or prompt_body in seen_prompt_bodies:
+                    continue
+                seen_prompt_bodies.add(prompt_body)
+                if is_source_phase_context_prompt(content):
+                    phase_index += 1
+                    events.append(source_phase_context_event(content, phase_index))
+                if is_source_step_prompt(content):
+                    events.append(source_step_prompt_event(content))
+    return events
+
+
+def source_llm_io_logs(run_dir: Path) -> list[Path]:
+    state_root = run_dir / "workdir" / ".anvil" / "state" / "sessions"
+    if not state_root.exists():
+        return []
+    return sorted(state_root.glob("*/logs/llm-io.jsonl"))
+
+
+def is_source_phase_context_prompt(content: str) -> bool:
+    return (
+        "Ultra goal:" in content
+        and "Current phase id:" in content
+        and "Current phase goal:" in content
+        and "Existing workspace snapshot:" in content
+    )
+
+
+def is_source_step_prompt(content: str) -> bool:
+    return (
+        "Overall goal:" in content
+        and "Current step id:" in content
+        and "Verification commands for this step:" in content
+        and "Expected verification result:" in content
+    )
+
+
+def source_phase_context_event(content: str, phase_index: int) -> dict[str, Any]:
+    snapshot = section_after(content, "Existing workspace snapshot:")
+    return {
+        "event": "source_phase_context_observed",
+        "phase_id": first_line_after(content, "Current phase id:"),
+        "phase_index": phase_index,
+        "has_ultra_goal": "Ultra goal:" in content,
+        "has_current_phase": "Current phase id:" in content and "Current phase goal:" in content,
+        "has_workspace_snapshot": "Existing workspace snapshot:" in content,
+        "has_profile_contract": "Profile contract:" in content,
+        "has_previous_context": phase_index > 1 and snapshot_has_context(snapshot),
+        "has_prior_conversation_context": phase_index > 1,
+        "prompt_body_saved": False,
+    }
+
+
+def source_step_prompt_event(content: str) -> dict[str, Any]:
+    return {
+        "event": "source_step_prompt_observed",
+        "step_id": first_line_after(content, "Current step id:"),
+        "has_overall_goal": "Overall goal:" in content,
+        "has_expected_paths": "Expected paths after this step:" in content
+        or "Expected paths for this step:" in content,
+        "has_verify_commands": "Verification commands for this step:" in content,
+        "has_expected_result": "Expected verification result:" in content,
+        "has_bounded_repair_policy": "fix only this step" in content.lower()
+        or "repair only this step" in content.lower()
+        or "bounded step-local repair" in content.lower(),
+        "prompt_body_saved": False,
+    }
+
+
+def first_line_after(content: str, marker: str) -> str:
+    if marker not in content:
+        return ""
+    tail = content.split(marker, 1)[1]
+    for line in tail.splitlines():
+        text = line.strip()
+        if text:
+            return redact_text(text)
+    return ""
+
+
+def section_after(content: str, marker: str) -> str:
+    if marker not in content:
+        return ""
+    tail = content.split(marker, 1)[1]
+    parts = tail.split("\n\n", 1)
+    return parts[0]
+
+
+def snapshot_has_context(snapshot: str) -> bool:
+    normalized = " ".join(snapshot.strip().lower().split())
+    return bool(normalized and normalized not in {"- none detected", "none detected", "- none"})
 
 
 def normalize_events(
@@ -403,6 +527,29 @@ def safe_event_details(event: dict[str, Any]) -> dict[str, Any]:
         "planner_provider",
         "planner_model",
         "http_status",
+        "phase_index",
+        "step_id",
+        "step_kind",
+        "shared_execution_session",
+        "session_message_count",
+        "completed_phase_count",
+        "changed_path_count",
+        "recent_verify_failure_count",
+        "recent_repair_changed_path_count",
+        "unresolved_repair_target_count",
+        "has_previous_context",
+        "has_prior_conversation_context",
+        "has_ultra_goal",
+        "has_current_phase",
+        "has_workspace_snapshot",
+        "has_profile_contract",
+        "has_overall_goal",
+        "has_expected_paths",
+        "has_verify_commands",
+        "has_expected_result",
+        "has_bounded_repair_policy",
+        "has_prior_artifact_context",
+        "prior_artifact_context_applicable",
     }
     out: dict[str, Any] = {}
     for key in allowed_keys:
@@ -586,6 +733,8 @@ def compare_trace_reports(source: dict[str, Any], mvp: dict[str, Any]) -> dict[s
         mvp_available=mvp_available,
         same_condition=condition,
     )
+    semantic_findings = trace_contract_findings(source, mvp)
+    apply_contract_findings_to_gate_results(gate_results, semantic_findings)
     gate_status_counts = Counter(str(item["status"]) for item in gate_results)
     missing_stages = sorted(source_stages - mvp_stages)
     extra_stages = sorted(mvp_stages - source_stages)
@@ -621,11 +770,13 @@ def compare_trace_reports(source: dict[str, Any], mvp: dict[str, Any]) -> dict[s
             if item["status"] == "intentionally_different"
         ),
         "partial_gate_ids": [],
+        "semantic_findings": semantic_findings,
         "regressions": trace_regressions(
             source,
             mvp,
             missing_stages=missing_stages,
             gate_results=gate_results,
+            semantic_findings=semantic_findings,
         ),
         "correct_failure_detection": trace_correct_failure_detection(
             source,
@@ -633,6 +784,132 @@ def compare_trace_reports(source: dict[str, Any], mvp: dict[str, Any]) -> dict[s
             extra_stages=extra_stages,
         ),
     }
+
+
+def trace_contract_findings(source: dict[str, Any], mvp: dict[str, Any]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    findings.extend(phase_context_findings("source", normalized_events_for_report(source)))
+    findings.extend(phase_context_findings("mvp", normalized_events_for_report(mvp)))
+    findings.extend(step_prompt_findings("source", normalized_events_for_report(source)))
+    findings.extend(step_prompt_findings("mvp", normalized_events_for_report(mvp)))
+    return findings
+
+
+def normalized_events_for_report(report: dict[str, Any]) -> list[dict[str, Any]]:
+    events = report.get("normalized_events", [])
+    if isinstance(events, list) and events:
+        return [event for event in events if isinstance(event, dict)]
+    raw_path = str(report.get("normalized_event_sequence_path", "")).strip()
+    if not raw_path:
+        return []
+    path = Path(raw_path)
+    if path.is_file():
+        return read_jsonl(path)
+    return []
+
+
+def phase_context_findings(side: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    phase_events = [event for event in events if event.get("stage") == "phase_context_attached"]
+    if not phase_events:
+        return [
+            {
+                "gate_id": "G-S05",
+                "side": side,
+                "kind": "missing_context",
+                "reason": "phase_context_trace_missing",
+            }
+        ]
+    findings: list[dict[str, Any]] = []
+    for event in phase_events:
+        if event.get("source_event") == "source_phase_context_observed":
+            required = [
+                ("has_ultra_goal", "missing_ultra_goal"),
+                ("has_current_phase", "missing_current_phase"),
+                ("has_workspace_snapshot", "missing_context"),
+                ("has_profile_contract", "missing_profile_contract"),
+            ]
+            for field, kind in required:
+                if event.get(field) is False:
+                    findings.append(
+                        contract_finding("G-S05", side, kind, field, event)
+                    )
+        phase_index = int_or_zero(event.get("phase_index"))
+        has_prior_context_field = (
+            "has_previous_context" in event or "has_prior_conversation_context" in event
+        )
+        prior_context_present = event_bool(event.get("has_previous_context")) or event_bool(
+            event.get("has_prior_conversation_context")
+        )
+        if phase_index > 1 and has_prior_context_field and not prior_context_present:
+            findings.append(
+                contract_finding(
+                    "G-S05",
+                    side,
+                    "missing_context",
+                    "has_previous_context",
+                    event,
+                )
+            )
+    return findings
+
+
+def step_prompt_findings(side: str, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    step_events = [event for event in events if event.get("stage") == "step_prompt_built"]
+    if not step_events:
+        return [
+            {
+                "gate_id": "G-S06",
+                "side": side,
+                "kind": "missing_step_prompt",
+                "reason": "step_prompt_trace_missing",
+            }
+        ]
+    required = [
+        ("has_overall_goal", "missing_overall_goal"),
+        ("has_expected_paths", "missing_expected_paths"),
+        ("has_verify_commands", "missing_verify"),
+        ("has_expected_result", "missing_expected_result"),
+    ]
+    findings: list[dict[str, Any]] = []
+    for event in step_events:
+        for field, kind in required:
+            if event.get(field) is False:
+                findings.append(contract_finding("G-S06", side, kind, field, event))
+    return findings
+
+
+def contract_finding(
+    gate_id: str,
+    side: str,
+    kind: str,
+    field: str,
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "gate_id": gate_id,
+        "side": side,
+        "kind": kind,
+        "field": field,
+        "run_id": str(event.get("run_id", "")),
+        "source_event": str(event.get("source_event", "")),
+        "phase_id": str(event.get("phase_id", "")),
+        "step_id": str(event.get("step_id", "")),
+    }
+
+
+def apply_contract_findings_to_gate_results(
+    gate_results: list[dict[str, Any]],
+    findings: list[dict[str, Any]],
+) -> None:
+    gates_with_findings = {str(item.get("gate_id", "")) for item in findings}
+    for item in gate_results:
+        if item["gate_id"] not in gates_with_findings:
+            continue
+        item["status"] = "fail"
+        item["reason"] = "semantic_trace_contract_missing"
+        item["semantic_finding_count"] = sum(
+            1 for finding in findings if finding.get("gate_id") == item["gate_id"]
+        )
 
 
 def trace_report_available(report: dict[str, Any]) -> bool:
@@ -777,6 +1054,7 @@ def trace_regressions(
     *,
     missing_stages: list[str],
     gate_results: list[dict[str, Any]],
+    semantic_findings: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     source_counts = source.get("stage_counts", {}) or {}
     mvp_counts = mvp.get("stage_counts", {}) or {}
@@ -800,6 +1078,17 @@ def trace_regressions(
                     "mvp": item["mvp_event_count"],
                 }
             )
+    for finding in semantic_findings:
+        regressions.append(
+            {
+                "kind": finding.get("kind", "semantic_trace_contract_missing"),
+                "gate_id": finding.get("gate_id", ""),
+                "side": finding.get("side", ""),
+                "field": finding.get("field", ""),
+                "run_id": finding.get("run_id", ""),
+                "source_event": finding.get("source_event", ""),
+            }
+        )
     return regressions
 
 

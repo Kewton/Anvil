@@ -144,11 +144,27 @@ GATE-00 では実装変更、provider probe、browser run、anvildev 比較を�
 | source/anvildev same-condition run | skipped | GATE-05 closes local source-first final acceptance authority by source refs and deterministic fixtures. Full source/MVP comparative browser trace remains UAT004-GATE-09. |
 | live browser/manual evidence | skipped | Browser/Playwright/dev-server execution must not become a normal unit-test dependency. Local fixtures verify unavailable/failed/pass classification and evidence content; live release probe remains opt-in for GATE-09. |
 
+## UAT004-GATE-06 Trace Update
+
+| item | status | evidence |
+| --- | --- | --- |
+| source refs inspected | complete | `src/agent/minimal_step_runner.rs`, `src/agent/minimal_step_runner/profile.rs`, `src/agent/minimal_step_runner/repair.rs` |
+| MVP refs changed | complete | `mvp/anvilminimal/scripts/eval_lib/runtime_trace.py`, `mvp/anvilminimal/tests/eval/test_runtime_semantics_trace.py`, `mvp/anvilminimal/tests/eval/test_eval_cli_contract.py` |
+| source trace | collected from existing same-condition run root | `/private/tmp/anvilminimal-eval-0229-anvildev-net-timeout` normalized into `workspace/mvp/uat/004/gate06_trace/source/runtime-semantics-trace-report.json` and `runtime-semantics-normalized-events.jsonl` |
+| MVP trace | collected from existing same-condition run root | `/private/tmp/anvilminimal-eval-0229-mvp-net-timeout` normalized into `workspace/mvp/uat/004/gate06_trace/mvp/runtime-semantics-trace-report.json` and `runtime-semantics-normalized-events.jsonl` |
+| normalized comparison | pass for G-S05/G-S06 | `workspace/mvp/uat/004/gate06_trace/runtime-semantics-trace-diff.json`: same-condition signatures `match` (source 48 / MVP 48), `semantic_findings=[]`, G-S05/G-S06 both `pass` |
+| G-S05 trace fields | observed | source `phase_context_attached=94`, MVP `phase_context_attached=75`; source prompt logs contain ultra goal, current phase, workspace snapshot, and profile contract; MVP events carry phase context continuity fields |
+| G-S06 trace fields | observed | source `step_prompt_built=100`, MVP `step_prompt_built=141`; both sides carry overall goal, expected paths, verify commands, and expected result |
+| missing-field detection | executable fixtures | `test_compare_reports_detects_missing_phase_context`, `test_compare_reports_detects_missing_expected_result_and_verify`, and `test_source_anvildev_llm_prompts_produce_phase_and_step_trace` |
+| trace-missing detection | enforced | `runtime_trace.py` now treats missing normalized G-S05/G-S06 trace as semantic failure; `test_compare_reports_does_not_pass_gate_counts_without_prompt_trace` asserts gate counts alone cannot pass, and `test_eval_preflight_writes_comparative_parity_gate_report` fixture was updated to include normalized phase/step prompt events |
+| required local tests | passed | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`: passed with 440 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval`: passed with 226 passed, 1 skipped |
+| new provider/browser run | skipped | GATE-06 is trace normalization/comparison over existing same-condition anvildev/MVP run roots. It does not require a new provider call, browser, or manual run. |
+
 ## Skip Evidence
 
 | skipped item | reason | impact | next action |
 | --- | --- | --- | --- |
-| source/anvildev same-condition run | GATE-00 is a baseline documentation phase; no runtime comparison requested | source parity remains pending for all gates | collect source/MVP normalized trace in the target gate before marking pass |
+| source/anvildev same-condition run | GATE-00 was a baseline documentation phase; later gate updates override this row when trace is collected, as in UAT004-GATE-06 | source parity remains pending only for gates without later trace evidence | collect source/MVP normalized trace in the target gate before marking pass |
 | provider live probe | API key/network must not be normal unit-test requirement | G-S07/G-S15 remain fail/pending | run provider probe only in UAT004-GATE-07 or opt-in release gate |
 | live browser readiness / interaction run | browser/dev-server must not be required for normal unit tests; GATE-05 used deterministic browser evidence fixtures and skipped live browser/manual execution | G-S12 local source parity is closed; G-S16/manual and comparative live release trace remain pending | run live browser readiness and interaction evidence in UAT004-GATE-09 or opt-in final gate |
 | `cargo test` / `pytest` / targeted eval | no code changes in GATE-00; objective is inventory and fixture fixation | no implementation correctness claim is made | run targeted tests in each implementation gate |

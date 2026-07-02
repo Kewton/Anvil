@@ -68,6 +68,21 @@ UAT004 の各 gate で、実行した検証、skip evidence、rollback 条件、
 | source/anvildev comparison | skipped; final comparative source/MVP browser and manual release trace remains GATE-09 |
 | rollback guard | do not allow build-only/title-only/static-only output, evidence path existence alone, malformed evidence, missing interaction evidence, browser unavailable, or browser HTTP 500 to become release-grade full success; keep browser unavailable `partial` and HTTP 500 `failed` |
 
+## UAT004-GATE-06 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/minimal_step_runner.rs`, `src/agent/minimal_step_runner/profile.rs`, `src/agent/minimal_step_runner/repair.rs` |
+| MVP refs | `mvp/anvilminimal/scripts/eval_lib/runtime_trace.py`, `mvp/anvilminimal/tests/eval/test_runtime_semantics_trace.py`, `mvp/anvilminimal/tests/eval/test_eval_cli_contract.py` |
+| implementation | `runtime_trace.py` normalizes source runtime prompt logs from `.anvil/state/sessions/*/logs/llm-io.jsonl` into phase-context and step-prompt trace events, keeps source/MVP prompt contract booleans in normalized events, fails G-S05/G-S06 for missing semantic fields, and treats trace absence as non-pass. |
+| trace commands | `python3 mvp/anvilminimal/scripts/eval-trace.py --run-root /private/tmp/anvilminimal-eval-0229-anvildev-net-timeout --subject source-anvildev ... --output-dir workspace/mvp/uat/004/gate06_trace/source`; same command for `/private/tmp/anvilminimal-eval-0229-mvp-net-timeout`; then `--compare-source-report ... --compare-mvp-report ... --diff-output workspace/mvp/uat/004/gate06_trace/runtime-semantics-trace-diff.json` |
+| normalized comparison | `same_condition.status=match`, source signatures 48, MVP signatures 48, `semantic_findings=[]`; G-S05 source/MVP counts 94/75 and G-S06 source/MVP counts 100/141 both pass with `source_and_mvp_gate_observed` |
+| targeted fixtures | `test_source_anvildev_llm_prompts_produce_phase_and_step_trace`, `test_compare_reports_detects_missing_phase_context`, `test_compare_reports_detects_missing_expected_result_and_verify`, `test_compare_reports_does_not_pass_gate_counts_without_prompt_trace`, and comparative preflight fixture update for normalized G-S05/G-S06 events |
+| full local verification | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 440 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 226 passed / 1 skipped |
+| provider/browser/manual UAT | skipped; GATE-06 uses existing same-condition runtime traces and does not require new provider calls, browser readiness, or manual TUI execution |
+| remaining unrelated gates | overall diff still has unrelated failed gate ids outside G-S05/G-S06; they remain assigned to later UAT004 gates |
+| rollback guard | do not allow trace-missing reports, missing phase context, missing expected result, or missing verify commands to pass G-S05/G-S06; do not remove source prompt-log normalization unless source emits equivalent native runtime trace events |
+
 ## Re-run Notes
 
 Before closing an implementation gate, update:

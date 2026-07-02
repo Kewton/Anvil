@@ -331,14 +331,45 @@ def write_trace_report(path: Path, trace_id: str):
         }
     ]
     gate_counts = {f"G-S{index:02d}": 1 for index in range(1, 17)}
+    is_source = trace_id == "source"
+    normalized_events = [
+        {
+            "stage": "phase_context_attached",
+            "gate_ids": ["G-S05"],
+            "source_event": "source_phase_context_observed"
+            if is_source
+            else "ultra_phase_context_attached",
+            "phase_index": 1,
+            "has_ultra_goal": True,
+            "has_current_phase": True,
+            "has_workspace_snapshot": True,
+            "has_profile_contract": True,
+        },
+        {
+            "stage": "step_prompt_built",
+            "gate_ids": ["G-S06"],
+            "source_event": "source_step_prompt_observed"
+            if is_source
+            else "step_prompt_contract",
+            "has_overall_goal": True,
+            "has_expected_paths": True,
+            "has_verify_commands": True,
+            "has_expected_result": True,
+        },
+    ]
     path.write_text(
         json.dumps(
             {
                 "trace_id": trace_id,
-                "normalized_event_count": len(gate_counts),
+                "normalized_event_count": len(normalized_events),
                 "manifest_rows": rows,
-                "stage_counts": {"plan_generated": 1},
+                "stage_counts": {
+                    "plan_generated": 1,
+                    "phase_context_attached": 1,
+                    "step_prompt_built": 1,
+                },
                 "gate_counts": gate_counts,
+                "normalized_events": normalized_events,
             }
         ),
         encoding="utf-8",

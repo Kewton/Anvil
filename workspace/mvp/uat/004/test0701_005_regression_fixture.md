@@ -219,6 +219,16 @@ Expected future behavior:
 | release evidence content validation | `plan_run_nextjs_browser_and_interaction_evidence_passes_release_gate` covers the positive pass path, while `plan_run_nextjs_browser_ok_without_render_detail_is_partial`, malformed JSON eval fixtures, missing interaction eval fixtures, and parity gate tests reject path-only or malformed evidence | evidence path existence alone is not a pass |
 | final acceptance failure lifecycle | `ultra_final_acceptance_failure_runs_bounded_repair`, `ultra_final_acceptance_repair_failure_saves_recovery_handoff`, `run_lifecycle_does_not_mask_browser_http_500_release_failure_as_complete`, and `run_lifecycle_does_not_mask_partial_release_gate_as_complete` connect final acceptance failure to repair/recovery/diagnostics instead of completion | correct failure detection preserved |
 
+## UAT004-GATE-06 Executable Fixture Binding
+
+| baseline fixture | executable assertion | expected classification |
+| --- | --- | --- |
+| F-001 phase context continuity needs source trace | `workspace/mvp/uat/004/gate06_trace/runtime-semantics-trace-diff.json` compares source and MVP same-condition normalized traces; G-S05 is `pass` only when phase context trace exists on both sides and no semantic finding is present | source parity proven for GATE-06 scope; trace absence remains failure |
+| F-001 step prompt contract needs source trace | The same GATE-06 diff compares source prompt log observations with MVP `step_prompt_contract`; G-S06 is `pass` only when overall goal, expected paths, verify commands, and expected result are present | source parity proven for GATE-06 scope; prompt-field absence remains failure |
+| missing phase context must fail | `test_compare_reports_detects_missing_phase_context` marks G-S05 `semantic_trace_contract_missing` with `missing_context` | correct failure detection preserved |
+| missing expected result / verify must fail | `test_compare_reports_detects_missing_expected_result_and_verify` marks G-S06 `semantic_trace_contract_missing` with `missing_expected_result` and `missing_verify` | correct failure detection preserved |
+| source prompt trace must be runtime evidence | `test_source_anvildev_llm_prompts_produce_phase_and_step_trace` proves source `llm-io.jsonl` request prompts are normalized into G-S05/G-S06 trace events; `test_compare_reports_does_not_pass_gate_counts_without_prompt_trace` and `test_eval_preflight_writes_comparative_parity_gate_report` require normalized phase/step events instead of gate counts only | regression fixed: gate counts alone cannot satisfy phase/prompt trace comparison |
+
 ## Fixture Reproduction Notes
 
 No new executable tests are created in GATE-00. The fixed baseline is document-level and must be converted into targeted automated fixtures in later gates.

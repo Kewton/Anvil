@@ -243,6 +243,240 @@ class RuntimeSemanticsTraceTest(unittest.TestCase):
         self.assertEqual(diff["status"], "same_condition_unknown")
         self.assertTrue(all(item["status"] == "fail" for item in diff["gate_results"]))
 
+    def test_source_anvildev_llm_prompts_produce_phase_and_step_trace(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_root = Path(td)
+            run_id = "source-prompt"
+            log_dir = (
+                run_root
+                / "runs"
+                / run_id
+                / "workdir"
+                / ".anvil"
+                / "state"
+                / "sessions"
+                / "session-1"
+                / "logs"
+            )
+            log_dir.mkdir(parents=True)
+            prompt_log = log_dir / "llm-io.jsonl"
+            phase_prompt = """Create a step plan for this task:
+Ultra goal:
+Create README.md.
+
+Current phase id:
+draft-readme
+
+Current phase goal:
+Create README.md.
+
+Existing workspace snapshot:
+- none detected
+
+Profile contract:
+- Keep changes scoped.
+"""
+            step_prompt = """Overall goal:
+Create README.md.
+
+Current step id:
+write-readme
+
+Expected paths after this step:
+- README.md
+
+Verification commands for this step:
+- cat README.md
+
+Expected verification result:
+pass
+"""
+            prompt_log.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "event": "openai.responses.request",
+                                "payload": {
+                                    "messages": [
+                                        {"role": "user", "content": phase_prompt},
+                                        {"role": "user", "content": step_prompt},
+                                    ]
+                                },
+                            }
+                        )
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            row = {key: "" for key in SUMMARY_HEADER}
+            row.update(
+                {
+                    "run_id": run_id,
+                    "suite": "s",
+                    "scenario": "scenario",
+                    "mode": "ultra-plan-run",
+                    "success": "true",
+                    "rc": "0",
+                    "main_provider": "openai",
+                    "main_model": "gpt",
+                    "planner_provider": "gemini",
+                    "planner_model": "flash",
+                }
+            )
+            write_summary(run_root / "summary.eval.tsv", [row])
+            report = write_trace_artifacts(
+                run_root,
+                subject="source-anvildev",
+                binary_kind="anvildev",
+                binary_path="anvildev",
+            )
+            events = [
+                json.loads(line)
+                for line in Path(report["normalized_event_sequence_path"])
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line.strip()
+            ]
+        stages = [event["stage"] for event in events]
+        self.assertIn("phase_context_attached", stages)
+        self.assertIn("step_prompt_built", stages)
+        self.assertEqual(report["gate_counts"]["G-S05"], 1)
+        self.assertEqual(report["gate_counts"]["G-S06"], 1)
+        step = next(event for event in events if event["stage"] == "step_prompt_built")
+        self.assertTrue(step["has_expected_result"])
+        self.assertTrue(step["has_verify_commands"])
+
+    def test_compare_reports_detects_missing_expected_result_and_verify(self):
+        rows = [
+            {
+                "suite": "s",
+                "scenario": "case",
+                "mode": "plan-run",
+                "provider_model_pair": "openai:gpt planner=gemini:flash",
+            }
+        ]
+        source = {
+            "trace_id": "source",
+            "normalized_event_count": 1,
+            "manifest_rows": rows,
+            "stage_counts": {"step_prompt_built": 1},
+            "gate_counts": {"G-S06": 1},
+            "normalized_events": [
+                {
+                    "stage": "step_prompt_built",
+                    "gate_ids": ["G-S06"],
+                    "source_event": "source_step_prompt_observed",
+                    "has_overall_goal": True,
+                    "has_expected_paths": True,
+                    "has_verify_commands": True,
+                    "has_expected_result": True,
+                }
+            ],
+        }
+        mvp = {
+            "trace_id": "mvp",
+            "normalized_event_count": 1,
+            "manifest_rows": rows,
+            "stage_counts": {"step_prompt_built": 1},
+            "gate_counts": {"G-S06": 1},
+            "normalized_events": [
+                {
+                    "stage": "step_prompt_built",
+                    "gate_ids": ["G-S06"],
+                    "source_event": "step_prompt_contract",
+                    "has_overall_goal": True,
+                    "has_expected_paths": True,
+                    "has_verify_commands": False,
+                    "has_expected_result": False,
+                }
+            ],
+        }
+        diff = compare_trace_reports(source, mvp)
+        by_gate = {item["gate_id"]: item for item in diff["gate_results"]}
+        self.assertEqual(by_gate["G-S06"]["status"], "fail")
+        self.assertEqual(by_gate["G-S06"]["reason"], "semantic_trace_contract_missing")
+        kinds = {item["kind"] for item in diff["semantic_findings"]}
+        self.assertIn("missing_expected_result", kinds)
+        self.assertIn("missing_verify", kinds)
+
+    def test_compare_reports_detects_missing_phase_context(self):
+        rows = [
+            {
+                "suite": "s",
+                "scenario": "case",
+                "mode": "ultra-plan-run",
+                "provider_model_pair": "openai:gpt planner=gemini:flash",
+            }
+        ]
+        source_event = {
+            "stage": "phase_context_attached",
+            "gate_ids": ["G-S05"],
+            "source_event": "source_phase_context_observed",
+            "phase_index": 2,
+            "has_ultra_goal": True,
+            "has_current_phase": True,
+            "has_workspace_snapshot": True,
+            "has_profile_contract": True,
+            "has_prior_conversation_context": True,
+        }
+        mvp_event = {
+            "stage": "phase_context_attached",
+            "gate_ids": ["G-S05"],
+            "source_event": "ultra_phase_context_attached",
+            "phase_index": 2,
+            "has_previous_context": False,
+        }
+        diff = compare_trace_reports(
+            {
+                "trace_id": "source",
+                "normalized_event_count": 1,
+                "manifest_rows": rows,
+                "stage_counts": {"phase_context_attached": 1},
+                "gate_counts": {"G-S05": 1},
+                "normalized_events": [source_event],
+            },
+            {
+                "trace_id": "mvp",
+                "normalized_event_count": 1,
+                "manifest_rows": rows,
+                "stage_counts": {"phase_context_attached": 1},
+                "gate_counts": {"G-S05": 1},
+                "normalized_events": [mvp_event],
+            },
+        )
+        by_gate = {item["gate_id"]: item for item in diff["gate_results"]}
+        self.assertEqual(by_gate["G-S05"]["status"], "fail")
+        findings = [item for item in diff["semantic_findings"] if item["gate_id"] == "G-S05"]
+        self.assertEqual(findings[0]["kind"], "missing_context")
+
+    def test_compare_reports_does_not_pass_gate_counts_without_prompt_trace(self):
+        rows = [
+            {
+                "suite": "s",
+                "scenario": "case",
+                "mode": "ultra-plan-run",
+                "provider_model_pair": "openai:gpt planner=gemini:flash",
+            }
+        ]
+        report = {
+            "trace_id": "trace",
+            "normalized_event_count": 1,
+            "manifest_rows": rows,
+            "stage_counts": {"plan_generated": 1},
+            "gate_counts": {"G-S05": 1, "G-S06": 1},
+        }
+        diff = compare_trace_reports(report, report)
+        by_gate = {item["gate_id"]: item for item in diff["gate_results"]}
+        self.assertEqual(by_gate["G-S05"]["status"], "fail")
+        self.assertEqual(by_gate["G-S06"]["status"], "fail")
+        self.assertEqual(by_gate["G-S05"]["reason"], "semantic_trace_contract_missing")
+        self.assertEqual(by_gate["G-S06"]["reason"], "semantic_trace_contract_missing")
+        kinds = {item["kind"] for item in diff["semantic_findings"]}
+        self.assertIn("missing_context", kinds)
+        self.assertIn("missing_step_prompt", kinds)
+
 
 if __name__ == "__main__":
     unittest.main()
