@@ -17,6 +17,10 @@ use crate::minimal_loop::loop_run::{
     RunSessionOptions, RunSessionOutcome, RunSessionStepKind, extract_requested_artifact_paths,
     run_session_with_outcome_with_options,
 };
+use crate::minimal_loop::reachability::{
+    RepairReachability, assess_repair_reachability, reachability_failure_kind,
+    reachability_recovery_reason,
+};
 use crate::minimal_loop::repair_target::{
     RepairFollowThrough, classify_repair_follow_through, classify_repair_target,
 };
@@ -857,6 +861,8 @@ fn run_step(
         return Ok(outcome);
     }
     let first_target = classify_repair_target(&report).as_str().to_string();
+    let mut current_reachability =
+        assess_repair_reachability(&report, None, setup_authority, config.offline);
     outcome.primary_failure = Some(report.primary_reason());
     outcome.verify_failures.push(report.primary_reason());
     outcome.repair_targets.push(first_target.clone());
@@ -875,6 +881,10 @@ fn run_step(
             "dependency_missing": report.dependency_missing.clone(),
             "profile_failures": report.profile_failures.clone(),
             "dependency_setup_authority": setup_authority.as_str(),
+            "repair_reachable": current_reachability.reachable,
+            "reachable": current_reachability.reachable,
+            "viable_actions": reachability_action_labels(&current_reachability),
+            "blocked_requirements": current_reachability.blocked_requirements.clone(),
         }),
     );
     let mut context = RepairContext {
@@ -894,170 +904,213 @@ fn run_step(
     let mut current_report = report;
     let mut previous_missing = current_report.missing_paths.len();
     let mut repair_stop_reason = None;
-    let mut terminal_repair_failure_kind: Option<&'static str> = None;
+    let mut terminal_repair_failure_kind: Option<String> = None;
+    let mut terminal_blocked_requirements: Vec<String> = Vec::new();
     let mut no_change_repairs = 0usize;
     let mut target_not_followed_repairs = 0usize;
     let mut identical_no_change_repairs = 0usize;
     let mut current_report_signature = verification_report_signature(&current_report);
     let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
-    for attempt in 1..=STEP_REPAIR_MAX_TURNS {
-        context.repair_attempt = Some(attempt);
-        let repair_prompt = build_repair_prompt_with_context(&step.id, &current_report, &context);
-        let repair = run_session_with_outcome_with_options(
-            client,
-            session,
-            &repair_prompt,
-            &step.expected_paths,
-            &repair_config,
-            ui,
-            step_options,
-        )
-        .map_err(|err| {
-            outcome.primary_failure = Some(err.to_string());
-            outcome.stop_reason = Some("repair_turn_error".to_string());
-            outcome.repair_attempts = attempt;
-            outcome.partial = true;
-            StepRunError {
-                message: err.to_string(),
-                outcome: outcome.clone(),
-            }
-        })?;
-        outcome.repair_attempts = attempt;
-        repair_stop_reason = Some(format!("{:?}", repair.stop_reason));
-        let changed_paths_before_repair = context.changed_files.clone();
-        let mut repair_turn_changed_paths = repair.changed_paths.clone();
-        merge_changed_files(&mut context, &repair.changed_paths);
-        merge_unique_strings(&mut outcome.changed_paths, &repair.changed_paths);
-        merge_unique_strings(&mut outcome.repair_changed_paths, &repair.changed_paths);
-        match profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal) {
-            Ok(true) => {
-                let package_path = "package.json".to_string();
-                merge_changed_files(&mut context, std::slice::from_ref(&package_path));
-                merge_unique_strings(
-                    &mut outcome.changed_paths,
-                    std::slice::from_ref(&package_path),
-                );
-                merge_unique_strings(&mut outcome.repair_changed_paths, &[package_path]);
-                merge_unique_strings(
-                    &mut repair_turn_changed_paths,
-                    &["package.json".to_string()],
-                );
-            }
-            Ok(false) => {}
-            Err(err) => {
+    if !current_reachability.reachable {
+        terminal_repair_failure_kind =
+            Some(reachability_failure_kind(&current_reachability).to_string());
+        terminal_blocked_requirements = current_reachability.blocked_requirements.clone();
+        context.progress_warning = Some(reachability_recovery_reason(&current_reachability));
+        emit_repair_unreachable(
+            config,
+            mode,
+            &step.id,
+            classify_repair_target(&current_report).as_str(),
+            &current_report.primary_reason(),
+            &current_reachability,
+        );
+    }
+    if current_reachability.reachable {
+        for attempt in 1..=STEP_REPAIR_MAX_TURNS {
+            context.repair_attempt = Some(attempt);
+            let repair_prompt =
+                build_repair_prompt_with_context(&step.id, &current_report, &context);
+            let repair = run_session_with_outcome_with_options(
+                client,
+                session,
+                &repair_prompt,
+                &step.expected_paths,
+                &repair_config,
+                ui,
+                step_options,
+            )
+            .map_err(|err| {
                 outcome.primary_failure = Some(err.to_string());
-                outcome.stop_reason = Some("profile_post_step_repair_error".to_string());
+                outcome.stop_reason = Some("repair_turn_error".to_string());
+                outcome.repair_attempts = attempt;
                 outcome.partial = true;
-                return Err(StepRunError {
+                StepRunError {
                     message: err.to_string(),
-                    outcome,
-                });
-            }
-        }
-        let (retry, retry_lifecycles) = verify_step_with_setup_observed_with_offline(
-            &config.workspace_root,
-            step,
-            setup_authority,
-            config.offline,
-        );
-        for lifecycle in &retry_lifecycles {
-            emit_dependency_build_lifecycle(
-                config.eval_events_path.as_deref(),
-                mode,
-                Some(&step.id),
-                lifecycle,
-            );
-        }
-        let retry_target = classify_repair_target(&retry);
-        let previous_target = classify_repair_target(&current_report);
-        let repair_follow_through =
-            classify_repair_follow_through(previous_target, &repair_turn_changed_paths);
-        let repair_target_followed = repair_follow_through.followed();
-        match repair_follow_through {
-            RepairFollowThrough::NoChange => {
-                no_change_repairs += 1;
-            }
-            RepairFollowThrough::TargetNotFollowed | RepairFollowThrough::UnrelatedChange => {
-                target_not_followed_repairs += 1;
-                no_change_repairs = 0;
-            }
-            RepairFollowThrough::TargetMatched => {
-                no_change_repairs = 0;
-                target_not_followed_repairs = 0;
-            }
-        }
-        let repair_failure_kind = repair_follow_through.failure_kind().unwrap_or("");
-        let retry_signature = verification_report_signature(&retry);
-        let report_signature_unchanged = retry_signature == current_report_signature;
-        if report_signature_unchanged && repair_turn_changed_paths.is_empty() {
-            identical_no_change_repairs += 1;
-        } else {
-            identical_no_change_repairs = 0;
-        }
-        merge_unique_strings(
-            &mut outcome.repair_targets,
-            &[retry_target.as_str().to_string()],
-        );
-        if !retry.is_pass() {
-            merge_unique_strings(&mut outcome.verify_failures, &[retry.primary_reason()]);
-            merge_unique_strings(
-                &mut outcome.command_failures,
-                &command_failure_summaries(&retry),
-            );
-            outcome.primary_failure = Some(retry.primary_reason());
-        }
-        eval_events::emit(
-            config.eval_events_path.as_deref(),
-            json!({
-                "event": "step_verify_repair",
-                "step_id": step.id,
-                "attempt": attempt,
-                "ok": retry.is_pass(),
-                "repair_target": retry_target.as_str(),
-                "previous_repair_target": previous_target.as_str(),
-                "repair_target_followed": repair_target_followed,
-                "target_relation": repair_follow_through.as_str(),
-                "repair_follow_through": repair_follow_through.as_str(),
-                "failure_kind": repair_failure_kind,
-                "primary_reason": eval_events::body_snippet(&retry.primary_reason()),
-                "changed_paths": repair_turn_changed_paths.clone(),
-                "changed_paths_before": changed_paths_before_repair,
-                "changed_paths_after": context.changed_files.clone(),
-                "repair_turn_changed_paths": repair_turn_changed_paths.clone(),
-                "no_change_repairs": no_change_repairs,
-                "target_not_followed_repairs": target_not_followed_repairs,
-                "identical_no_change_repairs": identical_no_change_repairs,
-                "report_signature_unchanged": report_signature_unchanged,
-                "allowed_action": previous_target.allowed_action(),
-                "repair_stop_reason": repair_stop_reason.clone().unwrap_or_default(),
-                "dependency_setup_authority": setup_authority.as_str(),
-            }),
-        );
-        if retry.is_pass() {
-            outcome.primary_failure = None;
-            outcome.stop_reason = repair_stop_reason.clone();
-            return Ok(outcome);
-        }
-        let next_missing = retry.missing_paths.len();
-        if next_missing >= previous_missing {
-            context.progress_warning = Some(format!(
-                "Missing expected paths did not decrease after repair. Remaining: {}",
-                if retry.missing_paths.is_empty() {
-                    "none".to_string()
-                } else {
-                    retry.missing_paths.join(", ")
+                    outcome: outcome.clone(),
                 }
-            ));
-        }
-        previous_missing = next_missing;
-        current_report = retry;
-        current_report_signature = retry_signature;
-        if identical_no_change_repairs >= STEP_REPAIR_IDENTICAL_NO_CHANGE_LIMIT {
-            terminal_repair_failure_kind = Some("verify_repair_progress_unchanged");
-            break;
+            })?;
+            outcome.repair_attempts = attempt;
+            repair_stop_reason = Some(format!("{:?}", repair.stop_reason));
+            let changed_paths_before_repair = context.changed_files.clone();
+            let mut repair_turn_changed_paths = repair.changed_paths.clone();
+            merge_changed_files(&mut context, &repair.changed_paths);
+            merge_unique_strings(&mut outcome.changed_paths, &repair.changed_paths);
+            merge_unique_strings(&mut outcome.repair_changed_paths, &repair.changed_paths);
+            match profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal) {
+                Ok(true) => {
+                    let package_path = "package.json".to_string();
+                    merge_changed_files(&mut context, std::slice::from_ref(&package_path));
+                    merge_unique_strings(
+                        &mut outcome.changed_paths,
+                        std::slice::from_ref(&package_path),
+                    );
+                    merge_unique_strings(&mut outcome.repair_changed_paths, &[package_path]);
+                    merge_unique_strings(
+                        &mut repair_turn_changed_paths,
+                        &["package.json".to_string()],
+                    );
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    outcome.primary_failure = Some(err.to_string());
+                    outcome.stop_reason = Some("profile_post_step_repair_error".to_string());
+                    outcome.partial = true;
+                    return Err(StepRunError {
+                        message: err.to_string(),
+                        outcome,
+                    });
+                }
+            }
+            let (retry, retry_lifecycles) = verify_step_with_setup_observed_with_offline(
+                &config.workspace_root,
+                step,
+                setup_authority,
+                config.offline,
+            );
+            for lifecycle in &retry_lifecycles {
+                emit_dependency_build_lifecycle(
+                    config.eval_events_path.as_deref(),
+                    mode,
+                    Some(&step.id),
+                    lifecycle,
+                );
+            }
+            let retry_target = classify_repair_target(&retry);
+            let retry_reachability =
+                assess_repair_reachability(&retry, None, setup_authority, config.offline);
+            let previous_target = classify_repair_target(&current_report);
+            let repair_follow_through =
+                classify_repair_follow_through(previous_target, &repair_turn_changed_paths);
+            let repair_target_followed = repair_follow_through.followed();
+            match repair_follow_through {
+                RepairFollowThrough::NoChange => {
+                    no_change_repairs += 1;
+                }
+                RepairFollowThrough::TargetNotFollowed | RepairFollowThrough::UnrelatedChange => {
+                    target_not_followed_repairs += 1;
+                    no_change_repairs = 0;
+                }
+                RepairFollowThrough::TargetMatched => {
+                    no_change_repairs = 0;
+                    target_not_followed_repairs = 0;
+                }
+            }
+            let repair_failure_kind = repair_follow_through.failure_kind().unwrap_or("");
+            let retry_signature = verification_report_signature(&retry);
+            let report_signature_unchanged = retry_signature == current_report_signature;
+            if report_signature_unchanged && repair_turn_changed_paths.is_empty() {
+                identical_no_change_repairs += 1;
+            } else {
+                identical_no_change_repairs = 0;
+            }
+            merge_unique_strings(
+                &mut outcome.repair_targets,
+                &[retry_target.as_str().to_string()],
+            );
+            if !retry.is_pass() {
+                merge_unique_strings(&mut outcome.verify_failures, &[retry.primary_reason()]);
+                merge_unique_strings(
+                    &mut outcome.command_failures,
+                    &command_failure_summaries(&retry),
+                );
+                outcome.primary_failure = Some(retry.primary_reason());
+            }
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "step_verify_repair",
+                    "step_id": step.id,
+                    "attempt": attempt,
+                    "ok": retry.is_pass(),
+                    "repair_target": retry_target.as_str(),
+                    "previous_repair_target": previous_target.as_str(),
+                    "repair_target_followed": repair_target_followed,
+                    "target_relation": repair_follow_through.as_str(),
+                    "repair_follow_through": repair_follow_through.as_str(),
+                    "failure_kind": repair_failure_kind,
+                    "primary_reason": eval_events::body_snippet(&retry.primary_reason()),
+                    "changed_paths": repair_turn_changed_paths.clone(),
+                    "changed_paths_before": changed_paths_before_repair,
+                    "changed_paths_after": context.changed_files.clone(),
+                    "repair_turn_changed_paths": repair_turn_changed_paths.clone(),
+                    "no_change_repairs": no_change_repairs,
+                    "target_not_followed_repairs": target_not_followed_repairs,
+                    "identical_no_change_repairs": identical_no_change_repairs,
+                    "report_signature_unchanged": report_signature_unchanged,
+                    "allowed_action": previous_target.allowed_action(),
+                    "repair_stop_reason": repair_stop_reason.clone().unwrap_or_default(),
+                    "dependency_setup_authority": setup_authority.as_str(),
+                    "repair_reachable": retry_reachability.reachable,
+                    "reachable": retry_reachability.reachable,
+                    "viable_actions": reachability_action_labels(&retry_reachability),
+                    "blocked_requirements": retry_reachability.blocked_requirements.clone(),
+                }),
+            );
+            if retry.is_pass() {
+                outcome.primary_failure = None;
+                outcome.stop_reason = repair_stop_reason.clone();
+                return Ok(outcome);
+            }
+            current_reachability = retry_reachability;
+            if !current_reachability.reachable {
+                terminal_repair_failure_kind =
+                    Some(reachability_failure_kind(&current_reachability).to_string());
+                terminal_blocked_requirements = current_reachability.blocked_requirements.clone();
+                context.progress_warning =
+                    Some(reachability_recovery_reason(&current_reachability));
+                current_report = retry;
+                emit_repair_unreachable(
+                    config,
+                    mode,
+                    &step.id,
+                    classify_repair_target(&current_report).as_str(),
+                    &current_report.primary_reason(),
+                    &current_reachability,
+                );
+                break;
+            }
+            let next_missing = retry.missing_paths.len();
+            if next_missing >= previous_missing {
+                context.progress_warning = Some(format!(
+                    "Missing expected paths did not decrease after repair. Remaining: {}",
+                    if retry.missing_paths.is_empty() {
+                        "none".to_string()
+                    } else {
+                        retry.missing_paths.join(", ")
+                    }
+                ));
+            }
+            previous_missing = next_missing;
+            current_report = retry;
+            current_report_signature = retry_signature;
+            if identical_no_change_repairs >= STEP_REPAIR_IDENTICAL_NO_CHANGE_LIMIT {
+                terminal_repair_failure_kind = Some("verify_repair_progress_unchanged".to_string());
+                break;
+            }
         }
     }
-    let final_failure_kind = terminal_repair_failure_kind.unwrap_or("bounded_repair_exhausted");
+    let final_failure_kind =
+        terminal_repair_failure_kind.unwrap_or_else(|| "bounded_repair_exhausted".to_string());
     context.repair_stop_reason = Some(final_failure_kind.to_string());
     let final_repair_target = classify_repair_target(&current_report);
     eval_events::emit(
@@ -1098,6 +1151,9 @@ fn run_step(
         failed_step: Some(step.id.clone()),
         failure_kind: final_failure_kind.to_string(),
         failure_evidence: std::iter::once(current_report.primary_reason())
+            .chain(reachability_blocked_evidence(
+                &terminal_blocked_requirements,
+            ))
             .chain(
                 current_report
                     .command_failures
@@ -1146,7 +1202,7 @@ fn run_step(
         config.eval_events_path.as_deref(),
         json!({
             "event": "recovery_prompt_saved",
-            "recovery_handoff_kind": "step_repair_exhausted",
+            "recovery_handoff_kind": final_failure_kind,
             "step_id": step.id,
             "recovery_prompt_path": repair_report_path.display().to_string(),
             "recovery_ultra_plan_path": recovery_plan_path
@@ -1737,6 +1793,52 @@ fn command_failure_summaries(report: &VerificationReport) -> Vec<String> {
             )
         })
         .collect()
+}
+
+fn reachability_action_labels(reachability: &RepairReachability) -> Vec<&'static str> {
+    reachability
+        .viable_actions
+        .iter()
+        .map(|action| action.as_str())
+        .collect()
+}
+
+fn reachability_blocked_evidence(blocked_requirements: &[String]) -> Vec<String> {
+    blocked_requirements
+        .iter()
+        .map(|requirement| match requirement.as_str() {
+            "dependency_setup_authority_required" => {
+                "dependency_setup_authority_required: requires a Setup-authority step running dependency install before verification can pass".to_string()
+            }
+            "dependency_setup_blocked_offline" => {
+                "dependency_setup_blocked_offline: dependency verification requires dependency setup lifecycle, but offline mode blocks install".to_string()
+            }
+            other => format!("repair_unreachable: {other}"),
+        })
+        .collect()
+}
+
+fn emit_repair_unreachable(
+    config: &Config,
+    mode: &str,
+    step_id: &str,
+    repair_target: &str,
+    primary_reason: &str,
+    reachability: &RepairReachability,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "repair_unreachable",
+            "mode": mode,
+            "step_id": step_id,
+            "reason": reachability_failure_kind(reachability),
+            "blocked_requirements": reachability.blocked_requirements.clone(),
+            "viable_actions": reachability_action_labels(reachability),
+            "repair_target": repair_target,
+            "primary_reason": eval_events::body_snippet(primary_reason),
+        }),
+    );
 }
 
 fn verification_report_signature(report: &VerificationReport) -> Vec<String> {
@@ -9233,6 +9335,64 @@ export default function Page(){
         assert!(dir.path().join("src/app/page.tsx").is_file());
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
+    }
+
+    #[test]
+    fn dependency_repair_without_setup_authority_saves_unreachable_handoff_without_repair_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let plan = StepPlan {
+            goal: "Verify dependency resolution".to_string(),
+            steps: vec![PlanStep {
+                id: "dependency-probe".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create a deterministic dependency probe script".to_string(),
+                expected_paths: vec!["missing-module.sh".to_string()],
+                verify: vec!["sh missing-module.sh".to_string()],
+            }],
+        };
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({
+                    "path":"missing-module.sh",
+                    "content":"echo \"Cannot find module 'next/package.json'\" >&2\nexit 1\n"
+                }),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("dependency_setup_authority_required"), "{err}");
+        assert_eq!(fake.messages.len(), 1);
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"repair_unreachable\""));
+        assert!(event_text.contains("\"reason\":\"dependency_setup_authority_required\""));
+        assert!(
+            event_text.contains("\"repair_attempts\":0")
+                || !event_text.contains("step_verify_repair")
+        );
+        let repair_dir = dir.path().join(".anvil/repairs");
+        let prompt = std::fs::read_dir(repair_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .find(|text| {
+                text.contains("requires a Setup-authority step running dependency install")
+            })
+            .unwrap_or_default();
+        assert!(
+            prompt.contains("requires a Setup-authority step running dependency install"),
+            "{prompt}"
+        );
     }
 
     #[test]

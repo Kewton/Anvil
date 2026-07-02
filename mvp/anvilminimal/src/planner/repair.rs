@@ -346,6 +346,7 @@ fn render_repair_report(
         failed_step: Some(step_id.to_string()),
         failure_kind: classify_repair_target(report).as_str().to_string(),
         failure_evidence: std::iter::once(report.primary_reason())
+            .chain(context.progress_warning.iter().cloned())
             .chain(
                 report
                     .command_failures

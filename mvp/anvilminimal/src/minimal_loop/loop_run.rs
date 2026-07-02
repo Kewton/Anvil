@@ -25,9 +25,14 @@ use super::compact::compact_if_needed;
 use super::completion::{
     CompletionContract, format_verify_feedback_with_contract, target_implementation_files,
 };
+use super::dependency_setup::NodeDependencySetupAuthority;
 use super::evidence::{RuntimeAcceptanceReport, verify_runtime_acceptance};
 use super::import_scan::{format_missing_import_feedback, scan_relative_imports};
 use super::prompt::{ToolPromptMode, build_request_messages};
+use super::reachability::{
+    RepairReachability, assess_repair_reachability, reachability_failure_kind,
+    reachability_recovery_reason,
+};
 use super::repair_progress::{
     RepairProgressVerdict, VerificationSignature, classify_repair_progress,
 };
@@ -759,6 +764,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     &changed_paths,
                     &[],
                     true,
+                    config.offline,
                 ) {
                     Ok(None) => {
                         eval_events::emit(
@@ -1062,6 +1068,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     &changed_paths,
                     &batch_changed_paths,
                     batch_had_edit,
+                    config.offline,
                 ) {
                     Ok(None) => {
                         eval_events::emit(
@@ -1421,6 +1428,7 @@ fn verify_completion_contract(
     changed_paths_after: &[String],
     repair_turn_changed_paths: &[String],
     had_edit: bool,
+    offline: bool,
 ) -> anyhow::Result<Option<VerifyFailureFeedback>> {
     *verify_attempts += 1;
     let (report, build_verifier_lifecycles) = contract.verify_with_goal_observed(root, goal);
@@ -1465,6 +1473,12 @@ fn verify_completion_contract(
         build_verifier_required,
         &build_verifier_lifecycles,
     );
+    let reachability = assess_repair_reachability(
+        &report,
+        Some(contract),
+        NodeDependencySetupAuthority::None,
+        offline,
+    );
     eval_events::emit(
         eval_events_path,
         json!({
@@ -1503,6 +1517,10 @@ fn verify_completion_contract(
             "build_verifier_lifecycle": build_verifier_lifecycles.clone(),
             "dependency_setup_status": dependency_setup_status,
             "verifier_bootstrap_state": verifier_bootstrap_state.as_str(),
+            "repair_reachable": reachability.reachable,
+            "reachable": reachability.reachable,
+            "viable_actions": reachability_action_labels(&reachability),
+            "blocked_requirements": reachability.blocked_requirements.clone(),
             "repair_target": repair_target.as_str(),
             "primary_reason": eval_events::body_snippet(&report.primary_reason()),
             "failure_signature": signature.label(),
@@ -1541,6 +1559,64 @@ fn verify_completion_contract(
     }
     if ok {
         return Ok(None);
+    }
+    if !reachability.reachable {
+        let failure_kind = reachability_failure_kind(&reachability).to_string();
+        let recovery_reason = reachability_recovery_reason(&reachability);
+        let recovery_paths = save_minimal_recovery_handoff(
+            root,
+            eval_events_path,
+            contract,
+            goal,
+            &failure_kind,
+            &recovery_reason,
+            &report,
+            changed_paths_after,
+            repair_target,
+        );
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "repair_unreachable",
+                "mode": "minimal-loop",
+                "reason": failure_kind,
+                "blocked_requirements": reachability.blocked_requirements.clone(),
+                "viable_actions": reachability_action_labels(&reachability),
+                "repair_target": repair_target.as_str(),
+                "primary_reason": eval_events::body_snippet(&recovery_reason),
+                "recovery_prompt_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.prompt_path.clone())
+                    .unwrap_or_default(),
+                "recovery_ultra_plan_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.yaml_path.clone())
+                    .unwrap_or_default(),
+                "recovery_yaml_missing": recovery_paths.is_none(),
+            }),
+        );
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "loop_stop",
+                "reason": failure_kind,
+                "verify_attempts": *verify_attempts,
+                "primary_reason": eval_events::body_snippet(&recovery_reason),
+                "repair_target": repair_target.as_str(),
+                "repair_reachable": false,
+                "blocked_requirements": reachability.blocked_requirements.clone(),
+                "recovery_prompt_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.prompt_path.clone())
+                    .unwrap_or_default(),
+                "recovery_ultra_plan_path": recovery_paths
+                    .as_ref()
+                    .map(|paths| paths.yaml_path.clone())
+                    .unwrap_or_default(),
+                "recovery_yaml_missing": recovery_paths.is_none(),
+            }),
+        );
+        bail!("completion contract verify repair unreachable: {recovery_reason}");
     }
     if previous_signature.is_some() {
         eval_events::emit(
@@ -1643,6 +1719,14 @@ fn verify_completion_contract(
         signature,
         target: repair_target,
     }))
+}
+
+fn reachability_action_labels(reachability: &RepairReachability) -> Vec<&'static str> {
+    reachability
+        .viable_actions
+        .iter()
+        .map(|action| action.as_str())
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -3260,6 +3344,7 @@ export default function Page(){
             &["a.py".to_string()],
             &[],
             false,
+            false,
         )
         .unwrap_err()
         .to_string();
@@ -3318,6 +3403,7 @@ export default function Page(){
             &["src/main.rs".to_string()],
             &["src/main.rs".to_string()],
             true,
+            false,
         )
         .unwrap()
         .expect("anchored feedback");
@@ -3372,6 +3458,7 @@ export default function Page(){
             &["src/app/widget.tsx".to_string()],
             &["src/app/widget.tsx".to_string()],
             true,
+            false,
         )
         .unwrap()
         .expect("first repair should be re-anchored, not stopped");
@@ -3399,6 +3486,7 @@ export default function Page(){
             ],
             &["src/app/page.tsx".to_string()],
             true,
+            false,
         )
         .unwrap();
         assert!(outcome.is_none());
