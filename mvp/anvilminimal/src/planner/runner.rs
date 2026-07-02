@@ -7,6 +7,9 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::eval_events;
+use crate::minimal_loop::browser_probe::{
+    BrowserReadinessObservation, probe_browser_readiness_with_offline,
+};
 use crate::minimal_loop::build_verifier::emit_dependency_build_lifecycle;
 use crate::minimal_loop::completion::{CompletionContract, evidence_hint_tokens_for_goal};
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
@@ -3131,6 +3134,7 @@ fn ultra_final_acceptance_report(
         &mut required_evidence,
         &inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities),
     );
+    let browser_probe = maybe_run_ultra_final_browser_probe(config, plan, &required_capabilities);
     let missing = missing_final_artifacts(&config.workspace_root, &required_paths);
     let acceptance = verify_runtime_acceptance_with_browser_dirs_and_hints(
         &config.workspace_root,
@@ -3314,7 +3318,101 @@ fn ultra_final_acceptance_report(
             release_gate.reasons.join("; ")
         ));
     }
+    if let Some(observation) = &browser_probe
+        && let Some(reason) = observation.failure_reason()
+    {
+        report.push_profile_failure(format!("browser_readiness_failed:{reason}"));
+        if !observation.output_excerpt.trim().is_empty() {
+            report.push_profile_failure(format!(
+                "browser_probe_output: {}",
+                eval_events::body_snippet(&observation.output_excerpt)
+            ));
+        }
+    }
     Ok(report)
+}
+
+fn maybe_run_ultra_final_browser_probe(
+    config: &Config,
+    plan: &UltraPlan,
+    required_capabilities: &[String],
+) -> Option<BrowserReadinessObservation> {
+    if !ultra_browser_probe_required(&plan.profile, &plan.goal, required_capabilities)
+        || !ultra_browser_probe_runtime_enabled(config)
+    {
+        return None;
+    }
+    let observation = probe_browser_readiness_with_offline(
+        &config.workspace_root,
+        &plan.profile,
+        None,
+        Duration::from_secs(30),
+        config.offline,
+    );
+    emit_browser_probe_event(config, &observation);
+    Some(observation)
+}
+
+fn ultra_browser_probe_required(
+    profile: &str,
+    goal: &str,
+    required_capabilities: &[String],
+) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    matches!(profile, "nextjs" | "next-js" | "next.js")
+        && (required_capabilities.iter().any(|capability| {
+            matches!(
+                capability.as_str(),
+                "stateful_interaction"
+                    | "player_control"
+                    | "user_input_or_action"
+                    | "visible_state_change"
+                    | "adversary_or_challenge"
+                    | "progression_or_score"
+                    | "failure_or_collision_rule"
+            )
+        }) || lower.contains("interactive")
+            || lower.contains("game")
+            || lower.contains("keyboard")
+            || goal.contains("ゲーム"))
+}
+
+fn ultra_browser_probe_runtime_enabled(config: &Config) -> bool {
+    #[cfg(test)]
+    {
+        config
+            .workspace_root
+            .join(".anvil")
+            .join("enable-browser-probe-tests")
+            .is_file()
+    }
+    #[cfg(not(test))]
+    {
+        let _ = config;
+        true
+    }
+}
+
+fn emit_browser_probe_event(config: &Config, observation: &BrowserReadinessObservation) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "browser_probe",
+            "profile": observation.profile,
+            "status": observation.status,
+            "ok": observation.ok,
+            "port": observation.port,
+            "route": observation.route,
+            "command": observation.command,
+            "http_status": observation.http_status,
+            "failure_kind": observation.failure_kind,
+            "elapsed_ms": observation.elapsed_ms,
+            "evidence_path": observation.evidence_path.display().to_string(),
+            "output_excerpt": eval_events::body_snippet(&observation.output_excerpt),
+            "child_spawned": observation.child_spawned,
+            "child_reaped": observation.child_reaped,
+        }),
+    );
 }
 
 fn ultra_contract_runtime_acceptance_report(
@@ -4540,6 +4638,13 @@ fn release_evidence_candidate_paths(config: &Config, names: &[&str]) -> Vec<Path
         }
     }
     for name in names {
+        out.push(
+            config
+                .workspace_root
+                .join(".anvil")
+                .join("evidence")
+                .join(name),
+        );
         out.push(config.workspace_root.join(".anvil").join(name));
         out.push(config.workspace_root.join(name));
     }
@@ -4767,6 +4872,8 @@ fn is_release_evidence_unavailable_status(status: &str) -> bool {
     ) || status.starts_with("unavailable:")
         || status == "browser_unavailable"
         || status.starts_with("browser_unavailable:")
+        || status == "skipped_offline"
+        || status == "skipped_unsupported_profile"
 }
 
 fn prefer_release_evidence_failure_kind_over_http(reason: &str) -> bool {
@@ -7812,6 +7919,77 @@ mod tests {
     }
 
     #[test]
+    fn ultra_final_acceptance_report_records_browser_probe_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        enable_browser_probe_test_override(dir.path());
+        let port = write_browser_probe_mock_command(dir.path(), "500");
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            format!(
+                r#"{{"scripts":{{"build":"next build","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            interactive_game_page_source(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/layout.tsx"),
+            "export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/global.d.ts"),
+            "declare module \"*.css\";",
+        )
+        .unwrap();
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![crate::planner::ultra_plan::UltraPhase {
+                id: "finish".to_string(),
+                prompt: "Finish app".to_string(),
+            }],
+        };
+
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(!report.is_pass(), "{report:?}");
+        let primary = report.primary_reason();
+        assert!(
+            primary.contains("browser_readiness_failed:http_500"),
+            "{primary}"
+        );
+        assert!(
+            report
+                .profile_failures
+                .iter()
+                .any(|failure| failure.contains("browser_probe_output")
+                    && failure.contains("Module parse failed")),
+            "{report:?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"browser_probe\""));
+        assert!(event_text.contains("\"status\":\"failed\""));
+        assert!(event_text.contains("\"failure_kind\":\"http_500\""));
+        assert!(event_text.contains("\"child_reaped\":true"));
+        assert!(
+            std::fs::read_to_string(dir.path().join(".anvil/evidence/browser-readiness.json"))
+                .unwrap()
+                .contains("\"http_status\": 500")
+        );
+    }
+
+    #[test]
     fn non_ultra_plan_run_still_enforces_completion_contract() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -10255,6 +10433,44 @@ export default function Page(){
             }],
         })
         .unwrap()
+    }
+
+    fn enable_browser_probe_test_override(root: &Path) {
+        std::fs::create_dir_all(root.join(".anvil")).unwrap();
+        std::fs::write(root.join(".anvil/enable-browser-probe-tests"), "1").unwrap();
+    }
+
+    fn write_browser_probe_mock_command(root: &Path, status: &str) -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let dir = root.join(".anvil/evidence");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let command = serde_json::json!({
+            "program": exe.display().to_string(),
+            "args": [
+                "--ignored",
+                "--exact",
+                "minimal_loop::browser_probe::tests::browser_probe_mock_server_child",
+                "--nocapture"
+            ],
+            "env": {
+                "ANVIL_BROWSER_PROBE_MOCK_CHILD": "1",
+                "ANVIL_BROWSER_PROBE_MOCK_PORT": port.to_string(),
+                "ANVIL_BROWSER_PROBE_MOCK_STATUS": status,
+                "ANVIL_BROWSER_PROBE_MOCK_DELAY_MS": "0"
+            },
+            "port": port,
+            "require_build": false,
+            "display": "mock browser probe child"
+        });
+        std::fs::write(
+            dir.join("browser-probe-command.json"),
+            serde_json::to_string_pretty(&command).unwrap(),
+        )
+        .unwrap();
+        port
     }
 
     fn config(root: PathBuf) -> Config {

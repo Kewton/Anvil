@@ -1,3 +1,4 @@
+pub mod browser_probe;
 pub mod build_verifier;
 pub mod compact;
 pub mod completion;

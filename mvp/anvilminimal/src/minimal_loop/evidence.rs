@@ -279,6 +279,7 @@ fn browser_evidence_candidate_paths(
     names: &[&str],
 ) -> Vec<PathBuf> {
     let mut dirs = extra_dirs.to_vec();
+    dirs.push(root.join(".anvil").join("evidence"));
     dirs.push(root.join(".anvil"));
     dirs.push(root.to_path_buf());
     let mut out = Vec::new();
@@ -321,7 +322,12 @@ fn classify_browser_evidence_json(
     if let Some(status) = text_field_deep(value, details, &["status"]) {
         if matches!(
             status.as_str(),
-            "not_enabled" | "adapter_not_implemented" | "unavailable" | "skipped"
+            "not_enabled"
+                | "adapter_not_implemented"
+                | "unavailable"
+                | "skipped"
+                | "skipped_offline"
+                | "skipped_unsupported_profile"
         ) {
             return BrowserEvidenceStatus::Unavailable(status);
         }
