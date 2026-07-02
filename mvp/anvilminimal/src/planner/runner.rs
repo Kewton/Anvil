@@ -11,11 +11,12 @@ use crate::minimal_loop::build_verifier::emit_dependency_build_lifecycle;
 use crate::minimal_loop::completion::CompletionContract;
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::evidence::{
-    required_evidence_for_capability, verify_runtime_acceptance_with_browser_dirs,
+    RuntimeAcceptanceReport, required_evidence_for_capability,
+    verify_runtime_acceptance_with_browser_dirs,
 };
 use crate::minimal_loop::loop_run::{
-    RunSessionOptions, RunSessionOutcome, RunSessionStepKind, extract_requested_artifact_paths,
-    run_session_with_outcome_with_options,
+    ContractEnforcement, RunSessionOptions, RunSessionOutcome, RunSessionStepKind,
+    extract_requested_artifact_paths, run_session_with_outcome_with_options,
 };
 use crate::minimal_loop::reachability::{
     RepairReachability, assess_repair_reachability, reachability_failure_kind,
@@ -411,9 +412,18 @@ pub fn run_step_plan_with_ui(
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<String> {
     let mut session = SessionSnapshot::new();
-    run_step_plan_with_session_with_ui(client, &mut session, plan, config, ui, true, "plan-run")
-        .map(|outcome| outcome.summary)
-        .map_err(|err| anyhow::anyhow!("{}", err.message))
+    run_step_plan_with_session_with_ui(
+        client,
+        &mut session,
+        plan,
+        config,
+        ui,
+        true,
+        "plan-run",
+        None,
+    )
+    .map(|outcome| outcome.summary)
+    .map_err(|err| anyhow::anyhow!("{}", err.message))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -422,6 +432,9 @@ struct StepPlanRunOutcome {
     completed_steps: usize,
     total_steps: usize,
     changed_paths: Vec<String>,
+    observed_missing_capabilities: Vec<String>,
+    observed_missing_evidence: Vec<String>,
+    observed_missing_obligations: Vec<String>,
     verify_failures: Vec<String>,
     primary_failure: Option<String>,
     repair_targets: Vec<String>,
@@ -440,6 +453,7 @@ struct UltraRunContext {
     last_verify_failures: Vec<String>,
     last_repair_changed_paths: Vec<String>,
     pending_final_artifacts: Vec<String>,
+    pending_capability_evidence: Vec<String>,
     unresolved_repair_targets: Vec<String>,
     truncated: bool,
 }
@@ -479,6 +493,7 @@ impl UltraRunContext {
             ULTRA_CONTEXT_MAX_PATHS,
             &mut self.truncated,
         );
+        self.merge_observed_contract_debt(outcome);
         self.last_verify_failures.clear();
         push_context_items_capped(
             &mut self.last_repair_changed_paths,
@@ -493,6 +508,39 @@ impl UltraRunContext {
             ULTRA_CONTEXT_MAX_MESSAGES,
             &mut self.truncated,
         );
+    }
+
+    fn merge_observed_contract_debt(&mut self, outcome: &StepPlanRunOutcome) {
+        push_context_items_capped(
+            &mut self.pending_capability_evidence,
+            &outcome.observed_contract_keys(),
+            ULTRA_CONTEXT_MAX_MESSAGES,
+            &mut self.truncated,
+        );
+    }
+
+    fn refresh_pending_capability_evidence(&mut self, report: &RuntimeAcceptanceReport) {
+        let mut still_missing = Vec::new();
+        merge_unique_strings(&mut still_missing, &report.missing_capabilities);
+        merge_unique_strings(&mut still_missing, &report.missing_evidence);
+        merge_unique_strings(&mut still_missing, &report.missing_obligations);
+        self.pending_capability_evidence
+            .retain(|item| still_missing.contains(item));
+    }
+
+    fn render_unmet_final_requirements_section(&self) -> String {
+        let mut lines = vec!["Unmet final requirements from earlier phases:".to_string()];
+        if self.pending_capability_evidence.is_empty() {
+            lines.push("- none".to_string());
+        } else {
+            for item in &self.pending_capability_evidence {
+                lines.push(format!("- {item}"));
+            }
+            lines.push(
+                "Close these requirements when they are in scope for this phase.".to_string(),
+            );
+        }
+        lines.join("\n")
     }
 
     fn update_after_failure(
@@ -564,6 +612,7 @@ impl UltraRunContext {
             && self.created_or_changed_paths.is_empty()
             && self.last_failed_phase.is_none()
             && self.pending_final_artifacts.is_empty()
+            && self.pending_capability_evidence.is_empty()
         {
             return "Prior ultra context:\n- none yet".to_string();
         }
@@ -594,6 +643,11 @@ impl UltraRunContext {
         );
         append_context_list(
             &mut lines,
+            "Pending capability/evidence",
+            &self.pending_capability_evidence,
+        );
+        append_context_list(
+            &mut lines,
             "Unresolved repair targets",
             &self.unresolved_repair_targets,
         );
@@ -615,6 +669,18 @@ impl StepPlanRunOutcome {
 
     fn merge_step(&mut self, step: &StepRunOutcome) {
         merge_unique_strings(&mut self.changed_paths, &step.changed_paths);
+        merge_unique_strings(
+            &mut self.observed_missing_capabilities,
+            &step.observed_missing_capabilities,
+        );
+        merge_unique_strings(
+            &mut self.observed_missing_evidence,
+            &step.observed_missing_evidence,
+        );
+        merge_unique_strings(
+            &mut self.observed_missing_obligations,
+            &step.observed_missing_obligations,
+        );
         merge_unique_strings(&mut self.verify_failures, &step.verify_failures);
         merge_unique_strings(&mut self.repair_targets, &step.repair_targets);
         merge_unique_strings(&mut self.command_failures, &step.command_failures);
@@ -635,11 +701,22 @@ impl StepPlanRunOutcome {
         self.stop_reason = Some(message);
         self.partial = true;
     }
+
+    fn observed_contract_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        merge_unique_strings(&mut out, &self.observed_missing_capabilities);
+        merge_unique_strings(&mut out, &self.observed_missing_evidence);
+        merge_unique_strings(&mut out, &self.observed_missing_obligations);
+        out
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 struct StepRunOutcome {
     changed_paths: Vec<String>,
+    observed_missing_capabilities: Vec<String>,
+    observed_missing_evidence: Vec<String>,
+    observed_missing_obligations: Vec<String>,
     verify_failures: Vec<String>,
     primary_failure: Option<String>,
     repair_targets: Vec<String>,
@@ -673,7 +750,7 @@ impl StepPlanRunError {
     }
 }
 
-#[allow(clippy::result_large_err)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn run_step_plan_with_session_with_ui(
     client: &mut dyn ChatClient,
     session: &mut SessionSnapshot,
@@ -682,6 +759,7 @@ fn run_step_plan_with_session_with_ui(
     ui: &dyn InteractionUi,
     verify_final_contract: bool,
     mode: &'static str,
+    phase_scope: Option<&str>,
 ) -> Result<StepPlanRunOutcome, StepPlanRunError> {
     let mut outcome = StepPlanRunOutcome::for_plan(plan);
     let report = lint_step_plan_report_with_workspace(plan, Some(&config.workspace_root));
@@ -725,6 +803,11 @@ fn run_step_plan_with_session_with_ui(
         );
         merge_unique_strings(&mut final_required_evidence, &contract.required_evidence);
     }
+    let contract_enforcement = if verify_final_contract {
+        ContractEnforcement::Enforce
+    } else {
+        ContractEnforcement::Observe
+    };
     let mut prior_expected_paths = Vec::new();
     for step in &plan.steps {
         if ui.interrupted() {
@@ -748,6 +831,8 @@ fn run_step_plan_with_session_with_ui(
             config,
             ui,
             mode,
+            contract_enforcement,
+            phase_scope,
         ) {
             Ok(step_outcome) => {
                 outcome.completed_steps += 1;
@@ -793,6 +878,8 @@ fn run_step(
     config: &Config,
     ui: &dyn InteractionUi,
     mode: &'static str,
+    contract_enforcement: ContractEnforcement,
+    phase_scope: Option<&str>,
 ) -> Result<StepRunOutcome, StepRunError> {
     let instruction = build_step_prompt(plan, step, prompt_context);
     emit_step_prompt_contract(config, step, prompt_context, &instruction);
@@ -808,7 +895,7 @@ fn run_step(
     {
         step_config.completion_contract_path = Some(path);
     }
-    let step_options = step_run_session_options(step);
+    let step_options = step_run_session_options(step, contract_enforcement, phase_scope);
     let initial = run_session_with_outcome_with_options(
         client,
         session,
@@ -816,7 +903,7 @@ fn run_step(
         &step.expected_paths,
         &step_config,
         ui,
-        step_options,
+        step_options.clone(),
     )
     .map_err(|err| StepRunError {
         message: err.to_string(),
@@ -829,6 +916,9 @@ fn run_step(
     })?;
     let mut outcome = StepRunOutcome {
         changed_paths: initial.changed_paths.clone(),
+        observed_missing_capabilities: initial.missing_capabilities.clone(),
+        observed_missing_evidence: initial.missing_evidence.clone(),
+        observed_missing_obligations: initial.missing_obligations.clone(),
         stop_reason: Some(format!("{:?}", initial.stop_reason)),
         ..StepRunOutcome::default()
     };
@@ -937,7 +1027,7 @@ fn run_step(
                 &step.expected_paths,
                 &repair_config,
                 ui,
-                step_options,
+                step_options.clone(),
             )
             .map_err(|err| {
                 outcome.primary_failure = Some(err.to_string());
@@ -955,6 +1045,18 @@ fn run_step(
             let mut repair_turn_changed_paths = repair.changed_paths.clone();
             merge_changed_files(&mut context, &repair.changed_paths);
             merge_unique_strings(&mut outcome.changed_paths, &repair.changed_paths);
+            merge_unique_strings(
+                &mut outcome.observed_missing_capabilities,
+                &repair.missing_capabilities,
+            );
+            merge_unique_strings(
+                &mut outcome.observed_missing_evidence,
+                &repair.missing_evidence,
+            );
+            merge_unique_strings(
+                &mut outcome.observed_missing_obligations,
+                &repair.missing_obligations,
+            );
             merge_unique_strings(&mut outcome.repair_changed_paths, &repair.changed_paths);
             match profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal) {
                 Ok(true) => {
@@ -1324,8 +1426,16 @@ fn step_verify_setup_authority(plan: &StepPlan, step: &PlanStep) -> NodeDependen
     }
 }
 
-fn step_run_session_options(step: &PlanStep) -> RunSessionOptions {
-    RunSessionOptions::plan_step(run_session_step_kind(step))
+fn step_run_session_options(
+    step: &PlanStep,
+    contract_enforcement: ContractEnforcement,
+    phase_scope: Option<&str>,
+) -> RunSessionOptions {
+    RunSessionOptions::plan_step_with_enforcement(
+        run_session_step_kind(step),
+        contract_enforcement,
+        phase_scope.map(str::to_string),
+    )
 }
 
 fn run_session_step_kind(step: &PlanStep) -> RunSessionStepKind {
@@ -2268,6 +2378,7 @@ pub fn run_ultra_plan_with_ui(
             ui,
             final_phase,
             "ultra-plan-run",
+            Some(&phase.id),
         ) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -2318,6 +2429,10 @@ pub fn run_ultra_plan_with_ui(
             &step_outcome,
             missing_final_artifacts(&config.workspace_root, &final_expected_paths),
         );
+        if !final_phase {
+            let acceptance = ultra_contract_runtime_acceptance_report(plan, config)?;
+            ultra_context.refresh_pending_capability_evidence(&acceptance);
+        }
         emit_ultra_phase_context_updated(
             config,
             plan,
@@ -3190,6 +3305,58 @@ fn ultra_final_acceptance_report(
         ));
     }
     Ok(report)
+}
+
+fn ultra_contract_runtime_acceptance_report(
+    plan: &UltraPlan,
+    config: &Config,
+) -> anyhow::Result<RuntimeAcceptanceReport> {
+    let mut required_paths =
+        profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+    let mut required_capabilities = inferred_required_capabilities(&plan.profile, &plan.goal);
+    let mut required_obligations =
+        inferred_required_obligations(&plan.profile, &plan.goal, &required_capabilities);
+    let mut required_evidence =
+        inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities);
+    let bound_contract = bind_completion_contract_for_acceptance(
+        config,
+        "ultra-plan-run",
+        &plan.profile,
+        &plan.goal,
+        &required_paths,
+        &required_capabilities,
+        &required_evidence,
+        &required_obligations,
+    )?;
+    let mut deferred_commands = Vec::new();
+    let mut verify_commands = Vec::new();
+    if let Some(contract) = bound_contract.as_ref().map(|bound| &bound.contract) {
+        merge_unique_strings(&mut required_paths, &contract.required_paths);
+        merge_unique_strings(&mut required_capabilities, &contract.required_capabilities);
+        merge_unique_strings(&mut required_evidence, &contract.required_evidence);
+        merge_unique_strings(&mut required_obligations, &contract.required_obligations);
+        merge_unique_strings(&mut verify_commands, &contract.verify_commands);
+        deferred_commands.extend(
+            contract
+                .deferred_verify_requirements
+                .iter()
+                .map(|requirement| requirement.command.clone()),
+        );
+    }
+    merge_unique_strings(
+        &mut required_evidence,
+        &inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities),
+    );
+    Ok(verify_runtime_acceptance_with_browser_dirs(
+        &config.workspace_root,
+        &required_paths,
+        &verify_commands,
+        &required_capabilities,
+        &required_evidence,
+        &required_obligations,
+        &deferred_commands,
+        &release_evidence_extra_dirs(config),
+    ))
 }
 
 fn inferred_required_capabilities(profile: &str, goal: &str) -> Vec<String> {
@@ -5404,6 +5571,8 @@ fn emit_ultra_context_initialized(
             "shared_execution_session": true,
             "session_message_count": session_message_count,
             "pending_final_artifacts_count": context.pending_final_artifacts.len(),
+            "pending_capability_evidence": context.pending_capability_evidence.clone(),
+            "pending_capability_evidence_count": context.pending_capability_evidence.len(),
             "context_truncated": context.truncated,
         }),
     );
@@ -5429,6 +5598,8 @@ fn emit_ultra_phase_context_attached(
             "completed_phase_count": context.completed_phases.len(),
             "changed_path_count": context.created_or_changed_paths.len(),
             "pending_final_artifacts_count": context.pending_final_artifacts.len(),
+            "pending_capability_evidence": context.pending_capability_evidence.clone(),
+            "pending_capability_evidence_count": context.pending_capability_evidence.len(),
             "unresolved_repair_target_count": context.unresolved_repair_targets.len(),
             "has_previous_context": index > 0
                 && (!context.completed_phases.is_empty()
@@ -5460,6 +5631,8 @@ fn emit_ultra_phase_context_updated(
             "completed_phase_count": context.completed_phases.len(),
             "changed_path_count": context.created_or_changed_paths.len(),
             "pending_final_artifacts_count": context.pending_final_artifacts.len(),
+            "pending_capability_evidence": context.pending_capability_evidence.clone(),
+            "pending_capability_evidence_count": context.pending_capability_evidence.len(),
             "recent_verify_failure_count": context.last_verify_failures.len(),
             "recent_repair_changed_path_count": context.last_repair_changed_paths.len(),
             "unresolved_repair_target_count": context.unresolved_repair_targets.len(),
@@ -6530,8 +6703,9 @@ fn ultra_phase_prompt(
     };
     let workspace_snapshot = compact_workspace_snapshot(&config.workspace_root);
     let prior_context = context.render_prompt_section();
+    let unmet_final_requirements = context.render_unmet_final_requirements_section();
     format!(
-        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\nProfile runtime contract:\n{}\n\nDeterministic verification preference:\n{}\n{}{}{}",
+        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\nProfile runtime contract:\n{}\n\nDeterministic verification preference:\n{}\n{}{}{}",
         plan.goal,
         plan.profile,
         plan.style,
@@ -6540,6 +6714,7 @@ fn ultra_phase_prompt(
         phase.prompt,
         workspace_snapshot,
         prior_context,
+        unmet_final_requirements,
         runtime_contract,
         preferred_verify,
         required,
@@ -7484,6 +7659,185 @@ mod tests {
         assert!(prompt.contains("- score_or_progression_evidence"));
         assert!(prompt.contains("- failure_or_collision_evidence"));
         assert!(prompt.contains("- restart_or_recoverable_state_evidence"));
+    }
+
+    #[test]
+    fn ultra_non_final_contract_observation_carries_forward_and_final_phase_can_satisfy() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_challenge_contract(dir.path()));
+        let phase_plan = challenge_implement_step_plan_json();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(phase_plan.clone()),
+            AssistantReply::text(phase_plan),
+        ]);
+        let static_page =
+            "export default function Page(){ return <main><canvas>ready</canvas></main>; }";
+        let complete_page = "export default function Page(){ const enemies = ['drone']; return <main>enemy challenge {enemies.length}</main>; }";
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Edit",
+                    serde_json::json!({
+                        "path":"src/app/page.tsx",
+                        "old": static_page,
+                        "new": complete_page,
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+        let plan = challenge_ultra_plan();
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"contract_observation_incomplete\""));
+        assert!(event_text.contains("\"contract_enforcement\":\"observe\""));
+        assert!(event_text.contains("\"phase_scope\":\"phase-one\""));
+        assert!(
+            event_text
+                .contains("\"pending_capability_evidence\":[\"challenge_or_adversary_evidence\"]")
+        );
+        assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
+        let phase_two_prompt = planner_request_text(&planner, 1);
+        assert!(phase_two_prompt.contains("Unmet final requirements from earlier phases:"));
+        assert!(phase_two_prompt.contains("- challenge_or_adversary_evidence"));
+        assert!(phase_two_prompt.contains("Close these requirements when they are in scope"));
+    }
+
+    #[test]
+    fn ultra_final_phase_enforces_when_observed_contract_debt_remains() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_challenge_contract(dir.path()));
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(challenge_implement_step_plan_json()),
+            AssistantReply::text(challenge_setup_step_plan_json()),
+        ]);
+        let static_page =
+            "export default function Page(){ return <main><canvas>ready</canvas></main>; }";
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"phase-two.txt","content":"verified final phase without adversary evidence"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("final acceptance repair could not add evidence"),
+        ]);
+        let plan = challenge_ultra_plan();
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("challenge_or_adversary_evidence"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"plan_final_contract\""));
+        assert!(event_text.contains("\"ok\":false"));
+        assert!(event_text.contains("challenge_or_adversary_evidence"));
+        assert!(!event_text.contains("\"event\":\"ultra_plan_complete\""));
+    }
+
+    #[test]
+    fn ultra_final_acceptance_report_enforces_contract_evidence_without_implement_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_challenge_contract(dir.path()));
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){ return <main><canvas>ready</canvas></main>; }",
+        )
+        .unwrap();
+        let plan = challenge_ultra_plan();
+
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(!report.is_pass(), "{report:?}");
+        assert!(
+            report
+                .primary_reason()
+                .contains("challenge_or_adversary_evidence"),
+            "{report:?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"ultra_final_acceptance\""));
+        assert!(event_text.contains("\"runtime_acceptance_passed\":false"));
+        assert!(event_text.contains("\"missing_evidence\":[\"challenge_or_adversary_evidence\"]"));
+    }
+
+    #[test]
+    fn non_ultra_plan_run_still_enforces_completion_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_challenge_contract(dir.path()));
+        let plan = StepPlan {
+            goal: "Create the page".to_string(),
+            steps: vec![PlanStep {
+                id: "page".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create src/app/page.tsx".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({
+                    "path":"src/app/page.tsx",
+                    "content":"export default function Page(){ return <main><canvas>ready</canvas></main>; }",
+                }),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("completion contract verify failed"), "{err}");
+        assert!(err.contains("challenge_or_adversary_evidence"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"contract_enforcement\":\"enforce\""));
+        assert!(!event_text.contains("\"event\":\"contract_observation_incomplete\""));
     }
 
     #[test]
@@ -9716,6 +10070,78 @@ export default function Page(){
                 },
             ],
         })
+    }
+
+    fn challenge_ultra_plan() -> UltraPlan {
+        UltraPlan {
+            goal: "Create a browser challenge screen".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "phase-one".to_string(),
+                    prompt: "Create the first page artifact.".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "phase-two".to_string(),
+                    prompt: "Close remaining final requirements.".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn challenge_implement_step_plan_json() -> String {
+        serde_json::to_string(&StepPlan {
+            goal: "Create src/app/page.tsx".to_string(),
+            steps: vec![PlanStep {
+                id: "page".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create or update src/app/page.tsx".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: Vec::new(),
+            }],
+        })
+        .unwrap()
+    }
+
+    fn challenge_setup_step_plan_json() -> String {
+        serde_json::to_string(&StepPlan {
+            goal: "Record phase two setup completion".to_string(),
+            steps: vec![PlanStep {
+                id: "phase-two-marker".to_string(),
+                kind: "setup".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create phase-two.txt".to_string(),
+                expected_paths: vec!["phase-two.txt".to_string()],
+                verify: Vec::new(),
+            }],
+        })
+        .unwrap()
+    }
+
+    fn write_challenge_contract(root: &Path) -> PathBuf {
+        let path = root.join("challenge-contract.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "required_paths": ["src/app/page.tsx"],
+                "required_evidence": ["challenge_or_adversary_evidence"],
+                "verify_repair_cap": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn planner_request_text(client: &FakeClient, index: usize) -> String {
+        client.messages[index]
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn generated_nextjs_artifact_plan_json(goal: &str) -> String {

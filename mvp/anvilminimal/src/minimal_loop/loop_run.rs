@@ -46,6 +46,7 @@ pub enum RunStopReason {
     AssistantFinal,
     RequiredArtifactsSatisfiedAfterTool,
     CompletionContractSatisfied,
+    CompletionContractObservedIncomplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,9 @@ pub struct RunSessionOutcome {
     pub iterations: usize,
     pub tool_calls: usize,
     pub missing_required_paths: Vec<String>,
+    pub missing_capabilities: Vec<String>,
+    pub missing_evidence: Vec<String>,
+    pub missing_obligations: Vec<String>,
     pub verify_attempts: usize,
     pub last_blocking_reason: Option<String>,
     pub last_provider_error: Option<String>,
@@ -86,6 +90,12 @@ pub(crate) enum CompletionContractVerification {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContractEnforcement {
+    Enforce,
+    Observe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActionNoToolPolicy {
     RequireWriteForActionPrompt,
     RequireToolOnlyIfNoToolSeen,
@@ -107,11 +117,13 @@ pub(crate) enum RunSessionStepKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct RunSessionOptions {
     pub prompt_artifact_extraction: PromptArtifactExtraction,
     pub completion_contract_path_merge: CompletionContractPathMerge,
     pub completion_contract_verification: CompletionContractVerification,
+    pub contract_enforcement: ContractEnforcement,
+    pub phase_scope: Option<String>,
     pub action_no_tool_policy: ActionNoToolPolicy,
     pub scope: RunSessionScope,
     pub step_kind: Option<RunSessionStepKind>,
@@ -123,6 +135,8 @@ impl Default for RunSessionOptions {
             prompt_artifact_extraction: PromptArtifactExtraction::Enabled,
             completion_contract_path_merge: CompletionContractPathMerge::Enabled,
             completion_contract_verification: CompletionContractVerification::Enabled,
+            contract_enforcement: ContractEnforcement::Enforce,
+            phase_scope: None,
             action_no_tool_policy: ActionNoToolPolicy::RequireWriteForActionPrompt,
             scope: RunSessionScope::MinimalLoop,
             step_kind: None,
@@ -132,10 +146,20 @@ impl Default for RunSessionOptions {
 
 impl RunSessionOptions {
     pub(crate) fn plan_step(step_kind: RunSessionStepKind) -> Self {
+        Self::plan_step_with_enforcement(step_kind, ContractEnforcement::Enforce, None)
+    }
+
+    pub(crate) fn plan_step_with_enforcement(
+        step_kind: RunSessionStepKind,
+        enforcement: ContractEnforcement,
+        phase_scope: Option<String>,
+    ) -> Self {
         let completion_contract_enabled = step_kind == RunSessionStepKind::Implement;
+        let contract_path_merge_enabled =
+            completion_contract_enabled && enforcement == ContractEnforcement::Enforce;
         Self {
             prompt_artifact_extraction: PromptArtifactExtraction::Disabled,
-            completion_contract_path_merge: if completion_contract_enabled {
+            completion_contract_path_merge: if contract_path_merge_enabled {
                 CompletionContractPathMerge::Enabled
             } else {
                 CompletionContractPathMerge::Disabled
@@ -145,26 +169,28 @@ impl RunSessionOptions {
             } else {
                 CompletionContractVerification::DisabledDuringStep
             },
+            contract_enforcement: enforcement,
+            phase_scope,
             action_no_tool_policy: ActionNoToolPolicy::RequireToolOnlyIfNoToolSeen,
             scope: RunSessionScope::PlanRunStep,
             step_kind: Some(step_kind),
         }
     }
 
-    fn contract_runtime_enabled(self) -> bool {
+    fn contract_runtime_enabled(&self) -> bool {
         self.completion_contract_verification == CompletionContractVerification::Enabled
     }
 
-    fn contract_path_merge_enabled(self) -> bool {
+    fn contract_path_merge_enabled(&self) -> bool {
         self.completion_contract_path_merge == CompletionContractPathMerge::Enabled
     }
 
-    fn prompt_artifact_extraction_enabled(self) -> bool {
+    fn prompt_artifact_extraction_enabled(&self) -> bool {
         self.prompt_artifact_extraction == PromptArtifactExtraction::Enabled
     }
 
     fn requires_action_tool_feedback(
-        self,
+        &self,
         write_or_edit_seen: bool,
         tool_call_count: usize,
     ) -> bool {
@@ -174,7 +200,7 @@ impl RunSessionOptions {
         }
     }
 
-    fn allows_tool_only_step_completion(self) -> bool {
+    fn allows_tool_only_step_completion(&self) -> bool {
         self.scope == RunSessionScope::PlanRunStep
             && matches!(
                 self.step_kind,
@@ -184,6 +210,19 @@ impl RunSessionOptions {
                         | RunSessionStepKind::Verify
                 )
             )
+    }
+
+    fn contract_enforcement_label(&self) -> &'static str {
+        self.contract_enforcement.as_str()
+    }
+}
+
+impl ContractEnforcement {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ContractEnforcement::Enforce => "enforce",
+            ContractEnforcement::Observe => "observe",
+        }
     }
 }
 
@@ -289,7 +328,7 @@ impl RuntimeBashPolicyDecision {
 }
 
 fn runtime_bash_policy_decision(
-    options: RunSessionOptions,
+    options: &RunSessionOptions,
     tool_name: &str,
     arguments: &Value,
 ) -> Option<RuntimeBashPolicyDecision> {
@@ -351,6 +390,37 @@ struct VerifyFailureFeedback {
     feedback: String,
     signature: VerificationSignature,
     target: RepairTarget,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ContractObservation {
+    missing_paths: Vec<String>,
+    missing_capabilities: Vec<String>,
+    missing_evidence: Vec<String>,
+    missing_obligations: Vec<String>,
+    primary_reason: String,
+}
+
+impl ContractObservation {
+    fn from_report(
+        report: &crate::planner::verify::VerificationReport,
+        runtime_acceptance: &RuntimeAcceptanceReport,
+    ) -> Self {
+        Self {
+            missing_paths: report.missing_paths.clone(),
+            missing_capabilities: runtime_acceptance.missing_capabilities.clone(),
+            missing_evidence: runtime_acceptance.missing_evidence.clone(),
+            missing_obligations: runtime_acceptance.missing_obligations.clone(),
+            primary_reason: report.primary_reason(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ContractVerificationOutcome {
+    Satisfied,
+    NeedsRepair(VerifyFailureFeedback),
+    ObservationIncomplete(ContractObservation),
 }
 
 #[derive(Debug, Default)]
@@ -489,13 +559,13 @@ pub(crate) fn run_session_with_outcome_with_options(
             .as_ref()
             .map(|contract| contract.required_paths.as_slice())
             .unwrap_or(&[]),
-        options,
+        &options,
     );
     let required_paths = path_sources.effective_required_paths.clone();
     let initially_missing_paths = missing_paths(&config.workspace_root, &required_paths);
     emit_step_obligation_scope(
         config.eval_events_path.as_deref(),
-        options,
+        &options,
         &path_sources,
         &initially_missing_paths,
     );
@@ -516,7 +586,7 @@ pub(crate) fn run_session_with_outcome_with_options(
     let mut verify_repair_state = VerifyRepairState::default();
     let mut recoverable_tool_error_state = RecoverableToolErrorState::default();
     let mut malformed_native_tool_feedbacks = 0usize;
-    let step_capability_gate = StepCapabilityGate::from_prompt(user_prompt, options);
+    let step_capability_gate = StepCapabilityGate::from_prompt(user_prompt, &options);
     let iteration_limit = if contract_runtime_enabled && completion_contract.is_some() {
         config.max_iterations
             + ARTIFACT_RECOVERY_ATTEMPT_LIMIT.saturating_mul(required_paths.len().max(1))
@@ -752,7 +822,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     pending_feedback = Some(feedback);
                     continue;
                 }
-                match verify_completion_contract(
+                match verify_completion_contract_with_enforcement(
                     &config.workspace_root,
                     config.eval_events_path.as_deref(),
                     contract,
@@ -765,8 +835,9 @@ pub(crate) fn run_session_with_outcome_with_options(
                     &[],
                     true,
                     config.offline,
+                    &options,
                 ) {
-                    Ok(None) => {
+                    Ok(ContractVerificationOutcome::Satisfied) => {
                         eval_events::emit(
                             config.eval_events_path.as_deref(),
                             json!({
@@ -783,12 +854,15 @@ pub(crate) fn run_session_with_outcome_with_options(
                             iterations: iteration + 1,
                             tool_calls: tool_call_count,
                             missing_required_paths: Vec::new(),
+                            missing_capabilities: Vec::new(),
+                            missing_evidence: Vec::new(),
+                            missing_obligations: Vec::new(),
                             verify_attempts,
                             last_blocking_reason,
                             last_provider_error,
                         });
                     }
-                    Ok(Some(feedback)) => {
+                    Ok(ContractVerificationOutcome::NeedsRepair(feedback)) => {
                         session.messages.pop();
                         last_blocking_reason = Some("completion verify failed".to_string());
                         verify_repair_state.pending_signature = Some(feedback.signature);
@@ -797,6 +871,22 @@ pub(crate) fn run_session_with_outcome_with_options(
                         verify_repair_state.no_edit_turns = 0;
                         pending_feedback = Some(feedback.feedback);
                         continue;
+                    }
+                    Ok(ContractVerificationOutcome::ObservationIncomplete(observation)) => {
+                        return Ok(RunSessionOutcome {
+                            final_text: reply.content,
+                            stop_reason: RunStopReason::CompletionContractObservedIncomplete,
+                            changed_paths,
+                            iterations: iteration + 1,
+                            tool_calls: tool_call_count,
+                            missing_required_paths: observation.missing_paths,
+                            missing_capabilities: observation.missing_capabilities,
+                            missing_evidence: observation.missing_evidence,
+                            missing_obligations: observation.missing_obligations,
+                            verify_attempts,
+                            last_blocking_reason,
+                            last_provider_error,
+                        });
                     }
                     Err(err) => {
                         return Err(err);
@@ -810,6 +900,9 @@ pub(crate) fn run_session_with_outcome_with_options(
                 iterations: iteration + 1,
                 tool_calls: tool_call_count,
                 missing_required_paths: Vec::new(),
+                missing_capabilities: Vec::new(),
+                missing_evidence: Vec::new(),
+                missing_obligations: Vec::new(),
                 verify_attempts,
                 last_blocking_reason,
                 last_provider_error,
@@ -845,7 +938,7 @@ pub(crate) fn run_session_with_outcome_with_options(
             }
             if let (Some(command), Some(decision)) = (
                 recovered_bash_command(&call.name, &call.arguments),
-                runtime_bash_policy_decision(options, &call.name, &call.arguments),
+                runtime_bash_policy_decision(&options, &call.name, &call.arguments),
             ) {
                 emit_runtime_bash_policy(config.eval_events_path.as_deref(), &decision, &command);
                 if decision.blocked {
@@ -1017,6 +1110,9 @@ pub(crate) fn run_session_with_outcome_with_options(
                 iterations: iteration + 1,
                 tool_calls: tool_call_count,
                 missing_required_paths: Vec::new(),
+                missing_capabilities: Vec::new(),
+                missing_evidence: Vec::new(),
+                missing_obligations: Vec::new(),
                 verify_attempts,
                 last_blocking_reason,
                 last_provider_error,
@@ -1056,7 +1152,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     pending_feedback = Some(feedback);
                     continue;
                 }
-                match verify_completion_contract(
+                match verify_completion_contract_with_enforcement(
                     &config.workspace_root,
                     config.eval_events_path.as_deref(),
                     contract,
@@ -1069,8 +1165,9 @@ pub(crate) fn run_session_with_outcome_with_options(
                     &batch_changed_paths,
                     batch_had_edit,
                     config.offline,
+                    &options,
                 ) {
-                    Ok(None) => {
+                    Ok(ContractVerificationOutcome::Satisfied) => {
                         eval_events::emit(
                             config.eval_events_path.as_deref(),
                             json!({
@@ -1090,12 +1187,15 @@ pub(crate) fn run_session_with_outcome_with_options(
                             iterations: iteration + 1,
                             tool_calls: tool_call_count,
                             missing_required_paths: Vec::new(),
+                            missing_capabilities: Vec::new(),
+                            missing_evidence: Vec::new(),
+                            missing_obligations: Vec::new(),
                             verify_attempts,
                             last_blocking_reason,
                             last_provider_error,
                         });
                     }
-                    Ok(Some(feedback)) => {
+                    Ok(ContractVerificationOutcome::NeedsRepair(feedback)) => {
                         last_blocking_reason = Some("completion verify failed".to_string());
                         verify_repair_state.pending_signature = Some(feedback.signature);
                         verify_repair_state.pending_target = Some(feedback.target);
@@ -1104,12 +1204,32 @@ pub(crate) fn run_session_with_outcome_with_options(
                         pending_feedback = Some(feedback.feedback);
                         continue;
                     }
+                    Ok(ContractVerificationOutcome::ObservationIncomplete(observation)) => {
+                        return Ok(RunSessionOutcome {
+                            final_text: format!(
+                                "completion contract observed incomplete: {}",
+                                observation.primary_reason
+                            ),
+                            stop_reason: RunStopReason::CompletionContractObservedIncomplete,
+                            changed_paths,
+                            iterations: iteration + 1,
+                            tool_calls: tool_call_count,
+                            missing_required_paths: observation.missing_paths,
+                            missing_capabilities: observation.missing_capabilities,
+                            missing_evidence: observation.missing_evidence,
+                            missing_obligations: observation.missing_obligations,
+                            verify_attempts,
+                            last_blocking_reason,
+                            last_provider_error,
+                        });
+                    }
                     Err(err) => {
                         return Err(err);
                     }
                 }
             }
-            if let Some(gate) = step_capability_gate.as_ref()
+            if options.contract_enforcement == ContractEnforcement::Enforce
+                && let Some(gate) = step_capability_gate.as_ref()
                 && let Some(feedback) = gate.maybe_feedback(
                     &config.workspace_root,
                     config.eval_events_path.as_deref(),
@@ -1138,6 +1258,9 @@ pub(crate) fn run_session_with_outcome_with_options(
                 iterations: iteration + 1,
                 tool_calls: tool_call_count,
                 missing_required_paths: Vec::new(),
+                missing_capabilities: Vec::new(),
+                missing_evidence: Vec::new(),
+                missing_obligations: Vec::new(),
                 verify_attempts,
                 last_blocking_reason,
                 last_provider_error,
@@ -1199,7 +1322,7 @@ struct StepCapabilityGate {
 }
 
 impl StepCapabilityGate {
-    fn from_prompt(prompt: &str, options: RunSessionOptions) -> Option<Self> {
+    fn from_prompt(prompt: &str, options: &RunSessionOptions) -> Option<Self> {
         if options.scope != RunSessionScope::PlanRunStep
             || options.step_kind != Some(RunSessionStepKind::Implement)
         {
@@ -1352,7 +1475,7 @@ fn effective_required_path_sources(
     explicit: &[String],
     prompt: &str,
     contract_paths: &[String],
-    options: RunSessionOptions,
+    options: &RunSessionOptions,
 ) -> RequiredPathSources {
     let prompt_extracted_paths = if options.prompt_artifact_extraction_enabled() {
         extract_requested_artifact_paths(root, prompt)
@@ -1391,7 +1514,7 @@ fn effective_required_path_sources(
 
 fn emit_step_obligation_scope(
     eval_events_path: Option<&Path>,
-    options: RunSessionOptions,
+    options: &RunSessionOptions,
     sources: &RequiredPathSources,
     initially_missing_paths: &[String],
 ) {
@@ -1406,6 +1529,8 @@ fn emit_step_obligation_scope(
             "prompt_extracted_paths": sources.prompt_extracted_paths.clone(),
             "completion_contract_path_merge_enabled": options.contract_path_merge_enabled(),
             "completion_contract_verification_enabled": options.contract_runtime_enabled(),
+            "contract_enforcement": options.contract_enforcement_label(),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
             "completion_contract_paths": sources.completion_contract_paths.clone(),
             "effective_required_paths": sources.effective_required_paths.clone(),
             "initially_missing_paths": initially_missing_paths,
@@ -1415,6 +1540,7 @@ fn emit_step_obligation_scope(
     );
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn verify_completion_contract(
     root: &Path,
@@ -1430,6 +1556,46 @@ fn verify_completion_contract(
     had_edit: bool,
     offline: bool,
 ) -> anyhow::Result<Option<VerifyFailureFeedback>> {
+    let options = RunSessionOptions::default();
+    match verify_completion_contract_with_enforcement(
+        root,
+        eval_events_path,
+        contract,
+        goal,
+        verify_attempts,
+        previous_signature,
+        previous_target,
+        changed_paths_before,
+        changed_paths_after,
+        repair_turn_changed_paths,
+        had_edit,
+        offline,
+        &options,
+    )? {
+        ContractVerificationOutcome::Satisfied => Ok(None),
+        ContractVerificationOutcome::NeedsRepair(feedback) => Ok(Some(feedback)),
+        ContractVerificationOutcome::ObservationIncomplete(_) => {
+            unreachable!("default completion contract enforcement cannot observe")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_completion_contract_with_enforcement(
+    root: &Path,
+    eval_events_path: Option<&Path>,
+    contract: &CompletionContract,
+    goal: &str,
+    verify_attempts: &mut usize,
+    previous_signature: Option<&VerificationSignature>,
+    previous_target: Option<RepairTarget>,
+    changed_paths_before: &[String],
+    changed_paths_after: &[String],
+    repair_turn_changed_paths: &[String],
+    had_edit: bool,
+    offline: bool,
+    options: &RunSessionOptions,
+) -> anyhow::Result<ContractVerificationOutcome> {
     *verify_attempts += 1;
     let (report, build_verifier_lifecycles) = contract.verify_with_goal_observed(root, goal);
     let build_verifier_observations = build_verifier_lifecycles
@@ -1486,6 +1652,10 @@ fn verify_completion_contract(
             "ok": ok,
             "attempt": *verify_attempts,
             "repair_cap": contract.verify_repair_cap,
+            "contract_enforcement": options.contract_enforcement_label(),
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
             "missing_paths": report.missing_paths.clone(),
             "command_failures": report.command_failures.len(),
             "dependency_missing": report.dependency_missing.clone(),
@@ -1558,11 +1728,26 @@ fn verify_completion_contract(
         );
     }
     if ok {
-        return Ok(None);
+        return Ok(ContractVerificationOutcome::Satisfied);
     }
     if !reachability.reachable {
         let failure_kind = reachability_failure_kind(&reachability).to_string();
         let recovery_reason = reachability_recovery_reason(&reachability);
+        if options.contract_enforcement == ContractEnforcement::Observe {
+            let observation = ContractObservation::from_report(&report, &runtime_acceptance);
+            emit_contract_observation_incomplete(
+                eval_events_path,
+                options,
+                contract,
+                &observation,
+                *verify_attempts,
+                "repair_unreachable",
+                &reachability.blocked_requirements,
+            );
+            return Ok(ContractVerificationOutcome::ObservationIncomplete(
+                observation,
+            ));
+        }
         let recovery_paths = save_minimal_recovery_handoff(
             root,
             eval_events_path,
@@ -1644,6 +1829,21 @@ fn verify_completion_contract(
             verdict,
             repair_target,
         );
+        if options.contract_enforcement == ContractEnforcement::Observe {
+            let observation = ContractObservation::from_report(&report, &runtime_acceptance);
+            emit_contract_observation_incomplete(
+                eval_events_path,
+                options,
+                contract,
+                &observation,
+                *verify_attempts,
+                &stop_reason,
+                &reachability.blocked_requirements,
+            );
+            return Ok(ContractVerificationOutcome::ObservationIncomplete(
+                observation,
+            ));
+        }
         let recovery_paths = save_minimal_recovery_handoff(
             root,
             eval_events_path,
@@ -1714,11 +1914,64 @@ fn verify_completion_contract(
         contract,
         &runtime_acceptance,
     );
-    Ok(Some(VerifyFailureFeedback {
-        feedback,
-        signature,
-        target: repair_target,
-    }))
+    Ok(ContractVerificationOutcome::NeedsRepair(
+        VerifyFailureFeedback {
+            feedback,
+            signature,
+            target: repair_target,
+        },
+    ))
+}
+
+fn emit_contract_observation_incomplete(
+    eval_events_path: Option<&Path>,
+    options: &RunSessionOptions,
+    contract: &CompletionContract,
+    observation: &ContractObservation,
+    verify_attempts: usize,
+    reason: &str,
+    blocked_requirements: &[String],
+) {
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "contract_observation_incomplete",
+            "contract_enforcement": options.contract_enforcement_label(),
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+            "verify_attempts": verify_attempts,
+            "repair_cap": contract.verify_repair_cap,
+            "reason": reason,
+            "required_paths": contract.required_paths.clone(),
+            "missing_paths": observation.missing_paths.clone(),
+            "required_capabilities": contract.required_capabilities.clone(),
+            "required_evidence": contract.required_evidence.clone(),
+            "required_obligations": contract.required_obligations.clone(),
+            "missing_capabilities": observation.missing_capabilities.clone(),
+            "missing_evidence": observation.missing_evidence.clone(),
+            "missing_obligations": observation.missing_obligations.clone(),
+            "primary_reason": eval_events::body_snippet(&observation.primary_reason),
+            "blocked_requirements": blocked_requirements,
+        }),
+    );
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "loop_stop",
+            "reason": "contract_observation_incomplete",
+            "contract_enforcement": options.contract_enforcement_label(),
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+            "verify_attempts": verify_attempts,
+            "missing_paths": observation.missing_paths.clone(),
+            "missing_capabilities": observation.missing_capabilities.clone(),
+            "missing_evidence": observation.missing_evidence.clone(),
+            "missing_obligations": observation.missing_obligations.clone(),
+            "primary_reason": eval_events::body_snippet(&observation.primary_reason),
+        }),
+    );
 }
 
 fn reachability_action_labels(reachability: &RepairReachability) -> Vec<&'static str> {
