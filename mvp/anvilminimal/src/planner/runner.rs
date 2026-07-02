@@ -18,7 +18,7 @@ use crate::minimal_loop::evidence::{
     verify_runtime_acceptance_with_browser_dirs_and_hints,
 };
 use crate::minimal_loop::loop_run::{
-    ContractEnforcement, RunSessionOptions, RunSessionOutcome, RunSessionStepKind,
+    ContractEnforcement, RunSessionError, RunSessionOptions, RunSessionOutcome, RunSessionStepKind,
     extract_requested_artifact_paths, run_session_with_outcome_with_options,
 };
 use crate::minimal_loop::reachability::{
@@ -918,14 +918,12 @@ fn run_step(
         ui,
         step_options.clone(),
     )
-    .map_err(|err| StepRunError {
-        message: err.to_string(),
-        outcome: StepRunOutcome {
-            primary_failure: Some(err.to_string()),
-            stop_reason: Some("initial_turn_error".to_string()),
-            partial: true,
-            ..StepRunOutcome::default()
-        },
+    .map_err(|err| {
+        let message = err.to_string();
+        StepRunError {
+            outcome: step_run_outcome_from_session_error(&err, "initial_turn_error"),
+            message,
+        }
     })?;
     let mut outcome = StepRunOutcome {
         changed_paths: initial.changed_paths.clone(),
@@ -1057,12 +1055,14 @@ fn run_step(
                 step_options.clone(),
             )
             .map_err(|err| {
-                outcome.primary_failure = Some(err.to_string());
+                let message = err.to_string();
+                apply_session_error_observations(&mut outcome, &err, &message);
+                outcome.primary_failure = Some(message.clone());
                 outcome.stop_reason = Some("repair_turn_error".to_string());
                 outcome.repair_attempts = attempt;
                 outcome.partial = true;
                 StepRunError {
-                    message: err.to_string(),
+                    message,
                     outcome: outcome.clone(),
                 }
             })?;
@@ -1985,6 +1985,79 @@ fn merge_unique_strings(out: &mut Vec<String>, incoming: &[String]) {
         if !out.contains(item) {
             out.push(item.clone());
         }
+    }
+}
+
+fn step_run_outcome_from_session_error(err: &anyhow::Error, stop_reason: &str) -> StepRunOutcome {
+    let message = err.to_string();
+    let mut outcome = StepRunOutcome {
+        primary_failure: Some(message.clone()),
+        stop_reason: Some(stop_reason.to_string()),
+        partial: true,
+        ..StepRunOutcome::default()
+    };
+    apply_session_error_observations(&mut outcome, err, &message);
+    outcome
+}
+
+fn apply_session_error_observations(
+    outcome: &mut StepRunOutcome,
+    err: &anyhow::Error,
+    message: &str,
+) {
+    if let Some(session_error) = err.downcast_ref::<RunSessionError>() {
+        merge_unique_strings(
+            &mut outcome.observed_missing_capabilities,
+            &session_error.context.missing_capabilities,
+        );
+        merge_unique_strings(
+            &mut outcome.observed_missing_evidence,
+            &session_error.context.missing_evidence,
+        );
+        merge_unique_strings(
+            &mut outcome.observed_missing_obligations,
+            &session_error.context.missing_obligations,
+        );
+        if let Some(repair_target) = session_error.context.repair_target.as_ref() {
+            merge_unique_strings(
+                &mut outcome.repair_targets,
+                std::slice::from_ref(repair_target),
+            );
+        }
+    }
+
+    let missing_capabilities =
+        missing_signal_values_after_prefix(message, "missing_required_capabilities:");
+    let missing_evidence =
+        missing_signal_values_after_prefix(message, "missing_required_evidence:");
+    let missing_obligations =
+        missing_signal_values_after_prefix(message, "missing_required_obligations:");
+    merge_unique_strings(
+        &mut outcome.observed_missing_capabilities,
+        &missing_capabilities,
+    );
+    merge_unique_strings(&mut outcome.observed_missing_evidence, &missing_evidence);
+    merge_unique_strings(
+        &mut outcome.observed_missing_obligations,
+        &missing_obligations,
+    );
+    ensure_session_error_repair_target(outcome);
+}
+
+fn ensure_session_error_repair_target(outcome: &mut StepRunOutcome) {
+    if !outcome.repair_targets.is_empty() {
+        return;
+    }
+    if !outcome.observed_missing_evidence.is_empty()
+        || !outcome.observed_missing_obligations.is_empty()
+    {
+        outcome
+            .repair_targets
+            .push("required_evidence_missing".to_string());
+    } else if !outcome.observed_missing_capabilities.is_empty() {
+        outcome
+            .repair_targets
+            .push("capability_missing".to_string());
     }
 }
 
@@ -9221,6 +9294,119 @@ mod tests {
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"recovery_prompt_path\":\".anvil/repairs/"));
         assert!(event_text.contains("\"recovery_ultra_plan_path\":\".anvil/plans/"));
+    }
+
+    #[test]
+    fn session_error_text_missing_evidence_populates_step_outcome() {
+        let err = anyhow::anyhow!(
+            "completion contract verify failed after 1 attempts: \
+             missing_required_capabilities:stateful_interaction \
+             missing_required_evidence:challenge_or_adversary_evidence"
+        );
+
+        let outcome = step_run_outcome_from_session_error(&err, "initial_turn_error");
+
+        assert_eq!(
+            outcome.observed_missing_capabilities,
+            vec!["stateful_interaction".to_string()]
+        );
+        assert_eq!(
+            outcome.observed_missing_evidence,
+            vec!["challenge_or_adversary_evidence".to_string()]
+        );
+        assert_eq!(
+            outcome.repair_targets,
+            vec!["required_evidence_missing".to_string()]
+        );
+        assert_eq!(outcome.stop_reason.as_deref(), Some("initial_turn_error"));
+        assert!(outcome.partial);
+    }
+
+    #[test]
+    fn ultra_phase_recovery_handoff_uses_contract_error_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_challenge_contract(dir.path()));
+        let plan = challenge_ultra_plan();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(challenge_setup_step_plan_json()),
+            AssistantReply::text(challenge_implement_step_plan_json()),
+        ]);
+        let static_page =
+            "export default function Page(){ return <main><canvas>ready</canvas></main>; }";
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"phase-two.txt","content":"phase one complete"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("challenge_or_adversary_evidence"), "{err}");
+        let repairs_dir = dir.path().join(".anvil/repairs");
+        let repair_text = std::fs::read_dir(&repairs_dir)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .find(|text| text.contains("- phase: phase-two"))
+            .expect("phase recovery prompt");
+        assert!(
+            repair_text.contains("- challenge_or_adversary_evidence"),
+            "{repair_text}"
+        );
+        assert!(!repair_text.contains("Missing capabilities:\n- none"));
+        assert!(!repair_text.contains("Repair targets:\n- none"));
+        assert!(repair_text.contains("Repair targets:\n- "), "{repair_text}");
+        let recovery_plan = std::fs::read_dir(dir.path().join(".anvil/plans"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("recovery-ultra-plan-") && name.ends_with(".yaml")
+                    })
+                    .then(|| parse_ultra_plan(&std::fs::read_to_string(path).unwrap()).unwrap())
+            })
+            .find(|plan| {
+                plan.phases.iter().any(|phase| {
+                    phase.prompt.contains("- challenge_or_adversary_evidence")
+                        && phase.prompt.contains("Repair targets:\n- ")
+                        && !phase.prompt.contains("Repair targets:\n- none")
+                })
+            })
+            .expect("phase recovery ultra plan");
+        assert!(
+            recovery_plan
+                .phases
+                .iter()
+                .any(|phase| phase.prompt.contains("- challenge_or_adversary_evidence"))
+        );
+        assert!(recovery_plan.phases.iter().any(|phase| {
+            phase.prompt.contains("Repair targets:\n- ")
+                && !phase.prompt.contains("Repair targets:\n- none")
+        }));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"completion_verify\""));
+        assert!(event_text.contains("\"event\":\"ultra_phase_failed\""));
     }
 
     #[test]

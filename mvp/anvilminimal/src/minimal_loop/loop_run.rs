@@ -65,6 +65,65 @@ pub struct RunSessionOutcome {
     pub last_provider_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunSessionErrorContext {
+    pub missing_capabilities: Vec<String>,
+    pub missing_evidence: Vec<String>,
+    pub missing_obligations: Vec<String>,
+    pub repair_target: Option<String>,
+}
+
+impl RunSessionErrorContext {
+    fn from_runtime_acceptance(
+        runtime_acceptance: &RuntimeAcceptanceReport,
+        repair_target: RepairTarget,
+    ) -> Self {
+        Self {
+            missing_capabilities: runtime_acceptance.missing_capabilities.clone(),
+            missing_evidence: runtime_acceptance.missing_evidence.clone(),
+            missing_obligations: runtime_acceptance.missing_obligations.clone(),
+            repair_target: Some(repair_target.as_str().to_string()),
+        }
+    }
+
+    fn from_repair_target(repair_target: RepairTarget) -> Self {
+        Self {
+            repair_target: Some(repair_target.as_str().to_string()),
+            ..Self::default()
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.missing_capabilities.is_empty()
+            && self.missing_evidence.is_empty()
+            && self.missing_obligations.is_empty()
+            && self.repair_target.is_none()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RunSessionError {
+    pub message: String,
+    pub context: RunSessionErrorContext,
+}
+
+impl RunSessionError {
+    fn new(message: impl Into<String>, context: RunSessionErrorContext) -> Self {
+        Self {
+            message: message.into(),
+            context,
+        }
+    }
+}
+
+impl std::fmt::Display for RunSessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(f)
+    }
+}
+
+impl std::error::Error for RunSessionError {}
+
 const ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD: usize = 3;
 const ARTIFACT_RECOVERY_ATTEMPT_LIMIT: usize = 3;
 const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 1;
@@ -392,6 +451,7 @@ fn emit_runtime_bash_policy(
 struct VerifyRepairState {
     pending_signature: Option<VerificationSignature>,
     pending_target: Option<RepairTarget>,
+    pending_error_context: RunSessionErrorContext,
     changed_paths_at_failure: Vec<String>,
     no_edit_turns: usize,
 }
@@ -401,6 +461,7 @@ struct VerifyFailureFeedback {
     feedback: String,
     signature: VerificationSignature,
     target: RepairTarget,
+    error_context: RunSessionErrorContext,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -877,6 +938,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     Ok(ContractVerificationOutcome::NeedsRepair(feedback)) => {
                         session.messages.pop();
                         last_blocking_reason = Some("completion verify failed".to_string());
+                        verify_repair_state.pending_error_context = feedback.error_context.clone();
                         verify_repair_state.pending_signature = Some(feedback.signature);
                         verify_repair_state.pending_target = Some(feedback.target);
                         verify_repair_state.changed_paths_at_failure = changed_paths.clone();
@@ -1210,6 +1272,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     }
                     Ok(ContractVerificationOutcome::NeedsRepair(feedback)) => {
                         last_blocking_reason = Some("completion verify failed".to_string());
+                        verify_repair_state.pending_error_context = feedback.error_context.clone();
                         verify_repair_state.pending_signature = Some(feedback.signature);
                         verify_repair_state.pending_target = Some(feedback.target);
                         verify_repair_state.changed_paths_at_failure = changed_paths.clone();
@@ -1815,7 +1878,11 @@ fn verify_completion_contract_with_enforcement(
                 "recovery_yaml_missing": recovery_paths.is_none(),
             }),
         );
-        bail!("completion contract verify repair unreachable: {recovery_reason}");
+        return Err(RunSessionError::new(
+            format!("completion contract verify repair unreachable: {recovery_reason}"),
+            RunSessionErrorContext::from_runtime_acceptance(&runtime_acceptance, repair_target),
+        )
+        .into());
     }
     if previous_signature.is_some() {
         eval_events::emit(
@@ -1914,11 +1981,15 @@ fn verify_completion_contract_with_enforcement(
                     .collect::<Vec<_>>(),
             }),
         );
-        bail!(
-            "completion contract verify failed after {} attempts: {}",
-            *verify_attempts,
-            report.primary_reason()
-        );
+        return Err(RunSessionError::new(
+            format!(
+                "completion contract verify failed after {} attempts: {}",
+                *verify_attempts,
+                report.primary_reason()
+            ),
+            RunSessionErrorContext::from_runtime_acceptance(&runtime_acceptance, repair_target),
+        )
+        .into());
     }
     let feedback = reanchored_verify_feedback_if_needed(
         format_verify_feedback_with_contract(&report, Some(contract)),
@@ -1933,6 +2004,10 @@ fn verify_completion_contract_with_enforcement(
             feedback,
             signature,
             target: repair_target,
+            error_context: RunSessionErrorContext::from_runtime_acceptance(
+                &runtime_acceptance,
+                repair_target,
+            ),
         },
     ))
 }
@@ -2219,7 +2294,17 @@ fn handle_verify_repair_no_edit(
                 "no_edit_turns": state.no_edit_turns,
             }),
         );
-        bail!("completion contract verify repair made no file changes");
+        let mut error_context = state.pending_error_context.clone();
+        if error_context.is_empty() {
+            error_context = RunSessionErrorContext::from_repair_target(repair_target);
+        } else if error_context.repair_target.is_none() {
+            error_context.repair_target = Some(repair_target.as_str().to_string());
+        }
+        return Err(RunSessionError::new(
+            "completion contract verify repair made no file changes",
+            error_context,
+        )
+        .into());
     }
     Ok(Some(super::feedback::verify_repair_edit_required(
         &signature.label(),
