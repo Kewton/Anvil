@@ -4122,17 +4122,28 @@ export default function Page(){
         let repaired_page = r#""use client";
 import { useState } from "react";
 export default function Page(){
-  const [gameState,setGameState] = useState("ready");
+  const [gameOver,setGameOver] = useState(false);
   const [score,setScore] = useState(0);
-  const enemies = [{ x: 1, y: 1 }];
+  const [bullets,setBullets] = useState([{ x: 0, y: 0 }]);
+  const [enemies,setEnemies] = useState([{ x: 1, y: 1 }]);
   const fire = () => {
-    const collision = enemies.some((enemy) => enemy.x > 0);
-    if (collision) {
-      setGameState("gameover");
-      setScore((value) => value + 10);
-    }
+    setBullets((items) => [...items, { x: 1, y: 1 }]);
+    bullets.forEach((bullet) => {
+      enemies.forEach((enemy) => {
+        if (Math.abs(bullet.x - enemy.x) < 10 && Math.abs(bullet.y - enemy.y) < 10) {
+          setGameOver(true);
+          setScore((value) => value + 10);
+        }
+      });
+    });
   };
-  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button><button onClick={fire}>Fire</button><p>enemy collision score {score} {gameState}</p></main>;
+  const restart = () => {
+    setGameOver(false);
+    setScore(0);
+    setBullets([]);
+    setEnemies([{ x: 1, y: 1 }]);
+  };
+  return <main><button onClick={fire}>Start</button><button onClick={restart}>Restart</button><button onClick={fire}>Fire</button><p>enemy collision score {score} {gameOver ? "game over" : "playing"}</p></main>;
 }
 "#;
         let mut fake = Fake {

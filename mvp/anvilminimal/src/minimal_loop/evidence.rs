@@ -176,6 +176,142 @@ struct WorkspaceEvidence {
 struct SourceFile {
     rel: String,
     content: String,
+    comment_stripped_content: String,
+    scan_content: String,
+}
+
+impl SourceFile {
+    fn new(rel: String, content: String) -> Self {
+        let (comment_stripped_content, scan_content) = source_scan_texts(&rel, &content);
+        Self {
+            rel,
+            content,
+            comment_stripped_content,
+            scan_content,
+        }
+    }
+
+    fn scan_text(&self) -> &str {
+        &self.scan_content
+    }
+
+    fn comment_stripped_text(&self) -> &str {
+        &self.comment_stripped_content
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiteralScanMode {
+    Keep,
+    Strip,
+}
+
+fn source_scan_texts(rel: &str, content: &str) -> (String, String) {
+    if !uses_c_family_lexical_comments(rel) {
+        return (content.to_string(), content.to_string());
+    }
+    let comment_stripped = strip_c_family_comments_and_literals(content, LiteralScanMode::Keep)
+        .unwrap_or_else(|| content.to_string());
+    let scan = strip_c_family_comments_and_literals(content, LiteralScanMode::Strip)
+        .unwrap_or_else(|| content.to_string());
+    (comment_stripped, scan)
+}
+
+fn uses_c_family_lexical_comments(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    [
+        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".c", ".cc", ".cpp", ".h", ".hpp", ".java",
+        ".cs", ".go",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
+}
+
+fn strip_c_family_comments_and_literals(content: &str, mode: LiteralScanMode) -> Option<String> {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                out.push(' ');
+                out.push(' ');
+                for comment_ch in chars.by_ref() {
+                    if comment_ch == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                    out.push(' ');
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                out.push(' ');
+                out.push(' ');
+                let mut closed = false;
+                let mut previous = '\0';
+                for comment_ch in chars.by_ref() {
+                    if comment_ch == '\n' {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                    if previous == '*' && comment_ch == '/' {
+                        closed = true;
+                        break;
+                    }
+                    previous = comment_ch;
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            '\'' | '"' | '`' => {
+                if !strip_or_copy_string_literal(ch, &mut chars, &mut out, mode) {
+                    return None;
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    Some(out)
+}
+
+fn strip_or_copy_string_literal<I>(
+    quote: char,
+    chars: &mut std::iter::Peekable<I>,
+    out: &mut String,
+    mode: LiteralScanMode,
+) -> bool
+where
+    I: Iterator<Item = char>,
+{
+    out.push(quote);
+    let mut escaped = false;
+    for ch in chars.by_ref() {
+        match mode {
+            LiteralScanMode::Keep => out.push(ch),
+            LiteralScanMode::Strip if ch == quote && !escaped => out.push(ch),
+            LiteralScanMode::Strip if ch == '\n' => out.push('\n'),
+            LiteralScanMode::Strip => out.push(' '),
+        }
+
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            return true;
+        }
+        if ch == '\n' && quote != '`' {
+            return false;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,9 +864,12 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
                 }
             }
             "user_input_handler_evidence" => {
-                if !has_user_input_handler_evidence(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_source_signal(
+                    evidence,
+                    user_input_handler_signal(&workspace),
+                    &mut missing_evidence,
+                    &mut weak_evidence,
+                );
             }
             "stateful_update_evidence" => {
                 if !has_stateful_update_evidence(&workspace) {
@@ -743,19 +882,28 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
                 }
             }
             "score_or_progression_evidence" => {
-                if !has_score_or_progression_evidence(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_source_signal(
+                    evidence,
+                    score_or_progression_signal(&workspace),
+                    &mut missing_evidence,
+                    &mut weak_evidence,
+                );
             }
             "failure_or_collision_evidence" => {
-                if !has_failure_or_collision_evidence(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_source_signal(
+                    evidence,
+                    failure_or_collision_signal(&workspace),
+                    &mut missing_evidence,
+                    &mut weak_evidence,
+                );
             }
             "restart_or_recoverable_state_evidence" => {
-                if !has_restart_or_recoverable_state_evidence(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_source_signal(
+                    evidence,
+                    restart_or_recoverable_state_signal(&workspace),
+                    &mut missing_evidence,
+                    &mut weak_evidence,
+                );
             }
             "nextjs_route_evidence" => {
                 if !has_nextjs_route_evidence(&workspace) {
@@ -863,10 +1011,7 @@ pub fn artifact_obligation_evidence_with_hints(
             continue;
         }
         let content = std::fs::read_to_string(&full).unwrap_or_default();
-        let file = SourceFile {
-            rel: path.clone(),
-            content,
-        };
+        let file = SourceFile::new(path.clone(), content);
         let role = artifact_role_for_file(&file);
         let evidence = evidence_kinds_for_file(&file, evidence_hint_tokens)
             .into_iter()
@@ -1191,10 +1336,7 @@ fn collect_workspace_evidence(root: &Path) -> WorkspaceEvidence {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let file = SourceFile {
-            rel: rel.clone(),
-            content,
-        };
+        let file = SourceFile::new(rel.clone(), content);
         if looks_like_test_file(&rel) {
             evidence.test_files.push(file.clone());
         }
@@ -1273,11 +1415,7 @@ fn has_implementation_artifact(
             return false;
         }
         let content = std::fs::read_to_string(full).unwrap_or_default();
-        artifact_role_for_file(&SourceFile {
-            rel: path.clone(),
-            content,
-        })
-        .satisfies_implementation()
+        artifact_role_for_file(&SourceFile::new(path.clone(), content)).satisfies_implementation()
     }) || workspace
         .source_files
         .iter()
@@ -1369,6 +1507,29 @@ fn collect_weak_verify_evidence(
     weak.dedup();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceEvidenceSignal {
+    Absent,
+    Weak(&'static str),
+    Strong,
+}
+
+fn record_source_signal(
+    evidence: &str,
+    signal: SourceEvidenceSignal,
+    missing_evidence: &mut Vec<String>,
+    weak_evidence: &mut Vec<String>,
+) {
+    match signal {
+        SourceEvidenceSignal::Strong => {}
+        SourceEvidenceSignal::Weak(reason) => {
+            missing_evidence.push(evidence.to_string());
+            weak_evidence.push(format!("weak_source_evidence:{evidence}:{reason}"));
+        }
+        SourceEvidenceSignal::Absent => missing_evidence.push(evidence.to_string()),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VerifyCommandKind {
     Test,
@@ -1457,11 +1618,8 @@ fn has_visible_interactive_surface_evidence(workspace: &WorkspaceEvidence) -> bo
         .any(source_file_has_visible_interactive_surface)
 }
 
-fn has_user_input_handler_evidence(workspace: &WorkspaceEvidence) -> bool {
-    workspace
-        .source_files
-        .iter()
-        .any(source_file_has_user_input_handler)
+fn user_input_handler_signal(workspace: &WorkspaceEvidence) -> SourceEvidenceSignal {
+    workspace_source_signal(workspace, source_file_user_input_handler_signal)
 }
 
 fn has_stateful_update_evidence(workspace: &WorkspaceEvidence) -> bool {
@@ -1481,25 +1639,31 @@ fn has_challenge_or_adversary_evidence(
         .any(|file| source_file_has_challenge_or_adversary(file, evidence_hint_tokens))
 }
 
-fn has_score_or_progression_evidence(workspace: &WorkspaceEvidence) -> bool {
-    workspace
-        .source_files
-        .iter()
-        .any(source_file_has_score_or_progression)
+fn score_or_progression_signal(workspace: &WorkspaceEvidence) -> SourceEvidenceSignal {
+    workspace_source_signal(workspace, source_file_score_or_progression_signal)
 }
 
-fn has_failure_or_collision_evidence(workspace: &WorkspaceEvidence) -> bool {
-    workspace
-        .source_files
-        .iter()
-        .any(source_file_has_failure_or_collision)
+fn failure_or_collision_signal(workspace: &WorkspaceEvidence) -> SourceEvidenceSignal {
+    workspace_source_signal(workspace, source_file_failure_or_collision_signal)
 }
 
-fn has_restart_or_recoverable_state_evidence(workspace: &WorkspaceEvidence) -> bool {
-    workspace
-        .source_files
-        .iter()
-        .any(source_file_has_restart_or_recoverable_state)
+fn restart_or_recoverable_state_signal(workspace: &WorkspaceEvidence) -> SourceEvidenceSignal {
+    workspace_source_signal(workspace, source_file_restart_or_recoverable_state_signal)
+}
+
+fn workspace_source_signal(
+    workspace: &WorkspaceEvidence,
+    signal_fn: fn(&SourceFile) -> SourceEvidenceSignal,
+) -> SourceEvidenceSignal {
+    let mut found_weak = SourceEvidenceSignal::Absent;
+    for file in &workspace.source_files {
+        match signal_fn(file) {
+            SourceEvidenceSignal::Strong => return SourceEvidenceSignal::Strong,
+            SourceEvidenceSignal::Weak(reason) => found_weak = SourceEvidenceSignal::Weak(reason),
+            SourceEvidenceSignal::Absent => {}
+        }
+    }
+    found_weak
 }
 
 fn has_nextjs_route_evidence(workspace: &WorkspaceEvidence) -> bool {
@@ -1752,7 +1916,7 @@ fn obligation_role_satisfied(
 }
 
 fn source_file_has_interactive_ui(file: &SourceFile) -> bool {
-    let content = file.content.as_str();
+    let content = file.scan_text();
     let lower = content.to_ascii_lowercase();
     (content.contains("useState")
         || content.contains("useReducer")
@@ -1770,7 +1934,7 @@ fn source_file_has_interactive_ui(file: &SourceFile) -> bool {
 }
 
 fn source_file_has_non_static_screen(file: &SourceFile) -> bool {
-    let lower = file.content.to_ascii_lowercase();
+    let lower = file.scan_text().to_ascii_lowercase();
     (lower.contains("score")
         || lower.contains("level")
         || lower.contains("life")
@@ -1789,7 +1953,7 @@ fn source_file_has_non_static_screen(file: &SourceFile) -> bool {
 }
 
 fn source_file_has_visible_interactive_surface(file: &SourceFile) -> bool {
-    let lower = file.content.to_ascii_lowercase();
+    let lower = file.scan_text().to_ascii_lowercase();
     lower.contains("<canvas")
         || lower.contains("<button")
         || lower.contains("<input")
@@ -1804,7 +1968,14 @@ fn source_file_has_visible_interactive_surface(file: &SourceFile) -> bool {
 }
 
 fn source_file_has_user_input_handler(file: &SourceFile) -> bool {
-    let content = file.content.as_str();
+    matches!(
+        source_file_user_input_handler_signal(file),
+        SourceEvidenceSignal::Strong
+    )
+}
+
+fn source_file_has_user_input_handler_keyword(file: &SourceFile) -> bool {
+    let content = file.scan_text();
     let lower = content.to_ascii_lowercase();
     content.contains("addEventListener")
         || lower.contains("onkeydown")
@@ -1823,7 +1994,7 @@ fn source_file_has_user_input_handler(file: &SourceFile) -> bool {
 }
 
 fn source_file_has_stateful_update(file: &SourceFile) -> bool {
-    let content = file.content.as_str();
+    let content = file.scan_text();
     let lower = content.to_ascii_lowercase();
     content.contains("useState")
         || content.contains("useReducer")
@@ -1839,7 +2010,7 @@ fn source_file_has_challenge_or_adversary(
     file: &SourceFile,
     evidence_hint_tokens: &[String],
 ) -> bool {
-    let lower = file.content.to_ascii_lowercase();
+    let lower = file.scan_text().to_ascii_lowercase();
     let static_adversary_token = [
         "enemy",
         "enemies",
@@ -1872,7 +2043,7 @@ fn source_file_has_challenge_or_adversary(
 }
 
 fn source_file_has_goal_adversary_hint(file: &SourceFile, evidence_hint_tokens: &[String]) -> bool {
-    let lower = file.content.to_ascii_lowercase();
+    let lower = file.scan_text().to_ascii_lowercase();
     evidence_hint_tokens
         .iter()
         .map(|token| token.trim())
@@ -1881,7 +2052,7 @@ fn source_file_has_goal_adversary_hint(file: &SourceFile, evidence_hint_tokens: 
             if token.is_ascii() {
                 lower.contains(&token.to_ascii_lowercase())
             } else {
-                file.content.contains(token)
+                file.scan_text().contains(token)
             }
         })
 }
@@ -1893,7 +2064,7 @@ fn source_file_has_adversary_motion_or_interaction_signal(file: &SourceFile) -> 
 }
 
 fn source_file_has_position_or_motion_update(file: &SourceFile) -> bool {
-    let lower = file.content.to_ascii_lowercase();
+    let lower = file.scan_text().to_ascii_lowercase();
     let has_position_or_motion_token = [
         "position",
         "positions",
@@ -1930,7 +2101,14 @@ fn source_file_has_position_or_motion_update(file: &SourceFile) -> bool {
 }
 
 fn source_file_has_score_or_progression(file: &SourceFile) -> bool {
-    let lower = file.content.to_ascii_lowercase();
+    matches!(
+        source_file_score_or_progression_signal(file),
+        SourceEvidenceSignal::Strong
+    )
+}
+
+fn source_file_has_score_or_progression_keyword(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
     [
         "score",
         "points",
@@ -1949,8 +2127,15 @@ fn source_file_has_score_or_progression(file: &SourceFile) -> bool {
 }
 
 fn source_file_has_failure_or_collision(file: &SourceFile) -> bool {
-    let lower = file.content.to_ascii_lowercase();
-    let has_failure_token = [
+    matches!(
+        source_file_failure_or_collision_signal(file),
+        SourceEvidenceSignal::Strong
+    )
+}
+
+fn source_file_has_failure_or_collision_keyword(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    [
         "collision",
         "collide",
         "hit",
@@ -1969,55 +2154,19 @@ fn source_file_has_failure_or_collision(file: &SourceFile) -> bool {
         "当たり",
     ]
     .iter()
-    .any(|needle| lower.contains(needle));
-    if !has_failure_token {
-        return false;
-    }
-    let failure_state_transition = [
-        "setgamestate(\"gameover\"",
-        "setgamestate('gameover'",
-        "setgamestate(`gameover`",
-        "setgamestate(\"game over\"",
-        "setgamestate('game over'",
-        "setgamestate(\"lost\"",
-        "setgamestate('lost'",
-        "setstatus(\"gameover\"",
-        "setstatus('gameover'",
-        "setstatus(\"lost\"",
-        "setstatus('lost'",
-        "setscreen(\"gameover\"",
-        "setscreen('gameover'",
-        "setmode(\"gameover\"",
-        "setmode('gameover'",
-        "dispatch({type:\"gameover\"",
-        "dispatch({ type: \"gameover\"",
-        "dispatch({type:'gameover'",
-        "dispatch({ type: 'gameover'",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    let damage_or_life_mutation = [
-        "setlives(",
-        "setlife(",
-        "sethealth(",
-        "sethp(",
-        "lives -",
-        "life -",
-        "health -",
-        "hp -",
-        "lives--",
-        "health--",
-        "damageplayer(",
-        "takedamage(",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    failure_state_transition || damage_or_life_mutation
+    .any(|needle| lower.contains(needle))
 }
 
 fn source_file_has_restart_or_recoverable_state(file: &SourceFile) -> bool {
-    let lower = file.content.to_ascii_lowercase();
-    let has_recoverable_state = [
+    matches!(
+        source_file_restart_or_recoverable_state_signal(file),
+        SourceEvidenceSignal::Strong
+    )
+}
+
+fn source_file_has_restart_or_recoverable_state_keyword(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    [
         "start",
         "restart",
         "reset",
@@ -2031,21 +2180,380 @@ fn source_file_has_restart_or_recoverable_state(file: &SourceFile) -> bool {
         "開始",
     ]
     .iter()
-    .any(|needle| lower.contains(needle));
-    let has_recoverable_transition = [
+    .any(|needle| lower.contains(needle))
+}
+
+fn source_file_user_input_handler_signal(file: &SourceFile) -> SourceEvidenceSignal {
+    if !source_file_has_user_input_handler_keyword(file) {
+        return SourceEvidenceSignal::Absent;
+    }
+    if source_file_has_mutating_input_handler(file) {
+        SourceEvidenceSignal::Strong
+    } else {
+        SourceEvidenceSignal::Weak(
+            "input handler must mutate state or call a non-audio gameplay function",
+        )
+    }
+}
+
+fn source_file_score_or_progression_signal(file: &SourceFile) -> SourceEvidenceSignal {
+    if !source_file_has_score_or_progression_keyword(file) {
+        return SourceEvidenceSignal::Absent;
+    }
+    if source_file_has_score_update_signal(file) {
+        SourceEvidenceSignal::Strong
+    } else {
+        SourceEvidenceSignal::Weak(
+            "score/progression needs an executable update such as score +=, score++, score =, or setScore(...)",
+        )
+    }
+}
+
+fn source_file_failure_or_collision_signal(file: &SourceFile) -> SourceEvidenceSignal {
+    if !source_file_has_failure_or_collision_keyword(file) {
+        return SourceEvidenceSignal::Absent;
+    }
+    if source_file_has_game_over_transition(file) || source_file_has_collision_conditional(file) {
+        SourceEvidenceSignal::Strong
+    } else {
+        SourceEvidenceSignal::Weak(
+            "failure/collision needs a game-over transition or conditional overlap/intersect/distance comparison",
+        )
+    }
+}
+
+fn source_file_restart_or_recoverable_state_signal(file: &SourceFile) -> SourceEvidenceSignal {
+    if !source_file_has_restart_or_recoverable_state_keyword(file) {
+        return SourceEvidenceSignal::Absent;
+    }
+    if source_file_has_restart_reset_handler(file) {
+        SourceEvidenceSignal::Strong
+    } else {
+        SourceEvidenceSignal::Weak(
+            "restart/recovery needs a handler that references game-over state and resets score/entities",
+        )
+    }
+}
+
+fn source_file_has_mutating_input_handler(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    handler_segments(&lower).into_iter().any(|segment| {
+        segment_has_state_mutation(segment) || segment_has_non_audio_gameplay_call(segment)
+    })
+}
+
+fn handler_segments(lower: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    for needle in [
+        "restart",
+        "resetgame",
+        "restartgame",
+        "startgame",
+        "newgame",
+        "onkeydown",
+        "onkeyup",
+        "onclick",
+        "onpointer",
+        "onmousedown",
+        "onmouseup",
+        "ontouch",
+        "onsubmit",
+        "onchange",
+        "pointerdown",
+        "touchstart",
+        "keydown",
+        "keyup",
+        "addeventlistener",
+    ] {
+        for (index, _) in lower.match_indices(needle) {
+            let end = lower.len().min(index + 500);
+            segments.push(&lower[index..end]);
+        }
+    }
+    segments
+}
+
+fn segment_has_state_mutation(segment: &str) -> bool {
+    [
+        "setscore(",
+        "setpoints(",
+        "setlevel(",
+        "setstage(",
+        "setwave(",
+        "setcombo(",
+        "setprogress(",
+        "setbullets(",
+        "setbullet(",
+        "setshots(",
+        "setprojectiles(",
+        "setenemies(",
+        "setinvaders(",
+        "setplayer(",
         "setgamestate(",
-        "setstatus(",
-        "setscreen(",
-        "setmode(",
+        "setgameover(",
         "dispatch(",
-        "resetgame(",
-        "restartgame(",
-        "startgame(",
-        "newgame(",
+        ".push(",
+        ".splice(",
+        "+=",
+        "-=",
+        "++",
+        "--",
     ]
     .iter()
-    .any(|needle| lower.contains(needle));
-    has_recoverable_state && has_recoverable_transition && source_file_has_user_input_handler(file)
+    .any(|needle| segment.contains(needle))
+}
+
+fn segment_has_non_audio_gameplay_call(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if !is_identifier_start(bytes[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while index < bytes.len() && is_identifier_continue(bytes[index]) {
+            index += 1;
+        }
+        let ident = &segment[start..index];
+        let mut lookahead = index;
+        while lookahead < bytes.len() && bytes[lookahead].is_ascii_whitespace() {
+            lookahead += 1;
+        }
+        if lookahead < bytes.len()
+            && bytes[lookahead] == b'('
+            && non_audio_gameplay_call_name(ident)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$')
+}
+
+fn is_identifier_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn non_audio_gameplay_call_name(name: &str) -> bool {
+    if matches!(
+        name,
+        "if" | "for"
+            | "while"
+            | "switch"
+            | "catch"
+            | "function"
+            | "useeffect"
+            | "map"
+            | "foreach"
+            | "some"
+            | "filter"
+            | "addeventlistener"
+            | "removeeventlistener"
+            | "preventdefault"
+            | "stoppropagation"
+            | "settimeout"
+            | "setinterval"
+            | "requestanimationframe"
+            | "play"
+            | "pause"
+    ) || ["audio", "sound", "music", "beep", "tone"]
+        .iter()
+        .any(|needle| name.contains(needle))
+    {
+        return false;
+    }
+    [
+        "shoot",
+        "fire",
+        "bullet",
+        "projectile",
+        "move",
+        "jump",
+        "start",
+        "restart",
+        "reset",
+        "spawn",
+        "launch",
+        "attack",
+        "defend",
+        "select",
+        "submit",
+        "toggle",
+        "advance",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
+}
+
+fn source_file_has_score_update_signal(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    [
+        "setscore(",
+        "setpoints(",
+        "setlevel(",
+        "setstage(",
+        "setwave(",
+        "setcombo(",
+        "setprogress(",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || [
+            "score", "points", "level", "stage", "wave", "combo", "progress",
+        ]
+        .iter()
+        .any(|name| identifier_has_assignment_or_increment(&lower, name))
+}
+
+fn identifier_has_assignment_or_increment(lower: &str, name: &str) -> bool {
+    [
+        format!("{name} +="),
+        format!("{name}+="),
+        format!("{name}++"),
+        format!("++{name}"),
+        format!("{name} ="),
+        format!("{name}="),
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn source_file_has_game_over_transition(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    let comment_stripped = file.comment_stripped_text().to_ascii_lowercase();
+    [
+        "setgameover(",
+        "gameover = true",
+        "gameover=true",
+        "isgameover = true",
+        "isgameover=true",
+        "setgamestate(gameover",
+        "setstatus(gameover",
+        "setscreen(gameover",
+        "setmode(gameover",
+        "dispatch({type:gameover",
+        "dispatch({ type: gameover",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || [
+            "setgamestate(\"gameover\"",
+            "setgamestate('gameover'",
+            "setgamestate(`gameover`",
+            "setgamestate(\"game over\"",
+            "setgamestate('game over'",
+            "setstatus(\"gameover\"",
+            "setstatus('gameover'",
+            "setscreen(\"gameover\"",
+            "setscreen('gameover'",
+            "setmode(\"gameover\"",
+            "setmode('gameover'",
+        ]
+        .iter()
+        .any(|needle| comment_stripped.contains(needle))
+}
+
+fn source_file_has_collision_conditional(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    lower
+        .match_indices("if")
+        .filter_map(|(index, _)| if_condition_segment(&lower, index))
+        .any(|segment| {
+            [
+                "overlap",
+                "intersect",
+                "collision",
+                "collide",
+                "distance",
+                "math.abs",
+                ".x",
+                ".y",
+            ]
+            .iter()
+            .any(|needle| segment.contains(needle))
+                && ["<=", ">=", "<", ">"].iter().any(|op| segment.contains(op))
+        })
+}
+
+fn if_condition_segment(lower: &str, if_index: usize) -> Option<&str> {
+    let bytes = lower.as_bytes();
+    let mut index = if_index + 2;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'(') {
+        return None;
+    }
+    let start = index;
+    let mut depth = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return lower.get(start..=index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn source_file_has_restart_reset_handler(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    let comment_stripped = file.comment_stripped_text().to_ascii_lowercase();
+    let has_game_over_reference = [
+        "gameover",
+        "game over",
+        "isgameover",
+        "setgameover(",
+        "setgamestate(\"gameover\"",
+        "setgamestate('gameover'",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle) || comment_stripped.contains(needle));
+    if !has_game_over_reference {
+        return false;
+    }
+    handler_segments(&lower).into_iter().any(|segment| {
+        let resets_score = [
+            "setscore(0",
+            "setpoints(0",
+            "setlevel(0",
+            "score = 0",
+            "score=0",
+            "points = 0",
+            "points=0",
+        ]
+        .iter()
+        .any(|needle| segment.contains(needle));
+        let resets_entities = [
+            "setbullets([]",
+            "setbullet([]",
+            "setshots([]",
+            "setprojectiles([]",
+            "setenemies(",
+            "setinvaders(",
+            "bullets = []",
+            "bullets=[]",
+            "enemies = []",
+            "enemies=[]",
+        ]
+        .iter()
+        .any(|needle| segment.contains(needle));
+        let references_game_over = segment.contains("gameover")
+            || segment.contains("setgameover(")
+            || segment.contains("setgamestate(");
+        resets_score && resets_entities && references_game_over
+    })
 }
 
 #[cfg(test)]
@@ -2601,6 +3109,215 @@ export default function Page(){
     }
 
     #[test]
+    fn uat_0702_placeholder_space_invaders_source_is_weak_not_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/SpaceInvaders.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+type GameState = "playing" | "gameOver";
+export default function SpaceInvaders() {
+  const [score, setScore] = useState(0);
+  const [gameState, setGameState] = useState<GameState>("playing");
+  const enemies = [{ x: 20, y: 30 }, { x: 60, y: 30 }];
+  const shootSound = { play() {} };
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.code === "Space") {
+        // Basic shoot logic would go here.
+        shootSound.play();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+  return <main><canvas /><p>Score: {score}</p><p>{gameState}</p><button>Restart</button>{enemies.map((enemy) => <span key={enemy.x}>{enemy.x}</span>)}</main>;
+}
+"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/SpaceInvaders.tsx".to_string()],
+            &[],
+            &[
+                "stateful_interaction".to_string(),
+                "start_or_restart_flow".to_string(),
+                "player_control".to_string(),
+                "adversary_or_challenge".to_string(),
+                "progression_or_score".to_string(),
+                "failure_or_collision_rule".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(!report.passed, "{report:?}");
+        for key in [
+            "user_input_handler_evidence",
+            "score_or_progression_evidence",
+            "failure_or_collision_evidence",
+            "restart_or_recoverable_state_evidence",
+        ] {
+            assert!(
+                report.missing_evidence.contains(&key.to_string()),
+                "{key}: {report:?}"
+            );
+            assert!(
+                !report.artifact_obligations[0]
+                    .evidence
+                    .contains(&key.to_string()),
+                "{key}: {report:?}"
+            );
+        }
+        assert!(
+            report
+                .weak_evidence
+                .iter()
+                .any(|item| item.contains("weak_source_evidence:user_input_handler_evidence")),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .weak_evidence
+                .iter()
+                .any(|item| item.contains("weak_source_evidence:score_or_progression_evidence")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn wired_gameplay_source_satisfies_score_collision_restart_and_input() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+export default function Page() {
+  const [score, setScore] = useState(0);
+  const [gameOver, setGameOver] = useState(false);
+  const [bullets, setBullets] = useState<{ x: number; y: number }[]>([]);
+  const [enemies, setEnemies] = useState([{ x: 80, y: 20 }]);
+  const fireBullet = () => setBullets((items) => [...items, { x: 50, y: 90 }]);
+  const restart = () => {
+    setGameOver(false);
+    setScore(0);
+    setBullets([]);
+    setEnemies([{ x: 80, y: 20 }]);
+  };
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.code === "Space") fireBullet();
+    };
+    const frame = requestAnimationFrame(() => {
+      bullets.forEach((bullet) => {
+        enemies.forEach((enemy) => {
+          if (Math.abs(bullet.x - enemy.x) < 18 && Math.abs(bullet.y - enemy.y) < 18) {
+            setGameOver(true);
+            setScore((value) => value + 10);
+          }
+        });
+      });
+      setEnemies((items) => items.map((enemy) => ({ ...enemy, x: enemy.x + 1 })));
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [bullets, enemies]);
+  return <main><canvas /><button onClick={restart}>Restart</button><p>score {score}</p><p>{gameOver ? "Game Over" : "Playing"}</p></main>;
+}
+"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[
+                "stateful_interaction".to_string(),
+                "start_or_restart_flow".to_string(),
+                "player_control".to_string(),
+                "adversary_or_challenge".to_string(),
+                "progression_or_score".to_string(),
+                "failure_or_collision_rule".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(report.passed, "{report:?}");
+        let evidence = &report.artifact_obligations[0].evidence;
+        for key in [
+            "user_input_handler_evidence",
+            "score_or_progression_evidence",
+            "failure_or_collision_evidence",
+            "restart_or_recoverable_state_evidence",
+        ] {
+            assert!(evidence.contains(&key.to_string()), "{key}: {report:?}");
+        }
+        assert!(report.weak_evidence.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn gameplay_keywords_inside_comments_or_strings_do_not_satisfy_source_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+export default function Page() {
+  // score += 10; setScore(10); collision gameOver restart
+  const label = "score setScore collision gameOver restart";
+  return <main>{label}</main>;
+}
+"#,
+        )
+        .unwrap();
+        let comment_only = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["score_or_progression_evidence".to_string()],
+            &[],
+            &[],
+        );
+        assert!(!comment_only.passed, "{comment_only:?}");
+        assert!(
+            comment_only
+                .missing_evidence
+                .contains(&"score_or_progression_evidence".to_string())
+        );
+        assert!(comment_only.weak_evidence.is_empty(), "{comment_only:?}");
+
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+export default function Page() {
+  let score = 0;
+  score += 10;
+  return <main>{score}</main>;
+}
+"#,
+        )
+        .unwrap();
+        let code_signal = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["score_or_progression_evidence".to_string()],
+            &[],
+            &[],
+        );
+        assert!(code_signal.passed, "{code_signal:?}");
+    }
+
+    #[test]
     fn verification_and_report_artifacts_do_not_satisfy_implementation_obligation() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
@@ -2658,7 +3375,7 @@ import { useEffect, useState } from "react";
 export default function Page(){
   const [score, setScore] = useState(0);
   const [gameState, setGameState] = useState("ready");
-  const enemies = [{ x: 10, y: 20 }];
+  const [enemies, setEnemies] = useState([{ x: 10, y: 20 }]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "ArrowLeft") {
@@ -2676,7 +3393,7 @@ export default function Page(){
       window.removeEventListener("keydown", onKeyDown);
     };
   }, []);
-  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button><canvas /><p>score {score} enemy collision {gameState}</p></main>;
+  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); setEnemies([{ x: 10, y: 20 }]); }}>Restart</button><canvas /><p>score {score} enemy collision {gameState}</p></main>;
 }
 "#,
         )

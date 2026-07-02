@@ -10524,29 +10524,7 @@ mod tests {
                 verify: Vec::new(),
             }],
         };
-        let page = r#""use client";
-import { useEffect, useState } from "react";
-export default function Page(){
-  const [score,setScore] = useState(0);
-  const [gameState,setGameState] = useState("ready");
-  useEffect(() => {
-    const onKeyDown = () => {
-      setGameState("playing");
-      setScore((value) => value + 1);
-    };
-    const frame = requestAnimationFrame(() => {
-      const collision = true;
-      if (collision) setGameState("gameover");
-    });
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      cancelAnimationFrame(frame);
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, []);
-  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button><canvas /><p>enemy bullet collision score {score} {gameState}</p></main>;
-}
-"#;
+        let page = interactive_game_page_source();
         let mut fake = FakeClient::new(vec![AssistantReply {
             content: String::new(),
             tool_calls: vec![
@@ -12190,26 +12168,40 @@ export default function Page(){
 import { useEffect, useState } from "react";
 export default function Page(){
   const [score, setScore] = useState(0);
-  const [gameState, setGameState] = useState("ready");
-  const enemies = [{ x: 10, y: 20 }];
+  const [gameOver, setGameOver] = useState(false);
+  const [bullets, setBullets] = useState<{ x: number; y: number }[]>([]);
+  const [enemies, setEnemies] = useState([{ x: 10, y: 20 }]);
+  const fireBullet = () => setBullets((items) => [...items, { x: 10, y: 90 }]);
+  const restart = () => {
+    setGameOver(false);
+    setScore(0);
+    setBullets([]);
+    setEnemies([{ x: 10, y: 20 }]);
+  };
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "ArrowLeft") {
-        setGameState("playing");
-        setScore((value) => value + 1);
+        fireBullet();
       }
     };
     const frame = requestAnimationFrame(() => {
-      const collision = enemies.some((enemy) => enemy.x > 0);
-      if (collision) setGameState("gameover");
+      bullets.forEach((bullet) => {
+        enemies.forEach((enemy) => {
+          if (Math.abs(bullet.x - enemy.x) < 12 && Math.abs(bullet.y - enemy.y) < 12) {
+            setGameOver(true);
+            setScore((value) => value + 10);
+          }
+        });
+      });
+      setEnemies((items) => items.map((enemy) => ({ ...enemy, x: enemy.x + 1 })));
     });
     window.addEventListener("keydown", onKeyDown);
     return () => {
       cancelAnimationFrame(frame);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, []);
-  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); }}>Restart</button><canvas /><p>score {score} enemy collision {gameState}</p></main>;
+  }, [bullets, enemies]);
+  return <main><button onClick={fireBullet}>Start</button><button onClick={restart}>Restart</button><canvas /><p>score {score} enemy collision {gameOver ? "game over" : "playing"}</p></main>;
 }
 "#
     }
