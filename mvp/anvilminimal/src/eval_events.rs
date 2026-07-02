@@ -63,7 +63,7 @@ pub fn write_run_summary(path: Option<&Path>, text: &str) {
         return;
     };
     let summary = parent.join("summary.md");
-    let content = summary_body(text);
+    let content = summary_document(text);
     if let Err(err) = std::fs::create_dir_all(parent) {
         eprintln!("warning: failed to create run summary directory: {err}");
         return;
@@ -88,7 +88,7 @@ pub fn append_run_summary(path: Option<&Path>, text: &str) {
     }
     let existing = std::fs::read_to_string(&summary).unwrap_or_default();
     let combined = if existing.trim().is_empty() {
-        format!("{content}\n")
+        format!("{}\n", summary_document(text))
     } else {
         format!("{}\n---\n\n{content}\n", existing.trim_end())
     };
@@ -1278,6 +1278,15 @@ fn summary_body(body: &str) -> String {
         len += line_len;
     }
     out
+}
+
+fn summary_document(body: &str) -> String {
+    let content = summary_body(body);
+    if content.is_empty() {
+        crate::build_info::summary_line()
+    } else {
+        format!("{}\n{content}", crate::build_info::summary_line())
+    }
 }
 
 fn argument_value_summary(key: &str, value: &Value) -> Value {

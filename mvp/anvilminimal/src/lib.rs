@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+pub mod build_info;
 pub mod cli;
 pub mod config;
 pub mod eval_events;
@@ -115,6 +116,9 @@ fn emit_run_start(config: &Config) {
             "style": config.style,
             "action": format!("{:?}", config.action),
             "eval_events_override": eval_events::is_eval_events_override(),
+            "build_commit": build_info::COMMIT,
+            "build_dirty": build_info::dirty(),
+            "build_timestamp": build_info::TIMESTAMP,
         }),
     );
     if !host_env_contamination.is_empty() {
@@ -265,10 +269,34 @@ mod tests {
         let event_text = std::fs::read_to_string(&events).unwrap();
         assert!(event_text.contains("\"event\":\"run_start\""));
         assert!(event_text.contains("\"event\":\"run_stop\""));
+        let first_event = event_text.lines().next().unwrap();
+        let first_event: serde_json::Value = serde_json::from_str(first_event).unwrap();
+        assert_eq!(
+            first_event
+                .get("build_commit")
+                .and_then(|value| value.as_str()),
+            Some(build_info::COMMIT)
+        );
+        assert_eq!(
+            first_event
+                .get("build_dirty")
+                .and_then(|value| value.as_bool()),
+            Some(build_info::dirty())
+        );
+        assert_eq!(
+            first_event
+                .get("build_timestamp")
+                .and_then(|value| value.as_str()),
+            Some(build_info::TIMESTAMP)
+        );
         assert!(event_text.contains("\"task_status\":\"complete\""));
         assert!(event_text.contains("\"session_status\":\"process_exited\""));
         assert!(event_text.contains("\"repl_status\":\"not_applicable\""));
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(
+            summary.starts_with(&format!("{}\n", build_info::summary_line())),
+            "{summary}"
+        );
         assert!(summary.contains("Status: running"));
         assert!(summary.contains("Action: Repl"));
         assert!(summary.contains("Status: complete"));

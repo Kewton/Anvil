@@ -495,6 +495,13 @@ enum ContractVerificationOutcome {
     ObservationIncomplete(ContractObservation),
 }
 
+#[derive(Debug)]
+enum VerifyRepairNoEditOutcome {
+    NoPendingFailure,
+    Feedback(String),
+    ObservationIncomplete(ContractObservation),
+}
+
 #[derive(Debug, Default)]
 struct ArtifactRecoveryState {
     target_path: Option<String>,
@@ -881,18 +888,38 @@ pub(crate) fn run_session_with_outcome_with_options(
                 .filter(|_| contract_runtime_enabled)
                 .filter(|contract| contract.has_verify())
             {
-                if let Some(feedback) = handle_verify_repair_no_edit(
+                match handle_verify_repair_no_edit(
                     &config.workspace_root,
                     config.eval_events_path.as_deref(),
                     contract,
                     user_prompt,
                     &mut verify_repair_state,
                     &changed_paths,
+                    &options,
                 )? {
-                    session.messages.pop();
-                    last_blocking_reason = Some("verify repair missing edit".to_string());
-                    pending_feedback = Some(feedback);
-                    continue;
+                    VerifyRepairNoEditOutcome::NoPendingFailure => {}
+                    VerifyRepairNoEditOutcome::Feedback(feedback) => {
+                        session.messages.pop();
+                        last_blocking_reason = Some("verify repair missing edit".to_string());
+                        pending_feedback = Some(feedback);
+                        continue;
+                    }
+                    VerifyRepairNoEditOutcome::ObservationIncomplete(observation) => {
+                        return Ok(RunSessionOutcome {
+                            final_text: reply.content,
+                            stop_reason: RunStopReason::CompletionContractObservedIncomplete,
+                            changed_paths,
+                            iterations: iteration + 1,
+                            tool_calls: tool_call_count,
+                            missing_required_paths: observation.missing_paths,
+                            missing_capabilities: observation.missing_capabilities,
+                            missing_evidence: observation.missing_evidence,
+                            missing_obligations: observation.missing_obligations,
+                            verify_attempts,
+                            last_blocking_reason,
+                            last_provider_error,
+                        });
+                    }
                 }
                 match verify_completion_contract_with_enforcement(
                     &config.workspace_root,
@@ -1212,19 +1239,42 @@ pub(crate) fn run_session_with_outcome_with_options(
                 .filter(|_| contract_runtime_enabled)
                 .filter(|contract| contract.has_verify())
             {
-                if !batch_had_edit
-                    && let Some(feedback) = handle_verify_repair_no_edit(
+                if !batch_had_edit {
+                    match handle_verify_repair_no_edit(
                         &config.workspace_root,
                         config.eval_events_path.as_deref(),
                         contract,
                         user_prompt,
                         &mut verify_repair_state,
                         &changed_paths,
-                    )?
-                {
-                    last_blocking_reason = Some("verify repair missing edit".to_string());
-                    pending_feedback = Some(feedback);
-                    continue;
+                        &options,
+                    )? {
+                        VerifyRepairNoEditOutcome::NoPendingFailure => {}
+                        VerifyRepairNoEditOutcome::Feedback(feedback) => {
+                            last_blocking_reason = Some("verify repair missing edit".to_string());
+                            pending_feedback = Some(feedback);
+                            continue;
+                        }
+                        VerifyRepairNoEditOutcome::ObservationIncomplete(observation) => {
+                            return Ok(RunSessionOutcome {
+                                final_text: format!(
+                                    "completion contract observed incomplete: {}",
+                                    observation.primary_reason
+                                ),
+                                stop_reason: RunStopReason::CompletionContractObservedIncomplete,
+                                changed_paths,
+                                iterations: iteration + 1,
+                                tool_calls: tool_call_count,
+                                missing_required_paths: observation.missing_paths,
+                                missing_capabilities: observation.missing_capabilities,
+                                missing_evidence: observation.missing_evidence,
+                                missing_obligations: observation.missing_obligations,
+                                verify_attempts,
+                                last_blocking_reason,
+                                last_provider_error,
+                            });
+                        }
+                    }
                 }
                 match verify_completion_contract_with_enforcement(
                     &config.workspace_root,
@@ -2236,9 +2286,10 @@ fn handle_verify_repair_no_edit(
     goal: &str,
     state: &mut VerifyRepairState,
     changed_paths: &[String],
-) -> anyhow::Result<Option<String>> {
+    options: &RunSessionOptions,
+) -> anyhow::Result<VerifyRepairNoEditOutcome> {
     let Some(signature) = state.pending_signature.as_ref() else {
-        return Ok(None);
+        return Ok(VerifyRepairNoEditOutcome::NoPendingFailure);
     };
     state.no_edit_turns += 1;
     eval_events::emit(
@@ -2258,6 +2309,53 @@ fn handle_verify_repair_no_edit(
             "verify_repair_no_change: no file changes after verifier failure {}",
             signature.label()
         ));
+        if options.contract_enforcement == ContractEnforcement::Observe {
+            let observation = ContractObservation {
+                missing_paths: Vec::new(),
+                missing_capabilities: state.pending_error_context.missing_capabilities.clone(),
+                missing_evidence: state.pending_error_context.missing_evidence.clone(),
+                missing_obligations: state.pending_error_context.missing_obligations.clone(),
+                primary_reason: report.primary_reason(),
+            };
+            emit_contract_observation_incomplete(
+                eval_events_path,
+                options,
+                contract,
+                &observation,
+                state.no_edit_turns,
+                "verify_repair_no_change_observed",
+                &[],
+            );
+            eval_events::emit(
+                eval_events_path,
+                json!({
+                    "event": "loop_stop",
+                    "reason": "verify_repair_no_change_observed",
+                    "failure_signature": signature.label(),
+                    "contract_enforcement": options.contract_enforcement_label(),
+                    "session_scope": options.scope.as_str(),
+                    "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+                    "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+                    "repair_target": state.pending_target.map(RepairTarget::as_str).unwrap_or(""),
+                    "repair_target_followed": false,
+                    "target_relation": "no_change",
+                    "repair_follow_through": "no_change",
+                    "changed_paths_before": state.changed_paths_at_failure.clone(),
+                    "changed_paths_after": changed_paths,
+                    "repair_turn_changed_paths": Vec::<String>::new(),
+                    "missing_capabilities": observation.missing_capabilities.clone(),
+                    "missing_evidence": observation.missing_evidence.clone(),
+                    "missing_obligations": observation.missing_obligations.clone(),
+                    "recovery_prompt_path": "",
+                    "recovery_ultra_plan_path": "",
+                    "recovery_yaml_missing": true,
+                    "no_edit_turns": state.no_edit_turns,
+                }),
+            );
+            return Ok(VerifyRepairNoEditOutcome::ObservationIncomplete(
+                observation,
+            ));
+        }
         let recovery_paths = save_minimal_recovery_handoff(
             root,
             eval_events_path,
@@ -2306,11 +2404,13 @@ fn handle_verify_repair_no_edit(
         )
         .into());
     }
-    Ok(Some(super::feedback::verify_repair_edit_required(
-        &signature.label(),
-        state.no_edit_turns,
-        VERIFY_REPAIR_NO_EDIT_LIMIT,
-    )))
+    Ok(VerifyRepairNoEditOutcome::Feedback(
+        super::feedback::verify_repair_edit_required(
+            &signature.label(),
+            state.no_edit_turns,
+            VERIFY_REPAIR_NO_EDIT_LIMIT,
+        ),
+    ))
 }
 
 fn reanchored_verify_feedback_if_needed(
@@ -3616,6 +3716,146 @@ export default function Page(){
         assert!(event_text.contains("\"recovery_yaml_missing\":false"));
         assert!(dir.path().join(".anvil/repairs").is_dir());
         assert!(dir.path().join(".anvil/plans").is_dir());
+    }
+
+    #[test]
+    fn observe_verify_repair_no_edit_returns_observation_without_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["src/app/page.tsx"],"required_evidence":["challenge_or_adversary_evidence"],"verify_repair_cap":2}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 6;
+        let static_page =
+            "export default function Page(){ return <main><canvas>ready</canvas></main>; }";
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":static_page}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text(
+                    "I inspected the page but made no edit.",
+                )),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create src/app/page.tsx",
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step_with_enforcement(
+                RunSessionStepKind::Implement,
+                ContractEnforcement::Observe,
+                Some("phase-one".to_string()),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::CompletionContractObservedIncomplete
+        );
+        assert_eq!(
+            outcome.missing_evidence,
+            vec!["challenge_or_adversary_evidence".to_string()]
+        );
+        assert!(!dir.path().join(".anvil/repairs").exists());
+        let events = event_values(&events);
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(Value::as_str) == Some("loop_stop")
+                && event.get("reason").and_then(Value::as_str)
+                    == Some("verify_repair_no_change_observed")
+                && event.get("contract_enforcement").and_then(Value::as_str) == Some("observe")
+                && event.get("phase_scope").and_then(Value::as_str) == Some("phase-one")
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(Value::as_str) == Some("contract_observation_incomplete")
+                && event
+                    .get("missing_evidence")
+                    .and_then(Value::as_array)
+                    .is_some_and(|values| {
+                        values
+                            .iter()
+                            .any(|value| value.as_str() == Some("challenge_or_adversary_evidence"))
+                    })
+        }));
+    }
+
+    #[test]
+    fn enforce_verify_repair_no_edit_still_bails_and_saves_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = dir.path().join("contract.json");
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(
+            &contract,
+            r#"{"required_paths":["src/app/page.tsx"],"required_evidence":["challenge_or_adversary_evidence"],"verify_repair_cap":2}"#,
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.completion_contract_path = Some(contract);
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 6;
+        let static_page =
+            "export default function Page(){ return <main><canvas>ready</canvas></main>; }";
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":static_page}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text(
+                    "I inspected the page but made no edit.",
+                )),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create src/app/page.tsx",
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step_with_enforcement(
+                RunSessionStepKind::Implement,
+                ContractEnforcement::Enforce,
+                None,
+            ),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("verify repair made no file changes"), "{err}");
+        assert!(dir.path().join(".anvil/repairs").is_dir());
+        let events = event_values(&events);
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(Value::as_str) == Some("loop_stop")
+                && event.get("reason").and_then(Value::as_str) == Some("verify_repair_no_change")
+                && event.get("recovery_yaml_missing").and_then(Value::as_bool) == Some(false)
+        }));
+        assert!(!events.iter().any(|event| {
+            event.get("reason").and_then(Value::as_str) == Some("verify_repair_no_change_observed")
+        }));
     }
 
     #[test]

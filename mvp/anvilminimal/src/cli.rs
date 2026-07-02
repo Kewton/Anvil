@@ -12,7 +12,7 @@ pub enum ProviderArg {
 #[derive(Debug, Parser)]
 #[command(name = "anvilminimal")]
 #[command(about = "Minimal loop + YAML plan runner MVP")]
-#[command(version)]
+#[command(version = crate::build_info::VERSION)]
 pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     pub yes: bool,
@@ -101,6 +101,17 @@ mod tests {
     fn help_hides_completion_contract_json() {
         let help = Cli::command().render_long_help().to_string();
         assert!(!help.contains("--completion-contract-json"));
+    }
+
+    #[test]
+    fn version_includes_embedded_build_commit_or_unknown() {
+        let version = Cli::command().render_version().to_string();
+        assert!(version.contains(env!("CARGO_PKG_VERSION")), "{version}");
+        assert!(
+            version.contains(crate::build_info::COMMIT) || version.contains("unknown"),
+            "{version}"
+        );
+        assert!(version.contains(crate::build_info::TIMESTAMP), "{version}");
     }
 
     #[test]

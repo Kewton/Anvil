@@ -55,6 +55,19 @@ anvilminimal --help
 anvilminimal --yes --context-budget 65536 --model qwen3.6:27b-coding-nvfp4 --planner-model gemini-3.5-flash --planner-provider gemini --provider ollama
 ```
 
+## UAT
+
+Before a UAT run, verify the binary provenance:
+
+```bash
+anvilminimal --version
+command -v anvilminimal
+```
+
+`anvilminimal --version` should show the intended commit, dirty marker, and
+build timestamp. `command -v anvilminimal` should resolve to the expected
+`target/` binary or install path for the run.
+
 ## API Keys
 
 `OPENAI_API_KEY` and `GEMINI_API_KEY` are read from process env first, then

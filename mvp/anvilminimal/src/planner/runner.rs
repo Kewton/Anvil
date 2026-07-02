@@ -8668,6 +8668,64 @@ mod tests {
     }
 
     #[test]
+    fn ultra_observe_no_edit_contract_repair_starts_next_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_challenge_contract_with_cap(dir.path(), 2));
+        cfg.max_iterations = 8;
+        let phase_plan = challenge_implement_step_plan_json();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(phase_plan.clone()),
+            AssistantReply::text(phase_plan),
+        ]);
+        let static_page =
+            "export default function Page(){ return <main><canvas>ready</canvas></main>; }";
+        let complete_page = "export default function Page(){ const enemies = ['drone']; return <main>enemy challenge {enemies.length}</main>; }";
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("I inspected the page but made no edit."),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Edit",
+                    serde_json::json!({
+                        "path":"src/app/page.tsx",
+                        "old": static_page,
+                        "new": complete_page,
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+        let plan = challenge_ultra_plan();
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        assert_eq!(planner.messages.len(), 2);
+        assert!(!dir.path().join(".anvil/repairs").exists());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"reason\":\"verify_repair_no_change_observed\""));
+        assert!(event_text.contains("\"phase_scope\":\"phase-one\""));
+        assert!(event_text.contains("\"event\":\"ultra_phase_execute_complete\""));
+        assert!(event_text.contains("\"phase_id\":\"phase-two\""));
+        let phase_two_prompt = planner_request_text(&planner, 1);
+        assert!(phase_two_prompt.contains("Unmet final requirements from earlier phases:"));
+        assert!(phase_two_prompt.contains("- challenge_or_adversary_evidence"));
+    }
+
+    #[test]
     fn ultra_final_phase_enforces_when_observed_contract_debt_remains() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -11473,13 +11531,17 @@ export default function Page(){
     }
 
     fn write_challenge_contract(root: &Path) -> PathBuf {
+        write_challenge_contract_with_cap(root, 1)
+    }
+
+    fn write_challenge_contract_with_cap(root: &Path, verify_repair_cap: usize) -> PathBuf {
         let path = root.join("challenge-contract.json");
         std::fs::write(
             &path,
             serde_json::to_string_pretty(&serde_json::json!({
                 "required_paths": ["src/app/page.tsx"],
                 "required_evidence": ["challenge_or_adversary_evidence"],
-                "verify_repair_cap": 1
+                "verify_repair_cap": verify_repair_cap
             }))
             .unwrap(),
         )

@@ -132,6 +132,9 @@ fn emit_tui_command_stop(
             "lifecycle_stage": "tui_command",
             "command": command,
             "ok": ok,
+            "build_commit": crate::build_info::COMMIT,
+            "build_dirty": crate::build_info::dirty(),
+            "build_timestamp": crate::build_info::TIMESTAMP,
             "failure_kind": failure_kind,
             "stop_reason": stop_reason,
             "completion_status": &completion.status,
@@ -352,6 +355,13 @@ mod tests {
         );
         assert!(
             tui_stop.contains(r#""recovery_ultra_plan_path":".anvil/plans/recovery-phase.yaml""#),
+            "{tui_stop}"
+        );
+        assert!(
+            tui_stop.contains(&format!(
+                r#""build_commit":"{}""#,
+                crate::build_info::COMMIT
+            )),
             "{tui_stop}"
         );
         assert!(tui_stop.contains(r#""suggested_recovery_command":"/ultra-plan-run"#));

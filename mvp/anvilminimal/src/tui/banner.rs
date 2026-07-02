@@ -63,6 +63,8 @@ pub fn render_startup_banner(config: &Config, style: BannerStyle) -> String {
 
     out.push_str("anvilminimal ");
     out.push_str(env!("CARGO_PKG_VERSION"));
+    out.push_str(" build=");
+    out.push_str(&crate::build_info::commit_with_dirty());
     out.push('\n');
     out.push_str(&format!(
         "model={} provider={} planner={} planner_provider={}\n",
@@ -177,6 +179,7 @@ mod tests {
     fn banner_legacy_has_dynamic_lines_without_art() {
         let out = render_startup_banner(&config(), BannerStyle::Legacy4Line);
         assert!(out.contains("anvilminimal"));
+        assert!(out.contains(&crate::build_info::commit_with_dirty()));
         assert!(out.contains("context_budget=65536 yes=true"));
         assert!(!out.contains("╔═╗"));
     }
