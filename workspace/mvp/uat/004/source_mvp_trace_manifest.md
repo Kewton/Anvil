@@ -129,13 +129,28 @@ GATE-00 では実装変更、provider probe、browser run、anvildev 比較を�
 | source/anvildev same-condition run | skipped | GATE-04 did not run the full source `RepairJob` under anvildev. The scoped parity claim is based on source refs plus deterministic MVP fixtures. Full source/MVP comparative trace remains UAT004-GATE-09. |
 | provider/browser/manual evidence | skipped | No live provider or browser run was required for GATE-04. Browser route failures are fixed as deterministic repair-target fixtures; release-grade browser/interaction execution remains GATE-05/GATE-09. |
 
+## UAT004-GATE-05 Trace Update
+
+| item | status | evidence |
+| --- | --- | --- |
+| source refs inspected | complete | `src/agent/loop_run/verifier.rs`, `verifier_driver.rs`, `project_probe.rs`, `project_verifier.rs`, `task_contract_completion_policy.rs`, `actor_loop_flow.rs`, `emit_verifier_events.rs` |
+| MVP refs changed | complete | `mvp/anvilminimal/src/planner/runner.rs` adds dev-server lifecycle stage list and probe environment to browser readiness evidence and event payloads. Existing audited refs: `minimal_loop/evidence.rs`, `minimal_loop/completion.rs`, `minimal_loop/build_verifier.rs`, `planner/profiles/nextjs.rs`, `scripts/eval_lib/browser_oracle.py`, `scripts/eval_lib/parity_gate.py`. |
+| browser readiness evidence | source-equivalent local fixture | `nextjs_dev_route_probe_disabled_records_lifecycle_stages` asserts browser unavailable is `partial`, not `failed`, and that readiness evidence plus `dev_server_lifecycle` events contain `start`, `wait`, `probe`, `cleanup`, `PORT`, and `NODE_ENV`/probe env keys. |
+| browser failure evidence | source-equivalent local fixture | `plan_run_nextjs_browser_http_500_fails_final_contract`, `plan_run_nextjs_tailwind_dev_route_failure_keeps_failure_kind`, `browser_http_500_fails_runtime_acceptance`, and eval HTTP 500 fixtures keep route/browser HTTP 500 as final acceptance failure, not full success. |
+| interaction evidence | source-equivalent local fixture | `plan_run_nextjs_browser_ready_without_interaction_is_partial` blocks release-grade pass without interaction evidence; `plan_run_nextjs_browser_and_interaction_evidence_passes_release_gate` proves the positive pass path when browser readiness and interaction evidence content are valid. |
+| static/build-only false positive evidence | preserved | `title_only_output_does_not_satisfy_interactive_game_evidence`, docs/style/scaffold/setup-only fixtures, eval false-positive fixtures, and parity gate malformed/missing evidence fixtures keep path/title/static/build-only output below release-grade full success. |
+| final acceptance repair/recovery lifecycle | source-equivalent local fixture | `plan_run_nextjs_interactive_app_records_partial_release_gate`, `ultra_final_acceptance_failure_runs_bounded_repair`, `ultra_final_acceptance_repair_failure_saves_recovery_handoff`, and lifecycle masking tests keep final acceptance failure connected to bounded repair/recovery/diagnostics instead of success. |
+| required local tests | passed | `cargo fmt --manifest-path mvp/anvilminimal/Cargo.toml -- --check`: passed; `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`: passed with 440 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval`: passed with 222 passed, 1 skipped |
+| source/anvildev same-condition run | skipped | GATE-05 closes local source-first final acceptance authority by source refs and deterministic fixtures. Full source/MVP comparative browser trace remains UAT004-GATE-09. |
+| live browser/manual evidence | skipped | Browser/Playwright/dev-server execution must not become a normal unit-test dependency. Local fixtures verify unavailable/failed/pass classification and evidence content; live release probe remains opt-in for GATE-09. |
+
 ## Skip Evidence
 
 | skipped item | reason | impact | next action |
 | --- | --- | --- | --- |
 | source/anvildev same-condition run | GATE-00 is a baseline documentation phase; no runtime comparison requested | source parity remains pending for all gates | collect source/MVP normalized trace in the target gate before marking pass |
 | provider live probe | API key/network must not be normal unit-test requirement | G-S07/G-S15 remain fail/pending | run provider probe only in UAT004-GATE-07 or opt-in release gate |
-| browser readiness / interaction run | browser/dev-server must not be required for normal unit tests | G-S12/G-S16 remain pending for release-grade pass | run browser readiness and interaction evidence in UAT004-GATE-05 or final gate |
+| live browser readiness / interaction run | browser/dev-server must not be required for normal unit tests; GATE-05 used deterministic browser evidence fixtures and skipped live browser/manual execution | G-S12 local source parity is closed; G-S16/manual and comparative live release trace remain pending | run live browser readiness and interaction evidence in UAT004-GATE-09 or opt-in final gate |
 | `cargo test` / `pytest` / targeted eval | no code changes in GATE-00; objective is inventory and fixture fixation | no implementation correctness claim is made | run targeted tests in each implementation gate |
 | recovery UltraPlan execution | baseline fixture records that recovery YAML exists; execution is a later lifecycle gate | G-S13 remains fail | execute recovery run in UAT004-GATE-04 or final comparative gate |
 

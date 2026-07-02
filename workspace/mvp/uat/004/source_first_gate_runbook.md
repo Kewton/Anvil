@@ -55,6 +55,19 @@ UAT004 の各 gate で、実行した検証、skip evidence、rollback 条件、
 | provider probe | skipped; no provider request schema, parser, tool-call shape, or prompt text changed |
 | rollback guard | do not allow no-change repair, target-misdirected repair, scaffold-only output, or recovery handoff persistence to become task success; browser route failures must remain repair/recovery targets |
 
+## UAT004-GATE-05 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/loop_run/verifier.rs`, `verifier_driver.rs`, `project_probe.rs`, `project_verifier.rs`, `task_contract_completion_policy.rs`, `actor_loop_flow.rs`, `emit_verifier_events.rs` |
+| MVP refs | `mvp/anvilminimal/src/planner/runner.rs`, `minimal_loop/evidence.rs`, `minimal_loop/completion.rs`, `minimal_loop/build_verifier.rs`, `planner/profiles/nextjs.rs`, `scripts/eval_lib/browser_oracle.py`, `scripts/eval_lib/parity_gate.py` |
+| implementation | `planner/runner.rs` now writes dev-server lifecycle stages and probe environment into `dev_server_lifecycle` events and browser readiness evidence; final acceptance continues to require valid browser readiness plus interaction evidence content for release-grade pass |
+| targeted fixtures | `nextjs_dev_route_probe_disabled_records_lifecycle_stages`, `plan_run_nextjs_interactive_app_records_partial_release_gate`, `plan_run_nextjs_browser_http_500_fails_final_contract`, `plan_run_nextjs_browser_ready_without_interaction_is_partial`, `plan_run_nextjs_browser_and_interaction_evidence_passes_release_gate`; title/static/build-only, malformed evidence, missing interaction, and final acceptance repair/recovery fixtures rerun in full suites |
+| full local verification | `cargo fmt --manifest-path mvp/anvilminimal/Cargo.toml -- --check` passed; `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 440 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 222 passed / 1 skipped |
+| browser/manual UAT | live browser/manual execution skipped; browser/Playwright/dev-server must not be required by normal unit tests. Deterministic fixtures cover unavailable/failed/pass classification and evidence content. |
+| source/anvildev comparison | skipped; final comparative source/MVP browser and manual release trace remains GATE-09 |
+| rollback guard | do not allow build-only/title-only/static-only output, evidence path existence alone, malformed evidence, missing interaction evidence, browser unavailable, or browser HTTP 500 to become release-grade full success; keep browser unavailable `partial` and HTTP 500 `failed` |
+
 ## Re-run Notes
 
 Before closing an implementation gate, update:

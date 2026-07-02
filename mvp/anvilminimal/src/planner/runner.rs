@@ -62,6 +62,7 @@ const NEXTJS_DEV_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const NEXTJS_DEV_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const NEXTJS_DEV_SERVER_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 const DEV_SERVER_ROUTE: &str = "/";
+const DEV_SERVER_LIFECYCLE_STAGES: [&str; 4] = ["start", "wait", "probe", "cleanup"];
 
 #[derive(Debug, Clone)]
 struct RecoveryArtifactValidation {
@@ -4077,8 +4078,19 @@ fn emit_dev_server_lifecycle_stage(
             "http_status": http_status,
             "pid": pid,
             "evidence_path": evidence_path.display().to_string(),
+            "lifecycle_stages": DEV_SERVER_LIFECYCLE_STAGES,
+            "probe_environment": dev_server_probe_environment(port),
         }),
     );
+}
+
+fn dev_server_probe_environment(port: u16) -> Value {
+    json!({
+        "NODE_ENV": std::env::var("NODE_ENV").unwrap_or_default(),
+        "PORT": port.to_string(),
+        "ANVIL_DEV_SERVER_PROBE": std::env::var("ANVIL_DEV_SERVER_PROBE").unwrap_or_default(),
+        "ANVIL_TEST_DEV_SERVER_PROBE": std::env::var("ANVIL_TEST_DEV_SERVER_PROBE").unwrap_or_default(),
+    })
 }
 
 fn dev_server_unavailable_evidence(
@@ -4099,6 +4111,8 @@ fn dev_server_unavailable_evidence(
             "command": command,
             "failure_kind": failure_kind,
             "output_excerpt": eval_events::body_snippet(output_excerpt),
+            "lifecycle_stages": DEV_SERVER_LIFECYCLE_STAGES,
+            "probe_environment": dev_server_probe_environment(port),
         }
     })
 }
@@ -4127,6 +4141,8 @@ fn dev_server_failed_evidence(
             "command": command,
             "failure_kind": failure_kind,
             "output_excerpt": eval_events::body_snippet(output_excerpt),
+            "lifecycle_stages": DEV_SERVER_LIFECYCLE_STAGES,
+            "probe_environment": dev_server_probe_environment(port),
         }
     })
 }
@@ -4149,6 +4165,8 @@ fn dev_server_passed_evidence(
             "route": route,
             "command": command,
             "body_excerpt": eval_events::body_snippet(body_excerpt),
+            "lifecycle_stages": DEV_SERVER_LIFECYCLE_STAGES,
+            "probe_environment": dev_server_probe_environment(port),
         }
     })
 }
@@ -8340,6 +8358,11 @@ export default function Page(){
             event_text.contains("browser_readiness_or_interaction_evidence_required"),
             "{event_text}"
         );
+        let readiness_text = std::fs::read_to_string(dir.path().join("browser-readiness.json"))
+            .expect("generated browser readiness evidence");
+        assert!(readiness_text.contains("\"lifecycle_stages\""));
+        assert!(readiness_text.contains("\"probe_environment\""));
+        assert!(readiness_text.contains("\"NODE_ENV\""));
         assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
         assert!(event_text.contains("\"recovery_handoff_kind\":\"browser_readiness_missing\""));
         assert!(event_text.contains("\"acceptance_layer\":\"release_gate\""));
@@ -8480,12 +8503,34 @@ export default function Page(){
                 "browser_unavailable:dev_server_probe_disabled_in_tests".to_string()
             )
         );
+        let dev_server = evidence
+            .get("dev_server")
+            .and_then(Value::as_object)
+            .expect("dev server evidence object");
+        let stages = dev_server
+            .get("lifecycle_stages")
+            .and_then(Value::as_array)
+            .expect("lifecycle stages");
+        assert_eq!(
+            stages.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+            vec!["start", "wait", "probe", "cleanup"]
+        );
+        let environment = dev_server
+            .get("probe_environment")
+            .and_then(Value::as_object)
+            .expect("probe environment");
+        assert_eq!(
+            environment.get("PORT").and_then(Value::as_str),
+            Some("3011")
+        );
+        assert!(environment.contains_key("NODE_ENV"));
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"event\":\"dev_server_lifecycle\""));
         assert!(event_text.contains("\"stage\":\"start\""));
         assert!(event_text.contains("\"stage\":\"wait\""));
         assert!(event_text.contains("\"stage\":\"probe\""));
         assert!(event_text.contains("\"stage\":\"cleanup\""));
+        assert!(event_text.contains("\"probe_environment\""));
         assert!(
             event_text.contains("browser_unavailable:dev_server_probe_disabled_in_tests"),
             "{event_text}"
