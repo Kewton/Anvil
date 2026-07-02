@@ -34,6 +34,8 @@ pub struct CompletionContract {
     #[serde(default)]
     pub required_evidence: Vec<String>,
     #[serde(default)]
+    pub evidence_hint_tokens: Vec<String>,
+    #[serde(default)]
     pub required_obligations: Vec<String>,
     #[serde(default)]
     pub deferred_verify_requirements: Vec<DeferredVerifyRequirement>,
@@ -88,9 +90,15 @@ impl CompletionContract {
                 commands.push(command);
             }
         }
+        self.required_paths = paths;
+        self.verify_commands = commands;
         self.required_capabilities = normalize_unique_list(self.required_capabilities);
         self.deterministic_oracles = normalize_unique_list(self.deterministic_oracles);
         self.required_evidence = normalize_unique_list(self.required_evidence);
+        self.evidence_hint_tokens = normalize_evidence_hint_tokens(self.evidence_hint_tokens);
+        if let Some(goal) = self.goal.clone() {
+            self.merge_evidence_hint_tokens_from_goal(&goal);
+        }
         self.required_obligations = normalize_obligation_roles(self.required_obligations)?;
         let mut evidence_seen = self
             .required_evidence
@@ -129,8 +137,6 @@ impl CompletionContract {
                 self.profile = Some(trimmed.to_string());
             }
         }
-        self.required_paths = paths;
-        self.verify_commands = commands;
         self.deferred_verify_requirements = deferred;
         if self.verify_repair_cap == 0 {
             self.verify_repair_cap = default_verify_repair_cap();
@@ -379,7 +385,7 @@ impl CompletionContract {
             .iter()
             .map(|requirement| requirement.command.clone())
             .collect::<Vec<_>>();
-        crate::minimal_loop::evidence::verify_runtime_acceptance(
+        crate::minimal_loop::evidence::verify_runtime_acceptance_with_hints(
             root,
             &self.required_paths,
             &self.verify_commands,
@@ -387,7 +393,23 @@ impl CompletionContract {
             &self.required_evidence,
             &self.required_obligations,
             &deferred_commands,
+            &self.evidence_hint_tokens,
         )
+    }
+
+    pub fn merge_evidence_hint_tokens_from_goal(&mut self, goal: &str) {
+        let mut seen = self
+            .evidence_hint_tokens
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for token in evidence_hint_tokens_for_goal(goal) {
+            if seen.insert(token.clone()) {
+                self.evidence_hint_tokens.push(token);
+            }
+        }
+        self.evidence_hint_tokens =
+            normalize_evidence_hint_tokens(std::mem::take(&mut self.evidence_hint_tokens));
     }
 
     pub fn deferred_status_summary(&self, root: &Path, fallback_goal: &str) -> Vec<String> {
@@ -638,6 +660,151 @@ fn normalize_unique_list(values: Vec<String>) -> Vec<String> {
     out
 }
 
+pub fn evidence_hint_tokens_for_goal(goal: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for token in ascii_goal_words(goal)
+        .into_iter()
+        .chain(katakana_goal_tokens(goal))
+    {
+        if seen.insert(token.clone()) {
+            out.push(token);
+        }
+    }
+    out
+}
+
+fn normalize_evidence_hint_tokens(values: Vec<String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let normalized = normalize_evidence_hint_token(&value);
+        if !normalized.is_empty()
+            && !evidence_hint_stopword(&normalized)
+            && seen.insert(normalized.clone())
+        {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+fn normalize_evidence_hint_token(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_ascii() {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn ascii_goal_words(goal: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in goal.chars() {
+        if ch.is_ascii_alphabetic() {
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            push_ascii_goal_word(&mut words, &mut current);
+        }
+    }
+    push_ascii_goal_word(&mut words, &mut current);
+    normalize_evidence_hint_tokens(words)
+}
+
+fn push_ascii_goal_word(words: &mut Vec<String>, current: &mut String) {
+    if current.len() >= 4 {
+        words.push(std::mem::take(current));
+    } else {
+        current.clear();
+    }
+}
+
+fn katakana_goal_tokens(goal: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in goal.chars() {
+        if is_katakana_hint_char(ch) {
+            current.push(ch);
+        } else {
+            push_katakana_goal_token(&mut tokens, &mut current);
+        }
+    }
+    push_katakana_goal_token(&mut tokens, &mut current);
+    normalize_evidence_hint_tokens(tokens)
+}
+
+fn push_katakana_goal_token(tokens: &mut Vec<String>, current: &mut String) {
+    if current.chars().count() >= 3 {
+        let token = std::mem::take(current);
+        tokens.push(token.clone());
+        for prefix in KATAKANA_GOAL_PREFIX_STOPWORDS {
+            if let Some(suffix) = token.strip_prefix(prefix)
+                && suffix.chars().count() >= 3
+            {
+                tokens.push(suffix.to_string());
+            }
+        }
+    } else {
+        current.clear();
+    }
+}
+
+fn is_katakana_hint_char(ch: char) -> bool {
+    matches!(ch, '\u{30A0}'..='\u{30FF}' | '\u{FF66}'..='\u{FF9F}')
+}
+
+fn evidence_hint_stopword(token: &str) -> bool {
+    ASCII_GOAL_HINT_STOPWORDS.contains(&token) || JAPANESE_GOAL_HINT_STOPWORDS.contains(&token)
+}
+
+const ASCII_GOAL_HINT_STOPWORDS: &[&str] = &[
+    "application",
+    "browser",
+    "build",
+    "canvas",
+    "client",
+    "component",
+    "create",
+    "develop",
+    "development",
+    "feature",
+    "game",
+    "games",
+    "implement",
+    "implementation",
+    "interactive",
+    "next",
+    "nextjs",
+    "page",
+    "playable",
+    "port",
+    "project",
+    "react",
+    "screen",
+    "shooting",
+    "space",
+    "typescript",
+    "using",
+    "with",
+];
+
+const JAPANESE_GOAL_HINT_STOPWORDS: &[&str] = &[
+    "アプリ",
+    "ゲーム",
+    "シューティング",
+    "スペース",
+    "ネクスト",
+    "ブラウザ",
+    "ページ",
+    "ポート",
+    "実装",
+    "作成",
+    "開発",
+];
+
+const KATAKANA_GOAL_PREFIX_STOPWORDS: &[&str] = &["スペース"];
+
 fn normalize_obligation_roles(values: Vec<String>) -> anyhow::Result<Vec<String>> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
@@ -688,7 +855,7 @@ fn evidence_repair_guidance(failure: &str) -> Vec<String> {
     }
     if failure.contains("challenge_or_adversary_evidence") {
         lines.push(
-            "For challenge_or_adversary_evidence, edit the task implementation artifact to implement a concrete adversary, obstacle, wave, hazard, target, or challenge that affects gameplay."
+            "For challenge_or_adversary_evidence, edit the task implementation artifact to name the adversary entities with a recognizable term (e.g. enemy, invader, or the goal's own term) and wire them to movement/collision."
                 .to_string(),
         );
     }
@@ -984,6 +1151,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
             required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 0,
@@ -1009,6 +1177,7 @@ mod tests {
             ],
             deterministic_oracles: vec![" source_semantic ".to_string(), "".to_string()],
             required_evidence: vec!["custom_evidence".to_string()],
+            evidence_hint_tokens: Vec::new(),
             required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
@@ -1035,6 +1204,50 @@ mod tests {
     }
 
     #[test]
+    fn contract_loads_old_json_without_evidence_hint_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract: CompletionContract = serde_json::from_str(
+            r#"{"required_paths":["src/main.rs"],"required_evidence":["challenge_or_adversary_evidence"]}"#,
+        )
+        .unwrap();
+        let contract = contract.validate(dir.path()).unwrap();
+        assert!(contract.evidence_hint_tokens.is_empty());
+        assert_eq!(
+            contract.required_evidence,
+            vec!["challenge_or_adversary_evidence"]
+        );
+    }
+
+    #[test]
+    fn contract_derives_goal_evidence_hint_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = CompletionContract {
+            required_paths: Vec::new(),
+            verify_commands: Vec::new(),
+            profile: None,
+            goal: Some("シューティングでドラゴンを倒すゲーム".to_string()),
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
+            required_obligations: Vec::new(),
+            deferred_verify_requirements: Vec::new(),
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap();
+        assert!(
+            contract
+                .evidence_hint_tokens
+                .contains(&"ドラゴン".to_string())
+        );
+        assert!(
+            evidence_hint_tokens_for_goal("スペースインベーダー")
+                .contains(&"インベーダー".to_string())
+        );
+    }
+
+    #[test]
     fn structured_contract_normalizes_required_obligations() {
         let dir = tempfile::tempdir().unwrap();
         let contract = CompletionContract {
@@ -1045,6 +1258,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
             required_obligations: vec![
                 " implementation ".to_string(),
                 "acceptance-evidence".to_string(),
@@ -1067,6 +1281,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
             required_obligations: vec!["reporting".to_string()],
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
@@ -1095,6 +1310,7 @@ mod tests {
                 required_capabilities: Vec::new(),
                 deterministic_oracles: Vec::new(),
                 required_evidence: Vec::new(),
+                evidence_hint_tokens: Vec::new(),
                 required_obligations: Vec::new(),
                 deferred_verify_requirements: Vec::new(),
                 verify_repair_cap: 2,
@@ -1119,6 +1335,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
             required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
@@ -1145,6 +1362,7 @@ mod tests {
                 required_capabilities: Vec::new(),
                 deterministic_oracles: Vec::new(),
                 required_evidence: Vec::new(),
+                evidence_hint_tokens: Vec::new(),
                 required_obligations: Vec::new(),
                 deferred_verify_requirements: Vec::new(),
                 verify_repair_cap: 2,
@@ -1263,6 +1481,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
             required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
@@ -1275,7 +1494,8 @@ mod tests {
         );
         let feedback = format_verify_feedback_with_contract(&report, Some(&contract));
         assert!(feedback.contains("Target implementation files: src/app/page.tsx"));
-        assert!(feedback.contains("adversary, obstacle, wave, hazard, target, or challenge"));
+        assert!(feedback.contains("enemy, invader, or the goal's own term"));
+        assert!(feedback.contains("movement/collision"));
         assert!(feedback.contains("bullet/enemy collision or damage detection"));
         assert!(feedback.contains("start/restart/reset behavior"));
         assert!(feedback.contains("score, level, wave, lives, health, or progress updates"));
@@ -1299,6 +1519,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
             required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
@@ -1345,6 +1566,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
             required_obligations: Vec::new(),
             deferred_verify_requirements: vec![DeferredVerifyRequirement {
                 command: "npm run build".to_string(),
@@ -1381,6 +1603,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
             required_obligations: Vec::new(),
             deferred_verify_requirements: Vec::new(),
             verify_repair_cap: 2,
@@ -1436,6 +1659,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
             required_obligations: Vec::new(),
             deferred_verify_requirements: vec![DeferredVerifyRequirement {
                 command: "npm run build".to_string(),
@@ -1492,6 +1716,7 @@ mod tests {
             required_capabilities: Vec::new(),
             deterministic_oracles: Vec::new(),
             required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
             required_obligations: Vec::new(),
             deferred_verify_requirements: vec![DeferredVerifyRequirement {
                 command: "npm run build".to_string(),

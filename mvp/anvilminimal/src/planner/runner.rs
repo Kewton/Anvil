@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::eval_events;
 use crate::minimal_loop::build_verifier::emit_dependency_build_lifecycle;
-use crate::minimal_loop::completion::CompletionContract;
+use crate::minimal_loop::completion::{CompletionContract, evidence_hint_tokens_for_goal};
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::evidence::{
     RuntimeAcceptanceReport, required_evidence_for_capability,
-    verify_runtime_acceptance_with_browser_dirs,
+    verify_runtime_acceptance_with_browser_dirs_and_hints,
 };
 use crate::minimal_loop::loop_run::{
     ContractEnforcement, RunSessionOptions, RunSessionOutcome, RunSessionStepKind,
@@ -1480,6 +1480,8 @@ fn bind_completion_contract_for_acceptance(
 ) -> anyhow::Result<Option<BoundCompletionContract>> {
     let required = completion_contract_required(profile, goal, required_capabilities);
     if let Some(contract) = CompletionContract::load_for_config(config)? {
+        let mut contract = contract;
+        contract.merge_evidence_hint_tokens_from_goal(goal);
         let path = explicit_completion_contract_path(config)
             .map(|path| display_path_for_event(&config.workspace_root, &path))
             .unwrap_or_else(|| "<inline-config>".to_string());
@@ -1505,6 +1507,7 @@ fn bind_completion_contract_for_acceptance(
         required_capabilities: required_capabilities.to_vec(),
         deterministic_oracles: Vec::new(),
         required_evidence: required_evidence.to_vec(),
+        evidence_hint_tokens: evidence_hint_tokens_for_goal(goal),
         required_obligations: required_obligations.to_vec(),
         deferred_verify_requirements: Vec::new(),
         verify_repair_cap: 2,
@@ -1616,6 +1619,7 @@ fn emit_completion_contract_bound(config: &Config, scope: &str, bound: &BoundCom
             "required_paths": bound.contract.required_paths.clone(),
             "required_capabilities": bound.contract.required_capabilities.clone(),
             "required_evidence": bound.contract.required_evidence.clone(),
+            "evidence_hint_tokens": bound.contract.evidence_hint_tokens.clone(),
             "required_obligations": bound.contract.required_obligations.clone(),
         }),
     );
@@ -1633,6 +1637,7 @@ fn verify_plan_final_contract(
         inferred_required_evidence(&config.profile, &plan.goal, &required_capabilities);
     let mut required_obligations =
         inferred_required_obligations(&config.profile, &plan.goal, &required_capabilities);
+    let mut evidence_hint_tokens = evidence_hint_tokens_for_goal(&plan.goal);
     let owned_bound_contract;
     let bound_contract = if let Some(bound_contract) = bound_contract {
         Some(bound_contract)
@@ -1658,6 +1663,7 @@ fn verify_plan_final_contract(
         merge_unique_strings(&mut required_evidence, &contract.required_evidence);
         merge_unique_strings(&mut required_obligations, &contract.required_obligations);
         merge_unique_strings(&mut verify_commands, &contract.verify_commands);
+        merge_unique_strings(&mut evidence_hint_tokens, &contract.evidence_hint_tokens);
         deferred_commands.extend(
             contract
                 .deferred_verify_requirements
@@ -1679,7 +1685,7 @@ fn verify_plan_final_contract(
         || !required_evidence.is_empty()
         || !required_obligations.is_empty();
     let runtime_acceptance = runtime_acceptance_required.then(|| {
-        verify_runtime_acceptance_with_browser_dirs(
+        verify_runtime_acceptance_with_browser_dirs_and_hints(
             &config.workspace_root,
             &required_paths,
             &verify_commands,
@@ -1688,6 +1694,7 @@ fn verify_plan_final_contract(
             &required_obligations,
             &deferred_commands,
             &release_evidence_extra_dirs(config),
+            &evidence_hint_tokens,
         )
     });
     let release_gate = final_acceptance_release_gate(
@@ -3093,6 +3100,7 @@ fn ultra_final_acceptance_report(
         inferred_required_obligations(&plan.profile, &plan.goal, &required_capabilities);
     let mut required_evidence =
         inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities);
+    let mut evidence_hint_tokens = evidence_hint_tokens_for_goal(&plan.goal);
     let bound_contract = bind_completion_contract_for_acceptance(
         config,
         "ultra-plan-run",
@@ -3111,6 +3119,7 @@ fn ultra_final_acceptance_report(
         merge_unique_strings(&mut required_evidence, &contract.required_evidence);
         merge_unique_strings(&mut required_obligations, &contract.required_obligations);
         merge_unique_strings(&mut verify_commands, &contract.verify_commands);
+        merge_unique_strings(&mut evidence_hint_tokens, &contract.evidence_hint_tokens);
         deferred_commands.extend(
             contract
                 .deferred_verify_requirements
@@ -3123,7 +3132,7 @@ fn ultra_final_acceptance_report(
         &inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities),
     );
     let missing = missing_final_artifacts(&config.workspace_root, &required_paths);
-    let acceptance = verify_runtime_acceptance_with_browser_dirs(
+    let acceptance = verify_runtime_acceptance_with_browser_dirs_and_hints(
         &config.workspace_root,
         &required_paths,
         &verify_commands,
@@ -3132,6 +3141,7 @@ fn ultra_final_acceptance_report(
         &required_obligations,
         &deferred_commands,
         &release_evidence_extra_dirs(config),
+        &evidence_hint_tokens,
     );
     let external_report = bound_contract.as_ref().map(|bound| {
         bound
@@ -3318,6 +3328,7 @@ fn ultra_contract_runtime_acceptance_report(
         inferred_required_obligations(&plan.profile, &plan.goal, &required_capabilities);
     let mut required_evidence =
         inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities);
+    let mut evidence_hint_tokens = evidence_hint_tokens_for_goal(&plan.goal);
     let bound_contract = bind_completion_contract_for_acceptance(
         config,
         "ultra-plan-run",
@@ -3336,6 +3347,7 @@ fn ultra_contract_runtime_acceptance_report(
         merge_unique_strings(&mut required_evidence, &contract.required_evidence);
         merge_unique_strings(&mut required_obligations, &contract.required_obligations);
         merge_unique_strings(&mut verify_commands, &contract.verify_commands);
+        merge_unique_strings(&mut evidence_hint_tokens, &contract.evidence_hint_tokens);
         deferred_commands.extend(
             contract
                 .deferred_verify_requirements
@@ -3347,7 +3359,7 @@ fn ultra_contract_runtime_acceptance_report(
         &mut required_evidence,
         &inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities),
     );
-    Ok(verify_runtime_acceptance_with_browser_dirs(
+    Ok(verify_runtime_acceptance_with_browser_dirs_and_hints(
         &config.workspace_root,
         &required_paths,
         &verify_commands,
@@ -3356,6 +3368,7 @@ fn ultra_contract_runtime_acceptance_report(
         &required_obligations,
         &deferred_commands,
         &release_evidence_extra_dirs(config),
+        &evidence_hint_tokens,
     ))
 }
 
