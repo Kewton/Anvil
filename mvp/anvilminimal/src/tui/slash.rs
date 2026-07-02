@@ -308,6 +308,57 @@ mod tests {
     }
 
     #[test]
+    fn tui_command_stop_uses_phase_scoped_recovery_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let events = workspace.join(".anvil/runs/test/events.jsonl");
+        let prompt_path = workspace.join(".anvil/repairs/repair-phase.md");
+        let yaml_path = workspace.join(".anvil/plans/recovery-phase.yaml");
+        std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+        let mut cfg = config();
+        cfg.workspace_root = workspace.clone();
+        cfg.eval_events_path = Some(events.clone());
+        crate::eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            serde_json::json!({
+                "event": "recovery_prompt_saved",
+                "recovery_prompt_path": prompt_path.display().to_string(),
+                "recovery_ultra_plan_path": yaml_path.display().to_string(),
+                "suggested_recovery_command": format!("/ultra-plan-run --profile nextjs \"$(cat {})\"", prompt_path.display()),
+                "suggested_recovery_yaml_command": format!("/run-ultra-plan {}", yaml_path.display()),
+            }),
+        );
+
+        let result: anyhow::Result<String> = Err(anyhow::anyhow!("phase invariant failed"));
+        let projection = emit_tui_command_stop(&cfg, "/ultra-plan-run", &result);
+
+        assert_eq!(
+            projection.recovery_prompt_path,
+            ".anvil/repairs/repair-phase.md"
+        );
+        assert_eq!(
+            projection.recovery_ultra_plan_path,
+            ".anvil/plans/recovery-phase.yaml"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        let tui_stop = event_text
+            .lines()
+            .filter(|line| line.contains(r#""event":"tui_command_stop""#))
+            .next_back()
+            .unwrap();
+        assert!(
+            tui_stop.contains(r#""recovery_prompt_path":".anvil/repairs/repair-phase.md""#),
+            "{tui_stop}"
+        );
+        assert!(
+            tui_stop.contains(r#""recovery_ultra_plan_path":".anvil/plans/recovery-phase.yaml""#),
+            "{tui_stop}"
+        );
+        assert!(tui_stop.contains(r#""suggested_recovery_command":"/ultra-plan-run"#));
+        assert!(tui_stop.contains(r#""suggested_recovery_yaml_command":"/run-ultra-plan"#));
+    }
+
+    #[test]
     fn parses_user_ultra_plan_run_nextjs_command() {
         let parsed = parse_slash(
             "/ultra-plan-run --profile nextjs あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。",

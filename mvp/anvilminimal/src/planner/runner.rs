@@ -1351,10 +1351,10 @@ fn run_step(
             "Recovery UltraPlan YAML missing: failed to save valid recovery plan".to_string()
         });
     let prompt_command_summary = if validation.prompt_command_available() {
-        format!("Suggested prompt command: {suggested_command}")
+        format!("Suggested command: {suggested_command}")
     } else {
         format!(
-            "Suggested prompt command: unavailable because recovery prompt validation failed ({})",
+            "Suggested command: unavailable because recovery prompt validation failed ({})",
             validation
                 .prompt_parse_error
                 .as_deref()
@@ -1377,7 +1377,7 @@ fn run_step(
             repair_report_display,
             prompt_command_summary,
             artifact_check_summary,
-            current_report.primary_reason()
+            eval_events::body_snippet(&current_report.primary_reason())
         ),
     );
     let yaml_message = recovery_plan_path
@@ -5994,10 +5994,10 @@ fn save_ultra_phase_recovery_handoff(
             "Recovery UltraPlan YAML missing: failed to save valid recovery plan".to_string()
         });
     let prompt_command_summary = if validation.prompt_command_available() {
-        format!("Suggested prompt command: {prompt_command}")
+        format!("Suggested command: {prompt_command}")
     } else {
         format!(
-            "Suggested prompt command: unavailable because recovery prompt validation failed ({})",
+            "Suggested command: unavailable because recovery prompt validation failed ({})",
             validation
                 .prompt_parse_error
                 .as_deref()
@@ -6177,7 +6177,7 @@ fn render_release_recovery_handoff_summary(
 - Recovery handoff kind: {}\n\
 - Recovery prompt saved: {}\n\
 - Recovery UltraPlan YAML saved: {}\n\
-- Suggested prompt command: {}\n\
+- Suggested command: {}\n\
 - Suggested YAML command: {}\n\
 - Recovery artifact check: {}",
         summary.acceptance_layer,
@@ -6224,7 +6224,7 @@ Failure:\n{}",
         summary.prompt_command_summary,
         summary.recovery_yaml_command_summary,
         summary.recovery_artifact_check,
-        summary.reason,
+        eval_events::body_snippet(summary.reason),
     )
 }
 

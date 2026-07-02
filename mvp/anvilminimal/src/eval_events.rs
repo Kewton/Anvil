@@ -227,20 +227,20 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .collect::<Vec<_>>();
     let diagnostics = planner_diagnostics_from_events(&events);
-    events
+    let recovery_fields = latest_recovery_fields(&events);
+    let mut snapshot = events
         .iter()
         .filter_map(snapshot_from_completion_event)
         .next_back()
-        .map(|mut snapshot| {
-            snapshot.planner_verify_normalization_count = diagnostics.verify_normalization_count;
-            snapshot.planner_retry_count = diagnostics.retry_count;
-            snapshot.planner_quality_warning_count = diagnostics.quality_warning_count;
-            snapshot.planner_quality_issue_count = diagnostics.quality_issue_count;
-            snapshot.planner_repaired = diagnostics.repaired();
-            snapshot.planner_release_risk = diagnostics.release_risk();
-            snapshot
-        })
-        .unwrap_or_else(CompletionSnapshot::empty)
+        .unwrap_or_else(CompletionSnapshot::empty);
+    snapshot.planner_verify_normalization_count = diagnostics.verify_normalization_count;
+    snapshot.planner_retry_count = diagnostics.retry_count;
+    snapshot.planner_quality_warning_count = diagnostics.quality_warning_count;
+    snapshot.planner_quality_issue_count = diagnostics.quality_issue_count;
+    snapshot.planner_repaired = diagnostics.repaired();
+    snapshot.planner_release_risk = diagnostics.release_risk();
+    recovery_fields.apply_to(&mut snapshot);
+    snapshot
 }
 
 pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> CompletionProjection {
@@ -323,6 +323,74 @@ fn planner_diagnostics_from_events(events: &[Value]) -> PlannerDiagnostics {
         }
     }
     diagnostics
+}
+
+#[derive(Debug, Clone, Default)]
+struct RecoveryFields {
+    recovery_prompt_path: String,
+    recovery_ultra_plan_path: String,
+    suggested_recovery_command: String,
+    suggested_recovery_yaml_command: String,
+}
+
+impl RecoveryFields {
+    fn apply_to(&self, snapshot: &mut CompletionSnapshot) {
+        if !self.recovery_prompt_path.is_empty() {
+            snapshot.recovery_prompt_path = self.recovery_prompt_path.clone();
+        }
+        if !self.recovery_ultra_plan_path.is_empty() {
+            snapshot.recovery_ultra_plan_path = self.recovery_ultra_plan_path.clone();
+        }
+        if !self.suggested_recovery_command.is_empty() {
+            snapshot.suggested_recovery_command = self.suggested_recovery_command.clone();
+        }
+        if !self.suggested_recovery_yaml_command.is_empty() {
+            snapshot.suggested_recovery_yaml_command = self.suggested_recovery_yaml_command.clone();
+        }
+    }
+}
+
+fn latest_recovery_fields(events: &[Value]) -> RecoveryFields {
+    let mut fields = RecoveryFields::default();
+    for event in events.iter().rev() {
+        if fields.recovery_prompt_path.is_empty()
+            && let Some(value) = non_empty_event_field(event, "recovery_prompt_path")
+        {
+            fields.recovery_prompt_path = handoff_display_value(value);
+        }
+        if fields.recovery_ultra_plan_path.is_empty()
+            && let Some(value) = non_empty_event_field(event, "recovery_ultra_plan_path")
+        {
+            fields.recovery_ultra_plan_path = handoff_display_value(value);
+        }
+        if fields.suggested_recovery_command.is_empty()
+            && let Some(value) = non_empty_event_field(event, "suggested_recovery_command")
+        {
+            fields.suggested_recovery_command = normalize_handoff_display_text(value.to_string());
+        }
+        if fields.suggested_recovery_yaml_command.is_empty()
+            && let Some(value) = non_empty_event_field(event, "suggested_recovery_yaml_command")
+        {
+            fields.suggested_recovery_yaml_command =
+                normalize_handoff_display_text(value.to_string());
+        }
+        if !fields.recovery_prompt_path.is_empty()
+            && !fields.recovery_ultra_plan_path.is_empty()
+            && !fields.suggested_recovery_command.is_empty()
+            && !fields.suggested_recovery_yaml_command.is_empty()
+        {
+            break;
+        }
+    }
+    fields
+}
+
+fn non_empty_event_field<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
+    event
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 pub fn append_completion_summary(
@@ -423,6 +491,7 @@ pub fn render_tui_command_failure_block(
                 &summary_text,
                 &[
                     "Suggested prompt command:",
+                    "Suggested command:",
                     "Recovery prompt command:",
                     "Suggested recovery command:",
                 ],
@@ -1012,6 +1081,7 @@ fn render_completion_summary(
         format!("Lifecycle: {lifecycle_stage}"),
         format!("Session/REPL status: {}", session_status(lifecycle_stage)),
     ];
+    let stop_reason = body_snippet(stop_reason);
     if let Some(action) = action {
         lines.push(format!("Action: {action}"));
     }
@@ -1090,15 +1160,15 @@ fn render_completion_summary(
         lines.extend([
             "Recovery handoff:".to_string(),
             format!(
-                "- Recovery prompt: {}",
+                "- Recovery prompt saved: {}",
                 missing_if_empty(&projection.recovery_prompt_path)
             ),
             format!(
-                "- Recovery UltraPlan YAML: {}",
+                "- Recovery UltraPlan YAML saved: {}",
                 missing_if_empty(&projection.recovery_ultra_plan_path)
             ),
             format!(
-                "- Suggested prompt command: {}",
+                "- Suggested command: {}",
                 missing_if_empty(&projection.suggested_recovery_command)
             ),
             format!(
@@ -1111,7 +1181,10 @@ fn render_completion_summary(
         lines.push(format!("Failure kind: {failure_kind}"));
     }
     if lifecycle_stage == "tui_command" && projection.command_completion == "failed" {
-        lines.push(format!("TUI command failed: {stop_reason}"));
+        lines.push(format!(
+            "TUI command failed: {}",
+            body_snippet(&stop_reason)
+        ));
     }
     lines.join("\n")
 }
@@ -1189,14 +1262,22 @@ pub fn body_snippet(body: &str) -> String {
 fn summary_body(body: &str) -> String {
     let clean = body.replace("\r\n", "\n").replace('\r', "\n");
     let clean = redact_home_paths(&clean);
-    clean
-        .lines()
-        .map(redact_secret_like)
-        .collect::<Vec<_>>()
-        .join("\n")
-        .chars()
-        .take(SUMMARY_LIMIT)
-        .collect()
+    let mut out = String::new();
+    let mut len = 0usize;
+    for line in clean.lines().map(redact_secret_like) {
+        let line_len = line.chars().count();
+        let next_len = len + usize::from(!out.is_empty()) + line_len;
+        if next_len > SUMMARY_LIMIT {
+            break;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+            len += 1;
+        }
+        out.push_str(&line);
+        len += line_len;
+    }
+    out
 }
 
 fn argument_value_summary(key: &str, value: &Value) -> Value {
@@ -1434,6 +1515,132 @@ mod tests {
         assert!(summary.contains(
             "Planner diagnostics: normalizations=1 retries=1 quality_warnings=1 quality_issues=0"
         ));
+    }
+
+    #[test]
+    fn completion_snapshot_uses_latest_non_empty_recovery_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "loop_stop",
+                "runtime_acceptance_status": "failed",
+                "final_acceptance_status": "failed",
+                "release_gate_status": "failed",
+                "recovery_prompt_path": "/tmp/work/.anvil/repairs/old.md",
+                "recovery_ultra_plan_path": "/tmp/work/.anvil/plans/old.yaml",
+                "suggested_recovery_command": "/ultra-plan-run --profile nextjs \"$(cat /tmp/work/.anvil/repairs/old.md)\"",
+                "suggested_recovery_yaml_command": "/run-ultra-plan /tmp/work/.anvil/plans/old.yaml",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "recovery_prompt_saved",
+                "recovery_prompt_path": "/tmp/work/.anvil/repairs/new.md",
+                "recovery_ultra_plan_path": "/tmp/work/.anvil/plans/new.yaml",
+                "suggested_recovery_command": "/ultra-plan-run --profile nextjs \"$(cat /tmp/work/.anvil/repairs/new.md)\"",
+                "suggested_recovery_yaml_command": "/run-ultra-plan /tmp/work/.anvil/plans/new.yaml",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_phase_failed",
+                "recovery_prompt_path": "",
+                "recovery_ultra_plan_path": "",
+                "suggested_recovery_command": "",
+                "suggested_recovery_yaml_command": "",
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+
+        assert_eq!(snapshot.recovery_prompt_path, ".anvil/repairs/new.md");
+        assert_eq!(snapshot.recovery_ultra_plan_path, ".anvil/plans/new.yaml");
+        assert_eq!(
+            snapshot.suggested_recovery_command,
+            "/ultra-plan-run --profile nextjs \"$(cat .anvil/repairs/new.md)\""
+        );
+        assert_eq!(
+            snapshot.suggested_recovery_yaml_command,
+            "/run-ultra-plan .anvil/plans/new.yaml"
+        );
+    }
+
+    #[test]
+    fn completion_snapshot_can_be_recovery_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "recovery_prompt_saved",
+                "recovery_prompt_path": "/tmp/work/.anvil/repairs/phase.md",
+                "recovery_ultra_plan_path": "/tmp/work/.anvil/plans/phase.yaml",
+                "suggested_recovery_command": "/ultra-plan-run --profile nextjs \"$(cat /tmp/work/.anvil/repairs/phase.md)\"",
+                "suggested_recovery_yaml_command": "/run-ultra-plan /tmp/work/.anvil/plans/phase.yaml",
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+
+        assert_eq!(snapshot.final_acceptance_status, "not_checked");
+        assert_eq!(snapshot.recovery_prompt_path, ".anvil/repairs/phase.md");
+        assert_eq!(snapshot.recovery_ultra_plan_path, ".anvil/plans/phase.yaml");
+    }
+
+    #[test]
+    fn summary_keeps_recovery_command_lines_intact_with_long_failure_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut snapshot = CompletionSnapshot::empty();
+        snapshot.recovery_prompt_path = ".anvil/repairs/repair-long.md".to_string();
+        snapshot.recovery_ultra_plan_path = ".anvil/plans/recovery-long.yaml".to_string();
+        let long_arg = "x".repeat(700);
+        snapshot.suggested_recovery_command = format!(
+            "/ultra-plan-run --profile nextjs \"$(cat .anvil/repairs/repair-long.md)\" --note {long_arg}"
+        );
+        snapshot.suggested_recovery_yaml_command =
+            format!("/run-ultra-plan .anvil/plans/recovery-long.yaml --note {long_arg}");
+        let projection = project_completion(false, &snapshot);
+        let long_reason = format!("failure {}", "y".repeat(20_000));
+        let summary = render_completion_summary(
+            "tui_command",
+            None,
+            Some("/ultra-plan-run"),
+            &long_reason,
+            "tui_command_failed",
+            &projection,
+        );
+
+        write_run_summary(Some(&path), &summary);
+
+        let written = std::fs::read_to_string(path.parent().unwrap().join("summary.md")).unwrap();
+        let suggested_line = format!(
+            "- Suggested command: {}",
+            snapshot.suggested_recovery_command
+        );
+        let suggested_yaml_line = format!(
+            "- Suggested YAML command: {}",
+            snapshot.suggested_recovery_yaml_command
+        );
+        assert!(written.contains(&suggested_line), "{written}");
+        assert!(written.contains(&suggested_yaml_line), "{written}");
+        assert!(
+            written
+                .lines()
+                .any(|line| line == suggested_line && line.starts_with("- Suggested command: /")),
+            "{written}"
+        );
+        assert!(
+            written.lines().any(|line| line == suggested_yaml_line
+                && line.starts_with("- Suggested YAML command: /")),
+            "{written}"
+        );
+        assert!(!written.contains(&"y".repeat(1_000)));
+        assert!(written.contains("Stop reason: failure "));
     }
 
     #[test]
