@@ -103,6 +103,13 @@ UAT004-GATE-00 の baseline として、source-first runtime semantics 復元で
 | G-S03 | `minimal_step_runner.rs` generation loop rejects tool calls, validates schema/lint, retries with corrective prompts, and fails invalid plans instead of returning fallback success | Existing `planner/runner.rs` source-shaped UltraPlan/StepPlan generation was re-audited; StepPlan generation now calls workspace-aware lint so source `lint_plan_with_workspace` semantics are used before success | `generated_final_verify_uses_existing_workspace_nextjs_artifacts`, `invalid_ultra_plan_generation_does_not_save_plan_file`, existing tool-call/schema/lint retry tests; full `cargo test` and `pytest mvp/anvilminimal/tests/eval` passed | provider probe skipped because no prompt/provider schema changed; final comparative source/MVP run deferred to GATE-09 |
 | G-S04 | `minimal_step_runner/plan_lint.rs` and `profiles/nextjs.rs` allow final build verification to rely on existing workspace entrypoint while keeping early build/order failures strict | `planner/lint.rs` adds `lint_step_plan_report_with_workspace`, checks existing `package.json`/`node_modules` context and Next.js entrypoints, and `planner/runner.rs` uses it for generation and plan-file validation | `workspace_manifest_and_entrypoint_allow_final_nextjs_verify`, `workspace_manifest_without_entrypoint_still_rejects_nextjs_build`, existing deterministic scaffold recovery completion-boundary fixture; full local tests passed | dependency setup/build rerun remains G-S09; browser/final acceptance remains G-S12 |
 
+## UAT004-GATE-03 Port Record
+
+| gate | source authority applied | MVP implementation | local evidence | remaining trace gap |
+| --- | --- | --- | --- | --- |
+| G-S08 | `verifier_command_policy.rs` admits only deterministic verifier command shapes and rejects shell control/setup/dev-server/workspace escape; `project_verifier.rs` keeps cheap checks structured and non-shell | `planner/verify.rs` keeps verify diagnosis and planner split policy strict; `planner/lint.rs` no longer turns manifest/dependency missing for existing verifier artifacts into planner dependency-order errors | verify policy positive/negative fixtures rerun in full `cargo test`; new dependency-boundary fixtures prove missing manifest is classified by verifier lifecycle | same-condition source/anvildev trace deferred to GATE-09 |
+| G-S09 | `node_request_helpers.rs` + `node_runner_manifest.rs` treat Node manifest completion as deterministic setup under authority; project probe/verifier and actor flow connect dependency missing to setup/retry/verifier lifecycle | `minimal_loop/build_verifier.rs` records dependency check, setup authority, setup attempted/blocked/passed, build/test rerun, final verification status; `dependency_setup.rs` gates network setup by authority and uses deterministic Node test manifest completion; `planner/lint.rs` routes existing entrypoint/test artifacts to dependency boundary | setup blocked/allowed/build rerun fixtures, Node test runner manifest fixtures, setup-only/manifest-only negative fixtures, and full local tests passed | browser/final acceptance remains G-S12; comparative source/MVP run remains GATE-09 |
+
 ## Gate-Level Migration Decision
 
 | gate | baseline status from matrix | UAT004 source-first decision | inventory note |
@@ -114,8 +121,8 @@ UAT004-GATE-00 の baseline として、source-first runtime semantics 復元で
 | G-S05 | fail | `source_trace_verification_target` | Phase context exists in MVP events; source same-condition trace is missing. |
 | G-S06 | fail | `source_trace_verification_target` | Step prompt contract events exist; source same-condition trace is missing. |
 | G-S07 | fail | `source_trace_verification_target` | Provider/tool recovery requires live/source trace; no provider probe in GATE-00. |
-| G-S08 | pass | pass re-audit | Verify policy needs positive/negative fixture and latest eval/source comparison. |
-| G-S09 | fail | `full_source_port_target` | Dependency/setup/build lifecycle must be controller-level, not helper-only. |
+| G-S08 | pass | `source_parity_pass` after GATE-03 re-audit | Verify command policy fixtures and dependency-boundary classification were rerun against source refs; shell control/setup/dev-server/workspace escape remain strict. |
+| G-S09 | fail | `source_parity_pass` for GATE-03 lifecycle scope | Dependency missing now flows through setup authority, deterministic setup/materialization, rerun, and verification lifecycle with setup-only/manifest-only still blocked from success. |
 | G-S10 | fail | `full_source_port_target` | RepairJob / repair lifecycle / verifier targeting parity is missing. |
 | G-S11 | fail | `full_source_port_target` | Scaffold must remain continuation target and not completion. |
 | G-S12 | fail | `full_source_port_target` | Final acceptance must integrate artifact/build/capability/postcheck/browser evidence. |

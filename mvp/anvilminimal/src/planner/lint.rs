@@ -222,6 +222,7 @@ pub fn lint_step_plan_report_with_workspace(
             if requires_dependency_setup_before_verify(command)
                 && !setup_seen
                 && !step_creates_dependency_manifest(step)
+                && !work_root.is_some_and(|root| workspace_has_dependency_boundary(root, command))
             {
                 report.push(
                     "dependency_order",
@@ -631,6 +632,74 @@ fn workspace_has_nextjs_entrypoint(root: &Path) -> bool {
     nextjs_entrypoints()
         .iter()
         .any(|path| root.join(path).is_file())
+}
+
+fn workspace_has_dependency_boundary(root: &Path, command: &str) -> bool {
+    if is_nextjs_build(command) {
+        return workspace_has_nextjs_entrypoint(root);
+    }
+    if is_node_test_command(command) {
+        return workspace_has_node_test_file(root);
+    }
+    false
+}
+
+fn is_node_test_command(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower == "npm test"
+        || lower == "npm run test"
+        || lower == "pnpm test"
+        || lower == "yarn test"
+        || lower.starts_with("npm test ")
+        || lower.starts_with("npm run test ")
+        || lower.starts_with("pnpm test ")
+        || lower.starts_with("yarn test ")
+}
+
+fn workspace_has_node_test_file(root: &Path) -> bool {
+    if dir_has_node_test_file(root) {
+        return true;
+    }
+    ["tests", "test", "__tests__"]
+        .iter()
+        .any(|dir| dir_has_node_test_file(&root.join(dir)))
+}
+
+fn dir_has_node_test_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.path().is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_node_test_filename)
+    })
+}
+
+fn is_node_test_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [
+        ".test.js",
+        ".test.mjs",
+        ".test.cjs",
+        ".test.jsx",
+        ".test.ts",
+        ".test.mts",
+        ".test.cts",
+        ".test.tsx",
+        ".spec.js",
+        ".spec.mjs",
+        ".spec.cjs",
+        ".spec.jsx",
+        ".spec.ts",
+        ".spec.mts",
+        ".spec.cts",
+        ".spec.tsx",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
 }
 
 fn step_creates_dependency_manifest(step: &crate::planner::step_plan::PlanStep) -> bool {
@@ -1122,6 +1191,58 @@ mod tests {
                 .any(|err| err.message.contains("entrypoint")),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn workspace_entrypoint_without_manifest_routes_build_to_dependency_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page() { return null; }\n",
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Verify the existing Next.js app".to_string(),
+            steps: vec![PlanStep {
+                id: "final-verify".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Run deterministic Next.js build verification".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["npm run build".to_string()],
+            }],
+        };
+
+        let report = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+
+        assert!(report.is_pass(), "{report:?}");
+    }
+
+    #[test]
+    fn workspace_node_test_without_manifest_routes_test_to_dependency_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("tests/main.test.js"),
+            "import test from 'node:test';\n",
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Run existing Node tests".to_string(),
+            steps: vec![PlanStep {
+                id: "test".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Run deterministic Node tests".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["npm test".to_string()],
+            }],
+        };
+
+        let report = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+
+        assert!(report.is_pass(), "{report:?}");
     }
 
     #[test]

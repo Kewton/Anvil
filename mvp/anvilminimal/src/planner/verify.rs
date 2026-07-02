@@ -695,6 +695,44 @@ mod tests {
     }
 
     #[test]
+    fn nextjs_build_missing_manifest_is_dependency_boundary_not_command_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page() { return null; }\n",
+        )
+        .unwrap();
+        let step = PlanStep {
+            id: "final-verify".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Run deterministic Next.js build".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["npm run build".to_string()],
+        };
+
+        let (report, lifecycles) =
+            verify_step_with_setup_observed(dir.path(), &step, NodeDependencySetupAuthority::None);
+
+        assert!(matches!(report.status, VerifyStatus::DependencyMissing(_)));
+        assert!(
+            report
+                .primary_reason()
+                .contains("package.json missing before Next.js build verifier"),
+            "{report:?}"
+        );
+        assert_eq!(lifecycles.len(), 1);
+        assert!(!lifecycles[0].before_setup.attempted);
+        assert_eq!(lifecycles[0].setup_status(), "blocked");
+        assert!(
+            lifecycles[0]
+                .lifecycle_stages()
+                .contains(&"verification_dependency_missing")
+        );
+    }
+
+    #[test]
     fn nextjs_build_step_returns_dependency_lifecycle() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(

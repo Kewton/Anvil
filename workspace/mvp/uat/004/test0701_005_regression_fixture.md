@@ -189,6 +189,15 @@ Expected future behavior:
 | invalid UltraPlan output | `invalid_ultra_plan_generation_does_not_save_plan_file` records `ultra_plan_generation_failed` with `planner_schema_error`, does not emit success, and does not save `.anvil/plans` | correct failure detection preserved; deterministic fallback is not treated as normal success |
 | scaffold fallback boundary | existing `deterministic_profile_fallback_requires_targeted_continuation_before_success` keeps `deterministic_scaffold_recovery` as `used_for_completion=false` until targeted implementation continuation succeeds | correct boundary preserved |
 
+## UAT004-GATE-03 Executable Fixture Binding
+
+| baseline fixture | executable assertion | expected classification |
+| --- | --- | --- |
+| F-001 manifest/dependency missing after valid final verify planning | `workspace_entrypoint_without_manifest_routes_build_to_dependency_boundary`, `next_build_without_manifest_reports_manifest_boundary_before_execution`, and `nextjs_build_missing_manifest_is_dependency_boundary_not_command_execution` route an existing Next.js entrypoint with missing `package.json` to dependency lifecycle instead of planner lint or command execution | regression fixed: manifest/dependency missing is a dependency boundary, not a planner scaffold failure |
+| Node test runner manifest boundary | `workspace_node_test_without_manifest_routes_test_to_dependency_boundary`, `node_test_runner_missing_manifest_setup_blocked_records_lifecycle`, and `node_test_runner_setup_allowed_then_test_rerun_records_lifecycle` cover test artifact present, missing runner manifest, setup authority, deterministic manifest materialization, and test rerun | source lifecycle restored for Node verifier binding |
+| setup-only / manifest-only false positive | `manifest_only_nextjs_build_verify_is_not_success`, `minimal_loop_nextjs_required_paths_only_does_not_complete`, and `plan_run_nextjs_game_setup_only_fails_inferred_obligation` continue to reject setup-only or manifest-only output as task success | correct false-positive rejection preserved |
+| G-S08 verifier command policy | `verify_command_rejects_shell_control_syntax`, `verify_command_rejects_install_or_dev_server`, `rust_manifest_path_escape_rejected`, `planner_verify_normalization_splits_only_allowlisted_and_commands`, and `planner_verify_normalization_rejects_unsafe_shell_syntax` were rerun in full `cargo test` | source verifier command policy parity re-audited |
+
 ## Fixture Reproduction Notes
 
 No new executable tests are created in GATE-00. The fixed baseline is document-level and must be converted into targeted automated fixtures in later gates.

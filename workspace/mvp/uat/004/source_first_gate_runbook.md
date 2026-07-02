@@ -29,6 +29,19 @@ UAT004 の各 gate で、実行した検証、skip evidence、rollback 条件、
 | anvildev comparison | skipped; final comparative source/MVP run remains GATE-09 |
 | rollback guard | do not accept deterministic fallback UltraPlan as success; do not reject final verify solely for plan-local entrypoint re-ownership when manifest+entrypoint exist; do not relax shell control rejection |
 
+## UAT004-GATE-03 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/loop_run/node_request_helpers.rs`, `node_runner_manifest.rs`, `project_probe.rs`, `project_verifier.rs`, `verifier_command_policy.rs`, `node_test_evidence_quality.rs`, `actor_loop_flow.rs` |
+| MVP refs | `mvp/anvilminimal/src/minimal_loop/dependency_setup.rs`, `minimal_loop/build_verifier.rs`, `planner/verify.rs`, `planner/lint.rs`, `planner/runner.rs` |
+| targeted fixtures | `workspace_entrypoint_without_manifest_routes_build_to_dependency_boundary`, `workspace_node_test_without_manifest_routes_test_to_dependency_boundary`, `next_build_without_manifest_reports_manifest_boundary_before_execution`, `nextjs_build_missing_manifest_is_dependency_boundary_not_command_execution`; existing setup blocked/allowed/build rerun and G-S08 verify policy fixtures rerun in full test suite |
+| full local verification | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 438 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 222 passed / 1 skipped |
+| network install | skipped; no real network install was executed, and setup remains gated by authority/workspace/profile contract |
+| browser/manual UAT | skipped; final browser readiness and interaction acceptance remain G-S12/G-S16 |
+| anvildev comparison | skipped; final comparative source/MVP run remains GATE-09 |
+| rollback guard | do not execute dependency setup without authority; do not let setup-only, manifest-only, build-only, or dependency handoff-only output become task success; do not relax verifier shell-control/workspace-escape rejection |
+
 ## Re-run Notes
 
 Before closing an implementation gate, update:

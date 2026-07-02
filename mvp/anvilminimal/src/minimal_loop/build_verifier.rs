@@ -374,6 +374,9 @@ fn requires_package_manifest(command: &str) -> bool {
 
 fn dependency_missing_reason(root: &Path, command: &str) -> String {
     if requires_next_binary(command) {
+        if requires_package_manifest(command) && !root.join("package.json").is_file() {
+            return "package.json missing before Next.js build verifier".to_string();
+        }
         dependency_setup::next_build_missing_dependency_reason(root)
     } else if requires_node_test_runner(command) {
         "package.json scripts.test missing before Node test verifier".to_string()
@@ -483,6 +486,54 @@ mod tests {
         let observation = observe_requirement(dir.path(), &requirement);
         assert_eq!(observation.status, BuildVerifierStatus::DependencyMissing);
         assert!(!observation.attempted);
+    }
+
+    #[test]
+    fn next_build_without_manifest_reports_manifest_boundary_before_execution() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page() { return null; }\n",
+        )
+        .unwrap();
+        let requirement = requirement_from_deferred(
+            "npm run build",
+            Some("nextjs"),
+            "final build check",
+            "profile:nextjs",
+            "pending",
+        )
+        .unwrap();
+
+        let lifecycle = observe_requirement_lifecycle(
+            dir.path(),
+            &requirement,
+            NodeDependencySetupAuthority::None,
+        );
+
+        assert_eq!(
+            lifecycle.before_setup.status,
+            BuildVerifierStatus::DependencyMissing
+        );
+        assert!(!lifecycle.before_setup.attempted);
+        assert_eq!(
+            lifecycle.before_setup.primary_reason,
+            "package.json missing before Next.js build verifier"
+        );
+        assert_eq!(lifecycle.setup_status(), "blocked");
+        assert_eq!(
+            lifecycle
+                .setup
+                .as_ref()
+                .map(|setup| setup.primary_reason.as_str()),
+            Some("package.json missing")
+        );
+        assert!(
+            lifecycle
+                .lifecycle_stages()
+                .contains(&"verification_dependency_missing")
+        );
     }
 
     #[test]

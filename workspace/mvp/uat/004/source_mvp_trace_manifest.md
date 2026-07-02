@@ -101,6 +101,20 @@ GATE-00 では実装変更、provider probe、browser run、anvildev 比較を�
 | anvildev same-condition run | skipped | Local source refs plus deterministic fixtures cover the scoped planner lint/fail-fast semantics. Comparative anvildev/MVP run remains a final UAT004-GATE-09 responsibility. |
 | browser/manual evidence | skipped | GATE-02 does not close final browser readiness or interaction acceptance. Those remain G-S12/G-S16 work in GATE-05/GATE-08. |
 
+## UAT004-GATE-03 Trace Update
+
+| item | status | evidence |
+| --- | --- | --- |
+| source refs inspected | complete | `src/agent/loop_run/node_request_helpers.rs`, `node_runner_manifest.rs`, `project_probe.rs`, `project_verifier.rs`, `verifier_command_policy.rs`, `node_test_evidence_quality.rs`, `actor_loop_flow.rs` |
+| MVP refs changed | complete | `mvp/anvilminimal/src/planner/lint.rs`, `mvp/anvilminimal/src/planner/verify.rs`, `mvp/anvilminimal/src/minimal_loop/build_verifier.rs` |
+| G-S09 lifecycle evidence | source-equivalent local fixture | Dependency lifecycle fixtures cover setup blocked, setup allowed, deterministic Node test-runner manifest completion without network, build/test rerun, and verification pass/fail. New fixtures add missing `package.json` boundary for existing Next.js entrypoint and Node test artifact so planner lint does not absorb manifest/dependency missing. |
+| G-S08 verify policy evidence | source-equivalent local fixture | `planner/verify.rs` positive/negative fixtures were rerun: shell control, setup/dev-server, workspace escape, and unsafe planner split remain rejected; safe npm/cargo/python verifier shapes remain accepted. |
+| setup-only / manifest-only boundary | preserved | Existing `manifest_only_nextjs_build_verify_is_not_success`, `minimal_loop_nextjs_required_paths_only_does_not_complete`, `plan_run_nextjs_game_setup_only_fails_inferred_obligation`, and setup/scaffold negative evidence fixtures continue to prevent setup-only/manifest-only completion. |
+| required local tests | passed | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`: passed with 438 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval`: 222 passed, 1 skipped |
+| network install | skipped | No real network install was executed. Setup execution remains guarded by `NodeDependencySetupAuthority`, package manager/workspace state, package contract, and profile contract; allowed setup fixtures use fake/local deterministic setup or manifest materialization. |
+| source/anvildev same-condition run | skipped | Local source refs plus deterministic lifecycle fixtures cover GATE-03 scope. Full comparative source/MVP run remains UAT004-GATE-09. |
+| browser/manual evidence | skipped | GATE-03 does not close final browser readiness or interaction acceptance; G-S12/G-S16 remain later gates. |
+
 ## Skip Evidence
 
 | skipped item | reason | impact | next action |
