@@ -6,6 +6,81 @@ use serde_json::json;
 use crate::config::Config;
 use crate::providers::ChatClient;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiTerminalStatus {
+    Completed,
+    Failed,
+    Aborted,
+    Interrupted,
+}
+
+impl TuiTerminalStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Aborted => "aborted",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    fn ok(self) -> bool {
+        self == Self::Completed
+    }
+
+    fn failure_kind(self) -> &'static str {
+        match self {
+            Self::Completed => "",
+            Self::Failed => "tui_command_failed",
+            Self::Aborted => "tui_command_aborted",
+            Self::Interrupted => "tui_command_interrupted",
+        }
+    }
+}
+
+struct TuiCommandCompletionGuard {
+    config: Config,
+    command: String,
+    finalized: bool,
+}
+
+impl TuiCommandCompletionGuard {
+    fn new(config: &Config, command: &str) -> Self {
+        Self {
+            config: config.clone(),
+            command: command.to_string(),
+            finalized: false,
+        }
+    }
+
+    fn finalize(
+        mut self,
+        result: &anyhow::Result<String>,
+        status: TuiTerminalStatus,
+    ) -> crate::eval_events::CompletionProjection {
+        let completion =
+            emit_tui_command_stop_with_status(&self.config, &self.command, result, status);
+        self.finalized = true;
+        completion
+    }
+}
+
+impl Drop for TuiCommandCompletionGuard {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        let result: anyhow::Result<String> =
+            Err(anyhow::anyhow!("command aborted before completion"));
+        let _ = emit_tui_command_stop_with_status(
+            &self.config,
+            &self.command,
+            &result,
+            TuiTerminalStatus::Aborted,
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSlash {
     pub command: String,
@@ -51,6 +126,7 @@ pub fn handle_command(
             "goal": crate::eval_events::body_snippet(&parsed.goal),
         }),
     );
+    let completion_guard = TuiCommandCompletionGuard::new(&config, &parsed.command);
     let result = (|| match parsed.command.as_str() {
         "/plan-steps" => {
             let plan =
@@ -90,7 +166,8 @@ pub fn handle_command(
         ),
         other => bail!("unknown slash command: {other}"),
     })();
-    let completion = emit_tui_command_stop(&config, &parsed.command, &result);
+    let terminal_status = terminal_status_for_result(&result, ui);
+    let completion = completion_guard.finalize(&result, terminal_status);
     if let Err(err) = &result {
         eprintln!(
             "{}",
@@ -109,22 +186,28 @@ pub fn handle_command(
     result.map(|output| crate::eval_events::render_tui_completion_output(&output, &completion))
 }
 
+#[cfg(test)]
 fn emit_tui_command_stop(
     config: &Config,
     command: &str,
     result: &anyhow::Result<String>,
 ) -> crate::eval_events::CompletionProjection {
-    let (ok, failure_kind, stop_reason) = match result {
-        Ok(_) => (true, "", "completed".to_string()),
-        Err(err) => (
-            false,
-            "tui_command_failed",
-            crate::eval_events::body_snippet(&err.to_string()),
-        ),
-    };
+    emit_tui_command_stop_with_status(config, command, result, status_without_ui(result))
+}
+
+fn emit_tui_command_stop_with_status(
+    config: &Config,
+    command: &str,
+    result: &anyhow::Result<String>,
+    terminal_status: TuiTerminalStatus,
+) -> crate::eval_events::CompletionProjection {
+    let ok = terminal_status.ok();
+    let failure_kind = terminal_status.failure_kind();
+    let stop_reason = stop_reason_for_result(result, terminal_status);
     let completion_snapshot =
         crate::eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
     let completion = crate::eval_events::project_completion(ok, &completion_snapshot);
+    let event_projection = event_projection_for_terminal_status(&completion, terminal_status);
     crate::eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -132,16 +215,17 @@ fn emit_tui_command_stop(
             "lifecycle_stage": "tui_command",
             "command": command,
             "ok": ok,
+            "status": terminal_status.as_str(),
             "build_commit": crate::build_info::COMMIT,
             "build_dirty": crate::build_info::dirty(),
             "build_timestamp": crate::build_info::TIMESTAMP,
             "failure_kind": failure_kind,
             "stop_reason": stop_reason,
             "completion_status": &completion.status,
-            "task_status": &completion.task_status,
+            "task_status": &event_projection.task_status,
             "session_status": "repl_ready",
             "repl_status": "ready",
-            "command_completion_state": &completion.command_completion,
+            "command_completion_state": &event_projection.command_completion,
             "runtime_acceptance_status": &completion.runtime_acceptance,
             "final_acceptance_status": &completion.final_acceptance,
             "release_gate_status": &completion.release_gate,
@@ -157,8 +241,8 @@ fn emit_tui_command_stop(
             "interaction_evidence_status": &completion.interaction_evidence,
             "interaction_evidence_path": &completion.interaction_evidence_path,
             "release_quality_completion": &completion.release_quality_completion,
-            "next_action": &completion.next_action,
-            "recovery_next_action": &completion.next_action,
+            "next_action": &event_projection.next_action,
+            "recovery_next_action": &event_projection.next_action,
             "recovery_prompt_path": &completion.recovery_prompt_path,
             "recovery_ultra_plan_path": &completion.recovery_ultra_plan_path,
             "suggested_recovery_command": &completion.suggested_recovery_command,
@@ -171,13 +255,12 @@ fn emit_tui_command_stop(
             "planner_release_risk": completion.planner_release_risk,
         }),
     );
-    crate::eval_events::append_completion_summary(
+    crate::eval_events::write_tui_command_completion_summary(
         config.eval_events_path.as_deref(),
-        "tui_command",
-        None,
-        Some(command),
+        command,
         &stop_reason,
         failure_kind,
+        terminal_status.as_str(),
         &completion,
     );
     if !ok {
@@ -191,7 +274,68 @@ fn emit_tui_command_stop(
             }),
         );
     }
-    completion
+    if ok { completion } else { event_projection }
+}
+
+fn terminal_status_for_result(
+    result: &anyhow::Result<String>,
+    ui: &dyn crate::tui::InteractionUi,
+) -> TuiTerminalStatus {
+    match result {
+        Ok(_) => TuiTerminalStatus::Completed,
+        Err(err) if ui.interrupted() || error_is_interrupted(err) => TuiTerminalStatus::Interrupted,
+        Err(_) => TuiTerminalStatus::Failed,
+    }
+}
+
+#[cfg(test)]
+fn status_without_ui(result: &anyhow::Result<String>) -> TuiTerminalStatus {
+    match result {
+        Ok(_) => TuiTerminalStatus::Completed,
+        Err(err) if error_is_interrupted(err) => TuiTerminalStatus::Interrupted,
+        Err(_) => TuiTerminalStatus::Failed,
+    }
+}
+
+fn stop_reason_for_result(
+    result: &anyhow::Result<String>,
+    terminal_status: TuiTerminalStatus,
+) -> String {
+    match result {
+        Ok(_) => "completed".to_string(),
+        Err(err) => {
+            let reason = crate::eval_events::body_snippet(&err.to_string());
+            if terminal_status == TuiTerminalStatus::Interrupted && reason.trim().is_empty() {
+                "interrupted by user".to_string()
+            } else {
+                reason
+            }
+        }
+    }
+}
+
+fn error_is_interrupted(err: &anyhow::Error) -> bool {
+    err.to_string().contains("interrupted by user")
+}
+
+fn event_projection_for_terminal_status(
+    completion: &crate::eval_events::CompletionProjection,
+    terminal_status: TuiTerminalStatus,
+) -> crate::eval_events::CompletionProjection {
+    let mut projection = completion.clone();
+    if terminal_status == TuiTerminalStatus::Completed {
+        return projection;
+    }
+    projection.status = terminal_status.as_str().to_string();
+    projection.command_completion = terminal_status.as_str().to_string();
+    projection.task_status = terminal_status.as_str().to_string();
+    projection.next_action = match terminal_status {
+        TuiTerminalStatus::Interrupted => "resume_or_rerun_command".to_string(),
+        TuiTerminalStatus::Aborted => "inspect_summary_and_resume_or_rerun".to_string(),
+        TuiTerminalStatus::Failed => "fix_command_failure".to_string(),
+        TuiTerminalStatus::Completed => projection.next_action,
+    };
+    projection
 }
 
 pub fn parse_profile_style(args: &[String], config: &Config) -> (String, String, Vec<String>) {

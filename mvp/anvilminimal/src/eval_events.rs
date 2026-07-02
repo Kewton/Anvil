@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -415,6 +415,31 @@ pub fn append_completion_summary(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn write_tui_command_completion_summary(
+    path: Option<&Path>,
+    command: &str,
+    stop_reason: &str,
+    failure_kind: &str,
+    terminal_status: &str,
+    projection: &CompletionProjection,
+) {
+    let events = read_event_values(path);
+    let previous_summary = read_run_summary(path).unwrap_or_default();
+    write_run_summary(
+        path,
+        &render_tui_command_completion_summary(
+            command,
+            stop_reason,
+            failure_kind,
+            terminal_status,
+            projection,
+            &events,
+            &previous_summary,
+        ),
+    );
+}
+
 pub fn render_tui_completion_output(output: &str, projection: &CompletionProjection) -> String {
     if projection.release_gate == "not_applicable"
         && projection.final_acceptance == "not_checked"
@@ -650,6 +675,226 @@ fn summary_section_count(text: &str, header: &str) -> Option<usize> {
         }
     }
     saw_bullet.then_some(count)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PhaseBreakdown {
+    completed: Vec<String>,
+    failed: Vec<String>,
+    pending: Vec<String>,
+}
+
+impl PhaseBreakdown {
+    fn is_empty(&self) -> bool {
+        self.completed.is_empty() && self.failed.is_empty() && self.pending.is_empty()
+    }
+}
+
+fn phase_breakdown_for_tui_summary(
+    events: &[Value],
+    previous_summary: &str,
+    terminal_status: &str,
+) -> PhaseBreakdown {
+    let mut breakdown = phase_breakdown_from_events(events, terminal_status);
+    let previous = phase_breakdown_from_summary(previous_summary);
+    if breakdown.is_empty() {
+        return previous;
+    }
+    if breakdown.completed.is_empty() {
+        breakdown.completed = previous.completed;
+    }
+    if breakdown.failed.is_empty() {
+        breakdown.failed = previous.failed;
+    }
+    if breakdown.pending.is_empty() {
+        breakdown.pending = previous.pending;
+    }
+    breakdown
+}
+
+fn phase_breakdown_from_events(events: &[Value], terminal_status: &str) -> PhaseBreakdown {
+    let mut completed = Vec::new();
+    let mut failed = Vec::new();
+    let mut explicit_completed: Option<Vec<String>> = None;
+    let mut explicit_pending: Option<Vec<String>> = None;
+    let mut started_by_index = BTreeMap::new();
+    let mut total_phases: Option<usize> = None;
+    let mut last_phase: Option<String> = None;
+    let mut last_index: Option<usize> = None;
+
+    for event in events {
+        let name = event.get("event").and_then(Value::as_str).unwrap_or("");
+        if let Some(total) = event.get("total_phases").and_then(Value::as_u64) {
+            total_phases = Some(total as usize);
+        }
+        let index = event
+            .get("phase_index")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize);
+        let phase = event
+            .get("phase_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        if name.starts_with("ultra_phase_")
+            && let Some(phase) = phase.clone()
+        {
+            last_phase = Some(phase.clone());
+            if let Some(index) = index {
+                last_index = Some(index);
+                started_by_index.entry(index).or_insert(phase);
+            }
+        }
+
+        match name {
+            "ultra_phase_complete" => {
+                if let Some(phase) = phase {
+                    push_unique_phase(&mut completed, phase);
+                }
+            }
+            "ultra_phase_failed" => {
+                if let Some(phase) = phase {
+                    push_unique_phase(&mut failed, phase);
+                }
+            }
+            _ => {}
+        }
+
+        let completed_ids = string_array_field(event, "completed_phase_ids");
+        if !completed_ids.is_empty() {
+            explicit_completed = Some(completed_ids);
+        }
+        let pending_ids = string_array_field(event, "pending_phase_ids");
+        if !pending_ids.is_empty()
+            || event
+                .get("pending_phase_ids")
+                .and_then(Value::as_array)
+                .is_some()
+        {
+            explicit_pending = Some(pending_ids);
+        }
+        for key in ["failed_phase_id", "failed_phase"] {
+            if let Some(value) = event
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(clean_phase_value)
+            {
+                push_unique_phase(&mut failed, value);
+            }
+        }
+    }
+
+    if let Some(values) = explicit_completed {
+        completed = values;
+    }
+    let mut pending = explicit_pending.unwrap_or_default();
+
+    if terminal_status != "completed"
+        && failed.is_empty()
+        && let Some(phase) = last_phase.as_ref()
+        && !contains_phase(&completed, phase)
+    {
+        push_unique_phase(&mut failed, phase.clone());
+    }
+
+    if pending.is_empty()
+        && terminal_status != "completed"
+        && let (Some(total), Some(index)) = (total_phases, last_index)
+    {
+        for pending_index in index.saturating_add(1)..=total {
+            let value = started_by_index
+                .get(&pending_index)
+                .cloned()
+                .unwrap_or_else(|| format!("phase {pending_index}"));
+            push_unique_phase(&mut pending, value);
+        }
+    }
+
+    if pending.is_empty()
+        && terminal_status == "completed"
+        && let Some(total) = total_phases
+    {
+        for pending_index in 1..=total {
+            let value = started_by_index
+                .get(&pending_index)
+                .cloned()
+                .unwrap_or_else(|| format!("phase {pending_index}"));
+            if !contains_phase(&completed, &value) && !contains_phase(&failed, &value) {
+                push_unique_phase(&mut pending, value);
+            }
+        }
+    }
+
+    PhaseBreakdown {
+        completed,
+        failed,
+        pending,
+    }
+}
+
+fn phase_breakdown_from_summary(text: &str) -> PhaseBreakdown {
+    let mut failed = summary_section_items(text, "Failed phases:");
+    if failed.is_empty() {
+        failed = summary_section_items(text, "Failed phase:");
+    }
+    PhaseBreakdown {
+        completed: summary_section_items(text, "Completed phases:"),
+        failed,
+        pending: summary_section_items(text, "Pending phases:"),
+    }
+}
+
+fn summary_section_items(text: &str, header: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut items = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if trimmed.is_empty() || (trimmed.ends_with(':') && !trimmed.starts_with("- ")) {
+            break;
+        }
+        if let Some(value) = phase_from_bullet(trimmed) {
+            push_unique_phase(&mut items, value);
+        }
+    }
+    items
+}
+
+fn string_array_field(event: &Value, key: &str) -> Vec<String> {
+    event
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            let mut values = Vec::new();
+            for item in items {
+                if let Some(value) = item.as_str().and_then(clean_phase_value) {
+                    push_unique_phase(&mut values, value);
+                }
+            }
+            values
+        })
+        .unwrap_or_default()
+}
+
+fn push_unique_phase(values: &mut Vec<String>, value: String) {
+    let Some(value) = clean_phase_value(&value) else {
+        return;
+    };
+    if !contains_phase(values, &value) {
+        values.push(value);
+    }
+}
+
+fn contains_phase(values: &[String], value: &str) -> bool {
+    values.iter().any(|existing| existing == value)
 }
 
 fn failed_phase_from_summary(text: &str) -> Option<String> {
@@ -1187,6 +1432,83 @@ fn render_completion_summary(
         ));
     }
     lines.join("\n")
+}
+
+fn render_tui_command_completion_summary(
+    command: &str,
+    stop_reason: &str,
+    failure_kind: &str,
+    terminal_status: &str,
+    projection: &CompletionProjection,
+    events: &[Value],
+    previous_summary: &str,
+) -> String {
+    let mut summary_projection = projection.clone();
+    summary_projection.status = terminal_status.to_string();
+    summary_projection.command_completion = terminal_status.to_string();
+    if terminal_status != "completed" {
+        summary_projection.task_status = terminal_status.to_string();
+        summary_projection.next_action = match terminal_status {
+            "interrupted" => "resume_or_rerun_command".to_string(),
+            "aborted" => "inspect_summary_and_resume_or_rerun".to_string(),
+            _ => "fix_command_failure".to_string(),
+        };
+    }
+    let mut lines = render_completion_summary(
+        "tui_command",
+        None,
+        Some(command),
+        stop_reason,
+        failure_kind,
+        &summary_projection,
+    )
+    .lines()
+    .map(ToOwned::to_owned)
+    .collect::<Vec<_>>();
+    let insert_at = lines
+        .iter()
+        .position(|line| line.starts_with("Lifecycle:"))
+        .unwrap_or(lines.len());
+    lines.insert(
+        insert_at,
+        format!("Completion status: {}", projection.status),
+    );
+    lines.push(String::new());
+    lines.push(render_phase_breakdown_for_summary(
+        &phase_breakdown_for_tui_summary(events, previous_summary, terminal_status),
+        terminal_status,
+    ));
+    lines.join("\n")
+}
+
+fn render_phase_breakdown_for_summary(breakdown: &PhaseBreakdown, terminal_status: &str) -> String {
+    let failed_status = match terminal_status {
+        "aborted" | "interrupted" => terminal_status,
+        _ => "failed",
+    };
+    [
+        "Completed phases:".to_string(),
+        render_phase_bullets_with_status(&breakdown.completed, "completed"),
+        String::new(),
+        "Failed phases:".to_string(),
+        render_phase_bullets_with_status(&breakdown.failed, failed_status),
+        String::new(),
+        "Pending phases:".to_string(),
+        render_phase_bullets_with_status(&breakdown.pending, "pending"),
+    ]
+    .join("\n")
+}
+
+fn render_phase_bullets_with_status(items: &[String], status: &str) -> String {
+    if items.is_empty() {
+        "- none".to_string()
+    } else {
+        items
+            .iter()
+            .map(|item| format!("- {item} ({status})"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 fn session_status(lifecycle_stage: &str) -> &'static str {

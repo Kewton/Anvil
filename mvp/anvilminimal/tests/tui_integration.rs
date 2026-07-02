@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anvilminimal::config::{Action, Config, Provider};
 use anvilminimal::minimal_loop::loop_run::run_session_with_required_paths_with_ui;
@@ -110,6 +110,119 @@ impl InteractionUi for FakeUi {
     fn interrupted(&self) -> bool {
         self.interrupted.load(Ordering::SeqCst)
     }
+}
+
+struct InterruptAfterUi {
+    events: Mutex<Vec<String>>,
+    checks: AtomicUsize,
+    interrupt_after: usize,
+}
+
+impl InterruptAfterUi {
+    fn new(interrupt_after: usize) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            checks: AtomicUsize::new(0),
+            interrupt_after,
+        }
+    }
+}
+
+impl InteractionUi for InterruptAfterUi {
+    fn before_model_call(&self, label: &str) -> UiGuard {
+        self.events.lock().unwrap().push(format!("model:{label}"));
+        UiGuard::noop()
+    }
+
+    fn before_tool_call(&self, name: &str) -> UiGuard {
+        self.events.lock().unwrap().push(format!("tool:{name}"));
+        UiGuard::noop()
+    }
+
+    fn publish_status(&self, status: UiStatus) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("status:{}:{}", status.provider, status.model));
+    }
+
+    fn interrupted(&self) -> bool {
+        self.checks.fetch_add(1, Ordering::SeqCst) >= self.interrupt_after
+    }
+}
+
+fn tui_command_stop_events(text: &str) -> Vec<serde_json::Value> {
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event
+                .get("event")
+                .and_then(|value| value.as_str())
+                .is_some_and(|name| name == "tui_command_stop")
+        })
+        .collect()
+}
+
+fn assert_exactly_one_tui_stop(text: &str, status: &str) {
+    let stops = tui_command_stop_events(text);
+    assert_eq!(stops.len(), 1, "{text}");
+    assert_eq!(
+        stops[0].get("status").and_then(|value| value.as_str()),
+        Some(status),
+        "{text}"
+    );
+}
+
+fn assert_terminal_summary(summary: &str, status: &str) {
+    assert!(
+        summary.starts_with(&format!("{}\n", anvilminimal::build_info::summary_line())),
+        "{summary}"
+    );
+    let expected = format!("Status: {status}");
+    assert_eq!(
+        summary.lines().find(|line| line.starts_with("Status: ")),
+        Some(expected.as_str()),
+        "{summary}"
+    );
+    assert!(!summary.contains("Status: running"), "{summary}");
+}
+
+fn two_phase_ultra_plan() -> anvilminimal::planner::ultra_plan::UltraPlan {
+    anvilminimal::planner::ultra_plan::UltraPlan {
+        goal: "build app".to_string(),
+        profile: "generic".to_string(),
+        style: "default".to_string(),
+        intent: "create".to_string(),
+        phases: vec![
+            anvilminimal::planner::ultra_plan::UltraPhase {
+                id: "p1".to_string(),
+                prompt: "phase 1".to_string(),
+            },
+            anvilminimal::planner::ultra_plan::UltraPhase {
+                id: "p2".to_string(),
+                prompt: "phase 2".to_string(),
+            },
+        ],
+    }
+}
+
+fn write_ultra_plan(root: &std::path::Path) -> String {
+    let path = root.join("ultra.yaml");
+    std::fs::write(
+        &path,
+        anvilminimal::planner::ultra_plan::render_ultra_plan(&two_phase_ultra_plan()),
+    )
+    .unwrap();
+    "ultra.yaml".to_string()
+}
+
+fn implement_step_plan_json() -> String {
+    let mut step_plan = anvilminimal::planner::step_plan::StepPlan::single("write app");
+    step_plan.steps[0].kind = "implement".to_string();
+    step_plan.steps[0]
+        .expected_paths
+        .push("app.txt".to_string());
+    serde_json::to_string(&step_plan).unwrap()
 }
 
 #[test]
@@ -305,7 +418,7 @@ fn tui_slash_failure_records_run_events_and_failure_stage() {
     assert!(err.contains("unknown slash command"));
     let events = std::fs::read_to_string(&events_path).unwrap();
     assert!(events.contains("\"event\":\"tui_command_start\""));
-    assert!(events.contains("\"event\":\"tui_command_stop\""));
+    assert_exactly_one_tui_stop(&events, "failed");
     assert!(events.contains("\"event\":\"loop_stop\""));
     assert!(events.contains("\"failure_kind\":\"tui_command_failed\""));
     assert!(events.contains("\"lifecycle_stage\":\"tui_command\""));
@@ -315,7 +428,8 @@ fn tui_slash_failure_records_run_events_and_failure_stage() {
     assert!(events.contains("\"recovery_next_action\":\"fix_command_failure\""));
     let summary =
         std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
-    assert!(summary.contains("Status: incomplete"));
+    assert_terminal_summary(&summary, "failed");
+    assert!(summary.contains("Completion status: incomplete"));
     assert!(summary.contains("Command status: failed"));
     assert!(summary.contains("Task status: failed"));
     assert!(summary.contains("Session/REPL status: repl_ready"));
@@ -325,7 +439,7 @@ fn tui_slash_failure_records_run_events_and_failure_stage() {
 }
 
 #[test]
-fn tui_slash_failure_appends_to_existing_partial_summary() {
+fn tui_slash_failure_rewrites_existing_partial_summary_with_phase_breakdown() {
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let mut cfg = config(dir.path().to_path_buf());
@@ -349,9 +463,9 @@ fn tui_slash_failure_appends_to_existing_partial_summary() {
     assert!(err.contains("unknown slash command"));
     let summary =
         std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
-    assert!(summary.contains("Status: incomplete"));
-    assert!(summary.contains("Completed phases:\n- scaffold"));
-    assert!(summary.contains("Failed phase:\n- final"));
+    assert_terminal_summary(&summary, "failed");
+    assert!(summary.contains("Completed phases:\n- scaffold (completed)"));
+    assert!(summary.contains("Failed phases:\n- final (failed)"));
     assert!(summary.contains("Pending phases:\n- none"));
     assert!(summary.contains("Recovery next action:"));
     assert!(summary.contains("TUI command failed"));
@@ -407,13 +521,15 @@ fn tui_slash_success_with_partial_release_gate_is_not_complete_only() {
     ));
     let events = std::fs::read_to_string(&events_path).unwrap();
     assert!(events.contains("\"event\":\"tui_command_stop\""));
+    assert_exactly_one_tui_stop(&events, "completed");
     assert!(events.contains("\"completion_status\":\"complete_with_partial_release_gate\""));
     assert!(events.contains("\"task_status\":\"partial\""));
     assert!(events.contains("\"session_status\":\"repl_ready\""));
     assert!(events.contains("\"release_gate_status\":\"partial\""));
     let summary =
         std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
-    assert!(summary.contains("Status: complete_with_partial_release_gate"));
+    assert_terminal_summary(&summary, "completed");
+    assert!(summary.contains("Completion status: complete_with_partial_release_gate"));
     assert!(summary.contains("Session/REPL status: repl_ready"));
     assert!(summary.contains("Command status: completed"));
     assert!(summary.contains("Command completion: completed"));
@@ -424,7 +540,140 @@ fn tui_slash_success_with_partial_release_gate_is_not_complete_only() {
     assert!(summary.contains(
         "Suggested YAML command: /run-ultra-plan .anvil/plans/recovery-ultra-plan-release.yaml"
     ));
-    assert!(!summary.contains("\nStatus: complete\nCommand completion: completed"));
+    assert!(!summary.contains("\nStatus: running\n"));
+}
+
+#[test]
+fn tui_slash_completion_guard_records_aborted_on_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    let mut planner = FakeClient::new("planner", Vec::new());
+    let mut execution = FakeClient::new("exec", Vec::new());
+    let ui = FakeUi::default();
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = anvilminimal::tui::slash::handle_command(
+            "/plan-steps panic",
+            &cfg,
+            &mut planner,
+            &mut execution,
+            &ui,
+        );
+    }));
+    assert!(panic.is_err());
+
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    assert!(events.contains("\"event\":\"tui_command_start\""));
+    assert_exactly_one_tui_stop(&events, "aborted");
+    assert!(events.contains("\"failure_kind\":\"tui_command_aborted\""));
+    let summary =
+        std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
+    assert_terminal_summary(&summary, "aborted");
+    assert!(summary.contains("Command status: aborted"));
+    assert!(summary.contains("Failure kind: tui_command_aborted"));
+    assert!(summary.contains("Completed phases:\n- none"));
+    assert!(summary.contains("Failed phases:\n- none"));
+    assert!(summary.contains("Pending phases:\n- none"));
+}
+
+#[test]
+fn tui_slash_completion_guard_records_interrupted_mid_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+    let plan_path = write_ultra_plan(dir.path());
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    let step_json = implement_step_plan_json();
+    let mut planner = FakeClient::new("planner", vec![AssistantReply::text(step_json)]);
+    let mut execution = FakeClient::new("exec", Vec::new());
+    let ui = InterruptAfterUi::new(2);
+
+    let err = anvilminimal::tui::slash::handle_command(
+        &format!("/run-ultra-plan {plan_path}"),
+        &cfg,
+        &mut planner,
+        &mut execution,
+        &ui,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("interrupted by user"), "{err}");
+
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    assert!(events.contains("\"event\":\"ultra_phase_start\""));
+    assert!(events.contains("\"event\":\"ultra_phase_failed\""));
+    assert_exactly_one_tui_stop(&events, "interrupted");
+    assert!(events.contains("\"failure_kind\":\"tui_command_interrupted\""));
+    let summary =
+        std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
+    assert_terminal_summary(&summary, "interrupted");
+    assert!(summary.contains("Command status: interrupted"));
+    assert!(summary.contains("Failed phases:\n- p1 (interrupted)"));
+    assert!(summary.contains("Pending phases:\n- p2 (pending)"));
+}
+
+#[test]
+fn tui_slash_ultra_plan_completion_records_phase_breakdown_and_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+    let plan_path = write_ultra_plan(dir.path());
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    let step_json = implement_step_plan_json();
+    let mut planner = FakeClient::new(
+        "planner",
+        vec![
+            AssistantReply::text(step_json.clone()),
+            AssistantReply::text(step_json),
+        ],
+    );
+    let mut execution = FakeClient::new(
+        "exec",
+        vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"app.txt","content":"phase1"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"app.txt","content":"phase2"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ],
+    );
+    let ui = FakeUi::default();
+
+    let output = anvilminimal::tui::slash::handle_command(
+        &format!("/run-ultra-plan {plan_path}"),
+        &cfg,
+        &mut planner,
+        &mut execution,
+        &ui,
+    )
+    .unwrap();
+    assert!(output.contains("ultra-plan-run complete: 2 phases"));
+
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    assert!(events.contains("\"event\":\"ultra_final_acceptance\""));
+    assert_exactly_one_tui_stop(&events, "completed");
+    let summary =
+        std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
+    assert_terminal_summary(&summary, "completed");
+    assert!(summary.contains("Completed phases:\n- p1 (completed)\n- p2 (completed)"));
+    assert!(summary.contains("Failed phases:\n- none"));
+    assert!(summary.contains("Pending phases:\n- none"));
+    assert!(summary.contains("Final acceptance: full_success"));
 }
 
 #[test]
