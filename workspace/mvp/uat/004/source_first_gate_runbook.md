@@ -99,6 +99,20 @@ UAT004 の各 gate で、実行した検証、skip evidence、rollback 条件、
 | full source port escalation | not required for G-S07/G-S15; no provider/tool diff remained after XML fallback parity and live provider probe evidence. |
 | rollback guard | do not treat provider parse/network/HTTP failures as runtime success; do not recover workspace escapes, hidden metadata access, or dangerous shell commands; do not close provider-sensitive changes with fake fixtures alone. |
 
+## UAT004-GATE-08 Run Record
+
+| item | result |
+| --- | --- |
+| source refs | `src/agent/loop_run/summary.rs`, `safe_stop_emit.rs`, `safe_stop_payload.rs`, `emit_verifier_events.rs` |
+| MVP refs | `mvp/anvilminimal/src/eval_events.rs`, `src/lib.rs`, `src/tui/slash.rs`, `scripts/eval_lib/runtime_trace.py`, `tests/tui_integration.rs`, `tests/eval/test_runtime_semantics_trace.py` |
+| implementation | Completion projection now renders and emits command status, task status, session/REPL status, and recovery next action separately. `run_stop` and `tui_command_stop` carry `task_status`, `session_status`, `repl_status`, and `recovery_next_action`; source safe-stop/verifier diagnostic events are normalized into G-S14 trace. |
+| normalized comparison | `workspace/mvp/uat/004/gate08_trace/runtime-semantics-trace-diff.json` has same-condition `match`; G-S14 and G-S16 both pass with `source_and_mvp_gate_observed`. Other gates are intentionally unobserved in this scoped trace and remain covered by their own gate artifacts. |
+| manual/TUI evidence | `workspace/mvp/uat/004/gate08_trace/manual_tui_run/.anvil/runs/gate08-manual/events.jsonl` and `summary.md` prove events are stored under `.anvil/runs/<run-id>/events.jsonl`, failed task status is not overwritten by `repl_ready`, and recovery YAML path plus suggested command are present. |
+| targeted fixtures | `tui_slash_failure_records_run_events_and_failure_stage`, `tui_slash_success_with_partial_release_gate_is_not_complete_only`, `run_lifecycle_records_incomplete_stop_reason`, `run_lifecycle_writes_events_and_summary_for_tui_exit`, `test_source_and_mvp_diagnostics_trace_can_pass_gs14`, `test_run_start_without_eval_override_is_manual_trace_evidence` |
+| verification | `cargo fmt --manifest-path mvp/anvilminimal/Cargo.toml -- --check` passed; `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 446 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 227 passed / 1 skipped. Targeted GATE-08 Rust and runtime trace fixtures also passed. |
+| live manual UAT | deferred to GATE-09. GATE-08 registers deterministic manual trace evidence; full terminal/browser/manual release UAT remains the final comparative gate. |
+| rollback guard | do not collapse command completion, task status, and REPL/session readiness into a single `complete` label; do not drop failure kind, stop reason, recovery next action, recovery YAML path, or suggested recovery command from events/summary. |
+
 ## Re-run Notes
 
 Before closing an implementation gate, update:

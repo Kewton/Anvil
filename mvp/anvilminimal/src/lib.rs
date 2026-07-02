@@ -152,6 +152,9 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "stop_reason": stop_reason,
             "failure_kind": failure_kind,
             "completion_status": &completion.status,
+            "task_status": &completion.task_status,
+            "session_status": "process_exited",
+            "repl_status": "not_applicable",
             "process_completion_state": &completion.command_completion,
             "command_completion_state": &completion.command_completion,
             "runtime_acceptance_status": &completion.runtime_acceptance,
@@ -170,6 +173,7 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "interaction_evidence_path": &completion.interaction_evidence_path,
             "release_quality_completion": &completion.release_quality_completion,
             "next_action": &completion.next_action,
+            "recovery_next_action": &completion.next_action,
             "recovery_prompt_path": &completion.recovery_prompt_path,
             "recovery_ultra_plan_path": &completion.recovery_ultra_plan_path,
             "suggested_recovery_command": &completion.suggested_recovery_command,
@@ -242,11 +246,17 @@ mod tests {
         let event_text = std::fs::read_to_string(&events).unwrap();
         assert!(event_text.contains("\"event\":\"run_start\""));
         assert!(event_text.contains("\"event\":\"run_stop\""));
+        assert!(event_text.contains("\"task_status\":\"complete\""));
+        assert!(event_text.contains("\"session_status\":\"process_exited\""));
+        assert!(event_text.contains("\"repl_status\":\"not_applicable\""));
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
         assert!(summary.contains("Status: running"));
         assert!(summary.contains("Action: Repl"));
         assert!(summary.contains("Status: complete"));
+        assert!(summary.contains("Command status: completed"));
         assert!(summary.contains("Command completion: completed"));
+        assert!(summary.contains("Task status: complete"));
+        assert!(summary.contains("Session/REPL status: process_exited"));
         assert!(summary.contains("Final acceptance: not_checked"));
         assert!(summary.contains("Stop reason: completed"));
     }
@@ -264,7 +274,11 @@ mod tests {
 
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
         assert!(summary.contains("Status: incomplete"));
+        assert!(summary.contains("Command status: failed"));
         assert!(summary.contains("Command completion: failed"));
+        assert!(summary.contains("Task status: failed"));
+        assert!(summary.contains("Session/REPL status: process_exited"));
+        assert!(summary.contains("Recovery next action: fix_command_failure"));
         assert!(summary.contains("Stop reason: boom"));
         assert!(summary.contains("Failure kind: process_failure"));
     }
@@ -297,9 +311,11 @@ mod tests {
         assert!(
             event_text.contains("\"completion_status\":\"complete_with_partial_release_gate\"")
         );
+        assert!(event_text.contains("\"task_status\":\"partial\""));
         assert!(event_text.contains("\"release_gate_status\":\"partial\""));
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
         assert!(summary.contains("Status: complete_with_partial_release_gate"));
+        assert!(summary.contains("Task status: partial"));
         assert!(summary.contains("Command completion: completed"));
         assert!(summary.contains("Runtime acceptance: pass"));
         assert!(summary.contains("Final acceptance: partial"));
@@ -339,9 +355,11 @@ mod tests {
 
         let event_text = std::fs::read_to_string(&events).unwrap();
         assert!(event_text.contains("\"completion_status\":\"incomplete_release_gate_failed\""));
+        assert!(event_text.contains("\"task_status\":\"failed\""));
         assert!(event_text.contains("\"browser_readiness_status\":\"failed:http_500\""));
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
         assert!(summary.contains("Status: incomplete_release_gate_failed"));
+        assert!(summary.contains("Task status: failed"));
         assert!(summary.contains("Release gate: failed"));
         assert!(summary.contains("- browser_readiness_failed:http_500"));
         assert!(!summary.contains("\nStatus: complete\nAction: Repl\nStop reason: completed"));

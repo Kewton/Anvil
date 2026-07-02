@@ -309,9 +309,19 @@ fn tui_slash_failure_records_run_events_and_failure_stage() {
     assert!(events.contains("\"event\":\"loop_stop\""));
     assert!(events.contains("\"failure_kind\":\"tui_command_failed\""));
     assert!(events.contains("\"lifecycle_stage\":\"tui_command\""));
+    assert!(events.contains("\"task_status\":\"failed\""));
+    assert!(events.contains("\"session_status\":\"repl_ready\""));
+    assert!(events.contains("\"repl_status\":\"ready\""));
+    assert!(events.contains("\"recovery_next_action\":\"fix_command_failure\""));
     let summary =
         std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
+    assert!(summary.contains("Status: incomplete"));
+    assert!(summary.contains("Command status: failed"));
+    assert!(summary.contains("Task status: failed"));
+    assert!(summary.contains("Session/REPL status: repl_ready"));
+    assert!(summary.contains("Recovery next action: fix_command_failure"));
     assert!(summary.contains("TUI command failed"));
+    assert!(!summary.contains("\nStatus: complete\n"));
 }
 
 #[test]
@@ -383,6 +393,7 @@ fn tui_slash_success_with_partial_release_gate_is_not_complete_only() {
     )
     .unwrap();
     assert!(output.contains("Command completion: completed"));
+    assert!(output.contains("Task status: partial"));
     assert!(output.contains("Runtime acceptance: pass"));
     assert!(output.contains("Final acceptance: partial"));
     assert!(output.contains("Release gate: partial"));
@@ -397,11 +408,16 @@ fn tui_slash_success_with_partial_release_gate_is_not_complete_only() {
     let events = std::fs::read_to_string(&events_path).unwrap();
     assert!(events.contains("\"event\":\"tui_command_stop\""));
     assert!(events.contains("\"completion_status\":\"complete_with_partial_release_gate\""));
+    assert!(events.contains("\"task_status\":\"partial\""));
+    assert!(events.contains("\"session_status\":\"repl_ready\""));
     assert!(events.contains("\"release_gate_status\":\"partial\""));
     let summary =
         std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
     assert!(summary.contains("Status: complete_with_partial_release_gate"));
+    assert!(summary.contains("Session/REPL status: repl_ready"));
+    assert!(summary.contains("Command status: completed"));
     assert!(summary.contains("Command completion: completed"));
+    assert!(summary.contains("Task status: partial"));
     assert!(summary.contains("Final acceptance: partial"));
     assert!(summary.contains("Release gate: partial"));
     assert!(summary.contains("Recovery handoff:"));

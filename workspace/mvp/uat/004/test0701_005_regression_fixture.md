@@ -240,6 +240,16 @@ Expected future behavior:
 | source XML fallback parity | `providers::xml_fallback` tests cover source-style named tags, `<function=...>`, inferred unambiguous tool names, closed unterminated blocks, relaxed JSON, and ambiguous inference rejection | source-style Ollama/XML fallback is recovered without loosening unsafe execution policy |
 | eval summary attachment | `test_provider_probe_results_are_recorded_in_dry_run_summary` verifies probe result paths, status, skipped count, recoverable count, unsafe path rejection, and unsafe shell-control rejection are recorded | provider probe skip/pass/fail evidence is connected to gate reporting |
 
+## UAT004-GATE-08 Executable Fixture Binding
+
+| baseline fixture | executable assertion | expected classification |
+| --- | --- | --- |
+| F-003 summary incomplete plus final complete | `run_lifecycle_records_incomplete_stop_reason`, `run_lifecycle_does_not_mask_partial_release_gate_as_complete`, `run_lifecycle_does_not_mask_browser_http_500_release_failure_as_complete`, and `tui_slash_failure_records_run_events_and_failure_stage` assert failed/partial lifecycle summaries do not end as unconditional `Status: complete` | regression fixed: command/process completion is separated from task/release status |
+| F-003 REPL ready overwrites task failure | `tui_slash_failure_records_run_events_and_failure_stage` asserts failed slash command events contain `task_status=failed`, `session_status=repl_ready`, and `repl_status=ready`, while summary shows `Task status: failed` and `Session/REPL status: repl_ready` | correct projection: REPL readiness is session status, not task completion |
+| F-002 recovery YAML path must remain visible | `tui_slash_success_with_partial_release_gate_is_not_complete_only` asserts `recovery_ultra_plan_path` and suggested YAML command remain in `tui_command_stop` events, rendered TUI output, and summary `Recovery handoff` block | recovery handoff path is machine-readable and user-visible |
+| G-S14 source diagnostics comparison | `test_source_and_mvp_diagnostics_trace_can_pass_gs14` normalizes source `agent.safe_stop.report` and MVP `run_stop` diagnostics, then compares reports with G-S14 `pass` | source diagnostics parity is based on trace evidence, not code reading alone |
+| G-S16 manual trace registration | `test_run_start_without_eval_override_is_manual_trace_evidence` and `gate08_trace/manual_tui_run/.anvil/runs/gate08-manual/events.jsonl` prove manual/TUI run events are registered under `.anvil/runs/<run-id>/events.jsonl` | silent exit or missing manual trace remains a gate failure |
+
 ## Fixture Reproduction Notes
 
 No new executable tests are created in GATE-00. The fixed baseline is document-level and must be converted into targeted automated fixtures in later gates.

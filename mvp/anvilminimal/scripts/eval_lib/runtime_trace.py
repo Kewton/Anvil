@@ -49,6 +49,9 @@ STAGE_TO_GATE_IDS: dict[str, list[str]] = {
 }
 
 SOURCE_EVENT_STAGE: dict[str, str] = {
+    "agent.safe_stop.report": "diagnostic_emitted",
+    "agent.verifier.external_import_rejected": "diagnostic_emitted",
+    "agent.verifier.invoked": "verify_started",
     "source_phase_context_observed": "phase_context_attached",
     "source_step_prompt_observed": "step_prompt_built",
     "task_contract_created": "contract_loaded",
@@ -500,9 +503,14 @@ def failure_kind_from_event(event: dict[str, Any], stage: str) -> str:
         "plan_output_failure_kind",
         "error_kind",
         "reason_kind",
+        "failure_type",
     ):
         value = event.get(key)
         if value not in {"", None}:
+            return str(value)
+    if stage in FAILURE_STAGES:
+        value = event.get("stop_reason")
+        if value not in {"", None, "completed"}:
             return str(value)
     if stage == "verify_failed":
         return "verify_failed"
@@ -537,6 +545,19 @@ def safe_event_details(event: dict[str, Any]) -> dict[str, Any]:
         "recent_verify_failure_count",
         "recent_repair_changed_path_count",
         "unresolved_repair_target_count",
+        "completion_status",
+        "command_completion_state",
+        "process_completion_state",
+        "task_status",
+        "session_status",
+        "repl_status",
+        "next_action",
+        "recovery_next_action",
+        "stop_reason",
+        "failure_type",
+        "blocker_class",
+        "authority_status",
+        "next_user_action",
         "has_previous_context",
         "has_prior_conversation_context",
         "has_ultra_goal",

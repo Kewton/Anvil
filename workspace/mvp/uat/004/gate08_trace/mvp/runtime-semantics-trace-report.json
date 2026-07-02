@@ -1,0 +1,28 @@
+{
+  "binary_kind": "mvp-anvilminimal",
+  "binary_path": "mvp-anvilminimal",
+  "gate_counts": {
+    "G-S01": 1,
+    "G-S14": 1,
+    "G-S16": 3
+  },
+  "manifest_rows": [
+    {
+      "mode": "ultra-plan-run",
+      "provider_model_pair": "openai:gpt planner=gemini:flash",
+      "scenario": "manual-tui-diagnostics",
+      "suite": "uat004-gate08"
+    }
+  ],
+  "normalized_event_count": 5,
+  "normalized_event_sequence_path": "workspace/mvp/uat/004/gate08_trace/mvp/runtime-semantics-normalized-events.jsonl",
+  "run_root": "workspace/mvp/uat/004/gate08_trace",
+  "schema_version": "1",
+  "stage_counts": {
+    "diagnostic_emitted": 1,
+    "manual_tui_trace_recorded": 3,
+    "request_understood": 1
+  },
+  "subject": "mvp-anvilminimal",
+  "trace_id": "uat004-gate08-mvp-tui-diagnostics"
+}

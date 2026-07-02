@@ -89,6 +89,81 @@ class RuntimeSemanticsTraceTest(unittest.TestCase):
         manual = next(event for event in normalized if event["stage"] == "manual_tui_trace_recorded")
         self.assertEqual(manual["gate_ids"], ["G-S16"])
 
+    def test_source_and_mvp_diagnostics_trace_can_pass_gs14(self):
+        rows = [
+            {
+                "suite": "s",
+                "scenario": "diagnostic",
+                "mode": "ultra-plan-run",
+                "provider_model_pair": "openai:gpt planner=gemini:flash",
+            }
+        ]
+        source_events = normalize_events(
+            [
+                {
+                    "event": "agent.safe_stop.report",
+                    "run_id": "diagnostic",
+                    "stop_reason": "repair_exhausted",
+                    "failure_type": "repair_exhausted",
+                    "blocker_class": "repair_convergence",
+                    "authority_status": "repair_authority_or_progress_not_established",
+                    "next_user_action": "inspect diagnostics and retry",
+                }
+            ],
+            subject="source-anvildev",
+        )
+        mvp_events = normalize_events(
+            [
+                {
+                    "event": "loop_stop",
+                    "run_id": "diagnostic",
+                    "reason": "repair_exhausted",
+                    "primary_reason": "repair_exhausted",
+                    "failure_kind": "repair_exhausted",
+                    "task_status": "failed",
+                    "session_status": "repl_ready",
+                    "recovery_next_action": "repair_final_acceptance_failure",
+                },
+                {
+                    "event": "run_stop",
+                    "run_id": "diagnostic",
+                    "ok": False,
+                    "stop_reason": "repair_exhausted",
+                    "failure_kind": "repair_exhausted",
+                    "task_status": "failed",
+                    "session_status": "process_exited",
+                    "recovery_next_action": "repair_final_acceptance_failure",
+                }
+            ],
+            subject="mvp-anvilminimal",
+        )
+        source = self._trace_report("source", rows, source_events)
+        mvp = self._trace_report("mvp", rows, mvp_events)
+        diff = compare_trace_reports(source, mvp)
+        by_gate = {item["gate_id"]: item for item in diff["gate_results"]}
+        self.assertEqual(by_gate["G-S14"]["status"], "pass")
+        self.assertEqual(by_gate["G-S14"]["reason"], "source_and_mvp_gate_observed")
+        self.assertEqual(source_events[0]["failure_kind"], "repair_exhausted")
+        diagnostic = next(event for event in mvp_events if event["stage"] == "diagnostic_emitted")
+        self.assertEqual(diagnostic["task_status"], "failed")
+        self.assertEqual(diagnostic["session_status"], "process_exited")
+
+    def _trace_report(self, trace_id, rows, events):
+        stage_counts = {}
+        gate_counts = {}
+        for event in events:
+            stage_counts[event["stage"]] = stage_counts.get(event["stage"], 0) + 1
+            for gate_id in event.get("gate_ids", []):
+                gate_counts[gate_id] = gate_counts.get(gate_id, 0) + 1
+        return {
+            "trace_id": trace_id,
+            "normalized_event_count": len(events),
+            "manifest_rows": rows,
+            "stage_counts": stage_counts,
+            "gate_counts": gate_counts,
+            "normalized_events": events,
+        }
+
     def test_trace_manifest_redacts_prompt_and_secrets_from_command(self):
         with tempfile.TemporaryDirectory() as td:
             run_root = Path(td)

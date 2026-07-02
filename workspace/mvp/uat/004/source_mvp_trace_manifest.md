@@ -177,6 +177,21 @@ GATE-00 では実装変更、provider probe、browser run、anvildev 比較を�
 | required local tests | passed | `cargo fmt --manifest-path mvp/anvilminimal/Cargo.toml -- --check`: passed; `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`: passed with 446 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval`: passed with 226 passed, 1 skipped |
 | full source port escalation | not required | No G-S07/G-S15 provider/tool diff remains after source-style XML fallback support and live provider probe evidence. |
 
+## UAT004-GATE-08 Trace Update
+
+| item | status | evidence |
+| --- | --- | --- |
+| source refs inspected | complete | `src/agent/loop_run/summary.rs`, `safe_stop_emit.rs`, `safe_stop_payload.rs`, `emit_verifier_events.rs` |
+| MVP refs changed | complete | `mvp/anvilminimal/src/eval_events.rs`, `src/lib.rs`, `src/tui/slash.rs`, `scripts/eval_lib/runtime_trace.py`, `tests/tui_integration.rs`, `tests/eval/test_runtime_semantics_trace.py` |
+| source diagnostics trace | normalized | `workspace/mvp/uat/004/gate08_trace/source/runtime-semantics-trace-report.json` and `runtime-semantics-normalized-events.jsonl` include source `agent.safe_stop.report` as `diagnostic_emitted` with `failure_type`, `stop_reason`, authority/blocker, and next-user-action fields. |
+| MVP TUI diagnostics trace | normalized | `workspace/mvp/uat/004/gate08_trace/mvp/runtime-semantics-trace-report.json` and `runtime-semantics-normalized-events.jsonl` include `tui_command_start`, `tui_command_stop`, and `run_stop` with command/task/session status fields and recovery next action. |
+| normalized comparison | passed for G-S14/G-S16 | `workspace/mvp/uat/004/gate08_trace/runtime-semantics-trace-diff.json`: same-condition status `match`; G-S14 `pass`; G-S16 `pass`; unrelated unobserved gates remain failed in this scoped trace. |
+| manual TUI run event artifact | present | `workspace/mvp/uat/004/gate08_trace/manual_tui_run/.anvil/runs/gate08-manual/events.jsonl` and `summary.md` show `.anvil/runs/<run-id>/events.jsonl`, failed command status, failed task status, `Session/REPL status: repl_ready`, recovery YAML path, and suggested YAML command. |
+| failed `/ultra-plan-run` summary behavior | fixed by fixture | `tui_slash_failure_records_run_events_and_failure_stage` and `run_lifecycle_records_incomplete_stop_reason` assert failed command/process summaries end with `Status: incomplete`, not unconditional `Status: complete`. |
+| recovery YAML path preservation | fixed by fixture | `tui_slash_success_with_partial_release_gate_is_not_complete_only` asserts `recovery_ultra_plan_path` and suggested YAML command remain in `tui_command_stop` events and summary. |
+| required local tests | passed | `cargo fmt --manifest-path mvp/anvilminimal/Cargo.toml -- --check` passed; `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed with 446 lib tests plus integration/doc tests; `pytest mvp/anvilminimal/tests/eval` passed with 227 passed / 1 skipped. |
+| source trace diff scope | documented | The GATE-08 diff intentionally observes diagnostics/TUI stages only. G-S05/G-S06 semantic missing findings in this diff are not regressions because they are covered by `gate06_trace`; full all-gate comparative trace remains GATE-09. |
+
 ## Skip Evidence
 
 | skipped item | reason | impact | next action |

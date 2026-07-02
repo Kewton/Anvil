@@ -167,6 +167,7 @@ impl CompletionSnapshot {
 pub struct CompletionProjection {
     pub status: String,
     pub command_completion: String,
+    pub task_status: String,
     pub runtime_acceptance: String,
     pub final_acceptance: String,
     pub release_gate: String,
@@ -260,10 +261,12 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
     };
     let release_quality_completion = release_quality_completion(&release_gate, &final_acceptance);
     let status = terminal_status(ok, &release_gate, &final_acceptance);
+    let task_status = task_status(ok, &release_gate, &final_acceptance);
     let next_action = next_action(ok, &release_gate, &final_acceptance);
     CompletionProjection {
         status,
         command_completion,
+        task_status,
         runtime_acceptance,
         final_acceptance,
         release_gate,
@@ -351,9 +354,11 @@ pub fn render_tui_completion_output(output: &str, projection: &CompletionProject
         return output.to_string();
     }
     let mut output = format!(
-        "{}\n\nCommand completion: {}\nRuntime acceptance: {}\nFinal acceptance: {}\nRelease gate: {}\ncompletion_contract_verification_enabled={}\nexternal_contract_checked={}\nPlanner diagnostics: normalizations={} retries={} quality_warnings={} quality_issues={}\nPlanner release risk: {}\nNext action: {}",
+        "{}\n\nCommand status: {}\nCommand completion: {}\nTask status: {}\nRuntime acceptance: {}\nFinal acceptance: {}\nRelease gate: {}\ncompletion_contract_verification_enabled={}\nexternal_contract_checked={}\nPlanner diagnostics: normalizations={} retries={} quality_warnings={} quality_issues={}\nPlanner release risk: {}\nNext action: {}",
         output,
         projection.command_completion,
+        projection.command_completion,
+        projection.task_status,
         projection.runtime_acceptance,
         projection.final_acceptance,
         projection.release_gate,
@@ -555,6 +560,24 @@ fn terminal_status(ok: bool, release_gate: &str, final_acceptance: &str) -> Stri
     }
 }
 
+fn task_status(ok: bool, release_gate: &str, final_acceptance: &str) -> String {
+    if !ok {
+        return "failed".to_string();
+    }
+    match release_gate {
+        "partial" => "partial".to_string(),
+        "failed" => "failed".to_string(),
+        "pass" => "complete".to_string(),
+        "not_applicable" | "not_checked" | "" => match final_acceptance {
+            "partial" => "partial".to_string(),
+            "incomplete" => "incomplete".to_string(),
+            "failed" => "failed".to_string(),
+            _ => "complete".to_string(),
+        },
+        _ => "incomplete".to_string(),
+    }
+}
+
 fn release_quality_completion(release_gate: &str, final_acceptance: &str) -> String {
     match release_gate {
         "pass" | "not_applicable" => "release_ready".to_string(),
@@ -594,6 +617,7 @@ fn render_completion_summary(
     let mut lines = vec![
         format!("Status: {}", projection.status),
         format!("Lifecycle: {lifecycle_stage}"),
+        format!("Session/REPL status: {}", session_status(lifecycle_stage)),
     ];
     if let Some(action) = action {
         lines.push(format!("Action: {action}"));
@@ -602,7 +626,9 @@ fn render_completion_summary(
         lines.push(format!("Command: {command}"));
     }
     lines.extend([
+        format!("Command status: {}", projection.command_completion),
         format!("Command completion: {}", projection.command_completion),
+        format!("Task status: {}", projection.task_status),
         format!("Runtime acceptance: {}", projection.runtime_acceptance),
         format!("Final acceptance: {}", projection.final_acceptance),
         format!("Release gate: {}", projection.release_gate),
@@ -653,6 +679,7 @@ fn render_completion_summary(
             missing_if_empty(&projection.interaction_evidence_path)
         ),
         format!("Next action: {}", projection.next_action),
+        format!("Recovery next action: {}", projection.next_action),
         format!("Stop reason: {stop_reason}"),
     ]);
     if !projection.recovery_prompt_path.is_empty()
@@ -687,6 +714,14 @@ fn render_completion_summary(
         lines.push(format!("TUI command failed: {stop_reason}"));
     }
     lines.join("\n")
+}
+
+fn session_status(lifecycle_stage: &str) -> &'static str {
+    match lifecycle_stage {
+        "tui_command" => "repl_ready",
+        "process" => "process_exited",
+        _ => "unknown",
+    }
 }
 
 fn render_summary_bullets(items: &[String]) -> String {
@@ -919,6 +954,8 @@ mod tests {
         let snapshot = latest_completion_snapshot(Some(&path));
         let projection = project_completion(true, &snapshot);
         let tui = render_tui_completion_output("done", &projection);
+        assert!(tui.contains("Command status: completed"));
+        assert!(tui.contains("Task status: partial"));
         assert!(tui.contains("completion_contract_verification_enabled=true"));
         assert!(tui.contains("external_contract_checked=true"));
         let summary = render_completion_summary(
@@ -929,6 +966,9 @@ mod tests {
             "",
             &projection,
         );
+        assert!(summary.contains("Session/REPL status: repl_ready"));
+        assert!(summary.contains("Command status: completed"));
+        assert!(summary.contains("Task status: partial"));
         assert!(summary.contains("completion_contract_verification_enabled=true"));
         assert!(summary.contains("completion_contract_path_merge_enabled=true"));
         assert!(summary.contains("external_contract_checked=true"));
@@ -972,6 +1012,7 @@ mod tests {
         let snapshot = latest_completion_snapshot(Some(&path));
         let projection = project_completion(true, &snapshot);
         let tui = render_tui_completion_output("done", &projection);
+        assert!(tui.contains("Task status: partial"));
         assert!(tui.contains(
             "Planner diagnostics: normalizations=1 retries=1 quality_warnings=1 quality_issues=0"
         ));
@@ -984,6 +1025,10 @@ mod tests {
             "",
             &projection,
         );
+        assert!(summary.contains("Task status: partial"));
+        assert!(summary.contains(
+            "Recovery next action: collect_missing_release_evidence_or_continue_release_recovery"
+        ));
         assert!(summary.contains("Planner repaired: true"));
         assert!(summary.contains("Planner release risk: true"));
         assert!(summary.contains(
