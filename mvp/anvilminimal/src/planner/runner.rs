@@ -93,6 +93,7 @@ impl ReleaseRecoveryHandoffSummary {
 struct BoundCompletionContract {
     contract: CompletionContract,
     path: String,
+    fs_path: Option<PathBuf>,
     generated: bool,
     required: bool,
 }
@@ -729,6 +730,9 @@ fn run_step_plan_with_session_with_ui(
             prior_expected_paths: prior_expected_paths.clone(),
             final_required_capabilities: final_required_capabilities.clone(),
             final_required_evidence: final_required_evidence.clone(),
+            completion_contract_path: bound_contract
+                .as_ref()
+                .and_then(|bound| bound.fs_path.clone()),
         };
         match run_step(
             client,
@@ -771,6 +775,7 @@ struct StepPromptContext {
     prior_expected_paths: Vec<String>,
     final_required_capabilities: Vec<String>,
     final_required_evidence: Vec<String>,
+    completion_contract_path: Option<PathBuf>,
 }
 
 fn run_step(
@@ -791,7 +796,12 @@ fn run_step(
     {
         return Ok(StepRunOutcome::default());
     }
-    let step_config = capped_config(config, STEP_TURN_MAX_ITERATIONS);
+    let mut step_config = capped_config(config, STEP_TURN_MAX_ITERATIONS);
+    if step.step_kind() == StepKind::Implement {
+        if let Some(path) = prompt_context.completion_contract_path.clone() {
+            step_config.completion_contract_path = Some(path);
+        }
+    }
     let step_options = step_run_session_options(step);
     let initial = run_session_with_outcome_with_options(
         client,
@@ -1306,9 +1316,11 @@ fn bind_completion_contract_for_acceptance(
         let path = explicit_completion_contract_path(config)
             .map(|path| display_path_for_event(&config.workspace_root, &path))
             .unwrap_or_else(|| "<inline-config>".to_string());
+        let fs_path = explicit_completion_contract_path(config);
         let bound = BoundCompletionContract {
             contract,
             path,
+            fs_path,
             generated: false,
             required,
         };
@@ -1340,6 +1352,7 @@ fn bind_completion_contract_for_acceptance(
     let bound = BoundCompletionContract {
         contract,
         path: display_path_for_event(&config.workspace_root, &path),
+        fs_path: Some(path),
         generated: true,
         required,
     };
@@ -6879,6 +6892,7 @@ mod tests {
             prior_expected_paths: vec!["package.json".to_string()],
             final_required_capabilities: vec!["player_control".to_string()],
             final_required_evidence: vec!["interactive_ui_source_evidence".to_string()],
+            completion_contract_path: None,
         };
         let prompt = build_step_prompt(&plan, &plan.steps[0], &context);
         assert!(prompt.contains("Overall goal:"));
@@ -8144,17 +8158,18 @@ mod tests {
         let err = run_step_plan(&mut fake, &plan, &cfg)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("plan final contract failed"), "{err}");
-        assert!(
-            err.contains("build_command_or_dependency_missing_boundary"),
-            "{err}"
-        );
+        assert!(err.contains("completion contract verify"), "{err}");
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"runtime_acceptance_inconclusive\":false"));
         assert!(event_text.contains("\"missing_evidence\""));
         assert!(event_text.contains("\"capability_evidence_bindings\""));
         assert!(event_text.contains("\"role\":\"scaffold\""));
         assert!(event_text.contains("\"artifact_paths\":[]"));
+        assert!(event_text.contains("\"event\":\"step_obligation_scope\""));
+        assert!(event_text.contains("\"step_kind\":\"implement\""));
+        assert!(event_text.contains("\"completion_contract_path_merge_enabled\":true"));
+        assert!(event_text.contains("\"completion_contract_verification_enabled\":true"));
+        assert!(event_text.contains("\"contract_paths_merged\":true"));
         assert!(event_text.contains("\"event\":\"completion_contract_bound\""));
         assert!(event_text.contains("\"session_scope\":\"plan-run\""));
         assert!(event_text.contains("\"completion_contract_verification_enabled\":true"));
@@ -8170,8 +8185,10 @@ mod tests {
     #[test]
     fn plan_run_nextjs_game_docs_only_fails_inferred_capabilities() {
         let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
         let plan = StepPlan {
             goal: "Create an interactive browser game\n\nRequired final artifacts:\n- README.md"
                 .to_string(),
@@ -8199,11 +8216,14 @@ mod tests {
         let err = run_step_plan(&mut fake, &plan, &cfg)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("plan final contract failed"), "{err}");
-        assert!(
-            err.contains("build_command_or_dependency_missing_boundary"),
-            "{err}"
-        );
+        assert!(err.contains("completion contract verify"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"step_obligation_scope\""));
+        assert!(event_text.contains("\"step_kind\":\"implement\""));
+        assert!(event_text.contains("\"completion_contract_path_merge_enabled\":true"));
+        assert!(event_text.contains("\"completion_contract_verification_enabled\":true"));
+        assert!(event_text.contains("\"missing_evidence\""));
+        assert!(event_text.contains("\"role\":\"acceptance_evidence\""));
     }
 
     #[test]
@@ -8733,6 +8753,7 @@ export default function Page(){
     #[test]
     fn plan_run_external_completion_contract_checks_required_evidence() {
         let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
         let contract = dir.path().join("contract.json");
         std::fs::write(
             &contract,
@@ -8741,6 +8762,7 @@ export default function Page(){
         .unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
+        cfg.eval_events_path = Some(events.clone());
         let plan = StepPlan {
             goal: "Create date helper".to_string(),
             steps: vec![PlanStep {
@@ -8752,20 +8774,31 @@ export default function Page(){
                 verify: Vec::new(),
             }],
         };
-        let mut fake = FakeClient::new(vec![AssistantReply {
-            content: String::new(),
-            tool_calls: vec![crate::state::ToolCall::new(
-                "Write",
-                serde_json::json!({"path":"date-helper.js","content":"exports.formatDate = (d) => String(d);"}),
-            )],
-            prompt_tokens: None,
-            completion_tokens: None,
-        }]);
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"date-helper.js","content":"exports.formatDate = (d) => String(d);"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("done"),
+        ]);
         let err = run_step_plan(&mut fake, &plan, &cfg)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("plan final contract failed"));
-        assert!(err.contains("missing_required_evidence"));
+        assert!(err.contains("completion contract verify"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"step_obligation_scope\""));
+        assert!(event_text.contains("\"step_kind\":\"implement\""));
+        assert!(event_text.contains("\"completion_contract_path_merge_enabled\":true"));
+        assert!(event_text.contains("\"completion_contract_verification_enabled\":true"));
+        assert!(event_text.contains("\"event\":\"completion_verify\""));
+        assert!(event_text.contains("\"missing_evidence\""));
+        assert!(event_text.contains("\"test_artifact\""));
+        assert!(event_text.contains("\"bound_verify_command\""));
     }
 
     #[test]

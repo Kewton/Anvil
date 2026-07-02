@@ -11,6 +11,7 @@
 | `pass_reaudit_required` | Previously marked pass, but source-first policy requires renewed source trace / fixture / UAT evidence. |
 | `pending_source_trace` | MVP event or implementation exists, but source same-condition trace is missing. |
 | `pending_live_probe` | Provider/browser/manual evidence is intentionally skipped in normal tests and must be collected in a later gate. |
+| `source_parity_pass` | Scoped source-first semantics were restored or proven equivalent with source refs, MVP refs, targeted fixtures, and required local tests. |
 
 ## UAT004-GATE-00 Status
 
@@ -21,6 +22,13 @@
 | gate status report skeleton | `baseline_fixed` | this file covers G-S01 through G-S16 | no gate promoted to pass by GATE-00 | update each gate with source refs, MVP refs, evidence, rollback condition |
 | source/MVP trace manifest | `baseline_fixed` | `source_mvp_trace_manifest.md` records MVP baseline and skip evidence | source/anvildev trace not collected | collect same-condition trace in target gates |
 | correct failure detection vs regression split | `baseline_fixed` | `test0701_005_regression_fixture.md` separates correct detection from regression | needs executable assertions later | add targeted fixtures without Space Invaders-specific string dependency |
+
+## UAT004-GATE-01 Status
+
+| gate | status | evidence | remaining issue | next action | rollback condition |
+| --- | --- | --- | --- | --- | --- |
+| G-S01 | `source_parity_pass` | Source refs read: `task_contract*.rs`, `task_contract_artifact_contract.rs`, `task_contract_deliverable_lifecycle.rs`, `evidence_binding.rs`, `artifact_ledger.rs`, `artifact_ownership.rs`, `artifact_target_alignment.rs`, `worker_contract.rs`. MVP changes: `minimal_loop/evidence.rs` now treats weak verifier evidence as blocking whenever source-first runtime requirements are present; `minimal_loop/loop_run.rs` emits step-level capability/evidence bindings from `completion_verify`; existing and added tests reject title-only, docs-only, style-only, scaffold-only, canvas/browser oracle failures, and artifact-only verifier completion. Verification: `cargo test --manifest-path mvp/anvilminimal/Cargo.toml` passed; `pytest mvp/anvilminimal/tests/eval` passed with 222 passed / 1 skipped. | No same-condition anvildev/source runtime trace was executed in this gate; browser/provider evidence remains in later gates by design. | Carry G-S01 as closed for UAT004-GATE-01 and re-check in GATE-05/GATE-09 with browser/release evidence. | Revert or block any change that lets interactive app/game completion pass with path-only, title-only, style-only, docs-only, scaffold-only, or weak static verifier evidence. |
+| G-S02 | `source_parity_pass` | `RunSessionOptions::plan_step(Implement)` now enables completion contract verification and path merge; generated or explicit `CompletionContract` path is injected into implement step config from `planner/runner.rs`, so `step_obligation_scope` for implement records `completion_contract_verification_enabled=true` and `completion_contract_path_merge_enabled=true`. Tests cover non-interactive file creation path-only success preservation, external contract required evidence failure at step level, and generated contract binding for interactive Next.js game steps. | Full source TaskContract graph is not byte-for-byte ported; this gate closes the scoped completion authority parity via equivalent MVP contract/evidence authority. Source trace execution remains skipped with this documented reason. | Keep G-S02 re-audit closed unless GATE-09 comparative UAT finds divergence; later gates must not use `completion_contract_verification_enabled=false` as release pass evidence for interactive implementation steps. | Preserve non-interactive required path completion while rejecting interactive false positives and weak verifier-only evidence. |
 
 ## Gate Status Skeleton
 

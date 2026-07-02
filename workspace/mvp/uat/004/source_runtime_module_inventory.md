@@ -89,6 +89,13 @@ UAT004-GATE-00 の baseline として、source-first runtime semantics 復元で
 | Tool / provider behavior | `tools/args_recovery.rs`, `providers/xml_fallback.rs`, `providers/openai.rs`, `providers/gemini.rs`, `providers/ollama.rs` | source tool runner, Ollama XML fallback, tool args policy | G-S07, G-S15 |
 | TUI / diagnostics | `eval_events.rs`, `lib.rs`, `tui/slash.rs`, `tui/repl.rs`, `scripts/eval_lib/runtime_trace.py`, `failure_classification.py` | `summary.rs`, `safe_stop_emit.rs`, `safe_stop_payload.rs`, verifier event emitters | G-S14, G-S16 |
 
+## UAT004-GATE-01 Port Record
+
+| gate | source authority applied | MVP implementation | local evidence | remaining trace gap |
+| --- | --- | --- | --- | --- |
+| G-S01 | `TaskContract::evaluate*`, `CompletionPolicy`, request inference, artifact contract, evidence binding, artifact ledger/ownership/target alignment, worker contract | `minimal_loop/evidence.rs` blocks weak verifier evidence under source-first runtime requirements and keeps implementation/style/docs/scaffold roles separate; `minimal_loop/loop_run.rs` exposes capability/evidence bindings in step-level completion events | focused artifact-only verifier fixture plus existing title-only, docs-only, style-only, scaffold-only, canvas/browser negative fixtures passed under `cargo test` | source/anvildev same-condition trace deferred to GATE-09 |
+| G-S02 | Source completion authority is deterministic and tied to required roles/evidence, not path existence alone | `RunSessionOptions::plan_step(Implement)` enables completion contract verification/path merge; `planner/runner.rs` passes generated or explicit contract path into implement step config; setup/inspect/verify/report step side effects remain disabled | `implement_plan_step_keeps_completion_contract_authority_enabled`, non-interactive path completion fixture, external contract evidence fixture, and interactive scaffold/docs negative plan fixtures passed | browser/provider/release evidence remains GATE-05/GATE-09 |
+
 ## Gate-Level Migration Decision
 
 | gate | baseline status from matrix | UAT004 source-first decision | inventory note |

@@ -693,10 +693,17 @@ pub fn verify_runtime_acceptance_with_browser_dirs(
         &missing_obligations,
     );
     let inconclusive = !inconclusive_reasons.is_empty();
+    let weak_evidence_blocks_completion = !weak_evidence.is_empty()
+        && source_first_completion_authority_required(
+            required_capabilities,
+            required_evidence,
+            required_obligations,
+        );
     let passed = missing_capabilities.is_empty()
         && missing_evidence.is_empty()
         && missing_obligations.is_empty()
-        && !inconclusive;
+        && !inconclusive
+        && !weak_evidence_blocks_completion;
     let primary_reason = if let Some(reason) = missing_capabilities.first() {
         format!("missing_required_capabilities:{reason}")
     } else if let Some(reason) = missing_evidence.first() {
@@ -729,6 +736,16 @@ pub fn verify_runtime_acceptance_with_browser_dirs(
         interaction_evidence_path: browser_interaction.interaction_evidence_path,
         primary_reason,
     }
+}
+
+fn source_first_completion_authority_required(
+    required_capabilities: &[String],
+    required_evidence: &[String],
+    required_obligations: &[String],
+) -> bool {
+    !required_capabilities.is_empty()
+        || !required_evidence.is_empty()
+        || !normalize_obligation_roles(required_obligations).is_empty()
 }
 
 pub fn artifact_obligation_evidence(
@@ -2350,6 +2367,69 @@ export default function Page(){
         assert!(evidence.contains(&"score_or_progression_evidence".to_string()));
         assert!(evidence.contains(&"failure_or_collision_evidence".to_string()));
         assert!(evidence.contains(&"restart_or_recoverable_state_evidence".to_string()));
+    }
+
+    #[test]
+    fn artifact_only_verify_does_not_satisfy_source_first_implementation_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  const [gameState, setGameState] = useState("ready");
+  const enemies = [{ x: 10, y: 20 }];
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") {
+        setGameState("playing");
+        setScore((value) => value + 1);
+      }
+    };
+    const frame = requestAnimationFrame(() => {
+      const collision = enemies.some((enemy) => enemy.x > 0);
+      if (collision) setGameState("gameover");
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+  return <main><button onClick={() => setGameState("playing")}>Start</button><canvas /><p>score {score} enemy collision {gameState}</p></main>;
+}
+"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &["test -f src/app/page.tsx".to_string()],
+            &[
+                "stateful_interaction".to_string(),
+                "player_control".to_string(),
+                "progression_or_score".to_string(),
+                "failure_or_collision_rule".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+        assert!(!report.passed);
+        assert!(report.missing_capabilities.is_empty(), "{report:?}");
+        assert!(report.missing_evidence.is_empty(), "{report:?}");
+        assert!(report.missing_obligations.is_empty(), "{report:?}");
+        assert!(
+            report
+                .weak_evidence
+                .contains(&"artifact_only_verify:test -f src/app/page.tsx".to_string())
+        );
+        assert!(
+            report.primary_reason.contains("weak_verification_evidence"),
+            "{report:?}"
+        );
     }
 
     #[test]

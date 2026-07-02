@@ -125,10 +125,19 @@ impl Default for RunSessionOptions {
 
 impl RunSessionOptions {
     pub(crate) fn plan_step(step_kind: RunSessionStepKind) -> Self {
+        let completion_contract_enabled = step_kind == RunSessionStepKind::Implement;
         Self {
             prompt_artifact_extraction: PromptArtifactExtraction::Disabled,
-            completion_contract_path_merge: CompletionContractPathMerge::Disabled,
-            completion_contract_verification: CompletionContractVerification::DisabledDuringStep,
+            completion_contract_path_merge: if completion_contract_enabled {
+                CompletionContractPathMerge::Enabled
+            } else {
+                CompletionContractPathMerge::Disabled
+            },
+            completion_contract_verification: if completion_contract_enabled {
+                CompletionContractVerification::Enabled
+            } else {
+                CompletionContractVerification::DisabledDuringStep
+            },
             action_no_tool_policy: ActionNoToolPolicy::RequireToolOnlyIfNoToolSeen,
             scope: RunSessionScope::PlanRunStep,
             step_kind: Some(step_kind),
@@ -1473,6 +1482,8 @@ fn verify_completion_contract(
             "missing_obligations": runtime_acceptance.missing_obligations.clone(),
             "weak_evidence": runtime_acceptance.weak_evidence.clone(),
             "artifact_obligations": runtime_acceptance.artifact_obligations.clone(),
+            "capability_evidence_bindings": runtime_acceptance.capability_evidence_bindings.clone(),
+            "obligation_repair_targets": runtime_acceptance.obligation_repair_targets.clone(),
             "inconclusive_reasons": runtime_acceptance.inconclusive_reasons.clone(),
             "browser_readiness_status": runtime_acceptance.browser_readiness_status.clone(),
             "browser_readiness_evidence_path": runtime_acceptance.browser_readiness_evidence_path.clone(),
@@ -2423,6 +2434,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+    }
+
+    #[test]
+    fn implement_plan_step_keeps_completion_contract_authority_enabled() {
+        let implement = RunSessionOptions::plan_step(RunSessionStepKind::Implement);
+        assert!(implement.contract_runtime_enabled());
+        assert!(implement.contract_path_merge_enabled());
+
+        for kind in [
+            RunSessionStepKind::Inspect,
+            RunSessionStepKind::Setup,
+            RunSessionStepKind::Verify,
+            RunSessionStepKind::Report,
+        ] {
+            let options = RunSessionOptions::plan_step(kind);
+            assert!(!options.contract_runtime_enabled(), "{kind:?}");
+            assert!(!options.contract_path_merge_enabled(), "{kind:?}");
+        }
     }
 
     #[test]

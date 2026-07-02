@@ -75,6 +75,18 @@ GATE-00 では実装変更、provider probe、browser run、anvildev 比較を�
 | G-S15 | `source_trace_verification_target` | no live provider behavior probe in fixture | pending | provider probe pending | API key/network not required for baseline docs | UAT004-GATE-07 | fake fixture alone cannot close prompt/provider changes |
 | G-S16 | `source_trace_verification_target` | `summary.md`, `tui_command_stop`, `run_stop` show contradiction | pending | manual TUI UAT pending | manual rerun not executed in GATE-00 | UAT004-GATE-08 | no silent exit and no task failure overwritten by REPL ready |
 
+## UAT004-GATE-01 Trace Update
+
+| item | status | evidence |
+| --- | --- | --- |
+| source refs inspected | complete | `src/agent/loop_run/task_contract.rs`, `task_contract_core.rs`, `task_contract_completion_policy.rs`, `task_contract_request_inference.rs`, `task_contract_artifact_contract.rs`, `task_contract_deliverable_lifecycle.rs`, `evidence_binding.rs`, `artifact_ledger.rs`, `artifact_ownership.rs`, `artifact_target_alignment.rs`, `worker_contract.rs` |
+| MVP refs changed | complete | `mvp/anvilminimal/src/minimal_loop/evidence.rs`, `mvp/anvilminimal/src/minimal_loop/loop_run.rs`, `mvp/anvilminimal/src/planner/runner.rs` |
+| G-S01 trace evidence | source-equivalent local fixture | `artifact_only_verify_does_not_satisfy_source_first_implementation_contract`, existing title/docs/style/scaffold/canvas/browser acceptance tests, and step-level `completion_verify` now reporting `capability_evidence_bindings` / `obligation_repair_targets` |
+| G-S02 trace evidence | source-equivalent local fixture | `implement_plan_step_keeps_completion_contract_authority_enabled`, `plan_step_non_interactive_completion_preserves_path_only_success`, `plan_run_external_completion_contract_checks_required_evidence`, `plan_run_nextjs_game_scaffold_only_fails_inferred_capabilities`, `plan_run_nextjs_game_docs_only_fails_inferred_capabilities` |
+| required local tests | passed | `cargo test --manifest-path mvp/anvilminimal/Cargo.toml`: passed; `pytest mvp/anvilminimal/tests/eval`: 222 passed, 1 skipped |
+| source/anvildev same-condition run | skipped | This gate restored deterministic TaskContract/completion semantics using source refs and local fixtures. Same-condition source/anvildev runtime comparison remains deferred to UAT004-GATE-09 because provider/browser/manual execution is not a normal unit-test requirement. |
+| provider/browser evidence | skipped | No live provider or browser readiness/interaction run was required for GATE-01; G-S12/G-S15/G-S16 remain covered by later gates. |
+
 ## Skip Evidence
 
 | skipped item | reason | impact | next action |
