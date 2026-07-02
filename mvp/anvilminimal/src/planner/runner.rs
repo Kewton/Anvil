@@ -52,9 +52,7 @@ use serde_json::{Value, json};
 const STEP_TURN_MAX_ITERATIONS: usize = 8;
 const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
 const STEP_REPAIR_MAX_TURNS: usize = 4;
-const STEP_REPAIR_MAX_FILE_CHANGING_TURNS: usize = 2;
-const STEP_REPAIR_NO_CHANGE_LIMIT: usize = 1;
-const STEP_REPAIR_TARGET_NOT_FOLLOWED_LIMIT: usize = 2;
+const STEP_REPAIR_IDENTICAL_NO_CHANGE_LIMIT: usize = 2;
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
 const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 1;
 const NEXTJS_DEV_SERVER_DEFAULT_PORT: u16 = 3011;
@@ -895,7 +893,8 @@ fn run_step(
     let mut terminal_repair_failure_kind: Option<&'static str> = None;
     let mut no_change_repairs = 0usize;
     let mut target_not_followed_repairs = 0usize;
-    let mut file_changing_repairs = 0usize;
+    let mut identical_no_change_repairs = 0usize;
+    let mut current_report_signature = verification_report_signature(&current_report);
     let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
     for attempt in 1..=STEP_REPAIR_MAX_TURNS {
         context.repair_attempt = Some(attempt);
@@ -926,9 +925,6 @@ fn run_step(
         merge_changed_files(&mut context, &repair.changed_paths);
         merge_unique_strings(&mut outcome.changed_paths, &repair.changed_paths);
         merge_unique_strings(&mut outcome.repair_changed_paths, &repair.changed_paths);
-        if !repair.changed_paths.is_empty() {
-            file_changing_repairs += 1;
-        }
         match profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal) {
             Ok(true) => {
                 let package_path = "package.json".to_string();
@@ -975,23 +971,21 @@ fn run_step(
             }
             RepairFollowThrough::TargetNotFollowed | RepairFollowThrough::UnrelatedChange => {
                 target_not_followed_repairs += 1;
+                no_change_repairs = 0;
             }
             RepairFollowThrough::TargetMatched => {
                 no_change_repairs = 0;
                 target_not_followed_repairs = 0;
             }
         }
-        let repair_failure_kind = match repair_follow_through {
-            RepairFollowThrough::NoChange if no_change_repairs >= STEP_REPAIR_NO_CHANGE_LIMIT => {
-                repair_follow_through.failure_kind().unwrap_or("")
-            }
-            RepairFollowThrough::TargetNotFollowed | RepairFollowThrough::UnrelatedChange
-                if target_not_followed_repairs >= STEP_REPAIR_TARGET_NOT_FOLLOWED_LIMIT =>
-            {
-                repair_follow_through.failure_kind().unwrap_or("")
-            }
-            _ => "",
-        };
+        let repair_failure_kind = repair_follow_through.failure_kind().unwrap_or("");
+        let retry_signature = verification_report_signature(&retry);
+        let report_signature_unchanged = retry_signature == current_report_signature;
+        if report_signature_unchanged && repair_turn_changed_paths.is_empty() {
+            identical_no_change_repairs += 1;
+        } else {
+            identical_no_change_repairs = 0;
+        }
         merge_unique_strings(
             &mut outcome.repair_targets,
             &[retry_target.as_str().to_string()],
@@ -1022,6 +1016,10 @@ fn run_step(
                 "changed_paths_before": changed_paths_before_repair,
                 "changed_paths_after": context.changed_files.clone(),
                 "repair_turn_changed_paths": repair_turn_changed_paths.clone(),
+                "no_change_repairs": no_change_repairs,
+                "target_not_followed_repairs": target_not_followed_repairs,
+                "identical_no_change_repairs": identical_no_change_repairs,
+                "report_signature_unchanged": report_signature_unchanged,
                 "allowed_action": previous_target.allowed_action(),
                 "repair_stop_reason": repair_stop_reason.clone().unwrap_or_default(),
                 "dependency_setup_authority": setup_authority.as_str(),
@@ -1045,19 +1043,9 @@ fn run_step(
         }
         previous_missing = next_missing;
         current_report = retry;
-        if no_change_repairs >= STEP_REPAIR_NO_CHANGE_LIMIT {
-            terminal_repair_failure_kind = Some("verify_repair_no_change");
-            break;
-        }
-        if target_not_followed_repairs >= STEP_REPAIR_TARGET_NOT_FOLLOWED_LIMIT {
-            terminal_repair_failure_kind = Some(
-                repair_follow_through
-                    .failure_kind()
-                    .unwrap_or("repair_target_not_followed"),
-            );
-            break;
-        }
-        if file_changing_repairs >= STEP_REPAIR_MAX_FILE_CHANGING_TURNS {
+        current_report_signature = retry_signature;
+        if identical_no_change_repairs >= STEP_REPAIR_IDENTICAL_NO_CHANGE_LIMIT {
+            terminal_repair_failure_kind = Some("verify_repair_progress_unchanged");
             break;
         }
     }
@@ -1741,6 +1729,51 @@ fn command_failure_summaries(report: &VerificationReport) -> Vec<String> {
             )
         })
         .collect()
+}
+
+fn verification_report_signature(report: &VerificationReport) -> Vec<String> {
+    let mut signature = Vec::new();
+    signature.extend(
+        report
+            .missing_paths
+            .iter()
+            .map(|path| format!("missing:{path}")),
+    );
+    signature.extend(
+        report
+            .dependency_missing
+            .iter()
+            .map(|reason| format!("dependency:{reason}")),
+    );
+    signature.extend(report.command_failures.iter().map(|failure| {
+        format!(
+            "command:{}:{}",
+            failure.command,
+            normalize_report_reason_for_signature(&failure.reason)
+        )
+    }));
+    signature.extend(
+        report
+            .profile_failures
+            .iter()
+            .map(|reason| format!("profile:{reason}")),
+    );
+    signature.sort();
+    signature
+}
+
+fn normalize_report_reason_for_signature(reason: &str) -> String {
+    let mut normalized = Vec::new();
+    let mut parts = reason.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part == "elapsed_ms:" {
+            let _ = parts.next();
+            normalized.push("elapsed_ms:<n>".to_string());
+        } else {
+            normalized.push(part.to_string());
+        }
+    }
+    normalized.join(" ")
 }
 
 fn push_context_items_capped(
@@ -9000,7 +9033,7 @@ export default function Page(){
     }
 
     #[test]
-    fn step_repair_no_change_is_classified_and_handoff_saved() {
+    fn step_repair_no_change_stops_on_progress_unchanged_and_handoff_saved() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
@@ -9048,6 +9081,26 @@ export default function Page(){
                 completion_tokens: None,
             },
             AssistantReply::text("still incomplete again"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("still incomplete third"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("still incomplete fourth"),
         ]);
         let err = run_step_plan(&mut fake, &plan, &cfg)
             .unwrap_err()
@@ -9055,9 +9108,9 @@ export default function Page(){
         assert!(err.contains("repair prompt saved"), "{err}");
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"repair_follow_through\":\"no_change\""));
-        assert!(event_text.contains("\"reason\":\"verify_repair_no_change\""));
+        assert!(event_text.contains("\"reason\":\"verify_repair_progress_unchanged\""));
         assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
-        assert!(event_text.contains("\"failure_kind\":\"verify_repair_no_change\""));
+        assert!(event_text.contains("\"failure_kind\":\"verify_repair_progress_unchanged\""));
         assert!(event_text.contains("\"recovery_ultra_plan_path\""));
         assert!(event_text.contains("\"suggested_recovery_yaml_command\""));
         let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
@@ -9066,7 +9119,7 @@ export default function Page(){
             recovery_plan
                 .phases
                 .iter()
-                .any(|phase| phase.prompt.contains("verify_repair_no_change"))
+                .any(|phase| phase.prompt.contains("verify_repair_progress_unchanged"))
         );
         let repair_dir = dir.path().join(".anvil/repairs");
         assert!(repair_dir.is_dir());
@@ -9168,21 +9221,25 @@ export default function Page(){
     }
 
     #[test]
-    fn step_repair_target_not_followed_is_classified_and_handoff_saved() {
+    fn step_repair_target_not_followed_streak_continues_while_report_improves() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
         let plan = StepPlan {
-            goal: "Create app entrypoint\n\nRequired final artifacts:\n- src/app/page.tsx"
+            goal: "Create app entrypoint and supporting files\n\nRequired final artifacts:\n- src/app/page.tsx\n- src/app/widget.tsx\n- src/app/sidebar.tsx"
                 .to_string(),
             steps: vec![PlanStep {
                 id: "entrypoint".to_string(),
                 kind: "verify".to_string(),
                 expected_result: "pass".to_string(),
-                instruction: "Verify and repair src/app/page.tsx if missing".to_string(),
+                instruction: "Verify and repair the app entrypoint if missing".to_string(),
                 expected_paths: Vec::new(),
-                verify: vec!["test -f src/app/page.tsx".to_string()],
+                verify: vec![
+                    "test -f src/app/page.tsx".to_string(),
+                    "test -f src/app/widget.tsx".to_string(),
+                    "test -f src/app/sidebar.tsx".to_string(),
+                ],
             }],
         };
         let mut fake = FakeClient::new(vec![
@@ -9216,21 +9273,29 @@ export default function Page(){
                 completion_tokens: None,
             },
             AssistantReply::text("repair two done"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main>ok</main>;}"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("repair three done"),
         ]);
-        let err = run_step_plan(&mut fake, &plan, &cfg)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("repair prompt saved"), "{err}");
-        assert!(!dir.path().join("src/app/page.tsx").exists());
+        let result = run_step_plan(&mut fake, &plan, &cfg).unwrap();
+        assert_eq!(result, "plan-run complete: 1 steps");
+        assert!(dir.path().join("src/app/page.tsx").exists());
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"repair_follow_through\":\"target_not_followed\""));
-        assert!(event_text.contains("\"reason\":\"repair_target_not_followed\""));
-        assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
+        assert!(event_text.contains("\"target_not_followed_repairs\":2"));
         assert!(event_text.contains("\"failure_kind\":\"repair_target_not_followed\""));
+        assert!(!event_text.contains("\"reason\":\"repair_target_not_followed\""));
     }
 
     #[test]
-    fn step_repair_unrelated_change_is_classified_and_handoff_saved() {
+    fn step_repair_unrelated_change_is_telemetry_and_handoff_saved() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
@@ -9278,6 +9343,26 @@ export default function Page(){
                 completion_tokens: None,
             },
             AssistantReply::text("repair two done"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"docs/notes-2.md","content":"still unrelated"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("repair three done"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"docs/notes-3.md","content":"still unrelated"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("repair four done"),
         ]);
         let err = run_step_plan(&mut fake, &plan, &cfg)
             .unwrap_err()
@@ -9286,9 +9371,10 @@ export default function Page(){
         assert!(!dir.path().join("src/app/page.tsx").exists());
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"repair_follow_through\":\"unrelated_change\""));
-        assert!(event_text.contains("\"reason\":\"repair_unrelated_change\""));
+        assert!(event_text.contains("\"reason\":\"bounded_repair_exhausted\""));
         assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
         assert!(event_text.contains("\"failure_kind\":\"repair_unrelated_change\""));
+        assert!(event_text.contains("\"failure_kind\":\"bounded_repair_exhausted\""));
     }
 
     #[test]

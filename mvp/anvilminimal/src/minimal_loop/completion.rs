@@ -588,52 +588,6 @@ pub(crate) fn format_verify_feedback_with_contract(
     lines.join("\n")
 }
 
-pub(crate) fn repair_target_allowed_paths(
-    target: RepairTarget,
-    report: &VerificationReport,
-    contract: Option<&CompletionContract>,
-) -> Vec<String> {
-    match target {
-        RepairTarget::DependencySetup => contract
-            .map(|contract| {
-                contract
-                    .required_paths
-                    .iter()
-                    .filter(|path| looks_like_setup_target_path(path))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .filter(|paths| !paths.is_empty())
-            .unwrap_or_else(|| vec!["package.json".to_string(), "Cargo.toml".to_string()]),
-        RepairTarget::PackageConfig => vec!["package.json".to_string()],
-        RepairTarget::FrameworkConfig => contract
-            .map(|contract| {
-                contract
-                    .required_paths
-                    .iter()
-                    .filter(|path| looks_like_framework_target_path(path))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .filter(|paths| !paths.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    "src/app/layout.tsx".to_string(),
-                    "src/app/global.d.ts".to_string(),
-                    "tsconfig.json".to_string(),
-                ]
-            }),
-        RepairTarget::MissingEntrypoint
-        | RepairTarget::EmptyApp
-        | RepairTarget::CapabilityMissing
-        | RepairTarget::Implementation => target_implementation_files(report, contract),
-        RepairTarget::RequiredEvidenceMissing | RepairTarget::TestOrEvidence => {
-            target_evidence_files(report, contract)
-        }
-        RepairTarget::Unknown => target_implementation_files(report, contract),
-    }
-}
-
 pub(crate) fn target_implementation_files(
     report: &VerificationReport,
     contract: Option<&CompletionContract>,
@@ -668,33 +622,6 @@ pub(crate) fn target_implementation_files(
     }
     if paths.is_empty() {
         paths.insert("src/app/page.tsx".to_string());
-    }
-    paths.into_iter().collect()
-}
-
-fn target_evidence_files(
-    report: &VerificationReport,
-    contract: Option<&CompletionContract>,
-) -> Vec<String> {
-    let mut paths = BTreeSet::new();
-    if let Some(contract) = contract {
-        paths.extend(
-            contract
-                .required_paths
-                .iter()
-                .filter(|path| looks_like_evidence_target_path(path))
-                .cloned(),
-        );
-    }
-    paths.extend(
-        report
-            .missing_paths
-            .iter()
-            .filter(|path| looks_like_evidence_target_path(path))
-            .cloned(),
-    );
-    if paths.is_empty() {
-        paths.insert("tests/acceptance-evidence.md".to_string());
     }
     paths.into_iter().collect()
 }

@@ -33,6 +33,11 @@ impl RepairFollowThrough {
         }
     }
 
+    /// Telemetry label for follow-through outcomes.
+    ///
+    /// This classifier is heuristic and must not gate repair-loop termination;
+    /// termination belongs to deterministic verification and repair-progress
+    /// verdicts.
     pub fn failure_kind(self) -> Option<&'static str> {
         match self {
             Self::NoChange => Some("verify_repair_no_change"),
