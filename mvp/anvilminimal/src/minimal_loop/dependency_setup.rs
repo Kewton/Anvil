@@ -124,6 +124,12 @@ pub struct NodeDependencySetupObservation {
     pub primary_reason: String,
     pub output_snippet: String,
     pub changed_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lockfile_present_before: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lockfile_present_after: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lockfile_created: Option<bool>,
 }
 
 impl NodeDependencySetupObservation {
@@ -141,6 +147,9 @@ impl NodeDependencySetupObservation {
             primary_reason: "dependency setup not required".to_string(),
             output_snippet: String::new(),
             changed_paths: Vec::new(),
+            lockfile_present_before: None,
+            lockfile_present_after: None,
+            lockfile_created: None,
         }
     }
 
@@ -160,6 +169,9 @@ impl NodeDependencySetupObservation {
             primary_reason: reason.into(),
             output_snippet: String::new(),
             changed_paths: Vec::new(),
+            lockfile_present_before: None,
+            lockfile_present_after: None,
+            lockfile_created: None,
         }
     }
 }
@@ -210,6 +222,10 @@ pub fn next_binary_ready(root: &Path) -> bool {
     root.join("node_modules/.bin/next").is_file()
 }
 
+pub fn next_package_ready(root: &Path) -> bool {
+    node_package_installed(root, "next")
+}
+
 pub fn next_build_dependencies_ready(root: &Path) -> bool {
     next_build_missing_dependency_labels(root).is_empty()
 }
@@ -246,6 +262,9 @@ fn next_build_missing_dependency_labels(root: &Path) -> Vec<String> {
     let mut missing = Vec::new();
     if !next_binary_ready(root) {
         missing.push("node_modules/.bin/next".to_string());
+    }
+    if !next_package_ready(root) {
+        missing.push("node_modules/next".to_string());
     }
     if workspace_requires_tailwind_toolchain(root) {
         for package in ["tailwindcss", "postcss", "autoprefixer"] {
@@ -525,7 +544,7 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
     let before_lock = root.join("package-lock.json").exists();
     let before_missing = setup_missing_dependency_labels(root, requirement.setup_kind);
     let started = Instant::now();
-    let mut child = match verifier_env::normalized_command(npm_program)
+    let mut child = match verifier_env::normalized_command_at_root(npm_program, root)
         .args(["install", "--ignore-scripts"])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -545,6 +564,9 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
                 primary_reason: format!("failed to spawn npm: {err}"),
                 output_snippet: String::new(),
                 changed_paths: Vec::new(),
+                lockfile_present_before: Some(before_lock),
+                lockfile_present_after: Some(root.join("package-lock.json").exists()),
+                lockfile_created: Some(!before_lock && root.join("package-lock.json").exists()),
             };
         }
     };
@@ -570,6 +592,7 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
                         changed_paths.push(path);
                     }
                 }
+                let after_lock = root.join("package-lock.json").exists();
                 let required_ready = setup_dependencies_ready(root, requirement.setup_kind);
                 let status_kind = if status.success() && required_ready {
                     NodeDependencySetupStatus::Passed
@@ -596,6 +619,9 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
                     },
                     output_snippet: eval_events::body_snippet(&combined),
                     changed_paths,
+                    lockfile_present_before: Some(before_lock),
+                    lockfile_present_after: Some(after_lock),
+                    lockfile_created: Some(!before_lock && after_lock),
                 };
             }
             Ok(None) => {}
@@ -610,6 +636,9 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
                     primary_reason: format!("dependency setup wait failed: {err}"),
                     output_snippet: String::new(),
                     changed_paths: Vec::new(),
+                    lockfile_present_before: Some(before_lock),
+                    lockfile_present_after: Some(root.join("package-lock.json").exists()),
+                    lockfile_created: Some(!before_lock && root.join("package-lock.json").exists()),
                 };
             }
         }
@@ -629,6 +658,9 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
                 ),
                 output_snippet: String::new(),
                 changed_paths: Vec::new(),
+                lockfile_present_before: Some(before_lock),
+                lockfile_present_after: Some(root.join("package-lock.json").exists()),
+                lockfile_created: Some(!before_lock && root.join("package-lock.json").exists()),
             };
         }
         thread::sleep(Duration::from_millis(20));
@@ -699,6 +731,9 @@ fn run_node_test_runner_manifest_setup(
             primary_reason: format!("node test runner manifest {}", completion.action.as_str()),
             output_snippet: String::new(),
             changed_paths: vec!["package.json".to_string()],
+            lockfile_present_before: None,
+            lockfile_present_after: None,
+            lockfile_created: None,
         },
         Err(err) => NodeDependencySetupObservation {
             status: NodeDependencySetupStatus::Failed,
@@ -710,6 +745,9 @@ fn run_node_test_runner_manifest_setup(
             primary_reason: format!("failed to write package.json: {err}"),
             output_snippet: String::new(),
             changed_paths: Vec::new(),
+            lockfile_present_before: None,
+            lockfile_present_after: None,
+            lockfile_created: None,
         },
     }
 }
@@ -984,6 +1022,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         fs::create_dir_all(dir.path().join("src/app")).unwrap();
         fs::create_dir_all(dir.path().join("node_modules/.bin")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/next")).unwrap();
         fs::write(dir.path().join("node_modules/.bin/next"), "").unwrap();
         write_package(
             dir.path(),

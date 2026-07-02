@@ -43,6 +43,14 @@ impl BuildVerifierStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForeignToolchainObservation {
+    pub tool: String,
+    pub resolved_path: String,
+    pub workspace_root: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BuildVerifierObservation {
     pub command: String,
     pub profile: Option<String>,
@@ -54,6 +62,8 @@ pub struct BuildVerifierObservation {
     pub status: BuildVerifierStatus,
     pub primary_reason: String,
     pub output_snippet: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreign_toolchain: Option<ForeignToolchainObservation>,
 }
 
 impl BuildVerifierObservation {
@@ -153,6 +163,9 @@ pub fn emit_dependency_build_lifecycle(
             "setup_kind": lifecycle.setup.as_ref().map(|setup| setup.setup_kind.as_str()).unwrap_or("none"),
             "setup_command": lifecycle.setup.as_ref().map(|setup| setup.command.as_str()).unwrap_or(""),
             "setup_changed_paths": lifecycle.setup.as_ref().map(|setup| setup.changed_paths.clone()).unwrap_or_default(),
+            "setup_lockfile_present_before": lifecycle.setup.as_ref().and_then(|setup| setup.lockfile_present_before),
+            "setup_lockfile_present_after": lifecycle.setup.as_ref().and_then(|setup| setup.lockfile_present_after),
+            "setup_lockfile_created": lifecycle.setup.as_ref().and_then(|setup| setup.lockfile_created),
             "after_status": lifecycle.after_setup.as_ref().map(BuildVerifierObservation::status_str).unwrap_or(""),
             "after_attempted": lifecycle.after_setup.as_ref().is_some_and(|observation| observation.attempted),
             "build_rerun_attempted": lifecycle.after_setup.as_ref().is_some_and(|observation| observation.attempted),
@@ -160,6 +173,35 @@ pub fn emit_dependency_build_lifecycle(
             "final_reason": eval_events::body_snippet(&lifecycle.final_reason),
         }),
     );
+    emit_foreign_toolchain_detected(eval_events_path, mode, step_id, &lifecycle.before_setup);
+    if let Some(after_setup) = lifecycle.after_setup.as_ref() {
+        emit_foreign_toolchain_detected(eval_events_path, mode, step_id, after_setup);
+    }
+}
+
+fn emit_foreign_toolchain_detected(
+    eval_events_path: Option<&Path>,
+    mode: &str,
+    step_id: Option<&str>,
+    observation: &BuildVerifierObservation,
+) {
+    if let Some(foreign) = observation.foreign_toolchain.as_ref() {
+        eval_events::emit(
+            eval_events_path,
+            serde_json::json!({
+                "event": "foreign_toolchain_detected",
+                "mode": mode,
+                "step_id": step_id.unwrap_or(""),
+                "command": observation.command,
+                "profile": observation.profile,
+                "tool": foreign.tool,
+                "resolved_path": foreign.resolved_path,
+                "workspace_root": foreign.workspace_root,
+                "reason": foreign.reason,
+                "status": observation.status_str(),
+            }),
+        );
+    }
 }
 
 pub fn requirement_from_deferred(
@@ -244,9 +286,15 @@ pub fn observe_requirement(
             status: BuildVerifierStatus::PolicyRejected,
             primary_reason: err.to_string(),
             output_snippet: String::new(),
+            foreign_toolchain: None,
         };
     }
     if !dependency_ready {
+        let foreign_toolchain = foreign_toolchain_for_requirement(root, requirement);
+        let mut primary_reason = dependency_missing_reason(root, &requirement.command);
+        if let Some(foreign) = foreign_toolchain.as_ref() {
+            primary_reason = format!("{primary_reason}; {}", foreign.reason);
+        }
         return BuildVerifierObservation {
             command: requirement.command.clone(),
             profile: requirement.profile.clone(),
@@ -256,8 +304,9 @@ pub fn observe_requirement(
             dependency_ready,
             attempted: false,
             status: BuildVerifierStatus::DependencyMissing,
-            primary_reason: dependency_missing_reason(root, &requirement.command),
+            primary_reason,
             output_snippet: String::new(),
+            foreign_toolchain,
         };
     }
     match verifier_env::run_checked(&requirement.command, root, false) {
@@ -272,6 +321,7 @@ pub fn observe_requirement(
             status: BuildVerifierStatus::Passed,
             primary_reason: "build verifier passed".to_string(),
             output_snippet: eval_events::body_snippet(&output),
+            foreign_toolchain: None,
         },
         Err(err) => {
             let reason = err.to_string();
@@ -293,6 +343,7 @@ pub fn observe_requirement(
                 status,
                 primary_reason: eval_events::body_snippet(&reason),
                 output_snippet: eval_events::body_snippet(&reason),
+                foreign_toolchain: None,
             }
         }
     }
@@ -392,6 +443,7 @@ pub(crate) fn observe_dependency_missing_output_lifecycle_with_setup_program_and
         status: BuildVerifierStatus::DependencyMissing,
         primary_reason: snippet.clone(),
         output_snippet: snippet,
+        foreign_toolchain: foreign_toolchain_for_requirement(root, requirement),
     };
     observe_requirement_lifecycle_from_before(
         root,
@@ -506,6 +558,33 @@ fn dependency_ready(root: &Path, command: &str) -> bool {
     true
 }
 
+fn foreign_toolchain_for_requirement(
+    root: &Path,
+    requirement: &BuildVerifierRequirement,
+) -> Option<ForeignToolchainObservation> {
+    if !requires_next_binary(&requirement.command)
+        && !matches!(
+            requirement.profile.as_deref(),
+            Some("nextjs" | "next-js" | "next.js")
+        )
+    {
+        return None;
+    }
+    if dependency_setup::next_package_ready(root) {
+        return None;
+    }
+    let resolved = verifier_env::foreign_node_modules_bin_on_path(root, "next")?;
+    Some(ForeignToolchainObservation {
+        tool: "next".to_string(),
+        resolved_path: resolved.display().to_string(),
+        workspace_root: root.display().to_string(),
+        reason: format!(
+            "foreign_toolchain_detected: workspace node_modules/next missing; PATH would resolve next outside workspace at {}",
+            resolved.display()
+        ),
+    })
+}
+
 fn requires_package_manifest(command: &str) -> bool {
     let normalized = command.to_ascii_lowercase();
     normalized.starts_with("npm ")
@@ -596,7 +675,20 @@ fn node_dependency_state_ready(root: &Path, profile: Option<&str>, command: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::Command;
     use tempfile::TempDir;
+
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
 
     #[test]
     fn deferred_next_build_becomes_required_build_verifier() {
@@ -670,9 +762,12 @@ mod tests {
             BuildVerifierStatus::DependencyMissing
         );
         assert!(!lifecycle.before_setup.attempted);
-        assert_eq!(
-            lifecycle.before_setup.primary_reason,
-            "package.json missing before Next.js build verifier"
+        assert!(
+            lifecycle
+                .before_setup
+                .primary_reason
+                .contains("package.json missing before Next.js build verifier"),
+            "{lifecycle:?}"
         );
         assert_eq!(lifecycle.setup_status(), "blocked");
         assert_eq!(
@@ -726,6 +821,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
         std::fs::create_dir_all(dir.path().join("node_modules/.bin")).unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/next")).unwrap();
         std::fs::write(dir.path().join("node_modules/.bin/next"), "").unwrap();
         std::fs::write(
             dir.path().join("package.json"),
@@ -757,6 +853,77 @@ mod tests {
     }
 
     #[test]
+    fn nextjs_build_with_foreign_next_on_path_is_dependency_missing_and_emits_event() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        )
+        .unwrap();
+        let foreign_bin = dir.path().join("foreign/node_modules/.bin");
+        std::fs::create_dir_all(&foreign_bin).unwrap();
+        write_executable(&foreign_bin.join("next"), "#!/bin/sh\nexit 0\n");
+        let events = dir.path().join("events.jsonl");
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let child_path = std::env::join_paths(
+            std::iter::once(foreign_bin.clone()).chain(std::env::split_paths(&original_path)),
+        )
+        .unwrap();
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "minimal_loop::build_verifier::tests::nextjs_build_with_foreign_next_on_path_child",
+                "--nocapture",
+            ])
+            .env("ANVIL_FOREIGN_TOOLCHAIN_ROOT", dir.path())
+            .env("ANVIL_FOREIGN_TOOLCHAIN_EVENTS", &events)
+            .env("PATH", child_path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status}");
+
+        let text = std::fs::read_to_string(events).unwrap();
+        assert!(text.contains("\"event\":\"foreign_toolchain_detected\""));
+        assert!(text.contains("\"status\":\"dependency_missing\""));
+        assert!(text.contains("foreign_toolchain_detected"));
+    }
+
+    #[test]
+    #[ignore]
+    fn nextjs_build_with_foreign_next_on_path_child() {
+        let root = std::env::var_os("ANVIL_FOREIGN_TOOLCHAIN_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap();
+        let events = std::env::var_os("ANVIL_FOREIGN_TOOLCHAIN_EVENTS")
+            .map(std::path::PathBuf::from)
+            .unwrap();
+        let requirement = requirement_from_deferred(
+            "npm run build",
+            Some("nextjs"),
+            "final build check",
+            "profile:nextjs",
+            "pending",
+        )
+        .unwrap();
+
+        let lifecycle =
+            observe_requirement_lifecycle(&root, &requirement, NodeDependencySetupAuthority::None);
+
+        assert_eq!(
+            lifecycle.before_setup.status,
+            BuildVerifierStatus::DependencyMissing
+        );
+        assert!(!lifecycle.before_setup.attempted);
+        assert!(
+            lifecycle.before_setup.foreign_toolchain.is_some(),
+            "{lifecycle:?}"
+        );
+        emit_dependency_build_lifecycle(Some(&events), "minimal-loop", Some("step"), &lifecycle);
+    }
+
+    #[test]
     fn dependency_missing_setup_allowed_then_build_rerun_records_lifecycle() {
         let dir = TempDir::new().unwrap();
         std::fs::write(
@@ -767,7 +934,7 @@ mod tests {
         let fake_npm = dir.path().join("fake-npm.sh");
         std::fs::write(
             &fake_npm,
-            "#!/bin/sh\nmkdir -p node_modules/.bin\ncat > node_modules/.bin/next <<'EOF'\n#!/bin/sh\nexit 0\nEOF\nchmod +x node_modules/.bin/next\ntouch package-lock.json\nexit 0\n",
+            "#!/bin/sh\nmkdir -p node_modules/.bin node_modules/next\ncat > node_modules/next/package.json <<'EOF'\n{\"version\":\"14.2.0\"}\nEOF\ncat > node_modules/.bin/next <<'EOF'\n#!/bin/sh\nexit 0\nEOF\nchmod +x node_modules/.bin/next\ntouch package-lock.json\nexit 0\n",
         )
         .unwrap();
         #[cfg(unix)]

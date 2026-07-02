@@ -174,6 +174,56 @@ impl CompletionContract {
         root: &Path,
         fallback_goal: &str,
     ) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+        self.verify_with_goal_observed_with_setup_authority(
+            root,
+            fallback_goal,
+            NodeDependencySetupAuthority::None,
+            false,
+        )
+    }
+
+    pub fn verify_with_goal_observed_with_setup_authority(
+        &self,
+        root: &Path,
+        fallback_goal: &str,
+        setup_authority: NodeDependencySetupAuthority,
+        offline: bool,
+    ) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+        self.verify_with_goal_observed_inner(
+            root,
+            fallback_goal,
+            setup_authority,
+            Path::new("npm"),
+            offline,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verify_with_goal_observed_with_setup_program_and_authority(
+        &self,
+        root: &Path,
+        fallback_goal: &str,
+        setup_authority: NodeDependencySetupAuthority,
+        npm_program: &Path,
+        offline: bool,
+    ) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+        self.verify_with_goal_observed_inner(
+            root,
+            fallback_goal,
+            setup_authority,
+            npm_program,
+            offline,
+        )
+    }
+
+    fn verify_with_goal_observed_inner(
+        &self,
+        root: &Path,
+        fallback_goal: &str,
+        setup_authority: NodeDependencySetupAuthority,
+        npm_program: &Path,
+        offline: bool,
+    ) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
         let mut report = VerificationReport::pass();
         let mut build_verifier_observations = Vec::new();
         for path in &self.required_paths {
@@ -193,11 +243,14 @@ impl CompletionContract {
                 "completion_contract",
                 "required",
             ) {
-                let lifecycle = build_verifier::observe_requirement_lifecycle(
-                    root,
-                    &build_requirement,
-                    NodeDependencySetupAuthority::None,
-                );
+                let lifecycle =
+                    build_verifier::observe_requirement_lifecycle_with_setup_program_and_offline(
+                        root,
+                        &build_requirement,
+                        setup_authority,
+                        npm_program,
+                        offline,
+                    );
                 let observation = lifecycle.final_observation();
                 if observation.status != BuildVerifierStatus::Passed {
                     match observation.status {
@@ -231,7 +284,7 @@ impl CompletionContract {
                 build_verifier_observations.push(lifecycle);
                 continue;
             }
-            match crate::minimal_loop::verifier_env::run_checked(command, root, false) {
+            match crate::minimal_loop::verifier_env::run_checked(command, root, offline) {
                 Ok(output) => {
                     if command.contains("npm") && output.contains("0 tests") {
                         report.push_command_failure(command.clone(), "Node 0 tests rejected");
@@ -285,11 +338,14 @@ impl CompletionContract {
                 &requirement.authority,
                 &requirement.status,
             ) {
-                let lifecycle = build_verifier::observe_requirement_lifecycle(
-                    root,
-                    &build_requirement,
-                    setup_authority_for_deferred(requirement),
-                );
+                let lifecycle =
+                    build_verifier::observe_requirement_lifecycle_with_setup_program_and_offline(
+                        root,
+                        &build_requirement,
+                        setup_authority_for_deferred(requirement, setup_authority),
+                        npm_program,
+                        offline,
+                    );
                 let observation = lifecycle.final_observation();
                 if build_requirement.required_for_completion
                     && observation.status != BuildVerifierStatus::Passed
@@ -498,6 +554,7 @@ impl CompletionContract {
 
 fn setup_authority_for_deferred(
     requirement: &DeferredVerifyRequirement,
+    fallback: NodeDependencySetupAuthority,
 ) -> NodeDependencySetupAuthority {
     let authority = requirement.authority.to_ascii_lowercase();
     if authority.contains("eval") && authority.contains("setup") {
@@ -507,7 +564,7 @@ fn setup_authority_for_deferred(
     } else if authority.contains("tui") && authority.contains("setup") {
         NodeDependencySetupAuthority::TuiConfirmed
     } else {
-        NodeDependencySetupAuthority::None
+        fallback
     }
 }
 
@@ -1139,6 +1196,18 @@ fn default_deferred_status() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn write_executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+    }
 
     #[test]
     fn structured_contract_deduplicates_and_accepts_safe_verify() {
@@ -1615,6 +1684,118 @@ mod tests {
         assert!(report.primary_reason().contains("dependency_setup_missing"));
         assert_eq!(lifecycles.len(), 1);
         assert!(lifecycles[0].lifecycle_stages().contains(&"setup_blocked"));
+    }
+
+    #[test]
+    fn contract_deferred_build_with_plan_setup_authority_installs_then_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        )
+        .unwrap();
+        let fake_npm = dir.path().join("fake-npm.sh");
+        write_executable(
+            &fake_npm,
+            "#!/bin/sh\nmkdir -p node_modules/.bin node_modules/next\ncat > node_modules/next/package.json <<'EOF'\n{\"version\":\"14.2.0\"}\nEOF\ncat > node_modules/.bin/next <<'EOF'\n#!/bin/sh\nexit 0\nEOF\ncat > node_modules/.bin/npm <<'EOF'\n#!/bin/sh\nif [ \"$1\" = \"run\" ] && [ \"$2\" = \"build\" ]; then exit 0; fi\nexit 1\nEOF\nchmod +x node_modules/.bin/next node_modules/.bin/npm\ntouch package-lock.json\nexit 0\n",
+        );
+        let contract = CompletionContract {
+            required_paths: vec!["package.json".to_string()],
+            verify_commands: Vec::new(),
+            profile: None,
+            goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
+            required_obligations: Vec::new(),
+            deferred_verify_requirements: vec![DeferredVerifyRequirement {
+                command: "npm run build".to_string(),
+                reason: "requires dependency setup".to_string(),
+                authority: "postcheck".to_string(),
+                profile: Some("nextjs".to_string()),
+                status: "blocked_by_dependency_setup".to_string(),
+            }],
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap();
+
+        let (report, lifecycles) = contract
+            .verify_with_goal_observed_with_setup_program_and_authority(
+                dir.path(),
+                "",
+                NodeDependencySetupAuthority::PlanSetupStep,
+                &fake_npm,
+                false,
+            );
+
+        assert!(report.is_pass(), "{report:?}");
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].setup_status(), "passed");
+        assert_eq!(lifecycles[0].final_status, BuildVerifierStatus::Passed);
+        assert!(dir.path().join("node_modules").is_dir());
+        assert!(dir.path().join("package-lock.json").is_file());
+        let setup = lifecycles[0].setup.as_ref().unwrap();
+        assert_eq!(setup.lockfile_present_before, Some(false));
+        assert_eq!(setup.lockfile_present_after, Some(true));
+        assert_eq!(setup.lockfile_created, Some(true));
+    }
+
+    #[test]
+    fn contract_deferred_build_without_authority_stays_dependency_missing_without_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        )
+        .unwrap();
+        let contract = CompletionContract {
+            required_paths: vec!["package.json".to_string()],
+            verify_commands: Vec::new(),
+            profile: None,
+            goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
+            required_obligations: Vec::new(),
+            deferred_verify_requirements: vec![DeferredVerifyRequirement {
+                command: "npm run build".to_string(),
+                reason: "requires dependency setup".to_string(),
+                authority: "postcheck".to_string(),
+                profile: Some("nextjs".to_string()),
+                status: "blocked_by_dependency_setup".to_string(),
+            }],
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap();
+
+        let (report, lifecycles) = contract
+            .verify_with_goal_observed_with_setup_program_and_authority(
+                dir.path(),
+                "",
+                NodeDependencySetupAuthority::None,
+                Path::new("missing-fake-npm"),
+                false,
+            );
+
+        assert!(!report.is_pass(), "{report:?}");
+        assert!(matches!(
+            report.status,
+            crate::planner::verify::VerifyStatus::DependencyMissing(_)
+        ));
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].setup_status(), "blocked");
+        assert!(
+            !lifecycles[0]
+                .setup
+                .as_ref()
+                .is_some_and(|setup| setup.attempted)
+        );
+        assert!(!dir.path().join("node_modules").exists());
+        assert!(!dir.path().join("package-lock.json").exists());
     }
 
     #[test]

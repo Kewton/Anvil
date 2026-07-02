@@ -200,6 +200,79 @@ pub fn verify_step_with_setup_observed_with_offline(
     )
 }
 
+pub fn verify_setup_dependency_state_with_setup_observed_with_offline(
+    root: &Path,
+    setup_authority: NodeDependencySetupAuthority,
+    offline: bool,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+    verify_setup_dependency_state_with_setup_observed_with_options(
+        root,
+        setup_authority,
+        Path::new("npm"),
+        offline,
+    )
+}
+
+#[cfg(test)]
+fn verify_setup_dependency_state_with_setup_observed_with_options(
+    root: &Path,
+    setup_authority: NodeDependencySetupAuthority,
+    npm_program: &Path,
+    offline: bool,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+    verify_setup_dependency_state_with_setup_observed_inner(
+        root,
+        setup_authority,
+        npm_program,
+        offline,
+    )
+}
+
+#[cfg(not(test))]
+fn verify_setup_dependency_state_with_setup_observed_with_options(
+    root: &Path,
+    setup_authority: NodeDependencySetupAuthority,
+    npm_program: &Path,
+    offline: bool,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+    verify_setup_dependency_state_with_setup_observed_inner(
+        root,
+        setup_authority,
+        npm_program,
+        offline,
+    )
+}
+
+fn verify_setup_dependency_state_with_setup_observed_inner(
+    root: &Path,
+    setup_authority: NodeDependencySetupAuthority,
+    npm_program: &Path,
+    offline: bool,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+    let mut report = VerificationReport::pass();
+    let mut build_lifecycles = Vec::new();
+    if let Some(requirement) = build_verifier::requirement_from_dependency_state(
+        root,
+        "test -d node_modules",
+        None,
+        "setup step completed with declared dependencies but missing node_modules",
+        setup_authority.as_str(),
+        "required",
+    ) {
+        let lifecycle =
+            build_verifier::observe_requirement_lifecycle_with_setup_program_and_offline(
+                root,
+                &requirement,
+                setup_authority,
+                npm_program,
+                offline,
+            );
+        record_build_lifecycle_result(&mut report, &requirement.command, &lifecycle);
+        build_lifecycles.push(lifecycle);
+    }
+    (report, build_lifecycles)
+}
+
 fn verify_step_with_setup_observed_with_options(
     root: &Path,
     step: &PlanStep,
@@ -976,6 +1049,57 @@ mod tests {
                 .as_ref()
                 .is_some_and(|after| after.attempted)
         );
+    }
+
+    #[test]
+    fn setup_step_empty_verify_declared_dependencies_runs_state_install_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"left-pad":"^1.3.0"}}"#,
+        )
+        .unwrap();
+        let fake_npm = dir.path().join("fake-npm.sh");
+        write_executable(
+            &fake_npm,
+            "#!/bin/sh\nmkdir -p node_modules\ntouch package-lock.json\nexit 0\n",
+        );
+        let step = PlanStep {
+            id: "workspace-and-dependencies-setup".to_string(),
+            kind: "setup".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Install declared dependencies".to_string(),
+            expected_paths: Vec::new(),
+            verify: Vec::new(),
+        };
+
+        let (initial_report, initial_lifecycles) = verify_step_with_setup_observed_with_options(
+            dir.path(),
+            &step,
+            NodeDependencySetupAuthority::PlanSetupStep,
+            &fake_npm,
+            false,
+        );
+        assert!(initial_report.is_pass(), "{initial_report:?}");
+        assert!(initial_lifecycles.is_empty());
+
+        let (report, lifecycles) = verify_setup_dependency_state_with_setup_observed_with_options(
+            dir.path(),
+            NodeDependencySetupAuthority::PlanSetupStep,
+            &fake_npm,
+            false,
+        );
+
+        assert!(report.is_pass(), "{report:?}");
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].setup_status(), "passed");
+        assert_eq!(lifecycles[0].final_status, BuildVerifierStatus::Passed);
+        assert!(dir.path().join("node_modules").is_dir());
+        assert!(dir.path().join("package-lock.json").is_file());
+        let setup = lifecycles[0].setup.as_ref().unwrap();
+        assert_eq!(setup.lockfile_present_before, Some(false));
+        assert_eq!(setup.lockfile_present_after, Some(true));
+        assert_eq!(setup.lockfile_created, Some(true));
     }
 
     #[test]

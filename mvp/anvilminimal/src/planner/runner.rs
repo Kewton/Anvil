@@ -12,7 +12,7 @@ use crate::minimal_loop::browser_probe::{
 };
 use crate::minimal_loop::build_verifier::emit_dependency_build_lifecycle;
 use crate::minimal_loop::completion::{CompletionContract, evidence_hint_tokens_for_goal};
-use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
+use crate::minimal_loop::dependency_setup::{self, NodeDependencySetupAuthority};
 use crate::minimal_loop::evidence::{
     RuntimeAcceptanceReport, required_evidence_for_capability,
     verify_runtime_acceptance_with_browser_dirs_and_hints,
@@ -51,7 +51,10 @@ use crate::planner::step_plan::{
     parse_step_plan, render_step_plan, repair_generated_step_plan_contract,
 };
 use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
-use crate::planner::verify::{VerificationReport, verify_step_with_setup_observed_with_offline};
+use crate::planner::verify::{
+    VerificationReport, verify_setup_dependency_state_with_setup_observed_with_offline,
+    verify_step_with_setup_observed_with_offline,
+};
 use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
 use crate::tools::path_guard::resolve_existing;
@@ -898,7 +901,14 @@ fn run_step(
     {
         step_config.completion_contract_path = Some(path);
     }
-    let step_options = step_run_session_options(step, contract_enforcement, phase_scope);
+    let setup_authority = step_verify_setup_authority(plan, step);
+    let contract_setup_authority = step_contract_setup_authority(plan, step, phase_scope);
+    let step_options = step_run_session_options(
+        step,
+        contract_enforcement,
+        phase_scope,
+        contract_setup_authority,
+    );
     let initial = run_session_with_outcome_with_options(
         client,
         session,
@@ -935,13 +945,27 @@ fn run_step(
             outcome,
         });
     }
-    let setup_authority = step_verify_setup_authority(plan, step);
-    let (report, build_lifecycles) = verify_step_with_setup_observed_with_offline(
+    let (mut report, mut build_lifecycles) = verify_step_with_setup_observed_with_offline(
         &config.workspace_root,
         step,
         setup_authority,
         config.offline,
     );
+    if should_run_setup_step_dependency_state_lifecycle(
+        &config.workspace_root,
+        step,
+        phase_scope,
+        setup_authority,
+    ) {
+        let (dependency_report, mut dependency_lifecycles) =
+            verify_setup_dependency_state_with_setup_observed_with_offline(
+                &config.workspace_root,
+                setup_authority,
+                config.offline,
+            );
+        merge_verification_report(&mut report, dependency_report);
+        build_lifecycles.append(&mut dependency_lifecycles);
+    }
     for lifecycle in &build_lifecycles {
         emit_dependency_build_lifecycle(
             config.eval_events_path.as_deref(),
@@ -1430,16 +1454,78 @@ fn step_verify_setup_authority(plan: &StepPlan, step: &PlanStep) -> NodeDependen
     }
 }
 
+fn step_contract_setup_authority(
+    _plan: &StepPlan,
+    step: &PlanStep,
+    phase_scope: Option<&str>,
+) -> NodeDependencySetupAuthority {
+    if step.step_kind() != StepKind::Implement {
+        return NodeDependencySetupAuthority::None;
+    }
+    if step_or_phase_is_dependency_setup_purpose(step, phase_scope) {
+        NodeDependencySetupAuthority::PlanSetupStep
+    } else {
+        NodeDependencySetupAuthority::None
+    }
+}
+
+fn step_or_phase_is_dependency_setup_purpose(step: &PlanStep, phase_scope: Option<&str>) -> bool {
+    [
+        step.id.as_str(),
+        step.kind.as_str(),
+        step.instruction.as_str(),
+    ]
+    .into_iter()
+    .chain(phase_scope)
+    .any(text_mentions_dependency_setup)
+}
+
+fn text_mentions_dependency_setup(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    (lower.contains("setup") || lower.contains("install"))
+        && (lower.contains("depend") || lower.contains("workspace") || lower.contains("package"))
+}
+
+fn should_run_setup_step_dependency_state_lifecycle(
+    root: &Path,
+    step: &PlanStep,
+    phase_scope: Option<&str>,
+    setup_authority: NodeDependencySetupAuthority,
+) -> bool {
+    step.step_kind() == StepKind::Setup
+        && setup_authority == NodeDependencySetupAuthority::PlanSetupStep
+        && step_or_phase_is_dependency_setup_purpose(step, phase_scope)
+        && dependency_setup::package_json_declares_dependencies(root)
+        && !dependency_setup::node_declared_dependencies_ready(root)
+}
+
+fn merge_verification_report(report: &mut VerificationReport, extra: VerificationReport) {
+    for path in extra.missing_paths {
+        report.push_missing_path(path);
+    }
+    for reason in extra.dependency_missing {
+        report.push_dependency_missing(reason);
+    }
+    for failure in extra.command_failures {
+        report.push_command_failure(failure.command, failure.reason);
+    }
+    for reason in extra.profile_failures {
+        report.push_profile_failure(reason);
+    }
+}
+
 fn step_run_session_options(
     step: &PlanStep,
     contract_enforcement: ContractEnforcement,
     phase_scope: Option<&str>,
+    setup_authority: NodeDependencySetupAuthority,
 ) -> RunSessionOptions {
     RunSessionOptions::plan_step_with_enforcement(
         run_session_step_kind(step),
         contract_enforcement,
         phase_scope.map(str::to_string),
     )
+    .with_dependency_setup_authority(setup_authority)
 }
 
 fn run_session_step_kind(step: &PlanStep) -> RunSessionStepKind {
@@ -4403,7 +4489,8 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
         );
     }
 
-    let mut command = verifier_env::normalized_command(&spec.package_manager);
+    let mut command =
+        verifier_env::normalized_command_at_root(&spec.package_manager, &config.workspace_root);
     command
         .args(&spec.args)
         .current_dir(&config.workspace_root)
@@ -7689,6 +7776,51 @@ mod tests {
         let plan = StepPlan::single("goal");
         let path = save_step_plan(dir.path(), &plan).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn implement_contract_setup_authority_requires_setup_purpose_step_or_phase() {
+        let implement = PlanStep {
+            id: "app".to_string(),
+            kind: "implement".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Build the app".to_string(),
+            expected_paths: Vec::new(),
+            verify: Vec::new(),
+        };
+        let setup_implement = PlanStep {
+            id: "workspace-and-dependencies-setup".to_string(),
+            kind: "implement".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Install dependencies".to_string(),
+            expected_paths: Vec::new(),
+            verify: Vec::new(),
+        };
+        let without_setup = StepPlan {
+            goal: "Build app".to_string(),
+            steps: vec![implement.clone()],
+        };
+        let with_setup_implement = StepPlan {
+            goal: "Build app".to_string(),
+            steps: vec![setup_implement.clone()],
+        };
+
+        assert_eq!(
+            step_contract_setup_authority(&without_setup, &implement, None),
+            NodeDependencySetupAuthority::None
+        );
+        assert_eq!(
+            step_contract_setup_authority(&with_setup_implement, &setup_implement, None),
+            NodeDependencySetupAuthority::PlanSetupStep
+        );
+        assert_eq!(
+            step_contract_setup_authority(
+                &without_setup,
+                &implement,
+                Some("workspace-and-dependencies-setup"),
+            ),
+            NodeDependencySetupAuthority::PlanSetupStep
+        );
     }
 
     #[test]

@@ -179,7 +179,7 @@ fn probe_browser_readiness_with_options(
         );
     }
 
-    let mut command = verifier_env::normalized_command(&spec.command.program);
+    let mut command = verifier_env::normalized_command_at_root(&spec.command.program, root);
     command
         .args(&spec.command.args)
         .current_dir(root)

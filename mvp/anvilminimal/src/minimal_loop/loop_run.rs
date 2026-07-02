@@ -127,6 +127,7 @@ pub(crate) struct RunSessionOptions {
     pub action_no_tool_policy: ActionNoToolPolicy,
     pub scope: RunSessionScope,
     pub step_kind: Option<RunSessionStepKind>,
+    pub dependency_setup_authority: NodeDependencySetupAuthority,
 }
 
 impl Default for RunSessionOptions {
@@ -140,6 +141,7 @@ impl Default for RunSessionOptions {
             action_no_tool_policy: ActionNoToolPolicy::RequireWriteForActionPrompt,
             scope: RunSessionScope::MinimalLoop,
             step_kind: None,
+            dependency_setup_authority: NodeDependencySetupAuthority::None,
         }
     }
 }
@@ -174,7 +176,16 @@ impl RunSessionOptions {
             action_no_tool_policy: ActionNoToolPolicy::RequireToolOnlyIfNoToolSeen,
             scope: RunSessionScope::PlanRunStep,
             step_kind: Some(step_kind),
+            dependency_setup_authority: NodeDependencySetupAuthority::None,
         }
+    }
+
+    pub(crate) fn with_dependency_setup_authority(
+        mut self,
+        authority: NodeDependencySetupAuthority,
+    ) -> Self {
+        self.dependency_setup_authority = authority;
+        self
     }
 
     fn contract_runtime_enabled(&self) -> bool {
@@ -834,6 +845,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     &changed_paths,
                     &[],
                     true,
+                    options.dependency_setup_authority,
                     config.offline,
                     &options,
                 ) {
@@ -1164,6 +1176,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     &changed_paths,
                     &batch_changed_paths,
                     batch_had_edit,
+                    options.dependency_setup_authority,
                     config.offline,
                     &options,
                 ) {
@@ -1554,6 +1567,7 @@ fn verify_completion_contract(
     changed_paths_after: &[String],
     repair_turn_changed_paths: &[String],
     had_edit: bool,
+    setup_authority: NodeDependencySetupAuthority,
     offline: bool,
 ) -> anyhow::Result<Option<VerifyFailureFeedback>> {
     let options = RunSessionOptions::default();
@@ -1569,6 +1583,7 @@ fn verify_completion_contract(
         changed_paths_after,
         repair_turn_changed_paths,
         had_edit,
+        setup_authority,
         offline,
         &options,
     )? {
@@ -1593,11 +1608,13 @@ fn verify_completion_contract_with_enforcement(
     changed_paths_after: &[String],
     repair_turn_changed_paths: &[String],
     had_edit: bool,
+    setup_authority: NodeDependencySetupAuthority,
     offline: bool,
     options: &RunSessionOptions,
 ) -> anyhow::Result<ContractVerificationOutcome> {
     *verify_attempts += 1;
-    let (report, build_verifier_lifecycles) = contract.verify_with_goal_observed(root, goal);
+    let (report, build_verifier_lifecycles) = contract
+        .verify_with_goal_observed_with_setup_authority(root, goal, setup_authority, offline);
     let build_verifier_observations = build_verifier_lifecycles
         .iter()
         .map(|lifecycle| lifecycle.final_observation().clone())
@@ -1639,12 +1656,8 @@ fn verify_completion_contract_with_enforcement(
         build_verifier_required,
         &build_verifier_lifecycles,
     );
-    let reachability = assess_repair_reachability(
-        &report,
-        Some(contract),
-        NodeDependencySetupAuthority::None,
-        offline,
-    );
+    let reachability =
+        assess_repair_reachability(&report, Some(contract), setup_authority, offline);
     eval_events::emit(
         eval_events_path,
         json!({
@@ -1686,6 +1699,7 @@ fn verify_completion_contract_with_enforcement(
             "build_verifier_observations": build_verifier_observations.clone(),
             "build_verifier_lifecycle": build_verifier_lifecycles.clone(),
             "dependency_setup_status": dependency_setup_status,
+            "dependency_setup_authority": setup_authority.as_str(),
             "verifier_bootstrap_state": verifier_bootstrap_state.as_str(),
             "repair_reachable": reachability.reachable,
             "reachable": reachability.reachable,
@@ -3602,6 +3616,7 @@ export default function Page(){
             &["a.py".to_string()],
             &[],
             false,
+            NodeDependencySetupAuthority::None,
             false,
         )
         .unwrap_err()
@@ -3662,6 +3677,7 @@ export default function Page(){
             &["src/main.rs".to_string()],
             &["src/main.rs".to_string()],
             true,
+            NodeDependencySetupAuthority::None,
             false,
         )
         .unwrap()
@@ -3718,6 +3734,7 @@ export default function Page(){
             &["src/app/widget.tsx".to_string()],
             &["src/app/widget.tsx".to_string()],
             true,
+            NodeDependencySetupAuthority::None,
             false,
         )
         .unwrap()
@@ -3746,6 +3763,7 @@ export default function Page(){
             ],
             &["src/app/page.tsx".to_string()],
             true,
+            NodeDependencySetupAuthority::None,
             false,
         )
         .unwrap();

@@ -1,5 +1,6 @@
-use std::ffi::OsStr;
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,11 +20,94 @@ pub fn normalized_command<S: AsRef<OsStr>>(program: S) -> Command {
     command
 }
 
+pub fn normalized_command_at_root<S: AsRef<OsStr>>(program: S, root: &Path) -> Command {
+    let mut command = normalized_command(program);
+    apply_workspace_path_env(&mut command, root);
+    command
+}
+
 pub fn apply_normalized_env(command: &mut Command) -> &mut Command {
     command
         .env_remove("NODE_ENV")
         .env_remove("NODE_OPTIONS")
         .env("NEXT_TELEMETRY_DISABLED", "1")
+}
+
+pub fn apply_workspace_path_env<'a>(command: &'a mut Command, root: &Path) -> &'a mut Command {
+    if let Some(path) = sanitized_path_for_root(root, std::env::var_os("PATH").as_deref()) {
+        command.env("PATH", path);
+    }
+    command
+}
+
+pub(crate) fn sanitized_path_for_root(root: &Path, path: Option<&OsStr>) -> Option<OsString> {
+    let workspace_bin = absolute_workspace_root(root).join("node_modules/.bin");
+    let mut entries = vec![workspace_bin.clone()];
+    let mut seen = BTreeSet::new();
+    seen.insert(path_key(&workspace_bin));
+
+    if let Some(path) = path {
+        for entry in std::env::split_paths(path) {
+            if is_foreign_node_modules_bin_entry(root, &entry) {
+                continue;
+            }
+            if seen.insert(path_key(&entry)) {
+                entries.push(entry);
+            }
+        }
+    }
+
+    std::env::join_paths(entries).ok()
+}
+
+pub(crate) fn foreign_node_modules_bin_on_path(root: &Path, tool: &str) -> Option<PathBuf> {
+    foreign_node_modules_bin_in_path_value(root, tool, std::env::var_os("PATH").as_deref())
+}
+
+pub(crate) fn foreign_node_modules_bin_in_path_value(
+    root: &Path,
+    tool: &str,
+    path: Option<&OsStr>,
+) -> Option<PathBuf> {
+    let path = path?;
+    std::env::split_paths(path)
+        .filter(|entry| is_foreign_node_modules_bin_entry(root, entry))
+        .map(|entry| entry.join(tool))
+        .find(|candidate| candidate.is_file())
+}
+
+fn is_foreign_node_modules_bin_entry(root: &Path, entry: &Path) -> bool {
+    path_contains_node_modules_bin(entry) && !path_is_under_root(entry, root)
+}
+
+fn path_contains_node_modules_bin(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    text.contains("/node_modules/.bin")
+        || text.contains("\\node_modules\\.bin")
+        || text.ends_with("node_modules/.bin")
+        || text.ends_with("node_modules\\.bin")
+}
+
+fn path_is_under_root(path: &Path, root: &Path) -> bool {
+    absolute_path(path).starts_with(absolute_workspace_root(root))
+}
+
+fn absolute_workspace_root(root: &Path) -> PathBuf {
+    absolute_path(root)
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().to_string()
 }
 
 pub fn host_env_contamination() -> Vec<String> {
@@ -101,7 +185,7 @@ fn run_structured(
         });
     }
 
-    let mut process = normalized_command("sh");
+    let mut process = normalized_command_at_root("sh", root);
     process.arg("-c").arg(command).current_dir(root);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(unix)]
@@ -277,6 +361,38 @@ mod tests {
                 .iter()
                 .any(|entry| entry == "NODE_ENV=production"),
             "{contamination:?}"
+        );
+    }
+
+    #[test]
+    fn sanitized_path_removes_foreign_node_modules_bin_and_prepends_workspace_bin() {
+        let root = Path::new("/tmp/anvil-workspace");
+        let current = std::env::join_paths([
+            Path::new("/usr/bin"),
+            Path::new("/tmp/other/node_modules/.bin"),
+            Path::new("/bin"),
+            Path::new("/tmp/anvil-workspace/node_modules/.bin"),
+        ])
+        .unwrap();
+
+        let sanitized = sanitized_path_for_root(root, Some(current.as_os_str())).unwrap();
+        let entries = std::env::split_paths(&sanitized).collect::<Vec<_>>();
+
+        assert_eq!(
+            entries[0],
+            PathBuf::from("/tmp/anvil-workspace/node_modules/.bin")
+        );
+        assert!(entries.contains(&PathBuf::from("/usr/bin")));
+        assert!(entries.contains(&PathBuf::from("/bin")));
+        assert!(!entries.contains(&PathBuf::from("/tmp/other/node_modules/.bin")));
+        assert_eq!(
+            entries
+                .iter()
+                .filter(
+                    |entry| entry.as_path() == Path::new("/tmp/anvil-workspace/node_modules/.bin")
+                )
+                .count(),
+            1
         );
     }
 
