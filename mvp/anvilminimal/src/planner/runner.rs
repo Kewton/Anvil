@@ -40,8 +40,8 @@ use crate::planner::lint::{
 use crate::planner::profile::{
     PhaseVerificationMode, ProfileSnapshot, profile_auto_repair, profile_before_phase,
     profile_expected_paths, profile_generation_rules, profile_guidance, profile_post_step_repair,
-    profile_quality_expectations, profile_repair_prompt, profile_runtime_contract,
-    verify_profile_final, verify_profile_invariant,
+    profile_quality_expectations, profile_runtime_contract, verify_profile_final,
+    verify_profile_invariant,
 };
 use crate::planner::repair::{
     RecoveryHandoff, RepairContext, build_repair_prompt_with_context, save_recovery_ultra_plan,
@@ -1821,6 +1821,7 @@ fn verify_plan_final_contract(
         &plan.goal,
         &required_capabilities,
         runtime_acceptance.as_ref(),
+        false,
     );
     let contract_required =
         completion_contract_required(&config.profile, &plan.goal, &required_capabilities)
@@ -2665,7 +2666,7 @@ pub fn run_ultra_plan_with_ui(
             &step_plan,
             config,
             ui,
-            final_phase,
+            false,
             "ultra-plan-run",
             Some(&phase.id),
         ) {
@@ -2725,10 +2726,8 @@ pub fn run_ultra_plan_with_ui(
             &step_outcome,
             missing_final_artifacts(&config.workspace_root, &final_expected_paths),
         );
-        if !final_phase {
-            let acceptance = ultra_contract_runtime_acceptance_report(plan, config)?;
-            ultra_context.refresh_pending_capability_evidence(&acceptance);
-        }
+        let acceptance = ultra_contract_runtime_acceptance_report(plan, config)?;
+        ultra_context.refresh_pending_capability_evidence(&acceptance);
         emit_ultra_phase_context_updated(
             config,
             plan,
@@ -2772,20 +2771,22 @@ pub fn run_ultra_plan_with_ui(
             )?;
         }
         if !invariant_report.is_pass() {
-            ultra_context.update_after_profile_failure(
-                phase,
-                &invariant_report.primary_reason(),
-                missing_final_artifacts(&config.workspace_root, &final_expected_paths),
-            );
-            emit_ultra_phase_context_updated(
-                config,
-                plan,
-                phase,
-                index,
-                &ultra_context,
-                ultra_session.messages.len(),
-                true,
-            );
+            if !final_phase {
+                ultra_context.update_after_profile_failure(
+                    phase,
+                    &invariant_report.primary_reason(),
+                    missing_final_artifacts(&config.workspace_root, &final_expected_paths),
+                );
+                emit_ultra_phase_context_updated(
+                    config,
+                    plan,
+                    phase,
+                    index,
+                    &ultra_context,
+                    ultra_session.messages.len(),
+                    true,
+                );
+            }
             emit_ultra_phase_event(
                 config,
                 if final_phase {
@@ -2866,368 +2867,16 @@ pub fn run_ultra_plan_with_ui(
             );
             continue;
         }
-        let profile_report = {
-            let final_report =
-                verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
-            if final_report.is_pass() && !invariant_report.is_pass() {
-                invariant_report.clone()
-            } else {
-                final_report
-            }
-        };
-        if !profile_report.is_pass() {
-            ultra_context.update_after_profile_failure(
-                phase,
-                &profile_report.primary_reason(),
-                missing_final_artifacts(&config.workspace_root, &final_expected_paths),
-            );
-            emit_ultra_phase_context_updated(
-                config,
-                plan,
-                phase,
-                index,
-                &ultra_context,
-                ultra_session.messages.len(),
-                true,
-            );
-            emit_ultra_phase_event(
-                config,
-                "ultra_phase_profile_check",
-                plan,
-                phase,
-                index,
-                "profile",
-                Some(false),
-                Some(&profile_report.primary_reason()),
-                None,
-            );
-            emit_phase_verification_event(
-                config,
-                plan,
-                phase,
-                index,
-                PhaseVerificationMode::FinalAcceptance,
-                false,
-                Some(&profile_report.primary_reason()),
-            );
-            if final_phase
-                && profile_auto_repair(
-                    &config.workspace_root,
-                    &plan.profile,
-                    &plan.goal,
-                    &profile_report,
-                )?
-            {
-                let auto_repair_target = classify_repair_target(&profile_report);
-                eval_events::emit(
-                    config.eval_events_path.as_deref(),
-                    json!({
-                        "event": "deterministic_scaffold_recovery",
-                        "lifecycle_stage": "profile_auto_repair",
-                        "phase_id": phase.id,
-                        "fallback_kind": "nextjs_profile_auto_repair",
-                        "repair_target": auto_repair_target.as_str(),
-                        "original_failure": eval_events::body_snippet(&profile_report.primary_reason()),
-                        "used_for_completion": false,
-                        "requires_continuation": true,
-                        "summary": "deterministic profile repair materialized recovery scaffold; final success still requires implementation continuation and acceptance verification",
-                    }),
-                );
-                let expected_paths =
-                    profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
-                let continuation_prompt = profile_auto_repair_continuation_prompt(
-                    plan,
-                    phase,
-                    &profile_report,
-                    &ultra_context,
-                    &expected_paths,
-                );
-                let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
-                eval_events::emit(
-                    config.eval_events_path.as_deref(),
-                    json!({
-                        "event": "profile_auto_repair_continuation_start",
-                        "phase_id": phase.id,
-                        "shared_execution_session": true,
-                        "bounded_repair": true,
-                        "max_iterations": repair_config.max_iterations,
-                        "expected_path_count": expected_paths.len(),
-                    }),
-                );
-                let continuation_outcome = run_session_with_outcome_with_options(
-                    execution,
-                    &mut ultra_session,
-                    &continuation_prompt,
-                    &expected_paths,
-                    &repair_config,
-                    ui,
-                    RunSessionOptions::plan_step(RunSessionStepKind::Implement),
-                )
-                .map_err(|err| {
-                    let message = err.to_string();
-                    let handoff = save_ultra_phase_recovery_handoff(
-                        config,
-                        plan,
-                        phase,
-                        UltraPhaseRecoveryRequest {
-                            failure_kind: "profile_auto_repair_continuation_failed",
-                            reason: &message,
-                            missing_paths: &missing_final_artifacts(
-                                &config.workspace_root,
-                                &final_expected_paths,
-                            ),
-                            missing_signals: &missing_signals_from_text(&message),
-                            repair_targets: &["profile_contract".to_string()],
-                        },
-                    )
-                    .unwrap_or_default();
-                    anyhow::anyhow!(
-                        "phase {} profile auto repair continuation failed: {message}{handoff}",
-                        phase.id
-                    )
-                })?;
-                push_context_items_capped(
-                    &mut ultra_context.created_or_changed_paths,
-                    &continuation_outcome.changed_paths,
-                    ULTRA_CONTEXT_MAX_PATHS,
-                    &mut ultra_context.truncated,
-                );
-                push_context_items_capped(
-                    &mut ultra_context.last_repair_changed_paths,
-                    &continuation_outcome.changed_paths,
-                    ULTRA_CONTEXT_MAX_PATHS,
-                    &mut ultra_context.truncated,
-                );
-                emit_ultra_phase_context_updated(
-                    config,
-                    plan,
-                    phase,
-                    index,
-                    &ultra_context,
-                    ultra_session.messages.len(),
-                    true,
-                );
-                eval_events::emit(
-                    config.eval_events_path.as_deref(),
-                    json!({
-                        "event": "profile_auto_repair_continuation_complete",
-                        "phase_id": phase.id,
-                        "shared_execution_session": true,
-                        "changed_path_count": continuation_outcome.changed_paths.len(),
-                        "iterations": continuation_outcome.iterations,
-                        "tool_calls": continuation_outcome.tool_calls,
-                    }),
-                );
-                let retry = verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
-                let continuation_followed = classify_repair_follow_through(
-                    auto_repair_target,
-                    &continuation_outcome.changed_paths,
-                )
-                .followed();
-                if retry.is_pass() && continuation_followed {
-                    emit_ultra_phase_event(
-                        config,
-                        "ultra_phase_profile_check",
-                        plan,
-                        phase,
-                        index,
-                        "profile_auto_repair",
-                        Some(true),
-                        None,
-                        None,
-                    );
-                    emit_ultra_phase_event(
-                        config,
-                        "ultra_phase_complete",
-                        plan,
-                        phase,
-                        index,
-                        "complete",
-                        Some(true),
-                        None,
-                        None,
-                    );
-                    continue;
-                }
-                if retry.is_pass() {
-                    let follow_through = classify_repair_follow_through(
-                        auto_repair_target,
-                        &continuation_outcome.changed_paths,
-                    );
-                    eval_events::emit(
-                        config.eval_events_path.as_deref(),
-                        json!({
-                            "event": "profile_auto_repair_continuation_incomplete",
-                            "phase_id": phase.id,
-                            "shared_execution_session": true,
-                            "reason": "deterministic_fallback_without_targeted_implementation_continuation",
-                            "repair_target": auto_repair_target.as_str(),
-                            "repair_follow_through": follow_through.as_str(),
-                            "changed_path_count": continuation_outcome.changed_paths.len(),
-                            "used_for_completion": false,
-                        }),
-                    );
-                }
-            }
-            if final_phase
-                && let Some(repair_prompt) = profile_repair_prompt(
-                    &config.workspace_root,
-                    &plan.profile,
-                    &plan.goal,
-                    &profile_report,
-                )
-            {
-                let expected_paths =
-                    profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
-                let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
-                eval_events::emit(
-                    config.eval_events_path.as_deref(),
-                    json!({
-                        "event": "profile_repair_start",
-                        "phase_id": phase.id,
-                        "shared_execution_session": true,
-                        "bounded_repair": true,
-                        "max_iterations": repair_config.max_iterations,
-                        "session_message_count": ultra_session.messages.len(),
-                    }),
-                );
-                let repair_outcome = run_profile_repair_with_ultra_session(
-                    execution,
-                    &mut ultra_session,
-                    &repair_prompt,
-                    &expected_paths,
-                    &repair_config,
-                    ui,
-                )
-                .map_err(|err| {
-                    anyhow::anyhow!("phase {} profile repair failed: {err}", phase.id)
-                })?;
-                push_context_items_capped(
-                    &mut ultra_context.created_or_changed_paths,
-                    &repair_outcome.changed_paths,
-                    ULTRA_CONTEXT_MAX_PATHS,
-                    &mut ultra_context.truncated,
-                );
-                push_context_items_capped(
-                    &mut ultra_context.last_repair_changed_paths,
-                    &repair_outcome.changed_paths,
-                    ULTRA_CONTEXT_MAX_PATHS,
-                    &mut ultra_context.truncated,
-                );
-                emit_ultra_phase_context_updated(
-                    config,
-                    plan,
-                    phase,
-                    index,
-                    &ultra_context,
-                    ultra_session.messages.len(),
-                    true,
-                );
-                eval_events::emit(
-                    config.eval_events_path.as_deref(),
-                    json!({
-                        "event": "profile_repair_complete",
-                        "phase_id": phase.id,
-                        "shared_execution_session": true,
-                        "changed_path_count": repair_outcome.changed_paths.len(),
-                        "iterations": repair_outcome.iterations,
-                        "tool_calls": repair_outcome.tool_calls,
-                    }),
-                );
-                let retry = verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
-                if retry.is_pass() {
-                    emit_ultra_phase_event(
-                        config,
-                        "ultra_phase_profile_check",
-                        plan,
-                        phase,
-                        index,
-                        "profile_repair",
-                        Some(true),
-                        None,
-                        None,
-                    );
-                    emit_ultra_phase_event(
-                        config,
-                        "ultra_phase_complete",
-                        plan,
-                        phase,
-                        index,
-                        "complete",
-                        Some(true),
-                        None,
-                        None,
-                    );
-                    continue;
-                }
-                emit_ultra_phase_event(
-                    config,
-                    "ultra_phase_failed",
-                    plan,
-                    phase,
-                    index,
-                    "profile_repair",
-                    Some(false),
-                    Some(&format!("{:?}", retry.status)),
-                    None,
-                );
-                return Err(anyhow::anyhow!(
-                    "phase {} profile verification failed after repair: {:?}{}",
-                    phase.id,
-                    retry.status,
-                    save_ultra_phase_recovery_handoff(
-                        config,
-                        plan,
-                        phase,
-                        UltraPhaseRecoveryRequest {
-                            failure_kind: "profile_repair_failed",
-                            reason: &format!("{:?}", retry.status),
-                            missing_paths: &retry.missing_paths,
-                            missing_signals: &verification_missing_signals(&retry),
-                            repair_targets: &["profile_contract".to_string()],
-                        },
-                    )
-                    .unwrap_or_default()
-                ));
-            }
-            emit_ultra_phase_event(
-                config,
-                "ultra_phase_failed",
-                plan,
-                phase,
-                index,
-                "profile",
-                Some(false),
-                Some(&format!("{:?}", profile_report.status)),
-                None,
-            );
-            let handoff = save_ultra_phase_recovery_handoff(
-                config,
-                plan,
-                phase,
-                UltraPhaseRecoveryRequest {
-                    failure_kind: "profile_final_failure",
-                    reason: &format!("{:?}", profile_report.status),
-                    missing_paths: &profile_report.missing_paths,
-                    missing_signals: &verification_missing_signals(&profile_report),
-                    repair_targets: &["profile_contract".to_string()],
-                },
-            );
-            return Err(anyhow::anyhow!(
-                "phase {} profile verification failed: {:?}{}",
-                phase.id,
-                profile_report.status,
-                handoff.unwrap_or_default()
-            ));
-        }
+        let final_invariant_reason =
+            (!invariant_report.is_pass()).then(|| invariant_report.primary_reason());
         emit_phase_verification_event(
             config,
             plan,
             phase,
             index,
             PhaseVerificationMode::FinalAcceptance,
-            true,
-            None,
+            invariant_report.is_pass(),
+            final_invariant_reason.as_deref(),
         );
         emit_ultra_phase_event(
             config,
@@ -3235,9 +2884,9 @@ pub fn run_ultra_plan_with_ui(
             plan,
             phase,
             index,
-            "profile",
-            Some(true),
-            None,
+            "profile_observed",
+            Some(invariant_report.is_pass()),
+            final_invariant_reason.as_deref(),
             None,
         );
         emit_ultra_phase_event(
@@ -3870,6 +3519,17 @@ fn ultra_final_acceptance_report(
         &release_evidence_extra_dirs(config),
         &evidence_hint_tokens,
     );
+    let profile_invariant_report = verify_profile_invariant(
+        &config.workspace_root,
+        &plan.profile,
+        &plan.goal,
+        &ProfileSnapshot::None,
+    );
+    let profile_report = if !profile_invariant_report.is_pass() {
+        profile_invariant_report
+    } else {
+        verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal)
+    };
     let external_report = bound_contract.as_ref().map(|bound| {
         bound
             .contract
@@ -3890,6 +3550,7 @@ fn ultra_final_acceptance_report(
         &plan.goal,
         &required_capabilities,
         Some(&acceptance),
+        true,
     );
     let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
     let runtime_acceptance_status = runtime_acceptance_status(acceptance.passed, Some(&acceptance));
@@ -3900,6 +3561,8 @@ fn ultra_final_acceptance_report(
         format!("missing final artifacts: {}", missing.join(", "))
     } else if contract_binding_missing {
         "completion contract binding required but missing".to_string()
+    } else if !profile_report.is_pass() {
+        profile_report.primary_reason()
     } else if !acceptance.passed {
         acceptance.primary_reason.clone()
     } else if let Some(report) = external_report.as_ref().filter(|report| !report.is_pass()) {
@@ -4017,8 +3680,12 @@ fn ultra_final_acceptance_report(
     for path in missing {
         report.push_missing_path(path);
     }
+    merge_verification_report(&mut report, profile_report);
     if !acceptance.passed {
         report.push_profile_failure(acceptance.primary_reason.clone());
+        for guidance in runtime_acceptance_repair_guidance(&acceptance) {
+            report.push_profile_failure(format!("repair guidance: {guidance}"));
+        }
         for target in &acceptance.obligation_repair_targets {
             report.push_profile_failure(format!(
                 "missing_required_obligation_target:{}:{}",
@@ -4035,11 +3702,15 @@ fn ultra_final_acceptance_report(
             external_report.primary_reason()
         ));
     }
+    let append_release_observations = !report.is_pass() || release_gate.status == "failed";
     if release_gate.status == "failed" {
         report.push_profile_failure(format!(
             "release gate failed: {}",
             release_gate.reasons.join("; ")
         ));
+    }
+    if append_release_observations {
+        append_release_gate_observation_failures(&mut report, &release_gate);
     }
     if let Some(observation) = &browser_probe
         && let Some(reason) = observation.failure_reason()
@@ -4320,6 +3991,7 @@ fn final_acceptance_release_gate(
     goal: &str,
     required_capabilities: &[String],
     acceptance: Option<&crate::minimal_loop::evidence::RuntimeAcceptanceReport>,
+    check_browser_on_runtime_failure: bool,
 ) -> ReleaseGateSummary {
     let lower = goal.to_ascii_lowercase();
     let is_next = matches!(profile, "nextjs" | "next-js" | "next.js");
@@ -4350,6 +4022,17 @@ fn final_acceptance_release_gate(
         };
     };
     if !report.passed {
+        if requires_browser
+            && check_browser_on_runtime_failure
+            && runtime_acceptance_has_buildable_nextjs_boundary(report)
+        {
+            let mut gate = browser_release_gate(config);
+            let mut reasons = vec![report.primary_reason.clone()];
+            reasons.extend(std::mem::take(&mut gate.reasons));
+            gate.status = "failed".to_string();
+            gate.reasons = dedup_strings(reasons);
+            return gate;
+        }
         return ReleaseGateSummary {
             status: "failed".to_string(),
             reasons: vec![report.primary_reason.clone()],
@@ -4370,6 +4053,99 @@ fn final_acceptance_release_gate(
         interaction_evidence_status: "not_applicable".to_string(),
         interaction_evidence_path: String::new(),
     }
+}
+
+fn runtime_acceptance_has_buildable_nextjs_boundary(
+    report: &crate::minimal_loop::evidence::RuntimeAcceptanceReport,
+) -> bool {
+    !report.missing_evidence.iter().any(|item| {
+        matches!(
+            item.as_str(),
+            "implementation_artifact"
+                | "nextjs_route_evidence"
+                | "build_command_or_dependency_missing_boundary"
+        )
+    }) && !report
+        .missing_obligations
+        .iter()
+        .any(|item| item == "implementation")
+}
+
+fn append_release_gate_observation_failures(
+    report: &mut VerificationReport,
+    release_gate: &ReleaseGateSummary,
+) {
+    if release_gate.browser_readiness_status != "not_checked"
+        && release_gate.browser_readiness_status != "not_applicable"
+    {
+        report.push_profile_failure(format!(
+            "browser readiness status: {}",
+            release_gate.browser_readiness_status
+        ));
+    }
+    if !release_gate.browser_readiness_evidence_path.is_empty() {
+        report.push_profile_failure(format!(
+            "browser readiness evidence: {}",
+            release_gate.browser_readiness_evidence_path
+        ));
+    }
+    if release_gate.interaction_evidence_status != "not_checked"
+        && release_gate.interaction_evidence_status != "not_applicable"
+    {
+        report.push_profile_failure(format!(
+            "interaction evidence status: {}",
+            release_gate.interaction_evidence_status
+        ));
+    }
+    if !release_gate.interaction_evidence_path.is_empty() {
+        report.push_profile_failure(format!(
+            "interaction evidence path: {}",
+            release_gate.interaction_evidence_path
+        ));
+    }
+}
+
+fn runtime_acceptance_repair_guidance(
+    acceptance: &crate::minimal_loop::evidence::RuntimeAcceptanceReport,
+) -> Vec<String> {
+    let mut guidance = Vec::new();
+    for evidence in &acceptance.missing_evidence {
+        match evidence.as_str() {
+            "restart_or_recoverable_state_evidence" => guidance.push(
+                "wire a handler (e.g. onClick) to a function that resets score AND entities and transitions out of the game-over state"
+                    .to_string(),
+            ),
+            "challenge_or_adversary_evidence" => guidance.push(
+                "add named adversary entities such as enemies or invaders and wire them to movement/collision"
+                    .to_string(),
+            ),
+            "failure_or_collision_evidence" => guidance.push(
+                "implement collision/damage detection that transitions into a real failure or game-over state"
+                    .to_string(),
+            ),
+            "score_or_progression_evidence" => guidance.push(
+                "update score, level, wave, lives, health, or progress from gameplay events"
+                    .to_string(),
+            ),
+            "stateful_update_evidence" => guidance.push(
+                "mutate application state over time or in response to input"
+                    .to_string(),
+            ),
+            "user_input_handler_evidence" => guidance.push(
+                "wire keyboard, pointer, click, touch, or form handlers to gameplay state changes"
+                    .to_string(),
+            ),
+            _ => {}
+        }
+    }
+    for weak in &acceptance.weak_evidence {
+        if let Some(reason) = weak.split(':').next_back()
+            && !reason.trim().is_empty()
+        {
+            guidance.push(reason.trim().to_string());
+        }
+    }
+    dedup_strings(guidance)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8108,46 +7884,6 @@ fn ultra_phase_prompt(
     )
 }
 
-fn profile_auto_repair_continuation_prompt(
-    plan: &UltraPlan,
-    phase: &UltraPhase,
-    failed_report: &VerificationReport,
-    context: &UltraRunContext,
-    expected_paths: &[String],
-) -> String {
-    let expected = if expected_paths.is_empty() {
-        "- none".to_string()
-    } else {
-        expected_paths
-            .iter()
-            .map(|path| format!("- {path}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    format!(
-        "Continue the current ultra phase after deterministic profile repair.\n\n\
-Original ultra goal:\n{goal}\n\n\
-Profile: {profile}\nIntent: {intent}\nPhase id: {phase_id}\nPhase task:\n{phase_task}\n\n\
-Profile repair result:\n- deterministic profile repair may have materialized framework files\n- original profile failure: {failure}\n\n\
-Expected profile artifacts:\n{expected}\n\n\
-{prior_context}\n\n\
-Continuation rules:\n\
-- Treat the materialized profile files as a recovery scaffold only, not as task completion.\n\
-- Continue with task-specific implementation details from the original ultra goal and phase task.\n\
-- Prefer editing the real entrypoint or implementation files over adding metadata-only files.\n\
-- Keep this continuation bounded to one repair turn budget; do not start a new planning cycle.\n\
-- Run or preserve deterministic verification where practical, then stop.",
-        goal = plan.goal,
-        profile = plan.profile,
-        intent = plan.intent,
-        phase_id = phase.id,
-        phase_task = phase.prompt,
-        failure = failed_report.primary_reason(),
-        expected = expected,
-        prior_context = context.render_prompt_section(),
-    )
-}
-
 fn final_acceptance_repair_expected_paths(
     plan: &UltraPlan,
     config: &Config,
@@ -9321,7 +9057,7 @@ Phase task: Initialize the Next.js project shell";
     }
 
     #[test]
-    fn ultra_final_phase_enforces_when_observed_contract_debt_remains() {
+    fn ultra_final_phase_observes_contract_debt_then_final_acceptance_enforces() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
@@ -9360,12 +9096,155 @@ Phase task: Initialize the Next.js project shell";
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("challenge_or_adversary_evidence"), "{err}");
+        assert!(
+            err.contains("ultra final acceptance repair failed"),
+            "{err}"
+        );
         let event_text = std::fs::read_to_string(events).unwrap();
-        assert!(event_text.contains("\"event\":\"plan_final_contract\""));
-        assert!(event_text.contains("\"ok\":false"));
+        assert!(!event_text.contains("\"event\":\"plan_final_contract\""));
+        assert!(event_text.contains("\"event\":\"ultra_phase_complete\""));
+        assert!(event_text.contains("\"phase_id\":\"phase-two\""));
+        assert!(event_text.contains("\"event\":\"ultra_final_acceptance\""));
+        assert!(event_text.contains("\"event\":\"ultra_final_acceptance_failed\""));
+        assert!(event_text.contains("\"event\":\"final_acceptance_repair_start\""));
         assert!(event_text.contains("challenge_or_adversary_evidence"));
         assert!(!event_text.contains("\"event\":\"ultra_plan_complete\""));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ultra_final_acceptance_runs_probe_when_runtime_evidence_is_missing() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let port = free_local_port();
+        enable_dev_server_probe_test_override(dir.path());
+        write_fake_nextjs_package_manager(dir.path(), false);
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let scaffold_plan = generated_nextjs_fixture_plan_json_with_kind(
+            "Create buildable app",
+            "check_scaffold.py",
+            "setup",
+        );
+        let final_plan = final_marker_implement_step_plan_json();
+        let mut planner_replies = Vec::new();
+        for _ in 0..3 {
+            planner_replies.push(AssistantReply::text(scaffold_plan.clone()));
+        }
+        for _ in 0..6 {
+            planner_replies.push(AssistantReply::text(final_plan.clone()));
+        }
+        let mut planner = FakeClient::new(planner_replies);
+        let package = format!(
+            r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"}}}}"#
+        );
+        let mut app_tool_calls =
+            nextjs_interactive_app_tool_calls(interactive_game_page_without_restart_source());
+        app_tool_calls[0] = crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({"path":"package.json","content":package}),
+        );
+        app_tool_calls.push(crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({
+                "path":"interaction-evidence.json",
+                "content":"{\"ok\":true,\"interaction_performed\":true,\"input_event_observed\":true,\"state_changed\":true,\"canvas_found\":true}"
+            }),
+        ));
+        app_tool_calls.push(crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({"path":"check_scaffold.py","content":"x = 1\n"}),
+        ));
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: app_tool_calls,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({
+                        "path":"src/app/page.tsx",
+                        "content":interactive_game_page_without_restart_source()
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("final acceptance repair could not add restart behavior"),
+        ]);
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "build".to_string(),
+                    prompt: "Create the app".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "final".to_string(),
+                    prompt: "Final implementation pass".to_string(),
+                },
+            ],
+        };
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("ultra final acceptance repair failed"),
+            "{err}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"event\":\"ultra_phase_complete\""));
+        assert!(event_text.contains("\"phase_id\":\"final\""));
+        assert!(event_text.contains("\"event\":\"ultra_final_acceptance\""));
+        assert!(event_text.contains("\"runtime_acceptance_status\":\"failed\""));
+        assert!(event_text.contains("\"restart_or_recoverable_state_evidence\""));
+        assert!(
+            event_text.contains("\"browser_readiness_status\":\"passed\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"interaction_evidence_status\":\"passed\""),
+            "{event_text}"
+        );
+        assert!(
+            !event_text.contains("\"browser_readiness_status\":\"not_checked\""),
+            "{event_text}"
+        );
+        assert!(event_text.contains("\"event\":\"dev_server_lifecycle\""));
+        assert!(event_text.contains("\"stage\":\"probe\""));
+        assert!(
+            events
+                .parent()
+                .unwrap()
+                .join("browser-readiness.json")
+                .is_file()
+        );
+        let repair_prompt = execution
+            .messages
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .find(|prompt| prompt.contains("Repair the final acceptance failure"))
+            .expect("final acceptance repair prompt");
+        assert!(repair_prompt.contains("browser readiness status: passed"));
+        assert!(repair_prompt.contains("interaction evidence status: passed"));
+        assert!(repair_prompt.contains("resets score AND entities"));
     }
 
     #[test]
@@ -9411,7 +9290,7 @@ Phase task: Initialize the Next.js project shell";
         std::fs::write(
             dir.path().join("package.json"),
             format!(
-                r#"{{"scripts":{{"build":"next build","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}}}"#
+                r#"{{"scripts":{{"build":"next build","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"}}}}"#
             ),
         )
         .unwrap();
@@ -9509,34 +9388,6 @@ Phase task: Initialize the Next.js project shell";
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"contract_enforcement\":\"enforce\""));
         assert!(!event_text.contains("\"event\":\"contract_observation_incomplete\""));
-    }
-
-    #[test]
-    fn profile_auto_repair_continuation_prompt_treats_scaffold_as_incomplete() {
-        let plan = UltraPlan {
-            goal: "Create an interactive app".to_string(),
-            profile: "nextjs".to_string(),
-            style: "default".to_string(),
-            intent: "create".to_string(),
-            phases: vec![crate::planner::ultra_plan::UltraPhase {
-                id: "finish".to_string(),
-                prompt: "Finish the app".to_string(),
-            }],
-        };
-        let phase = plan.phases[0].clone();
-        let mut context = UltraRunContext::new(vec!["src/app/page.tsx".to_string()]);
-        context.last_failed_phase = Some("finish".to_string());
-        let prompt = profile_auto_repair_continuation_prompt(
-            &plan,
-            &phase,
-            &VerificationReport::missing_path("src/app/page.tsx"),
-            &context,
-            &["package.json".to_string(), "src/app/page.tsx".to_string()],
-        );
-        assert!(prompt.contains("recovery scaffold only, not as task completion"));
-        assert!(prompt.contains("task-specific implementation details"));
-        assert!(prompt.contains("one repair turn budget"));
-        assert!(prompt.contains("Pending final artifacts"));
     }
 
     #[test]
@@ -10009,12 +9860,25 @@ Phase task: Initialize the Next.js project shell";
                 prompt_tokens: None,
                 completion_tokens: None,
             },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
         ]);
 
         let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
             .unwrap_err()
             .to_string();
 
+        assert!(
+            err.contains("ultra final acceptance repair failed"),
+            "{err}"
+        );
         assert!(err.contains("challenge_or_adversary_evidence"), "{err}");
         let repairs_dir = dir.path().join(".anvil/repairs");
         let repair_text = std::fs::read_dir(&repairs_dir)
@@ -10060,7 +9924,11 @@ Phase task: Initialize the Next.js project shell";
         }));
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"event\":\"completion_verify\""));
-        assert!(event_text.contains("\"event\":\"ultra_phase_failed\""));
+        assert!(event_text.contains("\"event\":\"ultra_phase_complete\""));
+        assert!(!event_text.contains("\"event\":\"ultra_phase_failed\""));
+        assert!(event_text.contains("\"event\":\"ultra_final_acceptance_failed\""));
+        assert!(event_text.contains("\"event\":\"final_acceptance_repair_start\""));
+        assert!(event_text.contains("\"event\":\"final_acceptance_repair_failed\""));
     }
 
     #[test]
@@ -10194,23 +10062,20 @@ Phase task: Initialize the Next.js project shell";
             },
             AssistantReply {
                 content: String::new(),
-                tool_calls: vec![crate::state::ToolCall::new(
-                    "Edit",
-                    serde_json::json!({
-                        "path":"src/app/page.tsx",
-                        "old":"Space Invaders",
-                        "new":"Space Invaders with keyboard controls, score, waves, and collisions"
-                    }),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            },
-            AssistantReply {
-                content: String::new(),
-                tool_calls: vec![crate::state::ToolCall::new(
-                    "Write",
-                    serde_json::json!({"path":"package.json","content":good_package}),
-                )],
+                tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"package.json","content":good_package}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Edit",
+                        serde_json::json!({
+                            "path":"src/app/page.tsx",
+                            "old":"Space Invaders",
+                            "new":"Space Invaders with keyboard controls, score, waves, and collisions"
+                        }),
+                    ),
+                ],
                 prompt_tokens: None,
                 completion_tokens: None,
             },
@@ -10255,7 +10120,13 @@ Phase task: Initialize the Next.js project shell";
         assert!(
             prompts
                 .iter()
-                .any(|prompt| prompt.contains("recovery scaffold only, not as task completion")),
+                .any(|prompt| prompt.contains("Repair the final acceptance failure")),
+            "{prompts:#?}"
+        );
+        assert!(
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("bounded final acceptance repair")),
             "{prompts:#?}"
         );
         assert!(
@@ -10265,7 +10136,7 @@ Phase task: Initialize the Next.js project shell";
     }
 
     #[test]
-    fn deterministic_profile_fallback_requires_targeted_continuation_before_success() {
+    fn final_phase_profile_dependency_repair_runs_in_final_acceptance() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
@@ -10322,19 +10193,16 @@ Phase task: Initialize the Next.js project shell";
             },
             AssistantReply {
                 content: String::new(),
-                tool_calls: vec![crate::state::ToolCall::new(
-                    "Write",
-                    serde_json::json!({"path":"README.md","content":"# Recovery note\nThe scaffold exists but implementation still needs task-specific gameplay."}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            },
-            AssistantReply {
-                content: String::new(),
-                tool_calls: vec![crate::state::ToolCall::new(
-                    "Write",
-                    serde_json::json!({"path":"package.json","content":package}),
-                )],
+                tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"README.md","content":"# Recovery note\nThe scaffold exists but implementation still needs task-specific gameplay."}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"package.json","content":package}),
+                    ),
+                ],
                 prompt_tokens: None,
                 completion_tokens: None,
             },
@@ -10358,11 +10226,13 @@ Phase task: Initialize the Next.js project shell";
         let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
         assert_eq!(result, "ultra-plan-run complete: 2 phases");
         let event_text = std::fs::read_to_string(events).unwrap();
-        assert!(event_text.contains("\"event\":\"deterministic_scaffold_recovery\""));
-        assert!(event_text.contains("\"used_for_completion\":false"));
-        assert!(event_text.contains("\"event\":\"profile_auto_repair_continuation_incomplete\""));
-        assert!(event_text.contains("\"repair_follow_through\":\"unrelated_change\""));
-        assert!(event_text.contains("\"event\":\"profile_repair_complete\""));
+        assert!(event_text.contains("\"event\":\"ultra_phase_complete\""));
+        assert!(event_text.contains("\"phase_id\":\"finish\""));
+        assert!(event_text.contains("\"event\":\"ultra_final_acceptance_failed\""));
+        assert!(event_text.contains("dependency missing: next"));
+        assert!(event_text.contains("\"event\":\"final_acceptance_repair_start\""));
+        assert!(event_text.contains("\"event\":\"final_acceptance_repair_complete\""));
+        assert!(!event_text.contains("\"event\":\"profile_repair_complete\""));
         assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
     }
 
@@ -11156,6 +11026,7 @@ Phase task: Initialize the Next.js project shell";
     #[test]
     #[cfg(unix)]
     fn slash_ultra_final_flow_reaches_stop_after_fake_dev_server_cleanup() {
+        let _probe_guard = dev_server_probe_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let port = free_local_port();
         let events = dir.path().join(".anvil/runs/fake/events.jsonl");
@@ -11190,7 +11061,7 @@ Phase task: Initialize the Next.js project shell";
             )),
         ]);
         let package = format!(
-            r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}}}"#
+            r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"}}}}"#
         );
         let mut tool_calls = nextjs_interactive_app_tool_calls(interactive_game_page_source());
         tool_calls[0] = crate::state::ToolCall::new(
@@ -11255,12 +11126,21 @@ Phase task: Initialize the Next.js project shell";
         assert!(event_text.contains("\"stage\":\"probe\""));
         assert!(event_text.contains("\"stage\":\"cleanup\""));
         assert!(event_text.contains("\"event\":\"ultra_final_acceptance\""));
+        assert!(event_text.contains("\"runtime_acceptance_status\":\"pass\""));
+        assert!(event_text.contains("\"final_acceptance_status\":\"full_success\""));
+        assert!(event_text.contains("\"browser_readiness_status\":\"passed\""));
+        assert!(event_text.contains("\"interaction_evidence_status\":\"passed\""));
         assert!(event_text.contains("\"event\":\"tui_command_stop\""));
         assert!(
             dir.path()
                 .join(".anvil/runs/fake/browser-readiness.json")
                 .is_file()
         );
+        let summary = std::fs::read_to_string(dir.path().join(".anvil/runs/fake/summary.md"))
+            .expect("summary");
+        assert!(summary.contains("Runtime acceptance: pass"));
+        assert!(summary.contains("Final acceptance: full_success"));
+        assert!(summary.contains("Release gate: pass"));
     }
 
     #[test]
@@ -12397,6 +12277,22 @@ export default function Page(){
         .unwrap()
     }
 
+    fn final_marker_implement_step_plan_json() -> String {
+        serde_json::to_string(&StepPlan {
+            goal: "Run the final implementation pass".to_string(),
+            steps: vec![PlanStep {
+                id: "final-page-pass".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Update src/app/page.tsx as the final implementation artifact."
+                    .to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: Vec::new(),
+            }],
+        })
+        .unwrap()
+    }
+
     fn write_challenge_contract(root: &Path) -> PathBuf {
         write_challenge_contract_with_cap(root, 1)
     }
@@ -12519,6 +12415,43 @@ export default function Page(){
     };
   }, [bullets, enemies]);
   return <main><button onClick={fireBullet}>Start</button><button onClick={restart}>Restart</button><canvas /><p>score {score} enemy collision {gameOver ? "game over" : "playing"}</p></main>;
+}
+"#
+    }
+
+    fn interactive_game_page_without_restart_source() -> &'static str {
+        r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  const [gameOver, setGameOver] = useState(false);
+  const [bullets, setBullets] = useState<{ x: number; y: number }[]>([]);
+  const [enemies, setEnemies] = useState([{ x: 10, y: 20 }]);
+  const fireBullet = () => setBullets((items) => [...items, { x: 10, y: 90 }]);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") {
+        fireBullet();
+      }
+    };
+    const frame = requestAnimationFrame(() => {
+      bullets.forEach((bullet) => {
+        enemies.forEach((enemy) => {
+          if (Math.abs(bullet.x - enemy.x) < 12 && Math.abs(bullet.y - enemy.y) < 12) {
+            setGameOver(true);
+            setScore((value) => value + 10);
+          }
+        });
+      });
+      setEnemies((items) => items.map((enemy) => ({ ...enemy, x: enemy.x + 1 })));
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [bullets, enemies]);
+  return <main><button onClick={fireBullet}>Fire</button><canvas /><p>score {score} enemy collision {gameOver ? "game over" : "playing"}</p></main>;
 }
 "#
     }
@@ -12676,9 +12609,39 @@ exit 2\n"
     }
 
     #[cfg(unix)]
+    static DEV_SERVER_PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    fn dev_server_probe_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        DEV_SERVER_PROBE_TEST_LOCK.lock().unwrap()
+    }
+
+    #[cfg(unix)]
+    static TEST_DEV_SERVER_PORT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(34_011);
+
+    #[cfg(unix)]
     fn free_local_port() -> u16 {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.local_addr().unwrap().port()
+        for _ in 0..2_000 {
+            let port = TEST_DEV_SERVER_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if port > u16::MAX as usize {
+                break;
+            }
+            let port = port as u16;
+            if port == NEXTJS_DEV_SERVER_DEFAULT_PORT {
+                continue;
+            }
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return port;
+            }
+        }
+        loop {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            if port != NEXTJS_DEV_SERVER_DEFAULT_PORT {
+                return port;
+            }
+        }
     }
 
     fn read_jsonl_events(path: &Path) -> Vec<Value> {
