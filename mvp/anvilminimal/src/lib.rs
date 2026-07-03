@@ -140,7 +140,7 @@ fn emit_run_start(config: &Config) {
         String::new()
     } else {
         format!(
-            "\nInfo: host_env_contamination: {}",
+            "\nHost env: {} detected (verifiers ran with a cleaned environment)",
             host_env_contamination.join(", ")
         )
     };
@@ -158,7 +158,7 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
         Ok(()) => (true, "completed".to_string(), ""),
         Err(err) => (
             false,
-            eval_events::body_snippet(&err.to_string()),
+            eval_events::render_stop_reason_text(&err.to_string()),
             "process_failure",
         ),
     };
@@ -337,7 +337,9 @@ mod tests {
         assert!(event_text.contains("NODE_ENV=production"), "{event_text}");
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
         assert!(
-            summary.contains("Info: host_env_contamination: NODE_ENV=production"),
+            summary.contains(
+                "Host env: NODE_ENV=production detected (verifiers ran with a cleaned environment)"
+            ),
             "{summary}"
         );
     }
@@ -358,6 +360,7 @@ mod tests {
         assert!(summary.contains("Command status: failed"));
         assert!(summary.contains("Command completion: failed"));
         assert!(summary.contains("Task status: failed"));
+        assert!(summary.contains("Process: exited normally (not task success)"));
         assert!(summary.contains("Session/REPL status: process_exited"));
         assert!(summary.contains("Recovery next action: fix_command_failure"));
         assert!(summary.contains("Stop reason: boom"));

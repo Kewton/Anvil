@@ -1345,6 +1345,15 @@ fn collect_workspace_evidence(root: &Path) -> WorkspaceEvidence {
     evidence
 }
 
+pub fn comment_stripped_source_corpus(root: &Path) -> String {
+    collect_workspace_evidence(root)
+        .source_files
+        .into_iter()
+        .map(|file| file.comment_stripped_content)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn collect_candidate_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];

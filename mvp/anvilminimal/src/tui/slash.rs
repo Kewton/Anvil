@@ -304,7 +304,7 @@ fn stop_reason_for_result(
     match result {
         Ok(_) => "completed".to_string(),
         Err(err) => {
-            let reason = crate::eval_events::body_snippet(&err.to_string());
+            let reason = crate::eval_events::render_stop_reason_text(&err.to_string());
             if terminal_status == TuiTerminalStatus::Interrupted && reason.trim().is_empty() {
                 "interrupted by user".to_string()
             } else {

@@ -8,6 +8,97 @@ use serde_json::{Value, json};
 const SNIPPET_LIMIT: usize = 500;
 const SUMMARY_LIMIT: usize = 8_000;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StopReasonParts {
+    pub free_text: String,
+    pub paths: Vec<String>,
+    pub commands: Vec<String>,
+}
+
+impl StopReasonParts {
+    pub fn free_text(value: impl Into<String>) -> Self {
+        Self {
+            free_text: value.into(),
+            ..Self::default()
+        }
+    }
+}
+
+pub fn render_stop_reason(parts: &StopReasonParts) -> String {
+    let mut lines = Vec::new();
+    let free_text = body_snippet_whole_tokens(parts.free_text.trim());
+    if !free_text.is_empty() {
+        lines.push(free_text);
+    }
+    append_stop_reason_section(&mut lines, "Paths", &parts.paths);
+    append_stop_reason_section(&mut lines, "Commands", &parts.commands);
+    if lines.is_empty() {
+        "unknown".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+pub fn render_stop_reason_text(value: &str) -> String {
+    render_stop_reason(&parse_stop_reason_parts(value))
+}
+
+fn parse_stop_reason_parts(value: &str) -> StopReasonParts {
+    let mut parts = StopReasonParts::default();
+    let mut free_lines = Vec::new();
+    let mut section = "";
+    for line in value.lines() {
+        let trimmed = line.trim();
+        match trimmed {
+            "Paths:" => {
+                section = "paths";
+                continue;
+            }
+            "Commands:" => {
+                section = "commands";
+                continue;
+            }
+            _ => {}
+        }
+        match section {
+            "paths" => {
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    parts.paths.push(item.to_string());
+                } else if !trimmed.is_empty() {
+                    parts.paths.push(trimmed.to_string());
+                }
+            }
+            "commands" => {
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    parts.commands.push(item.to_string());
+                } else if !trimmed.is_empty() {
+                    parts.commands.push(trimmed.to_string());
+                }
+            }
+            _ => free_lines.push(line.to_string()),
+        }
+    }
+    parts.free_text = free_lines.join("\n");
+    parts
+}
+
+fn append_stop_reason_section(lines: &mut Vec<String>, label: &str, values: &[String]) {
+    let values = values
+        .iter()
+        .map(|value| redact_stop_reason_detail(value))
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return;
+    }
+    lines.push(format!("{label}:"));
+    lines.extend(values.into_iter().map(|value| format!("- {value}")));
+}
+
+fn redact_stop_reason_detail(value: &str) -> String {
+    redact_home_paths(&redact_secret_like(value)).replace(['\n', '\r'], " ")
+}
+
 pub fn path_from_env() -> Option<PathBuf> {
     std::env::var_os("ANVIL_EVAL_EVENTS")
         .filter(|value| !value.is_empty())
@@ -117,6 +208,8 @@ pub struct CompletionSnapshot {
     pub recovery_ultra_plan_path: String,
     pub suggested_recovery_command: String,
     pub suggested_recovery_yaml_command: String,
+    pub plan_adherence_present: Vec<String>,
+    pub plan_adherence_missing: Vec<String>,
     pub planner_verify_normalization_count: usize,
     pub planner_retry_count: usize,
     pub planner_quality_warning_count: usize,
@@ -146,6 +239,8 @@ impl CompletionSnapshot {
             recovery_ultra_plan_path: String::new(),
             suggested_recovery_command: String::new(),
             suggested_recovery_yaml_command: String::new(),
+            plan_adherence_present: Vec::new(),
+            plan_adherence_missing: Vec::new(),
             planner_verify_normalization_count: 0,
             planner_retry_count: 0,
             planner_quality_warning_count: 0,
@@ -189,6 +284,8 @@ pub struct CompletionProjection {
     pub recovery_ultra_plan_path: String,
     pub suggested_recovery_command: String,
     pub suggested_recovery_yaml_command: String,
+    pub plan_adherence_present: Vec<String>,
+    pub plan_adherence_missing: Vec<String>,
     pub planner_verify_normalization_count: usize,
     pub planner_retry_count: usize,
     pub planner_quality_warning_count: usize,
@@ -288,6 +385,8 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         recovery_ultra_plan_path: snapshot.recovery_ultra_plan_path.clone(),
         suggested_recovery_command: snapshot.suggested_recovery_command.clone(),
         suggested_recovery_yaml_command: snapshot.suggested_recovery_yaml_command.clone(),
+        plan_adherence_present: snapshot.plan_adherence_present.clone(),
+        plan_adherence_missing: snapshot.plan_adherence_missing.clone(),
         planner_verify_normalization_count: snapshot.planner_verify_normalization_count,
         planner_retry_count: snapshot.planner_retry_count,
         planner_quality_warning_count: snapshot.planner_quality_warning_count,
@@ -1153,17 +1252,7 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .get("external_contract_ok")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        release_gate_reasons: event
-            .get("release_gate_reasons")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        release_gate_reasons: event_string_array(event, "release_gate_reasons"),
         browser_readiness_status: event
             .get("browser_readiness_status")
             .and_then(Value::as_str)
@@ -1204,6 +1293,8 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_str)
             .map(|value| normalize_handoff_display_text(value.to_string()))
             .unwrap_or_default(),
+        plan_adherence_present: event_string_array(event, "plan_adherence_present"),
+        plan_adherence_missing: event_string_array(event, "plan_adherence_missing"),
         planner_verify_normalization_count: event
             .get("planner_verify_normalization_count")
             .and_then(Value::as_u64)
@@ -1229,6 +1320,22 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
+}
+
+fn event_string_array(event: &Value, field: &str) -> Vec<String> {
+    event
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn has_completion_fields(event: &Value) -> bool {
@@ -1324,9 +1431,10 @@ fn render_completion_summary(
     let mut lines = vec![
         format!("Status: {}", projection.status),
         format!("Lifecycle: {lifecycle_stage}"),
+        format!("Process: {}", process_lifecycle_status(projection)),
         format!("Session/REPL status: {}", session_status(lifecycle_stage)),
     ];
-    let stop_reason = body_snippet(stop_reason);
+    let stop_reason = render_stop_reason_text(stop_reason);
     if let Some(action) = action {
         lines.push(format!("Action: {action}"));
     }
@@ -1393,9 +1501,20 @@ fn render_completion_summary(
     let host_env_contamination = crate::minimal_loop::verifier_env::host_env_contamination();
     if !host_env_contamination.is_empty() {
         lines.push(format!(
-            "Info: host_env_contamination: {}",
+            "Host env: {} detected (verifiers ran with a cleaned environment)",
             host_env_contamination.join(", ")
         ));
+    }
+    if !projection.plan_adherence_present.is_empty()
+        || !projection.plan_adherence_missing.is_empty()
+    {
+        lines.extend([
+            "Plan adherence:".to_string(),
+            "Present tokens:".to_string(),
+            render_summary_bullets(&projection.plan_adherence_present),
+            "Missing tokens:".to_string(),
+            render_summary_bullets(&projection.plan_adherence_missing),
+        ]);
     }
     if !projection.recovery_prompt_path.is_empty()
         || !projection.recovery_ultra_plan_path.is_empty()
@@ -1426,9 +1545,10 @@ fn render_completion_summary(
         lines.push(format!("Failure kind: {failure_kind}"));
     }
     if lifecycle_stage == "tui_command" && projection.command_completion == "failed" {
+        let first_stop_line = stop_reason.lines().next().unwrap_or("unknown");
         lines.push(format!(
             "TUI command failed: {}",
-            body_snippet(&stop_reason)
+            body_snippet(first_stop_line)
         ));
     }
     lines.join("\n")
@@ -1516,6 +1636,19 @@ fn session_status(lifecycle_stage: &str) -> &'static str {
         "tui_command" => "repl_ready",
         "process" => "process_exited",
         _ => "unknown",
+    }
+}
+
+fn process_lifecycle_status(projection: &CompletionProjection) -> String {
+    if projection.command_completion == "failed" || projection.task_status == "failed" {
+        "exited normally (not task success)".to_string()
+    } else if matches!(
+        projection.command_completion.as_str(),
+        "aborted" | "interrupted"
+    ) {
+        projection.command_completion.clone()
+    } else {
+        "exited normally".to_string()
     }
 }
 
@@ -1752,6 +1885,29 @@ mod tests {
         assert!(snippet.contains("<redacted>"));
         assert!(snippet.contains("/Users/<user>/project"));
         assert!(snippet.chars().count() <= SNIPPET_LIMIT);
+    }
+
+    #[test]
+    fn stop_reason_renderer_preserves_path_and_command_lines() {
+        let recovery_yaml =
+            ".anvil/plans/recovery-ultra-plan-final-acceptance-test0703-002-long-name.yaml";
+        let command = format!("/run-ultra-plan {recovery_yaml}");
+        let rendered = render_stop_reason(&StopReasonParts {
+            free_text: format!("failure {}", "x ".repeat(2_000)),
+            paths: vec![format!("recovery YAML saved: {recovery_yaml}")],
+            commands: vec![format!("suggested YAML command: {command}")],
+        });
+
+        assert!(
+            rendered.contains(&format!("- recovery YAML saved: {recovery_yaml}")),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("- suggested YAML command: {command}")),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(".yam\n"), "{rendered}");
+        assert!(!rendered.contains("recovery-ultr\n"), "{rendered}");
     }
 
     #[test]
@@ -2004,8 +2160,47 @@ mod tests {
                 && line.starts_with("- Suggested YAML command: /")),
             "{written}"
         );
+        assert!(
+            written.contains("Process: exited normally (not task success)"),
+            "{written}"
+        );
         assert!(!written.contains(&"y".repeat(1_000)));
-        assert!(written.contains("Stop reason: failure "));
+        assert!(written.contains("Stop reason: failure"));
+    }
+
+    #[test]
+    fn completion_summary_renders_plan_adherence_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "pass",
+                "release_gate_status": "pass",
+                "plan_adherence_present": ["score"],
+                "plan_adherence_missing": ["canvas", "pause"],
+            }),
+        );
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(true, &snapshot);
+        let summary = render_completion_summary(
+            "tui_command",
+            None,
+            Some("/ultra-plan-run"),
+            "completed",
+            "",
+            &projection,
+        );
+
+        assert!(summary.contains("Plan adherence:"), "{summary}");
+        assert!(summary.contains("Present tokens:\n- score"), "{summary}");
+        assert!(
+            summary.contains("Missing tokens:\n- canvas\n- pause"),
+            "{summary}"
+        );
+        assert!(summary.contains("Status: complete"), "{summary}");
     }
 
     #[test]

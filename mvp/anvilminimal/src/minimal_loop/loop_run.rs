@@ -1929,7 +1929,10 @@ fn verify_completion_contract_with_enforcement(
             }),
         );
         return Err(RunSessionError::new(
-            format!("completion contract verify repair unreachable: {recovery_reason}"),
+            render_minimal_recovery_stop_reason(
+                format!("completion contract verify repair unreachable: {recovery_reason}"),
+                recovery_paths.as_ref(),
+            ),
             RunSessionErrorContext::from_runtime_acceptance(&runtime_acceptance, repair_target),
         )
         .into());
@@ -2032,10 +2035,13 @@ fn verify_completion_contract_with_enforcement(
             }),
         );
         return Err(RunSessionError::new(
-            format!(
-                "completion contract verify failed after {} attempts: {}",
-                *verify_attempts,
-                report.primary_reason()
+            render_minimal_recovery_stop_reason(
+                format!(
+                    "completion contract verify failed after {} attempts: {}",
+                    *verify_attempts,
+                    report.primary_reason()
+                ),
+                recovery_paths.as_ref(),
             ),
             RunSessionErrorContext::from_runtime_acceptance(&runtime_acceptance, repair_target),
         )
@@ -2125,6 +2131,32 @@ fn reachability_action_labels(reachability: &RepairReachability) -> Vec<&'static
 struct MinimalRecoveryPaths {
     prompt_path: String,
     yaml_path: String,
+    suggested_prompt_command: String,
+    suggested_yaml_command: String,
+}
+
+fn render_minimal_recovery_stop_reason(
+    free_text: impl Into<String>,
+    recovery_paths: Option<&MinimalRecoveryPaths>,
+) -> String {
+    let mut parts = eval_events::StopReasonParts::free_text(free_text);
+    if let Some(paths) = recovery_paths {
+        parts
+            .paths
+            .push(format!("recovery prompt saved: {}", paths.prompt_path));
+        parts
+            .paths
+            .push(format!("recovery YAML saved: {}", paths.yaml_path));
+        parts.commands.push(format!(
+            "suggested command: {}",
+            paths.suggested_prompt_command
+        ));
+        parts.commands.push(format!(
+            "suggested YAML command: {}",
+            paths.suggested_yaml_command
+        ));
+    }
+    eval_events::render_stop_reason(&parts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2233,6 +2265,8 @@ fn save_minimal_recovery_handoff(
     Some(MinimalRecoveryPaths {
         prompt_path: prompt_display,
         yaml_path: yaml_display,
+        suggested_prompt_command,
+        suggested_yaml_command,
     })
 }
 
@@ -2399,7 +2433,10 @@ fn handle_verify_repair_no_edit(
             error_context.repair_target = Some(repair_target.as_str().to_string());
         }
         return Err(RunSessionError::new(
-            "completion contract verify repair made no file changes",
+            render_minimal_recovery_stop_reason(
+                "completion contract verify repair made no file changes",
+                recovery_paths.as_ref(),
+            ),
             error_context,
         )
         .into());
@@ -3455,6 +3492,11 @@ export default function Page(){
         .unwrap_err()
         .to_string();
         assert!(err.contains("completion contract verify failed"), "{err}");
+        assert!(
+            err.contains("/run-ultra-plan .anvil/plans/recovery-ultra-plan-minimal-loop-"),
+            "{err}"
+        );
+        assert!(err.contains(".yaml"), "{err}");
         assert!(dir.path().join("package.json").is_file());
     }
 
@@ -3708,6 +3750,11 @@ export default function Page(){
         .unwrap_err()
         .to_string();
         assert!(err.contains("verify repair made no file changes"));
+        assert!(
+            err.contains("/run-ultra-plan .anvil/plans/recovery-ultra-plan-minimal-loop-"),
+            "{err}"
+        );
+        assert!(err.contains(".yaml"), "{err}");
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"reason\":\"verify_repair_no_change\""));
         assert!(event_text.contains("\"repair_follow_through\":\"no_change\""));

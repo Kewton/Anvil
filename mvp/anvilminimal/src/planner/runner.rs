@@ -17,7 +17,7 @@ use crate::minimal_loop::build_verifier::emit_dependency_build_lifecycle;
 use crate::minimal_loop::completion::{CompletionContract, evidence_hint_tokens_for_goal};
 use crate::minimal_loop::dependency_setup::{self, NodeDependencySetupAuthority};
 use crate::minimal_loop::evidence::{
-    RuntimeAcceptanceReport, required_evidence_for_capability,
+    RuntimeAcceptanceReport, comment_stripped_source_corpus, required_evidence_for_capability,
     verify_runtime_acceptance_with_browser_dirs_and_hints,
 };
 use crate::minimal_loop::loop_run::{
@@ -101,6 +101,12 @@ struct ReleaseRecoveryHandoffSummary {
     recovery_ultra_plan_path: String,
     suggested_recovery_command: String,
     suggested_recovery_yaml_command: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PlanAdherenceReport {
+    present: Vec<String>,
+    missing: Vec<String>,
 }
 
 impl ReleaseRecoveryHandoffSummary {
@@ -1432,31 +1438,30 @@ fn run_step(
             eval_events::body_snippet(&current_report.primary_reason())
         ),
     );
-    let yaml_message = recovery_plan_path
-        .as_ref()
-        .zip(suggested_yaml_command.as_ref())
-        .map(|(path, command)| {
-            let display = handoff_path(path);
-            format!(
-                "; incomplete; recovery YAML saved: {}; suggested YAML command: {}",
-                display, command
-            )
-        })
-        .unwrap_or_else(|| "; incomplete; recovery YAML missing".to_string());
     let prompt_message = if validation.prompt_command_available() {
         format!("suggested command: {suggested_command}")
     } else {
         "suggested command unavailable because recovery prompt validation failed".to_string()
     };
-    let message = format!(
-        "step {} failed verification after bounded repair: {}; repair prompt saved: {}; {}; {}; {}",
-        step.id,
-        current_report.primary_reason(),
-        repair_report_display,
-        prompt_message,
-        yaml_message.trim_start_matches("; "),
-        artifact_check_summary
-    );
+    let yaml_message = suggested_yaml_command
+        .as_ref()
+        .map(|command| format!("suggested YAML command: {command}"))
+        .unwrap_or_else(|| {
+            "suggested YAML command unavailable because recovery YAML is missing".to_string()
+        });
+    let message = eval_events::render_stop_reason(&eval_events::StopReasonParts {
+        free_text: format!(
+            "step {} failed verification after bounded repair: {}; incomplete; {}",
+            step.id,
+            current_report.primary_reason(),
+            artifact_check_summary
+        ),
+        paths: vec![
+            format!("repair prompt saved: {repair_report_display}"),
+            yaml_summary,
+        ],
+        commands: vec![prompt_message, yaml_message],
+    });
     outcome.primary_failure = Some(current_report.primary_reason());
     outcome.stop_reason = Some(final_failure_kind.to_string());
     outcome.partial = true;
@@ -2632,9 +2637,14 @@ pub fn run_ultra_plan_with_ui(
                         missing_signals: &[],
                         repair_targets: &["phase_scaffold".to_string()],
                     },
+                );
+                anyhow::anyhow!(
+                    "{}",
+                    render_failure_stop_reason(
+                        format!("phase scaffold failed: {message}"),
+                        handoff,
+                    )
                 )
-                .unwrap_or_default();
-                anyhow::anyhow!("phase scaffold failed: {}{}", message, handoff)
             })?;
         emit_ultra_phase_event(
             config,
@@ -2713,11 +2723,13 @@ pub fn run_ultra_plan_with_ui(
                         missing_signals: &missing_signals,
                         repair_targets: &err.partial_outcome.repair_targets,
                     },
-                )
-                .unwrap_or_default();
+                );
                 return Err(anyhow::anyhow!(
-                    "phase {} failed: {message}{handoff}",
-                    phase.id
+                    "{}",
+                    render_failure_stop_reason(
+                        format!("phase {} failed: {message}", phase.id),
+                        handoff
+                    )
                 ));
             }
         };
@@ -2825,10 +2837,15 @@ pub fn run_ultra_plan_with_ui(
                     },
                 );
                 return Err(anyhow::anyhow!(
-                    "phase {} profile invariant verification failed: {}{}",
-                    phase.id,
-                    invariant_report.primary_reason(),
-                    handoff.unwrap_or_default()
+                    "{}",
+                    render_failure_stop_reason(
+                        format!(
+                            "phase {} profile invariant verification failed: {}",
+                            phase.id,
+                            invariant_report.primary_reason()
+                        ),
+                        handoff,
+                    )
                 ));
             }
         } else {
@@ -2984,9 +3001,14 @@ pub fn run_ultra_plan_with_ui(
                         missing_signals: &verification_missing_signals(&acceptance_report),
                         repair_targets: &[initial_target.as_str().to_string()],
                     },
-                )
-                .unwrap_or_default();
-                anyhow::bail!("ultra final acceptance repair failed: {err_text}{handoff}");
+                );
+                anyhow::bail!(
+                    "{}",
+                    render_failure_stop_reason(
+                        format!("ultra final acceptance repair failed: {err_text}"),
+                        handoff,
+                    )
+                );
             }
         };
         push_context_items_capped(
@@ -3045,9 +3067,14 @@ pub fn run_ultra_plan_with_ui(
                     missing_signals: &verification_missing_signals(&acceptance_report),
                     repair_targets: &[target.as_str().to_string()],
                 },
-            )
-            .unwrap_or_default();
-            anyhow::bail!("ultra final acceptance failed after bounded repair: {reason}{handoff}");
+            );
+            anyhow::bail!(
+                "{}",
+                render_failure_stop_reason(
+                    format!("ultra final acceptance failed after bounded repair: {reason}"),
+                    handoff,
+                )
+            );
         }
     }
     eval_events::emit(
@@ -3557,6 +3584,7 @@ fn ultra_final_acceptance_report(
     let release_quality_completion =
         release_quality_completion_status(&release_gate, final_acceptance_status);
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
+    let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
     let primary_reason = if !missing.is_empty() {
         format!("missing final artifacts: {}", missing.join(", "))
     } else if contract_binding_missing {
@@ -3669,6 +3697,8 @@ fn ultra_final_acceptance_report(
                 .as_ref()
                 .map(|handoff| handoff.suggested_recovery_yaml_command.as_str())
                 .unwrap_or_default(),
+            "plan_adherence_present": plan_adherence.present.clone(),
+            "plan_adherence_missing": plan_adherence.missing.clone(),
             "recovery_handoff_saved": recovery_handoff
                 .as_ref()
                 .is_some_and(ReleaseRecoveryHandoffSummary::has_artifact),
@@ -3724,6 +3754,128 @@ fn ultra_final_acceptance_report(
         }
     }
     Ok(report)
+}
+
+fn plan_adherence_report(plan: &UltraPlan, root: &Path) -> PlanAdherenceReport {
+    let tokens = ultra_plan_requested_feature_tokens(plan);
+    if tokens.is_empty() {
+        return PlanAdherenceReport::default();
+    }
+    let corpus = comment_stripped_source_corpus(root);
+    let corpus_lower = corpus.to_ascii_lowercase();
+    let mut report = PlanAdherenceReport::default();
+    for token in tokens {
+        let present = if token.is_ascii() {
+            corpus_lower.contains(&token)
+        } else {
+            corpus.contains(&token)
+        };
+        if present {
+            report.present.push(token);
+        } else {
+            report.missing.push(token);
+        }
+    }
+    report
+}
+
+fn ultra_plan_requested_feature_tokens(plan: &UltraPlan) -> Vec<String> {
+    let mut tokens = BTreeSet::new();
+    for phase in &plan.phases {
+        collect_plan_feature_tokens(&phase.prompt, &mut tokens);
+    }
+    tokens.into_iter().collect()
+}
+
+fn collect_plan_feature_tokens(text: &str, tokens: &mut BTreeSet<String>) {
+    let mut ascii = String::new();
+    let mut katakana = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            flush_katakana_token(&mut katakana, tokens);
+            ascii.push(ch.to_ascii_lowercase());
+        } else if is_katakana(ch) {
+            flush_ascii_token(&mut ascii, tokens);
+            katakana.push(ch);
+        } else {
+            flush_ascii_token(&mut ascii, tokens);
+            flush_katakana_token(&mut katakana, tokens);
+        }
+    }
+    flush_ascii_token(&mut ascii, tokens);
+    flush_katakana_token(&mut katakana, tokens);
+}
+
+fn flush_ascii_token(token: &mut String, tokens: &mut BTreeSet<String>) {
+    if token.len() >= 3
+        && !token.chars().all(|ch| ch.is_ascii_digit())
+        && !plan_adherence_stopword(token)
+    {
+        tokens.insert(token.clone());
+    }
+    token.clear();
+}
+
+fn flush_katakana_token(token: &mut String, tokens: &mut BTreeSet<String>) {
+    if token.chars().count() >= 2 {
+        tokens.insert(token.clone());
+    }
+    token.clear();
+}
+
+fn is_katakana(ch: char) -> bool {
+    matches!(ch, '\u{30A0}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}')
+}
+
+fn plan_adherence_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "acceptance"
+            | "add"
+            | "all"
+            | "and"
+            | "app"
+            | "application"
+            | "build"
+            | "component"
+            | "components"
+            | "complete"
+            | "create"
+            | "current"
+            | "feature"
+            | "features"
+            | "final"
+            | "for"
+            | "from"
+            | "game"
+            | "goal"
+            | "implement"
+            | "implementation"
+            | "interactive"
+            | "into"
+            | "logic"
+            | "next"
+            | "nextjs"
+            | "page"
+            | "phase"
+            | "player"
+            | "preserve"
+            | "project"
+            | "react"
+            | "screen"
+            | "setup"
+            | "state"
+            | "task"
+            | "that"
+            | "the"
+            | "tsx"
+            | "typescript"
+            | "ultra"
+            | "use"
+            | "using"
+            | "verify"
+            | "with"
+    )
 }
 
 fn maybe_run_ultra_final_browser_probe(
@@ -6142,7 +6294,7 @@ fn save_ultra_phase_recovery_handoff(
     plan: &UltraPlan,
     phase: &UltraPhase,
     request: UltraPhaseRecoveryRequest<'_>,
-) -> Option<String> {
+) -> Option<eval_events::StopReasonParts> {
     let handoff = RecoveryHandoff {
         profile: plan.profile.clone(),
         original_goal: plan.goal.clone(),
@@ -6171,7 +6323,9 @@ fn save_ultra_phase_recovery_handoff(
                     "reason": eval_events::body_snippet(&err.to_string()),
                 }),
             );
-            return Some(format!("; recovery prompt save failed: {err}"));
+            return Some(eval_events::StopReasonParts::free_text(format!(
+                "recovery prompt save failed: {err}"
+            )));
         }
     };
     let recovery_plan = match save_recovery_ultra_plan(&config.workspace_root, &scope, &handoff) {
@@ -6303,29 +6457,39 @@ fn save_ultra_phase_recovery_handoff(
             recovery_artifact_check: &artifact_check_summary,
         }),
     );
-    let recovery_yaml_message = recovery_plan
-        .as_ref()
-        .zip(recovery_plan_command.as_ref())
-        .map(|(path, command)| {
-            let display = handoff_path(path);
-            format!(
-                "; incomplete; recovery YAML saved: {}; suggested YAML command: {}",
-                display, command
-            )
-        })
-        .unwrap_or_else(|| "; incomplete; recovery YAML missing".to_string());
     let prompt_message = if validation.prompt_command_available() {
         format!("suggested command: {prompt_command}")
     } else {
         "suggested command unavailable because recovery prompt validation failed".to_string()
     };
-    Some(format!(
-        "; repair prompt saved: {}; {}; {}; {}",
-        &prompt_path,
-        prompt_message,
-        recovery_yaml_message.trim_start_matches("; "),
-        artifact_check_summary
-    ))
+    let recovery_yaml_command_message = recovery_plan_command
+        .as_ref()
+        .map(|command| format!("suggested YAML command: {command}"))
+        .unwrap_or_else(|| {
+            "suggested YAML command unavailable because recovery YAML is missing".to_string()
+        });
+    Some(eval_events::StopReasonParts {
+        free_text: format!("incomplete; {artifact_check_summary}"),
+        paths: vec![
+            format!("repair prompt saved: {prompt_path}"),
+            recovery_yaml_summary,
+        ],
+        commands: vec![prompt_message, recovery_yaml_command_message],
+    })
+}
+
+fn render_failure_stop_reason(
+    free_text: impl Into<String>,
+    handoff: Option<eval_events::StopReasonParts>,
+) -> String {
+    let free_text = free_text.into();
+    let mut parts = handoff.unwrap_or_default();
+    parts.free_text = if parts.free_text.trim().is_empty() {
+        free_text
+    } else {
+        format!("{free_text}; {}", parts.free_text)
+    };
+    eval_events::render_stop_reason(&parts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6501,7 +6665,7 @@ Failure:\n{}",
         summary.prompt_command_summary,
         summary.recovery_yaml_command_summary,
         summary.recovery_artifact_check,
-        eval_events::body_snippet_whole_tokens(summary.reason),
+        eval_events::render_stop_reason_text(summary.reason),
     )
 }
 
@@ -9278,6 +9442,61 @@ Phase task: Initialize the Next.js project shell";
     }
 
     #[test]
+    fn ultra_final_acceptance_reports_plan_adherence_without_gating() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "generic".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "// canvas pause\nexport default function Page(){ return <main><button>Start</button><div>Score</div></main>; }",
+        )
+        .unwrap();
+        let plan = UltraPlan {
+            goal: "Build a simple page".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "gameplay".to_string(),
+                prompt: "Implement canvas rendering with pause controls and score display"
+                    .to_string(),
+            }],
+        };
+
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(report.is_pass(), "{report:?}");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"plan_adherence_missing\""),
+            "{event_text}"
+        );
+        assert!(event_text.contains("\"canvas\""), "{event_text}");
+        assert!(event_text.contains("\"pause\""), "{event_text}");
+        assert!(event_text.contains("\"score\""), "{event_text}");
+        let snapshot = eval_events::latest_completion_snapshot(Some(&events));
+        let projection = eval_events::project_completion(report.is_pass(), &snapshot);
+        eval_events::append_completion_summary(
+            Some(&events),
+            "process",
+            None,
+            Some("/ultra-plan-run"),
+            "completed",
+            "",
+            &projection,
+        );
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains("Plan adherence:"), "{summary}");
+        assert!(summary.contains("Missing tokens:"), "{summary}");
+        assert!(summary.contains("- canvas"), "{summary}");
+        assert!(summary.contains("- pause"), "{summary}");
+        assert!(summary.contains("Status: complete"), "{summary}");
+    }
+
+    #[test]
     fn ultra_final_acceptance_report_records_browser_probe_failure() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -9632,6 +9851,11 @@ Phase task: Initialize the Next.js project shell";
             .to_string();
         assert!(err.contains("ultra final acceptance repair failed"));
         assert!(err.contains("Recovery artifact check"));
+        assert!(
+            err.contains("/run-ultra-plan .anvil/plans/recovery-ultra-plan-"),
+            "{err}"
+        );
+        assert!(err.contains(".yaml"), "{err}");
         let repairs_dir = dir.path().join(".anvil/repairs");
         assert!(repairs_dir.is_dir());
         assert!(std::fs::read_dir(&repairs_dir).unwrap().next().is_some());
@@ -9698,7 +9922,8 @@ Phase task: Initialize the Next.js project shell";
             .to_string();
         assert!(err.contains("phase scaffold failed"), "{err}");
         assert!(err.contains("incomplete"), "{err}");
-        assert!(err.contains("recovery YAML saved"), "{err}");
+        assert!(err.contains("Recovery UltraPlan YAML saved"), "{err}");
+        assert!(err.contains(".yaml"), "{err}");
         assert!(err.contains("Recovery artifact check"), "{err}");
         assert!(
             err.contains("/run-ultra-plan .anvil/plans/recovery-ultra-plan-"),
@@ -9749,6 +9974,71 @@ Phase task: Initialize the Next.js project shell";
     }
 
     #[test]
+    fn ultra_phase_execute_failure_saves_complete_recovery_yaml_in_stop_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let phase_step_plan = StepPlan {
+            goal: "phase one".to_string(),
+            steps: vec![PlanStep {
+                id: "write-phase-one".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "phase-one.txt exists".to_string(),
+                instruction: "Create phase-one.txt".to_string(),
+                expected_paths: vec!["phase-one.txt".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let mut planner = FakeClient::new(vec![AssistantReply::text(
+            serde_json::to_string(&phase_step_plan).unwrap(),
+        )]);
+        let mut execution = FakeClient::new(Vec::new());
+        let plan = UltraPlan {
+            goal: "Do two phases".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "phase-one".to_string(),
+                    prompt: "Create first artifact".to_string(),
+                },
+                UltraPhase {
+                    id: "phase-two".to_string(),
+                    prompt: "Finish second artifact".to_string(),
+                },
+            ],
+        };
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("phase phase-one failed"), "{err}");
+        assert!(err.contains("Paths:"), "{err}");
+        assert!(
+            err.contains("/run-ultra-plan .anvil/plans/recovery-ultra-plan-"),
+            "{err}"
+        );
+        assert!(err.contains(".yaml"), "{err}");
+        let summary = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+        assert!(summary.contains("Failed phase:\n- phase-one"), "{summary}");
+        assert!(
+            summary.contains("Pending phases:\n- phase-two"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Recovery UltraPlan YAML saved:"),
+            "{summary}"
+        );
+        assert!(summary.contains(".yaml"), "{summary}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"recovery_handoff_kind\":\"phase_execute_error\""));
+        assert!(event_text.contains("\"recovery_ultra_plan_path\":\".anvil/plans/"));
+    }
+
+    #[test]
     fn ultra_phase_recovery_handoff_renders_observed_missing_evidence_keys() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -9757,7 +10047,7 @@ Phase task: Initialize the Next.js project shell";
         let plan = challenge_ultra_plan();
         let phase = &plan.phases[0];
 
-        let message = save_ultra_phase_recovery_handoff(
+        let parts = save_ultra_phase_recovery_handoff(
             &cfg,
             &plan,
             phase,
@@ -9770,8 +10060,17 @@ Phase task: Initialize the Next.js project shell";
             },
         )
         .expect("recovery handoff should be saved");
+        let message = eval_events::render_stop_reason(&parts);
 
-        assert!(message.contains("recovery YAML saved"), "{message}");
+        assert!(
+            message.contains("Recovery UltraPlan YAML saved"),
+            "{message}"
+        );
+        assert!(
+            message.contains(".anvil/plans/recovery-ultra-plan-"),
+            "{message}"
+        );
+        assert!(message.contains(".yaml"), "{message}");
         let repairs_dir = dir.path().join(".anvil/repairs");
         let repair_text = std::fs::read_dir(&repairs_dir)
             .unwrap()
@@ -10450,12 +10749,18 @@ Phase task: Initialize the Next.js project shell";
             "{err}"
         );
         assert!(err.contains("tsconfig.rootDir"), "{err}");
+        assert!(
+            err.contains("/run-ultra-plan .anvil/plans/recovery-ultra-plan-"),
+            "{err}"
+        );
+        assert!(err.contains(".yaml"), "{err}");
         assert!(dir.path().join(".anvil/repairs").is_dir());
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"event\":\"profile_invariant_repair\""));
         assert!(event_text.contains("\"method\":\"deterministic\""));
         assert!(event_text.contains("\"method\":\"model\""));
         assert!(event_text.contains("\"recovery_handoff_kind\":\"profile_invariant_failure\""));
+        assert!(event_text.contains("\"recovery_ultra_plan_path\":\".anvil/plans/"));
     }
 
     #[test]
