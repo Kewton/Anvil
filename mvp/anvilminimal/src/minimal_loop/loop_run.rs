@@ -1785,6 +1785,7 @@ fn verify_completion_contract_with_enforcement(
             "missing_paths": report.missing_paths.clone(),
             "command_failures": report.command_failures.len(),
             "dependency_missing": report.dependency_missing.clone(),
+            "compile_errors": report.compile_errors.clone(),
             "profile": contract.profile.as_deref().unwrap_or(""),
             "profile_failures": report.profile_failures.clone(),
             "required_capabilities": contract.required_capabilities.clone(),
@@ -2189,6 +2190,12 @@ fn save_minimal_recovery_handoff(
                 .iter()
                 .map(|failure| format!("{}: {}", failure.command, failure.reason)),
         )
+        .chain(
+            report
+                .compile_errors
+                .iter()
+                .map(|error| format!("implementation_compile_error: {}", error.summary())),
+        )
         .chain(report.profile_failures.iter().cloned())
         .collect::<Vec<_>>();
     let handoff = crate::planner::repair::RecoveryHandoff {
@@ -2479,6 +2486,15 @@ fn follow_through_anchor_paths(
     contract: &CompletionContract,
     runtime_acceptance: &RuntimeAcceptanceReport,
 ) -> Vec<String> {
+    if !report.compile_errors.is_empty() {
+        return report
+            .compile_errors
+            .iter()
+            .map(|error| error.path.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
     let mut paths = Vec::new();
     for target in &runtime_acceptance.obligation_repair_targets {
         if target.target_role == "implementation" && !target.target_path.trim().is_empty() {
@@ -2533,6 +2549,9 @@ fn terminal_verify_stop_reason(
     verdict: RepairProgressVerdict,
     repair_target: RepairTarget,
 ) -> String {
+    if !report.compile_errors.is_empty() {
+        return "implementation_compile_error".to_string();
+    }
     if !report.dependency_missing.is_empty() {
         return "dependency_setup_missing".to_string();
     }

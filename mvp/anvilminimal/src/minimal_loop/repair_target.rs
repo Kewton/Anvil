@@ -121,6 +121,9 @@ impl RepairTarget {
 }
 
 pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
+    if !report.compile_errors.is_empty() {
+        return RepairTarget::Implementation;
+    }
     if !report.dependency_missing.is_empty() {
         return RepairTarget::DependencySetup;
     }

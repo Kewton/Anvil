@@ -10,6 +10,34 @@ use crate::minimal_loop::verifier_env;
 use crate::planner::verify::validate_verify_command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CompileError {
+    pub path: String,
+    pub line: usize,
+    pub column: usize,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_bound: Option<bool>,
+}
+
+impl CompileError {
+    pub fn location(&self) -> String {
+        if self.line > 0 && self.column > 0 {
+            format!("{}:{}:{}", self.path, self.line, self.column)
+        } else if self.line > 0 {
+            format!("{}:{}", self.path, self.line)
+        } else {
+            self.path.clone()
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        format!("{} {}", self.location(), self.message)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BuildVerifierRequirement {
     pub command: String,
     pub profile: Option<String>,
@@ -62,6 +90,8 @@ pub struct BuildVerifierObservation {
     pub status: BuildVerifierStatus,
     pub primary_reason: String,
     pub output_snippet: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compile_errors: Vec<CompileError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub foreign_toolchain: Option<ForeignToolchainObservation>,
 }
@@ -171,6 +201,7 @@ pub fn emit_dependency_build_lifecycle(
             "build_rerun_attempted": lifecycle.after_setup.as_ref().is_some_and(|observation| observation.attempted),
             "final_status": lifecycle.final_status.as_str(),
             "final_reason": eval_events::body_snippet(&lifecycle.final_reason),
+            "compile_errors": lifecycle.final_observation().compile_errors.clone(),
         }),
     );
     emit_foreign_toolchain_detected(eval_events_path, mode, step_id, &lifecycle.before_setup);
@@ -286,6 +317,7 @@ pub fn observe_requirement(
             status: BuildVerifierStatus::PolicyRejected,
             primary_reason: err.to_string(),
             output_snippet: String::new(),
+            compile_errors: Vec::new(),
             foreign_toolchain: None,
         };
     }
@@ -306,6 +338,7 @@ pub fn observe_requirement(
             status: BuildVerifierStatus::DependencyMissing,
             primary_reason,
             output_snippet: String::new(),
+            compile_errors: Vec::new(),
             foreign_toolchain,
         };
     }
@@ -321,12 +354,17 @@ pub fn observe_requirement(
             status: BuildVerifierStatus::Passed,
             primary_reason: "build verifier passed".to_string(),
             output_snippet: eval_events::body_snippet(&output),
+            compile_errors: Vec::new(),
             foreign_toolchain: None,
         },
         Err(err) => {
             let reason = err.to_string();
+            let mut compile_errors = parse_compile_errors(&reason);
+            annotate_compile_error_route_binding(root, &mut compile_errors);
             let status = if is_dependency_missing_output(&reason) {
                 BuildVerifierStatus::DependencyMissing
+            } else if !compile_errors.is_empty() {
+                BuildVerifierStatus::Failed
             } else if reason.contains("blocked") {
                 BuildVerifierStatus::Blocked
             } else {
@@ -343,6 +381,7 @@ pub fn observe_requirement(
                 status,
                 primary_reason: eval_events::body_snippet(&reason),
                 output_snippet: eval_events::body_snippet(&reason),
+                compile_errors,
                 foreign_toolchain: None,
             }
         }
@@ -443,6 +482,7 @@ pub(crate) fn observe_dependency_missing_output_lifecycle_with_setup_program_and
         status: BuildVerifierStatus::DependencyMissing,
         primary_reason: snippet.clone(),
         output_snippet: snippet,
+        compile_errors: Vec::new(),
         foreign_toolchain: foreign_toolchain_for_requirement(root, requirement),
     };
     observe_requirement_lifecycle_from_before(
@@ -505,6 +545,227 @@ fn observe_requirement_lifecycle_from_before(
         after_setup,
         final_status,
         final_reason,
+    }
+}
+
+pub fn parse_compile_errors(output: &str) -> Vec<CompileError> {
+    let clean = strip_ansi_sequences(output);
+    let lines = clean.lines().collect::<Vec<_>>();
+    let mut errors = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if let Some((path, line_number, column)) = parse_compile_location_line(line) {
+            let message = compile_message_after_location(&lines, index)
+                .unwrap_or_else(|| "compile error".to_string());
+            push_compile_error(
+                &mut errors,
+                CompileError {
+                    path,
+                    line: line_number,
+                    column,
+                    symbol: cannot_find_name_symbol(&message),
+                    message,
+                    route_bound: None,
+                },
+            );
+        } else if let Some(error) = parse_inline_tsc_error(line) {
+            push_compile_error(&mut errors, error);
+        }
+    }
+    if errors.is_empty() {
+        parse_failed_to_compile_module_error(&lines, &mut errors);
+    }
+    errors
+}
+
+fn push_compile_error(errors: &mut Vec<CompileError>, error: CompileError) {
+    if !errors.iter().any(|existing| {
+        existing.path == error.path
+            && existing.line == error.line
+            && existing.column == error.column
+            && existing.message == error.message
+    }) {
+        errors.push(error);
+    }
+}
+
+fn parse_compile_location_line(line: &str) -> Option<(String, usize, usize)> {
+    let trimmed = trim_compile_line(line);
+    let mut parts = trimmed.rsplitn(3, ':');
+    let column = parts.next()?.trim().parse::<usize>().ok()?;
+    let line_number = parts.next()?.trim().parse::<usize>().ok()?;
+    let path = normalize_compile_error_path(parts.next()?.trim())?;
+    if compile_error_path_is_supported(&path) {
+        Some((path, line_number, column))
+    } else {
+        None
+    }
+}
+
+fn parse_inline_tsc_error(line: &str) -> Option<CompileError> {
+    let trimmed = trim_compile_line(line);
+    let marker = " - error ";
+    let (location, message) = trimmed
+        .split_once(marker)
+        .or_else(|| trimmed.split_once(": error "))?;
+    let (path, line_number, column) = parse_compile_location_line(location)?;
+    let message = message.trim().to_string();
+    Some(CompileError {
+        path,
+        line: line_number,
+        column,
+        symbol: cannot_find_name_symbol(&message),
+        message,
+        route_bound: None,
+    })
+}
+
+fn compile_message_after_location(lines: &[&str], location_index: usize) -> Option<String> {
+    lines
+        .iter()
+        .skip(location_index + 1)
+        .map(|line| trim_compile_line(line))
+        .find(|line| {
+            !line.is_empty()
+                && (line.contains("Type error:")
+                    || line.contains("Syntax error:")
+                    || line.contains("Syntax Error")
+                    || line.starts_with("Error:")
+                    || line.starts_with("error "))
+        })
+        .map(ToOwned::to_owned)
+}
+
+fn parse_failed_to_compile_module_error(lines: &[&str], errors: &mut Vec<CompileError>) {
+    let Some(failed_index) = lines
+        .iter()
+        .position(|line| trim_compile_line(line).contains("Failed to compile"))
+    else {
+        return;
+    };
+    let Some((index, path)) = lines
+        .iter()
+        .enumerate()
+        .skip(failed_index + 1)
+        .filter_map(|(index, line)| {
+            normalize_compile_error_path(trim_compile_line(line))
+                .filter(|path| compile_error_path_is_supported(path))
+                .map(|path| (index, path))
+        })
+        .next()
+    else {
+        return;
+    };
+    let message = lines
+        .iter()
+        .skip(index + 1)
+        .map(|line| trim_compile_line(line))
+        .find(|line| {
+            !line.is_empty()
+                && (line.starts_with("Error:")
+                    || line.contains("Syntax Error")
+                    || line.contains("Syntax error:")
+                    || line.contains("Type error:"))
+        })
+        .unwrap_or("Failed to compile")
+        .to_string();
+    push_compile_error(
+        errors,
+        CompileError {
+            path,
+            line: 0,
+            column: 0,
+            symbol: cannot_find_name_symbol(&message),
+            message,
+            route_bound: None,
+        },
+    );
+}
+
+fn normalize_compile_error_path(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+        .trim_start_matches("./");
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = if trimmed.starts_with('/') {
+        trimmed
+            .find("/src/")
+            .map(|index| trimmed[index + 1..].to_string())
+            .or_else(|| {
+                trimmed
+                    .find("/app/")
+                    .map(|index| trimmed[index + 1..].to_string())
+            })
+            .or_else(|| {
+                trimmed
+                    .find("/pages/")
+                    .map(|index| trimmed[index + 1..].to_string())
+            })?
+    } else {
+        trimmed.to_string()
+    };
+    Some(normalized.replace('\\', "/"))
+}
+
+fn compile_error_path_is_supported(path: &str) -> bool {
+    let path = Path::new(path);
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("tsx" | "ts" | "jsx" | "js" | "css")
+    )
+}
+
+fn cannot_find_name_symbol(message: &str) -> Option<String> {
+    extract_quoted_after(message, "Cannot find name ")
+}
+
+fn extract_quoted_after(message: &str, marker: &str) -> Option<String> {
+    let rest = message.split_once(marker)?.1.trim_start();
+    let quote = rest.chars().next()?;
+    if !matches!(quote, '\'' | '"' | '`') {
+        return None;
+    }
+    let rest = &rest[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    let symbol = rest[..end].trim();
+    (!symbol.is_empty()).then(|| symbol.to_string())
+}
+
+fn trim_compile_line(line: &str) -> &str {
+    line.trim()
+        .trim_start_matches('>')
+        .trim()
+        .trim_start_matches("at ")
+        .trim()
+}
+
+fn strip_ansi_sequences(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn annotate_compile_error_route_binding(root: &Path, errors: &mut [CompileError]) {
+    if errors.is_empty() {
+        return;
+    }
+    let closure = crate::minimal_loop::import_scan::route_bound_closure(root, "nextjs");
+    for error in errors {
+        error.route_bound = Some(closure.contains(Path::new(&error.path)));
     }
 }
 
@@ -715,6 +976,27 @@ mod tests {
         )
         .unwrap();
         assert!(requirement.required_for_completion);
+    }
+
+    #[test]
+    fn parse_next_type_error_extracts_path_line_column_and_symbol() {
+        let output = r#"
+> next build
+
+Failed to compile.
+
+./src/components/SpaceInvaders.tsx:137:28
+Type error: Cannot find name 'reset'.
+"#;
+
+        let errors = parse_compile_errors(output);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "src/components/SpaceInvaders.tsx");
+        assert_eq!(errors[0].line, 137);
+        assert_eq!(errors[0].column, 28);
+        assert_eq!(errors[0].symbol.as_deref(), Some("reset"));
+        assert_eq!(errors[0].route_bound, None);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::minimal_loop::build_verifier::{
-    self, BuildVerifierLifecycleObservation, BuildVerifierStatus,
+    self, BuildVerifierLifecycleObservation, BuildVerifierStatus, CompileError,
 };
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::verifier_env;
@@ -24,6 +24,7 @@ pub struct VerificationReport {
     pub command_failures: Vec<CommandFailure>,
     pub dependency_missing: Vec<String>,
     pub profile_failures: Vec<String>,
+    pub compile_errors: Vec<CompileError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,7 @@ impl VerificationReport {
             command_failures: Vec::new(),
             dependency_missing: Vec::new(),
             profile_failures: Vec::new(),
+            compile_errors: Vec::new(),
         }
     }
 
@@ -87,6 +89,7 @@ impl VerificationReport {
             && self.command_failures.is_empty()
             && self.dependency_missing.is_empty()
             && self.profile_failures.is_empty()
+            && self.compile_errors.is_empty()
     }
 
     pub fn missing_path(path: impl Into<String>) -> Self {
@@ -136,6 +139,26 @@ impl VerificationReport {
         self.refresh_status();
     }
 
+    pub fn push_compile_errors(&mut self, command: impl Into<String>, errors: Vec<CompileError>) {
+        if errors.is_empty() {
+            return;
+        }
+        for error in &errors {
+            if !self.compile_errors.contains(error) {
+                self.compile_errors.push(error.clone());
+            }
+        }
+        let reason = format!(
+            "implementation_compile_error: {}",
+            errors
+                .iter()
+                .map(CompileError::summary)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        self.push_command_failure(command, reason);
+    }
+
     pub fn primary_reason(&self) -> String {
         self.missing_paths
             .first()
@@ -145,6 +168,11 @@ impl VerificationReport {
                 self.command_failures
                     .first()
                     .map(|failure| failure.reason.clone())
+            })
+            .or_else(|| {
+                self.compile_errors
+                    .first()
+                    .map(|error| format!("implementation_compile_error: {}", error.summary()))
             })
             .or_else(|| self.profile_failures.first().cloned())
             .unwrap_or_else(|| "pass".to_string())
@@ -157,6 +185,11 @@ impl VerificationReport {
             VerifyStatus::DependencyMissing(reason.clone())
         } else if let Some(failure) = self.command_failures.first() {
             VerifyStatus::CommandFailed(failure.reason.clone())
+        } else if let Some(error) = self.compile_errors.first() {
+            VerifyStatus::CommandFailed(format!(
+                "implementation_compile_error: {}",
+                error.summary()
+            ))
         } else if let Some(reason) = self.profile_failures.first() {
             VerifyStatus::ProfileContractFailed(reason.clone())
         } else {
@@ -421,13 +454,18 @@ fn record_build_lifecycle_result(
             false
         }
         BuildVerifierStatus::Failed => {
-            report.push_command_failure(
-                command.to_string(),
-                format!(
-                    "dependency_setup_lifecycle_failed: {}",
-                    lifecycle_failure_with_setup_output(lifecycle)
-                ),
-            );
+            let compile_errors = lifecycle.final_observation().compile_errors.clone();
+            if compile_errors.is_empty() {
+                report.push_command_failure(
+                    command.to_string(),
+                    format!(
+                        "dependency_setup_lifecycle_failed: {}",
+                        lifecycle_failure_with_setup_output(lifecycle)
+                    ),
+                );
+            } else {
+                report.push_compile_errors(command.to_string(), compile_errors);
+            }
             false
         }
     }
@@ -752,6 +790,26 @@ mod tests {
         }
     }
 
+    fn write_fake_next_build_workspace(root: &Path, npm_script: &str) {
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::create_dir_all(root.join("src/components")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/next")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("node_modules/next/package.json"), "{}").unwrap();
+        write_executable(&root.join("node_modules/.bin/next"), "#!/bin/sh\nexit 0\n");
+        write_executable(&root.join("node_modules/.bin/npm"), npm_script);
+        std::fs::write(
+            root.join("src/app/page.tsx"),
+            "export default function Page(){return <main>plain route</main>;}\n",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn missing_path_before_evidence() {
         let dir = tempfile::tempdir().unwrap();
@@ -1029,6 +1087,105 @@ mod tests {
         assert!(report.primary_reason().contains("dependency_setup_missing"));
         assert_eq!(lifecycles.len(), 1);
         assert!(lifecycles[0].lifecycle_stages().contains(&"setup_blocked"));
+    }
+
+    #[test]
+    fn nextjs_type_error_build_failure_is_implementation_compile_error() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_next_build_workspace(
+            dir.path(),
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"run\" ] && [ \"$2\" = \"build\" ]; then\n\
+               echo './src/components/SpaceInvaders.tsx:137:28' >&2\n\
+               echo \"Type error: Cannot find name 'reset'.\" >&2\n\
+               exit 1\n\
+             fi\n\
+             exit 2\n",
+        );
+        std::fs::write(
+            dir.path().join("src/components/SpaceInvaders.tsx"),
+            "export function SpaceInvaders(){return <button onClick={reset}>Restart</button>;}\n",
+        )
+        .unwrap();
+        let step = PlanStep {
+            id: "build".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Run production build".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["npm run build".to_string()],
+        };
+
+        let (report, lifecycles) =
+            verify_step_with_setup_observed(dir.path(), &step, NodeDependencySetupAuthority::None);
+
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::Implementation
+        );
+        assert!(report.dependency_missing.is_empty(), "{report:?}");
+        assert_eq!(report.compile_errors.len(), 1, "{report:?}");
+        assert_eq!(
+            report.compile_errors[0].path,
+            "src/components/SpaceInvaders.tsx"
+        );
+        assert_eq!(report.compile_errors[0].line, 137);
+        assert_eq!(report.compile_errors[0].symbol.as_deref(), Some("reset"));
+        assert_eq!(report.compile_errors[0].route_bound, Some(false));
+        assert!(
+            report
+                .primary_reason()
+                .contains("implementation_compile_error"),
+            "{report:?}"
+        );
+        let feedback = crate::minimal_loop::completion::format_verify_feedback(&report);
+        assert!(
+            feedback.contains("src/components/SpaceInvaders.tsx:137:28"),
+            "{feedback}"
+        );
+        assert!(feedback.contains("define reset"), "{feedback}");
+        assert!(
+            feedback.contains("replace the reference with an existing handler"),
+            "{feedback}"
+        );
+        assert!(feedback.contains("remove the dead code"), "{feedback}");
+        assert!(
+            feedback.contains("the file is not imported by any route"),
+            "{feedback}"
+        );
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].final_status, BuildVerifierStatus::Failed);
+    }
+
+    #[test]
+    fn nextjs_cannot_find_module_build_failure_stays_dependency_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_next_build_workspace(
+            dir.path(),
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"run\" ] && [ \"$2\" = \"build\" ]; then\n\
+               echo \"Cannot find module 'x'\" >&2\n\
+               exit 1\n\
+             fi\n\
+             exit 2\n",
+        );
+        let step = PlanStep {
+            id: "build".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Run production build".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["npm run build".to_string()],
+        };
+
+        let report = verify_step(dir.path(), &step);
+
+        assert!(matches!(report.status, VerifyStatus::DependencyMissing(_)));
+        assert!(report.compile_errors.is_empty(), "{report:?}");
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::DependencySetup
+        );
     }
 
     #[test]

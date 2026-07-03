@@ -6,6 +6,7 @@ pub struct VerificationSignature {
     pub dependency_missing: Vec<String>,
     pub command_failures: Vec<String>,
     pub profile_failures: Vec<String>,
+    pub compile_errors: Vec<String>,
 }
 
 impl VerificationSignature {
@@ -28,11 +29,18 @@ impl VerificationSignature {
         command_failures.sort();
         let mut profile_failures = report.profile_failures.clone();
         profile_failures.sort();
+        let mut compile_errors = report
+            .compile_errors
+            .iter()
+            .map(|error| error.summary())
+            .collect::<Vec<_>>();
+        compile_errors.sort();
         Self {
             missing_paths,
             dependency_missing,
             command_failures,
             profile_failures,
+            compile_errors,
         }
     }
 
@@ -41,15 +49,17 @@ impl VerificationSignature {
             + self.dependency_missing.len()
             + self.command_failures.len()
             + self.profile_failures.len()
+            + self.compile_errors.len()
     }
 
     pub fn label(&self) -> String {
         format!(
-            "missing={};dependency={};commands={};profile={}",
+            "missing={};dependency={};commands={};profile={};compile={}",
             self.missing_paths.join("|"),
             self.dependency_missing.join("|"),
             self.command_failures.join("|"),
-            self.profile_failures.join("|")
+            self.profile_failures.join("|"),
+            self.compile_errors.join("|")
         )
     }
 

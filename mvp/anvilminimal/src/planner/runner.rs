@@ -14,8 +14,10 @@ use crate::minimal_loop::behavior_evidence::{self, EvidenceArbitrationReport};
 use crate::minimal_loop::browser_probe::{
     BrowserReadinessObservation, html_surface_markers_json, probe_browser_readiness_with_offline,
 };
-use crate::minimal_loop::build_verifier::emit_dependency_build_lifecycle;
-use crate::minimal_loop::completion::{CompletionContract, evidence_hint_tokens_for_goal};
+use crate::minimal_loop::build_verifier::{CompileError, emit_dependency_build_lifecycle};
+use crate::minimal_loop::completion::{
+    CompletionContract, compile_error_repair_guidance, evidence_hint_tokens_for_goal,
+};
 use crate::minimal_loop::dependency_setup::{self, NodeDependencySetupAuthority};
 use crate::minimal_loop::evidence::{
     RuntimeAcceptanceReport, comment_stripped_source_corpus, required_evidence_for_capability,
@@ -1553,9 +1555,15 @@ fn merge_verification_report(report: &mut VerificationReport, extra: Verificatio
     for failure in extra.command_failures {
         report.push_command_failure(failure.command, failure.reason);
     }
+    for error in extra.compile_errors {
+        if !report.compile_errors.contains(&error) {
+            report.compile_errors.push(error);
+        }
+    }
     for reason in extra.profile_failures {
         report.push_profile_failure(reason);
     }
+    report.refresh_status();
 }
 
 fn step_run_session_options(
@@ -3052,6 +3060,7 @@ pub fn run_ultra_plan_with_ui(
                 "primary_reason": eval_events::body_snippet(&initial_reason),
                 "repair_target": initial_target.as_str(),
                 "missing_paths": acceptance_report.missing_paths.clone(),
+                "compile_errors": acceptance_report.compile_errors.clone(),
                 "profile_failures": acceptance_report.profile_failures.clone(),
                 "bounded_repair_available": true,
                 "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
@@ -3082,6 +3091,7 @@ pub fn run_ultra_plan_with_ui(
                 "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
                 "repair_target": initial_target.as_str(),
                 "missing_paths": acceptance_report.missing_paths.clone(),
+                "compile_errors": acceptance_report.compile_errors.clone(),
                 "profile_failures": acceptance_report.profile_failures.clone(),
                 "bounded_repair": true,
                 "max_iterations": repair_config.max_iterations,
@@ -3174,6 +3184,7 @@ pub fn run_ultra_plan_with_ui(
                     "repair_target": target.as_str(),
                     "primary_reason": eval_events::body_snippet(&reason),
                     "missing_paths": acceptance_report.missing_paths.clone(),
+                    "compile_errors": acceptance_report.compile_errors.clone(),
                     "profile_failures": acceptance_report.profile_failures.clone(),
                     "bounded_repair_exhausted": true,
                 }),
@@ -3679,7 +3690,6 @@ fn ultra_final_acceptance_report(
         &mut required_evidence,
         &inferred_required_evidence(&plan.profile, &plan.goal, &required_capabilities),
     );
-    let browser_probe = maybe_run_ultra_final_browser_probe(config, plan, &required_capabilities);
     let missing = missing_final_artifacts(&config.workspace_root, &required_paths);
     let mut acceptance = verify_runtime_acceptance_with_browser_dirs_and_hints(
         &config.workspace_root,
@@ -3725,32 +3735,53 @@ fn ultra_final_acceptance_report(
             external_report.as_ref(),
             Some(&acceptance),
         );
-    let release_gate = final_acceptance_release_gate(
-        config,
-        &plan.profile,
-        &plan.goal,
-        &required_capabilities,
-        Some(&acceptance),
-        true,
-    );
+    let production_build_failed = report_has_production_build_failure(&profile_report)
+        || external_report
+            .as_ref()
+            .is_some_and(report_has_production_build_failure);
+    let browser_probe = if production_build_failed {
+        None
+    } else {
+        maybe_run_ultra_final_browser_probe(config, plan, &required_capabilities)
+    };
+    let release_gate = if production_build_failed {
+        production_build_failed_release_gate()
+    } else {
+        final_acceptance_release_gate(
+            config,
+            &plan.profile,
+            &plan.goal,
+            &required_capabilities,
+            Some(&acceptance),
+            true,
+        )
+    };
     let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
     let runtime_acceptance_status = runtime_acceptance_status(acceptance.passed, Some(&acceptance));
     let release_quality_completion =
         release_quality_completion_status(&release_gate, final_acceptance_status);
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
     let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
+    let mut compile_errors = profile_report.compile_errors.clone();
+    if let Some(report) = external_report.as_ref() {
+        for error in &report.compile_errors {
+            if !compile_errors.contains(error) {
+                compile_errors.push(error.clone());
+            }
+        }
+    }
     let primary_reason = if !missing.is_empty() {
         format!("missing final artifacts: {}", missing.join(", "))
     } else if contract_binding_missing {
         "completion contract binding required but missing".to_string()
     } else if !profile_report.is_pass() {
         profile_report.primary_reason()
-    } else if !acceptance.passed {
-        acceptance.primary_reason.clone()
     } else if let Some(report) = external_report.as_ref().filter(|report| {
         !external_contract_ok_after_runtime_arbitration(Some(*report), Some(&acceptance))
     }) {
         report.primary_reason()
+    } else if !acceptance.passed {
+        acceptance.primary_reason.clone()
     } else if matches!(release_gate.status.as_str(), "partial" | "failed") {
         release_gate.reasons.join("; ")
     } else {
@@ -3812,6 +3843,8 @@ fn ultra_final_acceptance_report(
             "runtime_acceptance_passed": acceptance.passed,
             "runtime_acceptance_status": runtime_acceptance_status,
             "runtime_acceptance_inconclusive": acceptance.inconclusive,
+            "compile_errors": compile_errors.clone(),
+            "compile_error_failure_kind": if compile_errors.is_empty() { "" } else { "implementation_compile_error" },
             "final_acceptance_status": final_acceptance_status,
             "release_quality_completion": release_quality_completion,
             "missing_capabilities": acceptance.missing_capabilities.clone(),
@@ -3890,10 +3923,9 @@ fn ultra_final_acceptance_report(
     if let Some(external_report) = external_report.filter(|report| {
         !external_contract_ok_after_runtime_arbitration(Some(report), Some(&acceptance))
     }) {
-        report.push_profile_failure(format!(
-            "external contract failed: {}",
-            external_report.primary_reason()
-        ));
+        let reason = external_report.primary_reason();
+        merge_verification_report(&mut report, external_report);
+        report.push_profile_failure(format!("external contract failed: {}", reason));
     }
     let append_release_observations = !report.is_pass() || release_gate.status == "failed";
     if release_gate.status == "failed" {
@@ -4060,6 +4092,24 @@ fn maybe_run_ultra_final_browser_probe(
     );
     emit_browser_probe_event(config, &observation);
     Some(observation)
+}
+
+fn report_has_production_build_failure(report: &VerificationReport) -> bool {
+    !report.compile_errors.is_empty()
+        || report.dependency_missing.iter().any(|reason| {
+            let lower = reason.to_ascii_lowercase();
+            lower.contains("next.js build")
+                || lower.contains("next build")
+                || lower.contains("npm run build")
+                || lower.contains("dependency_setup_missing")
+        })
+        || report.command_failures.iter().any(|failure| {
+            let lower = format!("{} {}", failure.command, failure.reason).to_ascii_lowercase();
+            lower.contains("npm run build")
+                || lower.contains("next build")
+                || lower.contains("build_verify_failed")
+                || lower.contains("implementation_compile_error")
+        })
 }
 
 fn ultra_browser_probe_required(
@@ -4351,6 +4401,17 @@ struct ReleaseGateSummary {
     browser_readiness_evidence_path: String,
     interaction_evidence_status: String,
     interaction_evidence_path: String,
+}
+
+fn production_build_failed_release_gate() -> ReleaseGateSummary {
+    ReleaseGateSummary {
+        status: "not_applicable".to_string(),
+        reasons: vec!["production_build_failed_before_browser_probe".to_string()],
+        browser_readiness_status: "not_applicable".to_string(),
+        browser_readiness_evidence_path: String::new(),
+        interaction_evidence_status: "not_applicable".to_string(),
+        interaction_evidence_path: String::new(),
+    }
 }
 
 fn final_acceptance_release_gate(
@@ -8682,9 +8743,19 @@ fn final_acceptance_repair_expected_paths(
     if let Some(contract) = CompletionContract::load_for_config(config)? {
         merge_unique_strings(&mut expected, &contract.required_paths);
     }
+    merge_unique_strings(&mut expected, &compile_error_paths(&report.compile_errors));
     merge_unique_strings(&mut expected, &report.missing_paths);
     merge_unique_strings(&mut expected, &obligation_repair_target_paths(report));
     Ok(expected)
+}
+
+fn compile_error_paths(errors: &[CompileError]) -> Vec<String> {
+    errors
+        .iter()
+        .map(|error| error.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn obligation_repair_target_paths(report: &VerificationReport) -> Vec<String> {
@@ -8720,6 +8791,8 @@ fn final_acceptance_repair_prompt(
         final_acceptance_adherence_guidance(report, repair_target, adherence_missing);
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
+    let compile_errors =
+        render_prompt_bullets(&compile_error_repair_guidance(&report.compile_errors));
     format!(
         "Repair the final acceptance failure for the current ultra run.\n\n\
 Original ultra goal:\n{goal}\n\n\
@@ -8730,6 +8803,7 @@ Final acceptance failure:\n\
 - attempt: {attempt}/{max_attempts}\n\n\
 Missing paths:\n{missing}\n\n\
 Dependency failures:\n{dependencies}\n\n\
+Compile errors:\n{compile_errors}\n\n\
 Command failures:\n{command_failures}\n\n\
 Profile failures:\n{profile_failures}\n\n\
 {adherence_guidance}\
@@ -8749,6 +8823,7 @@ Bounded repair rules:\n\
         max_attempts = max_attempts,
         missing = missing,
         dependencies = dependencies,
+        compile_errors = compile_errors,
         command_failures = command_failures,
         profile_failures = profile_failures,
         adherence_guidance = adherence_guidance,
@@ -14682,6 +14757,97 @@ exit 2\n"
         std::fs::set_permissions(next_path, permissions).unwrap();
     }
 
+    #[cfg(unix)]
+    fn write_compile_error_nextjs_workspace(root: &Path, port: u16) -> PathBuf {
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::create_dir_all(root.join("src/components")).unwrap();
+        std::fs::create_dir_all(root.join(".anvil")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/next")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/tailwindcss")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/postcss")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/autoprefixer")).unwrap();
+        std::fs::write(root.join(".anvil/enable-browser-probe-tests"), "1").unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}}}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("node_modules/next/package.json"), "{}").unwrap();
+        std::fs::write(root.join("node_modules/tailwindcss/package.json"), "{}").unwrap();
+        std::fs::write(root.join("node_modules/postcss/package.json"), "{}").unwrap();
+        std::fs::write(root.join("node_modules/autoprefixer/package.json"), "{}").unwrap();
+        let component = r#""use client";
+import { useState } from "react";
+export function SpaceInvaders(){
+  const [score, setScore] = useState(0);
+  const fire = () => setScore((value) => value + 1);
+  return <main><button onClick={fire}>Fire</button><button onClick={reset}>Restart</button><canvas /><p>score {score}</p></main>;
+}
+"#;
+        std::fs::write(root.join("src/components/SpaceInvaders.tsx"), component).unwrap();
+        std::fs::write(
+            root.join("src/app/page.tsx"),
+            "export default function Page(){return <main><button>Plain</button></main>;}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/app/layout.tsx"), nextjs_layout_source()).unwrap();
+        std::fs::write(root.join("src/app/globals.css"), nextjs_globals_css()).unwrap();
+        std::fs::write(
+            root.join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("tsconfig.json"), nextjs_tsconfig_json()).unwrap();
+        std::fs::write(root.join("postcss.config.js"), nextjs_postcss_config()).unwrap();
+        std::fs::write(root.join("tailwind.config.ts"), nextjs_tailwind_config_ts()).unwrap();
+        let exe = shell_quote(&std::env::current_exe().unwrap().display().to_string());
+        let script = format!(
+            "#!/bin/sh\n\
+if [ \"$1\" = \"run\" ] && [ \"$2\" = \"build\" ]; then\n\
+  if grep -q 'onClick={{reset}}' src/components/SpaceInvaders.tsx && ! grep -q 'const reset' src/components/SpaceInvaders.tsx; then\n\
+    echo './src/components/SpaceInvaders.tsx:137:28' >&2\n\
+    echo \"Type error: Cannot find name 'reset'.\" >&2\n\
+    exit 1\n\
+  fi\n\
+  echo 'fake build ok'\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"run\" ] && {{ [ \"$2\" = \"dev\" ] || [ \"$2\" = \"start\" ]; }}; then\n\
+  ANVIL_FAKE_DEV_SERVER_CHILD=1 ANVIL_FAKE_DEV_SERVER_GRANDCHILD=0 exec {exe} --ignored --exact planner::runner::tests::fake_dev_server_package_manager_child --nocapture\n\
+fi\n\
+echo \"unexpected fake npm args: $*\" >&2\n\
+exit 2\n"
+        );
+        let npm = root.join("node_modules/.bin/npm");
+        std::fs::write(&npm, script).unwrap();
+        let mut permissions = std::fs::metadata(&npm).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&npm, permissions).unwrap();
+        let next_path = root.join("node_modules/.bin/next");
+        std::fs::write(&next_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&next_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(next_path, permissions).unwrap();
+        let contract_path = root.join("completion-contract.json");
+        std::fs::write(
+            &contract_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "required_paths": ["src/app/page.tsx", "src/components/SpaceInvaders.tsx"],
+                "verify_commands": ["npm run build"],
+                "profile": "nextjs",
+                "goal": "Create an interactive browser app",
+                "required_capabilities": ["playable_ui", "stateful_interaction"],
+                "verify_repair_cap": 2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        contract_path
+    }
+
     fn generated_nextjs_artifact_plan_json_with_build_verify(goal: &str) -> String {
         let expected_paths = nextjs_scaffold_expected_paths();
         serde_json::to_string(&StepPlan {
@@ -14699,6 +14865,188 @@ exit 2\n"
             }],
         })
         .unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compile_error_final_acceptance_skips_readiness_probe() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join("events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        let contract = write_compile_error_nextjs_workspace(dir.path(), port);
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(contract);
+        let plan = UltraPlan {
+            goal: "Create an interactive browser app".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "inspect-one".to_string(),
+                    prompt: "Inspect the existing app.".to_string(),
+                },
+                UltraPhase {
+                    id: "inspect-two".to_string(),
+                    prompt: "Inspect final readiness.".to_string(),
+                },
+            ],
+        };
+
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::Implementation
+        );
+        assert_eq!(report.compile_errors.len(), 1, "{report:?}");
+        assert!(report.dependency_missing.is_empty(), "{report:?}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("implementation_compile_error"));
+        assert!(event_text.contains("\"compile_errors\""));
+        assert!(!event_text.contains("\"event\":\"browser_probe\""));
+        assert!(!event_text.contains("\"event\":\"dev_server_lifecycle\""));
+        assert!(!dir.path().join("browser-readiness.json").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compile_error_repair_prompt_anchors_file_and_then_runs_readiness() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join("events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        let contract = write_compile_error_nextjs_workspace(dir.path(), port);
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(contract);
+        let plan = UltraPlan {
+            goal: "Create an interactive browser app".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "inspect-one".to_string(),
+                    prompt: "Inspect the existing app.".to_string(),
+                },
+                UltraPhase {
+                    id: "inspect-two".to_string(),
+                    prompt: "Inspect final readiness.".to_string(),
+                },
+            ],
+        };
+        let fixed_component = r#""use client";
+	import { useState } from "react";
+	export function SpaceInvaders(){
+	  const [score, setScore] = useState(0);
+	  const fire = () => setScore((value) => value + 1);
+	  const reset = () => setScore(0);
+	  return <main><button onClick={() => fire()}>Fire</button><button onClick={() => reset()}>Restart</button><canvas /><p>score {score}</p></main>;
+        }
+        "#;
+        let route_page = "import { SpaceInvaders } from '@/components/SpaceInvaders';\nexport default function Page(){return <SpaceInvaders />;}\n";
+        let initial_report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+        assert_eq!(
+            classify_repair_target(&initial_report),
+            RepairTarget::Implementation,
+            "{initial_report:?}"
+        );
+        let expected_paths = final_acceptance_repair_expected_paths(&plan, &cfg, &initial_report)
+            .expect("expected paths");
+        let repair_prompt = final_acceptance_repair_prompt(
+            &plan,
+            &initial_report,
+            &UltraRunContext::default(),
+            RepairTarget::Implementation.as_str(),
+            &expected_paths,
+            &[],
+            (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+        );
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/components/SpaceInvaders.tsx","content":fixed_component}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/page.tsx","content":route_page}),
+                    ),
+                ],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("compile error repaired"),
+            AssistantReply::text("compile error repaired"),
+            AssistantReply::text("compile error repaired"),
+            AssistantReply::text("compile error repaired"),
+            AssistantReply::text("compile error repaired"),
+        ]);
+        let mut session = SessionSnapshot::new();
+
+        let outcome = run_final_acceptance_repair_with_ultra_session(
+            &mut execution,
+            &mut session,
+            &repair_prompt,
+            &expected_paths,
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_or_else(|err| {
+            let event_text = std::fs::read_to_string(&events).unwrap_or_default();
+            panic!("{err}\nEvents:\n{event_text}");
+        });
+        assert!(
+            outcome
+                .changed_paths
+                .contains(&"src/components/SpaceInvaders.tsx".to_string())
+        );
+        let repaired_report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(
+            repaired_report.compile_errors.is_empty(),
+            "{repaired_report:?}"
+        );
+        assert!(
+            repair_prompt.contains("src/components/SpaceInvaders.tsx:137:28"),
+            "{repair_prompt}"
+        );
+        assert!(repair_prompt.contains("define reset"), "{repair_prompt}");
+        assert!(
+            repair_prompt.contains("replace the reference with an existing handler"),
+            "{repair_prompt}"
+        );
+        assert!(
+            repair_prompt.contains("remove the dead code"),
+            "{repair_prompt}"
+        );
+        assert!(
+            repair_prompt.contains("the file is not imported by any route"),
+            "{repair_prompt}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(
+            event_text.contains("\"event\":\"completion_verify\""),
+            "{event_text}"
+        );
+        assert!(event_text.contains("\"ok\":true"), "{event_text}");
+        assert!(
+            event_text.contains("\"event\":\"browser_probe\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"browser_readiness_status\":\"passed\""),
+            "{event_text}"
+        );
     }
 
     #[cfg(unix)]

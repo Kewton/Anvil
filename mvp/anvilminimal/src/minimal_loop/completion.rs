@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::eval_events;
 use crate::minimal_loop::build_verifier::{
-    self, BuildVerifierLifecycleObservation, BuildVerifierStatus,
+    self, BuildVerifierLifecycleObservation, BuildVerifierStatus, CompileError,
 };
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::evidence::{RuntimeAcceptanceReport, required_evidence_for_capability};
@@ -273,10 +273,17 @@ impl CompletionContract {
                             ));
                         }
                         BuildVerifierStatus::Failed => {
-                            report.push_command_failure(
-                                command.clone(),
-                                format!("build_verify_failed: {}", lifecycle.final_reason),
-                            );
+                            if observation.compile_errors.is_empty() {
+                                report.push_command_failure(
+                                    command.clone(),
+                                    format!("build_verify_failed: {}", lifecycle.final_reason),
+                                );
+                            } else {
+                                report.push_compile_errors(
+                                    command.clone(),
+                                    observation.compile_errors.clone(),
+                                );
+                            }
                         }
                         BuildVerifierStatus::Passed => {}
                     }
@@ -325,9 +332,15 @@ impl CompletionContract {
                 for failure in profile_report.command_failures {
                     report.push_command_failure(failure.command, failure.reason);
                 }
+                for error in profile_report.compile_errors {
+                    if !report.compile_errors.contains(&error) {
+                        report.compile_errors.push(error);
+                    }
+                }
                 for path in profile_report.missing_paths {
                     report.push_missing_path(path);
                 }
+                report.refresh_status();
             }
         }
         for requirement in &self.deferred_verify_requirements {
@@ -373,10 +386,17 @@ impl CompletionContract {
                             ));
                         }
                         BuildVerifierStatus::Failed => {
-                            report.push_command_failure(
-                                requirement.command.clone(),
-                                format!("build_verify_failed: {}", observation.primary_reason),
-                            );
+                            if observation.compile_errors.is_empty() {
+                                report.push_command_failure(
+                                    requirement.command.clone(),
+                                    format!("build_verify_failed: {}", observation.primary_reason),
+                                );
+                            } else {
+                                report.push_compile_errors(
+                                    requirement.command.clone(),
+                                    observation.compile_errors.clone(),
+                                );
+                            }
                         }
                         BuildVerifierStatus::Passed => {}
                     }
@@ -601,6 +621,9 @@ pub(crate) fn format_verify_feedback_with_contract(
             report.missing_paths.join(", ")
         ));
     }
+    for guidance in compile_error_repair_guidance(&report.compile_errors) {
+        lines.push(guidance);
+    }
     for reason in &report.dependency_missing {
         lines.push(format!("Dependency missing: {reason}"));
     }
@@ -672,6 +695,14 @@ pub(crate) fn target_implementation_files(
     contract: Option<&CompletionContract>,
 ) -> Vec<String> {
     let mut paths = BTreeSet::new();
+    for error in &report.compile_errors {
+        if looks_like_implementation_target_path(&error.path) {
+            paths.insert(error.path.clone());
+        }
+    }
+    if !paths.is_empty() {
+        return paths.into_iter().collect();
+    }
     if let Some(contract) = contract {
         paths.extend(
             contract
@@ -703,6 +734,27 @@ pub(crate) fn target_implementation_files(
         paths.insert("src/app/page.tsx".to_string());
     }
     paths.into_iter().collect()
+}
+
+pub(crate) fn compile_error_repair_guidance(errors: &[CompileError]) -> Vec<String> {
+    errors
+        .iter()
+        .flat_map(|error| {
+            let mut lines = vec![format!("Compile error: {}", error.summary())];
+            if let Some(symbol) = error.symbol.as_deref() {
+                let route_note = if error.route_bound == Some(false) {
+                    " - the file is not imported by any route"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "Cannot-find-name repair for `{symbol}` in {}: define {symbol}, or replace the reference with an existing handler, or remove the dead code{route_note}.",
+                    error.location()
+                ));
+            }
+            lines
+        })
+        .collect()
 }
 
 fn normalize_unique_list(values: Vec<String>) -> Vec<String> {
