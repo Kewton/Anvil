@@ -166,6 +166,11 @@ pub fn handle_command(
             &config,
             ui,
         ),
+        "/setup-interaction-probe" => {
+            let report =
+                crate::minimal_loop::interaction_probe::setup_interaction_probe_with_stdout_progress()?;
+            Ok(report.summary_lines().join("\n"))
+        }
         other => bail!("unknown slash command: {other}"),
     })();
     let terminal_status = terminal_status_for_result(&result, ui);
@@ -553,7 +558,7 @@ mod tests {
                 "release_gate_status": "partial",
                 "release_gate_reasons": [
                     "interaction_unverified:probe_unavailable",
-                    "install playwright to enable interaction release checks"
+                    crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
                 ],
                 "browser_readiness_status": "passed",
                 "browser_readiness_evidence_path": "browser-readiness.json",
@@ -573,7 +578,7 @@ mod tests {
         assert_eq!(projection.task_status, "partial (interaction unverified)");
         assert_eq!(
             projection.next_action,
-            "install_playwright_to_enable_interaction_release_checks"
+            "run_setup_interaction_probe_to_enable_interaction_release_checks"
         );
         let event_text = std::fs::read_to_string(&events).unwrap();
         let tui_stop = event_text
@@ -592,7 +597,9 @@ mod tests {
             "{summary}"
         );
         assert!(
-            summary.contains("install playwright to enable interaction release checks"),
+            summary.contains(
+                crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+            ),
             "{summary}"
         );
     }

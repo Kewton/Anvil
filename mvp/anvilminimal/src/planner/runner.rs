@@ -1946,6 +1946,10 @@ fn verify_plan_final_contract(
                 .as_ref()
                 .map(|report| report.weak_evidence.clone())
                 .unwrap_or_default(),
+            "unverified_evidence": runtime_acceptance
+                .as_ref()
+                .map(|report| report.unverified_evidence.clone())
+                .unwrap_or_default(),
             "evidence_tiers": runtime_acceptance
                 .as_ref()
                 .map(|report| report.evidence_tiers.clone())
@@ -3803,6 +3807,7 @@ fn ultra_final_acceptance_report(
             "missing_evidence": acceptance.missing_evidence.clone(),
             "missing_obligations": acceptance.missing_obligations.clone(),
             "weak_evidence": acceptance.weak_evidence.clone(),
+            "unverified_evidence": acceptance.unverified_evidence.clone(),
             "evidence_tiers": acceptance.evidence_tiers.clone(),
             "evidence_arbitration": evidence_arbitration.records.clone(),
             "evidence_arbitration_summary": evidence_arbitration.summary.clone(),
@@ -4118,10 +4123,13 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "ok": false,
                     "failure_kind": reason,
                     "evidence_path": "",
+                    "playwright_resolution_location": "",
+                    "playwright_version": "",
                 }),
             );
         }
         InteractionProbeOutcome::Observation(observation) => {
+            let resolution = observation.playwright_resolution.as_ref();
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
@@ -4136,6 +4144,18 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "output_excerpt": eval_events::body_snippet(&observation.output_excerpt),
                     "child_spawned": observation.child_spawned,
                     "child_reaped": observation.child_reaped,
+                    "playwright_resolution_location": resolution
+                        .map(|resolution| resolution.location.as_str())
+                        .unwrap_or(""),
+                    "playwright_module_path": resolution
+                        .map(|resolution| resolution.module_path.as_str())
+                        .unwrap_or(""),
+                    "playwright_node_path": resolution
+                        .and_then(|resolution| resolution.node_path.as_deref())
+                        .unwrap_or(""),
+                    "playwright_version": resolution
+                        .map(|resolution| resolution.version.as_str())
+                        .unwrap_or(""),
                 }),
             );
         }
@@ -4375,6 +4395,25 @@ fn final_acceptance_release_gate(
             interaction_evidence_path: String::new(),
         };
     }
+    if !report.unverified_evidence.is_empty() {
+        let mut gate = if requires_browser {
+            browser_release_gate(config)
+        } else {
+            ReleaseGateSummary {
+                status: "partial".to_string(),
+                reasons: Vec::new(),
+                browser_readiness_status: "not_applicable".to_string(),
+                browser_readiness_evidence_path: String::new(),
+                interaction_evidence_status: "not_applicable".to_string(),
+                interaction_evidence_path: String::new(),
+            }
+        };
+        let mut reasons = runtime_acceptance_unverified_release_reasons(report);
+        reasons.extend(std::mem::take(&mut gate.reasons));
+        gate.status = "partial".to_string();
+        gate.reasons = dedup_strings(reasons);
+        return gate;
+    }
     if requires_browser {
         return browser_release_gate(config);
     }
@@ -4386,6 +4425,34 @@ fn final_acceptance_release_gate(
         interaction_evidence_status: "not_applicable".to_string(),
         interaction_evidence_path: String::new(),
     }
+}
+
+fn runtime_acceptance_unverified_release_reasons(
+    report: &crate::minimal_loop::evidence::RuntimeAcceptanceReport,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let mut saw_probe_unavailable = false;
+    for evidence in &report.unverified_evidence {
+        if let Some(reason) = evidence
+            .split_once(":unverified:")
+            .map(|(_, reason)| reason.trim())
+            .filter(|reason| !reason.is_empty())
+        {
+            if reason == "probe_unavailable" {
+                saw_probe_unavailable = true;
+            } else {
+                reasons.push(format!("interaction_unverified:{reason}"));
+            }
+        }
+        reasons.push(format!("unverified_probe_required:{evidence}"));
+    }
+    if saw_probe_unavailable {
+        reasons.insert(0, "interaction_unverified:probe_unavailable".to_string());
+    }
+    reasons.push(
+        crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION.to_string(),
+    );
+    reasons
 }
 
 fn runtime_acceptance_has_buildable_nextjs_boundary(
@@ -4651,7 +4718,10 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
             if let Some(remediation) = interaction_probe_failure_remediation(&interaction.path) {
                 reasons.push(remediation);
             } else if reason == "probe_dependency_missing:browser_binaries_missing" {
-                reasons.push("run npx playwright install chromium".to_string());
+                reasons.push(
+                    crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+                        .to_string(),
+                );
             }
             return ReleaseGateSummary {
                 status: "failed".to_string(),
@@ -4689,7 +4759,8 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
                 status: "partial".to_string(),
                 reasons: vec![
                     "interaction_unverified:probe_unavailable".to_string(),
-                    "install playwright to enable interaction release checks".to_string(),
+                    crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+                        .to_string(),
                 ],
                 browser_readiness_status: browser_status,
                 browser_readiness_evidence_path: browser.path,
@@ -6310,6 +6381,7 @@ fn runtime_acceptance_status(
 ) -> &'static str {
     match report {
         Some(report) if report.inconclusive => "inconclusive",
+        Some(report) if !report.unverified_evidence.is_empty() => "partial",
         Some(_) if runtime_ok => "pass",
         Some(_) => "failed",
         None => "not_checked",
@@ -6509,6 +6581,12 @@ fn release_recovery_failure_evidence(
         );
         evidence.extend(
             report
+                .unverified_evidence
+                .iter()
+                .map(|item| format!("unverified runtime evidence: {item}")),
+        );
+        evidence.extend(
+            report
                 .missing_obligations
                 .iter()
                 .map(|item| format!("missing runtime obligation: {item}")),
@@ -6595,7 +6673,10 @@ fn release_recovery_verify_commands(
             .iter()
             .any(|reason| reason.contains("interaction_unverified:probe_unavailable"))
         {
-            commands.push("install playwright to enable interaction release checks".to_string());
+            commands.push(
+                crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+                    .to_string(),
+            );
         } else if release_gate_has_interaction_probe_infrastructure_failure(release_gate) {
             commands.push(
                 "fix the interaction probe infrastructure before rerunning release checks"
@@ -6606,7 +6687,10 @@ fn release_recovery_verify_commands(
                 .iter()
                 .any(|reason| reason.contains("probe_dependency_missing:browser_binaries_missing"))
             {
-                commands.push("run npx playwright install chromium".to_string());
+                commands.push(
+                    crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+                        .to_string(),
+                );
             }
         } else {
             commands
@@ -8615,6 +8699,7 @@ fn final_acceptance_model_fixable_profile_failures(report: &VerificationReport) 
                 && !lower.contains("interaction evidence status:")
                 && !lower.contains("interaction evidence path:")
                 && !lower.contains("interaction_unverified:probe_unavailable")
+                && !lower.contains("unverified:")
                 && !lower.contains("probe_dependency_missing")
                 && !lower.contains("probe_infrastructure_failed")
                 && !lower.contains("app interaction untested")
@@ -9916,20 +10001,25 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
             ],
         };
 
-        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
-            .unwrap_err()
-            .to_string();
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
 
-        assert!(
-            err.contains("ultra final acceptance repair failed"),
-            "{err}"
-        );
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
         let event_text = std::fs::read_to_string(&events).unwrap();
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
         assert!(event_text.contains("\"event\":\"ultra_phase_complete\""));
         assert!(event_text.contains("\"phase_id\":\"final\""));
         assert!(event_text.contains("\"event\":\"ultra_final_acceptance\""));
-        assert!(event_text.contains("\"runtime_acceptance_status\":\"failed\""));
+        assert!(event_text.contains("\"runtime_acceptance_status\":\"partial\""));
+        assert!(event_text.contains("\"final_acceptance_status\":\"partial\""));
+        assert!(event_text.contains("\"release_gate_status\":\"partial\""));
         assert!(event_text.contains("\"restart_or_recoverable_state_evidence\""));
+        assert!(
+            final_acceptance
+                .get("unverified_evidence")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| item.as_str()
+                    == Some("restart_or_recoverable_state_evidence:unverified:probe_unavailable")))
+        );
         assert!(
             event_text.contains("\"browser_readiness_status\":\"passed\""),
             "{event_text}"
@@ -9944,6 +10034,7 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
         );
         assert!(event_text.contains("\"event\":\"dev_server_lifecycle\""));
         assert!(event_text.contains("\"stage\":\"probe\""));
+        assert!(!event_text.contains("\"event\":\"final_acceptance_repair_start\""));
         assert!(
             events
                 .parent()
@@ -9951,21 +10042,129 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
                 .join("browser-readiness.json")
                 .is_file()
         );
-        let repair_prompt = execution
-            .messages
-            .iter()
-            .map(|messages| {
-                messages
+        assert!(!execution.messages.iter().flatten().any(|message| {
+            message
+                .content
+                .contains("Repair the final acceptance failure")
+        }));
+    }
+
+    #[test]
+    fn ultra_probe_unavailable_weak_restart_is_partial_without_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let phase_plan = generated_nextjs_artifact_plan_json("Create and verify the game app");
+        let mut planner_replies = Vec::new();
+        for _ in 0..8 {
+            planner_replies.push(AssistantReply::text(phase_plan.clone()));
+        }
+        let mut planner = FakeClient::new(planner_replies);
+        let mut tool_calls = nextjs_interactive_app_tool_calls(
+            cross_file_weak_restart_interactive_game_page_source(),
+        );
+        tool_calls.push(crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({
+                "path":"src/app/gameEngine.ts",
+                "content":cross_file_weak_restart_game_engine_source()
+            }),
+        ));
+        tool_calls.push(crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({
+                "path":"browser-readiness.json",
+                "content":"{\"ok\":true,\"http_status\":200,\"route_rendered\":true}"
+            }),
+        ));
+        let final_phase_reply = AssistantReply {
+            content: String::new(),
+            tool_calls: vec![
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({
+                        "path":"src/app/page.tsx",
+                        "content":cross_file_weak_restart_interactive_game_page_source()
+                    }),
+                ),
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({
+                        "path":"browser-readiness.json",
+                        "content":"{\"ok\":true,\"http_status\":200,\"route_rendered\":true}"
+                    }),
+                ),
+            ],
+            prompt_tokens: None,
+            completion_tokens: None,
+        };
+        let mut execution_replies = vec![AssistantReply {
+            content: String::new(),
+            tool_calls,
+            prompt_tokens: None,
+            completion_tokens: None,
+        }];
+        for _ in 0..8 {
+            execution_replies.push(final_phase_reply.clone());
+        }
+        let mut execution = FakeClient::new(execution_replies);
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "build".to_string(),
+                    prompt: "Create the interactive game app".to_string(),
+                },
+                UltraPhase {
+                    id: "final".to_string(),
+                    prompt: "Verify the final interactive game app".to_string(),
+                },
+            ],
+        };
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert!(event_text.contains("\"event\":\"ultra_final_acceptance\""));
+        assert!(event_text.contains("\"runtime_acceptance_status\":\"partial\""));
+        assert!(event_text.contains("\"final_acceptance_status\":\"partial\""));
+        assert!(event_text.contains("\"release_gate_status\":\"partial\""));
+        assert!(
+            final_acceptance
+                .get("unverified_evidence")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.iter().any(|item| item.as_str()
+                    == Some("restart_or_recoverable_state_evidence:unverified:probe_unavailable")))
+        );
+        assert_eq!(
+            final_acceptance
+                .get("evidence_tiers")
+                .and_then(|tiers| tiers.get("restart_or_recoverable_state_evidence"))
+                .and_then(Value::as_str),
+            Some("unverified:probe_unavailable")
+        );
+        assert!(
+            !final_acceptance
+                .get("missing_evidence")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items
                     .iter()
-                    .map(|message| message.content.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .find(|prompt| prompt.contains("Repair the final acceptance failure"))
-            .expect("final acceptance repair prompt");
-        assert!(repair_prompt.contains("browser readiness status: passed"));
-        assert!(!repair_prompt.contains("interaction evidence status"));
-        assert!(repair_prompt.contains("resets score AND entities"));
+                    .any(|item| item.as_str() == Some("restart_or_recoverable_state_evidence")))
+        );
+        assert!(event_text.contains("interaction_unverified:probe_unavailable"));
+        assert!(!event_text.contains("\"event\":\"final_acceptance_repair_start\""));
+        assert!(!execution.messages.iter().flatten().any(|message| {
+            message
+                .content
+                .contains("Repair the final acceptance failure")
+        }));
     }
 
     #[test]
@@ -12483,7 +12682,7 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
                 "stage": "resolving",
                 "steps": [],
                 "failure_kind": "probe_dependency_missing:playwright_module_missing",
-                "remediation": "install playwright or set ANVIL_PLAYWRIGHT_DIR to a directory containing the module"
+                "remediation": crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
             }))
             .unwrap(),
         )
@@ -12507,7 +12706,7 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
         assert!(
             gate.reasons
                 .iter()
-                .any(|reason| reason.contains("anvil_playwright_dir")),
+                .any(|reason| reason.contains("/setup-interaction-probe")),
             "{gate:?}"
         );
         assert_eq!(
@@ -14082,6 +14281,66 @@ export default function Page(){
     };
   }, [bullets, enemies]);
   return <main><button onClick={fireBullet}>Start</button><button onClick={restart}>Restart</button><canvas /><p>score {score} enemy collision {gameOver ? "game over" : "playing"}</p></main>;
+}
+"#
+    }
+
+    fn cross_file_weak_restart_interactive_game_page_source() -> &'static str {
+        r#""use client";
+import { useEffect, useRef, useState } from "react";
+import { GameEngine } from "./gameEngine";
+export default function Page(){
+  const engineRef = useRef(new GameEngine());
+  const [score, setScore] = useState(0);
+  const [gameOver, setGameOver] = useState(false);
+  const [screen, setScreen] = useState("gameOver");
+  const [bullets, setBullets] = useState<{ x: number; y: number }[]>([]);
+  const [enemies, setEnemies] = useState([{ x: 10, y: 20 }]);
+  const fireBullet = () => {
+    setBullets((items) => [...items, { x: 10, y: 90 }]);
+    setScore((value) => value + 10);
+  };
+  const startGame = () => {
+    engineRef.current?.reset();
+    setScreen("playing");
+    setGameOver(false);
+  };
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") {
+        fireBullet();
+      }
+    };
+    const frame = requestAnimationFrame(() => {
+      bullets.forEach((bullet) => {
+        enemies.forEach((enemy) => {
+          if (Math.abs(bullet.x - enemy.x) < 12 && Math.abs(bullet.y - enemy.y) < 12) {
+            setGameOver(true);
+            setScore((value) => value + 25);
+          }
+        });
+      });
+      setEnemies((items) => items.map((enemy) => ({ ...enemy, x: enemy.x + 1 })));
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [bullets, enemies]);
+  return <main><button onClick={startGame}>Restart</button><button onClick={fireBullet}>Fire</button><canvas /><p>score {score} enemy collision {gameOver ? "game over" : screen}</p></main>;
+}
+"#
+    }
+
+    fn cross_file_weak_restart_game_engine_source() -> &'static str {
+        r#"export class GameEngine {
+  score = 10;
+  actors = [{ x: 1, y: 2 }];
+  reset() {
+    this.score = 0;
+    this.actors = [{ x: 1, y: 2 }];
+  }
 }
 "#
     }

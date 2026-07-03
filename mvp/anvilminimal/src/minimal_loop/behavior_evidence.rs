@@ -20,6 +20,15 @@ const SURFACE_AND_START_KEYS: &[&str] = &[
 
 const INPUT_STATE_KEYS: &[&str] = &["user_input_handler_evidence", "stateful_update_evidence"];
 
+const PROBE_REQUIRED_BEHAVIOR_KEYS: &[&str] = &[
+    "interactive_ui_source_evidence",
+    "visible_interactive_surface_evidence",
+    "non_static_screen_evidence",
+    "user_input_handler_evidence",
+    "stateful_update_evidence",
+    "restart_or_recoverable_state_evidence",
+];
+
 const WEAK_BEHAVIOR_CORROBORATED_KEYS: &[&str] = &[
     "score_or_progression_evidence",
     "challenge_or_adversary_evidence",
@@ -81,40 +90,81 @@ pub fn arbitrate_final_acceptance(
 
     let Some(observation) = observation else {
         for (key, static_tier) in static_tiers {
+            let unverified = mark_unverified_if_probe_required_weak(
+                report,
+                &key,
+                &static_tier,
+                "probe_unavailable",
+            );
+            let final_tier = if unverified {
+                "unverified:probe_unavailable".to_string()
+            } else {
+                static_tier.clone()
+            };
             records.insert(
                 key,
                 EvidenceArbitrationRecord {
-                    final_tier: static_tier.clone(),
+                    final_tier,
                     static_tier,
-                    behavioral_observation: "probe_unavailable".to_string(),
-                    decided_by: "static".to_string(),
+                    behavioral_observation: "unverified:probe_unavailable".to_string(),
+                    decided_by: if unverified {
+                        "probe_required"
+                    } else {
+                        "static"
+                    }
+                    .to_string(),
                 },
             );
         }
+        refresh_runtime_acceptance_report(
+            report,
+            required_capabilities,
+            required_evidence,
+            required_obligations,
+        );
         return EvidenceArbitrationReport {
-            summary: "static (probe unavailable)".to_string(),
+            summary: "partial (probe unavailable)".to_string(),
             records,
         };
     };
 
     if observation.infrastructure_failure() {
+        let probe_reason = observation.failure_kind.as_str();
         for (key, static_tier) in static_tiers {
+            let unverified =
+                mark_unverified_if_probe_required_weak(report, &key, &static_tier, probe_reason);
+            let final_tier = if unverified {
+                format!("unverified:{probe_reason}")
+            } else {
+                static_tier.clone()
+            };
             records.insert(
                 key,
                 EvidenceArbitrationRecord {
-                    final_tier: static_tier.clone(),
+                    final_tier,
                     static_tier,
                     behavioral_observation: format!(
                         "probe_infrastructure_failure:{}",
                         observation.failure_kind
                     ),
-                    decided_by: "static".to_string(),
+                    decided_by: if unverified {
+                        "probe_required"
+                    } else {
+                        "static"
+                    }
+                    .to_string(),
                 },
             );
         }
+        refresh_runtime_acceptance_report(
+            report,
+            required_capabilities,
+            required_evidence,
+            required_obligations,
+        );
         return EvidenceArbitrationReport {
             summary: format!(
-                "static (probe infrastructure failure: {})",
+                "partial (probe infrastructure failure: {})",
                 observation.failure_kind
             ),
             records,
@@ -269,6 +319,35 @@ fn fail_evidence(report: &mut RuntimeAcceptanceReport, key: &str) {
     report
         .evidence_tiers
         .insert(key.to_string(), "absent".to_string());
+}
+
+fn mark_unverified_if_probe_required_weak(
+    report: &mut RuntimeAcceptanceReport,
+    key: &str,
+    static_tier: &str,
+    probe_reason: &str,
+) -> bool {
+    if static_tier != "weak" || !PROBE_REQUIRED_BEHAVIOR_KEYS.contains(&key) {
+        return false;
+    }
+    report.missing_evidence.retain(|evidence| evidence != key);
+    report.weak_evidence.retain(|evidence| {
+        !evidence
+            .strip_prefix("weak_source_evidence:")
+            .is_some_and(|rest| rest.starts_with(key) && rest[key.len()..].starts_with(':'))
+    });
+    let classified = format!("{key}:unverified:{probe_reason}");
+    if !report
+        .unverified_evidence
+        .iter()
+        .any(|evidence| evidence == &classified)
+    {
+        report.unverified_evidence.push(classified);
+    }
+    report
+        .evidence_tiers
+        .insert(key.to_string(), format!("unverified:{probe_reason}"));
+    true
 }
 
 fn read_behavior_observation(root: &Path, extra_dirs: &[PathBuf]) -> Option<BehaviorObservation> {
@@ -540,6 +619,39 @@ export default function Page() {
 "#
     }
 
+    fn write_cross_file_weak_restart_fixture(root: &Path) {
+        write_page(
+            root,
+            r#""use client";
+import { useRef, useState } from "react";
+import { GameEngine } from "./gameEngine";
+export default function Page() {
+  const engineRef = useRef(new GameEngine());
+  const [screen, setScreen] = useState("gameOver");
+  const startGame = () => {
+    engineRef.current?.reset();
+    setScreen("playing");
+  };
+  return <main><button onClick={startGame}>Restart</button><canvas />score enemy collision {screen}</main>;
+}
+"#,
+        );
+        let engine = root.join("src/app/gameEngine.ts");
+        std::fs::write(
+            engine,
+            r#"export class GameEngine {
+  score = 10;
+  actors = [{ x: 1, y: 2 }];
+  reset() {
+    this.score = 0;
+    this.actors = [{ x: 1, y: 2 }];
+  }
+}
+"#,
+        )
+        .unwrap();
+    }
+
     fn write_interaction(root: &Path, value: Value) -> PathBuf {
         let run_dir = root.join(".anvil/runs/test");
         std::fs::create_dir_all(&run_dir).unwrap();
@@ -685,12 +797,19 @@ export default function Page() {
     }
 
     #[test]
-    fn probe_unavailable_keeps_static_outcome() {
+    fn probe_unavailable_marks_weak_behavior_key_unverified() {
         let dir = tempfile::tempdir().unwrap();
-        write_page(dir.path(), weak_restart_and_collision_page());
+        write_cross_file_weak_restart_fixture(dir.path());
         let required = ["restart_or_recoverable_state_evidence"];
         let mut report = report_for(dir.path(), &required);
-        let before = report.clone();
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("weak"),
+            "{report:?}"
+        );
         let arbitration = arbitrate_final_acceptance(
             &mut report,
             dir.path(),
@@ -702,8 +821,154 @@ export default function Page() {
                 .collect::<Vec<_>>(),
             &[],
         );
-        assert_eq!(report, before);
-        assert_eq!(arbitration.summary, "static (probe unavailable)");
+        assert!(report.passed, "{report:?}");
+        assert!(
+            !report
+                .missing_evidence
+                .contains(&"restart_or_recoverable_state_evidence".to_string())
+        );
+        assert!(report.unverified_evidence.contains(
+            &"restart_or_recoverable_state_evidence:unverified:probe_unavailable".to_string()
+        ));
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("unverified:probe_unavailable")
+        );
+        assert_eq!(arbitration.summary, "partial (probe unavailable)");
+        assert_eq!(
+            arbitration
+                .records
+                .get("restart_or_recoverable_state_evidence")
+                .map(|record| record.decided_by.as_str()),
+            Some("probe_required")
+        );
+    }
+
+    #[test]
+    fn probe_unavailable_static_absent_restart_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#""use client";
+export default function Page() {
+  return <main><button>Begin</button><canvas />score enemy collision</main>;
+}
+"#,
+        );
+        let required = ["restart_or_recoverable_state_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("absent"),
+            "{report:?}"
+        );
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"restart_or_recoverable_state_evidence".to_string())
+        );
+        assert!(report.unverified_evidence.is_empty());
+        assert_eq!(arbitration.summary, "partial (probe unavailable)");
+    }
+
+    #[test]
+    fn probe_available_decides_cross_file_weak_restart_behaviorally() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cross_file_weak_restart_fixture(dir.path());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "steps": ["surface_visible", "start_transition", "recovery_transition"],
+                "before_marker": "gameOver",
+                "after_marker": "playing",
+                "recovery_transition": true
+            }),
+        );
+        let required = ["restart_or_recoverable_state_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        assert!(!report.passed, "{report:?}");
+        arbitrate(dir.path(), &mut report, &required);
+        assert!(report.passed, "{report:?}");
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("weak_behavior_corroborated")
+        );
+        assert!(report.unverified_evidence.is_empty());
+    }
+
+    #[test]
+    fn infrastructure_failure_marks_weak_behavior_key_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cross_file_weak_restart_fixture(dir.path());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": false,
+                "status": "failed",
+                "interaction_success": false,
+                "stage": "resolving",
+                "steps": [],
+                "failure_kind": "probe_dependency_missing:playwright_module_missing",
+                "remediation": crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+            }),
+        );
+        let required = ["restart_or_recoverable_state_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(report.unverified_evidence.contains(
+            &"restart_or_recoverable_state_evidence:unverified:probe_dependency_missing:playwright_module_missing"
+                .to_string()
+        ));
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("unverified:probe_dependency_missing:playwright_module_missing")
+        );
+        assert_eq!(
+            arbitration.summary,
+            "partial (probe infrastructure failure: probe_dependency_missing:playwright_module_missing)"
+        );
     }
 
     #[test]
@@ -719,7 +984,7 @@ export default function Page() {
                 "stage": "resolving",
                 "steps": [],
                 "failure_kind": "probe_dependency_missing:playwright_module_missing",
-                "remediation": "install playwright or set ANVIL_PLAYWRIGHT_DIR"
+                "remediation": crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
             }),
         );
         let required = [
@@ -744,7 +1009,7 @@ export default function Page() {
         assert_eq!(report, before);
         assert_eq!(
             arbitration.summary,
-            "static (probe infrastructure failure: probe_dependency_missing:playwright_module_missing)"
+            "partial (probe infrastructure failure: probe_dependency_missing:playwright_module_missing)"
         );
         assert_eq!(
             arbitration

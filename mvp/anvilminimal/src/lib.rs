@@ -96,6 +96,14 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{report}");
             Ok(())
         }
+        Action::SetupInteractionProbe => {
+            let report =
+                minimal_loop::interaction_probe::setup_interaction_probe_with_stdout_progress()?;
+            for line in report.summary_lines() {
+                println!("{line}");
+            }
+            Ok(())
+        }
     };
     emit_run_stop(&config, &result);
     result

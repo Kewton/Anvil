@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -11,8 +12,11 @@ use crate::minimal_loop::verifier_env;
 
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(20);
+const PROVISION_TIMEOUT: Duration = Duration::from_secs(180);
 const PROBE_SCRIPT_NAME: &str = "browser-interaction-probe.cjs";
-const PLAYWRIGHT_BROWSER_BINARIES_REMEDIATION: &str = "run npx playwright install chromium";
+const MANAGED_INTERACTION_PROBE_REL: &[&str] = &[".anvil", "tools", "interaction-probe"];
+pub const INTERACTION_PROBE_SETUP_REMEDIATION: &str = "run /setup-interaction-probe (or anvilminimal --setup-interaction-probe) to enable interaction release checks";
+const PLAYWRIGHT_BROWSER_BINARIES_REMEDIATION: &str = INTERACTION_PROBE_SETUP_REMEDIATION;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeAvailability {
@@ -41,6 +45,38 @@ pub struct PlaywrightResolution {
     pub module_path: String,
     pub module_dir: String,
     pub node_path: Option<String>,
+    pub location: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractionProbeSetupReport {
+    pub tool_dir: PathBuf,
+    pub resolution: PlaywrightResolution,
+    pub installed: bool,
+    pub log_paths: Vec<PathBuf>,
+}
+
+impl InteractionProbeSetupReport {
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.installed {
+            lines.push(format!(
+                "interaction probe setup: installed managed Playwright in {}",
+                self.tool_dir.display()
+            ));
+        } else {
+            lines.push(format!(
+                "interaction probe setup: managed Playwright already available in {}",
+                self.tool_dir.display()
+            ));
+        }
+        lines.push(format!(
+            "probe ready: playwright {} ({})",
+            self.resolution.version, self.resolution.location
+        ));
+        lines
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -63,6 +99,7 @@ pub struct BrowserInteractionObservation {
     pub output_excerpt: String,
     pub child_spawned: bool,
     pub child_reaped: bool,
+    pub playwright_resolution: Option<PlaywrightResolution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,34 +133,168 @@ pub fn playwright_availability(root: &Path) -> ProbeAvailability {
 
 #[cfg(not(test))]
 fn playwright_availability_from_command(root: &Path) -> ProbeAvailability {
-    playwright_availability_from_programs(
+    playwright_availability_from_programs_with_home(
         root,
         OsStr::new("node"),
         OsStr::new("npm"),
         std::env::var_os("ANVIL_PLAYWRIGHT_DIR").map(PathBuf::from),
+        Some(&home_dir()),
     )
 }
 
+#[cfg(test)]
 fn playwright_availability_from_programs(
     root: &Path,
     node_program: &OsStr,
     npm_program: &OsStr,
     configured_tool_dir: Option<PathBuf>,
 ) -> ProbeAvailability {
-    if let Some(resolution) = resolve_playwright_module(root, node_program, None) {
+    playwright_availability_from_programs_with_home(
+        root,
+        node_program,
+        npm_program,
+        configured_tool_dir,
+        Some(&home_dir()),
+    )
+}
+
+fn playwright_availability_from_programs_with_home(
+    root: &Path,
+    node_program: &OsStr,
+    npm_program: &OsStr,
+    configured_tool_dir: Option<PathBuf>,
+    home: Option<&Path>,
+) -> ProbeAvailability {
+    if let Some(resolution) = resolve_playwright_module(root, node_program, None, "workspace_root")
+    {
+        return ProbeAvailability::Available(resolution);
+    }
+    if let Some(home) = home
+        && let Some(resolution) = resolve_playwright_module(
+            root,
+            node_program,
+            Some(&managed_interaction_probe_node_modules_dir(home)),
+            "managed_interaction_probe",
+        )
+    {
         return ProbeAvailability::Available(resolution);
     }
     if let Some(global_root) = npm_global_root(root, npm_program)
-        && let Some(resolution) = resolve_playwright_module(root, node_program, Some(&global_root))
+        && let Some(resolution) =
+            resolve_playwright_module(root, node_program, Some(&global_root), "npm_global")
     {
         return ProbeAvailability::Available(resolution);
     }
     if let Some(tool_dir) = configured_tool_dir
-        && let Some(resolution) = resolve_playwright_module(root, node_program, Some(&tool_dir))
+        && let Some(resolution) =
+            resolve_playwright_module(root, node_program, Some(&tool_dir), "ANVIL_PLAYWRIGHT_DIR")
     {
         return ProbeAvailability::Available(resolution);
     }
     ProbeAvailability::Unavailable("playwright_not_installed".to_string())
+}
+
+pub fn setup_interaction_probe() -> anyhow::Result<InteractionProbeSetupReport> {
+    setup_interaction_probe_with_progress(|_| {})
+}
+
+pub fn setup_interaction_probe_with_stdout_progress() -> anyhow::Result<InteractionProbeSetupReport>
+{
+    setup_interaction_probe_with_progress(|line| println!("{line}"))
+}
+
+fn setup_interaction_probe_with_progress(
+    progress: impl FnMut(&str),
+) -> anyhow::Result<InteractionProbeSetupReport> {
+    setup_interaction_probe_with_programs(
+        Path::new("."),
+        OsStr::new("node"),
+        OsStr::new("npm"),
+        OsStr::new("npx"),
+        &home_dir(),
+        PROVISION_TIMEOUT,
+        progress,
+    )
+}
+
+fn setup_interaction_probe_with_programs(
+    root: &Path,
+    node_program: &OsStr,
+    npm_program: &OsStr,
+    npx_program: &OsStr,
+    home: &Path,
+    timeout: Duration,
+    mut progress: impl FnMut(&str),
+) -> anyhow::Result<InteractionProbeSetupReport> {
+    let tool_dir = managed_interaction_probe_tool_dir(home);
+    std::fs::create_dir_all(&tool_dir)
+        .with_context(|| format!("failed to create {}", tool_dir.display()))?;
+    progress(&format!(
+        "interaction probe setup: using {}",
+        tool_dir.display()
+    ));
+
+    if let Some(resolution) =
+        resolve_managed_playwright_module(&tool_dir, node_program, "managed_interaction_probe")
+    {
+        progress(&format!(
+            "interaction probe setup: existing playwright {} resolved from {}",
+            resolution.version, resolution.location
+        ));
+        return Ok(InteractionProbeSetupReport {
+            tool_dir,
+            resolution,
+            installed: false,
+            log_paths: Vec::new(),
+        });
+    }
+
+    ensure_managed_package_json(&tool_dir)?;
+    let log_dir = tool_dir.join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create {}", log_dir.display()))?;
+
+    let npm_log = log_dir.join("npm-install-playwright.log");
+    progress("interaction probe setup: npm install playwright");
+    run_setup_command(
+        root,
+        &tool_dir,
+        npm_program,
+        &["install", "playwright"],
+        &npm_log,
+        timeout,
+    )?;
+
+    let npx_log = log_dir.join("npx-playwright-install-chromium.log");
+    progress("interaction probe setup: npx playwright install chromium");
+    run_setup_command(
+        root,
+        &tool_dir,
+        npx_program,
+        &["playwright", "install", "chromium"],
+        &npx_log,
+        timeout,
+    )?;
+
+    let resolution =
+        resolve_managed_playwright_module(&tool_dir, node_program, "managed_interaction_probe")
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "managed interaction probe setup completed but playwright could not be resolved from {}",
+                    managed_interaction_probe_node_modules_dir(home).display()
+                )
+            })?;
+    Ok(InteractionProbeSetupReport {
+        tool_dir,
+        resolution,
+        installed: true,
+        log_paths: vec![
+            npm_log.with_extension("out"),
+            npm_log.with_extension("err"),
+            npx_log.with_extension("out"),
+            npx_log.with_extension("err"),
+        ],
+    })
 }
 
 fn node_program_for_root(root: &Path) -> OsString {
@@ -139,25 +310,156 @@ fn resolve_playwright_module(
     root: &Path,
     node_program: &OsStr,
     node_path: Option<&Path>,
+    location: &str,
 ) -> Option<PlaywrightResolution> {
     let output = run_command_stdout(
         verifier_env::normalized_command_at_root(node_program, root)
             .arg("-e")
-            .arg("console.log(require.resolve('playwright'))")
+            .arg(
+                "const path=require.resolve('playwright');\
+const version=require('playwright/package.json').version||'unknown';\
+console.log(JSON.stringify({path,version}));",
+            )
             .current_dir(root)
             .stdin(Stdio::null())
             .envs(node_path_env(node_path)),
     )?;
-    let module_path = output.lines().find(|line| !line.trim().is_empty())?.trim();
-    let module_dir = Path::new(module_path)
+    let line = output.lines().find(|line| !line.trim().is_empty())?.trim();
+    let (module_path, version) = match serde_json::from_str::<Value>(line) {
+        Ok(value) => (
+            value.get("path")?.as_str()?.to_string(),
+            value
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string(),
+        ),
+        Err(_) => (line.to_string(), "unknown".to_string()),
+    };
+    let module_dir = Path::new(&module_path)
         .parent()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
     Some(PlaywrightResolution {
-        module_path: module_path.to_string(),
+        module_path,
         module_dir,
         node_path: node_path.map(|path| path.display().to_string()),
+        location: location.to_string(),
+        version,
     })
+}
+
+fn resolve_managed_playwright_module(
+    tool_dir: &Path,
+    node_program: &OsStr,
+    location: &str,
+) -> Option<PlaywrightResolution> {
+    resolve_playwright_module(
+        tool_dir,
+        node_program,
+        Some(&tool_dir.join("node_modules")),
+        location,
+    )
+}
+
+fn managed_interaction_probe_tool_dir(home: &Path) -> PathBuf {
+    MANAGED_INTERACTION_PROBE_REL
+        .iter()
+        .fold(home.to_path_buf(), |path, part| path.join(part))
+}
+
+fn managed_interaction_probe_node_modules_dir(home: &Path) -> PathBuf {
+    managed_interaction_probe_tool_dir(home).join("node_modules")
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn ensure_managed_package_json(tool_dir: &Path) -> anyhow::Result<()> {
+    let path = tool_dir.join("package.json");
+    if path.is_file() {
+        return Ok(());
+    }
+    std::fs::write(
+        &path,
+        "{\n  \"private\": true,\n  \"description\": \"Anvil managed interaction probe tools\"\n}\n",
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn run_setup_command(
+    root: &Path,
+    cwd: &Path,
+    program: &OsStr,
+    args: &[&str],
+    log_path: &Path,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let stdout_path = log_path.with_extension("out");
+    let stderr_path = log_path.with_extension("err");
+    let stdout = std::fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr = std::fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let mut command = verifier_env::normalized_command_at_root(program, root);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", program.to_string_lossy()))?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = child.wait();
+                if status.success() {
+                    return Ok(());
+                }
+                bail!(
+                    "command failed: {} {}\n{}",
+                    program.to_string_lossy(),
+                    args.join(" "),
+                    setup_command_excerpt(&stdout_path, &stderr_path)
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                terminate_child_group(&mut child);
+                let _ = child.wait();
+                return Err(err).context("failed to wait for interaction probe setup command");
+            }
+        }
+        if started.elapsed() >= timeout {
+            terminate_child_group(&mut child);
+            let _ = child.wait();
+            bail!(
+                "command timed out after {} ms: {} {}\n{}",
+                timeout.as_millis(),
+                program.to_string_lossy(),
+                args.join(" "),
+                setup_command_excerpt(&stdout_path, &stderr_path)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn setup_command_excerpt(stdout_path: &Path, stderr_path: &Path) -> String {
+    let stdout = std::fs::read_to_string(stdout_path).unwrap_or_default();
+    let stderr = std::fs::read_to_string(stderr_path).unwrap_or_default();
+    eval_events::body_snippet(format!("{stdout}\n{stderr}").trim())
 }
 
 fn npm_global_root(root: &Path, npm_program: &OsStr) -> Option<PathBuf> {
@@ -248,6 +550,7 @@ pub fn probe_browser_interaction_against_running_server(
             String::new(),
             false,
             true,
+            Some(resolution.clone()),
         );
         write_interaction_value(
             root,
@@ -275,6 +578,7 @@ pub fn probe_browser_interaction_against_running_server(
             &err.to_string(),
             false,
             true,
+            Some(resolution.clone()),
         );
         return InteractionProbeOutcome::Observation(Box::new(observation));
     }
@@ -292,6 +596,7 @@ pub fn probe_browser_interaction_against_running_server(
                 &err.to_string(),
                 false,
                 true,
+                Some(resolution.clone()),
             );
             return InteractionProbeOutcome::Observation(Box::new(observation));
         }
@@ -329,6 +634,7 @@ pub fn probe_browser_interaction_against_running_server(
                 &err.to_string(),
                 false,
                 true,
+                Some(resolution.clone()),
             );
             return InteractionProbeOutcome::Observation(Box::new(observation));
         }
@@ -357,6 +663,7 @@ pub fn probe_browser_interaction_against_running_server(
                         output_excerpt,
                         true,
                         reaped,
+                        Some(resolution.clone()),
                     );
                     mirror_interaction_observation(root, evidence_path, &observation);
                     return InteractionProbeOutcome::Observation(Box::new(observation));
@@ -371,6 +678,7 @@ pub fn probe_browser_interaction_against_running_server(
                         output_excerpt,
                         true,
                         reaped,
+                        Some(resolution.clone()),
                     );
                     mirror_interaction_observation(root, evidence_path, &observation);
                     return InteractionProbeOutcome::Observation(Box::new(observation));
@@ -385,6 +693,7 @@ pub fn probe_browser_interaction_against_running_server(
                     &output_excerpt,
                     true,
                     reaped,
+                    Some(resolution.clone()),
                 );
                 return InteractionProbeOutcome::Observation(Box::new(observation));
             }
@@ -402,6 +711,7 @@ pub fn probe_browser_interaction_against_running_server(
                     &err.to_string(),
                     true,
                     reaped,
+                    Some(resolution.clone()),
                 );
                 return InteractionProbeOutcome::Observation(Box::new(observation));
             }
@@ -420,6 +730,7 @@ pub fn probe_browser_interaction_against_running_server(
                 &output_excerpt,
                 true,
                 reaped,
+                Some(resolution.clone()),
             );
             return InteractionProbeOutcome::Observation(Box::new(observation));
         }
@@ -717,6 +1028,7 @@ fn observation_from_value(
     output_excerpt: String,
     child_spawned: bool,
     child_reaped: bool,
+    playwright_resolution: Option<PlaywrightResolution>,
 ) -> BrowserInteractionObservation {
     let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let raw_failure_kind = value
@@ -816,6 +1128,7 @@ fn observation_from_value(
         output_excerpt: eval_events::body_snippet(&output_excerpt),
         child_spawned,
         child_reaped,
+        playwright_resolution,
     }
 }
 
@@ -830,6 +1143,7 @@ fn failure_observation(
     output_excerpt: &str,
     child_spawned: bool,
     child_reaped: bool,
+    playwright_resolution: Option<PlaywrightResolution>,
 ) -> BrowserInteractionObservation {
     let url = format!("http://127.0.0.1:{port}/");
     let stage = stage_from_probe_output(output_excerpt).unwrap_or_default();
@@ -860,6 +1174,7 @@ fn failure_observation(
         output_excerpt: eval_events::body_snippet(output_excerpt),
         child_spawned,
         child_reaped,
+        playwright_resolution,
     };
     mirror_interaction_observation(root, evidence_path, &observation);
     observation
@@ -950,8 +1265,7 @@ fn interaction_failure_remediation(failure_kind: &str) -> String {
     if failure_kind == "probe_dependency_missing:browser_binaries_missing" {
         PLAYWRIGHT_BROWSER_BINARIES_REMEDIATION.to_string()
     } else if failure_kind == "probe_dependency_missing:playwright_module_missing" {
-        "install playwright or set ANVIL_PLAYWRIGHT_DIR to a directory containing the module"
-            .to_string()
+        INTERACTION_PROBE_SETUP_REMEDIATION.to_string()
     } else {
         String::new()
     }
@@ -1010,6 +1324,12 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
     }
     if !observation.output_excerpt.is_empty() {
         value["output_excerpt"] = json!(observation.output_excerpt);
+    }
+    if let Some(resolution) = &observation.playwright_resolution {
+        value["playwright_resolution"] = json!(resolution);
+        value["playwright_resolution_location"] = json!(resolution.location);
+        value["playwright_version"] = json!(resolution.version);
+        value["probe"]["playwright_resolution_location"] = json!(resolution.location);
     }
     value
 }
@@ -1086,6 +1406,16 @@ fn load_test_availability_override(root: &Path) -> Option<ProbeAvailability> {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned),
+            location: value
+                .get("location")
+                .and_then(Value::as_str)
+                .unwrap_or("test_override")
+                .to_string(),
+            version: value
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("0.0.0-test")
+                .to_string(),
         }))
     } else {
         Some(ProbeAvailability::Unavailable(
@@ -1148,6 +1478,8 @@ pub fn write_test_availability_override_with_resolution(
         value["module_path"] = json!(resolution.module_path);
         value["module_dir"] = json!(resolution.module_dir);
         value["node_path"] = json!(resolution.node_path.clone().unwrap_or_default());
+        value["location"] = json!(resolution.location);
+        value["version"] = json!(resolution.version);
     }
     write_text(
         &path,
@@ -1280,6 +1612,162 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn setup_interaction_probe_provisions_managed_dir_and_is_idempotent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let tool_dir = managed_interaction_probe_tool_dir(&home);
+        let managed_node_modules = tool_dir.join("node_modules");
+        let capture = dir.path().join("commands.log");
+
+        let fake_npm = dir.path().join("fake-npm.sh");
+        std::fs::write(
+            &fake_npm,
+            format!(
+                r#"#!/bin/sh
+echo "npm|$(pwd)|$*" >> "{capture}"
+if [ "$1" = "install" ] && [ "$2" = "playwright" ]; then
+  mkdir -p node_modules/playwright
+  printf 'module.exports = {{}};\n' > node_modules/playwright/index.js
+  printf '{{"version":"29.1.0"}}\n' > node_modules/playwright/package.json
+  exit 0
+fi
+if [ "$1" = "root" ] && [ "$2" = "-g" ]; then
+  echo "/not/used/global/node_modules"
+  exit 0
+fi
+exit 2
+"#,
+                capture = capture.display(),
+            ),
+        )
+        .unwrap();
+        let fake_npx = dir.path().join("fake-npx.sh");
+        std::fs::write(
+            &fake_npx,
+            format!(
+                r#"#!/bin/sh
+echo "npx|$(pwd)|$*" >> "{capture}"
+if [ "$1" = "playwright" ] && [ "$2" = "install" ] && [ "$3" = "chromium" ]; then
+  printf 'chromium\n' > chromium-installed
+  exit 0
+fi
+exit 2
+"#,
+                capture = capture.display(),
+            ),
+        )
+        .unwrap();
+        let fake_node = dir.path().join("fake-node.sh");
+        std::fs::write(
+            &fake_node,
+            format!(
+                r#"#!/bin/sh
+echo "node|$(pwd)|NODE_PATH=${{NODE_PATH}}|$*" >> "{capture}"
+if [ "$1" = "-e" ] && [ -f "${{NODE_PATH}}/playwright/index.js" ]; then
+  echo '{{"path":"'{managed}'/playwright/index.js","version":"29.1.0"}}'
+  exit 0
+fi
+exit 1
+"#,
+                capture = capture.display(),
+                managed = managed_node_modules.display(),
+            ),
+        )
+        .unwrap();
+        for path in [&fake_npm, &fake_npx, &fake_node] {
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let mut progress = Vec::new();
+        let report = setup_interaction_probe_with_programs(
+            &root,
+            fake_node.as_os_str(),
+            fake_npm.as_os_str(),
+            fake_npx.as_os_str(),
+            &home,
+            Duration::from_secs(2),
+            |line| progress.push(line.to_string()),
+        )
+        .unwrap();
+
+        assert!(report.installed, "{report:?}");
+        assert_eq!(report.resolution.location, "managed_interaction_probe");
+        assert_eq!(report.resolution.version, "29.1.0");
+        assert!(tool_dir.join("package.json").is_file());
+        assert!(tool_dir.join("chromium-installed").is_file());
+        let canonical_tool_dir = std::fs::canonicalize(&tool_dir).unwrap();
+        let capture_text = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            capture_text.contains(&format!(
+                "npm|{}|install playwright",
+                canonical_tool_dir.display()
+            )),
+            "{capture_text}"
+        );
+        assert!(
+            capture_text.contains(&format!(
+                "npx|{}|playwright install chromium",
+                canonical_tool_dir.display()
+            )),
+            "{capture_text}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|line| line.contains("npm install playwright")),
+            "{progress:?}"
+        );
+
+        let before_second_run = std::fs::read_to_string(&capture).unwrap();
+        let second = setup_interaction_probe_with_programs(
+            &root,
+            fake_node.as_os_str(),
+            fake_npm.as_os_str(),
+            fake_npx.as_os_str(),
+            &home,
+            Duration::from_secs(2),
+            |_| {},
+        )
+        .unwrap();
+        assert!(!second.installed, "{second:?}");
+        let after_second_run = std::fs::read_to_string(&capture).unwrap();
+        assert_eq!(
+            before_second_run.matches("npm|").count(),
+            after_second_run.matches("npm|").count(),
+            "{after_second_run}"
+        );
+        assert_eq!(
+            before_second_run.matches("npx|").count(),
+            after_second_run.matches("npx|").count(),
+            "{after_second_run}"
+        );
+
+        let availability = playwright_availability_from_programs_with_home(
+            &root,
+            fake_node.as_os_str(),
+            fake_npm.as_os_str(),
+            None,
+            Some(&home),
+        );
+        let ProbeAvailability::Available(resolution) = availability else {
+            panic!("expected managed resolver after setup");
+        };
+        assert_eq!(resolution.location, "managed_interaction_probe");
+        assert_eq!(
+            resolution.node_path.as_deref(),
+            Some(managed_node_modules.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
     fn failure_observation_preserves_latest_probe_stage_marker() {
         let dir = tempfile::tempdir().unwrap();
         let evidence_path = dir.path().join("browser-interaction.json");
@@ -1295,6 +1783,7 @@ mod tests {
             "{\"stage\":\"resolving\"}\n{\"stage\":\"navigating\"}",
             true,
             true,
+            None,
         );
 
         assert_eq!(observation.stage, "navigating");

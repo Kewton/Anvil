@@ -40,6 +40,8 @@ pub struct Cli {
     pub ultra_plan_run: bool,
     #[arg(long)]
     pub run_ultra_plan: Option<PathBuf>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub setup_interaction_probe: bool,
     #[arg(long, default_value = "generic")]
     pub profile: String,
     #[arg(long, default_value = "default")]

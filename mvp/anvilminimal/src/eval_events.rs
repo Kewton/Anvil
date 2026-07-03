@@ -200,6 +200,7 @@ pub struct CompletionSnapshot {
     pub external_contract_checked: bool,
     pub external_contract_ok: bool,
     pub release_gate_reasons: Vec<String>,
+    pub unverified_evidence: Vec<String>,
     pub browser_readiness_status: String,
     pub browser_readiness_evidence_path: String,
     pub interaction_evidence_status: String,
@@ -232,6 +233,7 @@ impl CompletionSnapshot {
             external_contract_checked: false,
             external_contract_ok: false,
             release_gate_reasons: Vec::new(),
+            unverified_evidence: Vec::new(),
             browser_readiness_status: "not_applicable".to_string(),
             browser_readiness_evidence_path: String::new(),
             interaction_evidence_status: "not_applicable".to_string(),
@@ -276,6 +278,7 @@ pub struct CompletionProjection {
     pub external_contract_checked: bool,
     pub external_contract_ok: bool,
     pub release_gate_reasons: Vec<String>,
+    pub unverified_evidence: Vec<String>,
     pub browser_readiness: String,
     pub browser_readiness_evidence_path: String,
     pub interaction_evidence: String,
@@ -370,7 +373,7 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         task_status(ok, &release_gate, &final_acceptance)
     };
     let next_action = if ok && interaction_unverified {
-        "install_playwright_to_enable_interaction_release_checks".to_string()
+        "run_setup_interaction_probe_to_enable_interaction_release_checks".to_string()
     } else {
         next_action(ok, &release_gate, &final_acceptance)
     };
@@ -388,6 +391,7 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         external_contract_checked: snapshot.external_contract_checked,
         external_contract_ok: snapshot.external_contract_ok,
         release_gate_reasons: snapshot.release_gate_reasons.clone(),
+        unverified_evidence: snapshot.unverified_evidence.clone(),
         browser_readiness: snapshot.browser_readiness_status.clone(),
         browser_readiness_evidence_path: snapshot.browser_readiness_evidence_path.clone(),
         interaction_evidence: snapshot.interaction_evidence_status.clone(),
@@ -1274,6 +1278,7 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         release_gate_reasons: event_string_array(event, "release_gate_reasons"),
+        unverified_evidence: event_string_array(event, "unverified_evidence"),
         browser_readiness_status: event
             .get("browser_readiness_status")
             .and_then(Value::as_str)
@@ -1528,13 +1533,23 @@ fn render_completion_summary(
         format!("Recovery next action: {}", projection.next_action),
         format!("Stop reason: {stop_reason}"),
     ]);
+    if !projection.unverified_evidence.is_empty() {
+        lines.push("Unverified (probe required):".to_string());
+        lines.push(render_summary_bullets(&projection.unverified_evidence));
+        lines.push(
+            crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION.to_string(),
+        );
+    }
     if interaction_unverified_probe_unavailable(
         &projection.release_gate,
         &projection.release_gate_reasons,
     ) {
         lines.push(
-            "Interaction verification: interaction_unverified:probe_unavailable; install playwright to enable interaction release checks."
-                .to_string(),
+            format!(
+                "Interaction verification: interaction_unverified:probe_unavailable; {}.",
+                crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+            )
+            .to_string(),
         );
     }
     if projection

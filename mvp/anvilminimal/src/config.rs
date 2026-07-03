@@ -34,6 +34,7 @@ pub enum Action {
     UltraPlan(String),
     UltraPlanRun(String),
     RunUltraPlan(PathBuf),
+    SetupInteractionProbe,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +119,7 @@ fn action_from_cli(cli: &Cli) -> anyhow::Result<Action> {
     count += cli.ultra_plan as usize;
     count += cli.ultra_plan_run as usize;
     count += cli.run_ultra_plan.is_some() as usize;
+    count += cli.setup_interaction_probe as usize;
     if count > 1 {
         bail!("only one action selector can be used at a time");
     }
@@ -145,6 +147,9 @@ fn action_from_cli(cli: &Cli) -> anyhow::Result<Action> {
             goal,
             "--ultra-plan-run",
         )?));
+    }
+    if cli.setup_interaction_probe {
+        return Ok(Action::SetupInteractionProbe);
     }
     Ok(Action::Repl)
 }
