@@ -2781,6 +2781,7 @@ fn restart_segment_resets_score(segment: &str) -> bool {
     ]
     .iter()
     .any(|needle| segment.contains(needle))
+        || segment_has_score_zero_assignment_reset(segment)
 }
 
 fn restart_segment_resets_entities(segment: &str) -> bool {
@@ -2800,6 +2801,7 @@ fn restart_segment_resets_entities(segment: &str) -> bool {
     .iter()
     .any(|needle| segment.contains(needle))
         || segment_has_generic_entity_fresh_reset(segment)
+        || segment_has_entity_fresh_assignment_reset(segment)
 }
 
 fn segment_has_generic_entity_fresh_reset(segment: &str) -> bool {
@@ -2834,6 +2836,122 @@ fn segment_has_generic_entity_fresh_reset(segment: &str) -> bool {
         cursor = name_end;
     }
     false
+}
+
+fn segment_has_entity_fresh_assignment_reset(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if !is_identifier_start(bytes[cursor]) {
+            cursor += 1;
+            continue;
+        }
+        let Some((name, name_end)) = read_identifier(segment, cursor) else {
+            cursor += 1;
+            continue;
+        };
+        if identifier_starts_property_access(segment, cursor) {
+            cursor = name_end;
+            continue;
+        }
+        if setter_name_has_entity_hint(name)
+            && let Some(value_start) = assignment_value_start_after_identifier(segment, name_end)
+            && assignment_value_starts_with_fresh_entity(segment, value_start)
+        {
+            return true;
+        }
+        cursor = name_end;
+    }
+    false
+}
+
+fn segment_has_score_zero_assignment_reset(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if !is_identifier_start(bytes[cursor]) {
+            cursor += 1;
+            continue;
+        }
+        let Some((name, name_end)) = read_identifier(segment, cursor) else {
+            cursor += 1;
+            continue;
+        };
+        if identifier_starts_property_access(segment, cursor) {
+            cursor = name_end;
+            continue;
+        }
+        if score_reset_name_has_progress_hint(name)
+            && let Some(value_start) = assignment_value_start_after_identifier(segment, name_end)
+            && assignment_value_starts_with_zero(segment, value_start)
+        {
+            return true;
+        }
+        cursor = name_end;
+    }
+    false
+}
+
+fn assignment_value_start_after_identifier(segment: &str, name_end: usize) -> Option<usize> {
+    let bytes = segment.as_bytes();
+    let mut cursor = skip_ascii_whitespace(segment, name_end);
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor = skip_ascii_whitespace(segment, cursor + 1);
+        let (property, property_end) = read_identifier(segment, cursor)?;
+        if property != "current" {
+            return None;
+        }
+        cursor = skip_ascii_whitespace(segment, property_end);
+    }
+    if !is_simple_assignment_operator(segment, cursor) {
+        return None;
+    }
+    Some(skip_ascii_whitespace(segment, cursor + 1))
+}
+
+fn is_simple_assignment_operator(segment: &str, cursor: usize) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.get(cursor) == Some(&b'=') && !matches!(bytes.get(cursor + 1), Some(&b'=') | Some(&b'>'))
+}
+
+fn identifier_starts_property_access(segment: &str, identifier_start: usize) -> bool {
+    if identifier_start == 0 {
+        return false;
+    }
+    segment.as_bytes()[..identifier_start]
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|previous| segment.as_bytes()[previous] == b'.')
+}
+
+fn assignment_value_starts_with_fresh_entity(segment: &str, value_start: usize) -> bool {
+    let window_end = segment.len().min(value_start + 240);
+    let Some(window) = segment.get(value_start..window_end) else {
+        return false;
+    };
+    let window = window.trim_start();
+    [
+        "[", "{", "create", "initial", "init", "spawn", "make", "build", "default",
+    ]
+    .iter()
+    .any(|needle| window.starts_with(needle))
+        || window.starts_with("new ")
+}
+
+fn assignment_value_starts_with_zero(segment: &str, value_start: usize) -> bool {
+    let bytes = segment.as_bytes();
+    if bytes.get(value_start) != Some(&b'0') {
+        return false;
+    }
+    !bytes
+        .get(value_start + 1)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.'))
+}
+
+fn score_reset_name_has_progress_hint(name: &str) -> bool {
+    ["score", "points", "level", "progress"]
+        .iter()
+        .any(|needle| name.contains(needle))
 }
 
 fn setter_name_has_entity_hint(name: &str) -> bool {
@@ -3678,6 +3796,71 @@ export default function Page() {
             source_file_restart_or_recoverable_state_signal(&file),
             SourceEvidenceSignal::Strong
         );
+    }
+
+    #[test]
+    fn restart_handler_with_ref_held_entities_satisfies_restart_evidence_regression() {
+        let file = SourceFile::new(
+            "src/app/page.tsx".to_string(),
+            r#""use client";
+import { useRef, useState } from "react";
+type GameState = "running" | "gameOver";
+type Alien = { x: number; y: number };
+function createAliens(level: number): Alien[] {
+  return [{ x: level * 20, y: 24 }];
+}
+export default function Page() {
+  const [score, setScore] = useState(0);
+  const [gameState, setGameState] = useState<GameState>("gameOver");
+  const aliensRef = useRef<Alien[]>(createAliens(1));
+  const bulletsRef = useRef<{ x: number; y: number }[]>([]);
+  const resetGame = () => {
+    setScore(0);
+    aliensRef.current = createAliens(1);
+    bulletsRef.current = [];
+    setGameState("running");
+  };
+  return (
+    <main>
+      <button onClick={resetGame}>Restart</button>
+      <p>{score} {gameState} {aliensRef.current.length} {bulletsRef.current.length}</p>
+    </main>
+  );
+}
+"#
+            .to_string(),
+        );
+        assert_eq!(
+            source_file_restart_or_recoverable_state_signal(&file),
+            SourceEvidenceSignal::Strong
+        );
+    }
+
+    #[test]
+    fn restart_reset_detection_accepts_ref_assignments_and_rejects_non_fresh_ref_rewrites() {
+        assert!(restart_segment_resets_score("{ scoreref.current = 0; }"));
+        assert!(restart_segment_resets_score("{ score.current=0; }"));
+
+        assert!(restart_segment_resets_entities(
+            "{ aliensref.current = createaliens(1); }"
+        ));
+        assert!(restart_segment_resets_entities(
+            "{ bulletsref.current = []; }"
+        ));
+        assert!(restart_segment_resets_entities(
+            "{ playerref.current = { x: 20, y: 30 }; }"
+        ));
+        assert!(restart_segment_resets_entities(
+            "{ invaders.current=spawnwave(1); }"
+        ));
+        assert!(!restart_segment_resets_entities(
+            "{ aliensref.current = aliensref.current.filter((alien) => alien.alive); }"
+        ));
+
+        assert!(restart_segment_resets_entities(
+            "{ setinvaders(createinvaders()); }"
+        ));
+        assert!(restart_segment_resets_entities("{ bullets = []; }"));
     }
 
     #[test]
