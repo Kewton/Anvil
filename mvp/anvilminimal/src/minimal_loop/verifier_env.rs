@@ -167,6 +167,18 @@ pub fn run_checked(command: &str, root: &Path, offline: bool) -> anyhow::Result<
     Ok(formatted)
 }
 
+pub(crate) fn run_structured_for_verify(
+    command: &str,
+    root: &Path,
+    offline: bool,
+) -> anyhow::Result<BashOutcome> {
+    run_structured(command, root, offline, DEFAULT_TIMEOUT)
+}
+
+pub(crate) fn format_verify_outcome(outcome: &BashOutcome) -> String {
+    format_outcome(outcome)
+}
+
 fn run_structured(
     command: &str,
     root: &Path,

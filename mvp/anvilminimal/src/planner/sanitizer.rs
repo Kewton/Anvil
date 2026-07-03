@@ -5,7 +5,9 @@ use crate::planner::lint::{
     VerifyDependencyOrderViolationKind, diagnose_step_plan_dependency_order,
 };
 use crate::planner::step_plan::{PlanStep, StepKind, StepPlan};
-use crate::planner::verify::{VerifyCommandViolationKind, diagnose_verify_command};
+use crate::planner::verify::{
+    VerifyCommandViolationKind, diagnose_verify_command, normalize_verify_command_for_oracle_repair,
+};
 use crate::tools::path_guard::validate_workspace_relative;
 
 const BROWSER_READINESS_NOTE: &str =
@@ -16,6 +18,7 @@ const SANITIZED_GOAL_MAX_CHARS: usize = 600;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SanitizerReport {
     pub goal_truncations: Vec<SanitizedGoalTruncationRecord>,
+    pub normalized_commands: Vec<SanitizedCommandNormalizationRecord>,
     pub removed_commands: Vec<SanitizedCommandRecord>,
     pub substituted_commands: Vec<SanitizedSubstitutionRecord>,
     pub moved_commands: Vec<SanitizedMoveRecord>,
@@ -35,6 +38,14 @@ pub struct SanitizedGoalTruncationRecord {
 pub struct SanitizedCommandRecord {
     pub step_id: String,
     pub command: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedCommandNormalizationRecord {
+    pub step_id: String,
+    pub original_command: String,
+    pub normalized_command: String,
     pub reason: String,
 }
 
@@ -70,6 +81,7 @@ pub struct SanitizedInstructionNote {
 impl SanitizerReport {
     pub fn is_empty(&self) -> bool {
         self.goal_truncations.is_empty()
+            && self.normalized_commands.is_empty()
             && self.removed_commands.is_empty()
             && self.substituted_commands.is_empty()
             && self.moved_commands.is_empty()
@@ -85,6 +97,7 @@ pub fn sanitize_step_plan_against_policy(
 ) -> SanitizerReport {
     let mut report = SanitizerReport::default();
     normalize_oversized_goal(plan, &mut report);
+    normalize_repairable_verify_commands(plan, &mut report);
     remove_setup_or_dev_server_verify_commands(plan, &mut report);
     let should_retype_manifest_step = !report.removed_commands.is_empty()
         || !diagnose_step_plan_dependency_order(plan, workspace_root).is_empty();
@@ -95,6 +108,28 @@ pub fn sanitize_step_plan_against_policy(
     normalize_empty_verify_steps(plan, &mut report);
     dedupe_verify_commands(plan);
     report
+}
+
+fn normalize_repairable_verify_commands(plan: &mut StepPlan, report: &mut SanitizerReport) {
+    for step in &mut plan.steps {
+        for command in &mut step.verify {
+            let Some(repair) = normalize_verify_command_for_oracle_repair(command) else {
+                continue;
+            };
+            if repair.normalized == *command {
+                continue;
+            }
+            let original = std::mem::replace(command, repair.normalized.clone());
+            report
+                .normalized_commands
+                .push(SanitizedCommandNormalizationRecord {
+                    step_id: step.id.clone(),
+                    original_command: original,
+                    normalized_command: repair.normalized,
+                    reason: repair.reason,
+                });
+        }
+    }
 }
 
 fn normalize_oversized_goal(plan: &mut StepPlan, report: &mut SanitizerReport) {
@@ -598,6 +633,82 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
 
         assert!(report.is_empty());
         assert_eq!(serde_json::to_string(&plan).unwrap(), before);
+    }
+
+    #[test]
+    fn sanitizer_normalizes_grep_dash_pattern_and_lint_passes_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Check the package dev port".to_string(),
+            steps: vec![PlanStep {
+                id: "verify-port".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify the package script uses port 3011".to_string(),
+                expected_paths: vec!["package.json".to_string()],
+                verify: vec![r#"grep -q "-p 3011" package.json"#.to_string()],
+            }],
+        };
+
+        let lint_before = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+        assert!(
+            lint_before.errors.iter().any(|err| {
+                err.category == "verify_policy"
+                    && err
+                        .message
+                        .contains("grep pattern begins with '-' but command lacks `--` or `-e`")
+            }),
+            "{lint_before:?}"
+        );
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.normalized_commands.len(), 1);
+        assert_eq!(
+            report.normalized_commands[0].original_command,
+            r#"grep -q "-p 3011" package.json"#
+        );
+        assert_eq!(
+            plan.steps[0].verify,
+            vec![r#"grep -q -- "-p 3011" package.json"#]
+        );
+        let lint_after = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+        assert!(lint_after.is_pass(), "{lint_after:?}");
+        let second = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+        assert!(second.is_empty(), "{second:?}");
+        assert_eq!(
+            plan.steps[0].verify,
+            vec![r#"grep -q -- "-p 3011" package.json"#]
+        );
+    }
+
+    #[test]
+    fn sanitizer_prefers_json_parser_for_recognizable_package_script_grep() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Check the package dev script".to_string(),
+            steps: vec![PlanStep {
+                id: "verify-dev-script".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify the package dev script".to_string(),
+                expected_paths: vec!["package.json".to_string()],
+                verify: vec![r#"grep -q "next dev -p 3011" package.json"#.to_string()],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.normalized_commands.len(), 1);
+        assert_eq!(
+            plan.steps[0].verify,
+            vec![
+                r#"node -p "String(require('./package.json').scripts.dev).includes('next dev -p 3011') ? true : process.exit(1)""#
+            ]
+        );
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
     }
 
     #[test]

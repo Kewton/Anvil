@@ -7,12 +7,14 @@ use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::verifier_env;
 use crate::planner::step_plan::{ExpectedResult, PlanStep};
 use crate::tools::path_guard::{resolve_existing, validate_workspace_relative};
+use crate::{eval_events, tools::bash::BashOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyStatus {
     Pass,
     MissingPath(String),
     CommandFailed(String),
+    VerifierCommandFalseNegative(String),
     DependencyMissing(String),
     ProfileContractFailed(String),
 }
@@ -22,6 +24,8 @@ pub struct VerificationReport {
     pub status: VerifyStatus,
     pub missing_paths: Vec<String>,
     pub command_failures: Vec<CommandFailure>,
+    pub verifier_command_false_negatives: Vec<VerifierCommandFalseNegative>,
+    pub runtime_command_normalizations: Vec<VerifyCommandRuntimeNormalization>,
     pub dependency_missing: Vec<String>,
     pub profile_failures: Vec<String>,
     pub compile_errors: Vec<CompileError>,
@@ -33,6 +37,18 @@ pub struct CommandFailure {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VerifierCommandFalseNegative {
+    pub command: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct VerifyCommandRuntimeNormalization {
+    pub original: String,
+    pub repaired: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyCommandViolationKind {
     Empty,
@@ -40,6 +56,8 @@ pub enum VerifyCommandViolationKind {
     ShellControlSyntax,
     SetupOrDevServer,
     WorkspaceEscape,
+    GrepDashPattern,
+    PackageJsonScriptGrep,
 }
 
 impl VerifyCommandViolationKind {
@@ -50,6 +68,8 @@ impl VerifyCommandViolationKind {
             Self::ShellControlSyntax => "shell_control_syntax",
             Self::SetupOrDevServer => "setup_or_dev_server",
             Self::WorkspaceEscape => "workspace_escape",
+            Self::GrepDashPattern => "grep_dash_pattern",
+            Self::PackageJsonScriptGrep => "package_json_script_grep",
         }
     }
 
@@ -60,6 +80,10 @@ impl VerifyCommandViolationKind {
             Self::ShellControlSyntax => "verify command may not use shell control syntax",
             Self::SetupOrDevServer => "verify command may not perform setup or start a dev server",
             Self::WorkspaceEscape => "verify command manifest path escapes workspace",
+            Self::GrepDashPattern => "grep pattern begins with '-' but command lacks `--` or `-e`",
+            Self::PackageJsonScriptGrep => {
+                "grep package.json script assertion should use JSON parser"
+            }
         }
     }
 }
@@ -77,6 +101,8 @@ impl VerificationReport {
             status: VerifyStatus::Pass,
             missing_paths: Vec::new(),
             command_failures: Vec::new(),
+            verifier_command_false_negatives: Vec::new(),
+            runtime_command_normalizations: Vec::new(),
             dependency_missing: Vec::new(),
             profile_failures: Vec::new(),
             compile_errors: Vec::new(),
@@ -87,6 +113,7 @@ impl VerificationReport {
         self.status == VerifyStatus::Pass
             && self.missing_paths.is_empty()
             && self.command_failures.is_empty()
+            && self.verifier_command_false_negatives.is_empty()
             && self.dependency_missing.is_empty()
             && self.profile_failures.is_empty()
             && self.compile_errors.is_empty()
@@ -127,6 +154,31 @@ impl VerificationReport {
             reason: reason.into(),
         });
         self.refresh_status();
+    }
+
+    pub fn push_verifier_command_false_negative(
+        &mut self,
+        command: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        self.verifier_command_false_negatives
+            .push(VerifierCommandFalseNegative {
+                command: command.into(),
+                reason: reason.into(),
+            });
+        self.refresh_status();
+    }
+
+    fn push_runtime_command_normalization(
+        &mut self,
+        original: impl Into<String>,
+        repaired: impl Into<String>,
+    ) {
+        self.runtime_command_normalizations
+            .push(VerifyCommandRuntimeNormalization {
+                original: original.into(),
+                repaired: repaired.into(),
+            });
     }
 
     pub fn push_dependency_missing(&mut self, reason: impl Into<String>) {
@@ -170,6 +222,11 @@ impl VerificationReport {
                     .map(|failure| failure.reason.clone())
             })
             .or_else(|| {
+                self.verifier_command_false_negatives
+                    .first()
+                    .map(|failure| failure.reason.clone())
+            })
+            .or_else(|| {
                 self.compile_errors
                     .first()
                     .map(|error| format!("implementation_compile_error: {}", error.summary()))
@@ -185,6 +242,8 @@ impl VerificationReport {
             VerifyStatus::DependencyMissing(reason.clone())
         } else if let Some(failure) = self.command_failures.first() {
             VerifyStatus::CommandFailed(failure.reason.clone())
+        } else if let Some(failure) = self.verifier_command_false_negatives.first() {
+            VerifyStatus::VerifierCommandFalseNegative(failure.reason.clone())
         } else if let Some(error) = self.compile_errors.first() {
             VerifyStatus::CommandFailed(format!(
                 "implementation_compile_error: {}",
@@ -224,12 +283,29 @@ pub fn verify_step_with_setup_observed_with_offline(
     setup_authority: NodeDependencySetupAuthority,
     offline: bool,
 ) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+    verify_step_with_setup_observed_with_offline_and_events(
+        root,
+        step,
+        setup_authority,
+        offline,
+        None,
+    )
+}
+
+pub fn verify_step_with_setup_observed_with_offline_and_events(
+    root: &Path,
+    step: &PlanStep,
+    setup_authority: NodeDependencySetupAuthority,
+    offline: bool,
+    eval_events_path: Option<&Path>,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
     verify_step_with_setup_observed_with_options(
         root,
         step,
         setup_authority,
         Path::new("npm"),
         offline,
+        eval_events_path,
     )
 }
 
@@ -312,6 +388,7 @@ fn verify_step_with_setup_observed_with_options(
     setup_authority: NodeDependencySetupAuthority,
     npm_program: &Path,
     offline: bool,
+    eval_events_path: Option<&Path>,
 ) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
     let mut report = VerificationReport::pass();
     let mut build_lifecycles = Vec::new();
@@ -321,7 +398,9 @@ fn verify_step_with_setup_observed_with_options(
         }
     }
     for command in &step.verify {
-        if let Err(err) = validate_verify_command(command) {
+        if let Err(err) = validate_verify_command(command)
+            && !verify_policy_error_allows_runtime_oracle(command)
+        {
             report.push_command_failure(command.clone(), err.to_string());
             continue;
         }
@@ -372,8 +451,17 @@ fn verify_step_with_setup_observed_with_options(
             }
             continue;
         }
-        match verifier_env::run_checked(command, root, false) {
-            Ok(output) => {
+        match run_verify_command_with_runtime_oracle(command, root, false, eval_events_path) {
+            VerifyCommandRunResult::Passed {
+                output,
+                normalization,
+            } => {
+                if let Some(normalization) = normalization {
+                    report.push_runtime_command_normalization(
+                        normalization.original,
+                        normalization.repaired,
+                    );
+                }
                 if step.expected_result_kind() == ExpectedResult::Fail {
                     report.push_command_failure(
                         command.clone(),
@@ -383,8 +471,10 @@ fn verify_step_with_setup_observed_with_options(
                     report.push_command_failure(command.clone(), "Node 0 tests rejected");
                 }
             }
-            Err(err) => {
-                let reason = err.to_string();
+            VerifyCommandRunResult::Failed {
+                command: failed_command,
+                reason,
+            } => {
                 if build_verifier::is_dependency_missing_output(&reason) {
                     if setup_authority.allows_setup() {
                         let requirement =
@@ -416,12 +506,178 @@ fn verify_step_with_setup_observed_with_options(
                         ));
                     }
                 } else if step.expected_result_kind() != ExpectedResult::Fail {
-                    report.push_command_failure(command.clone(), reason);
+                    report.push_command_failure(failed_command, reason);
+                }
+            }
+            VerifyCommandRunResult::FalseNegative {
+                command: failed_command,
+                reason,
+            } => {
+                if step.expected_result_kind() != ExpectedResult::Fail {
+                    report.push_verifier_command_false_negative(failed_command, reason);
                 }
             }
         }
     }
     (report, build_lifecycles)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeCommandNormalization {
+    original: String,
+    repaired: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VerifyCommandRunResult {
+    Passed {
+        output: String,
+        normalization: Option<RuntimeCommandNormalization>,
+    },
+    Failed {
+        command: String,
+        reason: String,
+    },
+    FalseNegative {
+        command: String,
+        reason: String,
+    },
+}
+
+fn run_verify_command_with_runtime_oracle(
+    command: &str,
+    root: &Path,
+    offline: bool,
+    eval_events_path: Option<&Path>,
+) -> VerifyCommandRunResult {
+    match verifier_env::run_structured_for_verify(command, root, offline) {
+        Ok(outcome) if outcome.is_success() => VerifyCommandRunResult::Passed {
+            output: verifier_env::format_verify_outcome(&outcome),
+            normalization: None,
+        },
+        Ok(outcome) => {
+            handle_failed_verify_command(command, root, offline, eval_events_path, outcome)
+        }
+        Err(err) => VerifyCommandRunResult::Failed {
+            command: command.to_string(),
+            reason: format!("failed to run verifier command: {err}"),
+        },
+    }
+}
+
+fn handle_failed_verify_command(
+    command: &str,
+    root: &Path,
+    offline: bool,
+    eval_events_path: Option<&Path>,
+    outcome: BashOutcome,
+) -> VerifyCommandRunResult {
+    let formatted = verifier_env::format_verify_outcome(&outcome);
+    if !is_verify_command_tool_usage_error(command, &outcome) {
+        return VerifyCommandRunResult::Failed {
+            command: command.to_string(),
+            reason: format!("command failed: {command}\n{formatted}"),
+        };
+    }
+    let Some(repair) = normalize_verify_command_for_oracle_repair(command) else {
+        return VerifyCommandRunResult::FalseNegative {
+            command: command.to_string(),
+            reason: verify_command_false_negative_reason(command, &formatted),
+        };
+    };
+    if repair.normalized == command {
+        return VerifyCommandRunResult::FalseNegative {
+            command: command.to_string(),
+            reason: verify_command_false_negative_reason(command, &formatted),
+        };
+    }
+    match verifier_env::run_structured_for_verify(&repair.normalized, root, offline) {
+        Ok(repaired_outcome) if repaired_outcome.is_success() => {
+            eval_events::emit(
+                eval_events_path,
+                serde_json::json!({
+                    "event": "verify_command_normalized_at_runtime",
+                    "classification": "verify_command_false_negative_candidate",
+                    "normalization_source": repair.kind,
+                    "original": eval_events::body_snippet(command),
+                    "repaired": eval_events::body_snippet(&repair.normalized),
+                }),
+            );
+            VerifyCommandRunResult::Passed {
+                output: verifier_env::format_verify_outcome(&repaired_outcome),
+                normalization: Some(RuntimeCommandNormalization {
+                    original: command.to_string(),
+                    repaired: repair.normalized,
+                }),
+            }
+        }
+        Ok(repaired_outcome) => {
+            let repaired_formatted = verifier_env::format_verify_outcome(&repaired_outcome);
+            if is_verify_command_tool_usage_error(&repair.normalized, &repaired_outcome) {
+                VerifyCommandRunResult::FalseNegative {
+                    command: repair.normalized,
+                    reason: verify_command_false_negative_reason(command, &repaired_formatted),
+                }
+            } else {
+                VerifyCommandRunResult::Failed {
+                    command: repair.normalized.clone(),
+                    reason: format!(
+                        "command failed: {}\n{}",
+                        repair.normalized, repaired_formatted
+                    ),
+                }
+            }
+        }
+        Err(err) => VerifyCommandRunResult::FalseNegative {
+            command: repair.normalized,
+            reason: verify_command_false_negative_reason(command, &err.to_string()),
+        },
+    }
+}
+
+fn verify_command_false_negative_reason(command: &str, tool_error: &str) -> String {
+    format!(
+        "verify_command_false_negative: the verify command is malformed; the artifact may already satisfy the requirement; command=`{}`; tool_error={}",
+        command,
+        eval_events::body_snippet(tool_error)
+    )
+}
+
+fn verify_policy_error_allows_runtime_oracle(command: &str) -> bool {
+    matches!(
+        diagnose_verify_command(command).violation,
+        Some(
+            VerifyCommandViolationKind::GrepDashPattern
+                | VerifyCommandViolationKind::PackageJsonScriptGrep
+        )
+    )
+}
+
+fn is_verify_command_tool_usage_error(command: &str, outcome: &BashOutcome) -> bool {
+    if grep_command_name(command).is_some() && outcome_exit_code(outcome) == Some(2) {
+        return true;
+    }
+    stderr_has_tool_usage_signature(&outcome.stderr)
+}
+
+fn stderr_has_tool_usage_signature(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("invalid option")
+        || lower.contains("unrecognized option")
+        || lower.contains("unknown option")
+        || lower
+            .lines()
+            .any(|line| line.trim_start().starts_with("usage:"))
+}
+
+fn outcome_exit_code(outcome: &BashOutcome) -> Option<i32> {
+    outcome
+        .status
+        .as_deref()?
+        .split_whitespace()
+        .next_back()?
+        .parse()
+        .ok()
 }
 
 fn record_build_lifecycle_result(
@@ -517,6 +773,13 @@ pub fn validate_verify_command(command: &str) -> anyhow::Result<()> {
 pub fn normalize_verify_command(command: &str) -> anyhow::Result<String> {
     let diagnosis = diagnose_verify_command(command);
     if let Some(violation) = diagnosis.violation {
+        if matches!(
+            violation,
+            VerifyCommandViolationKind::GrepDashPattern
+                | VerifyCommandViolationKind::PackageJsonScriptGrep
+        ) {
+            return Ok(diagnosis.normalized);
+        }
         anyhow::bail!(
             "{}",
             diagnosis
@@ -545,6 +808,13 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
     }
     if crate::tools::bash::blocked_reason(&normalized, false).is_some() {
         return verify_command_violation(normalized, VerifyCommandViolationKind::Blocked, None);
+    }
+    if let Some(repair) = normalize_verify_command_for_oracle_repair(&normalized) {
+        let violation = match repair.kind {
+            "package_json_script_assertion" => VerifyCommandViolationKind::PackageJsonScriptGrep,
+            _ => VerifyCommandViolationKind::GrepDashPattern,
+        };
+        return verify_command_violation(repair.normalized, violation, Some(repair.reason));
     }
     let lower = normalized.to_ascii_lowercase();
     if is_setup_or_dev_server_verify_command(&lower) {
@@ -577,7 +847,326 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyCommandOracleRepair {
+    pub normalized: String,
+    pub reason: String,
+    pub kind: &'static str,
+}
+
+pub fn normalize_verify_command_for_oracle_repair(
+    command: &str,
+) -> Option<VerifyCommandOracleRepair> {
+    let tokens = shell_words_with_spans(command)?;
+    if let Some(script_check) = package_json_script_grep_check_command(&tokens) {
+        return Some(VerifyCommandOracleRepair {
+            normalized: script_check,
+            reason: "grep package.json script assertion replaced with JSON parser check"
+                .to_string(),
+            kind: "package_json_script_assertion",
+        });
+    }
+    let grep = grep_dash_pattern(&tokens)?;
+    Some(VerifyCommandOracleRepair {
+        normalized: insert_grep_separator(command, tokens[grep.pattern_index].start),
+        reason: "grep pattern begins with '-' but command lacks `--` or `-e`".to_string(),
+        kind: "grep_dash_pattern_separator",
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellWord {
+    value: String,
+    start: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrepDashPattern {
+    pattern_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrepPattern {
+    pattern_index: usize,
+    pattern: String,
+}
+
+fn shell_words_with_spans(command: &str) -> Option<Vec<ShellWord>> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut start = None;
+    let mut single = false;
+    let mut double = false;
+    for (index, ch) in command.char_indices() {
+        if single {
+            if ch == '\'' {
+                single = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if double {
+            if ch == '"' {
+                double = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch.is_whitespace() {
+            if let Some(word_start) = start.take() {
+                out.push(ShellWord {
+                    value: std::mem::take(&mut current),
+                    start: word_start,
+                });
+            }
+            continue;
+        }
+        if start.is_none() {
+            start = Some(index);
+        }
+        match ch {
+            '\'' => single = true,
+            '"' => double = true,
+            _ => current.push(ch),
+        }
+    }
+    if single || double {
+        return None;
+    }
+    if let Some(word_start) = start {
+        out.push(ShellWord {
+            value: current,
+            start: word_start,
+        });
+    }
+    Some(out)
+}
+
+fn grep_dash_pattern(tokens: &[ShellWord]) -> Option<GrepDashPattern> {
+    let program = tokens.first()?.value.as_str();
+    grep_command_name(program)?;
+    let mut index = 1usize;
+    while index < tokens.len() {
+        let value = tokens[index].value.as_str();
+        if value == "--" || grep_arg_is_explicit_pattern_flag(value) {
+            return None;
+        }
+        if grep_arg_is_known_option(value) {
+            index += grep_option_arity(value);
+            index += 1;
+            continue;
+        }
+        if value.starts_with('-') {
+            return Some(GrepDashPattern {
+                pattern_index: index,
+            });
+        }
+        return None;
+    }
+    None
+}
+
+fn grep_pattern(tokens: &[ShellWord]) -> Option<GrepPattern> {
+    let program = tokens.first()?.value.as_str();
+    grep_command_name(program)?;
+    let mut index = 1usize;
+    while index < tokens.len() {
+        let value = tokens[index].value.as_str();
+        if value == "--" {
+            let pattern = tokens.get(index + 1)?;
+            return Some(GrepPattern {
+                pattern_index: index + 1,
+                pattern: pattern.value.clone(),
+            });
+        }
+        if value == "-e" || value == "--regexp" {
+            let pattern = tokens.get(index + 1)?;
+            return Some(GrepPattern {
+                pattern_index: index + 1,
+                pattern: pattern.value.clone(),
+            });
+        }
+        if let Some(pattern) = value.strip_prefix("-e").filter(|value| !value.is_empty()) {
+            return Some(GrepPattern {
+                pattern_index: index,
+                pattern: pattern.to_string(),
+            });
+        }
+        if let Some(pattern) = value
+            .strip_prefix("--regexp=")
+            .filter(|value| !value.is_empty())
+        {
+            return Some(GrepPattern {
+                pattern_index: index,
+                pattern: pattern.to_string(),
+            });
+        }
+        if grep_arg_is_known_option(value) {
+            index += grep_option_arity(value);
+            index += 1;
+            continue;
+        }
+        if value.starts_with('-') {
+            return None;
+        }
+        return Some(GrepPattern {
+            pattern_index: index,
+            pattern: value.to_string(),
+        });
+    }
+    None
+}
+
+fn grep_command_name(command: &str) -> Option<&'static str> {
+    match command.split_whitespace().next().unwrap_or(command) {
+        "grep" => Some("grep"),
+        "egrep" => Some("egrep"),
+        "fgrep" => Some("fgrep"),
+        _ => None,
+    }
+}
+
+fn grep_arg_is_explicit_pattern_flag(value: &str) -> bool {
+    value == "-e"
+        || value.starts_with("-e")
+        || value == "--regexp"
+        || value.starts_with("--regexp=")
+}
+
+fn grep_arg_is_known_option(value: &str) -> bool {
+    if !value.starts_with('-') || value == "-" {
+        return false;
+    }
+    if matches!(
+        value,
+        "-A" | "-B" | "-C" | "-m" | "-f" | "--file" | "--label"
+    ) {
+        return true;
+    }
+    if value.starts_with("--") {
+        return matches!(
+            value.split('=').next().unwrap_or(value),
+            "--quiet"
+                | "--silent"
+                | "--ignore-case"
+                | "--invert-match"
+                | "--fixed-strings"
+                | "--extended-regexp"
+                | "--basic-regexp"
+                | "--recursive"
+                | "--line-number"
+                | "--word-regexp"
+                | "--line-regexp"
+                | "--count"
+                | "--files-with-matches"
+                | "--files-without-match"
+                | "--with-filename"
+                | "--no-filename"
+                | "--only-matching"
+                | "--include"
+                | "--exclude"
+                | "--exclude-dir"
+                | "--max-count"
+                | "--after-context"
+                | "--before-context"
+                | "--context"
+                | "--binary-files"
+        );
+    }
+    let flags = value.trim_start_matches('-');
+    !flags.is_empty()
+        && flags.chars().all(|ch| {
+            matches!(
+                ch,
+                'q' | 's'
+                    | 'i'
+                    | 'v'
+                    | 'F'
+                    | 'E'
+                    | 'G'
+                    | 'r'
+                    | 'R'
+                    | 'n'
+                    | 'w'
+                    | 'x'
+                    | 'c'
+                    | 'l'
+                    | 'L'
+                    | 'h'
+                    | 'H'
+                    | 'o'
+                    | 'a'
+                    | 'I'
+            )
+        })
+}
+
+fn grep_option_arity(value: &str) -> usize {
+    if matches!(
+        value,
+        "-A" | "-B" | "-C" | "-m" | "-f" | "--file" | "--label"
+    ) {
+        1
+    } else {
+        0
+    }
+}
+
+fn insert_grep_separator(command: &str, pattern_start: usize) -> String {
+    let mut out = String::new();
+    out.push_str(command[..pattern_start].trim_end());
+    out.push_str(" -- ");
+    out.push_str(&command[pattern_start..]);
+    out
+}
+
+fn package_json_arg_present(tokens: &[ShellWord]) -> bool {
+    tokens
+        .iter()
+        .any(|token| matches!(token.value.as_str(), "package.json" | "./package.json"))
+}
+
+fn package_json_script_grep_check_command(tokens: &[ShellWord]) -> Option<String> {
+    let grep = grep_pattern(tokens)?;
+    if !package_json_arg_present(&tokens[(grep.pattern_index + 1)..]) {
+        return None;
+    }
+    package_json_script_check_command(&grep.pattern)
+}
+
+fn package_json_script_check_command(pattern: &str) -> Option<String> {
+    let lower = pattern.to_ascii_lowercase();
+    let script = if lower.contains("next build") || lower.contains("scripts.build") {
+        Some("build")
+    } else if lower.contains("next dev")
+        || lower.contains("scripts.dev")
+        || lower.contains("\"dev\"")
+        || lower.contains("'dev'")
+    {
+        Some("dev")
+    } else if lower.contains("next start")
+        || lower.contains("scripts.start")
+        || lower.contains("\"start\"")
+        || lower.contains("'start'")
+    {
+        Some("start")
+    } else {
+        None
+    }?;
+    if pattern.contains('\'') || pattern.contains('\\') {
+        return None;
+    }
+    Some(format!(
+        "node -p \"String(require('./package.json').scripts.{script}).includes('{pattern}') ? true : process.exit(1)\""
+    ))
+}
+
 fn is_setup_or_dev_server_verify_command(lower: &str) -> bool {
+    if lower.starts_with("node -p ") || lower.starts_with("node --print ") {
+        return false;
+    }
     lower.contains("npm install")
         || lower.contains("pnpm install")
         || lower.contains("yarn install")
@@ -878,6 +1467,31 @@ mod tests {
     fn verify_command_normalizes_safe_whitespace_only() {
         let normalized = normalize_verify_command("  cargo   test   --locked  ").unwrap();
         assert_eq!(normalized, "cargo test --locked");
+    }
+
+    #[test]
+    fn verify_command_normalizes_grep_dash_pattern() {
+        let diagnosis = diagnose_verify_command(r#"grep -q "-p 3011" package.json"#);
+
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::GrepDashPattern)
+        );
+        assert_eq!(diagnosis.normalized, r#"grep -q -- "-p 3011" package.json"#);
+    }
+
+    #[test]
+    fn verify_command_prefers_json_parser_for_package_script_grep() {
+        let diagnosis = diagnose_verify_command(r#"grep -q "next dev -p 3011" package.json"#);
+
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::PackageJsonScriptGrep)
+        );
+        assert_eq!(
+            diagnosis.normalized,
+            r#"node -p "String(require('./package.json').scripts.dev).includes('next dev -p 3011') ? true : process.exit(1)""#
+        );
     }
 
     #[test]
@@ -1216,6 +1830,7 @@ mod tests {
             NodeDependencySetupAuthority::PlanSetupStep,
             &fake_npm,
             false,
+            None,
         );
 
         assert!(report.is_pass(), "{report:?}");
@@ -1265,6 +1880,7 @@ mod tests {
             NodeDependencySetupAuthority::PlanSetupStep,
             &fake_npm,
             false,
+            None,
         );
         assert!(initial_report.is_pass(), "{initial_report:?}");
         assert!(initial_lifecycles.is_empty());
@@ -1316,6 +1932,138 @@ mod tests {
         assert_eq!(
             classify_repair_target(&report),
             RepairTarget::DependencySetup
+        );
+    }
+
+    fn package_port_verify_step() -> PlanStep {
+        PlanStep {
+            id: "verify-package-port".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Verify the package script uses port 3011".to_string(),
+            expected_paths: vec!["package.json".to_string()],
+            verify: vec![r#"grep -q "-p 3011" package.json"#.to_string()],
+        }
+    }
+
+    #[test]
+    fn runtime_oracle_repairs_grep_dash_pattern_false_negative_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"next dev -p 3011","build":"next build"}}"#,
+        )
+        .unwrap();
+
+        let report = verify_step_with_setup_observed_with_offline_and_events(
+            dir.path(),
+            &package_port_verify_step(),
+            NodeDependencySetupAuthority::None,
+            false,
+            Some(&events),
+        )
+        .0;
+
+        assert!(report.is_pass(), "{report:?}");
+        assert!(report.command_failures.is_empty(), "{report:?}");
+        assert!(
+            report.verifier_command_false_negatives.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(report.runtime_command_normalizations.len(), 1);
+        assert_eq!(
+            report.runtime_command_normalizations[0].original,
+            r#"grep -q "-p 3011" package.json"#
+        );
+        assert_eq!(
+            report.runtime_command_normalizations[0].repaired,
+            r#"grep -q -- "-p 3011" package.json"#
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"verify_command_normalized_at_runtime\""));
+        assert!(
+            event_text.contains("\"classification\":\"verify_command_false_negative_candidate\"")
+        );
+    }
+
+    #[test]
+    fn runtime_oracle_keeps_normalized_grep_no_match_as_artifact_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"next dev -p 3000","build":"next build"}}"#,
+        )
+        .unwrap();
+
+        let report = verify_step_with_setup_observed_with_offline_and_events(
+            dir.path(),
+            &package_port_verify_step(),
+            NodeDependencySetupAuthority::None,
+            false,
+            None,
+        )
+        .0;
+
+        assert!(!report.is_pass(), "{report:?}");
+        assert_eq!(report.command_failures.len(), 1);
+        assert!(
+            report.verifier_command_false_negatives.is_empty(),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.command_failures[0].command,
+            r#"grep -q -- "-p 3011" package.json"#
+        );
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::Implementation
+        );
+    }
+
+    #[test]
+    fn unrepairable_usage_error_is_verifier_command_false_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("usage_error.py"),
+            "import sys\nsys.stderr.write('usage: fake\\ninvalid option\\n')\nsys.exit(2)\n",
+        )
+        .unwrap();
+        let step = PlanStep {
+            id: "usage-error".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Run a malformed verifier command".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["python3 usage_error.py".to_string()],
+        };
+
+        let report = verify_step_with_setup_observed_with_offline_and_events(
+            dir.path(),
+            &step,
+            NodeDependencySetupAuthority::None,
+            false,
+            None,
+        )
+        .0;
+
+        assert!(!report.is_pass(), "{report:?}");
+        assert!(report.command_failures.is_empty(), "{report:?}");
+        assert_eq!(report.verifier_command_false_negatives.len(), 1);
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::VerifierCommand
+        );
+        let reachability = crate::minimal_loop::reachability::assess_repair_reachability(
+            &report,
+            None,
+            NodeDependencySetupAuthority::None,
+            false,
+        );
+        assert!(!reachability.reachable);
+        assert_eq!(
+            reachability.blocked_requirements,
+            vec!["deterministic_verify_command_bug".to_string()]
         );
     }
 

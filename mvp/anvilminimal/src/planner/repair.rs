@@ -348,6 +348,17 @@ fn render_repair_report(
                     .iter()
                     .map(|failure| format!("{}: {}", failure.command, failure.reason)),
             )
+            .chain(
+                report
+                    .verifier_command_false_negatives
+                    .iter()
+                    .map(|failure| {
+                        format!(
+                            "deterministic_verify_command_bug: {}: {}",
+                            failure.command, failure.reason
+                        )
+                    }),
+            )
             .collect(),
         missing_paths: report.missing_paths.clone(),
         missing_capabilities: Vec::new(),
@@ -362,6 +373,7 @@ Primary failure: {}\n\n\
 Repair target: {}\n\n\
 ## Missing Paths\n{}\n\n\
 ## Command Failures\n{}\n\n\
+## Verifier Command False Negatives\n{}\n\n\
 ## Dependency Missing\n{}\n\n\
 ## Profile Failures\n{}\n\n\
 ## Changed Files\n{}\n\n\
@@ -388,6 +400,16 @@ Suggested command:\n\
                 .command_failures
                 .iter()
                 .map(|failure| format!("{}: {}", failure.command, failure.reason))
+                .collect::<Vec<_>>()
+        ),
+        list_or_none(
+            &report
+                .verifier_command_false_negatives
+                .iter()
+                .map(|failure| format!(
+                    "deterministic_verify_command_bug: {}: {}",
+                    failure.command, failure.reason
+                ))
                 .collect::<Vec<_>>()
         ),
         list_or_none(&report.dependency_missing),

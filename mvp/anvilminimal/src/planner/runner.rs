@@ -65,6 +65,7 @@ use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render
 use crate::planner::verify::{
     VerificationReport, verify_setup_dependency_state_with_setup_observed_with_offline,
     verify_step_with_setup_observed_with_offline,
+    verify_step_with_setup_observed_with_offline_and_events,
 };
 use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
@@ -826,10 +827,12 @@ fn run_step_plan_with_session_with_ui(
     let report = lint_step_plan_report_with_workspace(plan, Some(&config.workspace_root));
     if !report.is_pass() {
         emit_planner_error_for_lint(config, "plan-file", &config.planner_model, &report, 0);
-        return Err(StepPlanRunError::from_error(
-            report.primary_message(),
-            outcome,
-        ));
+        if !lint_report_is_runtime_repairable_verifier_command(&report) {
+            return Err(StepPlanRunError::from_error(
+                report.primary_message(),
+                outcome,
+            ));
+        }
     }
     let required_final_artifacts = required_final_artifacts(plan, &config.workspace_root);
     let mut final_required_capabilities =
@@ -920,6 +923,19 @@ fn run_step_plan_with_session_with_ui(
     Ok(outcome)
 }
 
+fn lint_report_is_runtime_repairable_verifier_command(report: &PlanLintReport) -> bool {
+    !report.errors.is_empty()
+        && report.errors.iter().all(|error| {
+            error.category == "verify_policy"
+                && (error
+                    .message
+                    .contains("grep pattern begins with '-' but command lacks `--` or `-e`")
+                    || error.message.contains(
+                        "grep package.json script assertion replaced with JSON parser check",
+                    ))
+        })
+}
+
 #[derive(Debug, Clone, Default)]
 struct StepPromptContext {
     required_final_artifacts: Vec<String>,
@@ -942,6 +958,7 @@ fn run_step(
     contract_enforcement: ContractEnforcement,
     phase_scope: Option<&str>,
 ) -> Result<StepRunOutcome, StepRunError> {
+    let mut runtime_step = step.clone();
     let instruction = build_step_prompt(plan, step, prompt_context);
     emit_step_prompt_contract(config, step, prompt_context, &instruction);
     if step.step_kind() == StepKind::Report
@@ -998,12 +1015,15 @@ fn run_step(
             outcome,
         });
     }
-    let (mut report, mut build_lifecycles) = verify_step_with_setup_observed_with_offline(
-        &config.workspace_root,
-        step,
-        setup_authority,
-        config.offline,
-    );
+    let (mut report, mut build_lifecycles) =
+        verify_step_with_setup_observed_with_offline_and_events(
+            &config.workspace_root,
+            &runtime_step,
+            setup_authority,
+            config.offline,
+            config.eval_events_path.as_deref(),
+        );
+    apply_runtime_command_normalizations(&mut runtime_step, &report);
     if should_run_setup_step_dependency_state_lifecycle(
         &config.workspace_root,
         step,
@@ -1063,7 +1083,7 @@ fn run_step(
         required_final_artifacts: prompt_context.required_final_artifacts.clone(),
         step_instruction: Some(step.instruction.clone()),
         expected_paths: step.expected_paths.clone(),
-        verify_commands: step.verify.clone(),
+        verify_commands: runtime_step.verify.clone(),
         expected_result: Some(step_expected_result(step).to_string()),
         max_repair_turns: Some(STEP_REPAIR_MAX_TURNS),
         missing_paths: report.missing_paths.clone(),
@@ -1165,12 +1185,15 @@ fn run_step(
                     });
                 }
             }
-            let (retry, retry_lifecycles) = verify_step_with_setup_observed_with_offline(
+            let (retry, retry_lifecycles) = verify_step_with_setup_observed_with_offline_and_events(
                 &config.workspace_root,
-                step,
+                &runtime_step,
                 setup_authority,
                 config.offline,
+                config.eval_events_path.as_deref(),
             );
+            apply_runtime_command_normalizations(&mut runtime_step, &retry);
+            context.verify_commands = runtime_step.verify.clone();
             for lifecycle in &retry_lifecycles {
                 emit_dependency_build_lifecycle(
                     config.eval_events_path.as_deref(),
@@ -1344,6 +1367,17 @@ fn run_step(
                     .iter()
                     .map(|failure| format!("{}: {}", failure.command, failure.reason)),
             )
+            .chain(
+                current_report
+                    .verifier_command_false_negatives
+                    .iter()
+                    .map(|failure| {
+                        format!(
+                            "deterministic_verify_command_bug: {}: {}",
+                            failure.command, failure.reason
+                        )
+                    }),
+            )
             .collect(),
         missing_paths: current_report.missing_paths.clone(),
         missing_capabilities: vec![final_repair_target.as_str().to_string()],
@@ -1472,9 +1506,10 @@ fn run_step(
         });
     let message = eval_events::render_stop_reason(&eval_events::StopReasonParts {
         free_text: format!(
-            "step {} failed verification after bounded repair: {}; incomplete; {}",
+            "step {} failed verification after bounded repair: {}; failure_kind={}; incomplete; {}",
             step.id,
             current_report.primary_reason(),
+            final_failure_kind,
             artifact_check_summary
         ),
         paths: vec![
@@ -1563,6 +1598,12 @@ fn merge_verification_report(report: &mut VerificationReport, extra: Verificatio
     for failure in extra.command_failures {
         report.push_command_failure(failure.command, failure.reason);
     }
+    for failure in extra.verifier_command_false_negatives {
+        report.push_verifier_command_false_negative(failure.command, failure.reason);
+    }
+    for normalization in extra.runtime_command_normalizations {
+        report.runtime_command_normalizations.push(normalization);
+    }
     for error in extra.compile_errors {
         if !report.compile_errors.contains(&error) {
             report.compile_errors.push(error);
@@ -1572,6 +1613,16 @@ fn merge_verification_report(report: &mut VerificationReport, extra: Verificatio
         report.push_profile_failure(reason);
     }
     report.refresh_status();
+}
+
+fn apply_runtime_command_normalizations(step: &mut PlanStep, report: &VerificationReport) {
+    for normalization in &report.runtime_command_normalizations {
+        for command in &mut step.verify {
+            if command == &normalization.original {
+                *command = normalization.repaired.clone();
+            }
+        }
+    }
 }
 
 fn step_run_session_options(
@@ -2309,7 +2360,7 @@ fn optional_handoff_path(path: Option<&PathBuf>) -> String {
 }
 
 fn command_failure_summaries(report: &VerificationReport) -> Vec<String> {
-    report
+    let mut summaries = report
         .command_failures
         .iter()
         .map(|failure| {
@@ -2319,7 +2370,20 @@ fn command_failure_summaries(report: &VerificationReport) -> Vec<String> {
                 eval_events::body_snippet(&failure.reason)
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    summaries.extend(
+        report
+            .verifier_command_false_negatives
+            .iter()
+            .map(|failure| {
+                format!(
+                    "deterministic_verify_command_bug: {}: {}",
+                    failure.command,
+                    eval_events::body_snippet(&failure.reason)
+                )
+            }),
+    );
+    summaries
 }
 
 fn reachability_action_labels(reachability: &RepairReachability) -> Vec<&'static str> {
@@ -2339,6 +2403,9 @@ fn reachability_blocked_evidence(blocked_requirements: &[String]) -> Vec<String>
             }
             "dependency_setup_blocked_offline" => {
                 "dependency_setup_blocked_offline: dependency verification requires dependency setup lifecycle, but offline mode blocks install".to_string()
+            }
+            "deterministic_verify_command_bug" => {
+                "deterministic_verify_command_bug: the verify command is malformed; the artifact may already satisfy the requirement".to_string()
             }
             other => format!("repair_unreachable: {other}"),
         })
@@ -2389,6 +2456,18 @@ fn verification_report_signature(report: &VerificationReport) -> Vec<String> {
             normalize_report_reason_for_signature(&failure.reason)
         )
     }));
+    signature.extend(
+        report
+            .verifier_command_false_negatives
+            .iter()
+            .map(|failure| {
+                format!(
+                    "verifier_command:{}:{}",
+                    failure.command,
+                    normalize_report_reason_for_signature(&failure.reason)
+                )
+            }),
+    );
     signature.extend(
         report
             .profile_failures
@@ -4765,6 +4844,7 @@ fn external_contract_report_covered_by_runtime_arbitration(
     };
     report.missing_paths.is_empty()
         && report.command_failures.is_empty()
+        && report.verifier_command_false_negatives.is_empty()
         && report.dependency_missing.is_empty()
         && report
             .profile_failures
@@ -7355,6 +7435,9 @@ fn save_ultra_phase_recovery_handoff_with_evidence(
             prompt_command_summary: &prompt_command_summary,
             recovery_yaml_command_summary: &recovery_yaml_command_summary,
             recovery_artifact_check: &artifact_check_summary,
+            browser_evidence_missing_note: browser_evidence_missing_before_final_acceptance_note(
+                config,
+            ),
         }),
     );
     let prompt_message = if validation.prompt_command_available() {
@@ -7546,16 +7629,23 @@ struct UltraPartialRunSummary<'a> {
     prompt_command_summary: &'a str,
     recovery_yaml_command_summary: &'a str,
     recovery_artifact_check: &'a str,
+    browser_evidence_missing_note: Option<&'a str>,
 }
 
+const BROWSER_EVIDENCE_MISSING_BEFORE_FINAL_ACCEPTANCE: &str = "Browser evidence missing: run failed before final acceptance (interaction probe installed but not exercised).";
+
 fn render_ultra_partial_run_summary(summary: UltraPartialRunSummary<'_>) -> String {
+    let browser_evidence_missing = summary
+        .browser_evidence_missing_note
+        .map(|note| format!("\n\n{note}"))
+        .unwrap_or_default();
     format!(
         "Status: incomplete\n\n\
 Completed phases:\n{}\n\n\
 Failed phase:\n- {} ({})\n\n\
 Pending phases:\n{}\n\n\
 Recovery next action:\n- {}\n- Recovery prompt saved: {}\n- {}\n- {}\n- {}\n\n\
-Failure:\n{}",
+Failure:\n{}{}",
         render_summary_bullets(summary.completed_phases),
         summary.failed_phase,
         summary.failure_kind,
@@ -7566,7 +7656,20 @@ Failure:\n{}",
         summary.recovery_yaml_command_summary,
         summary.recovery_artifact_check,
         eval_events::render_stop_reason_text(summary.reason),
+        browser_evidence_missing,
     )
+}
+
+fn browser_evidence_missing_before_final_acceptance_note(config: &Config) -> Option<&'static str> {
+    if interaction_probe_performed_for_run(config) {
+        return None;
+    }
+    match interaction_probe::playwright_availability(&config.workspace_root) {
+        interaction_probe::ProbeAvailability::Available(_) => {
+            Some(BROWSER_EVIDENCE_MISSING_BEFORE_FINAL_ACCEPTANCE)
+        }
+        interaction_probe::ProbeAvailability::Unavailable(_) => None,
+    }
 }
 
 fn render_summary_bullets(items: &[String]) -> String {
@@ -7843,6 +7946,12 @@ fn emit_planner_plan_sanitized(
                 "kind": &record.kind,
                 "original_len": record.original_len,
                 "new_len": record.new_len,
+            })).collect::<Vec<_>>(),
+            "normalized_commands": report.normalized_commands.iter().map(|record| json!({
+                "step_id": &record.step_id,
+                "original_command": eval_events::body_snippet(&record.original_command),
+                "normalized_command": eval_events::body_snippet(&record.normalized_command),
+                "reason": eval_events::body_snippet(&record.reason),
             })).collect::<Vec<_>>(),
             "removed_commands": report.removed_commands.iter().map(|record| json!({
                 "step_id": &record.step_id,
@@ -9820,6 +9929,62 @@ mod tests {
     }
 
     #[test]
+    fn verifier_command_false_negative_does_not_start_implementation_repair_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(
+            dir.path().join("usage_error.py"),
+            "import sys\nsys.stderr.write('usage: fake\\ninvalid option\\n')\nsys.exit(2)\n",
+        )
+        .unwrap();
+        let plan = StepPlan {
+            goal: "Run deterministic verification".to_string(),
+            steps: vec![PlanStep {
+                id: "verify-usage-error".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Run the verifier command".to_string(),
+                expected_paths: Vec::new(),
+                verify: vec!["python3 usage_error.py".to_string()],
+            }],
+        };
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"test -f usage_error.py"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("Verification step complete."),
+        ]);
+
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(fake.messages.len(), 1, "{err}");
+        assert!(
+            fake.messages.iter().all(|messages| {
+                !messages
+                    .iter()
+                    .any(|message| message.content.contains("Repair step `verify-usage-error`"))
+            }),
+            "{:#?}",
+            fake.messages
+        );
+        assert!(err.contains("deterministic_verify_command_bug"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"reason\":\"deterministic_verify_command_bug\""));
+        assert!(event_text.contains("\"repair_target\":\"verifier_command\""));
+        assert!(!event_text.contains("\"reason\":\"bounded_repair_exhausted\""));
+    }
+
+    #[test]
     fn planner_prompt_report_is_blocker_not_success() {
         let prompt = plan_generation_system_prompt();
         assert!(prompt.contains("Report is not success"));
@@ -11635,6 +11800,57 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
     }
 
     #[test]
+    fn ultra_phase_summary_notes_missing_browser_evidence_when_probe_available_unexercised() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events);
+        cfg.profile = "nextjs".to_string();
+        let plan = UltraPlan {
+            goal: "Create an interactive browser app".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "phase-one".to_string(),
+                    prompt: "Create the app shell".to_string(),
+                },
+                UltraPhase {
+                    id: "final-acceptance".to_string(),
+                    prompt: "Run final browser acceptance".to_string(),
+                },
+            ],
+        };
+        let missing_paths: Vec<String> = Vec::new();
+        let missing_signals: Vec<String> = Vec::new();
+        let repair_targets = vec!["verifier_command".to_string()];
+
+        let _handoff = save_ultra_phase_recovery_handoff(
+            &cfg,
+            &plan,
+            &plan.phases[0],
+            UltraPhaseRecoveryRequest {
+                failure_kind: "deterministic_verify_command_bug",
+                reason: "verify command malformed",
+                missing_paths: &missing_paths,
+                missing_signals: &missing_signals,
+                repair_targets: &repair_targets,
+            },
+        )
+        .expect("handoff saved");
+
+        let summary = std::fs::read_to_string(dir.path().join("summary.md")).unwrap();
+        assert!(
+            summary.contains(
+                "Browser evidence missing: run failed before final acceptance (interaction probe installed but not exercised)."
+            ),
+            "{summary}"
+        );
+    }
+
+    #[test]
     fn ultra_phase_recovery_handoff_renders_observed_missing_evidence_keys() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -11890,6 +12106,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             prompt_command_summary: "Suggested command: unavailable",
             recovery_yaml_command_summary: &format!("Suggested YAML command: {command}"),
             recovery_artifact_check: "Recovery artifact check: prompt_parse_ok=true, yaml_parse_ok=true, command_targets_valid=true",
+            browser_evidence_missing_note: None,
         });
         let failure = summary.split("Failure:\n").nth(1).expect("failure block");
 

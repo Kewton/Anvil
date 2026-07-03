@@ -656,6 +656,17 @@ pub(crate) fn format_verify_feedback_with_contract(
             ));
         }
     }
+    for failure in &report.verifier_command_false_negatives {
+        lines.push(format!(
+            "Verifier command false negative: `{}`\n{}",
+            failure.command,
+            eval_events::body_snippet(&failure.reason)
+        ));
+        lines.push(
+            "The verify command is malformed; the artifact may already satisfy the requirement."
+                .to_string(),
+        );
+    }
     for failure in &report.profile_failures {
         lines.push(format!("Profile contract failed: {failure}"));
         if failure.contains("CSS side-effect imports require")

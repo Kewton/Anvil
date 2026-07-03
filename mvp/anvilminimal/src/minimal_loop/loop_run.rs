@@ -1784,6 +1784,7 @@ fn verify_completion_contract_with_enforcement(
             "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
             "missing_paths": report.missing_paths.clone(),
             "command_failures": report.command_failures.len(),
+            "verifier_command_false_negatives": report.verifier_command_false_negatives.clone(),
             "dependency_missing": report.dependency_missing.clone(),
             "compile_errors": report.compile_errors.clone(),
             "profile": contract.profile.as_deref().unwrap_or(""),
@@ -2192,6 +2193,17 @@ fn save_minimal_recovery_handoff(
         )
         .chain(
             report
+                .verifier_command_false_negatives
+                .iter()
+                .map(|failure| {
+                    format!(
+                        "deterministic_verify_command_bug: {}: {}",
+                        failure.command, failure.reason
+                    )
+                }),
+        )
+        .chain(
+            report
                 .compile_errors
                 .iter()
                 .map(|error| format!("implementation_compile_error: {}", error.summary())),
@@ -2551,6 +2563,9 @@ fn terminal_verify_stop_reason(
 ) -> String {
     if !report.compile_errors.is_empty() {
         return "implementation_compile_error".to_string();
+    }
+    if !report.verifier_command_false_negatives.is_empty() {
+        return "deterministic_verify_command_bug".to_string();
     }
     if !report.dependency_missing.is_empty() {
         return "dependency_setup_missing".to_string();

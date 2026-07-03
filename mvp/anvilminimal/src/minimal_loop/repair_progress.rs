@@ -5,6 +5,7 @@ pub struct VerificationSignature {
     pub missing_paths: Vec<String>,
     pub dependency_missing: Vec<String>,
     pub command_failures: Vec<String>,
+    pub verifier_command_false_negatives: Vec<String>,
     pub profile_failures: Vec<String>,
     pub compile_errors: Vec<String>,
 }
@@ -27,6 +28,18 @@ impl VerificationSignature {
             })
             .collect::<Vec<_>>();
         command_failures.sort();
+        let mut verifier_command_false_negatives = report
+            .verifier_command_false_negatives
+            .iter()
+            .map(|failure| {
+                format!(
+                    "{}:{}",
+                    failure.command,
+                    normalize_failure_reason(&failure.reason)
+                )
+            })
+            .collect::<Vec<_>>();
+        verifier_command_false_negatives.sort();
         let mut profile_failures = report.profile_failures.clone();
         profile_failures.sort();
         let mut compile_errors = report
@@ -39,6 +52,7 @@ impl VerificationSignature {
             missing_paths,
             dependency_missing,
             command_failures,
+            verifier_command_false_negatives,
             profile_failures,
             compile_errors,
         }
@@ -48,16 +62,18 @@ impl VerificationSignature {
         self.missing_paths.len()
             + self.dependency_missing.len()
             + self.command_failures.len()
+            + self.verifier_command_false_negatives.len()
             + self.profile_failures.len()
             + self.compile_errors.len()
     }
 
     pub fn label(&self) -> String {
         format!(
-            "missing={};dependency={};commands={};profile={};compile={}",
+            "missing={};dependency={};commands={};verifier_commands={};profile={};compile={}",
             self.missing_paths.join("|"),
             self.dependency_missing.join("|"),
             self.command_failures.join("|"),
+            self.verifier_command_false_negatives.join("|"),
             self.profile_failures.join("|"),
             self.compile_errors.join("|")
         )

@@ -10,6 +10,7 @@ pub enum RepairTarget {
     EmptyApp,
     CapabilityMissing,
     RequiredEvidenceMissing,
+    VerifierCommand,
     Implementation,
     TestOrEvidence,
     Unknown,
@@ -62,6 +63,7 @@ impl RepairTarget {
             Self::EmptyApp => "empty_app",
             Self::CapabilityMissing => "capability_missing",
             Self::RequiredEvidenceMissing => "required_evidence_missing",
+            Self::VerifierCommand => "verifier_command",
             Self::Implementation => "implementation",
             Self::TestOrEvidence => "test_or_evidence",
             Self::Unknown => "unknown",
@@ -91,6 +93,9 @@ impl RepairTarget {
             Self::RequiredEvidenceMissing => {
                 "Add deterministic source, test, or verification evidence for the requested behavior."
             }
+            Self::VerifierCommand => {
+                "The verify command is malformed; the artifact may already satisfy the requirement."
+            }
             Self::Implementation => {
                 "Fix the implementation files that should satisfy the requested behavior."
             }
@@ -115,12 +120,16 @@ impl RepairTarget {
             Self::RequiredEvidenceMissing | Self::TestOrEvidence => {
                 "edit_or_create_verification_evidence"
             }
+            Self::VerifierCommand => "fix_malformed_verify_command_only",
             Self::Unknown => "edit_smallest_relevant_workspace_artifact",
         }
     }
 }
 
 pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
+    if !report.verifier_command_false_negatives.is_empty() {
+        return RepairTarget::VerifierCommand;
+    }
     if !report.compile_errors.is_empty() {
         return RepairTarget::Implementation;
     }
@@ -405,6 +414,7 @@ pub fn repair_target_matches_changed_path(target: RepairTarget, path: &str) -> b
                 "readme",
             ],
         ),
+        RepairTarget::VerifierCommand => false,
         RepairTarget::Implementation => {
             contains_any(
                 &lower,

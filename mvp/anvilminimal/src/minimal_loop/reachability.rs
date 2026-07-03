@@ -46,6 +46,11 @@ pub fn assess_repair_reachability(
         blocked_requirements: Vec::new(),
     };
 
+    if !report.verifier_command_false_negatives.is_empty() {
+        push_blocked(&mut assessment, "deterministic_verify_command_bug");
+        return assessment;
+    }
+
     if !report.missing_paths.is_empty() {
         push_action(&mut assessment, RepairActionClass::EditSourceArtifact);
     }
@@ -88,6 +93,9 @@ pub fn reachability_recovery_reason(reachability: &RepairReachability) -> String
     }
     if kind == "dependency_setup_authority_required" {
         return "dependency_setup_authority_required: requires a Setup-authority step running dependency install before verification can pass".to_string();
+    }
+    if kind == "deterministic_verify_command_bug" {
+        return "deterministic_verify_command_bug: the verify command is malformed; the artifact may already satisfy the requirement".to_string();
     }
     format!(
         "repair_unreachable: {}",
@@ -248,6 +256,29 @@ mod tests {
         assert_eq!(
             reachability.blocked_requirements,
             vec!["dependency_setup_authority_required".to_string()]
+        );
+    }
+
+    #[test]
+    fn verifier_command_false_negative_is_unreachable() {
+        let mut report = VerificationReport::pass();
+        report.push_verifier_command_false_negative(
+            "python3 usage_error.py",
+            "verify_command_false_negative: usage: fake",
+        );
+
+        let reachability =
+            assess_repair_reachability(&report, None, NodeDependencySetupAuthority::None, false);
+
+        assert!(!reachability.reachable);
+        assert!(reachability.viable_actions.is_empty());
+        assert_eq!(
+            reachability.blocked_requirements,
+            vec!["deterministic_verify_command_bug".to_string()]
+        );
+        assert_eq!(
+            reachability_recovery_reason(&reachability),
+            "deterministic_verify_command_bug: the verify command is malformed; the artifact may already satisfy the requirement"
         );
     }
 }
