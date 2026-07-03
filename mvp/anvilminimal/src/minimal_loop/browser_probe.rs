@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::eval_events;
 use crate::minimal_loop::build_verifier::{self, BuildVerifierStatus};
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
+use crate::minimal_loop::interaction_probe;
 use crate::minimal_loop::verifier_env;
 
 const DEFAULT_ROUTE: &str = "/";
@@ -239,6 +240,16 @@ fn probe_browser_readiness_with_options(
                 let cleanup = child.finish();
                 let output = first_non_empty(&cleanup.output_excerpt, &response.body_excerpt);
                 if response.status == 200 {
+                    let run_dir = evidence_path.parent().unwrap_or(root);
+                    let interaction_path =
+                        interaction_probe::browser_interaction_evidence_path(root);
+                    let _ = interaction_probe::probe_browser_interaction_against_running_server(
+                        root,
+                        spec.port,
+                        run_dir,
+                        &interaction_path,
+                        Duration::from_secs(20),
+                    );
                     return finish_with_cleanup(
                         root,
                         started,

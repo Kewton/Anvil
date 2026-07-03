@@ -23,6 +23,7 @@ use crate::minimal_loop::evidence::{
 use crate::minimal_loop::import_scan::{
     MissingImport, format_missing_import_findings, missing_import_target_rel, scan_relative_imports,
 };
+use crate::minimal_loop::interaction_probe::{self, InteractionProbeOutcome};
 use crate::minimal_loop::loop_run::{
     ContractEnforcement, RunSessionError, RunSessionOptions, RunSessionOutcome, RunSessionStepKind,
     extract_requested_artifact_paths, run_session_with_outcome_with_options,
@@ -4066,6 +4067,41 @@ fn emit_browser_probe_event(config: &Config, observation: &BrowserReadinessObser
     );
 }
 
+fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionProbeOutcome) {
+    match outcome {
+        InteractionProbeOutcome::Unavailable(reason) => {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "browser_interaction_probe",
+                    "status": "unavailable",
+                    "ok": false,
+                    "failure_kind": reason,
+                    "evidence_path": "",
+                }),
+            );
+        }
+        InteractionProbeOutcome::Observation(observation) => {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "browser_interaction_probe",
+                    "status": observation.status,
+                    "ok": observation.ok,
+                    "failure_kind": observation.failure_kind,
+                    "steps": observation.steps,
+                    "duration_ms": observation.duration_ms,
+                    "evidence_path": observation.evidence_path.display().to_string(),
+                    "script_path": observation.script_path.display().to_string(),
+                    "output_excerpt": eval_events::body_snippet(&observation.output_excerpt),
+                    "child_spawned": observation.child_spawned,
+                    "child_reaped": observation.child_reaped,
+                }),
+            );
+        }
+    }
+}
+
 fn ultra_contract_runtime_acceptance_report(
     plan: &UltraPlan,
     config: &Config,
@@ -4512,6 +4548,19 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
         };
     }
     if let ReleaseEvidenceStatus::Unavailable(reason) = &interaction.status {
+        if interaction_probe_unavailable_reason_value(reason) {
+            return ReleaseGateSummary {
+                status: "partial".to_string(),
+                reasons: vec![
+                    "interaction_unverified:probe_unavailable".to_string(),
+                    "install playwright to enable interaction release checks".to_string(),
+                ],
+                browser_readiness_status: browser_status,
+                browser_readiness_evidence_path: browser.path,
+                interaction_evidence_status: interaction_status,
+                interaction_evidence_path: interaction.path,
+            };
+        }
         return ReleaseGateSummary {
             status: "partial".to_string(),
             reasons: vec![format!("browser_interaction_evidence_required:{reason}")],
@@ -4933,6 +4982,19 @@ fn run_nextjs_dev_route_probe_with_runtime(
                     )
                 };
                 write_release_evidence_json(evidence_path, &evidence);
+                if failure_kind.is_none() {
+                    let interaction_path = evidence_path.with_file_name("browser-interaction.json");
+                    let run_dir = evidence_path.parent().unwrap_or(&config.workspace_root);
+                    let interaction =
+                        interaction_probe::probe_browser_interaction_against_running_server(
+                            &config.workspace_root,
+                            spec.port,
+                            run_dir,
+                            &interaction_path,
+                            Duration::from_secs(20),
+                        );
+                    emit_browser_interaction_probe_event(config, &interaction);
+                }
                 let cleanup = cleanup_fn(child, &logs);
                 emit_dev_server_cleanup_lifecycle_stage(
                     config,
@@ -5730,10 +5792,28 @@ fn read_release_evidence(
             path: display,
         };
     }
+    if kind == ReleaseEvidenceKind::Interaction
+        && let Some(reason) = interaction_probe_unavailable_reason(&config.workspace_root)
+    {
+        return ReleaseEvidence {
+            status: ReleaseEvidenceStatus::Unavailable(reason),
+            path: String::new(),
+        };
+    }
     ReleaseEvidence {
         status: ReleaseEvidenceStatus::Unavailable(missing_reason.to_string()),
         path: String::new(),
     }
+}
+
+fn interaction_probe_unavailable_reason(root: &Path) -> Option<String> {
+    interaction_probe::playwright_availability(root)
+        .unavailable_reason()
+        .map(str::to_string)
+}
+
+fn interaction_probe_unavailable_reason_value(reason: &str) -> bool {
+    matches!(reason, "playwright_not_installed" | "probe_unavailable")
 }
 
 fn release_evidence_candidate_paths(config: &Config, names: &[&str]) -> Vec<PathBuf> {
@@ -6107,6 +6187,13 @@ fn release_recovery_failure_kind(
         if release_gate
             .reasons
             .iter()
+            .any(|reason| reason.contains("interaction_unverified:probe_unavailable"))
+        {
+            return "interaction_unverified_probe_unavailable".to_string();
+        }
+        if release_gate
+            .reasons
+            .iter()
             .any(|reason| reason.contains("browser_readiness_or_interaction_evidence_required"))
             || release_gate
                 .browser_readiness_status
@@ -6271,6 +6358,10 @@ fn release_recovery_repair_targets(
     let interaction_status = release_gate
         .interaction_evidence_status
         .to_ascii_lowercase();
+    let interaction_probe_unavailable = release_gate
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("interaction_unverified:probe_unavailable"));
     if browser_status.contains("tailwind_dev_pipeline_failure")
         || browser_status.contains("css")
         || browser_status.contains("http_500")
@@ -6279,13 +6370,17 @@ fn release_recovery_repair_targets(
     }
     if browser_status.starts_with("unavailable:")
         || browser_status.contains("evidence_missing")
-        || interaction_status.starts_with("unavailable:")
-        || interaction_status.contains("evidence_missing")
+        || (!interaction_probe_unavailable
+            && (interaction_status.starts_with("unavailable:")
+                || interaction_status.contains("evidence_missing")))
     {
         targets.push("required_evidence_missing".to_string());
     }
-    if browser_status.starts_with("failed:") || interaction_status.starts_with("failed:") {
+    if browser_status.starts_with("failed:") {
         targets.push("test_or_evidence".to_string());
+    }
+    if interaction_status.starts_with("failed:") {
+        targets.push("capability_implementation".to_string());
     }
     if let Some(report) = runtime_acceptance {
         targets.extend(
@@ -6311,8 +6406,16 @@ fn release_recovery_verify_commands(
         commands.push("start dev server with npm run dev and wait for readiness".to_string());
         commands.push("probe browser route GET / and record HTTP status".to_string());
         commands.push("write browser-readiness.json with route_rendered/http_status".to_string());
-        commands
-            .push("collect interaction-evidence.json for required browser interaction".to_string());
+        if release_gate
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("interaction_unverified:probe_unavailable"))
+        {
+            commands.push("install playwright to enable interaction release checks".to_string());
+        } else {
+            commands
+                .push("run the interaction probe and record browser-interaction.json".to_string());
+        }
     } else {
         commands.push("rerun deterministic acceptance checks for the original goal".to_string());
     }
@@ -8216,7 +8319,8 @@ fn final_acceptance_repair_prompt(
     let expected = render_prompt_bullets(expected_paths);
     let missing = render_prompt_bullets(&report.missing_paths);
     let dependencies = render_prompt_bullets(&report.dependency_missing);
-    let profile_failures = render_prompt_bullets(&report.profile_failures);
+    let profile_failures = final_acceptance_model_fixable_profile_failures(report);
+    let profile_failures = render_prompt_bullets(&profile_failures);
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
     format!(
@@ -8252,6 +8356,22 @@ Bounded repair rules:\n\
         expected = expected,
         prior_context = context.render_prompt_section(),
     )
+}
+
+fn final_acceptance_model_fixable_profile_failures(report: &VerificationReport) -> Vec<String> {
+    report
+        .profile_failures
+        .iter()
+        .filter(|failure| {
+            let lower = failure.to_ascii_lowercase();
+            !lower.contains("browser_interaction_evidence_required")
+                && !lower.contains("interaction_evidence_missing")
+                && !lower.contains("interaction evidence status:")
+                && !lower.contains("interaction evidence path:")
+                && !lower.contains("interaction_unverified:probe_unavailable")
+        })
+        .cloned()
+        .collect()
 }
 
 fn render_prompt_bullets(items: &[String]) -> String {
@@ -9556,7 +9676,7 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
             .find(|prompt| prompt.contains("Repair the final acceptance failure"))
             .expect("final acceptance repair prompt");
         assert!(repair_prompt.contains("browser readiness status: passed"));
-        assert!(repair_prompt.contains("interaction evidence status: passed"));
+        assert!(!repair_prompt.contains("interaction evidence status"));
         assert!(repair_prompt.contains("resets score AND entities"));
     }
 
@@ -11891,10 +12011,153 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
         assert!(event_text.contains("\"browser_readiness_status\":\"passed\""));
         assert!(
             event_text.contains(
-                "\"interaction_evidence_status\":\"unavailable:interaction_evidence_missing\""
+                "\"interaction_evidence_status\":\"unavailable:playwright_not_installed\""
             ),
             "{event_text}"
         );
+        assert!(event_text.contains("interaction_unverified:probe_unavailable"));
+        assert!(!event_text.contains("browser_interaction_evidence_required"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fake_interaction_probe_success_passes_release_gate() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/fake/events.jsonl");
+        write_fake_nextjs_dev_workspace(dir.path(), port, false);
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_override(
+            dir.path(),
+            &serde_json::json!({
+                "ok": true,
+                "status": "passed",
+                "steps": ["surface_visible", "start_transition", "control_input_dispatched"],
+                "before_marker": "menu",
+                "after_marker": "running",
+                "duration_ms": 11
+            }),
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events);
+        let evidence_path = nextjs_dev_route_evidence_path(&cfg);
+
+        let readiness = run_nextjs_dev_route_probe_with_runtime(
+            &cfg,
+            &evidence_path,
+            true,
+            cleanup_dev_server_child,
+        );
+
+        assert_eq!(readiness.get("ok").and_then(Value::as_bool), Some(true));
+        let interaction_path = evidence_path.with_file_name("browser-interaction.json");
+        assert!(interaction_path.is_file(), "run interaction evidence");
+        assert!(
+            interaction_probe::browser_interaction_evidence_path(dir.path()).is_file(),
+            "workspace interaction evidence"
+        );
+        let gate = browser_release_gate(&cfg);
+        assert_eq!(gate.status, "pass", "{gate:?}");
+        assert_eq!(gate.interaction_evidence_status, "passed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fake_interaction_probe_failure_fails_gate_without_evidence_repair_target() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/fake/events.jsonl");
+        write_fake_nextjs_dev_workspace(dir.path(), port, false);
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_override(
+            dir.path(),
+            &serde_json::json!({
+                "ok": false,
+                "status": "failed",
+                "steps": ["surface_visible", "control_input_dispatched"],
+                "before_marker": "menu",
+                "after_marker": "menu",
+                "failure_kind": "start_transition_missing",
+                "duration_ms": 13
+            }),
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events);
+        let evidence_path = nextjs_dev_route_evidence_path(&cfg);
+
+        let readiness = run_nextjs_dev_route_probe_with_runtime(
+            &cfg,
+            &evidence_path,
+            true,
+            cleanup_dev_server_child,
+        );
+
+        assert_eq!(readiness.get("ok").and_then(Value::as_bool), Some(true));
+        let gate = browser_release_gate(&cfg);
+        assert_eq!(gate.status, "failed", "{gate:?}");
+        assert_eq!(
+            gate.reasons,
+            vec!["browser_interaction_failed:start_transition_missing".to_string()]
+        );
+        assert_eq!(
+            release_recovery_repair_targets(&gate, None),
+            vec!["capability_implementation".to_string()]
+        );
+
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(format!("release gate failed: {}", gate.reasons.join("; ")));
+        append_release_gate_observation_failures(&mut report, &gate);
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: Vec::new(),
+        };
+        let prompt = final_acceptance_repair_prompt(
+            &plan,
+            &report,
+            &UltraRunContext::default(),
+            "capability_missing",
+            &["src/app/page.tsx".to_string()],
+            1,
+            2,
+        );
+        assert!(prompt.contains("start_transition_missing"), "{prompt}");
+        assert!(!prompt.contains("interaction_evidence_missing"), "{prompt}");
+        assert!(
+            !prompt.contains("browser_interaction_evidence_required"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("interaction evidence status"), "{prompt}");
+    }
+
+    #[test]
+    fn non_interactive_contract_does_not_require_interaction_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path().to_path_buf());
+        let report = RuntimeAcceptanceReport {
+            passed: true,
+            primary_reason: "pass".to_string(),
+            ..RuntimeAcceptanceReport::default()
+        };
+
+        let gate = final_acceptance_release_gate(
+            &cfg,
+            "nextjs",
+            "Create a static about page",
+            &[],
+            Some(&report),
+            true,
+        );
+
+        assert_eq!(gate.status, "pass");
+        assert_eq!(gate.browser_readiness_status, "not_applicable");
+        assert_eq!(gate.interaction_evidence_status, "not_applicable");
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::providers::ChatClient;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiTerminalStatus {
     Completed,
+    Partial,
     Failed,
     Aborted,
     Interrupted,
@@ -18,6 +19,7 @@ impl TuiTerminalStatus {
     fn as_str(self) -> &'static str {
         match self {
             Self::Completed => "completed",
+            Self::Partial => "partial",
             Self::Failed => "failed",
             Self::Aborted => "aborted",
             Self::Interrupted => "interrupted",
@@ -25,12 +27,12 @@ impl TuiTerminalStatus {
     }
 
     fn ok(self) -> bool {
-        self == Self::Completed
+        matches!(self, Self::Completed | Self::Partial)
     }
 
     fn failure_kind(self) -> &'static str {
         match self {
-            Self::Completed => "",
+            Self::Completed | Self::Partial => "",
             Self::Failed => "tui_command_failed",
             Self::Aborted => "tui_command_aborted",
             Self::Interrupted => "tui_command_interrupted",
@@ -201,12 +203,14 @@ fn emit_tui_command_stop_with_status(
     result: &anyhow::Result<String>,
     terminal_status: TuiTerminalStatus,
 ) -> crate::eval_events::CompletionProjection {
+    let requested_ok = terminal_status.ok();
+    let completion_snapshot =
+        crate::eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
+    let completion = crate::eval_events::project_completion(requested_ok, &completion_snapshot);
+    let terminal_status = effective_terminal_status(terminal_status, &completion);
     let ok = terminal_status.ok();
     let failure_kind = terminal_status.failure_kind();
     let stop_reason = stop_reason_for_result(result, terminal_status);
-    let completion_snapshot =
-        crate::eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
-    let completion = crate::eval_events::project_completion(ok, &completion_snapshot);
     let event_projection = event_projection_for_terminal_status(&completion, terminal_status);
     crate::eval_events::emit(
         config.eval_events_path.as_deref(),
@@ -314,6 +318,23 @@ fn stop_reason_for_result(
     }
 }
 
+fn effective_terminal_status(
+    requested: TuiTerminalStatus,
+    completion: &crate::eval_events::CompletionProjection,
+) -> TuiTerminalStatus {
+    if requested == TuiTerminalStatus::Completed
+        && completion.release_gate == "partial"
+        && completion
+            .release_gate_reasons
+            .iter()
+            .any(|reason| reason.contains("interaction_unverified:probe_unavailable"))
+    {
+        TuiTerminalStatus::Partial
+    } else {
+        requested
+    }
+}
+
 fn error_is_interrupted(err: &anyhow::Error) -> bool {
     err.to_string().contains("interrupted by user")
 }
@@ -323,7 +344,10 @@ fn event_projection_for_terminal_status(
     terminal_status: TuiTerminalStatus,
 ) -> crate::eval_events::CompletionProjection {
     let mut projection = completion.clone();
-    if terminal_status == TuiTerminalStatus::Completed {
+    if matches!(
+        terminal_status,
+        TuiTerminalStatus::Completed | TuiTerminalStatus::Partial
+    ) {
         return projection;
     }
     projection.status = terminal_status.as_str().to_string();
@@ -333,7 +357,7 @@ fn event_projection_for_terminal_status(
         TuiTerminalStatus::Interrupted => "resume_or_rerun_command".to_string(),
         TuiTerminalStatus::Aborted => "inspect_summary_and_resume_or_rerun".to_string(),
         TuiTerminalStatus::Failed => "fix_command_failure".to_string(),
-        TuiTerminalStatus::Completed => projection.next_action,
+        TuiTerminalStatus::Completed | TuiTerminalStatus::Partial => projection.next_action,
     };
     projection
 }
@@ -509,6 +533,68 @@ mod tests {
         );
         assert!(tui_stop.contains(r#""suggested_recovery_command":"/ultra-plan-run"#));
         assert!(tui_stop.contains(r#""suggested_recovery_yaml_command":"/run-ultra-plan"#));
+    }
+
+    #[test]
+    fn tui_command_stop_reports_interaction_unverified_as_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let events = workspace.join(".anvil/runs/test/events.jsonl");
+        std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+        let mut cfg = config();
+        cfg.workspace_root = workspace;
+        cfg.eval_events_path = Some(events.clone());
+        crate::eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            serde_json::json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "partial",
+                "release_gate_status": "partial",
+                "release_gate_reasons": [
+                    "interaction_unverified:probe_unavailable",
+                    "install playwright to enable interaction release checks"
+                ],
+                "browser_readiness_status": "passed",
+                "browser_readiness_evidence_path": "browser-readiness.json",
+                "interaction_evidence_status": "unavailable:playwright_not_installed",
+                "interaction_evidence_path": "",
+                "completion_contract_verification_enabled": true,
+                "completion_contract_path_merge_enabled": true,
+                "external_contract_checked": true,
+                "external_contract_ok": true,
+            }),
+        );
+
+        let result: anyhow::Result<String> = Ok("ultra-plan-run complete".to_string());
+        let projection = emit_tui_command_stop(&cfg, "/ultra-plan-run", &result);
+
+        assert_eq!(projection.release_gate, "partial");
+        assert_eq!(projection.task_status, "partial (interaction unverified)");
+        assert_eq!(
+            projection.next_action,
+            "install_playwright_to_enable_interaction_release_checks"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        let tui_stop = event_text
+            .lines()
+            .rfind(|line| line.contains(r#""event":"tui_command_stop""#))
+            .unwrap();
+        assert!(tui_stop.contains(r#""status":"partial""#), "{tui_stop}");
+        assert!(
+            tui_stop.contains(r#""task_status":"partial (interaction unverified)""#),
+            "{tui_stop}"
+        );
+        let summary = std::fs::read_to_string(events.with_file_name("summary.md")).unwrap();
+        assert!(summary.contains("Status: partial"), "{summary}");
+        assert!(
+            summary.contains("interaction_unverified:probe_unavailable"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("install playwright to enable interaction release checks"),
+            "{summary}"
+        );
     }
 
     #[test]

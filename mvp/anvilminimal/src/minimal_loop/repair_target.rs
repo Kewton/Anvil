@@ -209,6 +209,7 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
             &[
                 "interactive_ui_source_evidence",
                 "non_static_screen_evidence",
+                "browser_interaction_failed",
                 "missing_required_capabilities",
                 "plan_output_missing_required_capabilities",
                 "capability missing",
@@ -229,7 +230,6 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
                 "browser_readiness_missing",
                 "browser_readiness_evidence_missing",
                 "browser_readiness_or_interaction_evidence_required",
-                "interaction_evidence_missing",
             ],
         )
     }) {
@@ -245,7 +245,6 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
                 "bound_verify_command",
                 "release gate failed",
                 "browser_readiness_failed",
-                "browser_interaction_failed",
             ],
         )
     }) {
@@ -572,6 +571,22 @@ mod tests {
         assert_eq!(
             classify_repair_target(&report),
             RepairTarget::TestOrEvidence
+        );
+    }
+
+    #[test]
+    fn browser_interaction_probe_failure_targets_capability_implementation() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "release gate failed: browser_interaction_failed:start_transition_missing",
+        );
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::CapabilityMissing
+        );
+        assert_eq!(
+            classify_repair_target(&report).allowed_action(),
+            "edit_task_implementation_artifact"
         );
     }
 

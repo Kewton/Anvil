@@ -6,6 +6,7 @@ pub mod dependency_setup;
 pub mod evidence;
 pub mod feedback;
 pub mod import_scan;
+pub mod interaction_probe;
 pub mod loop_run;
 pub mod prompt;
 pub mod reachability;

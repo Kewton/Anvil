@@ -403,6 +403,11 @@ fn read_browser_evidence(
         }
         return (classify_browser_evidence_json(kind, &value), display);
     }
+    if kind == BrowserEvidenceKind::Interaction
+        && let Some(reason) = interaction_probe_unavailable_reason(root)
+    {
+        return (BrowserEvidenceStatus::Unavailable(reason), String::new());
+    }
     (
         BrowserEvidenceStatus::Unavailable(missing_reason.to_string()),
         String::new(),
@@ -634,8 +639,21 @@ fn record_browser_status(
     if let Some(reason) = status.strip_prefix("failed:") {
         missing_evidence.push(format!("{label}_failed:{reason}"));
     } else if let Some(reason) = status.strip_prefix("unavailable:") {
+        if label == "browser_interaction" && interaction_probe_unavailable_reason_value(reason) {
+            return;
+        }
         inconclusive_reasons.push(format!("{label}_unavailable:{reason}"));
     }
+}
+
+fn interaction_probe_unavailable_reason(root: &Path) -> Option<String> {
+    crate::minimal_loop::interaction_probe::playwright_availability(root)
+        .unavailable_reason()
+        .map(str::to_string)
+}
+
+fn interaction_probe_unavailable_reason_value(reason: &str) -> bool {
+    matches!(reason, "playwright_not_installed" | "probe_unavailable")
 }
 
 fn bool_field_deep(value: &Value, details: Option<&Value>, keys: &[&str]) -> Option<bool> {
@@ -4287,11 +4305,13 @@ export default function Page(){
         assert!(report.inconclusive_reasons.contains(
             &"browser_readiness_unavailable:browser_readiness_evidence_missing".to_string()
         ));
-        assert!(
-            report.inconclusive_reasons.contains(
-                &"browser_interaction_unavailable:interaction_evidence_missing".to_string()
-            )
+        assert_eq!(
+            report.interaction_evidence_status,
+            "unavailable:playwright_not_installed"
         );
+        assert!(!report.inconclusive_reasons.iter().any(|reason| {
+            reason.contains("browser_interaction_unavailable:interaction_evidence_missing")
+        }));
     }
 
     #[test]

@@ -359,8 +359,18 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
     };
     let release_quality_completion = release_quality_completion(&release_gate, &final_acceptance);
     let status = terminal_status(ok, &release_gate, &final_acceptance);
-    let task_status = task_status(ok, &release_gate, &final_acceptance);
-    let next_action = next_action(ok, &release_gate, &final_acceptance);
+    let interaction_unverified =
+        interaction_unverified_probe_unavailable(&release_gate, &snapshot.release_gate_reasons);
+    let task_status = if ok && interaction_unverified {
+        "partial (interaction unverified)".to_string()
+    } else {
+        task_status(ok, &release_gate, &final_acceptance)
+    };
+    let next_action = if ok && interaction_unverified {
+        "install_playwright_to_enable_interaction_release_checks".to_string()
+    } else {
+        next_action(ok, &release_gate, &final_acceptance)
+    };
     CompletionProjection {
         status,
         command_completion,
@@ -394,6 +404,13 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         planner_repaired: snapshot.planner_repaired,
         planner_release_risk: snapshot.planner_release_risk,
     }
+}
+
+fn interaction_unverified_probe_unavailable(release_gate: &str, reasons: &[String]) -> bool {
+    release_gate == "partial"
+        && reasons
+            .iter()
+            .any(|reason| reason.contains("interaction_unverified:probe_unavailable"))
 }
 
 fn planner_diagnostics_from_events(events: &[Value]) -> PlannerDiagnostics {
@@ -1498,6 +1515,15 @@ fn render_completion_summary(
         format!("Recovery next action: {}", projection.next_action),
         format!("Stop reason: {stop_reason}"),
     ]);
+    if interaction_unverified_probe_unavailable(
+        &projection.release_gate,
+        &projection.release_gate_reasons,
+    ) {
+        lines.push(
+            "Interaction verification: interaction_unverified:probe_unavailable; install playwright to enable interaction release checks."
+                .to_string(),
+        );
+    }
     let host_env_contamination = crate::minimal_loop::verifier_env::host_env_contamination();
     if !host_env_contamination.is_empty() {
         lines.push(format!(
@@ -1566,7 +1592,7 @@ fn render_tui_command_completion_summary(
     let mut summary_projection = projection.clone();
     summary_projection.status = terminal_status.to_string();
     summary_projection.command_completion = terminal_status.to_string();
-    if terminal_status != "completed" {
+    if terminal_status != "completed" && terminal_status != "partial" {
         summary_projection.task_status = terminal_status.to_string();
         summary_projection.next_action = match terminal_status {
             "interrupted" => "resume_or_rerun_command".to_string(),
