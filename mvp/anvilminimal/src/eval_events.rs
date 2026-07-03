@@ -204,6 +204,7 @@ pub struct CompletionSnapshot {
     pub browser_readiness_evidence_path: String,
     pub interaction_evidence_status: String,
     pub interaction_evidence_path: String,
+    pub evidence_arbitration_summary: String,
     pub recovery_prompt_path: String,
     pub recovery_ultra_plan_path: String,
     pub suggested_recovery_command: String,
@@ -235,6 +236,7 @@ impl CompletionSnapshot {
             browser_readiness_evidence_path: String::new(),
             interaction_evidence_status: "not_applicable".to_string(),
             interaction_evidence_path: String::new(),
+            evidence_arbitration_summary: String::new(),
             recovery_prompt_path: String::new(),
             recovery_ultra_plan_path: String::new(),
             suggested_recovery_command: String::new(),
@@ -278,6 +280,7 @@ pub struct CompletionProjection {
     pub browser_readiness_evidence_path: String,
     pub interaction_evidence: String,
     pub interaction_evidence_path: String,
+    pub evidence_arbitration_summary: String,
     pub release_quality_completion: String,
     pub next_action: String,
     pub recovery_prompt_path: String,
@@ -389,6 +392,7 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         browser_readiness_evidence_path: snapshot.browser_readiness_evidence_path.clone(),
         interaction_evidence: snapshot.interaction_evidence_status.clone(),
         interaction_evidence_path: snapshot.interaction_evidence_path.clone(),
+        evidence_arbitration_summary: snapshot.evidence_arbitration_summary.clone(),
         release_quality_completion,
         next_action,
         recovery_prompt_path: snapshot.recovery_prompt_path.clone(),
@@ -1290,6 +1294,11 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        evidence_arbitration_summary: event
+            .get("evidence_arbitration_summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         recovery_prompt_path: event
             .get("recovery_prompt_path")
             .and_then(Value::as_str)
@@ -1465,6 +1474,10 @@ fn render_completion_summary(
         format!("Runtime acceptance: {}", projection.runtime_acceptance),
         format!("Final acceptance: {}", projection.final_acceptance),
         format!("Release gate: {}", projection.release_gate),
+        format!(
+            "Evidence arbitration: {}",
+            missing_if_empty(&projection.evidence_arbitration_summary)
+        ),
         format!(
             "completion_contract_verification_enabled={}",
             projection.completion_contract_verification_enabled
@@ -2227,6 +2240,37 @@ mod tests {
             "{summary}"
         );
         assert!(summary.contains("Status: complete"), "{summary}");
+    }
+
+    #[test]
+    fn completion_summary_renders_evidence_arbitration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "pass",
+                "release_gate_status": "pass",
+                "evidence_arbitration_summary": "behavioral (probe ok)",
+            }),
+        );
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(true, &snapshot);
+        let summary = render_completion_summary(
+            "tui_command",
+            None,
+            Some("/ultra-plan-run"),
+            "completed",
+            "",
+            &projection,
+        );
+
+        assert!(
+            summary.contains("Evidence arbitration: behavioral (probe ok)"),
+            "{summary}"
+        );
     }
 
     #[test]

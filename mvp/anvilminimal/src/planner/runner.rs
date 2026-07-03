@@ -10,6 +10,7 @@ use std::os::unix::process::CommandExt;
 
 use crate::config::Config;
 use crate::eval_events;
+use crate::minimal_loop::behavior_evidence::{self, EvidenceArbitrationReport};
 use crate::minimal_loop::browser_probe::{
     BrowserReadinessObservation, probe_browser_readiness_with_offline,
 };
@@ -1811,7 +1812,7 @@ fn verify_plan_final_contract(
     let runtime_acceptance_required = !required_capabilities.is_empty()
         || !required_evidence.is_empty()
         || !required_obligations.is_empty();
-    let runtime_acceptance = runtime_acceptance_required.then(|| {
+    let mut runtime_acceptance = runtime_acceptance_required.then(|| {
         verify_runtime_acceptance_with_browser_dirs_and_hints(
             &config.workspace_root,
             &required_paths,
@@ -1822,6 +1823,15 @@ fn verify_plan_final_contract(
             &deferred_commands,
             &release_evidence_extra_dirs(config),
             &evidence_hint_tokens,
+        )
+    });
+    let evidence_arbitration = runtime_acceptance.as_mut().map(|report| {
+        final_acceptance_evidence_arbitration(
+            config,
+            report,
+            &required_capabilities,
+            &required_evidence,
+            &required_obligations,
         )
     });
     let release_gate = final_acceptance_release_gate(
@@ -1838,9 +1848,10 @@ fn verify_plan_final_contract(
     let external_contract_checked = bound_contract.is_some();
     let contract_binding_missing = contract_required && !external_contract_checked;
     let external_ok = !contract_binding_missing
-        && external_report
-            .as_ref()
-            .is_none_or(|report| report.is_pass());
+        && external_contract_ok_after_runtime_arbitration(
+            external_report.as_ref(),
+            runtime_acceptance.as_ref(),
+        );
     let runtime_ok = runtime_acceptance
         .as_ref()
         .is_none_or(|report| report.passed);
@@ -1862,7 +1873,9 @@ fn verify_plan_final_contract(
         "completion contract binding required but missing".to_string()
     } else if let Some(report) = runtime_acceptance.as_ref().filter(|report| !report.passed) {
         report.primary_reason.clone()
-    } else if let Some(report) = external_report.as_ref().filter(|report| !report.is_pass()) {
+    } else if let Some(report) = external_report.as_ref().filter(|report| {
+        !external_contract_ok_after_runtime_arbitration(Some(*report), runtime_acceptance.as_ref())
+    }) {
         report.primary_reason()
     } else if release_gate_failed {
         format!("release gate failed: {}", release_gate.reasons.join("; "))
@@ -1932,6 +1945,18 @@ fn verify_plan_final_contract(
             "weak_evidence": runtime_acceptance
                 .as_ref()
                 .map(|report| report.weak_evidence.clone())
+                .unwrap_or_default(),
+            "evidence_tiers": runtime_acceptance
+                .as_ref()
+                .map(|report| report.evidence_tiers.clone())
+                .unwrap_or_default(),
+            "evidence_arbitration": evidence_arbitration
+                .as_ref()
+                .map(|report| report.records.clone())
+                .unwrap_or_default(),
+            "evidence_arbitration_summary": evidence_arbitration
+                .as_ref()
+                .map(|report| report.summary.clone())
                 .unwrap_or_default(),
             "artifact_obligations": runtime_acceptance
                 .as_ref()
@@ -3641,7 +3666,7 @@ fn ultra_final_acceptance_report(
     );
     let browser_probe = maybe_run_ultra_final_browser_probe(config, plan, &required_capabilities);
     let missing = missing_final_artifacts(&config.workspace_root, &required_paths);
-    let acceptance = verify_runtime_acceptance_with_browser_dirs_and_hints(
+    let mut acceptance = verify_runtime_acceptance_with_browser_dirs_and_hints(
         &config.workspace_root,
         &required_paths,
         &verify_commands,
@@ -3651,6 +3676,13 @@ fn ultra_final_acceptance_report(
         &deferred_commands,
         &release_evidence_extra_dirs(config),
         &evidence_hint_tokens,
+    );
+    let evidence_arbitration = final_acceptance_evidence_arbitration(
+        config,
+        &mut acceptance,
+        &required_capabilities,
+        &required_evidence,
+        &required_obligations,
     );
     let profile_invariant_report = verify_profile_invariant(
         &config.workspace_root,
@@ -3674,9 +3706,10 @@ fn ultra_final_acceptance_report(
     let external_contract_checked = bound_contract.is_some();
     let contract_binding_missing = contract_required && !external_contract_checked;
     let external_ok = !contract_binding_missing
-        && external_report
-            .as_ref()
-            .is_none_or(|report| report.is_pass());
+        && external_contract_ok_after_runtime_arbitration(
+            external_report.as_ref(),
+            Some(&acceptance),
+        );
     let release_gate = final_acceptance_release_gate(
         config,
         &plan.profile,
@@ -3699,7 +3732,9 @@ fn ultra_final_acceptance_report(
         profile_report.primary_reason()
     } else if !acceptance.passed {
         acceptance.primary_reason.clone()
-    } else if let Some(report) = external_report.as_ref().filter(|report| !report.is_pass()) {
+    } else if let Some(report) = external_report.as_ref().filter(|report| {
+        !external_contract_ok_after_runtime_arbitration(Some(*report), Some(&acceptance))
+    }) {
         report.primary_reason()
     } else if matches!(release_gate.status.as_str(), "partial" | "failed") {
         release_gate.reasons.join("; ")
@@ -3769,6 +3804,8 @@ fn ultra_final_acceptance_report(
             "missing_obligations": acceptance.missing_obligations.clone(),
             "weak_evidence": acceptance.weak_evidence.clone(),
             "evidence_tiers": acceptance.evidence_tiers.clone(),
+            "evidence_arbitration": evidence_arbitration.records.clone(),
+            "evidence_arbitration_summary": evidence_arbitration.summary.clone(),
             "artifact_obligations": acceptance.artifact_obligations.clone(),
             "capability_evidence_bindings": acceptance.capability_evidence_bindings.clone(),
             "obligation_repair_targets": acceptance.obligation_repair_targets.clone(),
@@ -3833,7 +3870,9 @@ fn ultra_final_acceptance_report(
     if contract_binding_missing {
         report.push_profile_failure("completion contract binding required but missing".to_string());
     }
-    if let Some(external_report) = external_report.filter(|report| !report.is_pass()) {
+    if let Some(external_report) = external_report.filter(|report| {
+        !external_contract_ok_after_runtime_arbitration(Some(report), Some(&acceptance))
+    }) {
         report.push_profile_failure(format!(
             "external contract failed: {}",
             external_report.primary_reason()
@@ -4397,6 +4436,83 @@ fn append_release_gate_observation_failures(
             release_gate.interaction_evidence_path
         ));
     }
+}
+
+fn external_contract_ok_after_runtime_arbitration(
+    report: Option<&VerificationReport>,
+    acceptance: Option<&RuntimeAcceptanceReport>,
+) -> bool {
+    report.is_none_or(|report| {
+        report.is_pass()
+            || external_contract_report_covered_by_runtime_arbitration(report, acceptance)
+    })
+}
+
+fn external_contract_report_covered_by_runtime_arbitration(
+    report: &VerificationReport,
+    acceptance: Option<&RuntimeAcceptanceReport>,
+) -> bool {
+    let Some(acceptance) = acceptance.filter(|acceptance| acceptance.passed) else {
+        return false;
+    };
+    report.missing_paths.is_empty()
+        && report.command_failures.is_empty()
+        && report.dependency_missing.is_empty()
+        && report
+            .profile_failures
+            .iter()
+            .all(|failure| external_profile_failure_covered_by_runtime(failure, acceptance))
+}
+
+fn external_profile_failure_covered_by_runtime(
+    failure: &str,
+    acceptance: &RuntimeAcceptanceReport,
+) -> bool {
+    if let Some(evidence) = failure.strip_prefix("missing_required_evidence:") {
+        if evidence.starts_with("required_obligation:") {
+            return false;
+        }
+        return evidence
+            .split(',')
+            .map(str::trim)
+            .filter(|evidence| !evidence.is_empty())
+            .all(|evidence| runtime_acceptance_satisfied_evidence(acceptance, evidence));
+    }
+    if let Some(weak_evidence) = failure.strip_prefix("weak_verification_evidence:") {
+        return weak_evidence
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .all(|item| weak_source_evidence_covered_by_runtime(acceptance, item));
+    }
+    false
+}
+
+fn runtime_acceptance_satisfied_evidence(
+    acceptance: &RuntimeAcceptanceReport,
+    evidence: &str,
+) -> bool {
+    !acceptance
+        .missing_evidence
+        .iter()
+        .any(|missing| missing == evidence)
+        && acceptance
+            .evidence_tiers
+            .get(evidence)
+            .is_some_and(|tier| tier != "absent" && tier != "weak")
+}
+
+fn weak_source_evidence_covered_by_runtime(
+    acceptance: &RuntimeAcceptanceReport,
+    weak_evidence: &str,
+) -> bool {
+    let Some(rest) = weak_evidence.strip_prefix("weak_source_evidence:") else {
+        return false;
+    };
+    let Some((evidence, _reason)) = rest.split_once(':') else {
+        return false;
+    };
+    runtime_acceptance_satisfied_evidence(acceptance, evidence.trim())
 }
 
 fn runtime_acceptance_repair_guidance(
@@ -5847,6 +5963,23 @@ fn release_evidence_extra_dirs(config: &Config) -> Vec<PathBuf> {
         .and_then(|events_path| events_path.parent())
         .map(|run_dir| vec![run_dir.to_path_buf()])
         .unwrap_or_default()
+}
+
+fn final_acceptance_evidence_arbitration(
+    config: &Config,
+    report: &mut RuntimeAcceptanceReport,
+    required_capabilities: &[String],
+    required_evidence: &[String],
+    required_obligations: &[String],
+) -> EvidenceArbitrationReport {
+    behavior_evidence::arbitrate_final_acceptance(
+        report,
+        &config.workspace_root,
+        &release_evidence_extra_dirs(config),
+        required_capabilities,
+        required_evidence,
+        required_obligations,
+    )
 }
 
 fn classify_release_evidence_json(
@@ -12794,6 +12927,136 @@ export default function Page(){
                 .and_then(|tiers| tiers.get("restart_or_recoverable_state_evidence"))
                 .and_then(Value::as_str),
             Some("strong")
+        );
+    }
+
+    #[test]
+    fn ultra_final_acceptance_records_behavioral_arbitration_per_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [score, setScore] = useState(0);
+  const [mode, setMode] = useState("ready");
+  const fire = () => setScore((value) => value + 1);
+  const initGame = () => setMode("ready");
+  return <main><button onClick={fire}>Start</button><button onClick={initGame}>Restart</button><canvas />score enemy collision restart {score}{mode}</main>;
+}
+"#,
+        )
+        .unwrap();
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "required_paths": ["src/app/page.tsx"],
+                "required_evidence": [
+                    "implementation_artifact",
+                    "visible_interactive_surface_evidence",
+                    "interactive_ui_source_evidence",
+                    "non_static_screen_evidence",
+                    "user_input_handler_evidence",
+                    "stateful_update_evidence",
+                    "failure_or_collision_evidence",
+                    "restart_or_recoverable_state_evidence"
+                ],
+                "verify_repair_cap": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_override(
+            dir.path(),
+            &serde_json::json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "steps": [
+                    "surface_visible",
+                    "start_transition",
+                    "control_input_dispatched",
+                    "input_state_change",
+                    "recovery_transition"
+                ],
+                "before_marker": "menu",
+                "after_marker": "running",
+                "input_before_marker": "running",
+                "input_after_marker": "moved",
+                "duration_ms": 12
+            }),
+        );
+        let run_dir = dir.path().join(".anvil/runs/behavior");
+        let interaction_path = run_dir.join("browser-interaction.json");
+        let outcome = interaction_probe::probe_browser_interaction_against_running_server(
+            dir.path(),
+            34_099,
+            &run_dir,
+            &interaction_path,
+            Duration::from_secs(1),
+        );
+        assert!(
+            outcome
+                .observation()
+                .is_some_and(|observation| observation.ok),
+            "{outcome:?}"
+        );
+
+        let events = run_dir.join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(contract);
+        let plan = UltraPlan {
+            goal: "Create contracted implementation".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Final acceptance".to_string(),
+            }],
+        };
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+        assert!(report.is_pass(), "{report:?}");
+        let ultra = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            ultra
+                .get("evidence_arbitration_summary")
+                .and_then(Value::as_str),
+            Some("behavioral (probe ok)")
+        );
+        let arbitration = ultra
+            .get("evidence_arbitration")
+            .and_then(Value::as_object)
+            .expect("evidence_arbitration object");
+        let collision = arbitration
+            .get("failure_or_collision_evidence")
+            .and_then(Value::as_object)
+            .expect("collision arbitration");
+        assert_eq!(
+            collision.get("static_tier").and_then(Value::as_str),
+            Some("weak")
+        );
+        assert_eq!(
+            collision.get("final_tier").and_then(Value::as_str),
+            Some("weak_behavior_corroborated")
+        );
+        assert_eq!(
+            collision.get("decided_by").and_then(Value::as_str),
+            Some("behavioral")
+        );
+        assert_eq!(
+            ultra
+                .get("evidence_tiers")
+                .and_then(|tiers| tiers.get("failure_or_collision_evidence"))
+                .and_then(Value::as_str),
+            Some("weak_behavior_corroborated")
         );
     }
 

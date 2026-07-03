@@ -38,6 +38,9 @@ pub struct BrowserInteractionObservation {
     pub steps: Vec<String>,
     pub before_marker: String,
     pub after_marker: String,
+    pub input_state_changed: bool,
+    pub recovery_transition_observed: bool,
+    pub recovery_transition_not_observed: bool,
     pub failure_kind: String,
     pub duration_ms: u128,
     pub output_excerpt: String,
@@ -256,6 +259,20 @@ pub fn probe_browser_interaction_against_running_server(
                     mirror_interaction_observation(root, evidence_path, &observation);
                     return InteractionProbeOutcome::Observation(Box::new(observation));
                 }
+                if let Some(value) = read_interaction_value(evidence_path) {
+                    let observation = observation_from_value(
+                        evidence_path,
+                        &script_path,
+                        &url,
+                        value,
+                        started,
+                        output_excerpt,
+                        true,
+                        reaped,
+                    );
+                    mirror_interaction_observation(root, evidence_path, &observation);
+                    return InteractionProbeOutcome::Observation(Box::new(observation));
+                }
                 let observation = failure_observation(
                     root,
                     evidence_path,
@@ -325,6 +342,11 @@ const started = Date.now();
 const steps = [];
 let before_marker = "";
 let after_marker = "";
+let input_before_marker = "";
+let input_after_marker = "";
+let recovery_before_marker = "";
+let recovery_after_marker = "";
+let recovery_transition_status = "unknown";
 
 function write(value) {
   fs.mkdirSync(require("path").dirname(outputPath), { recursive: true });
@@ -333,15 +355,101 @@ function write(value) {
 
 async function marker(page) {
   return await page.evaluate(() => {
+    const textOf = (el) => (
+      el.getAttribute("aria-label") ||
+      el.getAttribute("title") ||
+      el.textContent ||
+      el.value ||
+      ""
+    ).trim();
     const buttons = Array.from(document.querySelectorAll("button,[role=button]"))
-      .map((el) => (el.textContent || "").trim())
+      .map((el) => textOf(el))
       .join("|");
     const body = (document.body && document.body.innerText ? document.body.innerText : "")
       .replace(/\s+/g, " ")
       .slice(0, 800);
     const element_count = document.querySelectorAll("*").length;
-    return JSON.stringify({ buttons, body, element_count });
+    const canvases = Array.from(document.querySelectorAll("canvas"))
+      .slice(0, 3)
+      .map((canvas) => {
+        try {
+          return canvas.toDataURL("image/png").slice(0, 2048);
+        } catch (_) {
+          return `${canvas.width}x${canvas.height}:unreadable`;
+        }
+      });
+    return JSON.stringify({ buttons, body, element_count, canvases });
   });
+}
+
+async function markerAfterChange(page, previous, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let current = await marker(page);
+  while (Date.now() < deadline) {
+    if (current !== previous) {
+      return current;
+    }
+    await page.waitForTimeout(80);
+    current = await marker(page);
+  }
+  return current;
+}
+
+async function controlText(locator) {
+  try {
+    return await locator.evaluate((el) => (
+      el.getAttribute("aria-label") ||
+      el.getAttribute("title") ||
+      el.textContent ||
+      el.value ||
+      ""
+    ).trim());
+  } catch (_) {
+    return "";
+  }
+}
+
+async function recoveryCandidateIndex(page, initialStartText) {
+  return await page.locator("button,[role=button]").evaluateAll((els, initialText) => {
+    const normalizedInitial = (initialText || "").trim();
+    const textOf = (el) => (
+      el.getAttribute("aria-label") ||
+      el.getAttribute("title") ||
+      el.textContent ||
+      el.value ||
+      ""
+    ).trim();
+    const candidates = els
+      .map((el, index) => ({ index, text: textOf(el) }))
+      .filter((candidate) => candidate.text.length > 0);
+    const changed = candidates.find((candidate) => candidate.text !== normalizedInitial);
+    if (changed) return changed.index;
+    const rerendered = candidates.find((candidate) => normalizedInitial && candidate.text === normalizedInitial);
+    return rerendered ? rerendered.index : -1;
+  }, initialStartText);
+}
+
+async function attemptRecoveryTransition(page, initialStartText) {
+  const deadline = Date.now() + 1200;
+  while (Date.now() < deadline) {
+    const index = await recoveryCandidateIndex(page, initialStartText);
+    if (index >= 0) {
+      const candidate = page.locator("button,[role=button]").nth(index);
+      recovery_before_marker = await marker(page);
+      try {
+        await candidate.click({ timeout: 1000 });
+        recovery_after_marker = await markerAfterChange(page, recovery_before_marker, 700);
+        if (recovery_before_marker !== recovery_after_marker) {
+          steps.push("recovery_transition");
+          recovery_transition_status = "observed";
+          return;
+        }
+      } catch (_) {}
+    }
+    await page.waitForTimeout(120);
+  }
+  steps.push("recovery_transition:not_observed");
+  recovery_transition_status = "not_observed";
 }
 
 (async () => {
@@ -356,14 +464,17 @@ async function marker(page) {
     before_marker = await marker(page);
 
     const startControl = page.locator("button, [role=button]").first();
+    let initial_start_text = "";
     if (await startControl.count()) {
+      initial_start_text = await controlText(startControl);
       await startControl.click({ timeout: 5000 });
     }
-    after_marker = await marker(page);
+    after_marker = await markerAfterChange(page, before_marker, 800);
     if (before_marker !== after_marker) {
       steps.push("start_transition");
     }
 
+    input_before_marker = await marker(page);
     const canvas = page.locator("canvas").first();
     if (await canvas.count()) {
       const box = await canvas.boundingBox();
@@ -372,21 +483,37 @@ async function marker(page) {
       }
     }
     await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("ArrowRight");
     await page.keyboard.press("Space");
     steps.push("control_input_dispatched");
+    input_after_marker = await markerAfterChange(page, input_before_marker, 800);
+    if (input_before_marker !== input_after_marker) {
+      steps.push("input_state_change");
+    }
+
+    await attemptRecoveryTransition(page, initial_start_text);
 
     const ok = steps.includes("surface_visible") && steps.includes("start_transition");
+    const inputStateChanged = steps.includes("input_state_change");
+    const recoveryObserved = steps.includes("recovery_transition");
     write({
       ok,
       status: ok ? "passed" : "failed",
       interaction_success: ok,
       interaction_performed: ok,
       input_event_observed: steps.includes("control_input_dispatched"),
-      state_changed: ok,
-      visible_state_changed: ok,
+      input_state_change: inputStateChanged,
+      state_changed: inputStateChanged,
+      visible_state_changed: inputStateChanged,
+      recovery_transition: recoveryObserved,
+      recovery_transition_status,
       steps,
       before_marker,
       after_marker,
+      input_before_marker,
+      input_after_marker,
+      recovery_before_marker,
+      recovery_after_marker,
       failure_kind: ok ? "" : "start_transition_missing",
       duration_ms: Date.now() - started
     });
@@ -402,6 +529,15 @@ async function marker(page) {
       steps,
       before_marker,
       after_marker,
+      input_before_marker,
+      input_after_marker,
+      recovery_before_marker,
+      recovery_after_marker,
+      input_state_change: steps.includes("input_state_change"),
+      state_changed: steps.includes("input_state_change"),
+      visible_state_changed: steps.includes("input_state_change"),
+      recovery_transition: steps.includes("recovery_transition"),
+      recovery_transition_status,
       failure_kind: "probe_script_error",
       error: err && err.message ? err.message : String(err),
       duration_ms: Date.now() - started
@@ -458,23 +594,49 @@ fn observation_from_value(
         .and_then(Value::as_u64)
         .map(u128::from)
         .unwrap_or_else(|| started.elapsed().as_millis());
+    let steps = value
+        .get("steps")
+        .and_then(Value::as_array)
+        .map(|steps| {
+            steps
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let input_event_observed = value
+        .get("input_event_observed")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| steps.iter().any(|step| step == "control_input_dispatched"));
+    let explicit_state_changed = value
+        .get("input_state_change")
+        .or_else(|| value.get("state_changed"))
+        .or_else(|| value.get("visible_state_changed"))
+        .and_then(Value::as_bool);
+    let input_state_changed = steps.iter().any(|step| step == "input_state_change")
+        || explicit_state_changed == Some(true)
+        || (ok && input_event_observed && explicit_state_changed.is_none());
+    let recovery_transition_observed = steps.iter().any(|step| step == "recovery_transition")
+        || value
+            .get("recovery_transition")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let recovery_transition_not_observed = steps
+        .iter()
+        .any(|step| step == "recovery_transition:not_observed")
+        || value.get("recovery_transition").and_then(Value::as_bool) == Some(false)
+        || value
+            .get("recovery_transition_status")
+            .and_then(Value::as_str)
+            == Some("not_observed");
     BrowserInteractionObservation {
         ok,
         status: if ok { "passed" } else { "failed" }.to_string(),
         url: url.to_string(),
         evidence_path: evidence_path.to_path_buf(),
         script_path: script_path.to_path_buf(),
-        steps: value
-            .get("steps")
-            .and_then(Value::as_array)
-            .map(|steps| {
-                steps
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
+        steps,
         before_marker: value
             .get("before_marker")
             .and_then(Value::as_str)
@@ -485,6 +647,9 @@ fn observation_from_value(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        input_state_changed,
+        recovery_transition_observed,
+        recovery_transition_not_observed,
         failure_kind,
         duration_ms,
         output_excerpt: eval_events::body_snippet(&output_excerpt),
@@ -515,6 +680,9 @@ fn failure_observation(
         steps: Vec::new(),
         before_marker: String::new(),
         after_marker: String::new(),
+        input_state_changed: false,
+        recovery_transition_observed: false,
+        recovery_transition_not_observed: false,
         failure_kind: failure_kind.to_string(),
         duration_ms: started.elapsed().as_millis(),
         output_excerpt: eval_events::body_snippet(output_excerpt),
@@ -551,8 +719,17 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "interaction_success": observation.ok,
         "interaction_performed": observation.ok,
         "input_event_observed": observation.steps.iter().any(|step| step == "control_input_dispatched"),
-        "state_changed": observation.ok,
-        "visible_state_changed": observation.ok,
+        "input_state_change": observation.input_state_changed,
+        "state_changed": observation.input_state_changed,
+        "visible_state_changed": observation.input_state_changed,
+        "recovery_transition": observation.recovery_transition_observed,
+        "recovery_transition_status": if observation.recovery_transition_observed {
+            "observed"
+        } else if observation.recovery_transition_not_observed {
+            "not_observed"
+        } else {
+            "unknown"
+        },
         "steps": observation.steps,
         "before_marker": observation.before_marker,
         "after_marker": observation.after_marker,
