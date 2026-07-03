@@ -72,9 +72,12 @@ pub fn html_surface_markers(body: &str) -> HtmlSurfaceMarkers {
 pub fn html_surface_markers_json(body: &str) -> Value {
     let markers = html_surface_markers(body);
     json!({
+        "ssr_has_canvas": markers.has_canvas,
+        "ssr_interactive_control_count": markers.interactive_control_count,
         "has_canvas": markers.has_canvas,
         "interactive_control_count": markers.interactive_control_count,
         "title_text_excerpt": markers.title_text_excerpt,
+        "surface_marker_authority": "ssr",
         "route_rendered_quality": if markers.has_canvas { "rendered" } else { "rendered_without_expected_surface" },
     })
 }
@@ -267,8 +270,6 @@ fn probe_browser_readiness_with_options(
         }
         match http_get_local_route(spec.port, &spec.route) {
             Ok(response) => {
-                let cleanup = child.finish();
-                let output = first_non_empty(&cleanup.output_excerpt, &response.body_excerpt);
                 if response.status == 200 {
                     let run_dir = evidence_path.parent().unwrap_or(root);
                     let interaction_path =
@@ -278,8 +279,10 @@ fn probe_browser_readiness_with_options(
                         spec.port,
                         run_dir,
                         &interaction_path,
-                        Duration::from_secs(20),
+                        Duration::from_secs(60),
                     );
+                    let cleanup = child.finish();
+                    let output = first_non_empty(&cleanup.output_excerpt, &response.body_excerpt);
                     return finish_with_cleanup(
                         root,
                         started,
@@ -294,6 +297,8 @@ fn probe_browser_readiness_with_options(
                         cleanup.reaped,
                     );
                 }
+                let cleanup = child.finish();
+                let output = first_non_empty(&cleanup.output_excerpt, &response.body_excerpt);
                 return finish_with_cleanup(
                     root,
                     started,
@@ -618,9 +623,12 @@ fn browser_readiness_evidence_json(observation: &BrowserReadinessObservation) ->
         "status": observation.status,
         "route": observation.route,
         "route_rendered": observation.ok,
+        "ssr_has_canvas": observation.has_canvas,
+        "ssr_interactive_control_count": observation.interactive_control_count,
         "has_canvas": observation.has_canvas,
         "interactive_control_count": observation.interactive_control_count,
         "title_text_excerpt": observation.title_text_excerpt,
+        "surface_marker_authority": "ssr",
         "route_rendered_quality": if observation.has_canvas { "rendered" } else { "rendered_without_expected_surface" },
         "dev_server": {
             "profile": observation.profile,
@@ -631,6 +639,8 @@ fn browser_readiness_evidence_json(observation: &BrowserReadinessObservation) ->
             "output_excerpt": observation.output_excerpt,
             "child_spawned": observation.child_spawned,
             "child_reaped": observation.child_reaped,
+            "ssr_has_canvas": observation.has_canvas,
+            "ssr_interactive_control_count": observation.interactive_control_count,
             "has_canvas": observation.has_canvas,
             "interactive_control_count": observation.interactive_control_count,
             "title_text_excerpt": observation.title_text_excerpt,
@@ -919,6 +929,11 @@ mod tests {
         assert_eq!(observation.title_text_excerpt, "Space Test");
         let evidence =
             std::fs::read_to_string(browser_readiness_evidence_path(dir.path())).unwrap();
+        assert!(evidence.contains("\"ssr_has_canvas\": true"), "{evidence}");
+        assert!(
+            evidence.contains("\"ssr_interactive_control_count\": 1"),
+            "{evidence}"
+        );
         assert!(evidence.contains("\"has_canvas\": true"), "{evidence}");
         assert!(
             evidence.contains("\"interactive_control_count\": 1"),

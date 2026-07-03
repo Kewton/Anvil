@@ -11,7 +11,7 @@ use crate::eval_events;
 use crate::minimal_loop::verifier_env;
 
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(10);
-const INTERACTION_TIMEOUT: Duration = Duration::from_secs(20);
+const INTERACTION_TIMEOUT: Duration = Duration::from_secs(60);
 const PROVISION_TIMEOUT: Duration = Duration::from_secs(180);
 const PROBE_SCRIPT_NAME: &str = "browser-interaction-probe.cjs";
 const MANAGED_INTERACTION_PROBE_REL: &[&str] = &[".anvil", "tools", "interaction-probe"];
@@ -89,17 +89,30 @@ pub struct BrowserInteractionObservation {
     pub steps: Vec<String>,
     pub before_marker: String,
     pub after_marker: String,
+    pub input_before_marker: String,
+    pub input_after_marker: String,
+    pub recovery_before_marker: String,
+    pub recovery_after_marker: String,
     pub input_state_changed: bool,
     pub recovery_transition_observed: bool,
     pub recovery_transition_not_observed: bool,
     pub failure_kind: String,
     pub stage: String,
+    pub error: String,
     pub remediation: String,
     pub duration_ms: u128,
     pub output_excerpt: String,
+    pub stdout_excerpt: String,
+    pub stderr_excerpt: String,
+    pub raw_stdout_excerpt: String,
     pub child_spawned: bool,
     pub child_reaped: bool,
     pub playwright_resolution: Option<PlaywrightResolution>,
+    pub server_http_status: Option<i64>,
+    pub server_http_error: String,
+    pub navigation_failure_kind: String,
+    pub has_canvas: Option<bool>,
+    pub interactive_control_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,6 +563,9 @@ pub fn probe_browser_interaction_against_running_server(
             value,
             Instant::now(),
             String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
             false,
             true,
             Some(resolution.clone()),
@@ -578,6 +594,10 @@ pub fn probe_browser_interaction_against_running_server(
             started,
             "probe_script_write_failed",
             &err.to_string(),
+            "",
+            "",
+            "",
+            "",
             false,
             true,
             Some(resolution.clone()),
@@ -596,6 +616,10 @@ pub fn probe_browser_interaction_against_running_server(
                 started,
                 "probe_stdio_open_failed",
                 &err.to_string(),
+                "",
+                "",
+                "",
+                "",
                 false,
                 true,
                 Some(resolution.clone()),
@@ -634,6 +658,10 @@ pub fn probe_browser_interaction_against_running_server(
                 started,
                 "probe_spawn_failed",
                 &err.to_string(),
+                "",
+                "",
+                "",
+                "",
                 false,
                 true,
                 Some(resolution.clone()),
@@ -646,13 +674,13 @@ pub fn probe_browser_interaction_against_running_server(
         match child.try_wait() {
             Ok(Some(status)) => {
                 let reaped = child.wait().is_ok();
-                let output_excerpt = interaction_stdio_excerpt(run_dir);
+                let logs = interaction_stdio_logs(run_dir);
                 if status.success() {
                     let value = read_interaction_value(evidence_path).unwrap_or_else(|| {
                         interaction_failure_json(
                             &url,
                             "probe_evidence_missing",
-                            &output_excerpt,
+                            &logs.output_excerpt,
                             started.elapsed().as_millis(),
                         )
                     });
@@ -662,7 +690,10 @@ pub fn probe_browser_interaction_against_running_server(
                         &url,
                         value,
                         started,
-                        output_excerpt,
+                        logs.output_excerpt,
+                        logs.stdout_excerpt,
+                        logs.stderr_excerpt,
+                        String::new(),
                         true,
                         reaped,
                         Some(resolution.clone()),
@@ -671,13 +702,17 @@ pub fn probe_browser_interaction_against_running_server(
                     return InteractionProbeOutcome::Observation(Box::new(observation));
                 }
                 if let Some(value) = read_interaction_value(evidence_path) {
+                    let value = merge_script_stdout_failure_value(value, &logs);
                     let observation = observation_from_value(
                         evidence_path,
                         &script_path,
                         &url,
                         value,
                         started,
-                        output_excerpt,
+                        logs.output_excerpt,
+                        logs.stdout_excerpt,
+                        logs.stderr_excerpt,
+                        String::new(),
                         true,
                         reaped,
                         Some(resolution.clone()),
@@ -692,7 +727,11 @@ pub fn probe_browser_interaction_against_running_server(
                     port,
                     started,
                     "probe_command_failed",
-                    &output_excerpt,
+                    &logs.output_excerpt,
+                    &logs.stdout_raw,
+                    &logs.stdout_excerpt,
+                    &logs.stderr_excerpt,
+                    &logs.raw_stdout_excerpt,
                     true,
                     reaped,
                     Some(resolution.clone()),
@@ -711,6 +750,10 @@ pub fn probe_browser_interaction_against_running_server(
                     started,
                     "probe_status_unreadable",
                     &err.to_string(),
+                    "",
+                    "",
+                    "",
+                    "",
                     true,
                     reaped,
                     Some(resolution.clone()),
@@ -721,7 +764,7 @@ pub fn probe_browser_interaction_against_running_server(
         if Instant::now() >= deadline {
             terminate_child_group(&mut child);
             let reaped = child.wait().is_ok();
-            let output_excerpt = interaction_stdio_excerpt(run_dir);
+            let logs = interaction_stdio_logs(run_dir);
             let observation = failure_observation(
                 root,
                 evidence_path,
@@ -729,7 +772,11 @@ pub fn probe_browser_interaction_against_running_server(
                 port,
                 started,
                 "probe_timeout",
-                &output_excerpt,
+                &logs.output_excerpt,
+                &logs.stdout_raw,
+                &logs.stdout_excerpt,
+                &logs.stderr_excerpt,
+                &logs.raw_stdout_excerpt,
                 true,
                 reaped,
                 Some(resolution.clone()),
@@ -749,10 +796,14 @@ fn write_probe_script(path: &Path) -> std::io::Result<()> {
 
 fn interaction_probe_script() -> &'static str {
     r#"const fs = require("fs");
+const http = require("http");
 
 const url = process.argv[2];
 const outputPath = process.argv[3];
 const started = Date.now();
+const LAUNCH_TIMEOUT_MS = 20000;
+const GOTO_TIMEOUT_MS = 12000;
+const SERVER_CHECK_TIMEOUT_MS = 5000;
 const steps = [];
 let stage = "resolving";
 let before_marker = "";
@@ -762,17 +813,61 @@ let input_after_marker = "";
 let recovery_before_marker = "";
 let recovery_after_marker = "";
 let recovery_transition_status = "unknown";
+let server_check = { ok: false, status: null, error: "" };
+let post_js_surface = null;
 
 function write(value) {
   fs.mkdirSync(require("path").dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, JSON.stringify(value, null, 2) + "\n");
 }
 
-function mark(nextStage) {
+function writeFailure(value) {
+  write(value);
+  try {
+    process.stdout.write(JSON.stringify(value) + "\n");
+  } catch (_) {}
+}
+
+function mark(nextStage, extra = {}) {
   stage = nextStage;
   try {
-    process.stderr.write(JSON.stringify({ stage }) + "\n");
+    process.stderr.write(JSON.stringify({ stage, ...extra }) + "\n");
   } catch (_) {}
+}
+
+function rawHttpGet(targetUrl) {
+  return new Promise((resolve) => {
+    let parsed;
+    try {
+      parsed = new URL(targetUrl);
+    } catch (err) {
+      resolve({ ok: false, status: null, error: err && err.message ? err.message : String(err) });
+      return;
+    }
+    const request = http.get({
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port,
+      path: `${parsed.pathname || "/"}${parsed.search || ""}`,
+      timeout: SERVER_CHECK_TIMEOUT_MS,
+      headers: {
+        "Connection": "close",
+        "User-Agent": "anvilminimal-interaction-probe"
+      }
+    }, (response) => {
+      response.resume();
+      response.on("end", () => {
+        resolve({ ok: true, status: response.statusCode || 0, error: "" });
+      });
+    });
+    request.on("timeout", () => {
+      request.destroy(new Error("server_check_timeout"));
+    });
+    request.on("error", (err) => {
+      const code = err && err.code ? `${err.code}: ` : "";
+      resolve({ ok: false, status: null, error: `${code}${err && err.message ? err.message : String(err)}` });
+    });
+  });
 }
 
 async function marker(page) {
@@ -802,6 +897,50 @@ async function marker(page) {
       });
     return JSON.stringify({ buttons, body, element_count, canvases });
   });
+}
+
+async function surfaceSnapshot(page) {
+  return await page.evaluate(() => {
+    const controls = document.querySelectorAll("button,[role=button],input,select,textarea,a[href]");
+    const canvases = document.querySelectorAll("canvas");
+    const title = document.title || "";
+    return {
+      has_canvas: canvases.length > 0,
+      canvas_count: canvases.length,
+      interactive_control_count: controls.length,
+      title_text_excerpt: title.slice(0, 120)
+    };
+  });
+}
+
+function navigationFailureDetail(err) {
+  const message = err && err.message ? err.message : String(err);
+  const net = message.match(/net::([A-Z0-9_]+)/);
+  if (net) return net[1];
+  if (/timeout/i.test(message)) return "timeout";
+  if (/page crashed/i.test(message)) return "page_crash";
+  if (/target closed/i.test(message)) return "target_closed";
+  return "navigation_error";
+}
+
+async function gotoWithRetry(page, targetUrl) {
+  let lastErr;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      return await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: GOTO_TIMEOUT_MS });
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 1) {
+        mark("goto_retry", { attempt, error: err && err.message ? err.message : String(err) });
+        await page.waitForTimeout(1000);
+      }
+    }
+  }
+  const detail = navigationFailureDetail(lastErr);
+  const err = new Error(lastErr && lastErr.message ? lastErr.message : String(lastErr));
+  err.anvilFailureKind = server_check.ok ? "app_route_unresponsive" : "probe_infrastructure_failed:server_unreachable";
+  err.navigationFailureKind = `probe_navigation_failed:${detail}`;
+  throw err;
 }
 
 async function markerAfterChange(page, previous, timeoutMs) {
@@ -880,14 +1019,23 @@ async function attemptRecoveryTransition(page, initialStartText) {
     mark("resolving");
     const { chromium } = require("playwright");
     mark("launching");
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, timeout: LAUNCH_TIMEOUT_MS });
     const page = await browser.newPage();
+    mark("server_check");
+    server_check = await rawHttpGet(url);
+    if (!server_check.ok) {
+      const err = new Error(server_check.error || "server_unreachable");
+      err.anvilFailureKind = "probe_infrastructure_failed:server_unreachable";
+      throw err;
+    }
     mark("navigating");
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
+    await gotoWithRetry(page, url);
+    mark("surface_wait");
     const surface = page.locator("canvas, button, [role=button]").first();
     await surface.waitFor({ timeout: 10000 });
     steps.push("surface_visible");
     mark("observing");
+    post_js_surface = await surfaceSnapshot(page);
     before_marker = await marker(page);
 
     const startControl = page.locator("button, [role=button]").first();
@@ -943,6 +1091,15 @@ async function attemptRecoveryTransition(page, initialStartText) {
       recovery_before_marker,
       recovery_after_marker,
       failure_kind: ok ? "" : "start_transition_missing",
+      server_http_status: server_check.status,
+      server_check,
+      post_js_has_canvas: post_js_surface ? post_js_surface.has_canvas : false,
+      post_js_canvas_count: post_js_surface ? post_js_surface.canvas_count : 0,
+      post_js_interactive_control_count: post_js_surface ? post_js_surface.interactive_control_count : 0,
+      has_canvas: post_js_surface ? post_js_surface.has_canvas : false,
+      canvas_count: post_js_surface ? post_js_surface.canvas_count : 0,
+      interactive_control_count: post_js_surface ? post_js_surface.interactive_control_count : 0,
+      title_text_excerpt: post_js_surface ? post_js_surface.title_text_excerpt : "",
       duration_ms: Date.now() - started
     });
     await browser.close();
@@ -951,7 +1108,7 @@ async function attemptRecoveryTransition(page, initialStartText) {
     if (browser) {
       try { await browser.close(); } catch (_) {}
     }
-    write({
+    writeFailure({
       ok: false,
       status: "failed",
       steps,
@@ -967,8 +1124,19 @@ async function attemptRecoveryTransition(page, initialStartText) {
       visible_state_changed: steps.includes("input_state_change"),
       recovery_transition: steps.includes("recovery_transition"),
       recovery_transition_status,
-      failure_kind: "probe_script_error",
+      failure_kind: err && err.anvilFailureKind ? err.anvilFailureKind : "probe_script_error",
+      navigation_failure_kind: err && err.navigationFailureKind ? err.navigationFailureKind : "",
       error: err && err.message ? err.message : String(err),
+      server_http_status: server_check.status,
+      server_http_error: server_check.error || "",
+      server_check,
+      post_js_has_canvas: post_js_surface ? post_js_surface.has_canvas : null,
+      post_js_canvas_count: post_js_surface ? post_js_surface.canvas_count : null,
+      post_js_interactive_control_count: post_js_surface ? post_js_surface.interactive_control_count : null,
+      has_canvas: post_js_surface ? post_js_surface.has_canvas : null,
+      canvas_count: post_js_surface ? post_js_surface.canvas_count : null,
+      interactive_control_count: post_js_surface ? post_js_surface.interactive_control_count : null,
+      title_text_excerpt: post_js_surface ? post_js_surface.title_text_excerpt : "",
       duration_ms: Date.now() - started
     });
     process.exit(1);
@@ -985,12 +1153,85 @@ fn open_stdio_logs(run_dir: &Path) -> std::io::Result<(std::fs::File, std::fs::F
     ))
 }
 
-fn interaction_stdio_excerpt(run_dir: &Path) -> String {
+#[derive(Debug, Clone, Default)]
+struct InteractionStdio {
+    output_excerpt: String,
+    stdout_raw: String,
+    stdout_excerpt: String,
+    stderr_excerpt: String,
+    raw_stdout_excerpt: String,
+}
+
+fn interaction_stdio_logs(run_dir: &Path) -> InteractionStdio {
     let stdout =
         std::fs::read_to_string(run_dir.join("browser-interaction.out")).unwrap_or_default();
     let stderr =
         std::fs::read_to_string(run_dir.join("browser-interaction.err")).unwrap_or_default();
-    eval_events::body_snippet(format!("{stdout}\n{stderr}").trim())
+    let stdout_trimmed = stdout.trim();
+    let stderr_tail = last_lines(&stderr, 20);
+    InteractionStdio {
+        output_excerpt: eval_events::body_snippet(format!("{stdout}\n{stderr}").trim()),
+        stdout_raw: stdout.clone(),
+        stdout_excerpt: eval_events::body_snippet(stdout_trimmed),
+        stderr_excerpt: eval_events::body_snippet(stderr_tail.trim()),
+        raw_stdout_excerpt: if stdout_failure_json(&stdout).is_some() {
+            String::new()
+        } else {
+            eval_events::body_snippet(stdout_trimmed)
+        },
+    }
+}
+
+fn last_lines(text: &str, max_lines: usize) -> String {
+    let mut lines = text.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.reverse();
+    lines.join("\n")
+}
+
+fn stdout_failure_json(stdout: &str) -> Option<Value> {
+    stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(Value::is_object)
+}
+
+fn merge_script_stdout_failure_value(mut value: Value, logs: &InteractionStdio) -> Value {
+    if let Some(stdout_value) = stdout_failure_json(&logs.stdout_raw) {
+        for key in [
+            "error",
+            "stage",
+            "before_marker",
+            "after_marker",
+            "input_before_marker",
+            "input_after_marker",
+            "recovery_before_marker",
+            "recovery_after_marker",
+            "failure_kind",
+            "navigation_failure_kind",
+            "server_http_status",
+            "server_http_error",
+            "server_check",
+            "post_js_has_canvas",
+            "post_js_canvas_count",
+            "post_js_interactive_control_count",
+            "has_canvas",
+            "canvas_count",
+            "interactive_control_count",
+        ] {
+            if let Some(field) = stdout_value.get(key) {
+                value[key] = field.clone();
+            }
+        }
+    } else if !logs.raw_stdout_excerpt.is_empty() {
+        value["raw_stdout_excerpt"] = json!(logs.raw_stdout_excerpt);
+    }
+    if !logs.stderr_excerpt.is_empty() {
+        value["stderr_excerpt"] = json!(logs.stderr_excerpt);
+    }
+    value
 }
 
 fn stage_from_probe_output(output: &str) -> Option<String> {
@@ -1028,6 +1269,9 @@ fn observation_from_value(
     value: Value,
     started: Instant,
     output_excerpt: String,
+    stdout_excerpt: String,
+    stderr_excerpt: String,
+    raw_stdout_excerpt: String,
     child_spawned: bool,
     child_reaped: bool,
     playwright_resolution: Option<PlaywrightResolution>,
@@ -1054,12 +1298,37 @@ fn observation_from_value(
         .get("error")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let server_http_status = value
+        .get("server_http_status")
+        .or_else(|| {
+            value
+                .get("server_check")
+                .and_then(|server_check| server_check.get("status"))
+        })
+        .and_then(Value::as_i64);
+    let server_http_error = value
+        .get("server_http_error")
+        .or_else(|| {
+            value
+                .get("server_check")
+                .and_then(|server_check| server_check.get("error"))
+        })
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let navigation_failure_kind = value
+        .get("navigation_failure_kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let failure_kind = normalized_interaction_failure_kind(
         ok,
         &stage,
         &raw_failure_kind,
         value_error,
         &output_excerpt,
+        server_http_status,
+        &server_http_error,
     );
     let remediation = interaction_failure_remediation(&failure_kind);
     let duration_ms = value
@@ -1120,18 +1389,91 @@ fn observation_from_value(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        input_before_marker: value
+            .get("input_before_marker")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        input_after_marker: value
+            .get("input_after_marker")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        recovery_before_marker: value
+            .get("recovery_before_marker")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        recovery_after_marker: value
+            .get("recovery_after_marker")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         input_state_changed,
         recovery_transition_observed,
         recovery_transition_not_observed,
         failure_kind,
         stage,
+        error: value_error.to_string(),
         remediation,
         duration_ms,
         output_excerpt: eval_events::body_snippet(&output_excerpt),
+        stdout_excerpt: eval_events::body_snippet(&stdout_excerpt),
+        stderr_excerpt: eval_events::body_snippet(&stderr_excerpt),
+        raw_stdout_excerpt: eval_events::body_snippet(
+            value
+                .get("raw_stdout_excerpt")
+                .and_then(Value::as_str)
+                .unwrap_or(&raw_stdout_excerpt),
+        ),
         child_spawned,
         child_reaped,
         playwright_resolution,
+        server_http_status,
+        server_http_error,
+        navigation_failure_kind,
+        has_canvas: bool_value(
+            &value,
+            &[
+                "post_js_has_canvas",
+                "has_canvas",
+                "canvas_found",
+                "canvas_available",
+            ],
+        ),
+        interactive_control_count: usize_value(
+            &value,
+            &[
+                "post_js_interactive_control_count",
+                "interactive_control_count",
+                "interactive_controls",
+            ],
+        ),
     }
+}
+
+fn bool_value(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_bool))
+}
+
+fn usize_value(value: &Value, keys: &[&str]) -> Option<usize> {
+    for key in keys {
+        let Some(raw) = value.get(*key) else {
+            continue;
+        };
+        if let Some(number) = raw.as_u64()
+            && let Ok(value) = usize::try_from(number)
+        {
+            return Some(value);
+        }
+        if let Some(text) = raw.as_str()
+            && let Ok(value) = text.parse::<usize>()
+        {
+            return Some(value);
+        }
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1143,11 +1485,38 @@ fn failure_observation(
     started: Instant,
     failure_kind: &str,
     output_excerpt: &str,
+    stdout_raw: &str,
+    stdout_excerpt: &str,
+    stderr_excerpt: &str,
+    raw_stdout_excerpt: &str,
     child_spawned: bool,
     child_reaped: bool,
     playwright_resolution: Option<PlaywrightResolution>,
 ) -> BrowserInteractionObservation {
     let url = format!("http://127.0.0.1:{port}/");
+    if failure_kind == "probe_command_failed"
+        && let Some(mut value) = stdout_failure_json(stdout_raw)
+    {
+        if value.get("stderr_excerpt").is_none() && !stderr_excerpt.is_empty() {
+            value["stderr_excerpt"] = json!(stderr_excerpt);
+        }
+        let observation = observation_from_value(
+            evidence_path,
+            script_path,
+            &url,
+            value,
+            started,
+            output_excerpt.to_string(),
+            stdout_excerpt.to_string(),
+            stderr_excerpt.to_string(),
+            raw_stdout_excerpt.to_string(),
+            child_spawned,
+            child_reaped,
+            playwright_resolution,
+        );
+        mirror_interaction_observation(root, evidence_path, &observation);
+        return observation;
+    }
     let stage = stage_from_probe_output(output_excerpt).unwrap_or_default();
     let failure_kind = normalized_interaction_failure_kind(
         false,
@@ -1155,6 +1524,8 @@ fn failure_observation(
         failure_kind,
         output_excerpt,
         output_excerpt,
+        None,
+        "",
     );
     let remediation = interaction_failure_remediation(&failure_kind);
     let observation = BrowserInteractionObservation {
@@ -1166,17 +1537,30 @@ fn failure_observation(
         steps: Vec::new(),
         before_marker: String::new(),
         after_marker: String::new(),
+        input_before_marker: String::new(),
+        input_after_marker: String::new(),
+        recovery_before_marker: String::new(),
+        recovery_after_marker: String::new(),
         input_state_changed: false,
         recovery_transition_observed: false,
         recovery_transition_not_observed: false,
         failure_kind,
         stage,
+        error: String::new(),
         remediation,
         duration_ms: started.elapsed().as_millis(),
         output_excerpt: eval_events::body_snippet(output_excerpt),
+        stdout_excerpt: eval_events::body_snippet(stdout_excerpt),
+        stderr_excerpt: eval_events::body_snippet(stderr_excerpt),
+        raw_stdout_excerpt: eval_events::body_snippet(raw_stdout_excerpt),
         child_spawned,
         child_reaped,
         playwright_resolution,
+        server_http_status: None,
+        server_http_error: String::new(),
+        navigation_failure_kind: String::new(),
+        has_canvas: None,
+        interactive_control_count: None,
     };
     mirror_interaction_observation(root, evidence_path, &observation);
     observation
@@ -1206,6 +1590,8 @@ fn normalized_interaction_failure_kind(
     raw_failure_kind: &str,
     error: &str,
     output_excerpt: &str,
+    server_http_status: Option<i64>,
+    server_http_error: &str,
 ) -> String {
     if ok {
         return String::new();
@@ -1221,6 +1607,23 @@ fn normalized_interaction_failure_kind(
         || raw_failure_kind.starts_with("probe_infrastructure_failed")
     {
         return raw_failure_kind.to_string();
+    }
+    if raw_failure_kind == "app_route_unresponsive" {
+        return raw_failure_kind.to_string();
+    }
+    if raw_failure_kind.starts_with("probe_navigation_failed") {
+        if server_http_status.is_some() && server_http_error.trim().is_empty() {
+            return "app_route_unresponsive".to_string();
+        }
+        return "probe_infrastructure_failed:server_unreachable".to_string();
+    }
+    if raw_failure_kind == "probe_script_error"
+        && stage == "navigating"
+        && server_http_status.is_some()
+        && server_http_error.trim().is_empty()
+        && looks_like_navigation_error(&combined)
+    {
+        return "app_route_unresponsive".to_string();
     }
     if probe_stage_before_observation(stage)
         || matches!(
@@ -1246,6 +1649,16 @@ fn normalized_interaction_failure_kind(
 
 fn probe_stage_before_observation(stage: &str) -> bool {
     matches!(stage, "resolving" | "launching" | "navigating")
+}
+
+fn looks_like_navigation_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("page.goto")
+        || lower.contains("net::err_")
+        || lower.contains("navigation")
+        || lower.contains("timeout")
+        || lower.contains("page crashed")
+        || lower.contains("target closed")
 }
 
 fn playwright_module_missing(text: &str) -> bool {
@@ -1274,9 +1687,9 @@ fn interaction_failure_remediation(failure_kind: &str) -> String {
 }
 
 fn interaction_failure_category(failure_kind: &str, stage: &str) -> &'static str {
+    let _ = stage;
     if failure_kind.starts_with("probe_dependency_missing")
         || failure_kind.starts_with("probe_infrastructure_failed")
-        || probe_stage_before_observation(stage)
     {
         "infrastructure"
     } else if failure_kind.is_empty() {
@@ -1311,6 +1724,10 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "steps": observation.steps,
         "before_marker": observation.before_marker,
         "after_marker": observation.after_marker,
+        "input_before_marker": observation.input_before_marker,
+        "input_after_marker": observation.input_after_marker,
+        "recovery_before_marker": observation.recovery_before_marker,
+        "recovery_after_marker": observation.recovery_after_marker,
         "duration_ms": observation.duration_ms,
         "probe": {
             "script_path": observation.script_path.display().to_string(),
@@ -1326,6 +1743,54 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
     }
     if !observation.output_excerpt.is_empty() {
         value["output_excerpt"] = json!(observation.output_excerpt);
+    }
+    if !observation.error.is_empty() {
+        value["error"] = json!(observation.error);
+        value["probe"]["error"] = json!(observation.error);
+    }
+    if !observation.stdout_excerpt.is_empty() {
+        value["stdout_excerpt"] = json!(observation.stdout_excerpt);
+        value["probe"]["stdout_excerpt"] = json!(observation.stdout_excerpt);
+    }
+    if !observation.stderr_excerpt.is_empty() {
+        value["stderr_excerpt"] = json!(observation.stderr_excerpt);
+        value["probe"]["stderr_excerpt"] = json!(observation.stderr_excerpt);
+    }
+    if !observation.raw_stdout_excerpt.is_empty() {
+        value["raw_stdout_excerpt"] = json!(observation.raw_stdout_excerpt);
+        value["probe"]["raw_stdout_excerpt"] = json!(observation.raw_stdout_excerpt);
+    }
+    if let Some(status) = observation.server_http_status {
+        value["server_http_status"] = json!(status);
+        value["server_check"] = json!({
+            "ok": observation.server_http_error.is_empty(),
+            "status": status,
+            "error": observation.server_http_error.as_str(),
+        });
+    } else if !observation.server_http_error.is_empty() {
+        value["server_http_error"] = json!(observation.server_http_error.as_str());
+        value["server_check"] = json!({
+            "ok": false,
+            "status": Value::Null,
+            "error": observation.server_http_error.as_str(),
+        });
+    }
+    if !observation.navigation_failure_kind.is_empty() {
+        value["navigation_failure_kind"] = json!(observation.navigation_failure_kind);
+        value["probe"]["navigation_failure_kind"] = json!(observation.navigation_failure_kind);
+    }
+    if let Some(has_canvas) = observation.has_canvas {
+        value["has_canvas"] = json!(has_canvas);
+        value["post_js_has_canvas"] = json!(has_canvas);
+        value["route_rendered_quality"] = json!(if has_canvas {
+            "rendered"
+        } else {
+            "rendered_without_expected_surface"
+        });
+    }
+    if let Some(count) = observation.interactive_control_count {
+        value["interactive_control_count"] = json!(count);
+        value["post_js_interactive_control_count"] = json!(count);
     }
     if let Some(resolution) = &observation.playwright_resolution {
         value["playwright_resolution"] = json!(resolution);
@@ -1783,6 +2248,10 @@ exit 1
             Instant::now(),
             "probe_command_failed",
             "{\"stage\":\"resolving\"}\n{\"stage\":\"navigating\"}",
+            "",
+            "",
+            "{\"stage\":\"resolving\"}\n{\"stage\":\"navigating\"}",
+            "",
             true,
             true,
             None,
@@ -1793,6 +2262,61 @@ exit 1
             observation.failure_kind,
             "probe_infrastructure_failed:probe_command_failed"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn script_exit_failure_merges_stdout_json_error_and_stderr_tail() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_node = dir.path().join("fake-node.sh");
+        std::fs::write(
+            &fake_node,
+            r#"#!/bin/sh
+echo '{"stage":"resolving"}' >&2
+echo '{"stage":"launching"}' >&2
+echo '{"stage":"navigating"}' >&2
+for i in $(seq 1 25); do echo "stderr line $i" >&2; done
+printf '%s\n' '{"ok":false,"status":"failed","stage":"navigating","failure_kind":"probe_script_error","error":"page.goto: net::ERR_CONNECTION_REFUSED at http://127.0.0.1:34001/","before_marker":"menu","after_marker":"menu","duration_ms":13}'
+exit 1
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_node).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_node, permissions).unwrap();
+
+        write_test_availability_override(dir.path(), true);
+        write_test_node_program_override(dir.path(), &fake_node);
+        let run_dir = dir.path().join(".anvil/runs/stdout-json");
+        let path = run_dir.join("browser-interaction.json");
+        let outcome = probe_browser_interaction_against_running_server(
+            dir.path(),
+            34001,
+            &run_dir,
+            &path,
+            Duration::from_secs(1),
+        );
+        let observation = outcome.observation().expect("observation");
+
+        assert!(!observation.ok, "{observation:?}");
+        assert!(
+            observation.error.contains("net::ERR_CONNECTION_REFUSED"),
+            "{observation:?}"
+        );
+        assert_eq!(observation.stage, "navigating");
+        assert_eq!(observation.before_marker, "menu");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value = serde_json::from_str::<Value>(&text).unwrap();
+        let stderr_excerpt = value
+            .get("stderr_excerpt")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(text.contains("net::ERR_CONNECTION_REFUSED"), "{text}");
+        assert!(text.contains("\"stderr_excerpt\""), "{text}");
+        assert!(stderr_excerpt.starts_with("stderr line 6"), "{text}");
+        assert!(stderr_excerpt.contains("stderr line 25"), "{text}");
     }
 
     #[test]

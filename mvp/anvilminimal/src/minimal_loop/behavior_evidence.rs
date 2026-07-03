@@ -453,13 +453,16 @@ impl BehaviorObservation {
     }
 
     fn infrastructure_failure(&self) -> bool {
+        if self.failure_kind == "app_route_unresponsive"
+            || self.failure_kind.starts_with("probe_navigation_failed")
+        {
+            return false;
+        }
         !self.ok
             && (self.failure_kind.starts_with("probe_dependency_missing")
                 || self.failure_kind.starts_with("probe_infrastructure_failed")
-                || (matches!(
-                    self.stage.as_str(),
-                    "resolving" | "launching" | "navigating"
-                ) && !self.surface_visible))
+                || (matches!(self.stage.as_str(), "resolving" | "launching")
+                    && !self.surface_visible))
     }
 }
 

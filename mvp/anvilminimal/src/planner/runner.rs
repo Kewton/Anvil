@@ -4170,6 +4170,8 @@ fn emit_browser_probe_event(config: &Config, observation: &BrowserReadinessObser
             "output_excerpt": eval_events::body_snippet(&observation.output_excerpt),
             "child_spawned": observation.child_spawned,
             "child_reaped": observation.child_reaped,
+            "ssr_has_canvas": observation.has_canvas,
+            "ssr_interactive_control_count": observation.interactive_control_count,
             "has_canvas": observation.has_canvas,
             "interactive_control_count": observation.interactive_control_count,
             "title_text_excerpt": observation.title_text_excerpt,
@@ -4202,6 +4204,23 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "status": observation.status,
                     "ok": observation.ok,
                     "failure_kind": observation.failure_kind,
+                    "failure_category": if observation.failure_kind.starts_with("probe_dependency_missing")
+                        || observation.failure_kind.starts_with("probe_infrastructure_failed")
+                    {
+                        "infrastructure"
+                    } else if observation.failure_kind.is_empty() {
+                        ""
+                    } else {
+                        "app"
+                    },
+                    "stage": observation.stage,
+                    "error": observation.error,
+                    "stderr_excerpt": observation.stderr_excerpt,
+                    "server_http_status": observation.server_http_status,
+                    "server_http_error": observation.server_http_error,
+                    "navigation_failure_kind": observation.navigation_failure_kind,
+                    "has_canvas": observation.has_canvas,
+                    "interactive_control_count": observation.interactive_control_count,
                     "steps": observation.steps,
                     "duration_ms": observation.duration_ms,
                     "evidence_path": observation.evidence_path.display().to_string(),
@@ -4820,9 +4839,8 @@ fn browser_release_gate_with_expectations(
     );
     let browser_status = browser.status.as_status();
     let interaction_status = interaction.status.as_status();
-    let canvas_surface_missing = canvas_surface_expected
-        && matches!(browser.status, ReleaseEvidenceStatus::Passed)
-        && release_evidence_canvas_marker_is_false(&browser.path);
+    let canvas_surface_missing =
+        release_gate_canvas_surface_missing(canvas_surface_expected, &browser, &interaction);
     if let ReleaseEvidenceStatus::Failed(reason) = &browser.status {
         return ReleaseGateSummary {
             status: "failed".to_string(),
@@ -5360,7 +5378,7 @@ fn run_nextjs_dev_route_probe_with_runtime(
                             spec.port,
                             run_dir,
                             &interaction_path,
-                            Duration::from_secs(20),
+                            Duration::from_secs(60),
                         );
                     emit_browser_interaction_probe_event(config, &interaction);
                 }
@@ -6140,9 +6158,12 @@ fn dev_server_passed_evidence(
 fn add_surface_markers_to_evidence(value: &mut Value, body_excerpt: &str) {
     let markers = html_surface_markers_json(body_excerpt);
     for key in [
+        "ssr_has_canvas",
+        "ssr_interactive_control_count",
         "has_canvas",
         "interactive_control_count",
         "title_text_excerpt",
+        "surface_marker_authority",
         "route_rendered_quality",
     ] {
         value[key] = markers.get(key).cloned().unwrap_or(Value::Null);
@@ -6158,8 +6179,60 @@ fn release_evidence_canvas_marker_is_false(path: &str) -> bool {
             .get("browser_details")
             .or_else(|| value.get("details"))
             .filter(|value| value.is_object());
-        bool_field_deep(value, details, &["has_canvas"]) == Some(false)
+        bool_field_deep(value, details, &["ssr_has_canvas", "has_canvas"]) == Some(false)
     })
+}
+
+fn release_gate_canvas_surface_missing(
+    expected: bool,
+    browser: &ReleaseEvidence,
+    interaction: &ReleaseEvidence,
+) -> bool {
+    if !expected {
+        return false;
+    }
+    if release_interaction_surface_authoritative(interaction) {
+        return release_interaction_canvas_marker(&interaction.path) == Some(false);
+    }
+    matches!(browser.status, ReleaseEvidenceStatus::Passed)
+        && release_evidence_canvas_marker_is_false(&browser.path)
+}
+
+fn release_interaction_surface_authoritative(interaction: &ReleaseEvidence) -> bool {
+    if interaction.path.is_empty() {
+        return false;
+    }
+    match &interaction.status {
+        ReleaseEvidenceStatus::Passed => true,
+        ReleaseEvidenceStatus::Failed(reason) => {
+            !interaction_probe_infrastructure_failure_reason(reason)
+        }
+        ReleaseEvidenceStatus::Unavailable(_) => false,
+    }
+}
+
+fn release_interaction_canvas_marker(path: &str) -> Option<bool> {
+    let value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+    let details = value
+        .get("browser_details")
+        .or_else(|| value.get("details"))
+        .filter(|value| value.is_object());
+    if let Some(has_canvas) = bool_field_deep(
+        &value,
+        details,
+        &[
+            "post_js_has_canvas",
+            "has_canvas",
+            "canvas_found",
+            "canvas_available",
+        ],
+    ) {
+        return Some(has_canvas);
+    }
+    numeric_field_deep(&value, details, &["post_js_canvas_count", "canvas_count"])
+        .map(|count| count > 0)
 }
 
 fn read_release_evidence(
@@ -13037,8 +13110,49 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
 
         assert_eq!(gate.status, "partial", "{gate:?}");
         assert_eq!(gate.browser_readiness_status, "passed");
+        assert!(gate.interaction_evidence_status.starts_with("unavailable:"));
         assert!(
             gate.reasons
+                .iter()
+                .any(|reason| reason.contains("rendered_without_expected_surface")),
+            "{gate:?}"
+        );
+    }
+
+    #[test]
+    fn interaction_dom_surface_supersedes_empty_ssr_surface_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":true,"http_status":200,"route_rendered":true,"ssr_has_canvas":false,"ssr_interactive_control_count":0,"has_canvas":false,"interactive_control_count":0,"route_rendered_quality":"rendered_without_expected_surface"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("browser-interaction.json"),
+            r#"{"ok":true,"status":"passed","interaction_success":true,"interaction_performed":true,"input_event_observed":true,"state_changed":true,"post_js_has_canvas":true,"post_js_interactive_control_count":1,"canvas_found":true}"#,
+        )
+        .unwrap();
+        let report = RuntimeAcceptanceReport {
+            passed: true,
+            primary_reason: "pass".to_string(),
+            ..RuntimeAcceptanceReport::default()
+        };
+
+        let gate = final_acceptance_release_gate(
+            &cfg,
+            "nextjs",
+            "Create a canvas-based interactive browser game",
+            &["player_control".to_string()],
+            Some(&report),
+            true,
+        );
+
+        assert_eq!(gate.status, "pass", "{gate:?}");
+        assert_eq!(gate.interaction_evidence_status, "passed");
+        assert!(
+            !gate
+                .reasons
                 .iter()
                 .any(|reason| reason.contains("rendered_without_expected_surface")),
             "{gate:?}"
