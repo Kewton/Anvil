@@ -33,7 +33,7 @@ use crate::minimal_loop::reachability::{
     reachability_recovery_reason,
 };
 use crate::minimal_loop::repair_target::{
-    RepairFollowThrough, classify_repair_follow_through, classify_repair_target,
+    RepairFollowThrough, RepairTarget, classify_repair_follow_through, classify_repair_target,
 };
 use crate::minimal_loop::verifier_env;
 use crate::planner::intent::detect_intent;
@@ -3030,8 +3030,8 @@ pub fn run_ultra_plan_with_ui(
             &ultra_context,
             initial_target.as_str(),
             &expected_paths,
-            1,
-            FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+            &plan_adherence_report(plan, &config.workspace_root).missing,
+            (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
         );
         eval_events::emit(
             config.eval_events_path.as_deref(),
@@ -8260,8 +8260,10 @@ fn ultra_phase_prompt(
     let workspace_snapshot = compact_workspace_snapshot(&config.workspace_root);
     let prior_context = context.render_prompt_section();
     let unmet_final_requirements = context.render_unmet_final_requirements_section();
+    let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
+    let requested_features = render_requested_features_not_detected_line(&plan_adherence.missing);
     format!(
-        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\nProfile runtime contract:\n{}\n\nDeterministic verification preference:\n{}\n{}{}{}",
+        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\n{}\n\nProfile runtime contract:\n{}\n\nDeterministic verification preference:\n{}\n{}{}{}",
         plan.goal,
         plan.profile,
         plan.style,
@@ -8271,6 +8273,7 @@ fn ultra_phase_prompt(
         workspace_snapshot,
         prior_context,
         unmet_final_requirements,
+        requested_features,
         runtime_contract,
         preferred_verify,
         required,
@@ -8313,14 +8316,17 @@ fn final_acceptance_repair_prompt(
     context: &UltraRunContext,
     repair_target: &str,
     expected_paths: &[String],
-    attempt: usize,
-    max_attempts: usize,
+    adherence_missing: &[String],
+    repair_budget: (usize, usize),
 ) -> String {
+    let (attempt, max_attempts) = repair_budget;
     let expected = render_prompt_bullets(expected_paths);
     let missing = render_prompt_bullets(&report.missing_paths);
     let dependencies = render_prompt_bullets(&report.dependency_missing);
     let profile_failures = final_acceptance_model_fixable_profile_failures(report);
     let profile_failures = render_prompt_bullets(&profile_failures);
+    let adherence_guidance =
+        final_acceptance_adherence_guidance(report, repair_target, adherence_missing);
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
     format!(
@@ -8335,6 +8341,7 @@ Missing paths:\n{missing}\n\n\
 Dependency failures:\n{dependencies}\n\n\
 Command failures:\n{command_failures}\n\n\
 Profile failures:\n{profile_failures}\n\n\
+{adherence_guidance}\
 Expected paths to preserve or create:\n{expected}\n\n\
 {prior_context}\n\n\
 Bounded repair rules:\n\
@@ -8353,9 +8360,52 @@ Bounded repair rules:\n\
         dependencies = dependencies,
         command_failures = command_failures,
         profile_failures = profile_failures,
+        adherence_guidance = adherence_guidance,
         expected = expected,
         prior_context = context.render_prompt_section(),
     )
+}
+
+fn render_requested_features_not_detected_line(missing: &[String]) -> String {
+    if missing.is_empty() {
+        "Requested features not yet detected: none".to_string()
+    } else {
+        format!(
+            "Requested features not yet detected: {}",
+            missing.join(", ")
+        )
+    }
+}
+
+fn final_acceptance_adherence_guidance(
+    report: &VerificationReport,
+    repair_target: &str,
+    adherence_missing: &[String],
+) -> String {
+    if adherence_missing.is_empty()
+        || !final_acceptance_repairs_contract_evidence(report, repair_target)
+    {
+        return String::new();
+    }
+    format!(
+        "Secondary plan-adherence guidance:\n- also close if in scope: {}\n\n",
+        adherence_missing.join(", ")
+    )
+}
+
+fn final_acceptance_repairs_contract_evidence(
+    report: &VerificationReport,
+    repair_target: &str,
+) -> bool {
+    repair_target == RepairTarget::RequiredEvidenceMissing.as_str()
+        || final_acceptance_model_fixable_profile_failures(report)
+            .iter()
+            .any(|failure| {
+                let lower = failure.to_ascii_lowercase();
+                lower.contains("missing_required_evidence")
+                    || lower.contains("weak_verification_evidence")
+                    || lower.contains("required evidence missing")
+            })
 }
 
 fn final_acceptance_model_fixable_profile_failures(report: &VerificationReport) -> Vec<String> {
@@ -9339,6 +9389,45 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
     }
 
     #[test]
+    fn ultra_phase_prompt_renders_missing_plan_adherence_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "// keyboard lives pause\nexport default function Page(){ return <main><p>score</p></main>; }",
+        )
+        .unwrap();
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![crate::planner::ultra_plan::UltraPhase {
+                id: "gameplay".to_string(),
+                prompt:
+                    "Implement keyboard controls, lives counter, pause overlay, and score display"
+                        .to_string(),
+            }],
+        };
+
+        let prompt = ultra_phase_prompt(
+            &plan,
+            &plan.phases[0],
+            &config(dir.path().to_path_buf()),
+            &UltraRunContext::new(Vec::new()),
+        );
+
+        let line = prompt
+            .lines()
+            .find(|line| line.starts_with("Requested features not yet detected:"))
+            .expect("requested feature guidance line");
+        assert!(line.contains("keyboard"), "{line}");
+        assert!(line.contains("lives"), "{line}");
+        assert!(line.contains("pause"), "{line}");
+        assert!(!line.contains("score"), "{line}");
+    }
+
+    #[test]
     fn ultra_phase_prompt_derives_interactive_capability_evidence_from_goal_and_phase() {
         let dir = tempfile::tempdir().unwrap();
         let plan = UltraPlan {
@@ -9763,6 +9852,42 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
         assert!(summary.contains("- canvas"), "{summary}");
         assert!(summary.contains("- pause"), "{summary}");
         assert!(summary.contains("Status: complete"), "{summary}");
+    }
+
+    #[test]
+    fn plan_adherence_missing_tokens_do_not_change_acceptance_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "generic".to_string();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){ return <main><p>Ready</p></main>; }",
+        )
+        .unwrap();
+        let with_adherence_drift = UltraPlan {
+            goal: "Build a simple page".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Implement keyboard controls, lives counter, and pause mode".to_string(),
+            }],
+        };
+        let without_adherence_drift = UltraPlan {
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Finalize the page".to_string(),
+            }],
+            ..with_adherence_drift.clone()
+        };
+
+        let with_report = ultra_final_acceptance_report(&with_adherence_drift, &cfg).unwrap();
+        let without_report = ultra_final_acceptance_report(&without_adherence_drift, &cfg).unwrap();
+
+        assert_eq!(with_report, without_report);
+        assert!(with_report.is_pass(), "{with_report:?}");
     }
 
     #[test]
@@ -12124,8 +12249,8 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
             &UltraRunContext::default(),
             "capability_missing",
             &["src/app/page.tsx".to_string()],
-            1,
-            2,
+            &[],
+            (1, 2),
         );
         assert!(prompt.contains("start_transition_missing"), "{prompt}");
         assert!(!prompt.contains("interaction_evidence_missing"), "{prompt}");
@@ -12134,6 +12259,46 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
             "{prompt}"
         );
         assert!(!prompt.contains("interaction evidence status"), "{prompt}");
+    }
+
+    #[test]
+    fn final_acceptance_repair_prompt_adds_plan_adherence_as_secondary_guidance() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "missing_required_evidence:user_input_handler_evidence".to_string(),
+        );
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: Vec::new(),
+        };
+
+        let prompt = final_acceptance_repair_prompt(
+            &plan,
+            &report,
+            &UltraRunContext::default(),
+            "required_evidence_missing",
+            &["src/app/page.tsx".to_string()],
+            &[
+                "keyboard".to_string(),
+                "lives".to_string(),
+                "pause".to_string(),
+            ],
+            (1, 1),
+        );
+
+        assert!(
+            prompt.contains(
+                "Profile failures:\n- missing_required_evidence:user_input_handler_evidence"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Secondary plan-adherence guidance:\n- also close if in scope: keyboard, lives, pause"),
+            "{prompt}"
+        );
     }
 
     #[test]
