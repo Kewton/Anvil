@@ -20,6 +20,9 @@ use crate::minimal_loop::evidence::{
     RuntimeAcceptanceReport, comment_stripped_source_corpus, required_evidence_for_capability,
     verify_runtime_acceptance_with_browser_dirs_and_hints,
 };
+use crate::minimal_loop::import_scan::{
+    MissingImport, format_missing_import_findings, missing_import_target_rel, scan_relative_imports,
+};
 use crate::minimal_loop::loop_run::{
     ContractEnforcement, RunSessionError, RunSessionOptions, RunSessionOutcome, RunSessionStepKind,
     extract_requested_artifact_paths, run_session_with_outcome_with_options,
@@ -40,8 +43,8 @@ use crate::planner::lint::{
 use crate::planner::profile::{
     PhaseVerificationMode, ProfileSnapshot, profile_auto_repair, profile_before_phase,
     profile_expected_paths, profile_generation_rules, profile_guidance, profile_post_step_repair,
-    profile_quality_expectations, profile_runtime_contract, verify_profile_final,
-    verify_profile_invariant,
+    profile_quality_expectations, profile_runtime_contract, profile_setup_scaffold_paths,
+    verify_profile_final, verify_profile_invariant,
 };
 use crate::planner::repair::{
     RecoveryHandoff, RepairContext, build_repair_prompt_with_context, save_recovery_ultra_plan,
@@ -2014,6 +2017,74 @@ fn missing_final_artifacts(root: &Path, required_paths: &[String]) -> Vec<String
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct ProfileInvariantFailureEvidence {
+    report: VerificationReport,
+    missing_paths: Vec<String>,
+    failure_evidence: Vec<String>,
+}
+
+fn fresh_profile_invariant_failure_evidence(
+    config: &Config,
+    plan: &UltraPlan,
+    snapshot: &ProfileSnapshot,
+    required_paths: &[String],
+) -> ProfileInvariantFailureEvidence {
+    let report =
+        verify_profile_invariant(&config.workspace_root, &plan.profile, &plan.goal, snapshot);
+    let mut required = required_paths.to_vec();
+    merge_unique_strings(
+        &mut required,
+        &profile_setup_scaffold_paths(&config.workspace_root, &plan.profile),
+    );
+    let mut missing_paths = missing_final_artifacts(&config.workspace_root, &required);
+    merge_unique_strings(&mut missing_paths, &report.missing_paths);
+
+    let missing_imports = profile_missing_relative_imports(&config.workspace_root, &plan.profile);
+    let import_findings = format_missing_import_findings(&config.workspace_root, &missing_imports);
+    merge_unique_strings(
+        &mut missing_paths,
+        &missing_import_target_paths(&config.workspace_root, &missing_imports),
+    );
+    if missing_paths.is_empty() && !missing_imports.is_empty() {
+        merge_unique_strings(&mut missing_paths, &import_findings);
+    }
+
+    let mut failure_evidence = vec![report.primary_reason()];
+    if !import_findings.is_empty() {
+        failure_evidence.push(format!(
+            "Missing relative imports:\n{}",
+            render_prompt_bullets(&import_findings)
+        ));
+    }
+
+    ProfileInvariantFailureEvidence {
+        report,
+        missing_paths,
+        failure_evidence,
+    }
+}
+
+fn profile_missing_relative_imports(root: &Path, profile: &str) -> Vec<MissingImport> {
+    let paths = match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::app_source_paths(root)
+        }
+        _ => Vec::new(),
+    };
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    scan_relative_imports(root, &paths).unwrap_or_default()
+}
+
+fn missing_import_target_paths(root: &Path, missing: &[MissingImport]) -> Vec<String> {
+    missing
+        .iter()
+        .filter_map(|missing| missing_import_target_rel(root, missing))
+        .collect()
+}
+
 fn merge_unique_strings(out: &mut Vec<String>, incoming: &[String]) {
     for item in incoming {
         if !out.contains(item) {
@@ -2783,11 +2854,21 @@ pub fn run_ultra_plan_with_ui(
             )?;
         }
         if !invariant_report.is_pass() {
+            let fresh_evidence = fresh_profile_invariant_failure_evidence(
+                config,
+                plan,
+                &profile_snapshot,
+                &final_expected_paths,
+            );
+            invariant_report = fresh_evidence.report.clone();
+            let invariant_reason = invariant_report.primary_reason();
+            let missing_paths = fresh_evidence.missing_paths.clone();
+            let failure_evidence = fresh_evidence.failure_evidence.clone();
             if !final_phase {
                 ultra_context.update_after_profile_failure(
                     phase,
-                    &invariant_report.primary_reason(),
-                    missing_final_artifacts(&config.workspace_root, &final_expected_paths),
+                    &invariant_reason,
+                    missing_paths.clone(),
                 );
                 emit_ultra_phase_context_updated(
                     config,
@@ -2811,7 +2892,7 @@ pub fn run_ultra_plan_with_ui(
                 index,
                 "profile_invariant",
                 Some(false),
-                Some(&invariant_report.primary_reason()),
+                Some(&invariant_reason),
                 None,
             );
             emit_phase_verification_event(
@@ -2821,28 +2902,28 @@ pub fn run_ultra_plan_with_ui(
                 index,
                 PhaseVerificationMode::IntermediateInvariant,
                 false,
-                Some(&invariant_report.primary_reason()),
+                Some(&invariant_reason),
             );
             if !final_phase {
-                let handoff = save_ultra_phase_recovery_handoff(
+                let handoff = save_ultra_phase_recovery_handoff_with_evidence(
                     config,
                     plan,
                     phase,
                     UltraPhaseRecoveryRequest {
                         failure_kind: "profile_invariant_failure",
-                        reason: &invariant_report.primary_reason(),
-                        missing_paths: &invariant_report.missing_paths,
+                        reason: &invariant_reason,
+                        missing_paths: &missing_paths,
                         missing_signals: &verification_missing_signals(&invariant_report),
                         repair_targets: &["profile_contract".to_string()],
                     },
+                    &failure_evidence,
                 );
                 return Err(anyhow::anyhow!(
                     "{}",
                     render_failure_stop_reason(
                         format!(
                             "phase {} profile invariant verification failed: {}",
-                            phase.id,
-                            invariant_report.primary_reason()
+                            phase.id, invariant_reason
                         ),
                         handoff,
                     )
@@ -3229,10 +3310,22 @@ fn repair_intermediate_profile_invariant(
             );
         }
     }
+    let fresh_evidence = fresh_profile_invariant_failure_evidence(
+        config,
+        plan,
+        profile_snapshot,
+        final_expected_paths,
+    );
+    retry = fresh_evidence.report.clone();
+    if retry.is_pass() {
+        return Ok(confirm_phase_build_after_profile_repair(
+            config, plan, phase, index, step_plan, retry,
+        ));
+    }
     ultra_context.update_after_profile_failure(
         phase,
         &retry.primary_reason(),
-        missing_final_artifacts(&config.workspace_root, final_expected_paths),
+        fresh_evidence.missing_paths,
     );
     emit_ultra_phase_context_updated(
         config,
@@ -3365,6 +3458,16 @@ fn profile_invariant_model_repair_prompt(
         &plan.profile,
         &exact_reason,
     );
+    let missing_imports = profile_missing_relative_imports(&config.workspace_root, &plan.profile);
+    let import_findings = format_missing_import_findings(&config.workspace_root, &missing_imports);
+    let import_scan_section = if import_findings.is_empty() {
+        "Current missing relative imports:\n- none".to_string()
+    } else {
+        format!(
+            "Current missing relative imports:\n{}",
+            render_prompt_bullets(&import_findings)
+        )
+    };
     let deterministic_note = deterministic_error
         .map(|err| format!("\nDeterministic repair error:\n{err}\n"))
         .unwrap_or_default();
@@ -3374,6 +3477,7 @@ Original ultra goal:\n{goal}\n\n\
 Profile: {profile}\nIntent: {intent}\nPhase id: {phase_id}\nPhase task:\n{phase_task}\n\n\
 Exact invariant reason:\n\"{exact_reason}\"\n{deterministic_note}\n\
 Offending file contents:\n{file_excerpts}\n\n\
+{import_scan_section}\n\n\
 Expected profile artifacts:\n{expected}\n\n\
 {prior_context}\n\n\
 Bounded repair rules:\n\
@@ -3389,6 +3493,7 @@ Bounded repair rules:\n\
         exact_reason = exact_reason,
         deterministic_note = deterministic_note,
         file_excerpts = file_excerpts,
+        import_scan_section = import_scan_section,
         expected = expected,
         prior_context = context.render_prompt_section(),
     )
@@ -6295,13 +6400,27 @@ fn save_ultra_phase_recovery_handoff(
     phase: &UltraPhase,
     request: UltraPhaseRecoveryRequest<'_>,
 ) -> Option<eval_events::StopReasonParts> {
+    save_ultra_phase_recovery_handoff_with_evidence(config, plan, phase, request, &[])
+}
+
+fn save_ultra_phase_recovery_handoff_with_evidence(
+    config: &Config,
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    request: UltraPhaseRecoveryRequest<'_>,
+    failure_evidence: &[String],
+) -> Option<eval_events::StopReasonParts> {
     let handoff = RecoveryHandoff {
         profile: plan.profile.clone(),
         original_goal: plan.goal.clone(),
         failed_phase: Some(phase.id.clone()),
         failed_step: None,
         failure_kind: request.failure_kind.to_string(),
-        failure_evidence: vec![request.reason.to_string()],
+        failure_evidence: if failure_evidence.is_empty() {
+            vec![request.reason.to_string()]
+        } else {
+            failure_evidence.to_vec()
+        },
         missing_paths: request.missing_paths.to_vec(),
         missing_capabilities: request.missing_signals.to_vec(),
         verify_commands: Vec::new(),
@@ -7015,7 +7134,7 @@ fn fallback_step_plan_for_setup_phase(goal: &str, config: &Config) -> Option<Ste
     if !known_profile_for_setup_fallback(&config.profile) || !looks_like_setup_phase_goal(goal) {
         return None;
     }
-    let expected_paths = profile_expected_paths(&config.workspace_root, &config.profile, goal);
+    let expected_paths = profile_setup_scaffold_paths(&config.workspace_root, &config.profile);
     if expected_paths.is_empty() {
         return None;
     }
@@ -7030,17 +7149,26 @@ fn fallback_step_plan_for_setup_phase(goal: &str, config: &Config) -> Option<Ste
             id: "fallback-setup".to_string(),
             kind: "setup".to_string(),
             expected_result: "pass".to_string(),
-            instruction: format!(
-                "Create the generic {} project scaffold required for this phase: {}",
-                config.profile,
-                compact_single_line(goal)
-            ),
+            instruction: fallback_setup_instruction(&config.profile, goal, &expected_paths),
             expected_paths,
             verify,
         }],
     };
     let lint_report = lint_step_plan_report_with_workspace(&plan, Some(&config.workspace_root));
     lint_report.is_pass().then_some(plan)
+}
+
+fn fallback_setup_instruction(profile: &str, goal: &str, expected_paths: &[String]) -> String {
+    format!(
+        "Create one coherent {profile} App Router scaffold for this setup phase: {goal}. \
+         Required files: {paths}. \
+         Coherence requirements: src/app/globals.css contains @tailwind base, @tailwind components, and @tailwind utilities; \
+         src/app/layout.tsx imports ./globals.css; \
+         create exactly one Tailwind config file, preferring tailwind.config.ts and never creating multiple tailwind.config.* files; \
+         package.json scripts.dev and scripts.start run next dev and next start on the goal's port when one is mentioned.",
+        goal = compact_single_line(goal),
+        paths = expected_paths.join(", "),
+    )
 }
 
 fn known_profile_for_setup_fallback(profile: &str) -> bool {
@@ -8735,7 +8863,7 @@ Profile: nextjs\n\
 Style: default\n\
 Intent: create\n\
 Phase id: project-setup\n\
-Phase task: Initialize the Next.js project shell";
+Phase task: Scaffold and initialize the Next.js project shell on port 3011";
         let mut planner = FakeClient::new(vec![
             AssistantReply::text("not a step plan"),
             AssistantReply::text("still not a step plan"),
@@ -8744,7 +8872,7 @@ Phase task: Initialize the Next.js project shell";
 
         let plan = generate_step_plan(&mut planner, goal, &cfg).unwrap();
 
-        let expected_paths = profile_expected_paths(dir.path(), "nextjs", goal);
+        let expected_paths = crate::planner::profiles::nextjs::setup_scaffold_paths(dir.path());
         assert_eq!(planner.messages.len(), 3);
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].kind, "setup");
@@ -8756,6 +8884,27 @@ Phase task: Initialize the Next.js project shell";
                 .map(|path| format!("test -f {path}"))
                 .collect::<Vec<_>>()
         );
+        for path in crate::planner::profiles::nextjs::setup_invariant_required_paths(dir.path()) {
+            assert!(
+                plan.steps[0].expected_paths.contains(&path),
+                "fallback expected_paths must include invariant-required {path}"
+            );
+        }
+        let instruction = &plan.steps[0].instruction;
+        assert!(instruction.contains("@tailwind base"), "{instruction}");
+        assert!(
+            instruction.contains("@tailwind components"),
+            "{instruction}"
+        );
+        assert!(instruction.contains("@tailwind utilities"), "{instruction}");
+        assert!(instruction.contains("./globals.css"), "{instruction}");
+        assert!(
+            instruction.contains("exactly one Tailwind config file"),
+            "{instruction}"
+        );
+        assert!(instruction.contains("scripts.dev"), "{instruction}");
+        assert!(instruction.contains("scripts.start"), "{instruction}");
+        assert!(instruction.contains("goal's port"), "{instruction}");
         assert!(
             lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
             "{plan:?}"
@@ -9509,8 +9658,19 @@ Phase task: Initialize the Next.js project shell";
         std::fs::write(
             dir.path().join("package.json"),
             format!(
-                r#"{{"scripts":{{"build":"next build","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"}}}}"#
+                r#"{{"scripts":{{"build":"next build","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}}}}"#
             ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), nextjs_tsconfig_json()).unwrap();
+        std::fs::write(
+            dir.path().join("postcss.config.js"),
+            nextjs_postcss_config(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tailwind.config.ts"),
+            nextjs_tailwind_config_ts(),
         )
         .unwrap();
         std::fs::write(
@@ -9520,9 +9680,10 @@ Phase task: Initialize the Next.js project shell";
         .unwrap();
         std::fs::write(
             dir.path().join("src/app/layout.tsx"),
-            "export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}",
+            nextjs_layout_source(),
         )
         .unwrap();
+        std::fs::write(dir.path().join("src/app/globals.css"), nextjs_globals_css()).unwrap();
         std::fs::write(
             dir.path().join("src/app/global.d.ts"),
             "declare module \"*.css\";",
@@ -9669,7 +9830,7 @@ Phase task: Initialize the Next.js project shell";
                 "setup",
             )),
         ]);
-        let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let package = nextjs_complete_package_json();
         let static_page =
             "export default function Page(){return <main>Press any key to start</main>;}";
         let mut execution = FakeClient::new(vec![
@@ -9682,11 +9843,27 @@ Phase task: Initialize the Next.js project shell";
                     ),
                     crate::state::ToolCall::new(
                         "Write",
+                        serde_json::json!({"path":"tsconfig.json","content":nextjs_tsconfig_json()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"postcss.config.js","content":nextjs_postcss_config()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"tailwind.config.ts","content":nextjs_tailwind_config_ts()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
                         serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
-                        serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+                        serde_json::json!({"path":"src/app/layout.tsx","content":nextjs_layout_source()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/globals.css","content":nextjs_globals_css()}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
@@ -9789,7 +9966,7 @@ Phase task: Initialize the Next.js project shell";
                 "setup",
             )),
         ]);
-        let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let package = nextjs_complete_package_json();
         let static_page =
             "export default function Page(){return <main>Press any key to start</main>;}";
         let mut execution = FakeClient::new(vec![
@@ -9802,11 +9979,27 @@ Phase task: Initialize the Next.js project shell";
                     ),
                     crate::state::ToolCall::new(
                         "Write",
+                        serde_json::json!({"path":"tsconfig.json","content":nextjs_tsconfig_json()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"postcss.config.js","content":nextjs_postcss_config()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"tailwind.config.ts","content":nextjs_tailwind_config_ts()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
                         serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
-                        serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+                        serde_json::json!({"path":"src/app/layout.tsx","content":nextjs_layout_source()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/globals.css","content":nextjs_globals_css()}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
@@ -10323,7 +10516,7 @@ Phase task: Initialize the Next.js project shell";
                 .map(|_| AssistantReply::text(step_json.clone()))
                 .collect(),
         );
-        let good_package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let good_package = nextjs_complete_package_json();
         let bad_package =
             r#"{"dependencies":{},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
         let mut execution = FakeClient::new(vec![
@@ -10336,11 +10529,27 @@ Phase task: Initialize the Next.js project shell";
                     ),
                     crate::state::ToolCall::new(
                         "Write",
+                        serde_json::json!({"path":"tsconfig.json","content":nextjs_tsconfig_json()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"postcss.config.js","content":nextjs_postcss_config()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"tailwind.config.ts","content":nextjs_tailwind_config_ts()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
                         serde_json::json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main>Space Invaders</main>;}"}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
-                        serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+                        serde_json::json!({"path":"src/app/layout.tsx","content":nextjs_layout_source()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/app/globals.css","content":nextjs_globals_css()}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
@@ -10455,7 +10664,7 @@ Phase task: Initialize the Next.js project shell";
             AssistantReply::text(finish_plan.clone()),
             AssistantReply::text(finish_plan),
         ]);
-        let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let package = nextjs_complete_package_json();
         let bad_package =
             r#"{"dependencies":{},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
         let mut first_phase_calls =
@@ -10590,7 +10799,7 @@ Phase task: Initialize the Next.js project shell";
             AssistantReply::text(scaffold_plan),
             AssistantReply::text(finish_plan),
         ]);
-        let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let package = nextjs_complete_package_json();
         let mut execution = FakeClient::new(vec![
             AssistantReply {
                 content: String::new(),
@@ -10598,6 +10807,10 @@ Phase task: Initialize the Next.js project shell";
                     crate::state::ToolCall::new(
                         "Write",
                         serde_json::json!({"path":"package.json","content":package}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"tsconfig.json","content":nextjs_tsconfig_json()}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
@@ -10617,7 +10830,7 @@ Phase task: Initialize the Next.js project shell";
                     ),
                     crate::state::ToolCall::new(
                         "Write",
-                        serde_json::json!({"path":"tailwind.config.js","content":"module.exports = { content: ['./src/pages/**/*.{ts,tsx}', './src/components/**/*.{ts,tsx}', './src/app/**/*.{ts,tsx}'], theme: { extend: {} }, plugins: [] };\n"}),
+                        serde_json::json!({"path":"tailwind.config.ts","content":nextjs_tailwind_config_ts()}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
@@ -10686,7 +10899,7 @@ Phase task: Initialize the Next.js project shell";
                 .map(|_| AssistantReply::text(step_json.clone()))
                 .collect(),
         );
-        let package = r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#;
+        let package = nextjs_complete_package_json();
         let mut execution = FakeClient::new(vec![
             AssistantReply {
                 content: String::new(),
@@ -10694,6 +10907,14 @@ Phase task: Initialize the Next.js project shell";
                     crate::state::ToolCall::new(
                         "Write",
                         serde_json::json!({"path":"package.json","content":package}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"postcss.config.js","content":nextjs_postcss_config()}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"tailwind.config.ts","content":nextjs_tailwind_config_ts()}),
                     ),
                     crate::state::ToolCall::new(
                         "Write",
@@ -10761,6 +10982,140 @@ Phase task: Initialize the Next.js project shell";
         assert!(event_text.contains("\"method\":\"model\""));
         assert!(event_text.contains("\"recovery_handoff_kind\":\"profile_invariant_failure\""));
         assert!(event_text.contains("\"recovery_ultra_plan_path\":\".anvil/plans/"));
+    }
+
+    #[test]
+    fn profile_invariant_handoff_uses_final_import_evidence_not_stale_postcss() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events);
+        write_nextjs_profile_workspace(dir.path(), None, Some(nextjs_postcss_config()), None);
+        let plan = UltraPlan {
+            goal: "3011 port app".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![crate::planner::ultra_plan::UltraPhase {
+                id: "scaffold".to_string(),
+                prompt: "Scaffold project".to_string(),
+            }],
+        };
+        let phase = &plan.phases[0];
+        let evidence = fresh_profile_invariant_failure_evidence(
+            &cfg,
+            &plan,
+            &ProfileSnapshot::None,
+            &nextjs_scaffold_expected_paths(),
+        );
+        let reason = evidence.report.primary_reason();
+
+        assert!(reason.contains("missing relative imports"), "{reason}");
+        assert!(reason.contains("src/app/globals.css"), "{reason}");
+        assert!(!reason.contains("PostCSS config file missing"), "{reason}");
+        assert_eq!(
+            reason,
+            verify_profile_invariant(dir.path(), "nextjs", &plan.goal, &ProfileSnapshot::None)
+                .primary_reason()
+        );
+        assert!(
+            evidence
+                .missing_paths
+                .contains(&"src/app/globals.css".to_string()),
+            "{:?}",
+            evidence.missing_paths
+        );
+
+        let prompt = profile_invariant_model_repair_prompt(
+            &plan,
+            phase,
+            &evidence.report,
+            &UltraRunContext::default(),
+            &nextjs_scaffold_expected_paths(),
+            &cfg,
+            None,
+        );
+        assert!(
+            prompt.contains(
+                "src/app/layout.tsx imports ./globals.css which does not exist - create src/app/globals.css"
+            ),
+            "{prompt}"
+        );
+
+        let _handoff = save_ultra_phase_recovery_handoff_with_evidence(
+            &cfg,
+            &plan,
+            phase,
+            UltraPhaseRecoveryRequest {
+                failure_kind: "profile_invariant_failure",
+                reason: &reason,
+                missing_paths: &evidence.missing_paths,
+                missing_signals: &[],
+                repair_targets: &["profile_contract".to_string()],
+            },
+            &evidence.failure_evidence,
+        );
+        let repair_text = std::fs::read_dir(dir.path().join(".anvil/repairs"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .find(|text| text.contains("profile_invariant_failure"))
+            .expect("profile invariant recovery prompt");
+        assert!(
+            repair_text.contains("Missing paths:\n- src/app/globals.css"),
+            "{repair_text}"
+        );
+        assert!(
+            repair_text.contains("src/app/layout.tsx imports ./globals.css which does not exist"),
+            "{repair_text}"
+        );
+        assert!(
+            !repair_text.contains("PostCSS config file missing"),
+            "{repair_text}"
+        );
+    }
+
+    #[test]
+    fn profile_invariant_fresh_evidence_reason_matches_final_reverification() {
+        for outcome in [
+            "valid-postcss-missing-globals",
+            "missing-postcss",
+            "bad-tsconfig",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = config(dir.path().to_path_buf());
+            let postcss = (outcome != "missing-postcss").then_some(nextjs_postcss_config());
+            let tsconfig = (outcome == "bad-tsconfig")
+                .then_some("{\"compilerOptions\":{\"rootDir\":\"src\"}}\n");
+            let globals =
+                (outcome != "valid-postcss-missing-globals").then_some(nextjs_globals_css());
+            write_nextjs_profile_workspace(dir.path(), globals, postcss, tsconfig);
+            let plan = UltraPlan {
+                goal: "3011 port app".to_string(),
+                profile: "nextjs".to_string(),
+                style: "default".to_string(),
+                intent: "create".to_string(),
+                phases: vec![crate::planner::ultra_plan::UltraPhase {
+                    id: outcome.to_string(),
+                    prompt: "Simulated repair outcome".to_string(),
+                }],
+            };
+
+            let evidence = fresh_profile_invariant_failure_evidence(
+                &cfg,
+                &plan,
+                &ProfileSnapshot::None,
+                &nextjs_scaffold_expected_paths(),
+            );
+            let reverified =
+                verify_profile_invariant(dir.path(), "nextjs", &plan.goal, &ProfileSnapshot::None);
+
+            assert_eq!(
+                evidence.report.primary_reason(),
+                reverified.primary_reason(),
+                "outcome {outcome}"
+            );
+        }
     }
 
     #[test]
@@ -11366,7 +11721,7 @@ Phase task: Initialize the Next.js project shell";
             )),
         ]);
         let package = format!(
-            r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"}}}}"#
+            r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}}}}"#
         );
         let mut tool_calls = nextjs_interactive_app_tool_calls(interactive_game_page_source());
         tool_calls[0] = crate::state::ToolCall::new(
@@ -11704,7 +12059,19 @@ Phase task: Initialize the Next.js project shell";
         vec![
             crate::state::ToolCall::new(
                 "Write",
-                serde_json::json!({"path":"package.json","content":"{\"scripts\":{\"build\":\"next build\"},\"dependencies\":{\"next\":\"^14.2.0\",\"react\":\"^18.3.0\",\"react-dom\":\"^18.3.0\"}}"}),
+                serde_json::json!({"path":"package.json","content":nextjs_complete_package_json()}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"tsconfig.json","content":nextjs_tsconfig_json()}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"postcss.config.js","content":nextjs_postcss_config()}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"tailwind.config.ts","content":nextjs_tailwind_config_ts()}),
             ),
             crate::state::ToolCall::new(
                 "Write",
@@ -11712,7 +12079,11 @@ Phase task: Initialize the Next.js project shell";
             ),
             crate::state::ToolCall::new(
                 "Write",
-                serde_json::json!({"path":"src/app/layout.tsx","content":"export default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"}),
+                serde_json::json!({"path":"src/app/layout.tsx","content":nextjs_layout_source()}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/globals.css","content":nextjs_globals_css()}),
             ),
             crate::state::ToolCall::new(
                 "Write",
@@ -12625,20 +12996,86 @@ export default function Page(){
             .join("\n")
     }
 
+    fn nextjs_scaffold_expected_paths() -> Vec<String> {
+        vec![
+            "package.json".to_string(),
+            "tsconfig.json".to_string(),
+            "postcss.config.js".to_string(),
+            "tailwind.config.ts".to_string(),
+            "src/app/layout.tsx".to_string(),
+            "src/app/page.tsx".to_string(),
+            "src/app/globals.css".to_string(),
+            "src/app/global.d.ts".to_string(),
+        ]
+    }
+
+    fn nextjs_complete_package_json() -> &'static str {
+        r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011","start":"next start -p 3011"}}"#
+    }
+
+    fn nextjs_tsconfig_json() -> &'static str {
+        r#"{"compilerOptions":{"target":"ES2017","lib":["dom","dom.iterable","esnext"],"allowJs":true,"skipLibCheck":true,"strict":true,"noEmit":true,"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler","resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve","incremental":true,"plugins":[{"name":"next"}],"baseUrl":".","paths":{"@/*":["./src/*"]}},"include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],"exclude":["node_modules"]}"#
+    }
+
+    fn nextjs_layout_source() -> &'static str {
+        "import './globals.css';\nexport default function Layout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>;}"
+    }
+
+    fn nextjs_globals_css() -> &'static str {
+        "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"
+    }
+
+    fn nextjs_tailwind_config_ts() -> &'static str {
+        "import type { Config } from 'tailwindcss';\nconst config: Config = { content: ['./src/pages/**/*.{js,ts,jsx,tsx,mdx}', './src/components/**/*.{js,ts,jsx,tsx,mdx}', './src/app/**/*.{js,ts,jsx,tsx,mdx}'], theme: { extend: {} }, plugins: [] };\nexport default config;\n"
+    }
+
+    fn nextjs_postcss_config() -> &'static str {
+        "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n"
+    }
+
+    fn write_nextjs_profile_workspace(
+        root: &Path,
+        globals_css: Option<&str>,
+        postcss_config: Option<&str>,
+        tsconfig_json: Option<&str>,
+    ) {
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::write(root.join("package.json"), nextjs_complete_package_json()).unwrap();
+        let tsconfig_json = tsconfig_json.unwrap_or(nextjs_tsconfig_json());
+        std::fs::write(root.join("tsconfig.json"), tsconfig_json).unwrap();
+        std::fs::write(root.join("tailwind.config.ts"), nextjs_tailwind_config_ts()).unwrap();
+        if let Some(postcss_config) = postcss_config {
+            std::fs::write(root.join("postcss.config.js"), postcss_config).unwrap();
+        }
+        std::fs::write(
+            root.join("src/app/page.tsx"),
+            "export default function Page(){return <main className=\"min-h-screen\">App</main>;}",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/app/layout.tsx"), nextjs_layout_source()).unwrap();
+        std::fs::write(
+            root.join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        if let Some(globals_css) = globals_css {
+            std::fs::write(root.join("src/app/globals.css"), globals_css).unwrap();
+        }
+    }
+
     fn generated_nextjs_artifact_plan_json(goal: &str) -> String {
+        let expected_paths = nextjs_scaffold_expected_paths();
         serde_json::to_string(&StepPlan {
             goal: goal.to_string(),
             steps: vec![PlanStep {
                 id: "create-nextjs-artifacts".to_string(),
                 kind: "implement".to_string(),
                 expected_result: "pass".to_string(),
-                instruction: "Create package.json, src/app/page.tsx, src/app/layout.tsx, and src/app/global.d.ts".to_string(),
-                expected_paths: vec![
-                    "package.json".to_string(),
-                    "src/app/page.tsx".to_string(),
-                    "src/app/layout.tsx".to_string(),
-                    "src/app/global.d.ts".to_string(),
-                ],
+                instruction: format!(
+                    "Create a coherent Next.js scaffold with {}",
+                    expected_paths.join(", ")
+                ),
+                expected_paths,
                 verify: Vec::new(),
             }],
         })
@@ -12652,13 +13089,8 @@ export default function Page(){
     ) -> String {
         let mut expected_paths = vec![check_path.to_string()];
         if check_path.contains("scaffold") {
-            expected_paths = vec![
-                "package.json".to_string(),
-                "src/app/page.tsx".to_string(),
-                "src/app/layout.tsx".to_string(),
-                "src/app/global.d.ts".to_string(),
-                check_path.to_string(),
-            ];
+            expected_paths = nextjs_scaffold_expected_paths();
+            expected_paths.push(check_path.to_string());
         }
         let verify = if kind == "setup" {
             Vec::new()
@@ -12862,6 +13294,9 @@ export default function Page(){
         let bin = root.join("node_modules/.bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(root.join("node_modules/next")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/tailwindcss")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/postcss")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/autoprefixer")).unwrap();
         let exe = shell_quote(&std::env::current_exe().unwrap().display().to_string());
         let grandchild = if spawn_grandchild { "1" } else { "0" };
         let script = format!(
@@ -12889,19 +13324,18 @@ exit 2\n"
     }
 
     fn generated_nextjs_artifact_plan_json_with_build_verify(goal: &str) -> String {
+        let expected_paths = nextjs_scaffold_expected_paths();
         serde_json::to_string(&StepPlan {
             goal: goal.to_string(),
             steps: vec![PlanStep {
                 id: "create-nextjs-artifacts".to_string(),
                 kind: "implement".to_string(),
                 expected_result: "pass".to_string(),
-                instruction: "Create package.json, src/app/page.tsx, src/app/layout.tsx, and src/app/global.d.ts".to_string(),
-                expected_paths: vec![
-                    "package.json".to_string(),
-                    "src/app/page.tsx".to_string(),
-                    "src/app/layout.tsx".to_string(),
-                    "src/app/global.d.ts".to_string(),
-                ],
+                instruction: format!(
+                    "Create a coherent Next.js scaffold with {}",
+                    expected_paths.join(", ")
+                ),
+                expected_paths,
                 verify: vec!["npm run build".to_string()],
             }],
         })

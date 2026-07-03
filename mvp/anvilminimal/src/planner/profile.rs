@@ -130,6 +130,15 @@ pub fn profile_expected_paths(root: &Path, profile: &str, goal: &str) -> Vec<Str
     }
 }
 
+pub fn profile_setup_scaffold_paths(root: &Path, profile: &str) -> Vec<String> {
+    match profile {
+        "nextjs" | "next-js" | "next.js" => {
+            crate::planner::profiles::nextjs::setup_scaffold_paths(root)
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub fn profile_quality_expectations(
     root: &Path,
     profile: &str,

@@ -93,6 +93,51 @@ pub fn format_missing_import_feedback(missing: &[MissingImport]) -> String {
     )
 }
 
+pub fn missing_import_target_path(root: &Path, missing: &MissingImport) -> Option<PathBuf> {
+    let source_path = root.join(&missing.source);
+    let parent = source_path.parent().unwrap_or(root);
+    let target = normalize_joined_path(&parent.join(&missing.specifier));
+    target.starts_with(root).then_some(target)
+}
+
+pub fn missing_import_target_rel(root: &Path, missing: &MissingImport) -> Option<String> {
+    let target = missing_import_target_path(root, missing)?;
+    target
+        .strip_prefix(root)
+        .ok()
+        .map(|path| path.display().to_string())
+}
+
+pub fn format_missing_import_findings(root: &Path, missing: &[MissingImport]) -> Vec<String> {
+    missing
+        .iter()
+        .map(|item| match missing_import_target_rel(root, item) {
+            Some(target) => format!(
+                "{} imports {} which does not exist - create {}",
+                item.source, item.specifier, target
+            ),
+            None => format!(
+                "{} imports {} which does not exist",
+                item.source, item.specifier
+            ),
+        })
+        .collect()
+}
+
+fn normalize_joined_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +222,30 @@ mod tests {
                 source: "src/page.tsx".to_string(),
                 specifier: "./Widget".to_string()
             }]
+        );
+    }
+
+    #[test]
+    fn missing_import_target_rel_resolves_relative_css_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/layout.tsx"),
+            r#"import "./globals.css";"#,
+        )
+        .unwrap();
+        let missing =
+            scan_relative_imports(dir.path(), &["src/app/layout.tsx".to_string()]).unwrap();
+
+        assert_eq!(
+            missing_import_target_rel(dir.path(), &missing[0]).as_deref(),
+            Some("src/app/globals.css")
+        );
+        assert_eq!(
+            format_missing_import_findings(dir.path(), &missing),
+            vec![
+                "src/app/layout.tsx imports ./globals.css which does not exist - create src/app/globals.css"
+            ]
         );
     }
 }

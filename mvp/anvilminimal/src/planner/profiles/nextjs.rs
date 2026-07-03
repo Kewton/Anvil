@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use crate::minimal_loop::import_scan::{
+    MissingImport, format_missing_import_findings, missing_import_target_path,
+    scan_relative_imports,
+};
 use crate::planner::profile::ProfileQualityExpectations;
 use crate::planner::profile::profile_failure;
 use crate::planner::verify::{VerificationReport, VerifyStatus};
@@ -96,6 +100,9 @@ pub fn verify(root: &Path, goal: &str) -> VerificationReport {
     if let Some(reason) = css_side_effect_import_contract_failure(&project.path) {
         return profile_failure(reason);
     }
+    if let Some(reason) = missing_app_relative_import_contract_failure(&project.path) {
+        return profile_failure(project.rel_path(&reason));
+    }
     if let Some(reason) = client_component_contract_failure(&project.path) {
         return profile_failure(reason);
     }
@@ -152,6 +159,9 @@ pub fn verify_invariant(root: &Path, goal: &str) -> VerificationReport {
     if let Some(reason) = css_side_effect_import_contract_failure(&project.path) {
         return profile_failure(reason);
     }
+    if let Some(reason) = missing_app_relative_import_contract_failure(&project.path) {
+        return profile_failure(project.rel_path(&reason));
+    }
     if let Some(reason) = client_component_contract_failure(&project.path) {
         return profile_failure(reason);
     }
@@ -170,8 +180,10 @@ pub fn guidance(goal: &str) -> String {
     format!(
         "For the nextjs profile, create a runnable Next.js app, not only package metadata. \
          Keep the project in the workspace root unless a project subdirectory already exists. \
-         Required artifacts by completion: package.json, src/app/page.tsx, src/app/layout.tsx, src/app/global.d.ts. \
-         If those files are absent, write package.json, src/app/layout.tsx, src/app/page.tsx, and src/app/global.d.ts before further inspection. \
+         Required setup scaffold artifacts by completion: package.json, tsconfig.json, postcss.config.js, exactly one tailwind.config.* file, src/app/layout.tsx, src/app/page.tsx, src/app/globals.css, src/app/global.d.ts. \
+         If those files are absent, write the coherent App Router scaffold before further inspection. \
+         Use tailwind.config.ts for new scaffolds unless exactly one existing Tailwind config is already being completed. \
+         src/app/globals.css must contain the @tailwind directives, and src/app/layout.tsx must import ./globals.css. \
          If any layout imports CSS such as ./globals.css, src/app/global.d.ts must declare module \"*.css\". \
          package.json must include compatible next, react, react-dom, @types/react, @types/react-dom, and TypeScript 5.x dependencies plus scripts.build = `next build`. \
          If Tailwind is used, package.json must include tailwindcss/postcss/autoprefixer and postcss.config plugins must include BOTH tailwindcss and autoprefixer. \
@@ -226,15 +238,44 @@ pub fn runtime_contract(intent: &str, goal: &str) -> String {
     }
 }
 
-pub fn expected_paths(root: &Path, goal: &str) -> Vec<String> {
-    let prefix = existing_project_prefix(root);
-    let mut paths = vec![format!("{prefix}package.json")];
-    if !goal.to_ascii_lowercase().contains("scaffold") {
-        paths.push(format!("{prefix}src/app/page.tsx"));
-        paths.push(format!("{prefix}src/app/layout.tsx"));
-        paths.push(format!("{prefix}src/app/global.d.ts"));
-    }
-    paths
+pub fn setup_scaffold_paths(root: &Path) -> Vec<String> {
+    let project = locate_project_root(root).ok();
+    let prefix = project
+        .as_ref()
+        .map(|project| project.prefix.as_str())
+        .unwrap_or_default();
+    let project_root = project
+        .as_ref()
+        .map(|project| project.path.as_path())
+        .unwrap_or(root);
+    vec![
+        format!("{prefix}package.json"),
+        format!("{prefix}tsconfig.json"),
+        format!("{prefix}postcss.config.js"),
+        format!("{prefix}{}", setup_tailwind_config_rel(project_root)),
+        format!("{prefix}src/app/layout.tsx"),
+        format!("{prefix}src/app/page.tsx"),
+        format!("{prefix}src/app/globals.css"),
+        format!("{prefix}src/app/global.d.ts"),
+    ]
+}
+
+pub fn setup_invariant_required_paths(root: &Path) -> Vec<String> {
+    setup_scaffold_paths(root)
+}
+
+pub fn expected_paths(root: &Path, _goal: &str) -> Vec<String> {
+    setup_scaffold_paths(root)
+}
+
+pub fn app_source_paths(root: &Path) -> Vec<String> {
+    let Ok(project) = locate_project_root(root) else {
+        return Vec::new();
+    };
+    project_app_source_paths(&project.path)
+        .into_iter()
+        .map(|path| format!("{}{}", project.prefix, path))
+        .collect()
 }
 
 pub fn quality_expectations(root: &Path, goal: &str) -> ProfileQualityExpectations {
@@ -279,6 +320,13 @@ pub fn auto_repair(root: &Path, goal: &str, report: &VerificationReport) -> anyh
     let reason = report.primary_reason();
     if reason.contains("tailwind_contract_failure") {
         return repair_tailwind_contract(root, goal, &reason);
+    }
+    if reason.contains("missing relative imports") {
+        let project = locate_project_root(root).unwrap_or_else(|_| ProjectRoot {
+            path: root.to_path_buf(),
+            prefix: String::new(),
+        });
+        return repair_missing_css_import_artifacts(&project.path);
     }
     let project = locate_project_root(root).unwrap_or_else(|_| ProjectRoot {
         path: root.to_path_buf(),
@@ -337,15 +385,18 @@ pub fn repair_tailwind_contract(root: &Path, goal: &str, reason: &str) -> anyhow
     });
     let project_root = project.path.as_path();
     let mut changed = false;
+    changed |= repair_missing_css_import_artifacts(project_root)?;
     if reason.contains("Tailwind toolchain dependency missing:") {
         changed |= ensure_package_json_changed(project_root, goal)?;
         return Ok(changed);
     }
     if reason.contains("Tailwind config file missing") {
-        changed |= write_file_if_changed(
-            &project_root.join("tailwind.config.js"),
-            canonical_tailwind_config(),
-        )?;
+        if !has_tailwind_config(project_root) {
+            changed |= write_file_if_changed(
+                &project_root.join(setup_tailwind_config_rel(project_root)),
+                canonical_tailwind_config(),
+            )?;
+        }
         return Ok(changed);
     }
     if reason.contains("PostCSS config file missing") {
@@ -439,10 +490,19 @@ fn locate_project_root(root: &Path) -> Result<ProjectRoot, String> {
     }
 }
 
-fn existing_project_prefix(root: &Path) -> String {
-    locate_project_root(root)
-        .map(|project| project.prefix)
-        .unwrap_or_default()
+const TAILWIND_CONFIG_RELS: &[&str] = &[
+    "tailwind.config.ts",
+    "tailwind.config.js",
+    "tailwind.config.cjs",
+    "tailwind.config.mjs",
+];
+
+fn setup_tailwind_config_rel(project_root: &Path) -> &'static str {
+    TAILWIND_CONFIG_RELS
+        .iter()
+        .copied()
+        .find(|rel| project_root.join(rel).is_file())
+        .unwrap_or("tailwind.config.ts")
 }
 
 fn ensure_package_json(root: &Path, goal: &str) -> anyhow::Result<()> {
@@ -547,11 +607,94 @@ fn write_file_if_changed(path: &Path, content: &str) -> anyhow::Result<bool> {
 }
 
 fn canonical_tailwind_config() -> &'static str {
-    "module.exports = {\n  content: [\n    \"./src/pages/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/components/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/app/**/*.{js,ts,jsx,tsx,mdx}\",\n  ],\n  theme: { extend: {} },\n  plugins: [],\n};\n"
+    "import type { Config } from \"tailwindcss\";\n\nconst config: Config = {\n  content: [\n    \"./src/pages/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/components/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/app/**/*.{js,ts,jsx,tsx,mdx}\",\n  ],\n  theme: { extend: {} },\n  plugins: [],\n};\n\nexport default config;\n"
 }
 
 fn canonical_postcss_config() -> &'static str {
     "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n"
+}
+
+fn canonical_tailwind_css() -> &'static str {
+    "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"
+}
+
+fn missing_app_relative_import_contract_failure(root: &Path) -> Option<String> {
+    let missing = missing_app_relative_imports(root).ok()?;
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "missing relative imports: {}",
+        format_missing_import_findings(root, &missing).join("; ")
+    ))
+}
+
+fn missing_app_relative_imports(root: &Path) -> anyhow::Result<Vec<MissingImport>> {
+    scan_relative_imports(root, &project_app_source_paths(root))
+}
+
+fn repair_missing_css_import_artifacts(root: &Path) -> anyhow::Result<bool> {
+    let mut changed = false;
+    for missing in missing_app_relative_imports(root)?
+        .into_iter()
+        .filter(|missing| missing.specifier.ends_with(".css"))
+    {
+        let Some(target) = missing_import_target_path(root, &missing) else {
+            continue;
+        };
+        let content = if is_app_global_stylesheet(root, &target) {
+            canonical_tailwind_css()
+        } else {
+            ""
+        };
+        changed |= write_file_if_changed(&target, content)?;
+    }
+    Ok(changed)
+}
+
+fn is_app_global_stylesheet(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .ok()
+        .and_then(|path| path.to_str())
+        .is_some_and(|rel| {
+            matches!(
+                rel.replace('\\', "/").as_str(),
+                "src/app/globals.css" | "src/app/global.css" | "app/globals.css" | "app/global.css"
+            )
+        })
+}
+
+fn project_app_source_paths(root: &Path) -> Vec<String> {
+    let mut paths = Vec::new();
+    for rel in ["src/app", "app"] {
+        collect_source_paths(root, Path::new(rel), &mut paths);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn collect_source_paths(root: &Path, rel_dir: &Path, out: &mut Vec<String>) {
+    let dir = root.join(rel_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let child_rel = rel_dir.join(file_name);
+        if path.is_dir() {
+            collect_source_paths(root, &child_rel, out);
+        } else if is_import_scan_source_path(&path) {
+            out.push(child_rel.display().to_string());
+        }
+    }
+}
+
+fn is_import_scan_source_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| matches!(ext, "js" | "jsx" | "ts" | "tsx"))
 }
 
 fn repair_postcss_plugins(root: &Path) -> anyhow::Result<bool> {
@@ -1165,8 +1308,22 @@ fn tailwind_contract_failure(root: &Path, package: &Value) -> Option<String> {
             )));
         }
     }
-    if !has_tailwind_config(root) {
-        return Some(tailwind_failure("Tailwind config file missing"));
+    let tailwind_configs = tailwind_config_paths(root);
+    if tailwind_configs.is_empty() {
+        return Some(tailwind_failure(format!(
+            "Tailwind config file missing: expected {}",
+            setup_tailwind_config_rel(root)
+        )));
+    }
+    if tailwind_configs.len() > 1 {
+        let names = tailwind_configs
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(tailwind_failure(format!(
+            "exactly one Tailwind config file is allowed: {names}"
+        )));
     }
     let Some(postcss_config) = postcss_config_path(root) else {
         return Some(tailwind_failure("PostCSS config file missing for Tailwind"));
@@ -1275,14 +1432,15 @@ fn uses_tailwind(root: &Path, package: &Value) -> bool {
 }
 
 fn has_tailwind_config(root: &Path) -> bool {
-    [
-        "tailwind.config.js",
-        "tailwind.config.cjs",
-        "tailwind.config.mjs",
-        "tailwind.config.ts",
-    ]
-    .iter()
-    .any(|rel| root.join(rel).is_file())
+    !tailwind_config_paths(root).is_empty()
+}
+
+fn tailwind_config_paths(root: &Path) -> Vec<PathBuf> {
+    TAILWIND_CONFIG_RELS
+        .iter()
+        .map(|rel| root.join(rel))
+        .filter(|path| path.is_file())
+        .collect()
 }
 
 fn postcss_config_references_tailwind(root: &Path) -> bool {
@@ -1536,11 +1694,67 @@ mod tests {
             expected_paths(dir.path(), "Implement game"),
             vec![
                 "space-invaders/package.json",
-                "space-invaders/src/app/page.tsx",
+                "space-invaders/tsconfig.json",
+                "space-invaders/postcss.config.js",
+                "space-invaders/tailwind.config.ts",
                 "space-invaders/src/app/layout.tsx",
+                "space-invaders/src/app/page.tsx",
+                "space-invaders/src/app/globals.css",
                 "space-invaders/src/app/global.d.ts"
             ]
         );
+    }
+
+    #[test]
+    fn expected_paths_do_not_degrade_when_goal_mentions_scaffold() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            expected_paths(dir.path(), "Scaffold a polished Next.js app"),
+            setup_scaffold_paths(dir.path())
+        );
+        assert_eq!(
+            expected_paths(dir.path(), "Scaffold a polished Next.js app"),
+            vec![
+                "package.json",
+                "tsconfig.json",
+                "postcss.config.js",
+                "tailwind.config.ts",
+                "src/app/layout.tsx",
+                "src/app/page.tsx",
+                "src/app/globals.css",
+                "src/app/global.d.ts"
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_invariant_required_paths_are_scaffold_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback_paths = setup_scaffold_paths(dir.path());
+
+        for path in setup_invariant_required_paths(dir.path()) {
+            assert!(
+                fallback_paths.contains(&path),
+                "invariant path {path} missing from fallback paths {fallback_paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_scaffold_paths_use_existing_single_tailwind_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), package_json()).unwrap();
+        std::fs::write(
+            dir.path().join("tailwind.config.js"),
+            "module.exports = {};\n",
+        )
+        .unwrap();
+
+        let paths = setup_scaffold_paths(dir.path());
+
+        assert!(paths.contains(&"tailwind.config.js".to_string()));
+        assert!(!paths.contains(&"tailwind.config.ts".to_string()));
     }
 
     #[test]
@@ -1879,6 +2093,25 @@ export default function Page() {
     }
 
     #[test]
+    fn nextjs_rejects_multiple_tailwind_config_files() {
+        let dir = complete_tailwind_app(
+            "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n",
+        );
+        std::fs::write(
+            dir.path().join("tailwind.config.ts"),
+            "export default { content: ['./src/**/*.{ts,tsx}'] };\n",
+        )
+        .unwrap();
+
+        let report = verify(dir.path(), "3011");
+
+        assert!(matches!(
+            report.status,
+            VerifyStatus::ProfileContractFailed(reason) if reason.contains("exactly one Tailwind config")
+        ));
+    }
+
+    #[test]
     fn nextjs_rejects_tailwind_directive_css_not_imported_by_layout() {
         let dir = complete_app();
         std::fs::write(
@@ -2026,6 +2259,67 @@ export default function Page() {
         let layout = std::fs::read_to_string(dir.path().join("src/app/layout.tsx")).unwrap();
         assert!(layout.contains("import \"./globals.css\";"));
         assert!(verify_invariant(dir.path(), "3011").is_pass());
+    }
+
+    #[test]
+    fn auto_repair_creates_missing_global_css_import_with_tailwind_directives() {
+        let dir = complete_tailwind_app(canonical_postcss_config());
+        std::fs::remove_file(dir.path().join("src/app/globals.css")).unwrap();
+
+        let report = verify_invariant(dir.path(), "3011");
+        let reason = report.primary_reason();
+        assert!(reason.contains("missing relative imports"), "{reason}");
+        assert!(reason.contains("src/app/globals.css"), "{reason}");
+
+        assert!(auto_repair(dir.path(), "3011", &report).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/globals.css")).unwrap(),
+            canonical_tailwind_css()
+        );
+        assert!(verify_invariant(dir.path(), "3011").is_pass());
+    }
+
+    #[test]
+    fn auto_repair_does_not_synthesize_missing_ts_imports() {
+        let dir = complete_tailwind_app(canonical_postcss_config());
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "import Widget from './Widget';\nexport default function Page(){return <Widget />;}",
+        )
+        .unwrap();
+
+        let report = verify_invariant(dir.path(), "3011");
+        let reason = report.primary_reason();
+        assert!(reason.contains("missing relative imports"), "{reason}");
+
+        assert!(!auto_repair(dir.path(), "3011", &report).unwrap());
+        assert!(!dir.path().join("src/app/Widget.tsx").exists());
+    }
+
+    #[test]
+    fn repair_tailwind_contract_does_not_duplicate_existing_ts_config() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tailwind.config.ts"),
+            "export default { content: ['./src/**/*.{ts,tsx}'] };\n",
+        )
+        .unwrap();
+
+        assert!(
+            !repair_tailwind_contract(
+                dir.path(),
+                "3011",
+                "tailwind_contract_failure: Tailwind config file missing"
+            )
+            .unwrap()
+        );
+        assert!(!dir.path().join("tailwind.config.js").exists());
+        assert!(dir.path().join("tailwind.config.ts").exists());
     }
 
     fn complete_tailwind_app(postcss_config: &str) -> tempfile::TempDir {
