@@ -139,6 +139,13 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
     }) {
         return RepairTarget::Unknown;
     }
+    if report
+        .profile_failures
+        .iter()
+        .any(|reason| app_behavior_probe_failure(reason))
+    {
+        return RepairTarget::Implementation;
+    }
     if report.profile_failures.iter().any(|reason| {
         contains_any(
             reason,
@@ -459,6 +466,26 @@ fn missing_required_evidence_includes_source_scan(reason: &str) -> bool {
         .any(|key| evidence_satisfaction_channel(key) == SatisfactionChannel::SourceScan)
 }
 
+fn app_behavior_probe_failure(reason: &str) -> bool {
+    contains_any(
+        reason,
+        &[
+            "browser_interaction_failed:interaction_state_change_missing",
+            "browser_interaction_failed:start_transition_missing",
+            "browser_interaction_failed:surface_missing",
+            "browser_interaction_failed:surface_visible_missing",
+            "browser_interaction_failed:interactive_surface_missing",
+            "browser_interaction_failed:canvas_unavailable",
+            "interaction evidence status: failed:interaction_state_change_missing",
+            "interaction evidence status: failed:start_transition_missing",
+            "interaction evidence status: failed:surface_missing",
+            "interaction evidence status: failed:surface_visible_missing",
+            "interaction evidence status: failed:interactive_surface_missing",
+            "interaction evidence status: failed:canvas_unavailable",
+        ],
+    )
+}
+
 fn missing_required_evidence_keys(reason: &str) -> Vec<&str> {
     let Some((_, rest)) = reason.split_once("missing_required_evidence:") else {
         return Vec::new();
@@ -597,7 +624,7 @@ mod tests {
         );
         assert_eq!(
             classify_repair_target(&report),
-            RepairTarget::CapabilityMissing
+            RepairTarget::Implementation
         );
         assert_eq!(
             classify_repair_target(&report).allowed_action(),

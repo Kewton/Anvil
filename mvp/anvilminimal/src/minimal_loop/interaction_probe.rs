@@ -1897,6 +1897,9 @@ fn load_test_availability_override(root: &Path) -> Option<ProbeAvailability> {
 
 #[cfg(test)]
 fn load_test_result_override(root: &Path) -> Option<Value> {
+    if let Some(value) = load_test_result_sequence_override(root) {
+        return Some(value);
+    }
     let path = root
         .join(".anvil")
         .join("evidence")
@@ -1905,6 +1908,25 @@ fn load_test_result_override(root: &Path) -> Option<Value> {
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .filter(Value::is_object)
+}
+
+#[cfg(test)]
+fn load_test_result_sequence_override(root: &Path) -> Option<Value> {
+    let path = root
+        .join(".anvil")
+        .join("evidence")
+        .join("interaction-probe-results.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut values = serde_json::from_str::<Vec<Value>>(&text).ok()?;
+    if values.is_empty() {
+        return None;
+    }
+    let value = values.remove(0);
+    write_text(
+        &path,
+        &format!("{}\n", serde_json::to_string_pretty(&values).ok()?),
+    );
+    value.is_object().then_some(value)
 }
 
 #[cfg(test)]
@@ -1963,6 +1985,18 @@ pub fn write_test_result_override(root: &Path, value: &Value) {
     write_text(
         &path,
         &format!("{}\n", serde_json::to_string_pretty(value).unwrap()),
+    );
+}
+
+#[cfg(test)]
+pub fn write_test_result_overrides(root: &Path, values: &[Value]) {
+    let path = root
+        .join(".anvil")
+        .join("evidence")
+        .join("interaction-probe-results.json");
+    write_text(
+        &path,
+        &format!("{}\n", serde_json::to_string_pretty(values).unwrap()),
     );
 }
 

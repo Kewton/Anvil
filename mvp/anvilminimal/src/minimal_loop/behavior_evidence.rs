@@ -7,9 +7,9 @@ use serde_json::Value;
 use crate::minimal_loop::evidence::{RuntimeAcceptanceReport, refresh_runtime_acceptance_report};
 
 const INTERACTION_EVIDENCE_NAMES: &[&str] = &[
+    "browser-interaction.json",
     "interaction-evidence.json",
     "interaction.json",
-    "browser-interaction.json",
 ];
 
 const SURFACE_AND_START_KEYS: &[&str] = &[
@@ -73,6 +73,7 @@ enum RecoveryTransition {
 enum BehavioralDecision {
     Pass(&'static str),
     Fail(&'static str),
+    Unverified(&'static str),
     Static(&'static str),
 }
 
@@ -203,6 +204,18 @@ pub fn arbitrate_final_acceptance(
                     },
                 );
             }
+            BehavioralDecision::Unverified(observed) => {
+                mark_unverified_evidence(report, key, observed);
+                records.insert(
+                    key.clone(),
+                    EvidenceArbitrationRecord {
+                        static_tier: static_tier.clone(),
+                        behavioral_observation: observed.to_string(),
+                        decided_by: "behavioral".to_string(),
+                        final_tier: format!("unverified:{observed}"),
+                    },
+                );
+            }
             BehavioralDecision::Static(observed) => {
                 records.insert(
                     key.clone(),
@@ -263,7 +276,10 @@ fn behavioral_decision(
     if key == "restart_or_recoverable_state_evidence" {
         return match observation.recovery_transition {
             RecoveryTransition::Observed => BehavioralDecision::Pass("recovery_transition"),
-            RecoveryTransition::NotObserved | RecoveryTransition::Unknown => {
+            RecoveryTransition::NotObserved => {
+                BehavioralDecision::Unverified("not_observed_by_probe")
+            }
+            RecoveryTransition::Unknown => {
                 if observation.start_transition {
                     weak_corroboration_or_static(key, static_tier, observation)
                 } else {
@@ -321,22 +337,14 @@ fn fail_evidence(report: &mut RuntimeAcceptanceReport, key: &str) {
         .insert(key.to_string(), "absent".to_string());
 }
 
-fn mark_unverified_if_probe_required_weak(
-    report: &mut RuntimeAcceptanceReport,
-    key: &str,
-    static_tier: &str,
-    probe_reason: &str,
-) -> bool {
-    if static_tier != "weak" || !PROBE_REQUIRED_BEHAVIOR_KEYS.contains(&key) {
-        return false;
-    }
+fn mark_unverified_evidence(report: &mut RuntimeAcceptanceReport, key: &str, reason: &str) {
     report.missing_evidence.retain(|evidence| evidence != key);
     report.weak_evidence.retain(|evidence| {
         !evidence
             .strip_prefix("weak_source_evidence:")
             .is_some_and(|rest| rest.starts_with(key) && rest[key.len()..].starts_with(':'))
     });
-    let classified = format!("{key}:unverified:{probe_reason}");
+    let classified = format!("{key}:unverified:{reason}");
     if !report
         .unverified_evidence
         .iter()
@@ -346,7 +354,19 @@ fn mark_unverified_if_probe_required_weak(
     }
     report
         .evidence_tiers
-        .insert(key.to_string(), format!("unverified:{probe_reason}"));
+        .insert(key.to_string(), format!("unverified:{reason}"));
+}
+
+fn mark_unverified_if_probe_required_weak(
+    report: &mut RuntimeAcceptanceReport,
+    key: &str,
+    static_tier: &str,
+    probe_reason: &str,
+) -> bool {
+    if static_tier != "weak" || !PROBE_REQUIRED_BEHAVIOR_KEYS.contains(&key) {
+        return false;
+    }
+    mark_unverified_evidence(report, key, probe_reason);
     true
 }
 
@@ -355,10 +375,14 @@ fn read_behavior_observation(root: &Path, extra_dirs: &[PathBuf]) -> Option<Beha
         if !path.is_file() {
             continue;
         }
-        let text = std::fs::read_to_string(path).ok()?;
-        let value = serde_json::from_str::<Value>(&text).ok()?;
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
         if !value.is_object() || evidence_status_unavailable(&value) {
-            return None;
+            continue;
         }
         if let Some(observation) = BehaviorObservation::from_value(&value) {
             return Some(observation);
@@ -924,6 +948,69 @@ export default function Page() {
             Some("weak_behavior_corroborated")
         );
         assert!(report.unverified_evidence.is_empty());
+    }
+
+    #[test]
+    fn recovery_transition_not_observed_while_probe_ran_is_unverified_not_probe_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cross_file_weak_restart_fixture(dir.path());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "steps": [
+                    "surface_visible",
+                    "start_transition",
+                    "control_input_dispatched",
+                    "input_state_change",
+                    "recovery_transition:not_observed"
+                ],
+                "before_marker": "gameOver",
+                "after_marker": "playing",
+                "input_before_marker": "playing:x=1",
+                "input_after_marker": "playing:x=2",
+                "recovery_transition": false,
+                "recovery_transition_status": "not_observed"
+            }),
+        );
+        let required = ["restart_or_recoverable_state_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(report.unverified_evidence.contains(
+            &"restart_or_recoverable_state_evidence:unverified:not_observed_by_probe".to_string()
+        ));
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("unverified:not_observed_by_probe")
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("restart_or_recoverable_state_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("not_observed_by_probe")
+        );
+        assert!(!arbitration.summary.contains("probe unavailable"));
     }
 
     #[test]

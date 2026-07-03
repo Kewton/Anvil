@@ -78,7 +78,8 @@ const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
 const STEP_REPAIR_MAX_TURNS: usize = 4;
 const STEP_REPAIR_IDENTICAL_NO_CHANGE_LIMIT: usize = 2;
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
-const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 1;
+const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 2;
+const FINAL_ACCEPTANCE_REPAIR_WALL_CLOCK_CAP: Duration = Duration::from_secs(240);
 const NEXTJS_DEV_SERVER_DEFAULT_PORT: u16 = 3011;
 const NEXTJS_DEV_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const NEXTJS_DEV_SERVER_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -89,6 +90,15 @@ const DEV_SERVER_LOG_EXCERPT_BYTES: usize = 24_000;
 const DEV_SERVER_ROUTE: &str = "/";
 const DEV_SERVER_LIFECYCLE_STAGES: [&str; 4] = ["start", "wait", "probe", "cleanup"];
 const PROFILE_REPAIR_FILE_EXCERPT_MAX_CHARS: usize = 2_400;
+const INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT: &str = "keyboard or pointer input must visibly change game state (player position, projectiles, score/health, or state transitions); wire input handlers into the render/update loop.";
+const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 6] = [
+    "interaction_state_change_missing",
+    "start_transition_missing",
+    "surface_missing",
+    "surface_visible_missing",
+    "interactive_surface_missing",
+    "canvas_unavailable",
+];
 
 #[derive(Debug, Clone)]
 struct RecoveryArtifactValidation {
@@ -3097,123 +3107,157 @@ pub fn run_ultra_plan_with_ui(
             id: "final".to_string(),
             prompt: "Final acceptance".to_string(),
         });
-        let expected_paths =
-            final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
         let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
-        let repair_prompt = final_acceptance_repair_prompt(
-            plan,
-            &acceptance_report,
-            &ultra_context,
-            initial_target.as_str(),
-            &expected_paths,
-            &plan_adherence_report(plan, &config.workspace_root).missing,
-            (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
-        );
-        eval_events::emit(
-            config.eval_events_path.as_deref(),
-            json!({
-                "event": "final_acceptance_repair_start",
-                "lifecycle_stage": "final_acceptance_repair",
-                "attempt": 1,
-                "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
-                "repair_target": initial_target.as_str(),
-                "missing_paths": acceptance_report.missing_paths.clone(),
-                "compile_errors": acceptance_report.compile_errors.clone(),
-                "profile_failures": acceptance_report.profile_failures.clone(),
-                "bounded_repair": true,
-                "max_iterations": repair_config.max_iterations,
-                "shared_execution_session": true,
-                "session_message_count": ultra_session.messages.len(),
-            }),
-        );
-        let repair_outcome = match run_final_acceptance_repair_with_ultra_session(
-            execution,
-            &mut ultra_session,
-            &repair_prompt,
-            &expected_paths,
-            &repair_config,
-            ui,
-        ) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                let err_text = err.to_string();
-                eval_events::emit(
-                    config.eval_events_path.as_deref(),
-                    json!({
-                        "event": "final_acceptance_repair_failed",
-                        "lifecycle_stage": "final_acceptance_repair",
-                        "attempt": 1,
-                        "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
-                        "repair_target": initial_target.as_str(),
-                        "reason": eval_events::body_snippet(&err_text),
-                        "bounded_repair_exhausted": true,
-                    }),
-                );
-                let handoff = save_ultra_phase_recovery_handoff(
-                    config,
-                    plan,
-                    &fallback_phase,
-                    UltraPhaseRecoveryRequest {
-                        failure_kind: "final_acceptance_repair_failed",
-                        reason: &err_text,
-                        missing_paths: &acceptance_report.missing_paths,
-                        missing_signals: &verification_missing_signals(&acceptance_report),
-                        repair_targets: &[initial_target.as_str().to_string()],
-                    },
-                );
-                anyhow::bail!(
-                    "{}",
-                    render_failure_stop_reason(
-                        format!("ultra final acceptance repair failed: {err_text}"),
-                        handoff,
-                    )
-                );
+        let repair_started = Instant::now();
+        let mut attempts_run = 0;
+        let mut exhausted_reason = "bounded_repair_exhausted".to_string();
+        for attempt in 1..=FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS {
+            if repair_started.elapsed() > FINAL_ACCEPTANCE_REPAIR_WALL_CLOCK_CAP {
+                exhausted_reason = "bounded_repair_wall_clock_cap".to_string();
+                break;
             }
-        };
-        push_context_items_capped(
-            &mut ultra_context.created_or_changed_paths,
-            &repair_outcome.changed_paths,
-            ULTRA_CONTEXT_MAX_PATHS,
-            &mut ultra_context.truncated,
-        );
-        push_context_items_capped(
-            &mut ultra_context.last_repair_changed_paths,
-            &repair_outcome.changed_paths,
-            ULTRA_CONTEXT_MAX_PATHS,
-            &mut ultra_context.truncated,
-        );
-        eval_events::emit(
-            config.eval_events_path.as_deref(),
-            json!({
-                "event": "final_acceptance_repair_complete",
-                "lifecycle_stage": "final_acceptance_repair",
-                "attempt": 1,
-                "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
-                "repair_target": initial_target.as_str(),
-                "changed_path_count": repair_outcome.changed_paths.len(),
-                "iterations": repair_outcome.iterations,
-                "tool_calls": repair_outcome.tool_calls,
-                "shared_execution_session": true,
-                "session_message_count": ultra_session.messages.len(),
-            }),
-        );
-        acceptance_report = ultra_final_acceptance_report(plan, config)?;
+            attempts_run = attempt;
+            let repair_target = classify_repair_target(&acceptance_report);
+            let expected_paths =
+                final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
+            let repair_prompt = final_acceptance_repair_prompt(
+                plan,
+                &acceptance_report,
+                &ultra_context,
+                repair_target.as_str(),
+                &expected_paths,
+                &plan_adherence_report(plan, &config.workspace_root).missing,
+                (attempt, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+            );
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "final_acceptance_repair_start",
+                    "lifecycle_stage": "final_acceptance_repair",
+                    "attempt": attempt,
+                    "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                    "repair_target": repair_target.as_str(),
+                    "missing_paths": acceptance_report.missing_paths.clone(),
+                    "compile_errors": acceptance_report.compile_errors.clone(),
+                    "profile_failures": acceptance_report.profile_failures.clone(),
+                    "bounded_repair": true,
+                    "max_iterations": repair_config.max_iterations,
+                    "shared_execution_session": true,
+                    "session_message_count": ultra_session.messages.len(),
+                }),
+            );
+            let repair_outcome = match run_final_acceptance_repair_with_ultra_session(
+                execution,
+                &mut ultra_session,
+                &repair_prompt,
+                &expected_paths,
+                &repair_config,
+                ui,
+            ) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let err_text = err.to_string();
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "final_acceptance_repair_failed",
+                            "lifecycle_stage": "final_acceptance_repair",
+                            "attempt": attempt,
+                            "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                            "repair_target": repair_target.as_str(),
+                            "reason": eval_events::body_snippet(&err_text),
+                            "bounded_repair_exhausted": true,
+                        }),
+                    );
+                    let repair_targets =
+                        final_acceptance_recovery_repair_targets(&acceptance_report, repair_target);
+                    let missing_signals = verification_missing_signals(&acceptance_report);
+                    let handoff = save_ultra_phase_recovery_handoff(
+                        config,
+                        plan,
+                        &fallback_phase,
+                        UltraPhaseRecoveryRequest {
+                            failure_kind: "final_acceptance_repair_failed",
+                            reason: &err_text,
+                            missing_paths: &acceptance_report.missing_paths,
+                            missing_signals: &missing_signals,
+                            repair_targets: &repair_targets,
+                        },
+                    );
+                    anyhow::bail!(
+                        "{}",
+                        render_failure_stop_reason(
+                            format!("ultra final acceptance repair failed: {err_text}"),
+                            handoff,
+                        )
+                    );
+                }
+            };
+            push_context_items_capped(
+                &mut ultra_context.created_or_changed_paths,
+                &repair_outcome.changed_paths,
+                ULTRA_CONTEXT_MAX_PATHS,
+                &mut ultra_context.truncated,
+            );
+            push_context_items_capped(
+                &mut ultra_context.last_repair_changed_paths,
+                &repair_outcome.changed_paths,
+                ULTRA_CONTEXT_MAX_PATHS,
+                &mut ultra_context.truncated,
+            );
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "final_acceptance_repair_complete",
+                    "lifecycle_stage": "final_acceptance_repair",
+                    "attempt": attempt,
+                    "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                    "repair_target": repair_target.as_str(),
+                    "changed_path_count": repair_outcome.changed_paths.len(),
+                    "iterations": repair_outcome.iterations,
+                    "tool_calls": repair_outcome.tool_calls,
+                    "shared_execution_session": true,
+                    "session_message_count": ultra_session.messages.len(),
+                }),
+            );
+            if !repair_outcome.changed_paths.is_empty() {
+                clear_final_acceptance_browser_probe_evidence(config);
+            }
+            acceptance_report = ultra_final_acceptance_report(plan, config)?;
+            if acceptance_report.is_pass() {
+                break;
+            }
+        }
         if !acceptance_report.is_pass() {
-            let reason = acceptance_report.primary_reason();
             let target = classify_repair_target(&acceptance_report);
+            let behavior_failure = final_acceptance_app_behavior_failure_kind(&acceptance_report);
+            let report_reason = acceptance_report.primary_reason();
+            let reason = behavior_failure
+                .clone()
+                .unwrap_or_else(|| report_reason.clone());
+            let failure_kind = behavior_failure
+                .clone()
+                .unwrap_or_else(|| "final_acceptance_repair_exhausted".to_string());
+            let handoff_reason =
+                final_acceptance_recovery_reason(&acceptance_report, &reason, &exhausted_reason);
+            let repair_targets =
+                final_acceptance_recovery_repair_targets(&acceptance_report, target);
+            let missing_signals = verification_missing_signals(&acceptance_report);
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
                     "event": "final_acceptance_repair_exhausted",
                     "lifecycle_stage": "final_acceptance_repair",
-                    "attempt": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                    "attempt": attempts_run,
                     "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
                     "repair_target": target.as_str(),
                     "primary_reason": eval_events::body_snippet(&reason),
+                    "failure_kind": failure_kind.clone(),
                     "missing_paths": acceptance_report.missing_paths.clone(),
                     "compile_errors": acceptance_report.compile_errors.clone(),
                     "profile_failures": acceptance_report.profile_failures.clone(),
                     "bounded_repair_exhausted": true,
+                    "exhausted_reason": exhausted_reason.clone(),
                 }),
             );
             let handoff = save_ultra_phase_recovery_handoff(
@@ -3221,11 +3265,11 @@ pub fn run_ultra_plan_with_ui(
                 plan,
                 &fallback_phase,
                 UltraPhaseRecoveryRequest {
-                    failure_kind: "final_acceptance_repair_exhausted",
-                    reason: &reason,
+                    failure_kind: &failure_kind,
+                    reason: &handoff_reason,
                     missing_paths: &acceptance_report.missing_paths,
-                    missing_signals: &verification_missing_signals(&acceptance_report),
-                    repair_targets: &[target.as_str().to_string()],
+                    missing_signals: &missing_signals,
+                    repair_targets: &repair_targets,
                 },
             );
             anyhow::bail!(
@@ -3729,13 +3773,6 @@ fn ultra_final_acceptance_report(
         &release_evidence_extra_dirs(config),
         &evidence_hint_tokens,
     );
-    let evidence_arbitration = final_acceptance_evidence_arbitration(
-        config,
-        &mut acceptance,
-        &required_capabilities,
-        &required_evidence,
-        &required_obligations,
-    );
     let profile_invariant_report = verify_profile_invariant(
         &config.workspace_root,
         &plan.profile,
@@ -3769,8 +3806,15 @@ fn ultra_final_acceptance_report(
     let browser_probe = if production_build_failed {
         None
     } else {
-        maybe_run_ultra_final_browser_probe(config, plan, &required_capabilities)
+        run_ultra_final_browser_checks_before_arbitration(config, plan, &required_capabilities)
     };
+    let evidence_arbitration = final_acceptance_evidence_arbitration(
+        config,
+        &mut acceptance,
+        &required_capabilities,
+        &required_evidence,
+        &required_obligations,
+    );
     let release_gate = if production_build_failed {
         production_build_failed_release_gate()
     } else {
@@ -4119,6 +4163,22 @@ fn maybe_run_ultra_final_browser_probe(
     );
     emit_browser_probe_event(config, &observation);
     Some(observation)
+}
+
+fn run_ultra_final_browser_checks_before_arbitration(
+    config: &Config,
+    plan: &UltraPlan,
+    required_capabilities: &[String],
+) -> Option<BrowserReadinessObservation> {
+    if !ultra_browser_probe_required(&plan.profile, &plan.goal, required_capabilities) {
+        return None;
+    }
+    let browser_probe = maybe_run_ultra_final_browser_probe(config, plan, required_capabilities);
+    let _ = browser_release_gate_with_expectations(
+        config,
+        requires_canvas_surface(&plan.goal, required_capabilities),
+    );
+    browser_probe
 }
 
 fn report_has_production_build_failure(report: &VerificationReport) -> bool {
@@ -4536,7 +4596,10 @@ fn final_acceptance_release_gate(
                 interaction_evidence_path: String::new(),
             }
         };
-        let mut reasons = runtime_acceptance_unverified_release_reasons(report);
+        let mut reasons = runtime_acceptance_unverified_release_reasons(
+            report,
+            interaction_probe_performed_for_run(config),
+        );
         reasons.extend(std::mem::take(&mut gate.reasons));
         gate.status = "partial".to_string();
         gate.reasons = dedup_strings(reasons);
@@ -4560,6 +4623,7 @@ fn final_acceptance_release_gate(
 
 fn runtime_acceptance_unverified_release_reasons(
     report: &crate::minimal_loop::evidence::RuntimeAcceptanceReport,
+    probe_performed_for_run: bool,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
     let mut saw_probe_unavailable = false;
@@ -4570,20 +4634,47 @@ fn runtime_acceptance_unverified_release_reasons(
             .filter(|reason| !reason.is_empty())
         {
             if reason == "probe_unavailable" {
+                if probe_performed_for_run {
+                    continue;
+                }
                 saw_probe_unavailable = true;
             } else {
                 reasons.push(format!("interaction_unverified:{reason}"));
             }
         }
+        if probe_performed_for_run && evidence.contains(":unverified:probe_unavailable") {
+            continue;
+        }
         reasons.push(format!("unverified_probe_required:{evidence}"));
     }
     if saw_probe_unavailable {
         reasons.insert(0, "interaction_unverified:probe_unavailable".to_string());
+        reasons.push(
+            crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION.to_string(),
+        );
     }
-    reasons.push(
-        crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION.to_string(),
-    );
     reasons
+}
+
+fn interaction_probe_performed_for_run(config: &Config) -> bool {
+    release_evidence_candidate_paths(
+        config,
+        &[
+            "browser-interaction.json",
+            "interaction-evidence.json",
+            "interaction.json",
+        ],
+    )
+    .into_iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .filter_map(|text| serde_json::from_str::<Value>(&text).ok())
+    .any(|value| {
+        let details = value
+            .get("browser_details")
+            .or_else(|| value.get("details"))
+            .filter(|value| value.is_object());
+        bool_field_deep(&value, details, &["interaction_performed"]) == Some(true)
+    })
 }
 
 fn runtime_acceptance_has_buildable_nextjs_boundary(
@@ -4857,9 +4948,9 @@ fn browser_release_gate_with_expectations(
     let interaction = read_release_evidence(
         config,
         &[
+            "browser-interaction.json",
             "interaction-evidence.json",
             "interaction.json",
-            "browser-interaction.json",
         ],
         "interaction_evidence_missing",
         ReleaseEvidenceKind::Interaction,
@@ -4931,6 +5022,19 @@ fn browser_release_gate_with_expectations(
             );
         }
         if interaction_probe_unavailable_reason_value(reason) {
+            if interaction_probe_performed_for_run(config) {
+                reasons.push(
+                    "browser_interaction_evidence_required:interaction_detail_missing".to_string(),
+                );
+                return ReleaseGateSummary {
+                    status: "partial".to_string(),
+                    reasons: dedup_strings(reasons),
+                    browser_readiness_status: browser_status,
+                    browser_readiness_evidence_path: browser.path,
+                    interaction_evidence_status: interaction_status,
+                    interaction_evidence_path: interaction.path,
+                };
+            }
             reasons.extend([
                 "interaction_unverified:probe_unavailable".to_string(),
                 crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
@@ -6346,6 +6450,20 @@ fn release_evidence_extra_dirs(config: &Config) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+fn clear_final_acceptance_browser_probe_evidence(config: &Config) {
+    for path in release_evidence_candidate_paths(
+        config,
+        &[
+            "browser-readiness.json",
+            "browser.json",
+            "browser-readiness-evidence.json",
+            "browser-interaction.json",
+        ],
+    ) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn final_acceptance_evidence_arbitration(
     config: &Config,
     report: &mut RuntimeAcceptanceReport,
@@ -6775,6 +6893,24 @@ fn release_recovery_failure_kind(
     } else {
         "final_acceptance_failed".to_string()
     }
+}
+
+fn final_acceptance_app_behavior_failure_kind(report: &VerificationReport) -> Option<String> {
+    let primary_reason = report.primary_reason();
+    report
+        .profile_failures
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(primary_reason.as_str()))
+        .find_map(app_behavior_probe_failure_kind)
+}
+
+fn app_behavior_probe_failure_kind(reason: &str) -> Option<String> {
+    let lower = reason.to_ascii_lowercase();
+    APP_BEHAVIOR_PROBE_FAILURE_KINDS
+        .iter()
+        .find(|kind| lower.contains(**kind))
+        .map(|kind| format!("browser_interaction_failed:{kind}"))
 }
 
 fn release_recovery_failure_evidence(
@@ -8909,6 +9045,8 @@ fn final_acceptance_repair_prompt(
     let profile_failures = render_prompt_bullets(&profile_failures);
     let adherence_guidance =
         final_acceptance_adherence_guidance(report, repair_target, adherence_missing);
+    let behavioral_probe_context =
+        final_acceptance_behavioral_probe_context(report, expected_paths);
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
     let compile_errors =
@@ -8926,6 +9064,7 @@ Dependency failures:\n{dependencies}\n\n\
 Compile errors:\n{compile_errors}\n\n\
 Command failures:\n{command_failures}\n\n\
 Profile failures:\n{profile_failures}\n\n\
+{behavioral_probe_context}\
 {adherence_guidance}\
 Expected paths to preserve or create:\n{expected}\n\n\
 {prior_context}\n\n\
@@ -8946,10 +9085,156 @@ Bounded repair rules:\n\
         compile_errors = compile_errors,
         command_failures = command_failures,
         profile_failures = profile_failures,
+        behavioral_probe_context = behavioral_probe_context,
         adherence_guidance = adherence_guidance,
         expected = expected,
         prior_context = context.render_prompt_section(),
     )
+}
+
+fn final_acceptance_behavioral_probe_context(
+    report: &VerificationReport,
+    expected_paths: &[String],
+) -> String {
+    let Some(failure_kind) = final_acceptance_app_behavior_failure_kind(report) else {
+        return String::new();
+    };
+    let evidence = interaction_probe_json_from_report(report);
+    let mut lines = vec![
+        "Interaction probe context:".to_string(),
+        format!("- failure kind: {failure_kind}"),
+        "- dispatched inputs: ArrowLeft keydown, ArrowRight keydown, Space keydown, canvas click"
+            .to_string(),
+    ];
+    if let Some(value) = evidence.as_ref() {
+        for key in [
+            "before_marker",
+            "after_marker",
+            "input_before_marker",
+            "input_after_marker",
+            "recovery_before_marker",
+            "recovery_after_marker",
+        ] {
+            if let Some(marker) =
+                raw_text_field_deep(value, &[key]).filter(|marker| !marker.is_empty())
+            {
+                lines.push(format!("- {key}: {}", prompt_marker_excerpt(&marker)));
+            }
+        }
+    }
+    if failure_kind.contains("interaction_state_change_missing") {
+        lines.push(format!(
+            "- concrete requirement: {INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT}"
+        ));
+    }
+    let route_paths = route_bound_implementation_paths(expected_paths);
+    if !route_paths.is_empty() {
+        lines.push("Route-bound implementation targets:".to_string());
+        lines.extend(route_paths.into_iter().map(|path| format!("- {path}")));
+    }
+    format!("{}\n\n", lines.join("\n"))
+}
+
+fn final_acceptance_recovery_reason(
+    report: &VerificationReport,
+    reason: &str,
+    exhausted_reason: &str,
+) -> String {
+    let Some(failure_kind) = final_acceptance_app_behavior_failure_kind(report) else {
+        return format!("{reason}; final acceptance repair stopped: {exhausted_reason}");
+    };
+    let mut out = format!(
+        "{failure_kind}; final acceptance repair stopped: {exhausted_reason}; repair target: capability_implementation"
+    );
+    if failure_kind.contains("interaction_state_change_missing") {
+        out.push_str("; ");
+        out.push_str(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT);
+    }
+    let context = final_acceptance_behavioral_probe_context(report, &[]);
+    if !context.is_empty() {
+        out.push('\n');
+        out.push_str(context.trim());
+    }
+    out
+}
+
+fn final_acceptance_recovery_repair_targets(
+    report: &VerificationReport,
+    fallback: RepairTarget,
+) -> Vec<String> {
+    if final_acceptance_app_behavior_failure_kind(report).is_some() {
+        vec!["capability_implementation".to_string()]
+    } else {
+        vec![fallback.as_str().to_string()]
+    }
+}
+
+fn route_bound_implementation_paths(expected_paths: &[String]) -> Vec<String> {
+    let mut paths = expected_paths
+        .iter()
+        .filter(|path| {
+            let lower = path.to_ascii_lowercase();
+            lower.contains("src/app/")
+                || lower.contains("app/page")
+                || lower.contains("pages/")
+                || lower.ends_with(".tsx")
+                || lower.ends_with(".jsx")
+                || lower.ends_with(".ts")
+                || lower.ends_with(".js")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        paths.extend(expected_paths.iter().cloned());
+    }
+    dedup_strings(paths)
+}
+
+fn interaction_probe_json_from_report(report: &VerificationReport) -> Option<Value> {
+    report
+        .profile_failures
+        .iter()
+        .find_map(|failure| failure.strip_prefix("interaction evidence path: "))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+}
+
+fn prompt_marker_excerpt(value: &str) -> String {
+    const MAX_CHARS: usize = 600;
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_string();
+    }
+    let mut excerpt = value.chars().take(MAX_CHARS).collect::<String>();
+    excerpt.push_str("[truncated]");
+    excerpt
+}
+
+fn raw_text_field_deep(value: &Value, names: &[&str]) -> Option<String> {
+    for scope in raw_value_scopes(value) {
+        for name in names {
+            if let Some(found) = scope.get(*name).and_then(Value::as_str) {
+                return Some(found.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn raw_value_scopes(value: &Value) -> Vec<&Value> {
+    let mut scopes = vec![value];
+    if let Some(details) = value.get("details").filter(|details| details.is_object()) {
+        scopes.push(details);
+    }
+    if let Some(details) = value
+        .get("browser_details")
+        .filter(|details| details.is_object())
+    {
+        scopes.push(details);
+    }
+    scopes
 }
 
 fn render_requested_features_not_detected_line(missing: &[String]) -> String {
@@ -11062,7 +11347,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             .find(|prompt| prompt.contains("Repair the final acceptance failure"))
             .expect("final acceptance repair request");
         assert!(repair_prompt.contains("Repair the final acceptance failure"));
-        assert!(repair_prompt.contains("attempt: 1/1"));
+        assert!(repair_prompt.contains("attempt: 1/2"));
         assert!(repair_prompt.contains("without weakening verification"));
     }
 
@@ -13135,6 +13420,555 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
     }
 
     #[test]
+    #[cfg(unix)]
+    fn ultra_final_acceptance_runs_probe_before_behavior_arbitration() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/order/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        write_probe_nextjs_workspace(dir.path(), port, interactive_game_page_source());
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_override(
+            dir.path(),
+            &interaction_state_missing_probe_result(),
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Final acceptance".to_string(),
+            }],
+        };
+
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(!report.is_pass(), "{report:?}");
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::Implementation
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(!event_text.contains("probe_unavailable"), "{event_text}");
+        assert!(
+            !event_text.contains("/setup-interaction-probe"),
+            "{event_text}"
+        );
+        assert!(event_text.contains("browser_interaction_failed:interaction_state_change_missing"));
+        let ultra = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            ultra
+                .get("interaction_evidence_status")
+                .and_then(Value::as_str),
+            Some("failed:interaction_state_change_missing")
+        );
+        let arbitration = ultra
+            .get("evidence_arbitration")
+            .and_then(Value::as_object)
+            .expect("evidence arbitration");
+        let stateful = arbitration
+            .get("stateful_update_evidence")
+            .and_then(Value::as_object)
+            .expect("stateful update arbitration");
+        assert_eq!(
+            stateful
+                .get("behavioral_observation")
+                .and_then(Value::as_str),
+            Some("input_state_change_missing")
+        );
+        assert_eq!(
+            stateful.get("final_tier").and_then(Value::as_str),
+            Some("absent")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "covered by focused final-acceptance repair/reprobe tests without intermediate phase repair"]
+    fn behavioral_interaction_failure_repairs_and_reprobes_to_success() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/repair-success/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        write_probe_nextjs_workspace(dir.path(), port, hollow_canvas_game_page_source());
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_overrides(
+            dir.path(),
+            &[
+                interaction_state_missing_probe_result(),
+                interaction_state_changed_probe_result(),
+            ],
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let scaffold_plan = generated_nextjs_fixture_plan_json_with_kind(
+            "Create buildable app",
+            "check_scaffold.py",
+            "setup",
+        );
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(scaffold_plan),
+            AssistantReply::text(final_marker_implement_step_plan_json()),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            probe_nextjs_scaffold_reply(port, interactive_game_page_source().to_string()),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(1)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(2)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(3)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(4)),
+        ]);
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "first".to_string(),
+                    prompt: "First implementation pass".to_string(),
+                },
+                UltraPhase {
+                    id: "final".to_string(),
+                    prompt: "Final implementation pass".to_string(),
+                },
+            ],
+        };
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"event\":\"final_acceptance_repair_start\""));
+        assert!(!event_text.contains("\"event\":\"final_acceptance_repair_exhausted\""));
+        assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
+        assert!(
+            event_text
+                .matches("\"event\":\"browser_interaction_probe\"")
+                .count()
+                >= 2,
+            "{event_text}"
+        );
+        let repair_prompt = execution
+            .messages
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .find(|prompt| prompt.contains("Repair the final acceptance failure"))
+            .expect("repair prompt");
+        assert!(
+            repair_prompt
+                .contains("ArrowLeft keydown, ArrowRight keydown, Space keydown, canvas click")
+        );
+        assert!(repair_prompt.contains("player=20 score=0 health=3"));
+        assert!(repair_prompt.contains(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT));
+        assert!(repair_prompt.contains("Route-bound implementation targets:"));
+        assert!(repair_prompt.contains("src/app/page.tsx"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "covered by focused final-acceptance repair/reprobe tests without intermediate phase repair"]
+    fn behavioral_interaction_failure_exhausts_after_two_reprobe_cycles() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/repair-exhaust/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        write_probe_nextjs_workspace(dir.path(), port, interactive_game_page_source());
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_overrides(
+            dir.path(),
+            &[
+                interaction_state_missing_probe_result(),
+                interaction_state_missing_probe_result(),
+                interaction_state_missing_probe_result(),
+            ],
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let scaffold_plan = generated_nextjs_fixture_plan_json_with_kind(
+            "Create buildable app",
+            "check_scaffold.py",
+            "setup",
+        );
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(scaffold_plan),
+            AssistantReply::text(final_marker_implement_step_plan_json()),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            probe_nextjs_scaffold_reply(port, interactive_game_page_source().to_string()),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(1)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(2)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(3)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(4)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(5)),
+        ]);
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "first".to_string(),
+                    prompt: "First implementation pass".to_string(),
+                },
+                UltraPhase {
+                    id: "final".to_string(),
+                    prompt: "Final implementation pass".to_string(),
+                },
+            ],
+        };
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains(
+                "ultra final acceptance failed after bounded repair: browser_interaction_failed:interaction_state_change_missing"
+            ),
+            "{err}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert_eq!(
+            event_text
+                .matches("\"event\":\"final_acceptance_repair_start\"")
+                .count(),
+            2,
+            "{event_text}"
+        );
+        assert!(event_text.contains(
+            "\"failure_kind\":\"browser_interaction_failed:interaction_state_change_missing\""
+        ));
+        assert!(!event_text.contains("interaction_unverified_probe_unavailable"));
+        assert!(!event_text.contains("/setup-interaction-probe"));
+        let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
+        let recovery_text = render_ultra_plan(&recovery_plan);
+        assert!(
+            recovery_text.contains("capability_implementation"),
+            "{recovery_text}"
+        );
+        assert!(
+            recovery_text.contains(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT),
+            "{recovery_text}"
+        );
+        assert!(!recovery_text.contains("/setup-interaction-probe"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "existing probe-unavailable partial tests cover this without intermediate phase repair"]
+    fn probe_unavailable_environment_remains_partial_without_final_repair() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir
+            .path()
+            .join(".anvil/runs/probe-unavailable/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        write_probe_nextjs_workspace(dir.path(), port, interactive_game_page_source());
+        interaction_probe::write_test_availability_override(dir.path(), false);
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let scaffold_plan = generated_nextjs_fixture_plan_json_with_kind(
+            "Create buildable app",
+            "check_scaffold.py",
+            "setup",
+        );
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(scaffold_plan),
+            AssistantReply::text(final_marker_implement_step_plan_json()),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            probe_nextjs_scaffold_reply(port, interactive_game_page_source().to_string()),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(1)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(2)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(3)),
+        ]);
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "first".to_string(),
+                    prompt: "First implementation pass".to_string(),
+                },
+                UltraPhase {
+                    id: "final".to_string(),
+                    prompt: "Final implementation pass".to_string(),
+                },
+            ],
+        };
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"final_acceptance_status\":\"partial\""));
+        assert!(event_text.contains("interaction_unverified:probe_unavailable"));
+        assert!(event_text.contains("/setup-interaction-probe"));
+        assert!(!event_text.contains("\"event\":\"final_acceptance_repair_start\""));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn focused_behavioral_repair_prompt_and_reprobe_passes() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/focused-success/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        write_probe_nextjs_workspace(dir.path(), port, interactive_game_page_source());
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_overrides(
+            dir.path(),
+            &[
+                interaction_state_missing_probe_result(),
+                interaction_state_changed_probe_result(),
+            ],
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Final acceptance".to_string(),
+            }],
+        };
+        let initial_report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+        assert!(!initial_report.is_pass(), "{initial_report:?}");
+        assert_eq!(
+            classify_repair_target(&initial_report),
+            RepairTarget::Implementation
+        );
+        let expected_paths =
+            final_acceptance_repair_expected_paths(&plan, &cfg, &initial_report).unwrap();
+        let repair_prompt = final_acceptance_repair_prompt(
+            &plan,
+            &initial_report,
+            &UltraRunContext::default(),
+            RepairTarget::Implementation.as_str(),
+            &expected_paths,
+            &[],
+            (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+        );
+        assert!(
+            repair_prompt
+                .contains("ArrowLeft keydown, ArrowRight keydown, Space keydown, canvas click")
+        );
+        assert!(repair_prompt.contains("player=20 score=0 health=3"));
+        assert!(repair_prompt.contains(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT));
+        assert!(repair_prompt.contains("src/app/page.tsx"));
+        let mut fake = FakeClient::new(vec![probe_nextjs_scaffold_reply(
+            port,
+            interactive_game_page_variant(9),
+        )]);
+        let mut session = SessionSnapshot::new();
+        let outcome = run_final_acceptance_repair_with_ultra_session(
+            &mut fake,
+            &mut session,
+            &repair_prompt,
+            &expected_paths,
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert!(!outcome.changed_paths.is_empty(), "{outcome:?}");
+        clear_final_acceptance_browser_probe_evidence(&cfg);
+        let repaired_report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+        assert!(repaired_report.is_pass(), "{repaired_report:?}");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text
+                .matches("\"event\":\"browser_interaction_probe\"")
+                .count()
+                >= 2,
+            "{event_text}"
+        );
+        assert!(!event_text.contains("probe_unavailable"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn focused_behavioral_repair_exhaustion_handoff_uses_probe_failure() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/focused-exhaust/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        write_probe_nextjs_workspace(dir.path(), port, interactive_game_page_source());
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_overrides(
+            dir.path(),
+            &[
+                interaction_state_missing_probe_result(),
+                interaction_state_missing_probe_result(),
+                interaction_state_missing_probe_result(),
+            ],
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Final acceptance".to_string(),
+            }],
+        };
+        let mut report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+        assert!(!report.is_pass(), "{report:?}");
+        let mut fake = FakeClient::new(vec![
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(10)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(11)),
+        ]);
+        let mut session = SessionSnapshot::new();
+        for attempt in 1..=FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS {
+            let target = classify_repair_target(&report);
+            let expected_paths =
+                final_acceptance_repair_expected_paths(&plan, &cfg, &report).unwrap();
+            let prompt = final_acceptance_repair_prompt(
+                &plan,
+                &report,
+                &UltraRunContext::default(),
+                target.as_str(),
+                &expected_paths,
+                &[],
+                (attempt, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+            );
+            let outcome = run_final_acceptance_repair_with_ultra_session(
+                &mut fake,
+                &mut session,
+                &prompt,
+                &expected_paths,
+                &cfg,
+                &NOOP_UI,
+            )
+            .unwrap();
+            assert!(!outcome.changed_paths.is_empty(), "{outcome:?}");
+            clear_final_acceptance_browser_probe_evidence(&cfg);
+            report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+        }
+        assert!(!report.is_pass(), "{report:?}");
+        let failure_kind = final_acceptance_app_behavior_failure_kind(&report).unwrap();
+        assert_eq!(
+            failure_kind,
+            "browser_interaction_failed:interaction_state_change_missing"
+        );
+        let reason =
+            final_acceptance_recovery_reason(&report, &failure_kind, "bounded_repair_exhausted");
+        let targets =
+            final_acceptance_recovery_repair_targets(&report, classify_repair_target(&report));
+        assert_eq!(targets, vec!["capability_implementation".to_string()]);
+        let missing_signals = verification_missing_signals(&report);
+        let phase = plan.phases.last().unwrap();
+        let _handoff = save_ultra_phase_recovery_handoff(
+            &cfg,
+            &plan,
+            phase,
+            UltraPhaseRecoveryRequest {
+                failure_kind: &failure_kind,
+                reason: &reason,
+                missing_paths: &report.missing_paths,
+                missing_signals: &missing_signals,
+                repair_targets: &targets,
+            },
+        )
+        .expect("handoff saved");
+        let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
+        let recovery_text = render_ultra_plan(&recovery_plan);
+        assert!(
+            recovery_text.contains("capability_implementation"),
+            "{recovery_text}"
+        );
+        assert!(
+            recovery_text.contains(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT),
+            "{recovery_text}"
+        );
+        assert!(!recovery_text.contains("/setup-interaction-probe"));
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(!event_text.contains("interaction_unverified_probe_unavailable"));
+        assert!(!event_text.contains("/setup-interaction-probe"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recovery_transition_not_observed_has_unverified_tier_without_setup_remediation() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir
+            .path()
+            .join(".anvil/runs/recovery-not-observed/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        write_probe_nextjs_workspace(dir.path(), port, interactive_game_page_source());
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_override(
+            dir.path(),
+            &recovery_not_observed_probe_result(),
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Final acceptance".to_string(),
+            }],
+        };
+
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(report.is_pass(), "{report:?}");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("unverified:not_observed_by_probe"));
+        assert!(event_text.contains("interaction_unverified:not_observed_by_probe"));
+        assert!(!event_text.contains("probe_unavailable"), "{event_text}");
+        assert!(
+            !event_text.contains("/setup-interaction-probe"),
+            "{event_text}"
+        );
+        let ultra = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            ultra
+                .get("evidence_tiers")
+                .and_then(|tiers| tiers.get("restart_or_recoverable_state_evidence"))
+                .and_then(Value::as_str),
+            Some("unverified:not_observed_by_probe")
+        );
+    }
+
+    #[test]
     fn interaction_probe_infrastructure_failure_blocks_release_without_static_override() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
@@ -15149,6 +15983,183 @@ exit 2\n"
         let mut permissions = std::fs::metadata(&next_path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
         std::fs::set_permissions(next_path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_probe_nextjs_workspace(root: &Path, port: u16, page: &str) {
+        std::fs::write(
+            root.join("package.json"),
+            format!(
+                r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}}}}"#
+            ),
+        )
+        .unwrap();
+        write_fake_nextjs_package_manager(root, false);
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::write(root.join("tsconfig.json"), nextjs_tsconfig_json()).unwrap();
+        std::fs::write(root.join("postcss.config.js"), nextjs_postcss_config()).unwrap();
+        std::fs::write(root.join("tailwind.config.ts"), nextjs_tailwind_config_ts()).unwrap();
+        std::fs::write(root.join("src/app/page.tsx"), page).unwrap();
+        std::fs::write(root.join("src/app/layout.tsx"), nextjs_layout_source()).unwrap();
+        std::fs::write(root.join("src/app/globals.css"), nextjs_globals_css()).unwrap();
+        std::fs::write(
+            root.join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+    }
+
+    fn hollow_canvas_game_page_source() -> &'static str {
+        r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [mode, setMode] = useState("menu");
+  return <main><button onClick={() => setMode("playing")}>Start</button><canvas /><p>score 0 health 3 {mode}</p></main>;
+}
+"#
+    }
+
+    fn interaction_state_missing_probe_result() -> Value {
+        serde_json::json!({
+            "ok": true,
+            "status": "passed",
+            "interaction_success": true,
+            "interaction_performed": true,
+            "input_event_observed": true,
+            "input_state_change": false,
+            "state_changed": false,
+            "visible_state_changed": false,
+            "steps": ["surface_visible", "start_transition", "control_input_dispatched"],
+            "before_marker": "screen=menu score=0 health=3",
+            "after_marker": "screen=playing score=0 health=3",
+            "input_before_marker": "player=20 score=0 health=3",
+            "input_after_marker": "player=20 score=0 health=3",
+            "recovery_transition": true,
+            "recovery_transition_status": "observed",
+            "duration_ms": 17
+        })
+    }
+
+    fn interaction_state_changed_probe_result() -> Value {
+        serde_json::json!({
+            "ok": true,
+            "status": "passed",
+            "interaction_success": true,
+            "interaction_performed": true,
+            "input_event_observed": true,
+            "input_state_change": true,
+            "state_changed": true,
+            "visible_state_changed": true,
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "control_input_dispatched",
+                "input_state_change",
+                "recovery_transition"
+            ],
+            "before_marker": "screen=menu score=0 health=3",
+            "after_marker": "screen=playing score=0 health=3",
+            "input_before_marker": "player=20 score=0 health=3",
+            "input_after_marker": "player=15 score=1 health=3",
+            "recovery_transition": true,
+            "recovery_transition_status": "observed",
+            "duration_ms": 19
+        })
+    }
+
+    fn recovery_not_observed_probe_result() -> Value {
+        serde_json::json!({
+            "ok": true,
+            "status": "passed",
+            "interaction_success": true,
+            "interaction_performed": true,
+            "input_event_observed": true,
+            "input_state_change": true,
+            "state_changed": true,
+            "visible_state_changed": true,
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "control_input_dispatched",
+                "input_state_change",
+                "recovery_transition:not_observed"
+            ],
+            "before_marker": "screen=menu",
+            "after_marker": "screen=playing",
+            "input_before_marker": "player=20 score=0",
+            "input_after_marker": "player=15 score=1",
+            "recovery_before_marker": "screen=playing",
+            "recovery_after_marker": "screen=playing",
+            "recovery_transition": false,
+            "recovery_transition_status": "not_observed",
+            "duration_ms": 23
+        })
+    }
+
+    #[cfg(unix)]
+    fn probe_nextjs_scaffold_tool_calls(
+        port: u16,
+        page: &str,
+        check_path: &str,
+    ) -> Vec<crate::state::ToolCall> {
+        vec![
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({
+                    "path":"package.json",
+                    "content": format!(
+                        r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}}}}"#
+                    )
+                }),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"tsconfig.json","content":nextjs_tsconfig_json()}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"postcss.config.js","content":nextjs_postcss_config()}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"tailwind.config.ts","content":nextjs_tailwind_config_ts()}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/page.tsx","content":page}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/layout.tsx","content":nextjs_layout_source()}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/globals.css","content":nextjs_globals_css()}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";"}),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":check_path,"content":"x = 1\n"}),
+            ),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn probe_nextjs_scaffold_reply(port: u16, page: String) -> AssistantReply {
+        AssistantReply {
+            content: String::new(),
+            tool_calls: probe_nextjs_scaffold_tool_calls(port, &page, "check_scaffold.py"),
+            prompt_tokens: None,
+            completion_tokens: None,
+        }
+    }
+
+    fn interactive_game_page_variant(label: usize) -> String {
+        interactive_game_page_source()
+            .replace("score {score}", &format!("score {{score}} health {label}"))
     }
 
     #[cfg(unix)]

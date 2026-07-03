@@ -369,9 +369,9 @@ pub fn browser_interaction_evidence_for_dirs(
         root,
         extra_dirs,
         &[
+            "browser-interaction.json",
             "interaction-evidence.json",
             "interaction.json",
-            "browser-interaction.json",
         ],
         BrowserEvidenceKind::Interaction,
         "interaction_evidence_missing",
