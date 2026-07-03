@@ -511,6 +511,7 @@ struct UltraRunContext {
 const ULTRA_CONTEXT_MAX_PHASES: usize = 12;
 const ULTRA_CONTEXT_MAX_PATHS: usize = 24;
 const ULTRA_CONTEXT_MAX_MESSAGES: usize = 10;
+const ULTRA_PROMPT_GUIDANCE_MAX_LINES: usize = 8;
 
 impl UltraRunContext {
     fn new(pending_final_artifacts: Vec<String>) -> Self {
@@ -582,18 +583,15 @@ impl UltraRunContext {
     }
 
     fn render_unmet_final_requirements_section(&self) -> String {
-        let mut lines = vec!["Unmet final requirements from earlier phases:".to_string()];
         if self.pending_capability_evidence.is_empty() {
-            lines.push("- none".to_string());
-        } else {
-            for item in &self.pending_capability_evidence {
-                lines.push(format!("- {item}"));
-            }
-            lines.push(
-                "Close these requirements when they are in scope for this phase.".to_string(),
-            );
+            return "Unmet final requirements from earlier phases:\n- none".to_string();
         }
-        lines.join("\n")
+        render_bounded_prompt_section(
+            "Unmet final requirements from earlier phases:",
+            &self.pending_capability_evidence,
+            Some("Close these requirements when they are in scope for this phase."),
+            ULTRA_PROMPT_GUIDANCE_MAX_LINES,
+        )
     }
 
     fn update_after_failure(
@@ -2440,6 +2438,35 @@ fn append_context_list(lines: &mut Vec<String>, label: &str, values: &[String]) 
     for value in values {
         lines.push(format!("  - {value}"));
     }
+}
+
+fn render_bounded_prompt_section(
+    header: &str,
+    items: &[String],
+    footer: Option<&str>,
+    max_lines: usize,
+) -> String {
+    let footer_lines = usize::from(footer.is_some());
+    let available_item_lines = max_lines.saturating_sub(1 + footer_lines).max(1);
+    let mut lines = vec![header.to_string()];
+    if items.len() > available_item_lines {
+        let shown = available_item_lines.saturating_sub(1);
+        for item in items.iter().take(shown) {
+            lines.push(format!("- {item}"));
+        }
+        lines.push(format!(
+            "- … and {} more",
+            items.len().saturating_sub(shown)
+        ));
+    } else {
+        for item in items {
+            lines.push(format!("- {item}"));
+        }
+    }
+    if let Some(footer) = footer {
+        lines.push(format!("- {footer}"));
+    }
+    lines.join("\n")
 }
 
 fn merge_changed_files(context: &mut RepairContext, incoming: &[String]) {
@@ -7671,6 +7698,16 @@ fn emit_planner_plan_sanitized(
             "planner_provider": provider,
             "planner_model": model,
             "repair_attempt": attempt,
+            "actions": report.goal_truncations.iter().map(|record| json!({
+                "kind": &record.kind,
+                "original_len": record.original_len,
+                "new_len": record.new_len,
+            })).collect::<Vec<_>>(),
+            "goal_truncations": report.goal_truncations.iter().map(|record| json!({
+                "kind": &record.kind,
+                "original_len": record.original_len,
+                "new_len": record.new_len,
+            })).collect::<Vec<_>>(),
             "removed_commands": report.removed_commands.iter().map(|record| json!({
                 "step_id": &record.step_id,
                 "command": eval_events::body_snippet(&record.command),
@@ -8145,6 +8182,9 @@ fn build_lint_retry_prompt(
     attempt: usize,
     categories_seen: &BTreeSet<String>,
 ) -> String {
+    if is_only_goal_length_lint(report) {
+        return "shorten goal to one sentence; keep steps unchanged".to_string();
+    }
     let guidance = lint_retry_hard_constraints(report, categories_seen).join("\n");
     let errors = report
         .errors
@@ -8160,6 +8200,12 @@ Return only one JSON object with top-level goal and steps. Do not use markdown f
 Step id must be a quoted string. expected_result must be exactly \"pass\" or \"fail\".\n\
 Goal: {goal}"
     )
+}
+
+fn is_only_goal_length_lint(report: &PlanLintReport) -> bool {
+    report.errors.len() == 1
+        && report.errors[0].category == "contract"
+        && report.errors[0].message == "StepPlan goal is too long"
 }
 
 fn build_quality_retry_prompt(goal: &str, report: &PlanQualityReport, attempt: usize) -> String {
@@ -8489,6 +8535,7 @@ fn build_step_plan_user_prompt(goal: &str, config: &Config) -> String {
     }
     if is_ultra_phase_step_goal(goal) {
         prompt.push_str("\nUltra phase hard constraints:\n");
+        prompt.push_str("- StepPlan.goal must be ONE short sentence naming the phase outcome; never copy the phase context, unmet-requirements, or adherence lists into goal -- details belong in step instructions.\n");
         prompt.push_str("- Do not put dev-server startup, page-load probes, curl localhost, or dependency installation in verify.\n");
         prompt.push_str("- Browser readiness is verified by the runtime at final acceptance.\n");
         prompt.push_str("- GOOD verify examples:\n");
@@ -8909,9 +8956,11 @@ fn render_requested_features_not_detected_line(missing: &[String]) -> String {
     if missing.is_empty() {
         "Requested features not yet detected: none".to_string()
     } else {
-        format!(
-            "Requested features not yet detected: {}",
-            missing.join(", ")
+        render_bounded_prompt_section(
+            "Requested features not yet detected:",
+            missing,
+            None,
+            ULTRA_PROMPT_GUIDANCE_MAX_LINES,
         )
     }
 }
@@ -9362,6 +9411,17 @@ mod tests {
     }
 
     #[test]
+    fn goal_length_retry_prompt_is_exact_and_step_preserving() {
+        let mut report = PlanLintReport::pass();
+        report.push("contract", "StepPlan goal is too long");
+        let categories = BTreeSet::new();
+
+        let prompt = build_lint_retry_prompt("goal", &report, 2, &categories);
+
+        assert_eq!(prompt, "shorten goal to one sentence; keep steps unchanged");
+    }
+
+    #[test]
     fn dependency_order_lint_maps_to_specific_planner_failure_kind() {
         let mut report = PlanLintReport::pass();
         report.push(
@@ -9653,6 +9713,18 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
     }
 
     #[test]
+    fn ultra_phase_step_prompt_requires_short_goal() {
+        let prompt = build_step_plan_user_prompt(
+            "Original ultra goal: Build game\nPhase id: ui\nPhase task: Build the arcade UI.",
+            &config(PathBuf::from("/tmp/work")),
+        );
+
+        assert!(prompt.contains("StepPlan.goal must be ONE short sentence"));
+        assert!(prompt.contains("never copy the phase context"));
+        assert!(prompt.contains("details belong in step instructions"));
+    }
+
+    #[test]
     fn ultra_plan_prompt_includes_source_parity_rules() {
         let mut cfg = config(PathBuf::from("/tmp/work"));
         cfg.profile = "nextjs".to_string();
@@ -9827,6 +9899,55 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
     }
 
     #[test]
+    fn echoed_ultra_phase_goal_is_sanitized_without_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let long_phase_prompt = format!(
+            "Original ultra goal: {}\n\
+Profile: nextjs\n\
+Style: default\n\
+Intent: create\n\
+Phase id: arcade-ui-and-local-storage\n\
+Phase task: Build the arcade UI and local storage persistence. Add details in the steps.\n\n\
+Unmet final requirements from earlier phases:\n- restart_or_recoverable_state_evidence\n\n\
+Requested features not yet detected: keyboard, score, wave, audio\n\n\
+Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}",
+            "Create a polished arcade game. ".repeat(120),
+            "Carry forward profile constraints. ".repeat(120)
+        );
+        let step_json = serde_json::to_string(&StepPlan {
+            goal: long_phase_prompt.clone(),
+            steps: vec![PlanStep {
+                id: "create-page".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create src/app/page.tsx for the arcade phase.".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: Vec::new(),
+            }],
+        })
+        .unwrap();
+        let mut planner = FakeClient::new(vec![AssistantReply::text(step_json)]);
+
+        let plan = generate_step_plan(&mut planner, &long_phase_prompt, &cfg).unwrap();
+
+        assert_eq!(planner.messages.len(), 1);
+        assert_eq!(
+            plan.goal,
+            "Build the arcade UI and local storage persistence."
+        );
+        assert!(!plan.goal.contains("Unmet final requirements"));
+        assert!(!plan.goal.contains("Requested features"));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"planner_plan_sanitized\""));
+        assert!(event_text.contains("\"kind\":\"goal_truncated\""));
+        assert!(event_text.contains("\"original_len\""));
+        assert!(event_text.contains("\"new_len\""));
+    }
+
+    #[test]
     fn retryable_quality_issue_gets_corrective_retry() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -9960,14 +10081,52 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
             &UltraRunContext::new(Vec::new()),
         );
 
-        let line = prompt
-            .lines()
-            .find(|line| line.starts_with("Requested features not yet detected:"))
-            .expect("requested feature guidance line");
-        assert!(line.contains("keyboard"), "{line}");
-        assert!(line.contains("lives"), "{line}");
-        assert!(line.contains("pause"), "{line}");
-        assert!(!line.contains("score"), "{line}");
+        let section = prompt_section_lines(&prompt, "Requested features not yet detected:");
+        let section_text = section.join("\n");
+        assert!(section_text.contains("- keyboard"), "{section_text}");
+        assert!(section_text.contains("- lives"), "{section_text}");
+        assert!(section_text.contains("- pause"), "{section_text}");
+        assert!(!section_text.contains("score"), "{section_text}");
+    }
+
+    #[test]
+    fn ultra_phase_prompt_elides_unmet_requirements_and_adherence_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = UltraRunContext::new(Vec::new());
+        context.pending_capability_evidence = (0..20)
+            .map(|index| format!("pending_evidence_{index:02}"))
+            .collect();
+        let feature_tokens = (0..30)
+            .map(|index| format!("needtoken{index:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let plan = UltraPlan {
+            goal: "Create a browser game".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![crate::planner::ultra_plan::UltraPhase {
+                id: "features".to_string(),
+                prompt: feature_tokens,
+            }],
+        };
+
+        let prompt = ultra_phase_prompt(
+            &plan,
+            &plan.phases[0],
+            &config(dir.path().to_path_buf()),
+            &context,
+        );
+
+        let unmet = prompt_section_lines(&prompt, "Unmet final requirements from earlier phases:");
+        let adherence = prompt_section_lines(&prompt, "Requested features not yet detected:");
+        assert!(unmet.len() <= ULTRA_PROMPT_GUIDANCE_MAX_LINES, "{unmet:#?}");
+        assert!(
+            adherence.len() <= ULTRA_PROMPT_GUIDANCE_MAX_LINES,
+            "{adherence:#?}"
+        );
+        assert!(unmet.iter().any(|line| line.contains("… and 15 more")));
+        assert!(adherence.iter().any(|line| line.contains("… and 24 more")));
     }
 
     #[test]
@@ -10002,6 +10161,63 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
         assert!(prompt.contains("- score_or_progression_evidence"));
         assert!(prompt.contains("- failure_or_collision_evidence"));
         assert!(prompt.contains("- restart_or_recoverable_state_evidence"));
+    }
+
+    #[test]
+    fn ultra_run_proceeds_when_step_planner_echoes_phase_prompt_into_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Create a polished arcade game with local storage. ".repeat(120),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "arcade-ui-and-local-storage".to_string(),
+                    prompt: "Build the arcade UI and local storage persistence.".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "final-marker".to_string(),
+                    prompt: "Write the final completion marker.".to_string(),
+                },
+            ],
+        };
+        let mut planner = EchoGoalPlanner::new();
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"phase-1.txt","content":"phase one\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"phase-2.txt","content":"phase two\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        assert_eq!(planner.messages.len(), 2);
+        assert!(dir.path().join("phase-1.txt").is_file());
+        assert!(dir.path().join("phase-2.txt").is_file());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"ultra_phase_scaffold_complete\""));
+        assert!(event_text.contains("\"event\":\"planner_plan_sanitized\""));
+        assert!(event_text.contains("\"kind\":\"goal_truncated\""));
+        assert!(!event_text.contains("phase_scaffold_error"));
     }
 
     #[test]
@@ -14358,6 +14574,56 @@ export default function Page() {
         }
     }
 
+    struct EchoGoalPlanner {
+        messages: Vec<Vec<ConversationMessage>>,
+        calls: usize,
+    }
+
+    impl EchoGoalPlanner {
+        fn new() -> Self {
+            Self {
+                messages: Vec::new(),
+                calls: 0,
+            }
+        }
+    }
+
+    impl ChatClient for EchoGoalPlanner {
+        fn label(&self) -> &str {
+            "echo-planner"
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            messages: &[ConversationMessage],
+            _tools: &[ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            self.messages.push(messages.to_vec());
+            self.calls += 1;
+            let echoed_goal = messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let path = format!("phase-{}.txt", self.calls);
+            let plan = StepPlan {
+                goal: echoed_goal,
+                steps: vec![PlanStep {
+                    id: format!("phase-{}", self.calls),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: format!("Create {path} for this phase."),
+                    expected_paths: vec![path],
+                    verify: Vec::new(),
+                }],
+            };
+            Ok(AssistantReply::text(serde_json::to_string(&plan).unwrap()))
+        }
+    }
+
     fn generated_step_plan_json(goal: &str) -> String {
         serde_json::to_string(&StepPlan::single(goal)).unwrap()
     }
@@ -14482,6 +14748,20 @@ export default function Page() {
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn prompt_section_lines(prompt: &str, header: &str) -> Vec<String> {
+        let mut lines = prompt.lines().skip_while(|line| *line != header);
+        let Some(first) = lines.next() else {
+            panic!("missing prompt section {header:?} in {prompt}");
+        };
+        std::iter::once(first.to_string())
+            .chain(
+                lines
+                    .take_while(|line| !line.trim().is_empty())
+                    .map(str::to_string),
+            )
+            .collect()
     }
 
     fn nextjs_scaffold_expected_paths() -> Vec<String> {

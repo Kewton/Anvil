@@ -10,15 +10,25 @@ use crate::tools::path_guard::validate_workspace_relative;
 
 const BROWSER_READINESS_NOTE: &str =
     "Browser readiness is verified by the runtime at final acceptance.";
+const STEP_PLAN_GOAL_LINT_LIMIT_CHARS: usize = 4_000;
+const SANITIZED_GOAL_MAX_CHARS: usize = 600;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SanitizerReport {
+    pub goal_truncations: Vec<SanitizedGoalTruncationRecord>,
     pub removed_commands: Vec<SanitizedCommandRecord>,
     pub substituted_commands: Vec<SanitizedSubstitutionRecord>,
     pub moved_commands: Vec<SanitizedMoveRecord>,
     pub dropped_commands: Vec<SanitizedCommandRecord>,
     pub retyped_steps: Vec<SanitizedRetypeRecord>,
     pub instruction_notes: Vec<SanitizedInstructionNote>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedGoalTruncationRecord {
+    pub kind: String,
+    pub original_len: usize,
+    pub new_len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +69,8 @@ pub struct SanitizedInstructionNote {
 
 impl SanitizerReport {
     pub fn is_empty(&self) -> bool {
-        self.removed_commands.is_empty()
+        self.goal_truncations.is_empty()
+            && self.removed_commands.is_empty()
             && self.substituted_commands.is_empty()
             && self.moved_commands.is_empty()
             && self.dropped_commands.is_empty()
@@ -73,6 +84,7 @@ pub fn sanitize_step_plan_against_policy(
     workspace_root: Option<&Path>,
 ) -> SanitizerReport {
     let mut report = SanitizerReport::default();
+    normalize_oversized_goal(plan, &mut report);
     remove_setup_or_dev_server_verify_commands(plan, &mut report);
     let should_retype_manifest_step = !report.removed_commands.is_empty()
         || !diagnose_step_plan_dependency_order(plan, workspace_root).is_empty();
@@ -83,6 +95,158 @@ pub fn sanitize_step_plan_against_policy(
     normalize_empty_verify_steps(plan, &mut report);
     dedupe_verify_commands(plan);
     report
+}
+
+fn normalize_oversized_goal(plan: &mut StepPlan, report: &mut SanitizerReport) {
+    let original_len = plan.goal.chars().count();
+    if original_len <= STEP_PLAN_GOAL_LINT_LIMIT_CHARS {
+        return;
+    }
+
+    let normalized = normalized_goal_summary(&plan.goal);
+    let new_len = normalized.chars().count();
+    plan.goal = normalized;
+    report.goal_truncations.push(SanitizedGoalTruncationRecord {
+        kind: "goal_truncated".to_string(),
+        original_len,
+        new_len,
+    });
+}
+
+fn normalized_goal_summary(goal: &str) -> String {
+    let candidate = phase_task_excerpt(goal)
+        .or_else(|| first_non_guidance_line(goal))
+        .unwrap_or_else(|| "Complete the current phase.".to_string());
+    let stripped = strip_echoed_guidance_sections(&candidate);
+    let compact = collapse_whitespace(if stripped.trim().is_empty() {
+        candidate.trim()
+    } else {
+        stripped.trim()
+    });
+    let bounded = truncate_at_sentence_or_line_boundary(&compact, SANITIZED_GOAL_MAX_CHARS);
+    if bounded.trim().is_empty() {
+        "Complete the current phase.".to_string()
+    } else {
+        bounded
+    }
+}
+
+fn phase_task_excerpt(goal: &str) -> Option<String> {
+    goal.lines()
+        .find_map(|line| line.trim().strip_prefix("Phase task:"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            truncate_at_sentence_or_line_boundary(
+                &first_sentence_or_line(line),
+                SANITIZED_GOAL_MAX_CHARS,
+            )
+        })
+}
+
+fn first_non_guidance_line(goal: &str) -> Option<String> {
+    strip_echoed_guidance_sections(goal)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !is_echoed_guidance_line(line))
+        .map(|line| truncate_at_sentence_or_line_boundary(line, SANITIZED_GOAL_MAX_CHARS))
+}
+
+fn strip_echoed_guidance_sections(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut skipping_guidance_section = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if starts_guidance_section(trimmed) {
+            skipping_guidance_section = true;
+            continue;
+        }
+        if skipping_guidance_section {
+            if trimmed.is_empty() {
+                skipping_guidance_section = false;
+            }
+            continue;
+        }
+        if is_echoed_guidance_line(trimmed) {
+            continue;
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+fn starts_guidance_section(line: &str) -> bool {
+    matches!(
+        line,
+        "Profile runtime contract:"
+            | "Profile contract:"
+            | "Route-bound implementation constraint:"
+            | "Deterministic verification preference:"
+    ) || line.starts_with("Unmet final requirements")
+        || line.starts_with("Requested features")
+}
+
+fn is_echoed_guidance_line(line: &str) -> bool {
+    if starts_guidance_section(line) {
+        return true;
+    }
+    if !line.starts_with("- ") {
+        return false;
+    }
+    let lower = line[2..].to_ascii_lowercase();
+    lower.starts_with("profile ")
+        || lower.starts_with("preserve ")
+        || lower.starts_with("keep ")
+        || lower.starts_with("prefer ")
+        || lower.starts_with("do not ")
+        || lower.starts_with("if ")
+        || lower.starts_with("browser readiness ")
+        || lower.starts_with("close these requirements ")
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn first_sentence_or_line(text: &str) -> String {
+    for (idx, ch) in text.char_indices() {
+        if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？' | '\n') {
+            let end = idx + ch.len_utf8();
+            let candidate = text[..end].trim();
+            if !candidate.is_empty() {
+                return candidate.to_string();
+            }
+        }
+    }
+    text.trim().to_string()
+}
+
+fn truncate_at_sentence_or_line_boundary(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.trim().to_string();
+    }
+    let mut best = None;
+    for (idx, ch) in text.char_indices() {
+        let end = idx + ch.len_utf8();
+        let chars = text[..end].chars().count();
+        if chars > max_chars {
+            break;
+        }
+        if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？' | '\n') {
+            best = Some(end);
+        }
+    }
+    if let Some(end) = best {
+        let candidate = text[..end].trim();
+        if !candidate.is_empty() {
+            return candidate.to_string();
+        }
+    }
+    text.chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn remove_setup_or_dev_server_verify_commands(plan: &mut StepPlan, report: &mut SanitizerReport) {
@@ -335,6 +499,106 @@ fn dedupe_verify_commands(plan: &mut StepPlan) {
 mod tests {
     use super::*;
     use crate::planner::lint::lint_step_plan_report_with_workspace;
+
+    fn valid_artifact_plan(goal: String) -> StepPlan {
+        StepPlan {
+            goal,
+            steps: vec![PlanStep {
+                id: "create-page".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create src/app/page.tsx for the requested phase.".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: vec!["test -f src/app/page.tsx".to_string()],
+            }],
+        }
+    }
+
+    fn uat_shaped_echoed_phase_prompt() -> String {
+        format!(
+            "Original ultra goal: {}\n\
+Profile: nextjs\n\
+Style: default\n\
+Intent: create\n\
+Phase id: arcade-ui-and-local-storage\n\
+Phase task: Build the arcade UI and local storage persistence. Add details in the steps.\n\n\
+Workspace snapshot:\n- none\n\n\
+Unmet final requirements from earlier phases:\n- restart_or_recoverable_state_evidence\n- interaction_evidence\n\n\
+Requested features not yet detected: keyboard, score, collision, wave, audio, particles, highscore\n\n\
+Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Keep next/react/react-dom dependencies in package.json.\n- Do not treat scaffold-only output as complete.\n\n{}",
+            "Create a polished canvas arcade game with persistent progress. ".repeat(80),
+            "Carry forward evidence and profile constraints. ".repeat(120)
+        )
+    }
+
+    #[test]
+    fn sanitizer_truncates_echoed_phase_prompt_goal_before_lint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = valid_artifact_plan(uat_shaped_echoed_phase_prompt());
+        assert!(plan.goal.chars().count() > STEP_PLAN_GOAL_LINT_LIMIT_CHARS);
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.goal_truncations.len(), 1);
+        assert_eq!(report.goal_truncations[0].kind, "goal_truncated");
+        assert!(report.goal_truncations[0].original_len > STEP_PLAN_GOAL_LINT_LIMIT_CHARS);
+        assert!(report.goal_truncations[0].new_len <= SANITIZED_GOAL_MAX_CHARS);
+        assert_eq!(
+            plan.goal,
+            "Build the arcade UI and local storage persistence."
+        );
+        assert!(!plan.goal.contains("Unmet final requirements"));
+        assert!(!plan.goal.contains("Requested features"));
+        assert!(!plan.goal.contains("Profile runtime contract"));
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn sanitizer_guarantees_goal_length_lint_cannot_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = valid_artifact_plan("x".repeat(10_000));
+
+        sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert!(plan.goal.chars().count() <= SANITIZED_GOAL_MAX_CHARS);
+        let lint = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+        assert!(
+            !lint
+                .errors
+                .iter()
+                .any(|err| err.message == "StepPlan goal is too long"),
+            "{lint:?}"
+        );
+        assert!(lint.is_pass(), "{lint:?}");
+    }
+
+    #[test]
+    fn goal_truncation_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = valid_artifact_plan(uat_shaped_echoed_phase_prompt());
+        sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+        let once = plan.clone();
+
+        let second = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert!(second.is_empty());
+        assert_eq!(plan, once);
+    }
+
+    #[test]
+    fn sanitizer_leaves_short_goal_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = valid_artifact_plan("Create README".to_string());
+        let before = serde_json::to_string(&plan).unwrap();
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert!(report.is_empty());
+        assert_eq!(serde_json::to_string(&plan).unwrap(), before);
+    }
 
     #[test]
     fn sanitizer_removes_setup_and_dev_server_verify_and_retypes_manifest_step() {
