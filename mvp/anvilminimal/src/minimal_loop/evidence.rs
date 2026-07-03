@@ -2176,6 +2176,12 @@ fn source_file_has_restart_or_recoverable_state_keyword(file: &SourceFile) -> bo
         "game over",
         "play again",
         "try again",
+        "initgame",
+        "initstate",
+        "resetstate",
+        "newgame",
+        "newstate",
+        "newlevel",
         "スタート",
         "開始",
     ]
@@ -2230,7 +2236,7 @@ fn source_file_restart_or_recoverable_state_signal(file: &SourceFile) -> SourceE
         SourceEvidenceSignal::Strong
     } else {
         SourceEvidenceSignal::Weak(
-            "restart/recovery needs a handler that references game-over state and resets score/entities",
+            "wire a handler (e.g. onClick) to a function that resets score AND entities and transitions out of the game-over state",
         )
     }
 }
@@ -2248,6 +2254,9 @@ fn handler_segments(lower: &str) -> Vec<&str> {
         "restart",
         "resetgame",
         "restartgame",
+        "initgame",
+        "initstate",
+        "resetstate",
         "startgame",
         "newgame",
         "onkeydown",
@@ -2510,7 +2519,19 @@ fn if_condition_segment(lower: &str, if_index: usize) -> Option<&str> {
 fn source_file_has_restart_reset_handler(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
     let comment_stripped = file.comment_stripped_text().to_ascii_lowercase();
-    let has_game_over_reference = [
+    let has_game_over_reference = source_text_has_game_over_reference(&lower, &comment_stripped);
+    if has_game_over_reference && source_text_has_single_segment_restart_reset_handler(&lower) {
+        return true;
+    }
+    source_text_has_linked_restart_reset_function(
+        &lower,
+        &comment_stripped,
+        has_game_over_reference,
+    )
+}
+
+fn source_text_has_game_over_reference(lower: &str, comment_stripped: &str) -> bool {
+    [
         "gameover",
         "game over",
         "isgameover",
@@ -2519,41 +2540,391 @@ fn source_file_has_restart_reset_handler(file: &SourceFile) -> bool {
         "setgamestate('gameover'",
     ]
     .iter()
-    .any(|needle| lower.contains(needle) || comment_stripped.contains(needle));
-    if !has_game_over_reference {
-        return false;
-    }
-    handler_segments(&lower).into_iter().any(|segment| {
-        let resets_score = [
-            "setscore(0",
-            "setpoints(0",
-            "setlevel(0",
-            "score = 0",
-            "score=0",
-            "points = 0",
-            "points=0",
-        ]
-        .iter()
-        .any(|needle| segment.contains(needle));
-        let resets_entities = [
-            "setbullets([]",
-            "setbullet([]",
-            "setshots([]",
-            "setprojectiles([]",
-            "setenemies(",
-            "setinvaders(",
-            "bullets = []",
-            "bullets=[]",
-            "enemies = []",
-            "enemies=[]",
-        ]
-        .iter()
-        .any(|needle| segment.contains(needle));
-        let references_game_over = segment.contains("gameover")
-            || segment.contains("setgameover(")
-            || segment.contains("setgamestate(");
-        resets_score && resets_entities && references_game_over
+    .any(|needle| lower.contains(needle) || comment_stripped.contains(needle))
+}
+
+fn source_text_has_single_segment_restart_reset_handler(lower: &str) -> bool {
+    handler_segments(lower).into_iter().any(|segment| {
+        restart_segment_resets_score(segment)
+            && restart_segment_resets_entities(segment)
+            && restart_segment_references_recoverable_state(segment)
     })
+}
+
+fn source_text_has_linked_restart_reset_function(
+    lower: &str,
+    comment_stripped: &str,
+    has_game_over_reference: bool,
+) -> bool {
+    restart_reset_function_candidates(lower, comment_stripped)
+        .into_iter()
+        .filter(|candidate| restart_segment_resets_score(&candidate.body))
+        .filter(|candidate| restart_segment_resets_entities(&candidate.body))
+        .any(|candidate| {
+            restart_function_is_referenced_from_handler(lower, &candidate.name)
+                || (restart_intent_function_name(&candidate.name) && has_game_over_reference)
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestartResetFunctionCandidate {
+    name: String,
+    body: String,
+}
+
+fn restart_reset_function_candidates(
+    lower: &str,
+    comment_stripped: &str,
+) -> Vec<RestartResetFunctionCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+    collect_function_declaration_candidates(lower, comment_stripped, &mut candidates, &mut seen);
+    collect_arrow_assignment_candidates(lower, comment_stripped, &mut candidates, &mut seen);
+    candidates
+}
+
+fn collect_function_declaration_candidates(
+    lower: &str,
+    comment_stripped: &str,
+    candidates: &mut Vec<RestartResetFunctionCandidate>,
+    seen: &mut BTreeSet<(String, usize)>,
+) {
+    let mut search_start = 0usize;
+    while let Some(relative) = lower[search_start..].find("function") {
+        let index = search_start + relative;
+        let after_keyword = index + "function".len();
+        if !keyword_boundary(lower, index, after_keyword) {
+            search_start = after_keyword;
+            continue;
+        }
+        let mut cursor = skip_ascii_whitespace(lower, after_keyword);
+        let Some((name, name_end)) = read_identifier(lower, cursor) else {
+            search_start = after_keyword;
+            continue;
+        };
+        cursor = skip_ascii_whitespace(lower, name_end);
+        if lower.as_bytes().get(cursor) != Some(&b'(') {
+            search_start = after_keyword;
+            continue;
+        }
+        let body_search_start = find_matching_delimiter(lower, cursor, b'(', b')')
+            .map(|end| end + 1)
+            .unwrap_or(cursor + 1);
+        push_function_candidate(
+            name,
+            lower,
+            comment_stripped,
+            body_search_start,
+            candidates,
+            seen,
+        );
+        search_start = after_keyword;
+    }
+}
+
+fn collect_arrow_assignment_candidates(
+    lower: &str,
+    comment_stripped: &str,
+    candidates: &mut Vec<RestartResetFunctionCandidate>,
+    seen: &mut BTreeSet<(String, usize)>,
+) {
+    let mut cursor = 0usize;
+    while cursor < lower.len() {
+        let byte = lower.as_bytes()[cursor];
+        if !is_identifier_start(byte) {
+            cursor += 1;
+            continue;
+        }
+        let Some((name, name_end)) = read_identifier(lower, cursor) else {
+            cursor += 1;
+            continue;
+        };
+        if matches!(name, "const" | "let" | "var" | "function" | "return") {
+            cursor = name_end;
+            continue;
+        }
+        let mut after_name = skip_ascii_whitespace(lower, name_end);
+        if lower.as_bytes().get(after_name) != Some(&b'=') {
+            cursor = name_end;
+            continue;
+        }
+        after_name = skip_ascii_whitespace(lower, after_name + 1);
+        if lower[after_name..].strip_prefix("async").is_some() {
+            let async_end = after_name + "async".len();
+            if keyword_boundary(lower, after_name, async_end) {
+                after_name = skip_ascii_whitespace(lower, async_end);
+            }
+        }
+        let Some(body_search_start) = arrow_function_body_search_start(lower, after_name) else {
+            cursor = name_end;
+            continue;
+        };
+        push_function_candidate(
+            name,
+            lower,
+            comment_stripped,
+            body_search_start,
+            candidates,
+            seen,
+        );
+        cursor = name_end;
+    }
+}
+
+fn arrow_function_body_search_start(lower: &str, start: usize) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let arrow_search_start = if bytes.get(start) == Some(&b'(') {
+        find_matching_delimiter(lower, start, b'(', b')')? + 1
+    } else {
+        let (_, ident_end) = read_identifier(lower, start)?;
+        ident_end
+    };
+    let after_params = skip_ascii_whitespace(lower, arrow_search_start);
+    lower[after_params..]
+        .find("=>")
+        .map(|relative| after_params + relative + "=>".len())
+}
+
+fn push_function_candidate(
+    name: &str,
+    lower: &str,
+    comment_stripped: &str,
+    body_search_start: usize,
+    candidates: &mut Vec<RestartResetFunctionCandidate>,
+    seen: &mut BTreeSet<(String, usize)>,
+) {
+    let Some((body_start, body_end)) = function_body_span(lower, body_search_start) else {
+        return;
+    };
+    let name = name.to_string();
+    if !seen.insert((name.clone(), body_start)) {
+        return;
+    }
+    let body = comment_stripped
+        .get(body_start..body_end)
+        .or_else(|| lower.get(body_start..body_end))
+        .unwrap_or_default()
+        .to_string();
+    candidates.push(RestartResetFunctionCandidate { name, body });
+}
+
+fn function_body_span(lower: &str, search_start: usize) -> Option<(usize, usize)> {
+    let body_start = lower[search_start..].find('{')? + search_start;
+    let body_end = find_matching_delimiter(lower, body_start, b'{', b'}')
+        .map(|end| end + 1)
+        .unwrap_or_else(|| lower.len().min(body_start + 1500));
+    Some((body_start, body_end))
+}
+
+fn find_matching_delimiter(text: &str, start: usize, open: u8, close: u8) -> Option<usize> {
+    if text.as_bytes().get(start) != Some(&open) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (index, byte) in text.as_bytes().iter().enumerate().skip(start) {
+        if *byte == open {
+            depth += 1;
+        } else if *byte == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn skip_ascii_whitespace(text: &str, mut index: usize) -> usize {
+    while index < text.len() && text.as_bytes()[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn read_identifier(text: &str, start: usize) -> Option<(&str, usize)> {
+    let bytes = text.as_bytes();
+    if !bytes.get(start).copied().is_some_and(is_identifier_start) {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < bytes.len() && is_identifier_continue(bytes[end]) {
+        end += 1;
+    }
+    text.get(start..end).map(|identifier| (identifier, end))
+}
+
+fn keyword_boundary(text: &str, start: usize, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    let before_ok = start == 0 || !is_identifier_continue(bytes[start - 1]);
+    let after_ok = end >= bytes.len() || !is_identifier_continue(bytes[end]);
+    before_ok && after_ok
+}
+
+fn restart_segment_resets_score(segment: &str) -> bool {
+    [
+        "setscore(0",
+        "setpoints(0",
+        "setlevel(0",
+        "score = 0",
+        "score=0",
+        "points = 0",
+        "points=0",
+    ]
+    .iter()
+    .any(|needle| segment.contains(needle))
+}
+
+fn restart_segment_resets_entities(segment: &str) -> bool {
+    [
+        "setbullets([]",
+        "setbullet([]",
+        "setshots([]",
+        "setprojectiles([]",
+        "setenemies(",
+        "setinvaders(",
+        "setplayerstate(",
+        "bullets = []",
+        "bullets=[]",
+        "enemies = []",
+        "enemies=[]",
+    ]
+    .iter()
+    .any(|needle| segment.contains(needle))
+        || segment_has_generic_entity_fresh_reset(segment)
+}
+
+fn segment_has_generic_entity_fresh_reset(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if !is_identifier_start(bytes[cursor]) {
+            cursor += 1;
+            continue;
+        }
+        let Some((name, name_end)) = read_identifier(segment, cursor) else {
+            cursor += 1;
+            continue;
+        };
+        let mut after_name = skip_ascii_whitespace(segment, name_end);
+        if name.starts_with("set")
+            && setter_name_has_entity_hint(name)
+            && segment.as_bytes().get(after_name) == Some(&b'(')
+        {
+            after_name += 1;
+            let argument_window_end = segment.len().min(after_name + 240);
+            if let Some(argument_window) = segment.get(after_name..argument_window_end)
+                && [
+                    "[", "create", "initial", "init", "spawn", "make", "build", "default",
+                ]
+                .iter()
+                .any(|needle| argument_window.contains(needle))
+            {
+                return true;
+            }
+        }
+        cursor = name_end;
+    }
+    false
+}
+
+fn setter_name_has_entity_hint(name: &str) -> bool {
+    [
+        "actor",
+        "alien",
+        "asteroid",
+        "bullet",
+        "cell",
+        "enemy",
+        "enemies",
+        "entities",
+        "entity",
+        "invader",
+        "laser",
+        "missile",
+        "mob",
+        "obstacle",
+        "player",
+        "projectile",
+        "ship",
+        "shot",
+        "target",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
+}
+
+fn restart_segment_references_recoverable_state(segment: &str) -> bool {
+    [
+        "gameover",
+        "setgameover(",
+        "setgamestate(",
+        "setgamestate(\"playing\"",
+        "setgamestate('playing'",
+        "setgamestate(`playing`",
+        "setplayerstate(",
+    ]
+    .iter()
+    .any(|needle| segment.contains(needle))
+}
+
+fn restart_function_is_referenced_from_handler(lower: &str, name: &str) -> bool {
+    handler_reference_segments(lower)
+        .into_iter()
+        .any(|segment| segment_contains_identifier(segment, name))
+}
+
+fn handler_reference_segments(lower: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    for needle in [
+        "onclick",
+        "onkeydown",
+        "onkeyup",
+        "onpointer",
+        "onmousedown",
+        "onmouseup",
+        "ontouch",
+        "onsubmit",
+        "onchange",
+        "pointerdown",
+        "touchstart",
+        "keydown",
+        "keyup",
+        "addeventlistener",
+    ] {
+        for (index, _) in lower.match_indices(needle) {
+            let end = lower.len().min(index + 500);
+            segments.push(&lower[index..end]);
+        }
+    }
+    segments
+}
+
+fn segment_contains_identifier(segment: &str, name: &str) -> bool {
+    let mut cursor = 0usize;
+    while cursor < segment.len() {
+        if !is_identifier_start(segment.as_bytes()[cursor]) {
+            cursor += 1;
+            continue;
+        }
+        let Some((identifier, identifier_end)) = read_identifier(segment, cursor) else {
+            cursor += 1;
+            continue;
+        };
+        if identifier == name {
+            return true;
+        }
+        cursor = identifier_end;
+    }
+    false
+}
+
+fn restart_intent_function_name(name: &str) -> bool {
+    ["restart", "reset", "init", "new"]
+        .iter()
+        .any(|needle| name.contains(needle))
+        && ["game", "state", "level"]
+            .iter()
+            .any(|needle| name.contains(needle))
 }
 
 #[cfg(test)]
@@ -3260,6 +3631,106 @@ export default function Page() {
             assert!(evidence.contains(&key.to_string()), "{key}: {report:?}");
         }
         assert!(report.weak_evidence.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn named_init_game_restart_handler_satisfies_restart_evidence_regression() {
+        let file = SourceFile::new(
+            "src/app/page.tsx".to_string(),
+            r#""use client";
+import { useState } from "react";
+type GameState = "START" | "PLAYING" | "GAMEOVER";
+type Invader = { x: number; y: number };
+function createInvaders(): Invader[] {
+  return [{ x: 20, y: 30 }];
+}
+export default function Page() {
+  const [score, setScore] = useState(0);
+  const [bullets, setBullets] = useState<{ x: number; y: number }[]>([]);
+  const [invaders, setInvaders] = useState<Invader[]>(createInvaders());
+  const [gameState, setGameState] = useState<GameState>("START");
+  const initGame = () => {
+    setScore(0);
+    setBullets([]);
+    setInvaders(createInvaders());
+    setGameState("PLAYING");
+  };
+  return (
+    <main>
+      <button onClick={initGame}>Restart</button>
+      <p>{score} {bullets.length} {invaders.length} {gameState}</p>
+    </main>
+  );
+}
+"#
+            .to_string(),
+        );
+        assert_eq!(
+            source_file_restart_or_recoverable_state_signal(&file),
+            SourceEvidenceSignal::Strong
+        );
+    }
+
+    #[test]
+    fn label_only_restart_handler_remains_weak() {
+        let file = SourceFile::new(
+            "src/app/page.tsx".to_string(),
+            r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [gameState, setGameState] = useState("GAMEOVER");
+  const initGame = () => {
+    setGameState("GAMEOVER");
+  };
+  return <main><button onClick={initGame}>Restart</button><p>{gameState}</p></main>;
+}
+"#
+            .to_string(),
+        );
+        assert!(matches!(
+            source_file_restart_or_recoverable_state_signal(&file),
+            SourceEvidenceSignal::Weak(reason)
+                if reason.contains("resets score AND entities")
+        ));
+    }
+
+    #[test]
+    fn comment_only_restart_mention_is_absent() {
+        let file = SourceFile::new(
+            "src/app/page.tsx".to_string(),
+            r#""use client";
+export default function Page() {
+  // restart: setScore(0); setEnemies([]); setGameState("PLAYING");
+  return <main />;
+}
+"#
+            .to_string(),
+        );
+        assert_eq!(
+            source_file_restart_or_recoverable_state_signal(&file),
+            SourceEvidenceSignal::Absent
+        );
+    }
+
+    #[test]
+    fn inline_single_segment_restart_handler_still_satisfies_restart_evidence() {
+        let file = SourceFile::new(
+            "src/app/page.tsx".to_string(),
+            r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [score, setScore] = useState(0);
+  const [gameState, setGameState] = useState("GAMEOVER");
+  const [enemies, setEnemies] = useState([{ x: 10, y: 20 }]);
+  return <main><button onClick={() => { setGameState("PLAYING"); setScore(0); setEnemies([{ x: 10, y: 20 }]); }}>Restart</button><p>{score} {gameState} {enemies.length}</p></main>;
+}
+"#
+            .to_string(),
+        );
+        assert_eq!(
+            source_file_restart_or_recoverable_state_signal(&file),
+            SourceEvidenceSignal::Strong
+        );
     }
 
     #[test]

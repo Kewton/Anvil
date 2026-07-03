@@ -924,7 +924,7 @@ fn evidence_repair_guidance(failure: &str) -> Vec<String> {
     }
     if failure.contains("restart_or_recoverable_state_evidence") {
         lines.push(
-            "For restart_or_recoverable_state_evidence, edit the task implementation artifact to implement start/restart/reset behavior that returns the game to a playable recoverable state."
+            "For restart_or_recoverable_state_evidence, edit the task implementation artifact to wire a handler (e.g. onClick) to a function that resets score AND entities and transitions out of the game-over state."
                 .to_string(),
         );
     }
@@ -1566,7 +1566,8 @@ mod tests {
         assert!(feedback.contains("enemy, invader, or the goal's own term"));
         assert!(feedback.contains("movement/collision"));
         assert!(feedback.contains("bullet/enemy collision or damage detection"));
-        assert!(feedback.contains("start/restart/reset behavior"));
+        assert!(feedback.contains("resets score AND entities"));
+        assert!(feedback.contains("transitions out of the game-over state"));
         assert!(feedback.contains("score, level, wave, lives, health, or progress updates"));
         assert!(feedback.contains("state mutations over time or in response to input"));
         assert!(feedback.contains("wire keyboard, pointer, click, touch, or form handlers"));
