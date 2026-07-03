@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::eval_events;
 use crate::minimal_loop::behavior_evidence::{self, EvidenceArbitrationReport};
 use crate::minimal_loop::browser_probe::{
-    BrowserReadinessObservation, probe_browser_readiness_with_offline,
+    BrowserReadinessObservation, html_surface_markers_json, probe_browser_readiness_with_offline,
 };
 use crate::minimal_loop::build_verifier::emit_dependency_build_lifecycle;
 use crate::minimal_loop::completion::{CompletionContract, evidence_hint_tokens_for_goal};
@@ -571,6 +571,12 @@ impl UltraRunContext {
         let still_missing = runtime_missing_signals(report);
         self.pending_capability_evidence
             .retain(|item| still_missing.contains(item));
+        push_context_items_capped(
+            &mut self.pending_capability_evidence,
+            &report.diagnostics,
+            ULTRA_CONTEXT_MAX_MESSAGES,
+            &mut self.truncated,
+        );
     }
 
     fn render_unmet_final_requirements_section(&self) -> String {
@@ -1946,6 +1952,10 @@ fn verify_plan_final_contract(
                 .as_ref()
                 .map(|report| report.weak_evidence.clone())
                 .unwrap_or_default(),
+            "runtime_acceptance_diagnostics": runtime_acceptance
+                .as_ref()
+                .map(|report| report.diagnostics.clone())
+                .unwrap_or_default(),
             "unverified_evidence": runtime_acceptance
                 .as_ref()
                 .map(|report| report.unverified_evidence.clone())
@@ -2201,6 +2211,7 @@ fn runtime_missing_signals(report: &RuntimeAcceptanceReport) -> Vec<String> {
     merge_unique_strings(&mut out, &report.missing_capabilities);
     merge_unique_strings(&mut out, &report.missing_evidence);
     merge_unique_strings(&mut out, &report.missing_obligations);
+    merge_unique_strings(&mut out, &report.diagnostics);
     out
 }
 
@@ -3807,6 +3818,7 @@ fn ultra_final_acceptance_report(
             "missing_evidence": acceptance.missing_evidence.clone(),
             "missing_obligations": acceptance.missing_obligations.clone(),
             "weak_evidence": acceptance.weak_evidence.clone(),
+            "runtime_acceptance_diagnostics": acceptance.diagnostics.clone(),
             "unverified_evidence": acceptance.unverified_evidence.clone(),
             "evidence_tiers": acceptance.evidence_tiers.clone(),
             "evidence_arbitration": evidence_arbitration.records.clone(),
@@ -4108,6 +4120,9 @@ fn emit_browser_probe_event(config: &Config, observation: &BrowserReadinessObser
             "output_excerpt": eval_events::body_snippet(&observation.output_excerpt),
             "child_spawned": observation.child_spawned,
             "child_reaped": observation.child_reaped,
+            "has_canvas": observation.has_canvas,
+            "interactive_control_count": observation.interactive_control_count,
+            "title_text_excerpt": observation.title_text_excerpt,
         }),
     );
 }
@@ -4379,7 +4394,10 @@ fn final_acceptance_release_gate(
             && check_browser_on_runtime_failure
             && runtime_acceptance_has_buildable_nextjs_boundary(report)
         {
-            let mut gate = browser_release_gate(config);
+            let mut gate = browser_release_gate_with_expectations(
+                config,
+                requires_canvas_surface(goal, required_capabilities),
+            );
             let mut reasons = vec![report.primary_reason.clone()];
             reasons.extend(std::mem::take(&mut gate.reasons));
             gate.status = "failed".to_string();
@@ -4397,7 +4415,10 @@ fn final_acceptance_release_gate(
     }
     if !report.unverified_evidence.is_empty() {
         let mut gate = if requires_browser {
-            browser_release_gate(config)
+            browser_release_gate_with_expectations(
+                config,
+                requires_canvas_surface(goal, required_capabilities),
+            )
         } else {
             ReleaseGateSummary {
                 status: "partial".to_string(),
@@ -4415,7 +4436,10 @@ fn final_acceptance_release_gate(
         return gate;
     }
     if requires_browser {
-        return browser_release_gate(config);
+        return browser_release_gate_with_expectations(
+            config,
+            requires_canvas_surface(goal, required_capabilities),
+        );
     }
     ReleaseGateSummary {
         status: "pass".to_string(),
@@ -4469,6 +4493,25 @@ fn runtime_acceptance_has_buildable_nextjs_boundary(
         .missing_obligations
         .iter()
         .any(|item| item == "implementation")
+}
+
+fn requires_canvas_surface(goal: &str, required_capabilities: &[String]) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    lower.contains("canvas")
+        && required_capabilities.iter().any(|capability| {
+            matches!(
+                capability.as_str(),
+                "browser_interaction"
+                    | "playable_ui"
+                    | "stateful_interaction"
+                    | "player_control"
+                    | "user_input_or_action"
+                    | "visible_state_change"
+                    | "adversary_or_challenge"
+                    | "progression_or_score"
+                    | "failure_or_collision_rule"
+            )
+        })
 }
 
 fn append_release_gate_observation_failures(
@@ -4622,6 +4665,15 @@ fn runtime_acceptance_repair_guidance(
             guidance.push(reason.trim().to_string());
         }
     }
+    for diagnostic in &acceptance.diagnostics {
+        if let Some(path) = diagnostic.strip_prefix("route_unbound_capability_artifact:") {
+            for evidence in &acceptance.missing_evidence {
+                guidance.push(format!(
+                    "For missing evidence {evidence}, {path} contains capability code but is not route-bound; import it from the route page, or consolidate into page.tsx and delete the dead component"
+                ));
+            }
+        }
+    }
     dedup_strings(guidance)
 }
 
@@ -4669,7 +4721,15 @@ struct HttpProbeResult {
     body_excerpt: String,
 }
 
+#[cfg(test)]
 fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
+    browser_release_gate_with_expectations(config, false)
+}
+
+fn browser_release_gate_with_expectations(
+    config: &Config,
+    canvas_surface_expected: bool,
+) -> ReleaseGateSummary {
     let mut browser = read_release_evidence(
         config,
         &[
@@ -4699,6 +4759,9 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
     );
     let browser_status = browser.status.as_status();
     let interaction_status = interaction.status.as_status();
+    let canvas_surface_missing = canvas_surface_expected
+        && matches!(browser.status, ReleaseEvidenceStatus::Passed)
+        && release_evidence_canvas_marker_is_false(&browser.path);
     if let ReleaseEvidenceStatus::Failed(reason) = &browser.status {
         return ReleaseGateSummary {
             status: "failed".to_string(),
@@ -4754,23 +4817,32 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
         };
     }
     if let ReleaseEvidenceStatus::Unavailable(reason) = &interaction.status {
+        let mut reasons = Vec::new();
+        if canvas_surface_missing {
+            reasons.push(
+                "browser_readiness_or_interaction_evidence_required:rendered_without_expected_surface"
+                    .to_string(),
+            );
+        }
         if interaction_probe_unavailable_reason_value(reason) {
+            reasons.extend([
+                "interaction_unverified:probe_unavailable".to_string(),
+                crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+                    .to_string(),
+            ]);
             return ReleaseGateSummary {
                 status: "partial".to_string(),
-                reasons: vec![
-                    "interaction_unverified:probe_unavailable".to_string(),
-                    crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
-                        .to_string(),
-                ],
+                reasons: dedup_strings(reasons),
                 browser_readiness_status: browser_status,
                 browser_readiness_evidence_path: browser.path,
                 interaction_evidence_status: interaction_status,
                 interaction_evidence_path: interaction.path,
             };
         }
+        reasons.push(format!("browser_interaction_evidence_required:{reason}"));
         return ReleaseGateSummary {
             status: "partial".to_string(),
-            reasons: vec![format!("browser_interaction_evidence_required:{reason}")],
+            reasons: dedup_strings(reasons),
             browser_readiness_status: browser_status,
             browser_readiness_evidence_path: browser.path,
             interaction_evidence_status: interaction_status,
@@ -5955,7 +6027,7 @@ fn dev_server_failed_evidence(
     body_excerpt: &str,
     output_excerpt: &str,
 ) -> Value {
-    json!({
+    let mut value = json!({
         "status": "failed",
         "ok": false,
         "http_status": http_status,
@@ -5973,7 +6045,9 @@ fn dev_server_failed_evidence(
             "lifecycle_stages": DEV_SERVER_LIFECYCLE_STAGES,
             "probe_environment": dev_server_probe_environment(port),
         }
-    })
+    });
+    add_surface_markers_to_evidence(&mut value, body_excerpt);
+    value
 }
 
 fn dev_server_passed_evidence(
@@ -5983,7 +6057,7 @@ fn dev_server_passed_evidence(
     http_status: i64,
     body_excerpt: &str,
 ) -> Value {
-    json!({
+    let mut value = json!({
         "status": "ready",
         "ok": true,
         "http_status": http_status,
@@ -5997,6 +6071,33 @@ fn dev_server_passed_evidence(
             "lifecycle_stages": DEV_SERVER_LIFECYCLE_STAGES,
             "probe_environment": dev_server_probe_environment(port),
         }
+    });
+    add_surface_markers_to_evidence(&mut value, body_excerpt);
+    value
+}
+
+fn add_surface_markers_to_evidence(value: &mut Value, body_excerpt: &str) {
+    let markers = html_surface_markers_json(body_excerpt);
+    for key in [
+        "has_canvas",
+        "interactive_control_count",
+        "title_text_excerpt",
+        "route_rendered_quality",
+    ] {
+        value[key] = markers.get(key).cloned().unwrap_or(Value::Null);
+    }
+}
+
+fn release_evidence_canvas_marker_is_false(path: &str) -> bool {
+    let value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    value.as_ref().is_some_and(|value| {
+        let details = value
+            .get("browser_details")
+            .or_else(|| value.get("details"))
+            .filter(|value| value.is_object());
+        bool_field_deep(value, details, &["has_canvas"]) == Some(false)
     })
 }
 
@@ -8405,6 +8506,7 @@ fn build_step_prompt(plan: &StepPlan, step: &PlanStep, context: &StepPromptConte
 - Prefer Write/Edit/MultiEdit for declared expected paths.\n\
 - If this step has verification commands, use them as the deterministic success contract.\n\
 - If verification fails, make a bounded step-local repair and re-check the declared contract.\n\
+- For Next.js/App Router work, keep a single route-bound implementation; do not leave capability components unimported.\n\
 - Do not claim the plan is complete until this step's expected paths and verification contract are satisfied.\n\
 - Report an explicit blocker only when the blocker cannot be resolved locally.",
     );
@@ -8542,8 +8644,16 @@ fn ultra_phase_prompt(
     let unmet_final_requirements = context.render_unmet_final_requirements_section();
     let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
     let requested_features = render_requested_features_not_detected_line(&plan_adherence.missing);
+    let route_bound_constraint = if matches!(
+        plan.profile.as_str(),
+        "nextjs" | "next-js" | "next.js"
+    ) {
+        "\nRoute-bound implementation constraint:\n- Keep a single route-bound implementation; do not leave capability components unimported.\n"
+    } else {
+        ""
+    };
     format!(
-        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\n{}\n\nProfile runtime contract:\n{}\n\nDeterministic verification preference:\n{}\n{}{}{}",
+        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\n{}\n\nProfile runtime contract:\n{}\n{}Deterministic verification preference:\n{}\n{}{}{}",
         plan.goal,
         plan.profile,
         plan.style,
@@ -8555,6 +8665,7 @@ fn ultra_phase_prompt(
         unmet_final_requirements,
         requested_features,
         runtime_contract,
+        route_bound_constraint,
         preferred_verify,
         required,
         capability_section,
@@ -12776,6 +12887,32 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
     }
 
     #[test]
+    fn route_unbound_runtime_guidance_names_file_and_remedies() {
+        let report = RuntimeAcceptanceReport {
+            missing_evidence: vec!["user_input_handler_evidence".to_string()],
+            diagnostics: vec![
+                "route_unbound_capability_artifact:src/components/SpaceInvaders.tsx".to_string(),
+            ],
+            ..RuntimeAcceptanceReport::default()
+        };
+
+        let guidance = runtime_acceptance_repair_guidance(&report).join("\n");
+
+        assert!(
+            guidance.contains("src/components/SpaceInvaders.tsx"),
+            "{guidance}"
+        );
+        assert!(
+            guidance.contains("import it from the route page"),
+            "{guidance}"
+        );
+        assert!(
+            guidance.contains("consolidate into page.tsx and delete the dead component"),
+            "{guidance}"
+        );
+    }
+
+    #[test]
     fn non_interactive_contract_does_not_require_interaction_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path().to_path_buf());
@@ -12797,6 +12934,40 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
         assert_eq!(gate.status, "pass");
         assert_eq!(gate.browser_readiness_status, "not_applicable");
         assert_eq!(gate.interaction_evidence_status, "not_applicable");
+    }
+
+    #[test]
+    fn canvas_goal_without_canvas_surface_marker_is_partial_release_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":true,"http_status":200,"route_rendered":true,"has_canvas":false,"interactive_control_count":1,"title_text_excerpt":"Start"}"#,
+        )
+        .unwrap();
+        let report = RuntimeAcceptanceReport {
+            passed: true,
+            primary_reason: "pass".to_string(),
+            ..RuntimeAcceptanceReport::default()
+        };
+
+        let gate = final_acceptance_release_gate(
+            &cfg,
+            "nextjs",
+            "Create a canvas-based interactive browser game",
+            &["player_control".to_string()],
+            Some(&report),
+            true,
+        );
+
+        assert_eq!(gate.status, "partial", "{gate:?}");
+        assert_eq!(gate.browser_readiness_status, "passed");
+        assert!(
+            gate.reasons
+                .iter()
+                .any(|reason| reason.contains("rendered_without_expected_surface")),
+            "{gate:?}"
+        );
     }
 
     #[test]
@@ -14112,8 +14283,7 @@ export default function Page() {
             .unwrap()
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|value| value.get("event").and_then(Value::as_str) == Some(event))
-            .last()
+            .rfind(|value| value.get("event").and_then(Value::as_str) == Some(event))
             .unwrap_or_else(|| panic!("missing event {event} in {}", path.display()))
     }
 

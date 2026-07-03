@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::minimal_loop::import_scan::route_bound_closure;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeAcceptanceReport {
     pub passed: bool,
@@ -12,6 +14,7 @@ pub struct RuntimeAcceptanceReport {
     pub missing_evidence: Vec<String>,
     pub missing_obligations: Vec<String>,
     pub weak_evidence: Vec<String>,
+    pub diagnostics: Vec<String>,
     pub unverified_evidence: Vec<String>,
     pub evidence_tiers: BTreeMap<String, String>,
     pub inconclusive_reasons: Vec<String>,
@@ -30,6 +33,7 @@ pub struct ArtifactObligationEvidence {
     pub path: String,
     pub role: String,
     pub evidence: Vec<String>,
+    pub route_bound: bool,
     pub satisfies_implementation: bool,
     pub required_capabilities_supported: Vec<String>,
 }
@@ -180,16 +184,22 @@ struct SourceFile {
     content: String,
     comments_stripped_strings_preserved: String,
     scan_content: String,
+    route_bound: bool,
 }
 
 impl SourceFile {
     fn new(rel: String, content: String) -> Self {
+        Self::new_with_route_bound(rel, content, true)
+    }
+
+    fn new_with_route_bound(rel: String, content: String, route_bound: bool) -> Self {
         let (comments_stripped_strings_preserved, scan_content) = source_scan_texts(&rel, &content);
         Self {
             rel,
             content,
             comments_stripped_strings_preserved,
             scan_content,
+            route_bound,
         }
     }
 
@@ -834,6 +844,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
 
     let mut missing_evidence = Vec::new();
     let mut weak_evidence = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut evidence_tiers = BTreeMap::new();
     let mut inconclusive_reasons = Vec::new();
     let browser_required = required_capabilities
@@ -997,6 +1008,14 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
     }
 
     collect_weak_verify_evidence(verify_commands, &workspace, &mut weak_evidence);
+    collect_route_unbound_capability_evidence(
+        &workspace,
+        &required,
+        &missing_evidence,
+        evidence_hint_tokens,
+        &mut weak_evidence,
+        &mut diagnostics,
+    );
     collect_weak_obligation_evidence(&artifact_obligations, &required, &mut weak_evidence);
     let missing_obligations =
         missing_required_obligations(required_obligations, &artifact_obligations, &workspace);
@@ -1045,6 +1064,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
         missing_evidence,
         missing_obligations,
         weak_evidence,
+        diagnostics,
         unverified_evidence: Vec::new(),
         evidence_tiers,
         inconclusive_reasons,
@@ -1122,13 +1142,15 @@ pub fn artifact_obligation_evidence_with_hints(
     evidence_hint_tokens: &[String],
 ) -> Vec<ArtifactObligationEvidence> {
     let mut out = Vec::new();
+    let route_bound_files = route_bound_closure(root, "nextjs");
     for path in required_paths {
         let full = root.join(path);
         if !full.is_file() {
             continue;
         }
         let content = std::fs::read_to_string(&full).unwrap_or_default();
-        let file = SourceFile::new(path.clone(), content);
+        let route_bound = route_bound_files.contains(Path::new(path));
+        let file = SourceFile::new_with_route_bound(path.clone(), content, route_bound);
         let role = artifact_role_for_file(&file);
         let evidence = evidence_kinds_for_file(&file, evidence_hint_tokens)
             .into_iter()
@@ -1137,9 +1159,10 @@ pub fn artifact_obligation_evidence_with_hints(
         let required_capabilities_supported = required_capabilities
             .iter()
             .filter(|capability| {
-                evidence_kinds_for_capability(capability)
-                    .into_iter()
-                    .any(|kind| evidence.contains(kind.as_str()))
+                route_bound
+                    && evidence_kinds_for_capability(capability)
+                        .into_iter()
+                        .any(|kind| evidence.contains(kind.as_str()))
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1147,7 +1170,8 @@ pub fn artifact_obligation_evidence_with_hints(
             path: path.clone(),
             role: role.as_str().to_string(),
             evidence: evidence.into_iter().collect(),
-            satisfies_implementation: role.satisfies_implementation(),
+            route_bound,
+            satisfies_implementation: route_bound && role.satisfies_implementation(),
             required_capabilities_supported,
         });
     }
@@ -1191,10 +1215,11 @@ fn capability_evidence_bindings(
                     .required_capabilities_supported
                     .iter()
                     .any(|supported| supported == capability)
-                    || artifact
-                        .evidence
-                        .iter()
-                        .any(|evidence| required_set.contains(evidence))
+                    || (artifact.route_bound
+                        && artifact
+                            .evidence
+                            .iter()
+                            .any(|evidence| required_set.contains(evidence)))
             })
             .map(|artifact| artifact.path.clone())
             .collect::<BTreeSet<_>>()
@@ -1433,6 +1458,7 @@ fn evidence_kinds_for_capability(capability: &str) -> Vec<EvidenceKind> {
 
 fn collect_workspace_evidence(root: &Path) -> WorkspaceEvidence {
     let mut evidence = WorkspaceEvidence::default();
+    let route_bound_files = route_bound_closure(root, "nextjs");
     for path in collect_candidate_files(root) {
         let Ok(rel) = path.strip_prefix(root) else {
             continue;
@@ -1453,13 +1479,40 @@ fn collect_workspace_evidence(root: &Path) -> WorkspaceEvidence {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let file = SourceFile::new(rel.clone(), content);
+        let file = SourceFile::new_with_route_bound(
+            rel.clone(),
+            content,
+            route_bound_files.contains(Path::new(&rel)),
+        );
         if looks_like_test_file(&rel) {
             evidence.test_files.push(file.clone());
         }
         evidence.source_files.push(file);
     }
     evidence
+}
+
+fn route_bound_source_files(workspace: &WorkspaceEvidence) -> impl Iterator<Item = &SourceFile> {
+    workspace
+        .source_files
+        .iter()
+        .filter(|file| file.route_bound)
+}
+
+fn route_unbound_source_files(workspace: &WorkspaceEvidence) -> impl Iterator<Item = &SourceFile> {
+    workspace
+        .source_files
+        .iter()
+        .filter(|file| !file.route_bound && is_route_importable_source_path(&file.rel))
+}
+
+fn is_route_importable_source_path(path: &str) -> bool {
+    Path::new(path).extension().is_some_and(|ext| {
+        matches!(
+            ext.to_string_lossy().to_ascii_lowercase().as_str(),
+            "tsx" | "ts" | "jsx" | "js" | "css"
+        )
+    })
 }
 
 pub fn comment_stripped_source_corpus(root: &Path) -> String {
@@ -1536,15 +1589,21 @@ fn has_implementation_artifact(
     workspace: &WorkspaceEvidence,
 ) -> bool {
     required_paths.iter().any(|path| {
-        let full = root.join(path);
-        if !full.is_file() {
-            return false;
-        }
-        let content = std::fs::read_to_string(full).unwrap_or_default();
-        artifact_role_for_file(&SourceFile::new(path.clone(), content)).satisfies_implementation()
-    }) || workspace
-        .source_files
-        .iter()
+        workspace
+            .source_files
+            .iter()
+            .find(|file| file.rel == *path)
+            .is_some_and(|file| {
+                file.route_bound && artifact_role_for_file(file).satisfies_implementation()
+            })
+            || route_bound_closure(root, "nextjs").contains(Path::new(path))
+                && root.join(path).is_file()
+                && artifact_role_for_file(&SourceFile::new(
+                    path.clone(),
+                    std::fs::read_to_string(root.join(path)).unwrap_or_default(),
+                ))
+                .satisfies_implementation()
+    }) || route_bound_source_files(workspace)
         .any(|file| artifact_role_for_file(file).satisfies_implementation())
 }
 
@@ -1631,6 +1690,53 @@ fn collect_weak_verify_evidence(
     }
     weak.sort();
     weak.dedup();
+}
+
+fn collect_route_unbound_capability_evidence(
+    workspace: &WorkspaceEvidence,
+    required_evidence: &BTreeSet<String>,
+    missing_evidence: &[String],
+    evidence_hint_tokens: &[String],
+    weak: &mut Vec<String>,
+    diagnostics: &mut Vec<String>,
+) {
+    let missing = missing_evidence.iter().cloned().collect::<BTreeSet<_>>();
+    for file in route_unbound_source_files(workspace) {
+        let route_scanned_kinds = evidence_kinds_for_file(file, evidence_hint_tokens)
+            .into_iter()
+            .filter(|kind| source_scanned_evidence_kind(*kind))
+            .collect::<Vec<_>>();
+        if route_scanned_kinds.is_empty() {
+            continue;
+        }
+        weak.push(format!("route_unbound:{}", file.rel));
+        if route_scanned_kinds.iter().any(|kind| {
+            let key = kind.as_str();
+            required_evidence.contains(key) && missing.contains(key)
+        }) {
+            diagnostics.push(format!("route_unbound_capability_artifact:{}", file.rel));
+        }
+    }
+    weak.sort();
+    weak.dedup();
+    diagnostics.sort();
+    diagnostics.dedup();
+}
+
+fn source_scanned_evidence_kind(kind: EvidenceKind) -> bool {
+    matches!(
+        kind,
+        EvidenceKind::InteractiveUiSourceEvidence
+            | EvidenceKind::NonStaticScreenEvidence
+            | EvidenceKind::VisibleInteractiveSurfaceEvidence
+            | EvidenceKind::UserInputHandlerEvidence
+            | EvidenceKind::StatefulUpdateEvidence
+            | EvidenceKind::ChallengeOrAdversaryEvidence
+            | EvidenceKind::ScoreOrProgressionEvidence
+            | EvidenceKind::FailureOrCollisionEvidence
+            | EvidenceKind::RestartOrRecoverableStateEvidence
+            | EvidenceKind::NextJsRouteEvidence
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1777,24 +1883,15 @@ fn verify_command_kind(command: &str, workspace: &WorkspaceEvidence) -> VerifyCo
 }
 
 fn has_interactive_ui_source(workspace: &WorkspaceEvidence) -> bool {
-    workspace
-        .source_files
-        .iter()
-        .any(source_file_has_interactive_ui)
+    route_bound_source_files(workspace).any(source_file_has_interactive_ui)
 }
 
 fn has_non_static_screen_evidence(workspace: &WorkspaceEvidence) -> bool {
-    workspace
-        .source_files
-        .iter()
-        .any(source_file_has_non_static_screen)
+    route_bound_source_files(workspace).any(source_file_has_non_static_screen)
 }
 
 fn has_visible_interactive_surface_evidence(workspace: &WorkspaceEvidence) -> bool {
-    workspace
-        .source_files
-        .iter()
-        .any(source_file_has_visible_interactive_surface)
+    route_bound_source_files(workspace).any(source_file_has_visible_interactive_surface)
 }
 
 fn user_input_handler_signal(workspace: &WorkspaceEvidence) -> SourceEvidenceSignal {
@@ -1802,19 +1899,14 @@ fn user_input_handler_signal(workspace: &WorkspaceEvidence) -> SourceEvidenceSig
 }
 
 fn has_stateful_update_evidence(workspace: &WorkspaceEvidence) -> bool {
-    workspace
-        .source_files
-        .iter()
-        .any(source_file_has_stateful_update)
+    route_bound_source_files(workspace).any(source_file_has_stateful_update)
 }
 
 fn has_challenge_or_adversary_evidence(
     workspace: &WorkspaceEvidence,
     evidence_hint_tokens: &[String],
 ) -> bool {
-    workspace
-        .source_files
-        .iter()
+    route_bound_source_files(workspace)
         .any(|file| source_file_has_challenge_or_adversary(file, evidence_hint_tokens))
 }
 
@@ -1835,7 +1927,7 @@ fn workspace_source_signal(
     signal_fn: fn(&SourceFile) -> SourceEvidenceSignal,
 ) -> SourceEvidenceSignal {
     let mut found_weak = SourceEvidenceSignal::Absent;
-    for file in &workspace.source_files {
+    for file in route_bound_source_files(workspace) {
         match signal_fn(file) {
             SourceEvidenceSignal::Strong => return SourceEvidenceSignal::Strong,
             SourceEvidenceSignal::Weak(reason) => found_weak = SourceEvidenceSignal::Weak(reason),
@@ -1846,7 +1938,7 @@ fn workspace_source_signal(
 }
 
 fn has_nextjs_route_evidence(workspace: &WorkspaceEvidence) -> bool {
-    workspace.source_files.iter().any(|file| {
+    route_bound_source_files(workspace).any(|file| {
         let path = file.rel.to_ascii_lowercase();
         matches!(
             path.as_str(),
@@ -2081,18 +2173,15 @@ fn obligation_role_satisfied(
             artifact_obligations
                 .iter()
                 .any(|obligation| obligation.role == "scaffold")
-                || workspace
-                    .source_files
-                    .iter()
-                    .any(|file| artifact_role_for_file(file) == ArtifactRoleLite::Scaffold)
+                || workspace.source_files.iter().any(|file| {
+                    file.route_bound && artifact_role_for_file(file) == ArtifactRoleLite::Scaffold
+                })
         }
         "implementation" => {
             artifact_obligations
                 .iter()
                 .any(|obligation| obligation.satisfies_implementation)
-                || workspace
-                    .source_files
-                    .iter()
+                || route_bound_source_files(workspace)
                     .any(|file| artifact_role_for_file(file).satisfies_implementation())
         }
         "verification" => has_test_artifact(workspace) || has_assertion_or_test_evidence(workspace),
@@ -3225,6 +3314,35 @@ fn restart_intent_function_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn route_bound_space_invaders_component() -> &'static str {
+        r#""use client";
+import { useEffect, useState } from "react";
+export default function SpaceInvaders(){
+  const [score, setScore] = useState(0);
+  const [gameState, setGameState] = useState("ready");
+  const [enemies, setEnemies] = useState([{ x: 10, y: 20 }]);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") {
+        setGameState("playing");
+        setScore((value) => value + 1);
+      }
+    };
+    const frame = requestAnimationFrame(() => {
+      const collision = enemies.some((enemy) => enemy.x > 0);
+      if (collision) setGameState("gameover");
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [enemies]);
+  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); setEnemies([{ x: 10, y: 20 }]); }}>Restart</button><canvas /><p>score {score} enemy collision {gameState}</p></main>;
+}
+"#
+    }
 
     #[test]
     fn source_scanned_evidence_keys_report_source_channel() {
@@ -4611,6 +4729,146 @@ export default function Page(){
         assert!(evidence.contains(&"score_or_progression_evidence".to_string()));
         assert!(evidence.contains(&"failure_or_collision_evidence".to_string()));
         assert!(evidence.contains(&"restart_or_recoverable_state_evidence".to_string()));
+    }
+
+    #[test]
+    fn route_unbound_game_component_does_not_satisfy_final_capability_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/components")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+export default function Page(){
+  return <main><button>Start</button></main>;
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/components/SpaceInvaders.tsx"),
+            route_bound_space_invaders_component(),
+        )
+        .unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &[
+                "src/app/page.tsx".to_string(),
+                "src/components/SpaceInvaders.tsx".to_string(),
+            ],
+            &[],
+            &[
+                "player_control".to_string(),
+                "progression_or_score".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"user_input_handler_evidence".to_string()),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .weak_evidence
+                .contains(&"route_unbound:src/components/SpaceInvaders.tsx".to_string()),
+            "{report:?}"
+        );
+        assert!(
+            report.diagnostics.contains(
+                &"route_unbound_capability_artifact:src/components/SpaceInvaders.tsx".to_string()
+            ),
+            "{report:?}"
+        );
+        let binding = report
+            .capability_evidence_bindings
+            .iter()
+            .find(|binding| binding.capability == "player_control")
+            .expect("player control binding");
+        assert!(
+            !binding
+                .artifact_paths
+                .contains(&"src/components/SpaceInvaders.tsx".to_string()),
+            "{binding:?}"
+        );
+    }
+
+    #[test]
+    fn route_imported_game_component_satisfies_final_capability_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/components")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import SpaceInvaders from "../components/SpaceInvaders";
+export default function Page(){ return <SpaceInvaders />; }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/components/SpaceInvaders.tsx"),
+            route_bound_space_invaders_component(),
+        )
+        .unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[
+                "player_control".to_string(),
+                "progression_or_score".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(report.diagnostics.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn alias_imported_game_component_satisfies_final_capability_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/components")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import SpaceInvaders from "@/components/SpaceInvaders";
+export default function Page(){ return <SpaceInvaders />; }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/components/SpaceInvaders.tsx"),
+            route_bound_space_invaders_component(),
+        )
+        .unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[
+                "player_control".to_string(),
+                "progression_or_score".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(report.diagnostics.is_empty(), "{report:?}");
     }
 
     #[test]

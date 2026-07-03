@@ -36,6 +36,9 @@ pub struct BrowserReadinessObservation {
     pub output_excerpt: String,
     pub child_spawned: bool,
     pub child_reaped: bool,
+    pub has_canvas: bool,
+    pub interactive_control_count: usize,
+    pub title_text_excerpt: String,
 }
 
 impl BrowserReadinessObservation {
@@ -48,6 +51,32 @@ impl BrowserReadinessObservation {
             }
         })
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct HtmlSurfaceMarkers {
+    pub has_canvas: bool,
+    pub interactive_control_count: usize,
+    pub title_text_excerpt: String,
+}
+
+pub fn html_surface_markers(body: &str) -> HtmlSurfaceMarkers {
+    let lower = body.to_ascii_lowercase();
+    HtmlSurfaceMarkers {
+        has_canvas: lower.contains("<canvas"),
+        interactive_control_count: count_interactive_controls(&lower),
+        title_text_excerpt: html_title_text_excerpt(body, &lower),
+    }
+}
+
+pub fn html_surface_markers_json(body: &str) -> Value {
+    let markers = html_surface_markers(body);
+    json!({
+        "has_canvas": markers.has_canvas,
+        "interactive_control_count": markers.interactive_control_count,
+        "title_text_excerpt": markers.title_text_excerpt,
+        "route_rendered_quality": if markers.has_canvas { "rendered" } else { "rendered_without_expected_surface" },
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +260,7 @@ fn probe_browser_readiness_with_options(
                 None,
                 "start_exited",
                 &output,
+                None,
                 true,
                 cleanup.reaped,
             );
@@ -259,6 +289,7 @@ fn probe_browser_readiness_with_options(
                         Some(response.status),
                         "",
                         &output,
+                        Some(html_surface_markers(&response.body_excerpt)),
                         true,
                         cleanup.reaped,
                     );
@@ -272,6 +303,7 @@ fn probe_browser_readiness_with_options(
                     Some(response.status),
                     &format!("http_{}", response.status),
                     &output,
+                    Some(html_surface_markers(&response.body_excerpt)),
                     true,
                     cleanup.reaped,
                 );
@@ -293,6 +325,7 @@ fn probe_browser_readiness_with_options(
         None,
         "timeout",
         &output,
+        None,
         true,
         cleanup.reaped,
     )
@@ -514,6 +547,9 @@ fn finish_without_spawn(
         output_excerpt: eval_events::body_snippet(output_excerpt),
         child_spawned: false,
         child_reaped: false,
+        has_canvas: false,
+        interactive_control_count: 0,
+        title_text_excerpt: String::new(),
     };
     write_browser_readiness_evidence(root, &observation);
     observation
@@ -529,6 +565,7 @@ fn finish_with_cleanup(
     http_status: Option<i64>,
     failure_kind: &str,
     output_excerpt: &str,
+    surface_markers: Option<HtmlSurfaceMarkers>,
     child_spawned: bool,
     child_reaped: bool,
 ) -> BrowserReadinessObservation {
@@ -536,6 +573,7 @@ fn finish_with_cleanup(
     let adjusted_failure_kind = browser_probe_failure_kind(failure_kind, output_excerpt);
     let adjusted_output_excerpt =
         browser_probe_output_excerpt(&adjusted_failure_kind, output_excerpt);
+    let surface_markers = surface_markers.unwrap_or_default();
     let observation = BrowserReadinessObservation {
         ok,
         status: if ok { "ready" } else { "failed" }.to_string(),
@@ -550,6 +588,9 @@ fn finish_with_cleanup(
         output_excerpt: eval_events::body_snippet(&adjusted_output_excerpt),
         child_spawned,
         child_reaped,
+        has_canvas: surface_markers.has_canvas,
+        interactive_control_count: surface_markers.interactive_control_count,
+        title_text_excerpt: surface_markers.title_text_excerpt,
     };
     write_browser_readiness_evidence(root, &observation);
     observation
@@ -577,6 +618,10 @@ fn browser_readiness_evidence_json(observation: &BrowserReadinessObservation) ->
         "status": observation.status,
         "route": observation.route,
         "route_rendered": observation.ok,
+        "has_canvas": observation.has_canvas,
+        "interactive_control_count": observation.interactive_control_count,
+        "title_text_excerpt": observation.title_text_excerpt,
+        "route_rendered_quality": if observation.has_canvas { "rendered" } else { "rendered_without_expected_surface" },
         "dev_server": {
             "profile": observation.profile,
             "port": observation.port,
@@ -586,6 +631,9 @@ fn browser_readiness_evidence_json(observation: &BrowserReadinessObservation) ->
             "output_excerpt": observation.output_excerpt,
             "child_spawned": observation.child_spawned,
             "child_reaped": observation.child_reaped,
+            "has_canvas": observation.has_canvas,
+            "interactive_control_count": observation.interactive_control_count,
+            "title_text_excerpt": observation.title_text_excerpt,
         }
     });
     if observation.status != "skipped_offline"
@@ -604,6 +652,54 @@ fn browser_readiness_evidence_json(observation: &BrowserReadinessObservation) ->
         value["output_excerpt"] = json!(observation.output_excerpt);
     }
     value
+}
+
+fn count_interactive_controls(lower: &str) -> usize {
+    [
+        "<button",
+        "<input",
+        "<select",
+        "<textarea",
+        "role=\"button\"",
+        "role='button'",
+    ]
+    .iter()
+    .map(|needle| lower.matches(needle).count())
+    .sum()
+}
+
+fn html_title_text_excerpt(body: &str, lower: &str) -> String {
+    extract_tag_text(body, lower, "title")
+        .or_else(|| extract_tag_text(body, lower, "h1"))
+        .map(|text| eval_events::body_snippet(&collapse_whitespace(&strip_html_tags(&text))))
+        .unwrap_or_default()
+}
+
+fn extract_tag_text(body: &str, lower: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}");
+    let close_tag = format!("</{tag}>");
+    let start = lower.find(&start_tag)?;
+    let content_start = lower[start..].find('>')? + start + 1;
+    let content_end = lower[content_start..].find(&close_tag)? + content_start;
+    body.get(content_start..content_end).map(str::to_string)
+}
+
+fn strip_html_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn first_non_empty(primary: &str, fallback: &str) -> String {
@@ -793,6 +889,48 @@ mod tests {
     }
 
     #[test]
+    fn child_that_responds_html_records_surface_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let markers = html_surface_markers(
+            "<html><head><title>Space Test</title></head><body><canvas></canvas><button>Start</button></body></html>",
+        );
+        let observation = BrowserReadinessObservation {
+            ok: true,
+            status: "ready".to_string(),
+            profile: "nextjs".to_string(),
+            port: 3000,
+            route: "/".to_string(),
+            command: "mock".to_string(),
+            http_status: Some(200),
+            failure_kind: String::new(),
+            evidence_path: browser_readiness_evidence_path(dir.path()),
+            elapsed_ms: 1,
+            output_excerpt: String::new(),
+            child_spawned: false,
+            child_reaped: false,
+            has_canvas: markers.has_canvas,
+            interactive_control_count: markers.interactive_control_count,
+            title_text_excerpt: markers.title_text_excerpt,
+        };
+        write_browser_readiness_evidence(dir.path(), &observation);
+
+        assert!(observation.has_canvas);
+        assert_eq!(observation.interactive_control_count, 1);
+        assert_eq!(observation.title_text_excerpt, "Space Test");
+        let evidence =
+            std::fs::read_to_string(browser_readiness_evidence_path(dir.path())).unwrap();
+        assert!(evidence.contains("\"has_canvas\": true"), "{evidence}");
+        assert!(
+            evidence.contains("\"interactive_control_count\": 1"),
+            "{evidence}"
+        );
+        assert!(
+            evidence.contains("\"title_text_excerpt\": \"Space Test\""),
+            "{evidence}"
+        );
+    }
+
+    #[test]
     fn child_that_responds_500_reports_http_failure() {
         let dir = tempfile::tempdir().unwrap();
         let port = free_port();
@@ -923,7 +1061,9 @@ mod tests {
         } else if code == 500 {
             eprintln!("Module parse failed: Unexpected character '@' (1:0)");
         }
-        let body = if status == "node-env-marker" {
+        let body = if status == "html-canvas" {
+            "<html><head><title>Space Test</title></head><body><canvas></canvas><button>Start</button></body></html>"
+        } else if status == "node-env-marker" {
             "Next.js detected a non-standard \"NODE_ENV\" value."
         } else if code == 500 {
             "Module parse failed: Unexpected character '@'"

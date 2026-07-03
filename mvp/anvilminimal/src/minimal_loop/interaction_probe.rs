@@ -125,10 +125,12 @@ pub fn playwright_availability(root: &Path) -> ProbeAvailability {
     #[cfg(test)]
     {
         let _ = root;
-        return ProbeAvailability::Unavailable("playwright_not_installed".to_string());
+        ProbeAvailability::Unavailable("playwright_not_installed".to_string())
     }
     #[cfg(not(test))]
-    return playwright_availability_from_command(root);
+    {
+        playwright_availability_from_command(root)
+    }
 }
 
 #[cfg(not(test))]
