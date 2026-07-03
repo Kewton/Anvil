@@ -128,6 +128,18 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
         contains_any(
             reason,
             &[
+                "probe_dependency_missing",
+                "probe_infrastructure_failed",
+                "app interaction untested",
+            ],
+        )
+    }) {
+        return RepairTarget::Unknown;
+    }
+    if report.profile_failures.iter().any(|reason| {
+        contains_any(
+            reason,
+            &[
                 "package.json",
                 "dependency",
                 "dependencies",
@@ -588,6 +600,17 @@ mod tests {
             classify_repair_target(&report).allowed_action(),
             "edit_task_implementation_artifact"
         );
+    }
+
+    #[test]
+    fn browser_interaction_probe_infrastructure_failure_is_not_app_repair_target() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "release gate failed: probe_dependency_missing:playwright_module_missing; app interaction untested"
+                .to_string(),
+        );
+
+        assert_eq!(classify_repair_target(&report), RepairTarget::Unknown);
     }
 
     #[test]

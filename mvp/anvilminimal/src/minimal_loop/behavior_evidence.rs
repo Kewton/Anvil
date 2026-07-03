@@ -45,6 +45,7 @@ pub struct EvidenceArbitrationReport {
 struct BehaviorObservation {
     ok: bool,
     failure_kind: String,
+    stage: String,
     steps: BTreeSet<String>,
     surface_visible: bool,
     start_transition: bool,
@@ -95,6 +96,30 @@ pub fn arbitrate_final_acceptance(
             records,
         };
     };
+
+    if observation.infrastructure_failure() {
+        for (key, static_tier) in static_tiers {
+            records.insert(
+                key,
+                EvidenceArbitrationRecord {
+                    final_tier: static_tier.clone(),
+                    static_tier,
+                    behavioral_observation: format!(
+                        "probe_infrastructure_failure:{}",
+                        observation.failure_kind
+                    ),
+                    decided_by: "static".to_string(),
+                },
+            );
+        }
+        return EvidenceArbitrationReport {
+            summary: format!(
+                "static (probe infrastructure failure: {})",
+                observation.failure_kind
+            ),
+            records,
+        };
+    }
 
     for (key, static_tier) in &static_tiers {
         let decision = behavioral_decision(key, static_tier, &observation);
@@ -156,9 +181,9 @@ pub fn arbitrate_final_acceptance(
         summary: if observation.ok {
             "behavioral (probe ok)".to_string()
         } else if observation.failure_kind.is_empty() {
-            "behavioral (probe failed)".to_string()
+            "behavioral (app failure)".to_string()
         } else {
-            format!("behavioral (probe failed:{})", observation.failure_kind)
+            format!("behavioral (app failure: {})", observation.failure_kind)
         },
         records,
     }
@@ -300,7 +325,9 @@ impl BehaviorObservation {
         let probe_shaped = !steps.is_empty()
             || value.get("probe").is_some()
             || text_field_deep(value, &["before_marker"]).is_some()
-            || text_field_deep(value, &["after_marker"]).is_some();
+            || text_field_deep(value, &["after_marker"]).is_some()
+            || text_field_deep(value, &["stage"]).is_some()
+            || text_field_deep(value, &["failure_kind", "browser_failure_kind"]).is_some();
         if !probe_shaped {
             return None;
         }
@@ -325,6 +352,7 @@ impl BehaviorObservation {
                 "browser_interaction_failed".to_string()
             }
         });
+        let stage = text_field_deep(value, &["stage"]).unwrap_or_default();
         let surface_visible = steps.contains("surface_visible")
             || bool_field_deep(value, &["surface_visible", "interactive_surface"]) == Some(true);
         let marker_changed = marker_changed(value, "before_marker", "after_marker");
@@ -336,12 +364,23 @@ impl BehaviorObservation {
         Some(Self {
             ok,
             failure_kind,
+            stage,
             steps,
             surface_visible,
             start_transition,
             input_state_change,
             recovery_transition,
         })
+    }
+
+    fn infrastructure_failure(&self) -> bool {
+        !self.ok
+            && (self.failure_kind.starts_with("probe_dependency_missing")
+                || self.failure_kind.starts_with("probe_infrastructure_failed")
+                || (matches!(
+                    self.stage.as_str(),
+                    "resolving" | "launching" | "navigating"
+                ) && !self.surface_visible))
     }
 }
 
@@ -608,6 +647,7 @@ export default function Page() {
                 "input_event_observed": true,
                 "state_changed": false,
                 "steps": ["surface_visible", "control_input_dispatched"],
+                "stage": "observing",
                 "before_marker": "same",
                 "after_marker": "same",
                 "failure_kind": "start_transition_missing"
@@ -664,6 +704,55 @@ export default function Page() {
         );
         assert_eq!(report, before);
         assert_eq!(arbitration.summary, "static (probe unavailable)");
+    }
+
+    #[test]
+    fn infrastructure_failure_keeps_static_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), strong_interactive_page());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": false,
+                "status": "failed",
+                "interaction_success": false,
+                "stage": "resolving",
+                "steps": [],
+                "failure_kind": "probe_dependency_missing:playwright_module_missing",
+                "remediation": "install playwright or set ANVIL_PLAYWRIGHT_DIR"
+            }),
+        );
+        let required = [
+            "interactive_ui_source_evidence",
+            "visible_interactive_surface_evidence",
+            "non_static_screen_evidence",
+            "restart_or_recoverable_state_evidence",
+        ];
+        let mut report = report_for(dir.path(), &required);
+        let before = report.clone();
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+        assert_eq!(report, before);
+        assert_eq!(
+            arbitration.summary,
+            "static (probe infrastructure failure: probe_dependency_missing:playwright_module_missing)"
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("interactive_ui_source_evidence")
+                .map(|record| record.decided_by.as_str()),
+            Some("static")
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
@@ -8,24 +9,38 @@ use serde_json::{Value, json};
 use crate::eval_events;
 use crate::minimal_loop::verifier_env;
 
-#[cfg(not(test))]
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(10);
 const INTERACTION_TIMEOUT: Duration = Duration::from_secs(20);
 const PROBE_SCRIPT_NAME: &str = "browser-interaction-probe.cjs";
+const PLAYWRIGHT_BROWSER_BINARIES_REMEDIATION: &str = "run npx playwright install chromium";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeAvailability {
-    Available,
+    Available(PlaywrightResolution),
     Unavailable(String),
 }
 
 impl ProbeAvailability {
     pub fn unavailable_reason(&self) -> Option<&str> {
         match self {
-            Self::Available => None,
+            Self::Available(_) => None,
             Self::Unavailable(reason) => Some(reason),
         }
     }
+
+    fn resolution(&self) -> Option<&PlaywrightResolution> {
+        match self {
+            Self::Available(resolution) => Some(resolution),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlaywrightResolution {
+    pub module_path: String,
+    pub module_dir: String,
+    pub node_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -42,6 +57,8 @@ pub struct BrowserInteractionObservation {
     pub recovery_transition_observed: bool,
     pub recovery_transition_not_observed: bool,
     pub failure_kind: String,
+    pub stage: String,
+    pub remediation: String,
     pub duration_ms: u128,
     pub output_excerpt: String,
     pub child_spawned: bool,
@@ -74,20 +91,96 @@ pub fn playwright_availability(root: &Path) -> ProbeAvailability {
         return ProbeAvailability::Unavailable("playwright_not_installed".to_string());
     }
     #[cfg(not(test))]
-    {
-        playwright_availability_from_command(root)
-    }
+    return playwright_availability_from_command(root);
 }
 
 #[cfg(not(test))]
 fn playwright_availability_from_command(root: &Path) -> ProbeAvailability {
-    let mut command = verifier_env::normalized_command_at_root("npx", root);
-    command
-        .args(["--no-install", "playwright", "--version"])
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    playwright_availability_from_programs(
+        root,
+        OsStr::new("node"),
+        OsStr::new("npm"),
+        std::env::var_os("ANVIL_PLAYWRIGHT_DIR").map(PathBuf::from),
+    )
+}
+
+fn playwright_availability_from_programs(
+    root: &Path,
+    node_program: &OsStr,
+    npm_program: &OsStr,
+    configured_tool_dir: Option<PathBuf>,
+) -> ProbeAvailability {
+    if let Some(resolution) = resolve_playwright_module(root, node_program, None) {
+        return ProbeAvailability::Available(resolution);
+    }
+    if let Some(global_root) = npm_global_root(root, npm_program)
+        && let Some(resolution) = resolve_playwright_module(root, node_program, Some(&global_root))
+    {
+        return ProbeAvailability::Available(resolution);
+    }
+    if let Some(tool_dir) = configured_tool_dir
+        && let Some(resolution) = resolve_playwright_module(root, node_program, Some(&tool_dir))
+    {
+        return ProbeAvailability::Available(resolution);
+    }
+    ProbeAvailability::Unavailable("playwright_not_installed".to_string())
+}
+
+fn node_program_for_root(root: &Path) -> OsString {
+    #[cfg(test)]
+    if let Some(path) = load_test_node_program_override(root) {
+        return path.into_os_string();
+    }
+    let _ = root;
+    OsString::from("node")
+}
+
+fn resolve_playwright_module(
+    root: &Path,
+    node_program: &OsStr,
+    node_path: Option<&Path>,
+) -> Option<PlaywrightResolution> {
+    let output = run_command_stdout(
+        verifier_env::normalized_command_at_root(node_program, root)
+            .arg("-e")
+            .arg("console.log(require.resolve('playwright'))")
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .envs(node_path_env(node_path)),
+    )?;
+    let module_path = output.lines().find(|line| !line.trim().is_empty())?.trim();
+    let module_dir = Path::new(module_path)
+        .parent()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    Some(PlaywrightResolution {
+        module_path: module_path.to_string(),
+        module_dir,
+        node_path: node_path.map(|path| path.display().to_string()),
+    })
+}
+
+fn npm_global_root(root: &Path, npm_program: &OsStr) -> Option<PathBuf> {
+    let output = run_command_stdout(
+        verifier_env::normalized_command_at_root(npm_program, root)
+            .args(["root", "-g"])
+            .current_dir(root)
+            .stdin(Stdio::null()),
+    )?;
+    output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| PathBuf::from(line.trim()))
+}
+
+fn node_path_env(node_path: Option<&Path>) -> Vec<(&'static str, OsString)> {
+    node_path
+        .map(|path| vec![("NODE_PATH", path.as_os_str().to_os_string())])
+        .unwrap_or_default()
+}
+
+fn run_command_stdout(command: &mut std::process::Command) -> Option<String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -95,29 +188,30 @@ fn playwright_availability_from_command(root: &Path) -> ProbeAvailability {
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return ProbeAvailability::Unavailable("playwright_not_installed".to_string()),
+        Err(_) => return None,
     };
     let deadline = Instant::now() + AVAILABILITY_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                let output = child.wait_with_output().ok()?;
                 return if status.success() {
-                    ProbeAvailability::Available
+                    Some(String::from_utf8_lossy(&output.stdout).to_string())
                 } else {
-                    ProbeAvailability::Unavailable("playwright_not_installed".to_string())
+                    None
                 };
             }
             Ok(None) => {}
             Err(_) => {
                 terminate_child_group(&mut child);
                 let _ = child.wait();
-                return ProbeAvailability::Unavailable("playwright_not_installed".to_string());
+                return None;
             }
         }
         if Instant::now() >= deadline {
             terminate_child_group(&mut child);
             let _ = child.wait();
-            return ProbeAvailability::Unavailable("playwright_not_installed".to_string());
+            return None;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -136,9 +230,13 @@ pub fn probe_browser_interaction_against_running_server(
     evidence_path: &Path,
     timeout: Duration,
 ) -> InteractionProbeOutcome {
-    if let ProbeAvailability::Unavailable(reason) = playwright_availability(root) {
+    let availability = playwright_availability(root);
+    let Some(resolution) = availability.resolution().cloned() else {
+        let ProbeAvailability::Unavailable(reason) = availability else {
+            unreachable!("availability without resolution must be unavailable");
+        };
         return InteractionProbeOutcome::Unavailable(reason);
-    }
+    };
     #[cfg(test)]
     if let Some(value) = load_test_result_override(root) {
         let observation = observation_from_value(
@@ -200,12 +298,16 @@ pub fn probe_browser_interaction_against_running_server(
     };
 
     let url = format!("http://127.0.0.1:{port}/");
-    let mut command = verifier_env::normalized_command_at_root("node", root);
+    let node_program = node_program_for_root(root);
+    let mut command = verifier_env::normalized_command_at_root(&node_program, root);
     command
         .arg(&script_path)
         .arg(&url)
         .arg(evidence_path)
         .current_dir(root)
+        .envs(node_path_env(
+            resolution.node_path.as_deref().map(Path::new),
+        ))
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log));
@@ -334,12 +436,12 @@ fn write_probe_script(path: &Path) -> std::io::Result<()> {
 
 fn interaction_probe_script() -> &'static str {
     r#"const fs = require("fs");
-const { chromium } = require("playwright");
 
 const url = process.argv[2];
 const outputPath = process.argv[3];
 const started = Date.now();
 const steps = [];
+let stage = "resolving";
 let before_marker = "";
 let after_marker = "";
 let input_before_marker = "";
@@ -351,6 +453,13 @@ let recovery_transition_status = "unknown";
 function write(value) {
   fs.mkdirSync(require("path").dirname(outputPath), { recursive: true });
   fs.writeFileSync(outputPath, JSON.stringify(value, null, 2) + "\n");
+}
+
+function mark(nextStage) {
+  stage = nextStage;
+  try {
+    process.stderr.write(JSON.stringify({ stage }) + "\n");
+  } catch (_) {}
 }
 
 async function marker(page) {
@@ -455,12 +564,17 @@ async function attemptRecoveryTransition(page, initialStartText) {
 (async () => {
   let browser;
   try {
+    mark("resolving");
+    const { chromium } = require("playwright");
+    mark("launching");
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage();
+    mark("navigating");
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15000 });
     const surface = page.locator("canvas, button, [role=button]").first();
     await surface.waitFor({ timeout: 10000 });
     steps.push("surface_visible");
+    mark("observing");
     before_marker = await marker(page);
 
     const startControl = page.locator("button, [role=button]").first();
@@ -508,6 +622,7 @@ async function attemptRecoveryTransition(page, initialStartText) {
       recovery_transition: recoveryObserved,
       recovery_transition_status,
       steps,
+      stage,
       before_marker,
       after_marker,
       input_before_marker,
@@ -527,6 +642,7 @@ async function attemptRecoveryTransition(page, initialStartText) {
       ok: false,
       status: "failed",
       steps,
+      stage,
       before_marker,
       after_marker,
       input_before_marker,
@@ -564,6 +680,26 @@ fn interaction_stdio_excerpt(run_dir: &Path) -> String {
     eval_events::body_snippet(format!("{stdout}\n{stderr}").trim())
 }
 
+fn stage_from_probe_output(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .filter_map(stage_from_probe_output_line)
+        .next()
+}
+
+fn stage_from_probe_output_line(line: &str) -> Option<String> {
+    serde_json::from_str::<Value>(line.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("stage")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|stage| !stage.is_empty())
+}
+
 fn read_interaction_value(path: &Path) -> Option<Value> {
     std::fs::read_to_string(path)
         .ok()
@@ -583,12 +719,35 @@ fn observation_from_value(
     child_reaped: bool,
 ) -> BrowserInteractionObservation {
     let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    let failure_kind = value
+    let raw_failure_kind = value
         .get("failure_kind")
         .or_else(|| value.get("browser_failure_kind"))
         .and_then(Value::as_str)
         .unwrap_or(if ok { "" } else { "browser_interaction_failed" })
         .to_string();
+    let stage = value
+        .get("stage")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("probe")
+                .and_then(|probe| probe.get("stage"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("")
+        .to_string();
+    let value_error = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let failure_kind = normalized_interaction_failure_kind(
+        ok,
+        &stage,
+        &raw_failure_kind,
+        value_error,
+        &output_excerpt,
+    );
+    let remediation = interaction_failure_remediation(&failure_kind);
     let duration_ms = value
         .get("duration_ms")
         .and_then(Value::as_u64)
@@ -651,6 +810,8 @@ fn observation_from_value(
         recovery_transition_observed,
         recovery_transition_not_observed,
         failure_kind,
+        stage,
+        remediation,
         duration_ms,
         output_excerpt: eval_events::body_snippet(&output_excerpt),
         child_spawned,
@@ -671,6 +832,15 @@ fn failure_observation(
     child_reaped: bool,
 ) -> BrowserInteractionObservation {
     let url = format!("http://127.0.0.1:{port}/");
+    let stage = stage_from_probe_output(output_excerpt).unwrap_or_default();
+    let failure_kind = normalized_interaction_failure_kind(
+        false,
+        &stage,
+        failure_kind,
+        output_excerpt,
+        output_excerpt,
+    );
+    let remediation = interaction_failure_remediation(&failure_kind);
     let observation = BrowserInteractionObservation {
         ok: false,
         status: "failed".to_string(),
@@ -683,7 +853,9 @@ fn failure_observation(
         input_state_changed: false,
         recovery_transition_observed: false,
         recovery_transition_not_observed: false,
-        failure_kind: failure_kind.to_string(),
+        failure_kind,
+        stage,
+        remediation,
         duration_ms: started.elapsed().as_millis(),
         output_excerpt: eval_events::body_snippet(output_excerpt),
         child_spawned,
@@ -711,6 +883,93 @@ fn interaction_failure_json(
     })
 }
 
+fn normalized_interaction_failure_kind(
+    ok: bool,
+    stage: &str,
+    raw_failure_kind: &str,
+    error: &str,
+    output_excerpt: &str,
+) -> String {
+    if ok {
+        return String::new();
+    }
+    let combined = format!("{raw_failure_kind}\n{error}\n{output_excerpt}");
+    if playwright_browser_binaries_missing(&combined) {
+        return "probe_dependency_missing:browser_binaries_missing".to_string();
+    }
+    if playwright_module_missing(&combined) {
+        return "probe_dependency_missing:playwright_module_missing".to_string();
+    }
+    if raw_failure_kind.starts_with("probe_dependency_missing")
+        || raw_failure_kind.starts_with("probe_infrastructure_failed")
+    {
+        return raw_failure_kind.to_string();
+    }
+    if probe_stage_before_observation(stage)
+        || matches!(
+            raw_failure_kind,
+            "probe_script_write_failed"
+                | "probe_stdio_open_failed"
+                | "probe_spawn_failed"
+                | "probe_status_unreadable"
+                | "probe_timeout"
+                | "probe_command_failed"
+                | "probe_evidence_missing"
+        )
+    {
+        let detail = if raw_failure_kind.trim().is_empty() {
+            "unknown"
+        } else {
+            raw_failure_kind.trim()
+        };
+        return format!("probe_infrastructure_failed:{detail}");
+    }
+    raw_failure_kind.to_string()
+}
+
+fn probe_stage_before_observation(stage: &str) -> bool {
+    matches!(stage, "resolving" | "launching" | "navigating")
+}
+
+fn playwright_module_missing(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("cannot find module 'playwright'")
+        || lower.contains("cannot find module \"playwright\"")
+        || lower.contains("module_not_found")
+}
+
+fn playwright_browser_binaries_missing(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("executable doesn't exist")
+        || lower.contains("browser executable not found")
+        || lower.contains("please run the following command to download new browsers")
+        || lower.contains("playwright install")
+}
+
+fn interaction_failure_remediation(failure_kind: &str) -> String {
+    if failure_kind == "probe_dependency_missing:browser_binaries_missing" {
+        PLAYWRIGHT_BROWSER_BINARIES_REMEDIATION.to_string()
+    } else if failure_kind == "probe_dependency_missing:playwright_module_missing" {
+        "install playwright or set ANVIL_PLAYWRIGHT_DIR to a directory containing the module"
+            .to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn interaction_failure_category(failure_kind: &str, stage: &str) -> &'static str {
+    if failure_kind.starts_with("probe_dependency_missing")
+        || failure_kind.starts_with("probe_infrastructure_failed")
+        || probe_stage_before_observation(stage)
+    {
+        "infrastructure"
+    } else if failure_kind.is_empty() {
+        ""
+    } else {
+        "app"
+    }
+}
+
 fn interaction_observation_json(observation: &BrowserInteractionObservation) -> Value {
     let mut value = json!({
         "ok": observation.ok,
@@ -730,6 +989,9 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         } else {
             "unknown"
         },
+        "stage": observation.stage,
+        "failure_category": interaction_failure_category(&observation.failure_kind, &observation.stage),
+        "remediation": observation.remediation,
         "steps": observation.steps,
         "before_marker": observation.before_marker,
         "after_marker": observation.after_marker,
@@ -739,6 +1001,7 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
             "output_excerpt": observation.output_excerpt,
             "child_spawned": observation.child_spawned,
             "child_reaped": observation.child_reaped,
+            "stage": observation.stage,
         }
     });
     if !observation.failure_kind.is_empty() {
@@ -807,7 +1070,23 @@ fn load_test_availability_override(root: &Path) -> Option<ProbeAvailability> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if available {
-        Some(ProbeAvailability::Available)
+        Some(ProbeAvailability::Available(PlaywrightResolution {
+            module_path: value
+                .get("module_path")
+                .and_then(Value::as_str)
+                .unwrap_or("test/node_modules/playwright/index.js")
+                .to_string(),
+            module_dir: value
+                .get("module_dir")
+                .and_then(Value::as_str)
+                .unwrap_or("test/node_modules/playwright")
+                .to_string(),
+            node_path: value
+                .get("node_path")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        }))
     } else {
         Some(ProbeAvailability::Unavailable(
             value
@@ -832,21 +1111,47 @@ fn load_test_result_override(root: &Path) -> Option<Value> {
 }
 
 #[cfg(test)]
+fn load_test_node_program_override(root: &Path) -> Option<PathBuf> {
+    let path = root
+        .join(".anvil")
+        .join("evidence")
+        .join("interaction-probe-node-program.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    value
+        .get("node_program")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(test)]
 pub fn write_test_availability_override(root: &Path, available: bool) {
+    write_test_availability_override_with_resolution(root, available, None);
+}
+
+#[cfg(test)]
+pub fn write_test_availability_override_with_resolution(
+    root: &Path,
+    available: bool,
+    resolution: Option<&PlaywrightResolution>,
+) {
     let path = root
         .join(".anvil")
         .join("evidence")
         .join("interaction-probe-availability.json");
+    let mut value = json!({
+        "available": available,
+        "reason": if available { "" } else { "playwright_not_installed" },
+    });
+    if let Some(resolution) = resolution {
+        value["module_path"] = json!(resolution.module_path);
+        value["module_dir"] = json!(resolution.module_dir);
+        value["node_path"] = json!(resolution.node_path.clone().unwrap_or_default());
+    }
     write_text(
         &path,
-        &format!(
-            "{}\n",
-            serde_json::to_string_pretty(&json!({
-                "available": available,
-                "reason": if available { "" } else { "playwright_not_installed" },
-            }))
-            .unwrap()
-        ),
+        &format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
     );
 }
 
@@ -859,6 +1164,24 @@ pub fn write_test_result_override(root: &Path, value: &Value) {
     write_text(
         &path,
         &format!("{}\n", serde_json::to_string_pretty(value).unwrap()),
+    );
+}
+
+#[cfg(test)]
+pub fn write_test_node_program_override(root: &Path, node_program: &Path) {
+    let path = root
+        .join(".anvil")
+        .join("evidence")
+        .join("interaction-probe-node-program.json");
+    write_text(
+        &path,
+        &format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json!({
+                "node_program": node_program.display().to_string(),
+            }))
+            .unwrap()
+        ),
     );
 }
 
@@ -954,5 +1277,106 @@ mod tests {
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("\"ok\": false"));
         assert!(text.contains("start_transition_missing"));
+    }
+
+    #[test]
+    fn failure_observation_preserves_latest_probe_stage_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let evidence_path = dir.path().join("browser-interaction.json");
+        let script_path = dir.path().join("browser-interaction-probe.cjs");
+
+        let observation = failure_observation(
+            dir.path(),
+            &evidence_path,
+            &script_path,
+            34001,
+            Instant::now(),
+            "probe_command_failed",
+            "{\"stage\":\"resolving\"}\n{\"stage\":\"navigating\"}",
+            true,
+            true,
+        );
+
+        assert_eq!(observation.stage, "navigating");
+        assert_eq!(
+            observation.failure_kind,
+            "probe_infrastructure_failed:probe_command_failed"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_node_path_is_reused_by_probe_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool_dir = dir.path().join("tools-node-path");
+        std::fs::create_dir_all(&tool_dir).unwrap();
+        let capture = dir.path().join("node-env.log");
+        let fake_node = dir.path().join("fake-node.sh");
+        std::fs::write(
+            &fake_node,
+            format!(
+                r#"#!/bin/sh
+echo "NODE_PATH=${{NODE_PATH}}" >> "{capture}"
+if [ "$1" = "-e" ]; then
+  if [ "${{NODE_PATH}}" = "{tool_dir}" ]; then
+    echo "{tool_dir}/playwright/index.js"
+    exit 0
+  fi
+  exit 1
+fi
+cat > "$3" <<'JSON'
+{{"ok":true,"status":"passed","interaction_success":true,"interaction_performed":true,"input_event_observed":true,"state_changed":true,"stage":"observing","steps":["surface_visible","start_transition","control_input_dispatched","input_state_change"],"before_marker":"menu","after_marker":"running"}}
+JSON
+exit 0
+"#,
+                capture = capture.display(),
+                tool_dir = tool_dir.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_node).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_node, permissions).unwrap();
+
+        let availability = playwright_availability_from_programs(
+            dir.path(),
+            fake_node.as_os_str(),
+            OsStr::new("/no/such/npm"),
+            Some(tool_dir.clone()),
+        );
+        let ProbeAvailability::Available(resolution) = availability else {
+            panic!("expected fake resolver to find playwright");
+        };
+        assert_eq!(
+            resolution.node_path.as_deref(),
+            Some(tool_dir.to_string_lossy().as_ref())
+        );
+        write_test_node_program_override(dir.path(), &fake_node);
+        write_test_availability_override_with_resolution(dir.path(), true, Some(&resolution));
+
+        let run_dir = dir.path().join(".anvil/runs/test");
+        let path = run_dir.join("browser-interaction.json");
+        let outcome = probe_browser_interaction_against_running_server(
+            dir.path(),
+            34001,
+            &run_dir,
+            &path,
+            Duration::from_secs(1),
+        );
+
+        assert!(
+            outcome
+                .observation()
+                .is_some_and(|observation| observation.ok)
+        );
+        let capture_text = std::fs::read_to_string(capture).unwrap();
+        assert!(
+            capture_text
+                .lines()
+                .any(|line| line == format!("NODE_PATH={}", tool_dir.display())),
+            "{capture_text}"
+        );
     }
 }

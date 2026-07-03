@@ -4643,6 +4643,25 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
         };
     }
     if let ReleaseEvidenceStatus::Failed(reason) = &interaction.status {
+        if interaction_probe_infrastructure_failure_reason(reason) {
+            let mut reasons = vec![
+                reason.clone(),
+                format!("app interaction untested (probe infrastructure failure: {reason})"),
+            ];
+            if let Some(remediation) = interaction_probe_failure_remediation(&interaction.path) {
+                reasons.push(remediation);
+            } else if reason == "probe_dependency_missing:browser_binaries_missing" {
+                reasons.push("run npx playwright install chromium".to_string());
+            }
+            return ReleaseGateSummary {
+                status: "failed".to_string(),
+                reasons: dedup_strings(reasons),
+                browser_readiness_status: browser_status,
+                browser_readiness_evidence_path: browser.path,
+                interaction_evidence_status: interaction_status,
+                interaction_evidence_path: interaction.path,
+            };
+        }
         return ReleaseGateSummary {
             status: "failed".to_string(),
             reasons: vec![format!("browser_interaction_failed:{reason}")],
@@ -4715,6 +4734,35 @@ fn write_release_evidence_json(path: &Path, value: &Value) {
     if let Ok(text) = serde_json::to_string_pretty(value) {
         let _ = std::fs::write(path, format!("{text}\n"));
     }
+}
+
+fn interaction_probe_infrastructure_failure_reason(reason: &str) -> bool {
+    reason.starts_with("probe_dependency_missing")
+        || reason.starts_with("probe_infrastructure_failed")
+}
+
+fn release_gate_has_interaction_probe_infrastructure_failure(
+    release_gate: &ReleaseGateSummary,
+) -> bool {
+    release_gate
+        .interaction_evidence_status
+        .strip_prefix("failed:")
+        .is_some_and(interaction_probe_infrastructure_failure_reason)
+        || release_gate
+            .reasons
+            .iter()
+            .any(|reason| interaction_probe_infrastructure_failure_reason(reason))
+}
+
+fn interaction_probe_failure_remediation(path: &str) -> Option<String> {
+    let value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())?;
+    let details = value
+        .get("browser_details")
+        .or_else(|| value.get("details"))
+        .filter(|value| value.is_object());
+    text_field_deep(&value, details, &["remediation"]).filter(|remediation| !remediation.is_empty())
 }
 
 fn nextjs_dev_route_evidence_path(config: &Config) -> PathBuf {
@@ -6496,6 +6544,8 @@ fn release_recovery_repair_targets(
         .reasons
         .iter()
         .any(|reason| reason.contains("interaction_unverified:probe_unavailable"));
+    let interaction_probe_infrastructure =
+        release_gate_has_interaction_probe_infrastructure_failure(release_gate);
     if browser_status.contains("tailwind_dev_pipeline_failure")
         || browser_status.contains("css")
         || browser_status.contains("http_500")
@@ -6513,7 +6563,7 @@ fn release_recovery_repair_targets(
     if browser_status.starts_with("failed:") {
         targets.push("test_or_evidence".to_string());
     }
-    if interaction_status.starts_with("failed:") {
+    if interaction_status.starts_with("failed:") && !interaction_probe_infrastructure {
         targets.push("capability_implementation".to_string());
     }
     if let Some(report) = runtime_acceptance {
@@ -6546,6 +6596,18 @@ fn release_recovery_verify_commands(
             .any(|reason| reason.contains("interaction_unverified:probe_unavailable"))
         {
             commands.push("install playwright to enable interaction release checks".to_string());
+        } else if release_gate_has_interaction_probe_infrastructure_failure(release_gate) {
+            commands.push(
+                "fix the interaction probe infrastructure before rerunning release checks"
+                    .to_string(),
+            );
+            if release_gate
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("probe_dependency_missing:browser_binaries_missing"))
+            {
+                commands.push("run npx playwright install chromium".to_string());
+            }
         } else {
             commands
                 .push("run the interaction probe and record browser-interaction.json".to_string());
@@ -8553,6 +8615,9 @@ fn final_acceptance_model_fixable_profile_failures(report: &VerificationReport) 
                 && !lower.contains("interaction evidence status:")
                 && !lower.contains("interaction evidence path:")
                 && !lower.contains("interaction_unverified:probe_unavailable")
+                && !lower.contains("probe_dependency_missing")
+                && !lower.contains("probe_infrastructure_failed")
+                && !lower.contains("app interaction untested")
         })
         .cloned()
         .collect()
@@ -12393,6 +12458,82 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
             "{prompt}"
         );
         assert!(!prompt.contains("interaction evidence status"), "{prompt}");
+    }
+
+    #[test]
+    fn interaction_probe_infrastructure_failure_blocks_release_without_static_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            interactive_game_page_source(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":true,"http_status":200,"route_rendered":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("browser-interaction.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": false,
+                "status": "failed",
+                "interaction_success": false,
+                "stage": "resolving",
+                "steps": [],
+                "failure_kind": "probe_dependency_missing:playwright_module_missing",
+                "remediation": "install playwright or set ANVIL_PLAYWRIGHT_DIR to a directory containing the module"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+
+        let gate = browser_release_gate(&cfg);
+        assert_eq!(gate.status, "failed", "{gate:?}");
+        assert!(
+            gate.reasons
+                .contains(&"probe_dependency_missing:playwright_module_missing".to_string()),
+            "{gate:?}"
+        );
+        assert!(
+            gate.reasons
+                .iter()
+                .any(|reason| reason.contains("app interaction untested")),
+            "{gate:?}"
+        );
+        assert!(
+            gate.reasons
+                .iter()
+                .any(|reason| reason.contains("anvil_playwright_dir")),
+            "{gate:?}"
+        );
+        assert_eq!(
+            release_recovery_repair_targets(&gate, None),
+            vec!["release_acceptance".to_string()]
+        );
+
+        let report = verify_runtime_acceptance_with_browser_dirs_and_hints(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["browser_interaction".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(report.passed, "{report:?}");
+        assert!(
+            !report
+                .missing_evidence
+                .iter()
+                .any(|evidence| evidence.contains("browser_interaction_failed")),
+            "{report:?}"
+        );
     }
 
     #[test]

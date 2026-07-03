@@ -1537,6 +1537,19 @@ fn render_completion_summary(
                 .to_string(),
         );
     }
+    if projection
+        .evidence_arbitration_summary
+        .starts_with("static (probe infrastructure failure:")
+        || projection.release_gate_reasons.iter().any(|reason| {
+            reason.contains("probe_dependency_missing")
+                || reason.contains("probe_infrastructure_failed")
+        })
+    {
+        lines.push(
+            "Interaction verification: app interaction untested (probe infrastructure failure)."
+                .to_string(),
+        );
+    }
     let host_env_contamination = crate::minimal_loop::verifier_env::host_env_contamination();
     if !host_env_contamination.is_empty() {
         lines.push(format!(
@@ -2269,6 +2282,49 @@ mod tests {
 
         assert!(
             summary.contains("Evidence arbitration: behavioral (probe ok)"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn completion_summary_renders_probe_infrastructure_failure_as_untested() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "failed",
+                "release_gate_status": "failed",
+                "release_gate_reasons": [
+                    "probe_dependency_missing:playwright_module_missing",
+                    "app interaction untested (probe infrastructure failure: probe_dependency_missing:playwright_module_missing)"
+                ],
+                "evidence_arbitration_summary": "static (probe infrastructure failure: probe_dependency_missing:playwright_module_missing)",
+            }),
+        );
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(false, &snapshot);
+        let summary = render_completion_summary(
+            "tui_command",
+            None,
+            Some("/ultra-plan-run"),
+            "failed",
+            "",
+            &projection,
+        );
+
+        assert!(
+            summary.contains(
+                "Evidence arbitration: static (probe infrastructure failure: probe_dependency_missing:playwright_module_missing)"
+            ),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(
+                "Interaction verification: app interaction untested (probe infrastructure failure)."
+            ),
             "{summary}"
         );
     }

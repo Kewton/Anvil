@@ -639,6 +639,10 @@ fn record_browser_status(
     inconclusive_reasons: &mut Vec<String>,
 ) {
     if let Some(reason) = status.strip_prefix("failed:") {
+        if label == "browser_interaction" && interaction_probe_infrastructure_failure_reason(reason)
+        {
+            return;
+        }
         missing_evidence.push(format!("{label}_failed:{reason}"));
     } else if let Some(reason) = status.strip_prefix("unavailable:") {
         if label == "browser_interaction" && interaction_probe_unavailable_reason_value(reason) {
@@ -656,6 +660,11 @@ fn interaction_probe_unavailable_reason(root: &Path) -> Option<String> {
 
 fn interaction_probe_unavailable_reason_value(reason: &str) -> bool {
     matches!(reason, "playwright_not_installed" | "probe_unavailable")
+}
+
+fn interaction_probe_infrastructure_failure_reason(reason: &str) -> bool {
+    reason.starts_with("probe_dependency_missing")
+        || reason.starts_with("probe_infrastructure_failed")
 }
 
 fn bool_field_deep(value: &Value, details: Option<&Value>, keys: &[&str]) -> Option<bool> {
