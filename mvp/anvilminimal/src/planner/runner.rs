@@ -3768,6 +3768,7 @@ fn ultra_final_acceptance_report(
             "missing_evidence": acceptance.missing_evidence.clone(),
             "missing_obligations": acceptance.missing_obligations.clone(),
             "weak_evidence": acceptance.weak_evidence.clone(),
+            "evidence_tiers": acceptance.evidence_tiers.clone(),
             "artifact_obligations": acceptance.artifact_obligations.clone(),
             "capability_evidence_bindings": acceptance.capability_evidence_bindings.clone(),
             "obligation_repair_targets": acceptance.obligation_repair_targets.clone(),
@@ -12710,6 +12711,93 @@ export default function Page(){
     }
 
     #[test]
+    fn completion_verify_and_ultra_final_acceptance_emit_matching_evidence_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let contract = dir.path().join("contract.json");
+        std::fs::write(
+            &contract,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "required_paths": ["src/app/page.tsx"],
+                "required_evidence": [
+                    "implementation_artifact",
+                    "visible_interactive_surface_evidence",
+                    "user_input_handler_evidence",
+                    "stateful_update_evidence",
+                    "challenge_or_adversary_evidence",
+                    "score_or_progression_evidence",
+                    "failure_or_collision_evidence",
+                    "restart_or_recoverable_state_evidence"
+                ],
+                "verify_repair_cap": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(contract);
+
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({
+                    "path": "src/app/page.tsx",
+                    "content": interactive_game_page_source()
+                }),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let mut session = SessionSnapshot::new();
+        run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create the contracted game implementation in src/app/page.tsx.",
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+        )
+        .unwrap();
+
+        let plan = UltraPlan {
+            goal: "Create the contracted game implementation".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Final acceptance".to_string(),
+            }],
+        };
+        let _report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        let completion = latest_event(&events, "completion_verify");
+        let ultra = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            completion.get("evidence_tiers"),
+            ultra.get("evidence_tiers"),
+            "completion={completion:?}\nultra={ultra:?}"
+        );
+        assert_eq!(
+            ultra
+                .get("evidence_tiers")
+                .and_then(|tiers| tiers.get("failure_or_collision_evidence"))
+                .and_then(Value::as_str),
+            Some("strong")
+        );
+        assert_eq!(
+            ultra
+                .get("evidence_tiers")
+                .and_then(|tiers| tiers.get("restart_or_recoverable_state_evidence"))
+                .and_then(Value::as_str),
+            Some("strong")
+        );
+    }
+
+    #[test]
     fn step_repair_missing_entrypoint_followthrough_creates_expected_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -13414,6 +13502,16 @@ export default function Page(){
         )
         .unwrap();
         path
+    }
+
+    fn latest_event(path: &Path, event: &str) -> Value {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value.get("event").and_then(Value::as_str) == Some(event))
+            .last()
+            .unwrap_or_else(|| panic!("missing event {event} in {}", path.display()))
     }
 
     fn planner_request_text(client: &FakeClient, index: usize) -> String {

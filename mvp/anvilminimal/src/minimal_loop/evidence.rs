@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -12,6 +12,7 @@ pub struct RuntimeAcceptanceReport {
     pub missing_evidence: Vec<String>,
     pub missing_obligations: Vec<String>,
     pub weak_evidence: Vec<String>,
+    pub evidence_tiers: BTreeMap<String, String>,
     pub inconclusive_reasons: Vec<String>,
     pub artifact_obligations: Vec<ArtifactObligationEvidence>,
     pub capability_evidence_bindings: Vec<CapabilityEvidenceBinding>,
@@ -176,17 +177,17 @@ struct WorkspaceEvidence {
 struct SourceFile {
     rel: String,
     content: String,
-    comment_stripped_content: String,
+    comments_stripped_strings_preserved: String,
     scan_content: String,
 }
 
 impl SourceFile {
     fn new(rel: String, content: String) -> Self {
-        let (comment_stripped_content, scan_content) = source_scan_texts(&rel, &content);
+        let (comments_stripped_strings_preserved, scan_content) = source_scan_texts(&rel, &content);
         Self {
             rel,
             content,
-            comment_stripped_content,
+            comments_stripped_strings_preserved,
             scan_content,
         }
     }
@@ -195,8 +196,8 @@ impl SourceFile {
         &self.scan_content
     }
 
-    fn comment_stripped_text(&self) -> &str {
-        &self.comment_stripped_content
+    fn comments_stripped_strings_preserved_text(&self) -> &str {
+        &self.comments_stripped_strings_preserved
     }
 }
 
@@ -210,11 +211,12 @@ fn source_scan_texts(rel: &str, content: &str) -> (String, String) {
     if !uses_c_family_lexical_comments(rel) {
         return (content.to_string(), content.to_string());
     }
-    let comment_stripped = strip_c_family_comments_and_literals(content, LiteralScanMode::Keep)
-        .unwrap_or_else(|| content.to_string());
+    let comments_stripped_strings_preserved =
+        strip_c_family_comments_and_literals(content, LiteralScanMode::Keep)
+            .unwrap_or_else(|| content.to_string());
     let scan = strip_c_family_comments_and_literals(content, LiteralScanMode::Strip)
         .unwrap_or_else(|| content.to_string());
-    (comment_stripped, scan)
+    (comments_stripped_strings_preserved, scan)
 }
 
 fn uses_c_family_lexical_comments(rel: &str) -> bool {
@@ -822,6 +824,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
 
     let mut missing_evidence = Vec::new();
     let mut weak_evidence = Vec::new();
+    let mut evidence_tiers = BTreeMap::new();
     let mut inconclusive_reasons = Vec::new();
     let browser_required = required_capabilities
         .iter()
@@ -838,48 +841,72 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
     for evidence in &required {
         match evidence.as_str() {
             "implementation_artifact" => {
-                if !has_implementation_artifact(root, required_paths, &workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_implementation_artifact(root, required_paths, &workspace),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "test_artifact" => {
-                if !has_test_artifact(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_test_artifact(&workspace),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "bound_verify_command" => {
-                if !has_bound_verify_command(verify_commands, &workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_bound_verify_command(verify_commands, &workspace),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "non_zero_test_or_assertion_evidence" => {
-                if !has_assertion_or_test_evidence(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_assertion_or_test_evidence(&workspace),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "build_command_or_dependency_missing_boundary" => {
-                if !has_build_command_or_dependency_boundary(
-                    verify_commands,
-                    deferred_verify_requirements,
-                    &workspace,
-                ) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_build_command_or_dependency_boundary(
+                        verify_commands,
+                        deferred_verify_requirements,
+                        &workspace,
+                    ),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "interactive_ui_source_evidence" => {
-                if !has_interactive_ui_source(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_interactive_ui_source(&workspace),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "non_static_screen_evidence" => {
-                if !has_non_static_screen_evidence(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_non_static_screen_evidence(&workspace),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "visible_interactive_surface_evidence" => {
-                if !has_visible_interactive_surface_evidence(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_visible_interactive_surface_evidence(&workspace),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "user_input_handler_evidence" => {
                 record_source_signal(
@@ -887,17 +914,24 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
                     user_input_handler_signal(&workspace),
                     &mut missing_evidence,
                     &mut weak_evidence,
+                    &mut evidence_tiers,
                 );
             }
             "stateful_update_evidence" => {
-                if !has_stateful_update_evidence(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_stateful_update_evidence(&workspace),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "challenge_or_adversary_evidence" => {
-                if !has_challenge_or_adversary_evidence(&workspace, evidence_hint_tokens) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_challenge_or_adversary_evidence(&workspace, evidence_hint_tokens),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "score_or_progression_evidence" => {
                 record_source_signal(
@@ -905,6 +939,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
                     score_or_progression_signal(&workspace),
                     &mut missing_evidence,
                     &mut weak_evidence,
+                    &mut evidence_tiers,
                 );
             }
             "failure_or_collision_evidence" => {
@@ -913,6 +948,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
                     failure_or_collision_signal(&workspace),
                     &mut missing_evidence,
                     &mut weak_evidence,
+                    &mut evidence_tiers,
                 );
             }
             "restart_or_recoverable_state_evidence" => {
@@ -921,19 +957,32 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
                     restart_or_recoverable_state_signal(&workspace),
                     &mut missing_evidence,
                     &mut weak_evidence,
+                    &mut evidence_tiers,
                 );
             }
             "nextjs_route_evidence" => {
-                if !has_nextjs_route_evidence(&workspace) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    has_nextjs_route_evidence(&workspace),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
             "requested_content_evidence" => {
-                if !workspace.readme && required_paths.iter().all(|path| !path.ends_with(".md")) {
-                    missing_evidence.push(evidence.clone());
-                }
+                record_bool_evidence_tier(
+                    evidence,
+                    workspace.readme || required_paths.iter().any(|path| path.ends_with(".md")),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
             }
-            unknown => missing_evidence.push(format!("unsupported_required_evidence:{unknown}")),
+            unknown => {
+                missing_evidence.push(format!("unsupported_required_evidence:{unknown}"));
+                evidence_tiers.insert(
+                    unknown.to_string(),
+                    EvidenceTier::Absent.as_str().to_string(),
+                );
+            }
         }
     }
 
@@ -986,6 +1035,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
         missing_evidence,
         missing_obligations,
         weak_evidence,
+        evidence_tiers,
         inconclusive_reasons,
         artifact_obligations,
         capability_evidence_bindings,
@@ -1367,7 +1417,7 @@ pub fn comment_stripped_source_corpus(root: &Path) -> String {
     collect_workspace_evidence(root)
         .source_files
         .into_iter()
-        .map(|file| file.comment_stripped_content)
+        .map(|file| file.comments_stripped_strings_preserved)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1541,19 +1591,72 @@ enum SourceEvidenceSignal {
     Strong,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceTier {
+    Strong,
+    Weak,
+    Absent,
+}
+
+impl EvidenceTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Strong => "strong",
+            Self::Weak => "weak",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+fn record_bool_evidence_tier(
+    evidence: &str,
+    present: bool,
+    missing_evidence: &mut Vec<String>,
+    evidence_tiers: &mut BTreeMap<String, String>,
+) {
+    if present {
+        evidence_tiers.insert(
+            evidence.to_string(),
+            EvidenceTier::Strong.as_str().to_string(),
+        );
+    } else {
+        missing_evidence.push(evidence.to_string());
+        evidence_tiers.insert(
+            evidence.to_string(),
+            EvidenceTier::Absent.as_str().to_string(),
+        );
+    }
+}
+
 fn record_source_signal(
     evidence: &str,
     signal: SourceEvidenceSignal,
     missing_evidence: &mut Vec<String>,
     weak_evidence: &mut Vec<String>,
+    evidence_tiers: &mut BTreeMap<String, String>,
 ) {
     match signal {
-        SourceEvidenceSignal::Strong => {}
+        SourceEvidenceSignal::Strong => {
+            evidence_tiers.insert(
+                evidence.to_string(),
+                EvidenceTier::Strong.as_str().to_string(),
+            );
+        }
         SourceEvidenceSignal::Weak(reason) => {
             missing_evidence.push(evidence.to_string());
             weak_evidence.push(format!("weak_source_evidence:{evidence}:{reason}"));
+            evidence_tiers.insert(
+                evidence.to_string(),
+                EvidenceTier::Weak.as_str().to_string(),
+            );
         }
-        SourceEvidenceSignal::Absent => missing_evidence.push(evidence.to_string()),
+        SourceEvidenceSignal::Absent => {
+            missing_evidence.push(evidence.to_string());
+            evidence_tiers.insert(
+                evidence.to_string(),
+                EvidenceTier::Absent.as_str().to_string(),
+            );
+        }
     }
 }
 
@@ -1830,7 +1933,10 @@ fn evidence_kinds_for_file(
     if source_file_has_visible_interactive_surface(file) {
         kinds.push(EvidenceKind::VisibleInteractiveSurfaceEvidence);
     }
-    if source_file_has_user_input_handler(file) {
+    if matches!(
+        source_file_user_input_handler_signal(file),
+        SourceEvidenceSignal::Strong
+    ) {
         kinds.push(EvidenceKind::UserInputHandlerEvidence);
     }
     if source_file_has_stateful_update(file) {
@@ -1839,13 +1945,22 @@ fn evidence_kinds_for_file(
     if source_file_has_challenge_or_adversary(file, evidence_hint_tokens) {
         kinds.push(EvidenceKind::ChallengeOrAdversaryEvidence);
     }
-    if source_file_has_score_or_progression(file) {
+    if matches!(
+        source_file_score_or_progression_signal(file),
+        SourceEvidenceSignal::Strong
+    ) {
         kinds.push(EvidenceKind::ScoreOrProgressionEvidence);
     }
-    if source_file_has_failure_or_collision(file) {
+    if matches!(
+        source_file_failure_or_collision_signal(file),
+        SourceEvidenceSignal::Strong
+    ) {
         kinds.push(EvidenceKind::FailureOrCollisionEvidence);
     }
-    if source_file_has_restart_or_recoverable_state(file) {
+    if matches!(
+        source_file_restart_or_recoverable_state_signal(file),
+        SourceEvidenceSignal::Strong
+    ) {
         kinds.push(EvidenceKind::RestartOrRecoverableStateEvidence);
     }
     kinds.sort_by_key(|kind| kind.as_str());
@@ -1981,6 +2096,9 @@ fn source_file_has_non_static_screen(file: &SourceFile) -> bool {
 
 fn source_file_has_visible_interactive_surface(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
+    let strings_preserved = file
+        .comments_stripped_strings_preserved_text()
+        .to_ascii_lowercase();
     lower.contains("<canvas")
         || lower.contains("<button")
         || lower.contains("<input")
@@ -1989,16 +2107,9 @@ fn source_file_has_visible_interactive_surface(file: &SourceFile) -> bool {
         || lower.contains("onclick")
         || lower.contains("onkeydown")
         || lower.contains("onpointer")
-        || lower.contains("role=\"button\"")
-        || lower.contains("role='button'")
+        || strings_preserved.contains("role=\"button\"")
+        || strings_preserved.contains("role='button'")
         || lower.contains("tabindex")
-}
-
-fn source_file_has_user_input_handler(file: &SourceFile) -> bool {
-    matches!(
-        source_file_user_input_handler_signal(file),
-        SourceEvidenceSignal::Strong
-    )
 }
 
 fn source_file_has_user_input_handler_keyword(file: &SourceFile) -> bool {
@@ -2127,13 +2238,6 @@ fn source_file_has_position_or_motion_update(file: &SourceFile) -> bool {
     has_position_or_motion_token && has_update_token
 }
 
-fn source_file_has_score_or_progression(file: &SourceFile) -> bool {
-    matches!(
-        source_file_score_or_progression_signal(file),
-        SourceEvidenceSignal::Strong
-    )
-}
-
 fn source_file_has_score_or_progression_keyword(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
     [
@@ -2182,13 +2286,6 @@ fn source_file_has_failure_or_collision_keyword(file: &SourceFile) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
-}
-
-fn source_file_has_restart_or_recoverable_state(file: &SourceFile) -> bool {
-    matches!(
-        source_file_restart_or_recoverable_state_signal(file),
-        SourceEvidenceSignal::Strong
-    )
 }
 
 fn source_file_has_restart_or_recoverable_state_keyword(file: &SourceFile) -> bool {
@@ -2461,7 +2558,9 @@ fn identifier_has_assignment_or_increment(lower: &str, name: &str) -> bool {
 
 fn source_file_has_game_over_transition(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
-    let comment_stripped = file.comment_stripped_text().to_ascii_lowercase();
+    let strings_preserved = file
+        .comments_stripped_strings_preserved_text()
+        .to_ascii_lowercase();
     [
         "setgameover(",
         "gameover = true",
@@ -2491,7 +2590,7 @@ fn source_file_has_game_over_transition(file: &SourceFile) -> bool {
             "setmode('gameover'",
         ]
         .iter()
-        .any(|needle| comment_stripped.contains(needle))
+        .any(|needle| strings_preserved.contains(needle))
 }
 
 fn source_file_has_collision_conditional(file: &SourceFile) -> bool {
@@ -2545,19 +2644,21 @@ fn if_condition_segment(lower: &str, if_index: usize) -> Option<&str> {
 
 fn source_file_has_restart_reset_handler(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
-    let comment_stripped = file.comment_stripped_text().to_ascii_lowercase();
-    let has_game_over_reference = source_text_has_game_over_reference(&lower, &comment_stripped);
+    let strings_preserved = file
+        .comments_stripped_strings_preserved_text()
+        .to_ascii_lowercase();
+    let has_game_over_reference = source_text_has_game_over_reference(&lower, &strings_preserved);
     if has_game_over_reference && source_text_has_single_segment_restart_reset_handler(&lower) {
         return true;
     }
     source_text_has_linked_restart_reset_function(
         &lower,
-        &comment_stripped,
+        &strings_preserved,
         has_game_over_reference,
     )
 }
 
-fn source_text_has_game_over_reference(lower: &str, comment_stripped: &str) -> bool {
+fn source_text_has_game_over_reference(lower: &str, strings_preserved: &str) -> bool {
     [
         "gameover",
         "game over",
@@ -2567,7 +2668,7 @@ fn source_text_has_game_over_reference(lower: &str, comment_stripped: &str) -> b
         "setgamestate('gameover'",
     ]
     .iter()
-    .any(|needle| lower.contains(needle) || comment_stripped.contains(needle))
+    .any(|needle| lower.contains(needle) || strings_preserved.contains(needle))
 }
 
 fn source_text_has_single_segment_restart_reset_handler(lower: &str) -> bool {
@@ -2580,10 +2681,10 @@ fn source_text_has_single_segment_restart_reset_handler(lower: &str) -> bool {
 
 fn source_text_has_linked_restart_reset_function(
     lower: &str,
-    comment_stripped: &str,
+    strings_preserved: &str,
     has_game_over_reference: bool,
 ) -> bool {
-    restart_reset_function_candidates(lower, comment_stripped)
+    restart_reset_function_candidates(lower, strings_preserved)
         .into_iter()
         .filter(|candidate| restart_segment_resets_score(&candidate.body))
         .filter(|candidate| restart_segment_resets_entities(&candidate.body))
@@ -2601,18 +2702,18 @@ struct RestartResetFunctionCandidate {
 
 fn restart_reset_function_candidates(
     lower: &str,
-    comment_stripped: &str,
+    strings_preserved: &str,
 ) -> Vec<RestartResetFunctionCandidate> {
     let mut candidates = Vec::new();
     let mut seen = BTreeSet::new();
-    collect_function_declaration_candidates(lower, comment_stripped, &mut candidates, &mut seen);
-    collect_arrow_assignment_candidates(lower, comment_stripped, &mut candidates, &mut seen);
+    collect_function_declaration_candidates(lower, strings_preserved, &mut candidates, &mut seen);
+    collect_arrow_assignment_candidates(lower, strings_preserved, &mut candidates, &mut seen);
     candidates
 }
 
 fn collect_function_declaration_candidates(
     lower: &str,
-    comment_stripped: &str,
+    strings_preserved: &str,
     candidates: &mut Vec<RestartResetFunctionCandidate>,
     seen: &mut BTreeSet<(String, usize)>,
 ) {
@@ -2640,7 +2741,7 @@ fn collect_function_declaration_candidates(
         push_function_candidate(
             name,
             lower,
-            comment_stripped,
+            strings_preserved,
             body_search_start,
             candidates,
             seen,
@@ -2651,7 +2752,7 @@ fn collect_function_declaration_candidates(
 
 fn collect_arrow_assignment_candidates(
     lower: &str,
-    comment_stripped: &str,
+    strings_preserved: &str,
     candidates: &mut Vec<RestartResetFunctionCandidate>,
     seen: &mut BTreeSet<(String, usize)>,
 ) {
@@ -2689,7 +2790,7 @@ fn collect_arrow_assignment_candidates(
         push_function_candidate(
             name,
             lower,
-            comment_stripped,
+            strings_preserved,
             body_search_start,
             candidates,
             seen,
@@ -2715,7 +2816,7 @@ fn arrow_function_body_search_start(lower: &str, start: usize) -> Option<usize> 
 fn push_function_candidate(
     name: &str,
     lower: &str,
-    comment_stripped: &str,
+    strings_preserved: &str,
     body_search_start: usize,
     candidates: &mut Vec<RestartResetFunctionCandidate>,
     seen: &mut BTreeSet<(String, usize)>,
@@ -2727,7 +2828,7 @@ fn push_function_candidate(
     if !seen.insert((name.clone(), body_start)) {
         return;
     }
-    let body = comment_stripped
+    let body = strings_preserved
         .get(body_start..body_end)
         .or_else(|| lower.get(body_start..body_end))
         .unwrap_or_default()
@@ -3883,9 +3984,7 @@ export default function Page() {
 
     #[test]
     fn label_only_restart_handler_remains_weak() {
-        let file = SourceFile::new(
-            "src/app/page.tsx".to_string(),
-            r#""use client";
+        let source = r#""use client";
 import { useState } from "react";
 export default function Page() {
   const [gameState, setGameState] = useState("GAMEOVER");
@@ -3894,14 +3993,53 @@ export default function Page() {
   };
   return <main><button onClick={initGame}>Restart</button><p>{gameState}</p></main>;
 }
-"#
-            .to_string(),
-        );
+"#;
+        let file = SourceFile::new("src/app/page.tsx".to_string(), source.to_string());
         assert!(matches!(
             source_file_restart_or_recoverable_state_signal(&file),
             SourceEvidenceSignal::Weak(reason)
                 if reason.contains("resets score AND entities")
         ));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("src/app/page.tsx"), source).unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["restart_or_recoverable_state_evidence".to_string()],
+            &[],
+            &[],
+        );
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"restart_or_recoverable_state_evidence".to_string())
+        );
+        assert!(
+            report
+                .weak_evidence
+                .iter()
+                .any(|item| item
+                    .contains("weak_source_evidence:restart_or_recoverable_state_evidence")),
+            "{report:?}"
+        );
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("weak")
+        );
+        assert!(
+            !report.artifact_obligations[0]
+                .evidence
+                .contains(&"restart_or_recoverable_state_evidence".to_string()),
+            "{report:?}"
+        );
     }
 
     #[test]
@@ -3941,6 +4079,326 @@ export default function Page() {
             source_file_restart_or_recoverable_state_signal(&file),
             SourceEvidenceSignal::Strong
         );
+    }
+
+    #[test]
+    fn quoted_game_over_transition_inside_callback_is_strong_regression() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+export default function Page() {
+  const [gameState, setGameState] = useState("playing");
+  useEffect(() => {
+    const collision = true;
+    if (collision) setGameState('gameover');
+  }, []);
+  return <main>{gameState}</main>;
+}
+"#,
+        )
+        .unwrap();
+
+        let file = SourceFile::new(
+            "src/app/page.tsx".to_string(),
+            std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
+        );
+        assert_eq!(
+            source_file_failure_or_collision_signal(&file),
+            SourceEvidenceSignal::Strong
+        );
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["failure_or_collision_evidence".to_string()],
+            &[],
+            &[],
+        );
+        assert!(report.passed, "{report:?}");
+        assert!(
+            report
+                .artifact_obligations
+                .first()
+                .is_some_and(|artifact| artifact
+                    .evidence
+                    .contains(&"failure_or_collision_evidence".to_string())),
+            "{report:?}"
+        );
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("failure_or_collision_evidence")
+                .map(String::as_str),
+            Some("strong")
+        );
+    }
+
+    #[test]
+    fn quoted_game_over_transition_inside_comment_is_absent_regression() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+export default function Page() {
+  // if (collision) setGameState('gameover');
+  return <main>ready</main>;
+}
+"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["failure_or_collision_evidence".to_string()],
+            &[],
+            &[],
+        );
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"failure_or_collision_evidence".to_string())
+        );
+        assert!(report.weak_evidence.is_empty(), "{report:?}");
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("failure_or_collision_evidence")
+                .map(String::as_str),
+            Some("absent")
+        );
+    }
+
+    #[test]
+    fn source_needle_families_survive_sourcefile_preprocessing() {
+        struct Fixture {
+            family: &'static str,
+            path: &'static str,
+            content: &'static str,
+            required_evidence: &'static [&'static str],
+            verify_commands: &'static [&'static str],
+            evidence_hint_tokens: &'static [&'static str],
+        }
+
+        let fixtures = [
+            Fixture {
+                family: "implementation_artifact",
+                path: "src/app/page.tsx",
+                content: "export default function Page(){ return <main>ready</main>; }\n",
+                required_evidence: &["implementation_artifact"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "test_artifact_assertion_require_single_quote",
+                path: "tests/page.test.js",
+                content: "const assert = require('assert');\nassert.equal(1, 1);\n",
+                required_evidence: &[
+                    "test_artifact",
+                    "non_zero_test_or_assertion_evidence",
+                    "bound_verify_command",
+                ],
+                verify_commands: &["node tests/page.test.js"],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "requested_content_readme",
+                path: "README.md",
+                content: "# Acceptance\nThe requested behavior is documented.\n",
+                required_evidence: &["requested_content_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "interactive_ui_use_state_click",
+                path: "src/app/page.tsx",
+                content: r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  return <main onClick={() => setScore(score + 1)}>score {score}</main>;
+}
+"#,
+                required_evidence: &["interactive_ui_source_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "non_static_screen_score_use_state",
+                path: "src/app/page.tsx",
+                content: r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score] = useState(0);
+  return <main>score {score}</main>;
+}
+"#,
+                required_evidence: &["non_static_screen_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "visible_surface_role_button_quoted",
+                path: "src/app/page.tsx",
+                content: "export default function Page(){ return <main role=\"button\">Play</main>; }\n",
+                required_evidence: &["visible_interactive_surface_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "user_input_handler_onclick_mutates",
+                path: "src/app/page.tsx",
+                content: r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  return <button onClick={() => setScore(score + 1)}>Add</button>;
+}
+"#,
+                required_evidence: &["user_input_handler_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "stateful_update_usestate",
+                path: "src/app/page.tsx",
+                content: r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [ready] = useState(true);
+  return <main>{ready}</main>;
+}
+"#,
+                required_evidence: &["stateful_update_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "challenge_static_enemy",
+                path: "src/app/page.tsx",
+                content: "export default function Page(){ const enemy = { x: 1 }; return <main>{enemy.x}</main>; }\n",
+                required_evidence: &["challenge_or_adversary_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "challenge_goal_hint_motion",
+                path: "src/app/page.tsx",
+                content: "export default function Page(){ let dragonPosition = 0; dragonPosition += 1; return <main>{dragonPosition}</main>; }\n",
+                required_evidence: &["challenge_or_adversary_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &["dragon"],
+            },
+            Fixture {
+                family: "score_update_setscore",
+                path: "src/app/page.tsx",
+                content: r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  setScore(1);
+  return <main>score {score}</main>;
+}
+"#,
+                required_evidence: &["score_or_progression_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "failure_game_over_transition_single_quote",
+                path: "src/app/page.tsx",
+                content: r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [gameState, setGameState] = useState("playing");
+  const collision = true;
+  if (collision) setGameState('gameover');
+  return <main>{gameState}</main>;
+}
+"#,
+                required_evidence: &["failure_or_collision_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "failure_collision_conditional",
+                path: "src/app/page.tsx",
+                content: "export default function Page(){ const collisionDistance = 10; const player = { x: 0, y: 0 }; const enemy = { x: 1, y: 1 }; if (Math.abs(player.x - enemy.x) < collisionDistance) return <main>hit</main>; return <main />; }\n",
+                required_evidence: &["failure_or_collision_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "restart_recoverable_state_playing_single_quote",
+                path: "src/app/page.tsx",
+                content: r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(3);
+  const [gameOver] = useState(true);
+  const [enemies, setEnemies] = useState([{ x: 1 }]);
+  return <button onClick={() => { setGameState('playing'); setScore(0); setEnemies([{ x: 1 }]); }}>Restart {score} {String(gameOver)} {enemies.length}</button>;
+}
+"#,
+                required_evidence: &["restart_or_recoverable_state_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "nextjs_route_page",
+                path: "src/app/page.tsx",
+                content: "export default function Page(){ return <main>route</main>; }\n",
+                required_evidence: &["nextjs_route_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+        ];
+
+        for fixture in fixtures {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(fixture.path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, fixture.content).unwrap();
+            let report = verify_runtime_acceptance_with_hints(
+                dir.path(),
+                &[fixture.path.to_string()],
+                &fixture
+                    .verify_commands
+                    .iter()
+                    .map(|command| command.to_string())
+                    .collect::<Vec<_>>(),
+                &[],
+                &fixture
+                    .required_evidence
+                    .iter()
+                    .map(|evidence| evidence.to_string())
+                    .collect::<Vec<_>>(),
+                &[],
+                &[],
+                &fixture
+                    .evidence_hint_tokens
+                    .iter()
+                    .map(|token| token.to_string())
+                    .collect::<Vec<_>>(),
+            );
+            assert!(report.passed, "{}: {report:?}", fixture.family);
+            for evidence in fixture.required_evidence {
+                assert_eq!(
+                    report.evidence_tiers.get(*evidence).map(String::as_str),
+                    Some("strong"),
+                    "{}: {evidence}: {report:?}",
+                    fixture.family
+                );
+            }
+        }
     }
 
     #[test]

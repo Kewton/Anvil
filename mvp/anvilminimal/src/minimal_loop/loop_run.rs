@@ -1794,6 +1794,7 @@ fn verify_completion_contract_with_enforcement(
             "missing_evidence": runtime_acceptance.missing_evidence.clone(),
             "missing_obligations": runtime_acceptance.missing_obligations.clone(),
             "weak_evidence": runtime_acceptance.weak_evidence.clone(),
+            "evidence_tiers": runtime_acceptance.evidence_tiers.clone(),
             "artifact_obligations": runtime_acceptance.artifact_obligations.clone(),
             "capability_evidence_bindings": runtime_acceptance.capability_evidence_bindings.clone(),
             "obligation_repair_targets": runtime_acceptance.obligation_repair_targets.clone(),
