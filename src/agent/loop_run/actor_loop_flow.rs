@@ -40,6 +40,7 @@ use crate::agent::orchestration::{
     RepoSnapshot, RepoVerification, capture_repo_snapshot, verify_repo_progress,
 };
 use crate::agent::recovery;
+use crate::agent::text_tokens;
 use crate::logging::log_llm_event;
 use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::{ExecutionMode, PlanStage};
@@ -5206,54 +5207,14 @@ pub(super) fn build_feedback_for_deterministic_content_fallback(
 }
 
 pub(super) fn reply_looks_like_future_work(reply: &str) -> bool {
-    let normalized = reply.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
+    let trimmed = reply.trim();
+    if trimmed.is_empty() {
         return false;
     }
-    let completion_markers = [
-        "done",
-        "completed",
-        "implemented",
-        "finished",
-        "ready",
-        "作成しました",
-        "実装しました",
-        "完了",
-        "できました",
-    ];
-    if completion_markers
-        .iter()
-        .any(|marker| normalized.contains(marker))
-    {
+    if text_tokens::contains_completion_marker(trimmed) {
         return false;
     }
-    let future_markers = [
-        "now i'll",
-        "now i will",
-        "i'll ",
-        "i will ",
-        "let me ",
-        "you can run",
-        "please run",
-        "run this yourself",
-        "run it yourself",
-        "next,",
-        "next i",
-        "次に",
-        "これから",
-        "今から",
-        "次は",
-        "探してみます",
-        "確認します",
-        "調べます",
-        "見てみます",
-        "してみます",
-        "実行してください",
-        "確認してください",
-    ];
-    future_markers
-        .iter()
-        .any(|marker| normalized.contains(marker))
+    text_tokens::contains_future_work_marker(trimmed)
 }
 
 pub(super) fn increment_artifact_completion_role_attempt(

@@ -44,7 +44,7 @@ fn engine_minimal_runs_ollama_turns() {
 
     let metas = scan_session_meta(state.path());
     assert_eq!(metas.len(), 1);
-    assert_eq!(metas[0].message_count, 3);
+    assert_eq!(metas[0].message_count, 2);
 
     let session_dir = std::fs::read_dir(state.path().join("sessions"))
         .unwrap()

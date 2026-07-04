@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::agent::text_tokens;
 use crate::session::store::ConversationMessage;
 
 const NEXT_VERSION: &str = "14.2.35";
@@ -57,17 +58,13 @@ impl RequestIntent {
         } else {
             FrameworkKind::Unknown
         };
-        let game_experience = lower.contains("game")
-            || request.contains("ゲーム")
+        let game_experience = text_tokens::contains_game_token(request)
             || request_matches_any(&lower, request, BREAKOUT_GAME_KEYWORDS)
             || request_matches_any(&lower, request, FALLING_BLOCK_GAME_KEYWORDS);
         let interactive_experience = game_experience
-            || lower.contains("playable")
-            || lower.contains("interactive")
+            || text_tokens::contains_interactive_token(request)
             || request_matches_any(&lower, request, INTERACTIVE_UI_KEYWORDS)
-            || request.contains("プレイ")
-            || request.contains("操作")
-            || request.contains("反応");
+            || text_tokens::contains_canvas_token(request);
         let explicit_create = lower.contains("create")
             || lower.contains("build")
             || lower.contains("develop")
@@ -574,7 +571,7 @@ pub(super) fn deterministic_empty_framework_game_files(
         return None;
     }
 
-    let port = requested_port(request).unwrap_or(3011);
+    let port = text_tokens::requested_port(request).unwrap_or(3011);
     let game = GameKind::from_request(request);
     match intent.framework {
         FrameworkKind::Next => Some(vec![
@@ -740,7 +737,7 @@ pub(super) fn deterministic_empty_framework_app_files(
         return None;
     }
 
-    let port = requested_port(request).unwrap_or(3011);
+    let port = text_tokens::requested_port(request).unwrap_or(3011);
     match intent.framework {
         FrameworkKind::Next => Some(vec![
             (
@@ -1234,11 +1231,7 @@ pub(super) fn request_explicitly_requires_tests(request: &str) -> bool {
 ///     a trailing space anyway (`fix `, `add `, …).
 pub(super) fn request_is_env_setup_only(request: &str) -> bool {
     let lower = request.to_ascii_lowercase();
-    let has_install_keyword = lower.contains("install")
-        || lower.contains("依存")
-        || request.contains("インストール")
-        || request.contains("セットアップ");
-    if !has_install_keyword {
+    if !text_tokens::contains_setup_token(request) {
         return false;
     }
     // Tests / verification asks always disqualify setup-only.
@@ -1249,10 +1242,13 @@ pub(super) fn request_is_env_setup_only(request: &str) -> bool {
     // CB-002: word-boundary aware negation for English verbs.
     // Matches `verify`, `run`, etc. even when adjacent to ASCII
     // punctuation or sentence boundaries (`run.`, `,verify`, etc.).
-    const ENGLISH_VERB_TOKENS: &[&str] = &[
-        "run", "start", "build", "lint", "serve", "dev", "deploy", "verify", "validate", "check",
-    ];
-    if contains_ascii_word(&lower, ENGLISH_VERB_TOKENS) {
+    if contains_ascii_word(
+        &lower,
+        &[
+            "run", "start", "build", "lint", "serve", "dev", "deploy", "verify", "validate",
+            "check",
+        ],
+    ) {
         return false;
     }
 
@@ -1260,23 +1256,7 @@ pub(super) fn request_is_env_setup_only(request: &str) -> bool {
     // ASCII boundaries) and English action verbs that always take an
     // object (`fix `, `add `, …) so the trailing space prevents matching
     // unrelated words like `fixture`, `additional`, …
-    const SUBSTRING_KEYWORDS: &[&str] = &[
-        "実行",
-        "起動",
-        "ビルド",
-        "修正",
-        "動作確認",
-        "確認",
-        "fix ",
-        "add ",
-        "create ",
-        "write ",
-        "implement ",
-    ];
-    if SUBSTRING_KEYWORDS
-        .iter()
-        .any(|kw| lower.contains(kw) || request.contains(kw))
-    {
+    if text_tokens::contains_setup_disqualifier_token(request) {
         return false;
     }
     true
@@ -1324,7 +1304,7 @@ pub(super) fn package_json_with_requested_port(
     request: &str,
     package_content: &str,
 ) -> Option<String> {
-    let port = requested_port(request)?;
+    let port = text_tokens::requested_port(request)?;
     let mut package: serde_json::Value = serde_json::from_str(package_content).ok()?;
     let framework = package_framework(&package)?;
     let scripts = package
@@ -1352,7 +1332,7 @@ pub(super) fn react_dev_wrapper_for_requested_port(
     request: &str,
     package_content: &str,
 ) -> Option<String> {
-    let port = requested_port(request)?;
+    let port = text_tokens::requested_port(request)?;
     let package: serde_json::Value = serde_json::from_str(package_content).ok()?;
     (package_framework(&package)? == FrameworkKind::React).then(|| vite_dev_wrapper_script(port))
 }
@@ -1500,51 +1480,6 @@ fn package_framework(package: &serde_json::Value) -> Option<FrameworkKind> {
     } else {
         None
     }
-}
-
-fn requested_port(request: &str) -> Option<u16> {
-    let chars: Vec<(usize, char)> = request.char_indices().collect();
-    let mut index = 0;
-    while index < chars.len() {
-        let (start_byte, ch) = chars[index];
-        if !ch.is_ascii_digit() {
-            index += 1;
-            continue;
-        }
-        let mut end = index + 1;
-        while end < chars.len() && chars[end].1.is_ascii_digit() {
-            end += 1;
-        }
-        let end_byte = chars
-            .get(end)
-            .map(|(byte, _)| *byte)
-            .unwrap_or_else(|| request.len());
-        let candidate = &request[start_byte..end_byte];
-        let value = candidate.parse::<u16>().ok();
-        if !(2..=5).contains(&candidate.len()) {
-            index = end;
-            continue;
-        }
-        let prefix_start = chars
-            .get(index.saturating_sub(10))
-            .map(|(byte, _)| *byte)
-            .unwrap_or(0);
-        let suffix_end = chars
-            .get((end + 8).min(chars.len()))
-            .map(|(byte, _)| *byte)
-            .unwrap_or_else(|| request.len());
-        let prefix = request[prefix_start..start_byte].to_ascii_lowercase();
-        let suffix = request[end_byte..suffix_end].to_ascii_lowercase();
-        if prefix.contains("port")
-            || suffix.contains("port")
-            || request[prefix_start..start_byte].contains("ポート")
-            || request[end_byte..suffix_end].contains("ポート")
-        {
-            return value;
-        }
-        index = end;
-    }
-    None
 }
 
 fn looks_like_incomplete_playable_slice(normalized_content: &str) -> bool {
@@ -3810,6 +3745,19 @@ mod tests {
     }
 
     #[test]
+    fn bilingual_goal_tokens_drive_ui_game_and_canvas_gates() {
+        assert!(request_needs_playable_ui_quality_gate(
+            "キャンバスで描画する小さなアプリを作成してください。"
+        ));
+        assert!(request_needs_playable_ui_quality_gate(
+            "クリックで反応する画面を作成してください。"
+        ));
+        assert!(request_needs_playable_ui_quality_gate(
+            "ブラウザゲームを作成してください。"
+        ));
+    }
+
+    #[test]
     fn unsupported_ui_framework_detection_is_explicit() {
         assert!(!request_mentions_unsupported_ui_framework(
             "SvelteKitで小さなメモアプリを作って下さい。"
@@ -4388,13 +4336,13 @@ export default function App(){
     #[test]
     fn package_json_port_fallback_updates_next_dev_script() {
         let request =
-            "シューティングゲームを3011ポートで起動可能なnext.jsアプリとして開発してください";
+            "シューティングゲームを4000番ポートで起動可能なnext.jsアプリとして開発してください";
         let package = r#"{
   "scripts": { "dev": "next dev", "build": "next build" },
   "dependencies": { "next": "16.2.4", "react": "19.2.4" }
 }"#;
         let output = package_json_with_requested_port(request, package).expect("package update");
-        assert!(output.contains(r#""dev": "next dev -p 3011""#));
+        assert!(output.contains(r#""dev": "next dev -p 4000""#));
         assert!(output.contains(r#""build": "next build""#));
     }
 
@@ -4415,6 +4363,18 @@ export default function App(){
             .map(|(_, content)| content)
             .expect("dev wrapper");
         assert!(dev_wrapper.contains(r#"viteArgs.push("--port", "3007");"#));
+    }
+
+    #[test]
+    fn package_json_port_fallback_is_absent_without_requested_port() {
+        let package = r#"{
+  "scripts": { "dev": "next dev", "build": "next build" },
+  "dependencies": { "next": "16.2.4", "react": "19.2.4" }
+}"#;
+        assert_eq!(
+            package_json_with_requested_port("Next.jsアプリを作成してください", package),
+            None
+        );
     }
 
     #[test]
@@ -4451,6 +4411,7 @@ export default function App(){
         assert!(request_is_env_setup_only("please install dependencies"));
         assert!(request_is_env_setup_only("pnpm install"));
         assert!(request_is_env_setup_only("依存パッケージのセットアップ"));
+        assert!(request_is_env_setup_only("環境をセットアップしてください"));
     }
 
     #[test]

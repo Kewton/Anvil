@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::agent::text_tokens;
+
 use super::super::WorkIntent;
 use super::super::profile::ProfileSnapshot;
 
@@ -23,7 +25,7 @@ pub(in crate::agent::minimal_step_runner) fn generation_rules(intent: WorkIntent
 pub(in crate::agent::minimal_step_runner) fn runtime_contract(intent: WorkIntent) -> &'static str {
     match intent {
         WorkIntent::Create => {
-            "- Preserve the workspace as a real Next.js app.\n- Keep next/react/react-dom dependencies in package.json.\n- Keep scripts.build as next build; do not replace it with echo/skip/no-op commands.\n- If npm run build cannot run because dependencies are not installed, report dependency_missing or install dependencies when the step explicitly allows it; do not fake success.\n- If a 3011 port requirement exists, keep the dev script on port 3011.\n- If using Tailwind utility classes or @tailwind directives, keep the Tailwind toolchain complete: tailwindcss/postcss/autoprefixer dependencies, tailwind.config.*, and postcss.config.*. Otherwise use plain CSS.\n- Do not set tsconfig rootDir to ./src in a way that excludes app/.\n- If source imports use @/* aliases, tsconfig.json must map @/* under compilerOptions.paths; otherwise use relative imports."
+            "- Preserve the workspace as a real Next.js app.\n- Keep next/react/react-dom dependencies in package.json.\n- Keep scripts.build as next build; do not replace it with echo/skip/no-op commands.\n- If npm run build cannot run because dependencies are not installed, report dependency_missing or install dependencies when the step explicitly allows it; do not fake success.\n- If a requested port requirement exists, keep dev/start scripts on that requested port.\n- If using Tailwind utility classes or @tailwind directives, keep the Tailwind toolchain complete: tailwindcss/postcss/autoprefixer dependencies, tailwind.config.*, and postcss.config.*. Otherwise use plain CSS.\n- Do not set tsconfig rootDir to ./src in a way that excludes app/.\n- If source imports use @/* aliases, tsconfig.json must map @/* under compilerOptions.paths; otherwise use relative imports."
         }
         WorkIntent::Fix => {
             "- Preserve the existing Next.js app structure.\n- Keep next/react/react-dom dependencies when already present.\n- Keep scripts.build as next build when already present; do not weaken build/test scripts to hide failures.\n- If npm run build cannot run because dependencies are missing, report dependency_missing or use the existing dependency workflow; do not fake success.\n- Do not set tsconfig rootDir to ./src in a way that excludes app/.\n- If source imports use @/* aliases, tsconfig.json must map @/* under compilerOptions.paths; otherwise use relative imports."
@@ -32,7 +34,7 @@ pub(in crate::agent::minimal_step_runner) fn runtime_contract(intent: WorkIntent
             "- Preserve the existing Next.js app unchanged unless the phase explicitly asks for fixes.\n- Produce concrete findings from inspected files and commands.\n- Separate observed facts from hypotheses.\n- Do not weaken package scripts or test/build checks while investigating."
         }
         _ => {
-            "- Preserve the workspace as a Next.js app when one exists.\n- Do not convert package.json to a standalone TypeScript/Node project.\n- Keep next/react/react-dom dependencies when already present.\n- Keep scripts.build as next build when already present.\n- If a 3011 port requirement exists, keep the dev script on port 3011.\n- Keep styling toolchains internally consistent: @tailwind directives require a real Tailwind dependency and config.\n- Do not set tsconfig rootDir to ./src in a way that excludes app/.\n- If source imports use @/* aliases, tsconfig.json must map @/* under compilerOptions.paths; otherwise use relative imports."
+            "- Preserve the workspace as a Next.js app when one exists.\n- Do not convert package.json to a standalone TypeScript/Node project.\n- Keep next/react/react-dom dependencies when already present.\n- Keep scripts.build as next build when already present.\n- If a requested port requirement exists, keep dev/start scripts on that requested port.\n- Keep styling toolchains internally consistent: @tailwind directives require a real Tailwind dependency and config.\n- Do not set tsconfig rootDir to ./src in a way that excludes app/.\n- If source imports use @/* aliases, tsconfig.json must map @/* under compilerOptions.paths; otherwise use relative imports."
         }
     }
 }
@@ -54,15 +56,25 @@ pub(in crate::agent::minimal_step_runner) fn snapshot(work_root: &Path) -> Profi
     if let Some(summary) = package_json_summary(&work_root.join("package.json")) {
         lines.push(summary);
     }
-    ProfileSnapshot {
-        lines,
-        protected_files: Vec::new(),
-    }
+    ProfileSnapshot::new(lines, Vec::new())
+}
+
+pub(in crate::agent::minimal_step_runner) fn probe_port(
+    work_root: &Path,
+    requested_port: Option<u16>,
+) -> u16 {
+    requested_port
+        .or_else(|| {
+            let raw = std::fs::read_to_string(work_root.join("package.json")).ok()?;
+            text_tokens::script_declared_port_from_package_json(&raw)
+        })
+        .unwrap_or(3000)
 }
 
 pub(in crate::agent::minimal_step_runner) fn verify(
     work_root: &Path,
     _intent: WorkIntent,
+    requested_port: Option<u16>,
     failures: &mut Vec<String>,
 ) {
     let package_path = work_root.join("package.json");
@@ -88,11 +100,18 @@ pub(in crate::agent::minimal_step_runner) fn verify(
                     .pointer("/scripts/dev")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if dev.contains("3011") && !dev.contains("next dev") {
-                    failures.push(format!(
-                        "contract_violation: package.json dev script mentions 3011 but is not next dev: {dev}"
-                    ));
-                }
+                let start = json
+                    .pointer("/scripts/start")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                verify_requested_port_script("dev", dev, "next dev", requested_port, failures);
+                verify_requested_port_script(
+                    "start",
+                    start,
+                    "next start",
+                    requested_port,
+                    failures,
+                );
             }
         } else {
             failures.push(
@@ -118,6 +137,32 @@ pub(in crate::agent::minimal_step_runner) fn verify(
                     .to_string(),
             );
         }
+    }
+}
+
+fn verify_requested_port_script(
+    script_name: &str,
+    script: &str,
+    expected_command: &str,
+    requested_port: Option<u16>,
+    failures: &mut Vec<String>,
+) {
+    let Some(requested_port) = requested_port else {
+        return;
+    };
+    if script.trim().is_empty() {
+        return;
+    }
+    if !script.contains(expected_command) {
+        failures.push(format!(
+            "contract_violation: package.json {script_name} script must use `{expected_command}` on requested port {requested_port}: {script}"
+        ));
+        return;
+    }
+    if text_tokens::requested_port(script) != Some(requested_port) {
+        failures.push(format!(
+            "contract_violation: package.json {script_name} script must stay on requested port {requested_port}: {script}"
+        ));
     }
 }
 

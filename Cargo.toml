@@ -16,7 +16,7 @@ categories = ["command-line-utilities", "development-tools"]
 # crate stays the only member; `exclude` keeps the fixture tree out.
 [workspace]
 exclude = ["tests/fixtures"]
-members = ["workspace/eval-artifacts/anvilminimal-mvp/20260625-113129-771260/runs/mvp-smoke__rust-cli-medium__minimal-loop__gemini-gemini-3.1-flash-lite__openai-gpt-5.4-mini__r1/workdir/my_cli", "workspace/eval-artifacts/anvilminimal-mvp/20260625-113129-771260/runs/mvp-smoke__rust-cli-medium__minimal-loop__openai-gpt-5.4-mini__gemini-gemini-3.5-flash__r1/workdir", "workspace/eval-artifacts/anvilminimal-mvp/20260625-113129-771260/runs/mvp-smoke__rust-cli-medium__plan-run__gemini-gemini-3.1-flash-lite__openai-gpt-5.4-mini__r1/workdir/rust-cli-demo", "workspace/eval-artifacts/anvilminimal-mvp/20260625-145055-945480/runs/mvp-smoke__rust-cli-medium__minimal-loop__gemini-gemini-3.1-flash-lite__openai-gpt-5.4-mini__r1/workdir"]
+members = ["."]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

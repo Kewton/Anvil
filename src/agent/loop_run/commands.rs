@@ -494,6 +494,7 @@ pub(crate) struct BannerInputs<'a> {
     pub fresh: bool,
     pub resumed: bool,
     pub llm_log_path: Option<&'a std::path::Path>,
+    pub profile_line: Option<&'a str>,
     pub style: BannerStyle,
 }
 
@@ -531,6 +532,10 @@ pub(crate) fn render_startup_banner(inputs: &BannerInputs<'_>) -> String {
         "session={} messages={} [{}]\n",
         inputs.session_id_short, inputs.message_count, state
     ));
+    if let Some(profile_line) = inputs.profile_line {
+        let safe_profile_line = sanitize_banner_text(profile_line);
+        out.push_str(&format!("{safe_profile_line}\n"));
+    }
     if let Some(path) = inputs.llm_log_path {
         let safe_path = sanitize_banner_text(&path.display().to_string());
         out.push_str(&format!("llm log={safe_path}\n"));
@@ -556,6 +561,7 @@ pub fn print_startup_banner(
     fresh: bool,
     resumed: bool,
     log_level: LogLevel,
+    profile_line: Option<&str>,
 ) {
     use std::io::IsTerminal;
     let tty = std::io::stdout().is_terminal();
@@ -583,6 +589,7 @@ pub fn print_startup_banner(
         fresh,
         resumed,
         llm_log_path,
+        profile_line,
         style,
     };
     print!("{}", render_startup_banner(&inputs));
@@ -595,9 +602,13 @@ pub fn print_startup_banner_stderr_oneshot(
     message_count: usize,
     fresh: bool,
     resumed: bool,
+    profile_line: Option<&str>,
 ) {
     let state = state_suffix(fresh, resumed);
     eprintln!("anvil session={session_id_short} messages={message_count} [{state}]");
+    if let Some(profile_line) = profile_line {
+        eprintln!("{}", sanitize_banner_text(profile_line));
+    }
 }
 
 impl Agent {
@@ -1297,6 +1308,7 @@ impl Agent {
             self.config.fresh_session,
             false,
             self.config.log_level,
+            None,
         );
         self.run_repl_loop()
     }
@@ -2347,6 +2359,7 @@ mod tests {
             fresh,
             resumed,
             llm_log_path,
+            profile_line: None,
             style,
         }
     }
@@ -2730,6 +2743,26 @@ mod tests {
             let expected = expected.trim_end().to_string();
             assert_eq!(sanitize_banner_text(input), expected);
         }
+    }
+
+    #[test]
+    fn render_startup_banner_includes_optional_profile_line() {
+        let mode = ExecutionMode::Act;
+        let cwd = Path::new("/tmp/work");
+        let mut inputs = build_inputs(
+            "main=qwen sidecar=disabled",
+            &mode,
+            cwd,
+            None,
+            true,
+            false,
+            BannerStyle::Legacy4Line,
+        );
+        inputs.profile_line = Some("profile_inferred: nextjs (from: goal)");
+
+        let out = render_startup_banner(&inputs);
+
+        assert!(out.contains("profile_inferred: nextjs (from: goal)\n"));
     }
 
     // --- render_startup_banner: Legacy4Line byte-identical -----------------

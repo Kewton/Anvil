@@ -1,3 +1,5 @@
+use crate::agent::text_tokens;
+
 pub const MINIMAL_FEEDBACK_PREFIX: &str = "[minimal-feedback]";
 
 #[derive(Debug, Default, Clone)]
@@ -90,75 +92,15 @@ fn is_edit_anchor_mismatch(error: &str) -> bool {
 }
 
 fn looks_like_repo_action(prompt: &str) -> bool {
-    let lower = prompt.to_ascii_lowercase();
-    [
-        "edit",
-        "write",
-        "create",
-        "modify",
-        "fix",
-        "implement",
-        "add",
-        "delete",
-        "update",
-        "refactor",
-        "test",
-        "修正",
-        "実装",
-        "作成",
-        "追加",
-        "変更",
-        "削除",
-        "更新",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    text_tokens::contains_repo_action_token(prompt)
 }
 
 fn looks_like_planned_tool_action(content: &str) -> bool {
-    let lower = content.to_ascii_lowercase();
-    let has_future_marker = [
-        "i will ",
-        "i'll ",
-        "let me ",
-        "now let me ",
-        "next, i ",
-        "i am going to ",
-        "i'm going to ",
-        "これから",
-        "今から",
-        "次に",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
-    if !has_future_marker {
+    if !text_tokens::contains_future_work_marker(content) {
         return false;
     }
 
-    [
-        "create",
-        "write",
-        "edit",
-        "modify",
-        "read",
-        "inspect",
-        "check",
-        "verify",
-        "test",
-        "run",
-        "build",
-        "起動",
-        "作成",
-        "書き",
-        "編集",
-        "修正",
-        "確認",
-        "検証",
-        "実行",
-        "ビルド",
-    ]
-    .iter()
-    .any(|verb| lower.contains(verb))
+    text_tokens::contains_planned_tool_verb(content)
 }
 
 #[cfg(test)]
@@ -235,6 +177,13 @@ mod tests {
             state
                 .planned_action_without_tool("I will explain the design tradeoffs.")
                 .is_none()
+        );
+
+        let mut state = FeedbackState::default();
+        assert!(
+            state
+                .planned_action_without_tool("これからREADMEを修正します。")
+                .is_some()
         );
     }
 }

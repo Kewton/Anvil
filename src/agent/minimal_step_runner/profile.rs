@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::agent::text_tokens;
+
 use super::{
     UltraPhase, UltraPlan, UltraProfile, WorkIntent, profiles, required_artifact_contract_prompt,
 };
@@ -8,12 +10,25 @@ use super::{
 pub(super) struct ProfileSnapshot {
     pub(super) lines: Vec<String>,
     pub(super) protected_files: Vec<ProtectedFile>,
+    pub(super) requested_port: Option<u16>,
+    pub(super) probe_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProtectedFile {
     pub(super) path: String,
     pub(super) len: u64,
+}
+
+impl ProfileSnapshot {
+    pub(super) fn new(lines: Vec<String>, protected_files: Vec<ProtectedFile>) -> Self {
+        Self {
+            lines,
+            protected_files,
+            requested_port: None,
+            probe_port: None,
+        }
+    }
 }
 
 pub(super) fn profile_generation_rules(profile: UltraProfile, intent: WorkIntent) -> &'static str {
@@ -53,12 +68,22 @@ pub(super) fn profile_snapshot(work_root: &Path, profile: UltraProfile) -> Profi
             &["Cargo.toml", "src/lib.rs", "src/main.rs", "tests"],
         ),
         UltraProfile::Investigation | UltraProfile::Docs | UltraProfile::Generic => {
-            ProfileSnapshot {
-                lines: Vec::new(),
-                protected_files: Vec::new(),
-            }
+            ProfileSnapshot::new(Vec::new(), Vec::new())
         }
     }
+}
+
+pub(super) fn profile_snapshot_for_ultra_plan(
+    work_root: &Path,
+    ultra_plan: &UltraPlan,
+) -> ProfileSnapshot {
+    let requested_port = super::requested_port_for_ultra_plan(ultra_plan);
+    let mut snapshot = profile_snapshot(work_root, ultra_plan.profile);
+    if ultra_plan.profile == UltraProfile::Nextjs {
+        snapshot.requested_port = requested_port;
+        snapshot.probe_port = Some(profiles::nextjs::probe_port(work_root, requested_port));
+    }
+    snapshot
 }
 
 pub(super) fn build_profiled_phase_prompt(
@@ -67,10 +92,31 @@ pub(super) fn build_profiled_phase_prompt(
     snapshot: &ProfileSnapshot,
     intent: WorkIntent,
 ) -> String {
-    let snapshot = if snapshot.lines.is_empty() {
+    let mut snapshot_lines = snapshot.lines.clone();
+    if ultra_plan.profile == UltraProfile::Nextjs {
+        if text_tokens::contains_canvas_token(&ultra_plan.goal)
+            || ultra_plan
+                .phases
+                .iter()
+                .any(|phase| text_tokens::contains_canvas_token(&phase.prompt))
+        {
+            snapshot_lines.push(
+                "Canvas surface requirement detected from goal or ultra-plan phases.".to_string(),
+            );
+        }
+        if let Some(port) = snapshot.requested_port {
+            snapshot_lines.push(format!(
+                "Requested port invariant: keep package.json dev/start scripts on port {port}."
+            ));
+        }
+        if let Some(port) = snapshot.probe_port {
+            snapshot_lines.push(format!("Readiness/interaction probe target port: {port}."));
+        }
+    }
+    let snapshot = if snapshot_lines.is_empty() {
         "- none detected".to_string()
     } else {
-        snapshot.lines.join("\n")
+        snapshot_lines.join("\n")
     };
     let required_artifacts = required_artifact_contract_prompt(&ultra_plan.goal);
     format!(
@@ -87,18 +133,31 @@ pub(super) fn build_profiled_phase_prompt(
     )
 }
 
+#[cfg(test)]
 pub(super) fn verify_profile_after_phase(
     work_root: &Path,
     profile: UltraProfile,
     intent: WorkIntent,
     before: &ProfileSnapshot,
 ) -> Result<(), String> {
+    verify_profile_after_phase_with_requested_port(work_root, profile, intent, before, None)
+}
+
+pub(super) fn verify_profile_after_phase_with_requested_port(
+    work_root: &Path,
+    profile: UltraProfile,
+    intent: WorkIntent,
+    before: &ProfileSnapshot,
+    requested_port: Option<u16>,
+) -> Result<(), String> {
     let mut failures = Vec::new();
     match profile {
         UltraProfile::DataAnalysis | UltraProfile::DataPipeline => {
             profiles::data::verify(work_root, before, &mut failures);
         }
-        UltraProfile::Nextjs => profiles::nextjs::verify(work_root, intent, &mut failures),
+        UltraProfile::Nextjs => {
+            profiles::nextjs::verify(work_root, intent, requested_port, &mut failures)
+        }
         UltraProfile::Python
         | UltraProfile::Rust
         | UltraProfile::Investigation
@@ -114,7 +173,9 @@ pub(super) fn verify_profile_after_phase(
 
 fn profile_runtime_contract(profile: UltraProfile, intent: WorkIntent) -> &'static str {
     match profile {
-        UltraProfile::Generic => "- Keep changes scoped to the current phase.",
+        UltraProfile::Generic => {
+            "- Generic profile: no capability contract is bound; behavioral verification is not run."
+        }
         UltraProfile::Nextjs => profiles::nextjs::runtime_contract(intent),
         UltraProfile::Python => {
             "- Preserve the existing Python package/import layout.\n- Prefer pytest and python -m py_compile for verification.\n- Do not rewrite project metadata unless this phase explicitly requires it."
@@ -140,8 +201,5 @@ fn simple_existing_paths(work_root: &Path, paths: &[&str]) -> ProfileSnapshot {
         .filter(|path| work_root.join(path).exists())
         .map(|path| format!("Existing path: {path}"))
         .collect();
-    ProfileSnapshot {
-        lines,
-        protected_files: Vec::new(),
-    }
+    ProfileSnapshot::new(lines, Vec::new())
 }

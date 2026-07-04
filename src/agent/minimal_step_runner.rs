@@ -5,8 +5,10 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::config::Config;
+use crate::logging::log_llm_event;
 use crate::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
 #[cfg(test)]
 use crate::tools::registry::ToolSpec;
@@ -14,6 +16,7 @@ use crate::tools::registry::ToolSpec;
 use super::minimal_loop::MinimalChatClient;
 use super::minimal_repl::run_turn_with_early_success_paths;
 use super::planner_llm::PlannerLlm;
+use super::text_tokens;
 
 mod intent;
 mod plan_lint;
@@ -27,10 +30,10 @@ use intent::{WorkIntent, detect_work_intent};
 use plan_lint::lint_plan;
 use plan_lint::{lint_plan_with_workspace, lint_ultra_plan};
 #[cfg(test)]
-use profile::ProfileSnapshot;
+use profile::{ProfileSnapshot, profile_snapshot, verify_profile_after_phase};
 use profile::{
-    build_profiled_phase_prompt, profile_generation_rules, profile_snapshot,
-    verify_profile_after_phase,
+    build_profiled_phase_prompt, profile_generation_rules, profile_snapshot_for_ultra_plan,
+    verify_profile_after_phase_with_requested_port,
 };
 #[cfg(test)]
 use repair::REPAIR_REPLAN_PROMPT_MAX_CHARS;
@@ -211,6 +214,13 @@ impl UltraProfile {
             Self::DataPipeline => "data-pipeline",
         }
     }
+
+    pub fn inference_id(self) -> &'static str {
+        match self {
+            Self::Python => "python-cli",
+            other => other.as_str(),
+        }
+    }
 }
 
 impl fmt::Display for UltraProfile {
@@ -226,7 +236,7 @@ impl FromStr for UltraProfile {
         match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
             "generic" | "default" | "auto" => Ok(Self::Generic),
             "nextjs" | "next-js" | "next.js" => Ok(Self::Nextjs),
-            "python" | "py" => Ok(Self::Python),
+            "python" | "python-cli" | "py" => Ok(Self::Python),
             "rust" | "cargo" => Ok(Self::Rust),
             "investigation" | "triage" | "research" => Ok(Self::Investigation),
             "docs" | "documentation" => Ok(Self::Docs),
@@ -236,6 +246,89 @@ impl FromStr for UltraProfile {
                 "unknown ultra profile `{other}`; expected generic, nextjs, python, rust, investigation, docs, data-analysis, or data-pipeline"
             )),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileResolutionSource {
+    Explicit,
+    Goal,
+    Workspace,
+    Default,
+}
+
+impl ProfileResolutionSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Goal => "goal",
+            Self::Workspace => "workspace",
+            Self::Default => "default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileResolution {
+    pub profile: UltraProfile,
+    pub source: ProfileResolutionSource,
+}
+
+impl ProfileResolution {
+    pub fn is_explicit(self) -> bool {
+        self.source == ProfileResolutionSource::Explicit
+    }
+
+    pub fn is_inferred(self) -> bool {
+        !self.is_explicit()
+    }
+
+    pub fn summary_line(self) -> Option<String> {
+        self.is_inferred().then(|| {
+            format!(
+                "profile_inferred: {} (from: {})",
+                self.profile.inference_id(),
+                self.source.as_str()
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssuranceLevel {
+    Full,
+    Reduced,
+}
+
+impl AssuranceLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Reduced => "reduced",
+        }
+    }
+
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Self::Full => "completed",
+            Self::Reduced => "completed (reduced assurance)",
+        }
+    }
+
+    pub fn summary_line(self) -> Option<&'static str> {
+        match self {
+            Self::Full => None,
+            Self::Reduced => Some(
+                "Assurance: reduced (generic profile — no capability contract, no behavioral verification)",
+            ),
+        }
+    }
+}
+
+pub fn assurance_for_profile(profile: UltraProfile) -> AssuranceLevel {
+    match profile {
+        UltraProfile::Generic => AssuranceLevel::Reduced,
+        _ => AssuranceLevel::Full,
     }
 }
 
@@ -289,6 +382,82 @@ impl UltraPlan {
     }
 }
 
+pub fn resolve_ultra_profile(
+    work_root: &Path,
+    goal: &str,
+    explicit_profile: Option<&str>,
+) -> Result<ProfileResolution, String> {
+    if let Some(value) = explicit_profile {
+        return Ok(ProfileResolution {
+            profile: value.parse()?,
+            source: ProfileResolutionSource::Explicit,
+        });
+    }
+    if text_tokens::contains_nextjs_profile_token(goal) {
+        return Ok(ProfileResolution {
+            profile: UltraProfile::Nextjs,
+            source: ProfileResolutionSource::Goal,
+        });
+    }
+    if text_tokens::contains_python_cli_profile_token(goal) {
+        return Ok(ProfileResolution {
+            profile: UltraProfile::Python,
+            source: ProfileResolutionSource::Goal,
+        });
+    }
+    if workspace_has_next_dependency(work_root) {
+        return Ok(ProfileResolution {
+            profile: UltraProfile::Nextjs,
+            source: ProfileResolutionSource::Workspace,
+        });
+    }
+    if work_root.join("pyproject.toml").is_file() {
+        return Ok(ProfileResolution {
+            profile: UltraProfile::Python,
+            source: ProfileResolutionSource::Workspace,
+        });
+    }
+    Ok(ProfileResolution {
+        profile: UltraProfile::Generic,
+        source: ProfileResolutionSource::Default,
+    })
+}
+
+pub fn log_profile_resolution(resolution: ProfileResolution, requested_port: Option<u16>) {
+    if !resolution.is_inferred() {
+        return;
+    }
+    log_llm_event(
+        "profile_inferred",
+        json!({
+            "profile": resolution.profile.inference_id(),
+            "from": resolution.source.as_str(),
+            "requested_port": requested_port,
+        }),
+    );
+}
+
+fn workspace_has_next_dependency(work_root: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(work_root.join("package.json")) else {
+        return false;
+    };
+    package_json_has_dependency(&raw, "next")
+}
+
+fn package_json_has_dependency(raw: &str, name: &str) -> bool {
+    let Ok(package) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    ["dependencies", "devDependencies", "peerDependencies"]
+        .into_iter()
+        .any(|section| {
+            package
+                .get(section)
+                .and_then(|value| value.get(name))
+                .is_some()
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepRunSummary {
     pub total: usize,
@@ -312,6 +481,17 @@ pub struct PlanRunSummary {
 pub struct UltraRunSummary {
     pub total: usize,
     pub completed: usize,
+    pub assurance_level: AssuranceLevel,
+}
+
+impl UltraRunSummary {
+    pub fn status_label(&self) -> &'static str {
+        self.assurance_level.status_label()
+    }
+
+    pub fn assurance_summary_line(&self) -> Option<&'static str> {
+        self.assurance_level.summary_line()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,7 +744,18 @@ pub fn generate_ultra_plan<P: PlannerLlm + ?Sized>(
                 lint_ultra_plan(&plan)?;
                 Ok(plan)
             }) {
-                Ok(plan) => return save_ultra_plan(&config.cwd, &plan),
+                Ok(plan) => {
+                    let requested_port = requested_port_for_ultra_plan(&plan);
+                    log_llm_event(
+                        "agent.minimal.ultra_plan.generated",
+                        json!({
+                            "profile": profile.inference_id(),
+                            "style": style.as_str(),
+                            "requested_port": requested_port,
+                        }),
+                    );
+                    return save_ultra_plan(&config.cwd, &plan);
+                }
                 Err(err) => last_error = err,
             }
         }
@@ -590,6 +781,8 @@ pub fn run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
     validate_ultra_plan(&ultra_plan)?;
     lint_ultra_plan(&ultra_plan)?;
     let intent = ultra_plan.effective_intent();
+    let requested_port = requested_port_for_ultra_plan(&ultra_plan);
+    let assurance_level = assurance_for_profile(ultra_plan.profile);
 
     let mut completed = 0usize;
     for (index, phase) in ultra_plan.phases.iter().enumerate() {
@@ -599,7 +792,16 @@ pub fn run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
             ultra_plan.phases.len(),
             phase.id
         );
-        let snapshot = profile_snapshot(&config.cwd, ultra_plan.profile);
+        let snapshot = profile_snapshot_for_ultra_plan(&config.cwd, &ultra_plan);
+        log_llm_event(
+            "agent.minimal.ultra_phase.start",
+            json!({
+                "phase_id": phase.id,
+                "profile": ultra_plan.profile.inference_id(),
+                "requested_port": requested_port,
+                "probe_port": snapshot.probe_port,
+            }),
+        );
         let phase_prompt = build_profiled_phase_prompt(&ultra_plan, phase, &snapshot, intent);
         let summary = generate_and_run_step_plan(
             config,
@@ -611,8 +813,14 @@ pub fn run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
             &phase_prompt,
         )
         .map_err(|err| format!("phase {} failed: {err}", phase.id))?;
-        verify_profile_after_phase(&config.cwd, ultra_plan.profile, intent, &snapshot)
-            .map_err(|err| format!("phase {} failed profile verification: {err}", phase.id))?;
+        verify_profile_after_phase_with_requested_port(
+            &config.cwd,
+            ultra_plan.profile,
+            intent,
+            &snapshot,
+            requested_port,
+        )
+        .map_err(|err| format!("phase {} failed profile verification: {err}", phase.id))?;
         completed += 1;
         println!(
             "phase {}: ok (step plan: {}, completed {}/{})",
@@ -623,12 +831,27 @@ pub fn run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
         );
     }
 
+    if assurance_level == AssuranceLevel::Reduced {
+        log_llm_event(
+            "tui_command_stop",
+            json!({
+                "status": assurance_level.status_label(),
+                "assurance_level": assurance_level.as_str(),
+                "profile": ultra_plan.profile.inference_id(),
+                "completed": completed,
+                "total": ultra_plan.phases.len(),
+            }),
+        );
+    }
+
     Ok(UltraRunSummary {
         total: ultra_plan.phases.len(),
         completed,
+        assurance_level,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn generate_and_run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
     config: &Config,
     planner: &mut P,
@@ -732,6 +955,17 @@ fn ultra_plan_generation_user_prompt(
         profile.as_str(),
         style.as_str(),
         intent.as_str()
+    )
+}
+
+pub fn requested_port_for_goal(goal: &str) -> Option<u16> {
+    text_tokens::requested_port(goal)
+}
+
+fn requested_port_for_ultra_plan(plan: &UltraPlan) -> Option<u16> {
+    text_tokens::requested_port_from_texts(
+        std::iter::once(plan.goal.as_str())
+            .chain(plan.phases.iter().map(|phase| phase.prompt.as_str())),
     )
 }
 
@@ -1450,12 +1684,25 @@ mod tests {
     }
 
     fn config(root: &TempDir) -> Config {
-        let mut config = Config::default();
-        config.cwd = root.path().to_path_buf();
-        config.context_budget = 24_000;
-        config.max_iterations = 4;
-        config.yes_mode = true;
-        config
+        Config {
+            cwd: root.path().to_path_buf(),
+            context_budget: 24_000,
+            max_iterations: 4,
+            yes_mode: true,
+            ..Default::default()
+        }
+    }
+
+    fn session_snapshot(mode: ExecutionMode) -> SessionSnapshot {
+        SessionSnapshot {
+            id: "session-1".to_string(),
+            workspace_key: "workspace-1".to_string(),
+            mode_state: crate::modes::plan_act::ModeState {
+                mode,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -1617,6 +1864,114 @@ mod tests {
             detect_work_intent("README ドキュメントを更新する"),
             WorkIntent::Document
         );
+    }
+
+    #[test]
+    fn profile_inference_prefers_goal_tokens_then_workspace_then_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let res = resolve_ultra_profile(temp.path(), "Web アプリを作成してください", None).unwrap();
+        assert_eq!(res.profile, UltraProfile::Nextjs);
+        assert_eq!(res.source, ProfileResolutionSource::Goal);
+        assert_eq!(
+            res.summary_line().as_deref(),
+            Some("profile_inferred: nextjs (from: goal)")
+        );
+
+        let res = resolve_ultra_profile(temp.path(), "コマンドラインツールを作成", None).unwrap();
+        assert_eq!(res.profile, UltraProfile::Python);
+        assert_eq!(res.source, ProfileResolutionSource::Goal);
+        assert_eq!(
+            res.summary_line().as_deref(),
+            Some("profile_inferred: python-cli (from: goal)")
+        );
+
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0"}}"#,
+        )
+        .unwrap();
+        let res = resolve_ultra_profile(temp.path(), "小さな画面を作成", None).unwrap();
+        assert_eq!(res.profile, UltraProfile::Nextjs);
+        assert_eq!(res.source, ProfileResolutionSource::Workspace);
+        assert_eq!(
+            res.summary_line().as_deref(),
+            Some("profile_inferred: nextjs (from: workspace)")
+        );
+
+        let py = tempfile::tempdir().unwrap();
+        std::fs::write(py.path().join("pyproject.toml"), "[project]\nname='x'\n").unwrap();
+        let res = resolve_ultra_profile(py.path(), "小さなツールを作成", None).unwrap();
+        assert_eq!(res.profile, UltraProfile::Python);
+        assert_eq!(res.source, ProfileResolutionSource::Workspace);
+
+        let generic = tempfile::tempdir().unwrap();
+        let res = resolve_ultra_profile(generic.path(), "調査メモをまとめる", None).unwrap();
+        assert_eq!(res.profile, UltraProfile::Generic);
+        assert_eq!(res.source, ProfileResolutionSource::Default);
+        assert_eq!(
+            res.summary_line().as_deref(),
+            Some("profile_inferred: generic (from: default)")
+        );
+    }
+
+    #[test]
+    fn explicit_profile_wins_over_goal_and_workspace_inference() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0"}}"#,
+        )
+        .unwrap();
+
+        let res = resolve_ultra_profile(
+            temp.path(),
+            "React Web アプリを作成してください",
+            Some("generic"),
+        )
+        .unwrap();
+
+        assert_eq!(res.profile, UltraProfile::Generic);
+        assert_eq!(res.source, ProfileResolutionSource::Explicit);
+        assert_eq!(res.summary_line(), None);
+    }
+
+    #[test]
+    fn requested_port_for_ultra_plan_uses_first_goal_or_phase_match() {
+        let ultra = UltraPlan {
+            goal: "4000番ポートでNext.jsアプリを作成".into(),
+            profile: UltraProfile::Nextjs,
+            style: UltraPlanStyle::Default,
+            intent: WorkIntent::Create,
+            phases: vec![
+                UltraPhase {
+                    id: "build".into(),
+                    prompt: "ポート5000に変更せず実装する".into(),
+                },
+                UltraPhase {
+                    id: "verify".into(),
+                    prompt: "Verify".into(),
+                },
+            ],
+        };
+        assert_eq!(requested_port_for_ultra_plan(&ultra), Some(4000));
+
+        let ultra = UltraPlan {
+            goal: "Next.jsアプリを作成".into(),
+            profile: UltraProfile::Nextjs,
+            style: UltraPlanStyle::Default,
+            intent: WorkIntent::Create,
+            phases: vec![
+                UltraPhase {
+                    id: "build".into(),
+                    prompt: "dev script should use port 4100".into(),
+                },
+                UltraPhase {
+                    id: "verify".into(),
+                    prompt: "Verify".into(),
+                },
+            ],
+        };
+        assert_eq!(requested_port_for_ultra_plan(&ultra), Some(4100));
     }
 
     #[test]
@@ -1892,6 +2247,149 @@ steps:
             &snapshot,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn nextjs_requested_port_invariant_enforces_dynamic_port() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+        std::fs::write(
+            temp.path().join("app/page.tsx"),
+            "export default function Page(){ return null; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"},"scripts":{"build":"next build","dev":"next dev -p 3011","start":"next start -p 3011"}}"#,
+        )
+        .unwrap();
+        let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
+
+        let err = verify_profile_after_phase_with_requested_port(
+            temp.path(),
+            UltraProfile::Nextjs,
+            WorkIntent::Create,
+            &snapshot,
+            Some(4000),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("requested port 4000"), "{err}");
+        assert!(err.contains("dev script"), "{err}");
+        assert!(err.contains("start script"), "{err}");
+    }
+
+    #[test]
+    fn nextjs_requested_port_invariant_accepts_matching_port_and_skips_absent_request() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("app")).unwrap();
+        std::fs::write(
+            temp.path().join("app/page.tsx"),
+            "export default function Page(){ return null; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"},"scripts":{"build":"next build","dev":"next dev -p 4000","start":"next start -p 4000"}}"#,
+        )
+        .unwrap();
+        let snapshot = profile_snapshot(temp.path(), UltraProfile::Nextjs);
+
+        verify_profile_after_phase_with_requested_port(
+            temp.path(),
+            UltraProfile::Nextjs,
+            WorkIntent::Create,
+            &snapshot,
+            Some(4000),
+        )
+        .unwrap();
+
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0","react":"18.0.0","react-dom":"18.0.0"},"scripts":{"build":"next build","dev":"next dev -p 3011","start":"next start"}}"#,
+        )
+        .unwrap();
+        verify_profile_after_phase(
+            temp.path(),
+            UltraProfile::Nextjs,
+            WorkIntent::Create,
+            &snapshot,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn nextjs_profile_snapshot_selects_requested_script_and_default_probe_ports() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("package.json"),
+            r#"{"dependencies":{"next":"14.0.0"},"scripts":{"dev":"next dev -p 4100"}}"#,
+        )
+        .unwrap();
+
+        let requested = UltraPlan {
+            goal: "4000番ポートでNext.jsアプリを作成".into(),
+            profile: UltraProfile::Nextjs,
+            style: UltraPlanStyle::Default,
+            intent: WorkIntent::Create,
+            phases: vec![
+                UltraPhase {
+                    id: "build".into(),
+                    prompt: "Create the app".into(),
+                },
+                UltraPhase {
+                    id: "verify".into(),
+                    prompt: "Verify the app".into(),
+                },
+            ],
+        };
+        let snapshot = profile_snapshot_for_ultra_plan(temp.path(), &requested);
+        assert_eq!(snapshot.requested_port, Some(4000));
+        assert_eq!(snapshot.probe_port, Some(4000));
+
+        let fallback = UltraPlan {
+            goal: "Next.jsアプリを作成".into(),
+            profile: UltraProfile::Nextjs,
+            style: UltraPlanStyle::Default,
+            intent: WorkIntent::Create,
+            phases: requested.phases.clone(),
+        };
+        let snapshot = profile_snapshot_for_ultra_plan(temp.path(), &fallback);
+        assert_eq!(snapshot.requested_port, None);
+        assert_eq!(snapshot.probe_port, Some(4100));
+
+        std::fs::remove_file(temp.path().join("package.json")).unwrap();
+        let snapshot = profile_snapshot_for_ultra_plan(temp.path(), &fallback);
+        assert_eq!(snapshot.probe_port, Some(3000));
+    }
+
+    #[test]
+    fn profiled_phase_prompt_includes_port_and_canvas_phase_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let ultra = UltraPlan {
+            goal: "4000番ポートでNext.jsアプリを作成".into(),
+            profile: UltraProfile::Nextjs,
+            style: UltraPlanStyle::Default,
+            intent: WorkIntent::Create,
+            phases: vec![
+                UltraPhase {
+                    id: "build".into(),
+                    prompt: "HTML5 Canvasで操作できる画面を実装する".into(),
+                },
+                UltraPhase {
+                    id: "verify".into(),
+                    prompt: "Verify the app".into(),
+                },
+            ],
+        };
+        let snapshot = profile_snapshot_for_ultra_plan(temp.path(), &ultra);
+        let prompt =
+            build_profiled_phase_prompt(&ultra, &ultra.phases[0], &snapshot, WorkIntent::Create);
+
+        assert!(prompt.contains("Requested port invariant"));
+        assert!(prompt.contains("4000"));
+        assert!(prompt.contains("Readiness/interaction probe target port: 4000"));
+        assert!(prompt.contains("Canvas surface requirement detected"));
     }
 
     #[test]
@@ -2253,10 +2751,7 @@ raise SystemExit(1)
         let prompt = build_profiled_phase_prompt(
             &ultra,
             &ultra.phases[0],
-            &ProfileSnapshot {
-                lines: Vec::new(),
-                protected_files: Vec::new(),
-            },
+            &ProfileSnapshot::new(Vec::new(), Vec::new()),
             WorkIntent::Create,
         );
 
@@ -2419,10 +2914,7 @@ raise SystemExit(1)
         let temp = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let store = SessionStore::new(state.path(), "session-1", "workspace-1");
-        let mut session = SessionSnapshot::default();
-        session.id = "session-1".to_string();
-        session.workspace_key = "workspace-1".to_string();
-        session.mode_state.mode = ExecutionMode::Act;
+        let mut session = session_snapshot(ExecutionMode::Act);
         let plan = StepPlan {
             goal: "Create report".into(),
             steps: vec![PlanStep {
@@ -2468,10 +2960,7 @@ raise SystemExit(1)
         let temp = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let store = SessionStore::new(state.path(), "session-1", "workspace-1");
-        let mut session = SessionSnapshot::default();
-        session.id = "session-1".to_string();
-        session.workspace_key = "workspace-1".to_string();
-        session.mode_state.mode = ExecutionMode::Act;
+        let mut session = session_snapshot(ExecutionMode::Act);
         let plan = StepPlan {
             goal: "Create report".into(),
             steps: vec![PlanStep {
@@ -2531,10 +3020,7 @@ raise SystemExit(1)
         .unwrap();
         let state = tempfile::tempdir().unwrap();
         let store = SessionStore::new(state.path(), "session-1", "workspace-1");
-        let mut session = SessionSnapshot::default();
-        session.id = "session-1".to_string();
-        session.workspace_key = "workspace-1".to_string();
-        session.mode_state.mode = ExecutionMode::Act;
+        let mut session = session_snapshot(ExecutionMode::Act);
         let plan = StepPlan {
             goal: "Fix report".into(),
             steps: vec![PlanStep {
@@ -2593,10 +3079,7 @@ raise SystemExit(1)
         .unwrap();
         let state = tempfile::tempdir().unwrap();
         let store = SessionStore::new(state.path(), "session-1", "workspace-1");
-        let mut session = SessionSnapshot::default();
-        session.id = "session-1".to_string();
-        session.workspace_key = "workspace-1".to_string();
-        session.mode_state.mode = ExecutionMode::Act;
+        let mut session = session_snapshot(ExecutionMode::Act);
         let plan = StepPlan {
             goal: "Fix report.md so check.py passes".into(),
             steps: vec![PlanStep {
@@ -2804,14 +3287,14 @@ raise SystemExit(1)
         let phase_prompt = build_profiled_phase_prompt(
             &ultra,
             &ultra.phases[0],
-            &ProfileSnapshot {
-                lines: vec![
+            &ProfileSnapshot::new(
+                vec![
                     "- package.json exists".into(),
                     "- app/page.tsx exists".into(),
                     "- components/SpaceInvaders.tsx exists".into(),
                 ],
-                protected_files: Vec::new(),
-            },
+                Vec::new(),
+            ),
             WorkIntent::Fix,
         );
         assert!(
@@ -2883,14 +3366,38 @@ raise SystemExit(1)
     }
 
     #[test]
+    fn assurance_labels_are_reduced_only_for_generic_profile() {
+        assert_eq!(
+            assurance_for_profile(UltraProfile::Generic),
+            AssuranceLevel::Reduced
+        );
+        assert_eq!(
+            assurance_for_profile(UltraProfile::Nextjs),
+            AssuranceLevel::Full
+        );
+        let reduced = UltraRunSummary {
+            total: 2,
+            completed: 2,
+            assurance_level: AssuranceLevel::Reduced,
+        };
+        assert_eq!(reduced.status_label(), "completed (reduced assurance)");
+        assert!(reduced.assurance_summary_line().is_some());
+
+        let full = UltraRunSummary {
+            total: 2,
+            completed: 2,
+            assurance_level: AssuranceLevel::Full,
+        };
+        assert_eq!(full.status_label(), "completed");
+        assert_eq!(full.assurance_summary_line(), None);
+    }
+
+    #[test]
     fn run_ultra_plan_runs_each_phase_with_step_plans() {
         let temp = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let store = SessionStore::new(state.path(), "session-1", "workspace-1");
-        let mut session = SessionSnapshot::default();
-        session.id = "session-1".to_string();
-        session.workspace_key = "workspace-1".to_string();
-        session.mode_state.mode = ExecutionMode::Act;
+        let mut session = session_snapshot(ExecutionMode::Act);
         let ultra = UltraPlan {
             goal: "Create two files".into(),
             profile: UltraProfile::Generic,
@@ -2944,6 +3451,8 @@ raise SystemExit(1)
         .unwrap();
 
         assert_eq!(summary.completed, 2);
+        assert_eq!(summary.assurance_level, AssuranceLevel::Reduced);
+        assert_eq!(summary.status_label(), "completed (reduced assurance)");
         assert!(temp.path().join("a.txt").is_file());
         assert!(temp.path().join("b.txt").is_file());
     }

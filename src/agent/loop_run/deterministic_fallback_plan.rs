@@ -13,33 +13,18 @@
 //!   "the requested Next.js app" vs. "the requested deliverable".
 //! * `fallback_plan_platform_label(task) -> &'static str` — picks
 //!   "Next.js app" vs. "local app".
-//! * `extract_requested_port(task) -> Option<String>` — first 2-5
-//!   digit run.
+//! * `extract_requested_port(task) -> Option<String>` — shared contextual
+//!   port extractor.
 //!
 //! `pub(super)` limited / no facade re-export (DR3-001).
 
 use std::path::Path;
 
+use crate::agent::text_tokens;
 use crate::modes::plan_act::TaskProfile;
 
 pub(super) fn extract_requested_port(task: &str) -> Option<String> {
-    let bytes = task.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if !bytes[i].is_ascii_digit() {
-            i += 1;
-            continue;
-        }
-        let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        let candidate = &task[start..i];
-        if (2..=5).contains(&candidate.len()) {
-            return Some(candidate.to_string());
-        }
-    }
-    None
+    text_tokens::requested_port(task).map(|port| port.to_string())
 }
 
 pub(super) fn fallback_plan_request_label(task: &str) -> String {

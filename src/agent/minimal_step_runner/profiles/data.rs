@@ -59,10 +59,7 @@ pub(in crate::agent::minimal_step_runner) fn snapshot(work_root: &Path) -> Profi
             lines.push(format!("Existing directory: {dir}"));
         }
     }
-    ProfileSnapshot {
-        lines,
-        protected_files,
-    }
+    ProfileSnapshot::new(lines, protected_files)
 }
 
 pub(in crate::agent::minimal_step_runner) fn verify(

@@ -264,13 +264,13 @@ fn render_selected_lines(lines: &[&str], selected: &BTreeSet<usize>) -> String {
         if index >= lines.len() {
             continue;
         }
-        if let Some(previous_index) = previous {
-            if index > previous_index + 1 {
-                rendered.push(format!(
-                    "... omitted {} lines ...",
-                    index - previous_index - 1
-                ));
-            }
+        if let Some(previous_index) = previous
+            && index > previous_index + 1
+        {
+            rendered.push(format!(
+                "... omitted {} lines ...",
+                index - previous_index - 1
+            ));
         }
         rendered.push(lines[index].to_string());
         previous = Some(index);
@@ -305,10 +305,10 @@ struct SourceLocation {
 fn source_excerpts_for_output(work_root: &Path, lines: &[&str]) -> String {
     let mut locations = BTreeSet::new();
     for line in lines {
-        if let Some(location) = parse_source_location(line) {
-            if work_root.join(&location.path).is_file() {
-                locations.insert(location);
-            }
+        if let Some(location) = parse_source_location(line)
+            && work_root.join(&location.path).is_file()
+        {
+            locations.insert(location);
         }
         if locations.len() >= 3 {
             break;
@@ -332,9 +332,9 @@ fn render_source_excerpt(work_root: &Path, location: &SourceLocation) -> Option<
         .saturating_sub(VERIFY_FAILURE_SOURCE_CONTEXT + 1);
     let end = (location.line + VERIFY_FAILURE_SOURCE_CONTEXT).min(lines.len());
     let mut rendered = vec![format!("{}:{}-{}", location.path.display(), start + 1, end)];
-    for index in start..end {
+    for (index, line) in lines.iter().enumerate().take(end).skip(start) {
         let marker = if index + 1 == location.line { ">" } else { " " };
-        rendered.push(format!("{marker} {:>4} | {}", index + 1, lines[index]));
+        rendered.push(format!("{marker} {:>4} | {line}", index + 1));
     }
     Some(rendered.join("\n"))
 }

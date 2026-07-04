@@ -257,6 +257,27 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     let mode_for_banner = session.mode_state.mode;
     let fresh = config.fresh_session;
     let log_level = config.log_level;
+    let ultra_profile_resolution = if config.engine == Engine::Minimal {
+        ultra_plan
+            .as_deref()
+            .or(ultra_plan_run.as_deref())
+            .map(|goal| {
+                let resolution = agent::minimal_step_runner::resolve_ultra_profile(
+                    &config.cwd,
+                    goal,
+                    ultra_profile.as_deref(),
+                )?;
+                agent::minimal_step_runner::log_profile_resolution(
+                    resolution,
+                    agent::minimal_step_runner::requested_port_for_goal(goal),
+                );
+                Ok::<_, String>(resolution)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let profile_line = ultra_profile_resolution.and_then(|resolution| resolution.summary_line());
 
     // Resume path has to read the last user prompt before we hand the
     // snapshot to Agent::new (which consumes it by value).
@@ -273,7 +294,13 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     // Banner: REPL / resume get stdout; oneshot gets stderr so stdout stays
     // clean for script consumers.
     if is_oneshot {
-        print_startup_banner_stderr_oneshot(&session_short, messages_count, fresh, is_resume);
+        print_startup_banner_stderr_oneshot(
+            &session_short,
+            messages_count,
+            fresh,
+            is_resume,
+            profile_line.as_deref(),
+        );
     } else {
         print_startup_banner(
             version,
@@ -285,6 +312,7 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
             fresh,
             is_resume,
             log_level,
+            profile_line.as_deref(),
         );
     }
 
@@ -327,6 +355,8 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
             run_ultra_plan_path,
             ultra_style,
             ultra_profile,
+            ultra_profile_resolution,
+            profile_line,
             planner_provider,
             planner_model,
         );
@@ -372,6 +402,7 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
     agent.run_repl_loop()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_minimal_engine(
     config: Config,
     models: RuntimeModels,
@@ -390,6 +421,8 @@ fn run_minimal_engine(
     run_ultra_plan_path: Option<PathBuf>,
     ultra_style: Option<String>,
     ultra_profile: Option<String>,
+    ultra_profile_resolution: Option<agent::minimal_step_runner::ProfileResolution>,
+    ultra_profile_line: Option<String>,
     planner_provider: PlannerProvider,
     planner_model: Option<String>,
 ) -> Result<(), String> {
@@ -463,9 +496,12 @@ fn run_minimal_engine(
         Some(value) => value.parse()?,
         None => agent::minimal_step_runner::UltraPlanStyle::Default,
     };
-    let ultra_profile = match ultra_profile {
-        Some(value) => value.parse()?,
-        None => agent::minimal_step_runner::UltraProfile::Generic,
+    let ultra_profile = match ultra_profile_resolution {
+        Some(resolution) => resolution.profile,
+        None => match ultra_profile {
+            Some(value) => value.parse()?,
+            None => agent::minimal_step_runner::UltraProfile::Generic,
+        },
     };
 
     if let Some(goal) = &ultra_plan {
@@ -484,6 +520,9 @@ fn run_minimal_engine(
             ultra_style,
         )?;
         println!("created ultra plan: {}", path.display());
+        if let Some(line) = &ultra_profile_line {
+            println!("{line}");
+        }
         return Ok(());
     }
 
@@ -507,10 +546,18 @@ fn run_minimal_engine(
             ultra_style,
         )?;
         println!("created ultra plan: {}", summary.plan_path.display());
+        if let Some(line) = &ultra_profile_line {
+            println!("{line}");
+        }
         println!(
-            "completed {}/{} ultra phases",
-            summary.phases.completed, summary.phases.total
+            "{} {}/{} ultra phases",
+            summary.phases.status_label(),
+            summary.phases.completed,
+            summary.phases.total
         );
+        if let Some(line) = summary.phases.assurance_summary_line() {
+            println!("{line}");
+        }
         return Ok(());
     }
 
@@ -532,9 +579,14 @@ fn run_minimal_engine(
             &plan_path,
         )?;
         println!(
-            "completed {}/{} ultra phases",
-            summary.completed, summary.total
+            "{} {}/{} ultra phases",
+            summary.status_label(),
+            summary.completed,
+            summary.total
         );
+        if let Some(line) = summary.assurance_summary_line() {
+            println!("{line}");
+        }
         return Ok(());
     }
 

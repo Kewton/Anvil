@@ -164,9 +164,14 @@ pub fn run(
                     Ok(summary) => {
                         println!("created ultra plan: {}", summary.plan_path.display());
                         println!(
-                            "completed {}/{} ultra phases",
-                            summary.phases.completed, summary.phases.total
+                            "{} {}/{} ultra phases",
+                            summary.phases.status_label(),
+                            summary.phases.completed,
+                            summary.phases.total
                         );
+                        if let Some(line) = summary.phases.assurance_summary_line() {
+                            println!("{line}");
+                        }
                     }
                     Err(err) => eprintln!("ERROR: {err}"),
                 }
@@ -184,9 +189,14 @@ pub fn run(
                 ) {
                     Ok(summary) => {
                         println!(
-                            "completed {}/{} ultra phases",
-                            summary.completed, summary.total
-                        )
+                            "{} {}/{} ultra phases",
+                            summary.status_label(),
+                            summary.completed,
+                            summary.total
+                        );
+                        if let Some(line) = summary.assurance_summary_line() {
+                            println!("{line}");
+                        }
                     }
                     Err(err) => eprintln!("ERROR: {err}"),
                 }
@@ -512,12 +522,25 @@ mod tests {
     }
 
     fn config(cwd: PathBuf) -> Config {
-        let mut config = Config::default();
-        config.cwd = cwd;
-        config.context_budget = 24_000;
-        config.max_iterations = 2;
-        config.yes_mode = true;
-        config
+        Config {
+            cwd,
+            context_budget: 24_000,
+            max_iterations: 2,
+            yes_mode: true,
+            ..Default::default()
+        }
+    }
+
+    fn session_snapshot(mode: ExecutionMode) -> SessionSnapshot {
+        SessionSnapshot {
+            id: "session-1".to_string(),
+            workspace_key: "workspace-1".to_string(),
+            mode_state: crate::modes::plan_act::ModeState {
+                mode,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -611,10 +634,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let store = SessionStore::new(state.path(), "session-1", "workspace-1");
-        let mut session = SessionSnapshot::default();
-        session.id = "session-1".to_string();
-        session.workspace_key = "workspace-1".to_string();
-        session.mode_state.mode = ExecutionMode::Plan;
+        let mut session = session_snapshot(ExecutionMode::Plan);
         let mut client = MockClient::default();
         client.push_reply("first reply");
 

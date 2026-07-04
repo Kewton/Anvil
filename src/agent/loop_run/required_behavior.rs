@@ -39,6 +39,7 @@
 //! contract's artifact source without touching either pipeline stage.
 
 use super::task_contract::ArtifactRole;
+use crate::agent::text_tokens;
 
 /// Upper bound for the byte slice of `request` that the extractor / filter
 /// will scan (DR4-002). Both raw user request and any candidate string get
@@ -593,31 +594,18 @@ pub(super) fn behavior_contract_has_repair_authority(
 // capability Stage B fallback).
 // ---------------------------------------------------------------------------
 
-/// Set of substring needles classified as a `Setup` capability / expectation
-/// label (旧 AD9 補助 fallback / AD13 で格下げ). Lowercased ASCII-only;
-/// callers must lowercase before matching. The deterministic order is
-/// pinned via the slice literal so future additions are review-visible.
-const SETUP_LABEL_NEEDLES: &[&str] = &[
-    "install",
-    "setup",
-    "bootstrap",
-    "configure",
-    "dependency",
-    "environment",
-];
-
 /// Set of substring needles classified as a `Verifier prerequisite`
 /// capability label (Stage B / 候補 b for AD18 verifier prerequisite signal).
 const VERIFIER_CAPABILITY_NEEDLES: &[&str] = &["test", "verify"];
 
 /// `true` iff the projection carries any `required_capabilities` /
-/// `verification_expectations` label whose lower-cased form contains
-/// one of [`SETUP_LABEL_NEEDLES`]. Used by `should_install_setup_bootstrap`
+/// `verification_expectations` label whose text matches the shared setup
+/// token table. Used by `should_install_setup_bootstrap`
 /// as the last-resort fallback when neither `required_artifacts::Setup`
 /// nor `optional_artifacts::Setup` / verifier prerequisite signal fired.
 pub(super) fn behavior_projection_has_setup_label(p: &BehaviorContractProjection) -> bool {
-    label_set_hits_needle(&p.required_capabilities, SETUP_LABEL_NEEDLES)
-        || label_set_hits_needle(&p.verification_expectations, SETUP_LABEL_NEEDLES)
+    label_set_hits_setup_token(&p.required_capabilities)
+        || label_set_hits_setup_token(&p.verification_expectations)
 }
 
 /// `true` iff the projection carries any `required_capabilities` /
@@ -638,6 +626,12 @@ fn label_set_hits_needle(entries: &[BoundedLabelWithExcerpt], needles: &[&str]) 
         let lower = entry.label.to_ascii_lowercase();
         needles.iter().any(|needle| lower.contains(needle))
     })
+}
+
+fn label_set_hits_setup_token(entries: &[BoundedLabelWithExcerpt]) -> bool {
+    entries
+        .iter()
+        .any(|entry| text_tokens::contains_setup_token(&entry.label))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3226,6 +3220,7 @@ mod tests {
             "configure database",
             "manage dependency tree",
             "prepare environment",
+            "依存をインストール",
         ] {
             let p = projection_with_capabilities(&[needle]);
             assert!(

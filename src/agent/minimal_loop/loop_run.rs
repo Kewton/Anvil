@@ -1244,7 +1244,7 @@ mod tests {
 
         let messages = build_request_messages(
             &session,
-            &ToolRegistry::default().specs(),
+            ToolRegistry::default().specs(),
             temp.path(),
             PromptToolMode::Native,
             None,

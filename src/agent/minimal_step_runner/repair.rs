@@ -146,6 +146,7 @@ pub(super) fn failed_step_stop_reason(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_repair_exhausted_report(
     work_root: &Path,
     plan: &StepPlan,

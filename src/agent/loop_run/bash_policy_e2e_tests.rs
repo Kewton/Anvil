@@ -986,9 +986,8 @@ fn setup_bootstrap_does_not_overfire_on_plain_add_test_request() {
     // projection only carrying a verifier-capability label (no Setup
     // keyword), `should_install_setup_bootstrap` must return false at
     // step (2) — the label-only Stage B is corroborated only at step
-    // (4) via `behavior_projection_has_setup_label`, which checks
-    // SETUP_LABEL_NEEDLES (install / setup / bootstrap / configure /
-    // dependency / environment) — none of which match "test".
+    // (4) via `behavior_projection_has_setup_label`, which checks the shared
+    // setup token table — none of which match "test".
     let candidates = build_arbiter_candidates_for_test(&agent);
     let setup_bootstrap_present = candidates
         .iter()
