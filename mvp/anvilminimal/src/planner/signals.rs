@@ -6,6 +6,15 @@ pub enum PortSource {
     Plan,
 }
 
+impl PortSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Goal => "goal",
+            Self::Plan => "plan",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestedPort {
     pub port: u16,

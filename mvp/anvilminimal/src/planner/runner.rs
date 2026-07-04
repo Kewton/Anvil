@@ -139,6 +139,32 @@ fn current_final_acceptance_cycle_index() -> usize {
     FINAL_ACCEPTANCE_CYCLE_INDEX.with(Cell::get)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveRequestedPort {
+    port: u16,
+    telemetry: String,
+}
+
+fn effective_requested_port(
+    profile: &str,
+    goal: &str,
+    plan_text: Option<&str>,
+) -> Option<EffectiveRequestedPort> {
+    if let Some(requested) = signals::requested_port(goal, plan_text) {
+        return Some(EffectiveRequestedPort {
+            port: requested.port,
+            telemetry: format!("{} ({})", requested.port, requested.source.as_str()),
+        });
+    }
+    (canonical_profile_name(profile) == "nextjs").then(|| EffectiveRequestedPort {
+        port: crate::planner::profiles::nextjs::DEFAULT_REQUESTED_PORT,
+        telemetry: format!(
+            "{} (default)",
+            crate::planner::profiles::nextjs::DEFAULT_REQUESTED_PORT
+        ),
+    })
+}
+
 fn with_final_acceptance_cycle<T>(cycle_index: usize, f: impl FnOnce() -> T) -> T {
     FINAL_ACCEPTANCE_CYCLE_INDEX.with(|cell| {
         let previous = cell.replace(cycle_index);
@@ -2205,7 +2231,7 @@ fn verify_plan_final_contract(
     let action_hooks = interaction_action_hooks_from_path(&release_gate.interaction_evidence_path);
     let text_telemetry =
         interaction_text_telemetry_from_path(&release_gate.interaction_evidence_path);
-    let requested_port = signals::requested_port(&plan.goal, None).map(|requested| requested.port);
+    let requested_port = effective_requested_port(&config.profile, &plan.goal, None);
     let primary_reason = if !missing_final_artifacts.is_empty() {
         format!(
             "missing final artifacts: {}",
@@ -2257,7 +2283,7 @@ fn verify_plan_final_contract(
         json!({
             "event": "plan_final_contract",
             "profile": config.profile,
-            "requested_port": requested_port,
+            "requested_port": requested_port.as_ref().map(|requested| requested.telemetry.clone()),
             "required_final_artifacts": required_paths,
             "missing_final_artifacts": missing_final_artifacts,
             "completion_contract_verification_enabled": external_contract_checked,
@@ -4841,8 +4867,8 @@ fn ultra_final_acceptance_report_inner(
         interaction_text_telemetry_from_path(&release_gate.interaction_evidence_path);
     let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
     let phase_signal_text = ultra_plan_phase_signal_text(plan);
-    let requested_port = signals::requested_port(&plan.goal, Some(&phase_signal_text))
-        .map(|requested| requested.port);
+    let requested_port =
+        effective_requested_port(&plan.profile, &plan.goal, Some(&phase_signal_text));
     let mut compile_errors = profile_report.compile_errors.clone();
     if let Some(report) = external_report.as_ref() {
         for error in &report.compile_errors {
@@ -4915,7 +4941,7 @@ fn ultra_final_acceptance_report_inner(
                 .profile_inference
                 .map(|inference| inference.source.as_str())
                 .unwrap_or(""),
-            "requested_port": requested_port,
+            "requested_port": requested_port.as_ref().map(|requested| requested.telemetry.clone()),
             "required_paths": required_paths.clone(),
             "missing_paths": missing.clone(),
             "completion_contract_verification_enabled": external_contract_checked,
@@ -5173,11 +5199,11 @@ fn maybe_run_ultra_final_browser_probe(
     {
         return None;
     }
-    let requested_port = signals::requested_port(&plan.goal, Some(&phase_text));
+    let requested_port = effective_requested_port(&plan.profile, &plan.goal, Some(&phase_text));
     let observation = probe_browser_readiness_with_offline_and_interaction_options(
         &config.workspace_root,
         &plan.profile,
-        requested_port.map(|requested| requested.port),
+        requested_port.as_ref().map(|requested| requested.port),
         Duration::from_secs(30),
         config.offline,
         interaction_options,
@@ -5185,7 +5211,9 @@ fn maybe_run_ultra_final_browser_probe(
     emit_browser_probe_event(
         config,
         &observation,
-        requested_port.map(|requested| requested.port),
+        requested_port
+            .as_ref()
+            .map(|requested| requested.telemetry.clone()),
     );
     Some(observation)
 }
@@ -5201,7 +5229,7 @@ fn run_ultra_final_browser_checks_before_arbitration(
     if !ultra_browser_probe_required(&plan.profile, &signal_text, required_capabilities) {
         return None;
     }
-    let requested_port = signals::requested_port(&plan.goal, Some(&phase_text));
+    let requested_port = effective_requested_port(&plan.profile, &plan.goal, Some(&phase_text));
     let interaction_options =
         browser_interaction_probe_options(required_capabilities, required_evidence);
     let browser_probe = maybe_run_ultra_final_browser_probe(
@@ -5214,7 +5242,7 @@ fn run_ultra_final_browser_checks_before_arbitration(
         config,
         requires_canvas_surface(&signal_text, required_capabilities),
         interaction_options,
-        requested_port.map(|requested| requested.port),
+        requested_port.as_ref().map(|requested| requested.port),
     );
     browser_probe
 }
@@ -5324,7 +5352,7 @@ fn ultra_browser_probe_runtime_enabled(config: &Config) -> bool {
 fn emit_browser_probe_event(
     config: &Config,
     observation: &BrowserReadinessObservation,
-    requested_port: Option<u16>,
+    requested_port: Option<String>,
 ) {
     eval_events::emit(
         config.eval_events_path.as_deref(),
@@ -5640,7 +5668,7 @@ fn final_acceptance_release_gate(
         .unwrap_or_default();
     let interaction_options =
         browser_interaction_probe_options(required_capabilities, &acceptance_required_evidence);
-    let requested_port = signals::requested_port(goal, None);
+    let requested_port = effective_requested_port(profile, goal, None);
     let requires_browser = is_next
         && (required_capabilities.iter().any(|capability| {
             matches!(
@@ -5674,7 +5702,7 @@ fn final_acceptance_release_gate(
                 config,
                 requires_canvas_surface(goal, required_capabilities),
                 interaction_options,
-                requested_port.map(|requested| requested.port),
+                requested_port.as_ref().map(|requested| requested.port),
             );
             let mut reasons = vec![report.primary_reason.clone()];
             reasons.extend(std::mem::take(&mut gate.reasons));
@@ -5697,7 +5725,7 @@ fn final_acceptance_release_gate(
                 config,
                 requires_canvas_surface(goal, required_capabilities),
                 interaction_options,
-                requested_port.map(|requested| requested.port),
+                requested_port.as_ref().map(|requested| requested.port),
             )
         } else {
             ReleaseGateSummary {
@@ -5723,7 +5751,7 @@ fn final_acceptance_release_gate(
             config,
             requires_canvas_surface(goal, required_capabilities),
             interaction_options,
-            requested_port.map(|requested| requested.port),
+            requested_port.as_ref().map(|requested| requested.port),
         );
     }
     ReleaseGateSummary {
@@ -6810,9 +6838,7 @@ fn load_nextjs_dev_server_probe_spec(
     if !script_contains_next_dev(script) {
         return Err("browser_unavailable:dev_script_not_next_dev".to_string());
     }
-    let port = requested_port
-        .or_else(|| parse_next_dev_port(script))
-        .unwrap_or(NEXTJS_DEV_SERVER_DEFAULT_PORT);
+    let port = requested_port.unwrap_or(NEXTJS_DEV_SERVER_DEFAULT_PORT);
     let (package_manager, args) = package_manager_dev_command(root);
     let command_display = std::iter::once(package_manager.as_str())
         .chain(args.iter().map(String::as_str))
@@ -6830,30 +6856,6 @@ fn load_nextjs_dev_server_probe_spec(
 fn script_contains_next_dev(script: &str) -> bool {
     let lower = script.to_ascii_lowercase();
     lower.contains("next") && lower.contains("dev")
-}
-
-fn parse_next_dev_port(script: &str) -> Option<u16> {
-    let tokens = script.split_whitespace().collect::<Vec<_>>();
-    for (index, token) in tokens.iter().enumerate() {
-        if matches!(*token, "-p" | "--port")
-            && let Some(raw) = tokens.get(index + 1)
-            && let Ok(port) = raw.parse::<u16>()
-        {
-            return Some(port);
-        }
-        if let Some(raw) = token.strip_prefix("-p")
-            && !raw.is_empty()
-            && let Ok(port) = raw.parse::<u16>()
-        {
-            return Some(port);
-        }
-        if let Some(raw) = token.strip_prefix("--port=")
-            && let Ok(port) = raw.parse::<u16>()
-        {
-            return Some(port);
-        }
-    }
-    None
 }
 
 fn package_manager_dev_command(root: &Path) -> (String, Vec<String>) {
@@ -13268,7 +13270,7 @@ if __name__ == "__main__":
             AssistantReply::text("final acceptance repair could not add restart behavior"),
         ]);
         let plan = UltraPlan {
-            goal: "Create an interactive browser game".to_string(),
+            goal: explicit_port_goal("Create an interactive browser game", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -13584,7 +13586,7 @@ if __name__ == "__main__":
         std::fs::write(
             dir.path().join("package.json"),
             format!(
-                r#"{{"scripts":{{"build":"next build","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}}}}"#
+                r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}}}}"#
             ),
         )
         .unwrap();
@@ -13616,7 +13618,7 @@ if __name__ == "__main__":
         )
         .unwrap();
         let plan = UltraPlan {
-            goal: "Create an interactive browser game".to_string(),
+            goal: explicit_port_goal("Create an interactive browser game", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -15803,7 +15805,7 @@ if __name__ == "__main__":
             true,
             cleanup_dev_server_child,
             BrowserInteractionProbeOptions::default(),
-            None,
+            Some(port),
         );
 
         assert!(
@@ -15860,7 +15862,7 @@ if __name__ == "__main__":
             true,
             forced_cleanup_timeout_after_real_cleanup,
             BrowserInteractionProbeOptions::default(),
-            None,
+            Some(port),
         );
 
         assert_eq!(evidence.get("ok").and_then(Value::as_bool), Some(true));
@@ -15899,7 +15901,7 @@ if __name__ == "__main__":
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let plan = UltraPlan {
-            goal: "Create an interactive browser game".to_string(),
+            goal: explicit_port_goal("Create an interactive browser game", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -15963,8 +15965,11 @@ if __name__ == "__main__":
         );
         let mut execution = FakeClient::new(execution_replies);
 
+        let command = format!(
+            "/ultra-plan-run --profile nextjs \"Create an interactive browser game on port {port}\""
+        );
         let result = crate::tui::slash::handle_command(
-            "/ultra-plan-run --profile nextjs \"Create an interactive browser game\"",
+            &command,
             &cfg,
             &mut planner,
             &mut execution,
@@ -16138,7 +16143,7 @@ if __name__ == "__main__":
             true,
             cleanup_dev_server_child,
             BrowserInteractionProbeOptions::default(),
-            None,
+            Some(port),
         );
 
         assert_eq!(readiness.get("ok").and_then(Value::as_bool), Some(true));
@@ -16185,7 +16190,7 @@ if __name__ == "__main__":
             true,
             cleanup_dev_server_child,
             BrowserInteractionProbeOptions::default(),
-            None,
+            Some(port),
         );
 
         assert_eq!(readiness.get("ok").and_then(Value::as_bool), Some(true));
@@ -16273,7 +16278,7 @@ if __name__ == "__main__":
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let plan = UltraPlan {
-            goal: "Create an interactive browser game".to_string(),
+            goal: explicit_port_goal("Create an interactive browser game", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -16589,7 +16594,7 @@ if __name__ == "__main__":
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let plan = UltraPlan {
-            goal: "Create an interactive browser game".to_string(),
+            goal: explicit_port_goal("Create an interactive browser game", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -16685,7 +16690,7 @@ if __name__ == "__main__":
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let plan = UltraPlan {
-            goal: "Create an interactive browser game".to_string(),
+            goal: explicit_port_goal("Create an interactive browser game", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -16790,7 +16795,7 @@ if __name__ == "__main__":
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let plan = UltraPlan {
-            goal: "Create an interactive browser game".to_string(),
+            goal: explicit_port_goal("Create an interactive browser game", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -16843,7 +16848,7 @@ if __name__ == "__main__":
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let plan = UltraPlan {
-            goal: "Create an interactive browser game with restart flow".to_string(),
+            goal: explicit_port_goal("Create an interactive browser game with restart flow", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -16976,7 +16981,7 @@ if __name__ == "__main__":
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let plan = UltraPlan {
-            goal: "Create an interactive browser game with restart flow".to_string(),
+            goal: explicit_port_goal("Create an interactive browser game with restart flow", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -17065,7 +17070,7 @@ if __name__ == "__main__":
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let plan = UltraPlan {
-            goal: "Create an interactive browser game with restart flow".to_string(),
+            goal: explicit_port_goal("Create an interactive browser game with restart flow", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -18979,6 +18984,10 @@ export default function Memo(){
         r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011","start":"next start -p 3011"}}"#
     }
 
+    fn explicit_port_goal(goal: &str, port: u16) -> String {
+        format!("{goal} on port {port}")
+    }
+
     fn nextjs_tsconfig_json() -> &'static str {
         r#"{"compilerOptions":{"target":"ES2017","lib":["dom","dom.iterable","esnext"],"allowJs":true,"skipLibCheck":true,"strict":true,"noEmit":true,"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler","resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve","incremental":true,"plugins":[{"name":"next"}],"baseUrl":".","paths":{"@/*":["./src/*"]}},"include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],"exclude":["node_modules"]}"#
     }
@@ -19636,7 +19645,7 @@ exit 2\n"
                 "required_paths": ["src/app/page.tsx", "src/components/SpaceInvaders.tsx"],
                 "verify_commands": ["npm run build"],
                 "profile": "nextjs",
-                "goal": "Create an interactive browser app",
+                "goal": explicit_port_goal("Create an interactive browser app", port),
                 "required_capabilities": ["playable_ui", "stateful_interaction"],
                 "verify_repair_cap": 2
             }))
@@ -19843,7 +19852,7 @@ exit 2\n",
         cfg.eval_events_path = Some(events.clone());
         cfg.completion_contract_path = Some(contract);
         let plan = UltraPlan {
-            goal: "Create an interactive browser app".to_string(),
+            goal: explicit_port_goal("Create an interactive browser app", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -19889,7 +19898,7 @@ exit 2\n",
         cfg.eval_events_path = Some(events.clone());
         cfg.completion_contract_path = Some(contract);
         let plan = UltraPlan {
-            goal: "Create an interactive browser app".to_string(),
+            goal: explicit_port_goal("Create an interactive browser app", port),
             profile: "nextjs".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -20301,7 +20310,7 @@ exit 2\n",
     }
 
     #[test]
-    fn dev_server_probe_spec_falls_back_to_script_port_without_request() {
+    fn dev_server_probe_spec_defaults_to_3011_without_request() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("package.json"),
@@ -20311,7 +20320,28 @@ exit 2\n",
 
         let spec = load_nextjs_dev_server_probe_spec(dir.path(), None).unwrap();
 
-        assert_eq!(spec.port, 4010);
+        assert_eq!(spec.port, 3011);
+    }
+
+    #[test]
+    fn requested_port_telemetry_labels_nextjs_default_and_explicit_goal() {
+        let default = effective_requested_port("nextjs", "ブラウザで使えるメモアプリ", None)
+            .expect("nextjs default port");
+        assert_eq!(default.port, 3011);
+        assert_eq!(default.telemetry, "3011 (default)");
+
+        let explicit =
+            effective_requested_port("nextjs", "4000番ポートで起動", None).expect("explicit port");
+        assert_eq!(explicit.port, 4000);
+        assert_eq!(explicit.telemetry, "4000 (goal)");
+    }
+
+    #[test]
+    fn requested_port_telemetry_leaves_python_cli_without_default_port() {
+        assert_eq!(
+            effective_requested_port("python-cli", "CSVを集計するCLI", None),
+            None
+        );
     }
 
     #[test]

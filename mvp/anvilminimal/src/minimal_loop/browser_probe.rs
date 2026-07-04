@@ -14,7 +14,7 @@ use crate::minimal_loop::interaction_probe;
 use crate::minimal_loop::verifier_env;
 
 const DEFAULT_ROUTE: &str = "/";
-const DEFAULT_NEXTJS_PORT: u16 = 3000;
+const DEFAULT_NEXTJS_PORT: u16 = crate::planner::profiles::nextjs::DEFAULT_REQUESTED_PORT;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const WALL_CLOCK_CAP: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -384,9 +384,7 @@ fn resolve_probe_spec(
     command_override: Option<&ProbeCommand>,
 ) -> ProbeSpec {
     let manifest = read_package_json(root);
-    let detected_port = explicit_port
-        .or_else(|| manifest.as_ref().and_then(port_from_package_scripts))
-        .unwrap_or(DEFAULT_NEXTJS_PORT);
+    let detected_port = explicit_port.unwrap_or(DEFAULT_NEXTJS_PORT);
     let command = command_override
         .cloned()
         .unwrap_or_else(|| start_command_for_package(manifest.as_ref(), detected_port));
@@ -400,20 +398,6 @@ fn resolve_probe_spec(
 fn read_package_json(root: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(root.join("package.json")).ok()?;
     serde_json::from_str::<Value>(&text).ok()
-}
-
-fn port_from_package_scripts(package: &Value) -> Option<u16> {
-    let scripts = package.get("scripts")?.as_object()?;
-    scripts
-        .get("start")
-        .and_then(Value::as_str)
-        .and_then(parse_script_port)
-        .or_else(|| {
-            scripts
-                .get("dev")
-                .and_then(Value::as_str)
-                .and_then(parse_script_port)
-        })
 }
 
 fn start_command_for_package(package: Option<&Value>, port: u16) -> ProbeCommand {
@@ -443,30 +427,6 @@ fn start_command_for_package(package: Option<&Value>, port: u16) -> ProbeCommand
         env: Vec::new(),
         display: format!("npx --no-install next start -p {port}"),
     }
-}
-
-fn parse_script_port(script: &str) -> Option<u16> {
-    let tokens = script.split_whitespace().collect::<Vec<_>>();
-    for (index, token) in tokens.iter().enumerate() {
-        if matches!(*token, "-p" | "--port")
-            && let Some(raw) = tokens.get(index + 1)
-            && let Ok(port) = raw.parse::<u16>()
-        {
-            return Some(port);
-        }
-        if let Some(raw) = token.strip_prefix("-p")
-            && !raw.is_empty()
-            && let Ok(port) = raw.parse::<u16>()
-        {
-            return Some(port);
-        }
-        if let Some(raw) = token.strip_prefix("--port=")
-            && let Ok(port) = raw.parse::<u16>()
-        {
-            return Some(port);
-        }
-    }
-    None
 }
 
 fn normalized_timeout(timeout: Duration) -> Duration {
@@ -1001,6 +961,21 @@ mod tests {
         assert!(!observation.ok, "{observation:?}");
         assert_eq!(observation.failure_kind, "port_in_use");
         assert!(!observation.child_spawned);
+    }
+
+    #[test]
+    fn probe_spec_defaults_to_3011_without_explicit_port() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"start":"next start -p 3000","dev":"next dev -p 3000"},"dependencies":{"next":"x"}}"#,
+        )
+        .unwrap();
+
+        let spec = resolve_probe_spec(dir.path(), None, None);
+
+        assert_eq!(spec.port, DEFAULT_NEXTJS_PORT);
+        assert_eq!(spec.port, 3011);
     }
 
     #[test]
