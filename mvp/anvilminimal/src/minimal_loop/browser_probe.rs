@@ -104,6 +104,7 @@ struct ProbeOptions {
     offline: bool,
     require_build: bool,
     command_override: Option<ProbeCommand>,
+    interaction_options: interaction_probe::BrowserInteractionProbeOptions,
 }
 
 pub fn probe_browser_readiness(
@@ -122,6 +123,24 @@ pub fn probe_browser_readiness_with_offline(
     timeout: Duration,
     offline: bool,
 ) -> BrowserReadinessObservation {
+    probe_browser_readiness_with_offline_and_interaction_options(
+        root,
+        profile,
+        port,
+        timeout,
+        offline,
+        interaction_probe::BrowserInteractionProbeOptions::default(),
+    )
+}
+
+pub fn probe_browser_readiness_with_offline_and_interaction_options(
+    root: &Path,
+    profile: &str,
+    port: Option<u16>,
+    timeout: Duration,
+    offline: bool,
+    interaction_options: interaction_probe::BrowserInteractionProbeOptions,
+) -> BrowserReadinessObservation {
     #[cfg(not(test))]
     let options = ProbeOptions {
         port,
@@ -129,6 +148,7 @@ pub fn probe_browser_readiness_with_offline(
         offline,
         require_build: true,
         command_override: None,
+        interaction_options,
     };
     #[cfg(test)]
     let mut options = ProbeOptions {
@@ -137,6 +157,7 @@ pub fn probe_browser_readiness_with_offline(
         offline,
         require_build: true,
         command_override: None,
+        interaction_options,
     };
     #[cfg(test)]
     if let Some(override_command) = load_test_probe_command(root) {
@@ -274,12 +295,13 @@ fn probe_browser_readiness_with_options(
                     let run_dir = evidence_path.parent().unwrap_or(root);
                     let interaction_path =
                         interaction_probe::browser_interaction_evidence_path(root);
-                    let _ = interaction_probe::probe_browser_interaction_against_running_server(
+                    let _ = interaction_probe::probe_browser_interaction_against_running_server_with_options(
                         root,
                         spec.port,
                         run_dir,
                         &interaction_path,
                         Duration::from_secs(60),
+                        options.interaction_options,
                     );
                     let cleanup = child.finish();
                     let output = first_non_empty(&cleanup.output_excerpt, &response.body_excerpt);
@@ -1137,6 +1159,7 @@ mod tests {
                 offline: false,
                 require_build: false,
                 command_override: Some(command),
+                interaction_options: interaction_probe::BrowserInteractionProbeOptions::default(),
             },
         )
     }

@@ -13,7 +13,8 @@ use crate::config::Config;
 use crate::eval_events;
 use crate::minimal_loop::behavior_evidence::{self, EvidenceArbitrationReport};
 use crate::minimal_loop::browser_probe::{
-    BrowserReadinessObservation, html_surface_markers_json, probe_browser_readiness_with_offline,
+    BrowserReadinessObservation, html_surface_markers_json,
+    probe_browser_readiness_with_offline_and_interaction_options,
 };
 use crate::minimal_loop::build_verifier::{
     BuildVerifierLifecycleObservation, BuildVerifierStatus, CompileError,
@@ -31,7 +32,9 @@ use crate::minimal_loop::import_scan::{
     MissingImport, format_missing_import_findings, missing_import_target_rel, route_bound_closure,
     scan_relative_imports,
 };
-use crate::minimal_loop::interaction_probe::{self, InteractionProbeOutcome};
+use crate::minimal_loop::interaction_probe::{
+    self, BrowserInteractionProbeOptions, InteractionProbeOutcome,
+};
 use crate::minimal_loop::loop_run::{
     ContractEnforcement, RunSessionError, RunSessionOptions, RunSessionOutcome, RunSessionStepKind,
     extract_requested_artifact_paths, run_session_with_outcome_with_options,
@@ -99,10 +102,12 @@ const DEV_SERVER_LIFECYCLE_STAGES: [&str; 4] = ["start", "wait", "probe", "clean
 const PROFILE_REPAIR_FILE_EXCERPT_MAX_CHARS: usize = 2_400;
 const INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT: &str = "keyboard or pointer input must visibly change game state (player position, projectiles, score/health, or state transitions); wire input handlers into the render/update loop.";
 const INTERACTION_START_REPAIR_REQUIREMENT: &str = "primary/start controls must transition the visible app state before input is evaluated; wire the start action into state and render updates.";
-const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 9] = [
+const PERSISTENCE_RELOAD_REPAIR_REQUIREMENT: &str = "load persisted state on mount (e.g. read localStorage in initialization) and write on mutation";
+const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 10] = [
     "interaction_state_change_missing",
     "input_state_change_missing_after_start",
     "input_state_change_not_evaluated_after_start",
+    "persistence_after_reload_reset",
     "primary_start_transition_missing",
     "start_transition_missing",
     "surface_missing",
@@ -2006,6 +2011,7 @@ fn verify_plan_final_contract(
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
     let state_dimensions_changed =
         interaction_state_dimensions_changed_from_path(&release_gate.interaction_evidence_path);
+    let action_hooks = interaction_action_hooks_from_path(&release_gate.interaction_evidence_path);
     let primary_reason = if !missing_final_artifacts.is_empty() {
         format!(
             "missing final artifacts: {}",
@@ -2139,6 +2145,7 @@ fn verify_plan_final_contract(
             "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "state_dimensions_changed": state_dimensions_changed,
+            "action_hooks": action_hooks,
             "next_action": next_action,
             "recovery_handoff_kind": recovery_handoff
                 .as_ref()
@@ -4548,7 +4555,12 @@ fn ultra_final_acceptance_report_inner(
     let browser_probe = if production_build_failed {
         None
     } else {
-        run_ultra_final_browser_checks_before_arbitration(config, plan, &required_capabilities)
+        run_ultra_final_browser_checks_before_arbitration(
+            config,
+            plan,
+            &required_capabilities,
+            &required_evidence,
+        )
     };
     let evidence_arbitration = final_acceptance_evidence_arbitration(
         config,
@@ -4584,6 +4596,7 @@ fn ultra_final_acceptance_report_inner(
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
     let state_dimensions_changed =
         interaction_state_dimensions_changed_from_path(&release_gate.interaction_evidence_path);
+    let action_hooks = interaction_action_hooks_from_path(&release_gate.interaction_evidence_path);
     let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
     let mut compile_errors = profile_report.compile_errors.clone();
     if let Some(report) = external_report.as_ref() {
@@ -4696,6 +4709,7 @@ fn ultra_final_acceptance_report_inner(
             "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "state_dimensions_changed": state_dimensions_changed,
+            "action_hooks": action_hooks,
             "next_action": next_action,
             "recovery_handoff_kind": recovery_handoff
                 .as_ref()
@@ -4915,18 +4929,20 @@ fn maybe_run_ultra_final_browser_probe(
     config: &Config,
     plan: &UltraPlan,
     required_capabilities: &[String],
+    interaction_options: BrowserInteractionProbeOptions,
 ) -> Option<BrowserReadinessObservation> {
     if !ultra_browser_probe_required(&plan.profile, &plan.goal, required_capabilities)
         || !ultra_browser_probe_runtime_enabled(config)
     {
         return None;
     }
-    let observation = probe_browser_readiness_with_offline(
+    let observation = probe_browser_readiness_with_offline_and_interaction_options(
         &config.workspace_root,
         &plan.profile,
         None,
         Duration::from_secs(30),
         config.offline,
+        interaction_options,
     );
     emit_browser_probe_event(config, &observation);
     Some(observation)
@@ -4936,16 +4952,39 @@ fn run_ultra_final_browser_checks_before_arbitration(
     config: &Config,
     plan: &UltraPlan,
     required_capabilities: &[String],
+    required_evidence: &[String],
 ) -> Option<BrowserReadinessObservation> {
     if !ultra_browser_probe_required(&plan.profile, &plan.goal, required_capabilities) {
         return None;
     }
-    let browser_probe = maybe_run_ultra_final_browser_probe(config, plan, required_capabilities);
-    let _ = browser_release_gate_with_expectations(
+    let interaction_options =
+        browser_interaction_probe_options(required_capabilities, required_evidence);
+    let browser_probe = maybe_run_ultra_final_browser_probe(
+        config,
+        plan,
+        required_capabilities,
+        interaction_options,
+    );
+    let _ = browser_release_gate_with_options(
         config,
         requires_canvas_surface(&plan.goal, required_capabilities),
+        interaction_options,
     );
     browser_probe
+}
+
+fn browser_interaction_probe_options(
+    required_capabilities: &[String],
+    required_evidence: &[String],
+) -> BrowserInteractionProbeOptions {
+    BrowserInteractionProbeOptions {
+        persistence_required: required_capabilities
+            .iter()
+            .any(|capability| capability == "persistence")
+            || required_evidence
+                .iter()
+                .any(|evidence| evidence == "persistence_evidence"),
+    }
 }
 
 fn report_has_production_build_failure(report: &VerificationReport) -> bool {
@@ -5085,6 +5124,9 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "candidate_table": &observation.candidate_table,
                     "input_dispatches": &observation.input_dispatches,
                     "state_dimensions_changed": &observation.state_dimensions_changed,
+                    "persistence_after_reload": observation.persistence_after_reload.as_str(),
+                    "persistence_changed_dimensions": &observation.persistence_changed_dimensions,
+                    "action_hooks": &observation.action_hooks,
                     "input_state_evaluated_after_start": observation.input_state_evaluated_after_start,
                     "primary_start_transition": observation.primary_transition_observed,
                     "informational_failure_kinds": &observation.informational_failure_kinds,
@@ -5310,6 +5352,11 @@ fn final_acceptance_release_gate(
 ) -> ReleaseGateSummary {
     let lower = goal.to_ascii_lowercase();
     let is_next = matches!(profile, "nextjs" | "next-js" | "next.js");
+    let acceptance_required_evidence = acceptance
+        .map(|report| report.evidence_tiers.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let interaction_options =
+        browser_interaction_probe_options(required_capabilities, &acceptance_required_evidence);
     let requires_browser = is_next
         && (required_capabilities.iter().any(|capability| {
             matches!(
@@ -5342,9 +5389,10 @@ fn final_acceptance_release_gate(
             && check_browser_on_runtime_failure
             && runtime_acceptance_has_buildable_nextjs_boundary(report)
         {
-            let mut gate = browser_release_gate_with_expectations(
+            let mut gate = browser_release_gate_with_options(
                 config,
                 requires_canvas_surface(goal, required_capabilities),
+                interaction_options,
             );
             let mut reasons = vec![report.primary_reason.clone()];
             reasons.extend(std::mem::take(&mut gate.reasons));
@@ -5363,9 +5411,10 @@ fn final_acceptance_release_gate(
     }
     if !report.unverified_evidence.is_empty() {
         let mut gate = if requires_browser {
-            browser_release_gate_with_expectations(
+            browser_release_gate_with_options(
                 config,
                 requires_canvas_surface(goal, required_capabilities),
+                interaction_options,
             )
         } else {
             ReleaseGateSummary {
@@ -5387,9 +5436,10 @@ fn final_acceptance_release_gate(
         return gate;
     }
     if requires_browser {
-        return browser_release_gate_with_expectations(
+        return browser_release_gate_with_options(
             config,
             requires_canvas_surface(goal, required_capabilities),
+            interaction_options,
         );
     }
     ReleaseGateSummary {
@@ -5615,6 +5665,9 @@ fn runtime_acceptance_repair_guidance(
                 "provide a reachable terminal/failure state and a restart control (data-anvil-action=\"restart\") that resets observable state"
                     .to_string(),
             ),
+            "persistence_evidence" => {
+                guidance.push(PERSISTENCE_RELOAD_REPAIR_REQUIREMENT.to_string())
+            }
             "challenge_or_adversary_evidence" => guidance.push(
                 "wire a reachable challenge/adversary entity into state evolution, not only a static label"
                     .to_string(),
@@ -5706,9 +5759,22 @@ fn browser_release_gate(config: &Config) -> ReleaseGateSummary {
     browser_release_gate_with_expectations(config, false)
 }
 
+#[cfg(test)]
 fn browser_release_gate_with_expectations(
     config: &Config,
     canvas_surface_expected: bool,
+) -> ReleaseGateSummary {
+    browser_release_gate_with_options(
+        config,
+        canvas_surface_expected,
+        BrowserInteractionProbeOptions::default(),
+    )
+}
+
+fn browser_release_gate_with_options(
+    config: &Config,
+    canvas_surface_expected: bool,
+    interaction_options: BrowserInteractionProbeOptions,
 ) -> ReleaseGateSummary {
     let mut browser = read_release_evidence(
         config,
@@ -5725,7 +5791,7 @@ fn browser_release_gate_with_expectations(
         ReleaseEvidenceStatus::Unavailable(reason)
             if reason == "browser_readiness_evidence_missing"
     ) {
-        browser = nextjs_dev_route_release_evidence(config);
+        browser = nextjs_dev_route_release_evidence(config, interaction_options);
     }
     let interaction = read_release_evidence(
         config,
@@ -5851,9 +5917,13 @@ fn browser_release_gate_with_expectations(
     }
 }
 
-fn nextjs_dev_route_release_evidence(config: &Config) -> ReleaseEvidence {
+fn nextjs_dev_route_release_evidence(
+    config: &Config,
+    interaction_options: BrowserInteractionProbeOptions,
+) -> ReleaseEvidence {
     let path = nextjs_dev_route_evidence_path(config);
-    let value = run_nextjs_dev_route_probe(config, &path);
+    let value =
+        run_nextjs_dev_route_probe_with_interaction_options(config, &path, interaction_options);
     let status = classify_release_evidence_json(ReleaseEvidenceKind::BrowserReadiness, &value);
     write_release_evidence_json(&path, &value);
     ReleaseEvidence {
@@ -5912,12 +5982,26 @@ fn nextjs_dev_route_evidence_path(config: &Config) -> PathBuf {
         .join("browser-readiness.json")
 }
 
+#[cfg(test)]
 fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
+    run_nextjs_dev_route_probe_with_interaction_options(
+        config,
+        evidence_path,
+        BrowserInteractionProbeOptions::default(),
+    )
+}
+
+fn run_nextjs_dev_route_probe_with_interaction_options(
+    config: &Config,
+    evidence_path: &Path,
+    interaction_options: BrowserInteractionProbeOptions,
+) -> Value {
     run_nextjs_dev_route_probe_with_runtime(
         config,
         evidence_path,
         dev_server_probe_runtime_enabled(config),
         cleanup_dev_server_child,
+        interaction_options,
     )
 }
 
@@ -5928,6 +6012,7 @@ fn run_nextjs_dev_route_probe_with_runtime(
     evidence_path: &Path,
     runtime_enabled: bool,
     cleanup_fn: DevServerCleanupFn,
+    interaction_options: BrowserInteractionProbeOptions,
 ) -> Value {
     if !runtime_enabled {
         let failure_kind = if cfg!(test) {
@@ -6286,12 +6371,13 @@ fn run_nextjs_dev_route_probe_with_runtime(
                     let interaction_path = evidence_path.with_file_name("browser-interaction.json");
                     let run_dir = evidence_path.parent().unwrap_or(&config.workspace_root);
                     let interaction =
-                        interaction_probe::probe_browser_interaction_against_running_server(
+                        interaction_probe::probe_browser_interaction_against_running_server_with_options(
                             &config.workspace_root,
                             spec.port,
                             run_dir,
                             &interaction_path,
                             Duration::from_secs(60),
+                            interaction_options,
                         );
                     emit_browser_interaction_probe_event(config, &interaction);
                 }
@@ -8016,6 +8102,8 @@ fn interaction_repair_targets_for_reason(reason: &str) -> Vec<String> {
         || lower.contains("interaction_state_change_missing")
     {
         vec!["input_state_render_wiring".to_string()]
+    } else if lower.contains("persistence_after_reload_reset") {
+        vec!["persistence_state_wiring".to_string()]
     } else if lower.contains("start_transition_missing")
         || lower.contains("primary_start_transition_missing")
     {
@@ -8032,6 +8120,7 @@ fn behavior_depth_evidence_key(evidence: &str) -> bool {
             | "failure_or_collision_evidence"
             | "score_or_progression_evidence"
             | "restart_or_recoverable_state_evidence"
+            | "persistence_evidence"
     )
 }
 
@@ -10248,11 +10337,28 @@ fn final_acceptance_behavioral_probe_context(
         if let Some(restart_present) = raw_contract_hook_bool(value, "restart_present") {
             lines.push(format!("- restart hook present: {restart_present}"));
         }
+        let action_hooks = raw_string_array_field_deep(value, "action_hooks");
+        if !action_hooks.is_empty() {
+            lines.push(format!("- action hooks: {}", action_hooks.join(", ")));
+        }
         let state_dimensions = raw_string_array_field_deep(value, "state_dimensions_changed");
         if !state_dimensions.is_empty() {
             lines.push(format!(
                 "- state dimensions changed: {}",
                 state_dimensions.join(", ")
+            ));
+        }
+        if let Some(status) = raw_text_field_deep(value, &["persistence_after_reload"])
+            .filter(|status| !status.is_empty())
+        {
+            lines.push(format!("- persistence after reload: {status}"));
+        }
+        let persisted_dimensions =
+            raw_string_array_field_deep(value, "persistence_changed_dimensions");
+        if !persisted_dimensions.is_empty() {
+            lines.push(format!(
+                "- persistence dimensions checked: {}",
+                persisted_dimensions.join(", ")
             ));
         }
         let info = raw_string_array_field_deep(value, "informational_failure_kinds");
@@ -10295,6 +10401,11 @@ fn final_acceptance_behavioral_probe_context(
             "- concrete requirement: {INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT}"
         ));
     }
+    if failure_kind.contains("persistence_after_reload_reset") {
+        lines.push(format!(
+            "- concrete requirement: {PERSISTENCE_RELOAD_REPAIR_REQUIREMENT}"
+        ));
+    }
     let route_paths = route_bound_implementation_paths(expected_paths);
     if !route_paths.is_empty() {
         lines.push("Route-bound implementation targets:".to_string());
@@ -10324,6 +10435,9 @@ fn final_acceptance_recovery_reason(
     } else if failure_kind.contains("start_transition_missing") {
         out.push_str("; ");
         out.push_str(INTERACTION_START_REPAIR_REQUIREMENT);
+    } else if failure_kind.contains("persistence_after_reload_reset") {
+        out.push_str("; ");
+        out.push_str(PERSISTENCE_RELOAD_REPAIR_REQUIREMENT);
     }
     let context = final_acceptance_behavioral_probe_context(report, &[]);
     if !context.is_empty() {
@@ -10403,6 +10517,15 @@ fn interaction_state_dimensions_changed_from_path(path: &str) -> Vec<String> {
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
         .filter(Value::is_object)
         .map(|value| raw_string_array_field_deep(&value, "state_dimensions_changed"))
+        .unwrap_or_default()
+}
+
+fn interaction_action_hooks_from_path(path: &str) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+        .map(|value| raw_string_array_field_deep(&value, "action_hooks"))
         .unwrap_or_default()
 }
 
@@ -14587,6 +14710,7 @@ if __name__ == "__main__":
             &evidence_path,
             true,
             cleanup_dev_server_child,
+            BrowserInteractionProbeOptions::default(),
         );
 
         assert!(
@@ -14642,6 +14766,7 @@ if __name__ == "__main__":
             &evidence_path,
             true,
             forced_cleanup_timeout_after_real_cleanup,
+            BrowserInteractionProbeOptions::default(),
         );
 
         assert_eq!(evidence.get("ok").and_then(Value::as_bool), Some(true));
@@ -14918,6 +15043,7 @@ if __name__ == "__main__":
             &evidence_path,
             true,
             cleanup_dev_server_child,
+            BrowserInteractionProbeOptions::default(),
         );
 
         assert_eq!(readiness.get("ok").and_then(Value::as_bool), Some(true));
@@ -14963,6 +15089,7 @@ if __name__ == "__main__":
             &evidence_path,
             true,
             cleanup_dev_server_child,
+            BrowserInteractionProbeOptions::default(),
         );
 
         assert_eq!(readiness.get("ok").and_then(Value::as_bool), Some(true));
@@ -16022,6 +16149,48 @@ if __name__ == "__main__":
             guidance.contains("consolidate into page.tsx and delete the dead component"),
             "{guidance}"
         );
+    }
+
+    #[test]
+    fn persistence_reset_runtime_guidance_names_reload_persistence_repair() {
+        let report = RuntimeAcceptanceReport {
+            missing_evidence: vec!["persistence_evidence".to_string()],
+            ..RuntimeAcceptanceReport::default()
+        };
+
+        let guidance = runtime_acceptance_repair_guidance(&report).join("\n");
+
+        assert!(
+            guidance.contains("load persisted state on mount"),
+            "{guidance}"
+        );
+        assert!(
+            guidance.contains("read localStorage in initialization"),
+            "{guidance}"
+        );
+        assert!(guidance.contains("write on mutation"), "{guidance}");
+    }
+
+    #[test]
+    fn browser_interaction_probe_options_require_reload_only_for_persistence_contract() {
+        let game = browser_interaction_probe_options(
+            &[
+                "stateful_interaction".to_string(),
+                "player_control".to_string(),
+            ],
+            &["stateful_update_evidence".to_string()],
+        );
+        assert!(
+            !game.persistence_required,
+            "game contracts without persistence must not reload"
+        );
+
+        let by_capability = browser_interaction_probe_options(&["persistence".to_string()], &[]);
+        assert!(by_capability.persistence_required);
+
+        let by_evidence =
+            browser_interaction_probe_options(&[], &["persistence_evidence".to_string()]);
+        assert!(by_evidence.persistence_required);
     }
 
     #[test]

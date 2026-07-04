@@ -88,6 +88,11 @@ pub struct InteractionProbeCandidateEvidence {
     pub changed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+pub struct BrowserInteractionProbeOptions {
+    pub persistence_required: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BrowserInteractionObservation {
     pub ok: bool,
@@ -109,6 +114,11 @@ pub struct BrowserInteractionObservation {
     pub candidate_table: Vec<InteractionProbeCandidateEvidence>,
     pub input_dispatches: Vec<String>,
     pub state_dimensions_changed: Vec<String>,
+    pub persistence_after_reload: String,
+    pub persistence_changed_dimensions: Vec<String>,
+    pub persistence_before_reload_marker: String,
+    pub persistence_after_reload_marker: String,
+    pub action_hooks: Vec<String>,
     pub primary_transition_observed: bool,
     pub start_control_found: bool,
     pub informational_failure_kinds: Vec<String>,
@@ -590,6 +600,24 @@ pub fn probe_browser_interaction_against_running_server(
     evidence_path: &Path,
     timeout: Duration,
 ) -> InteractionProbeOutcome {
+    probe_browser_interaction_against_running_server_with_options(
+        root,
+        port,
+        run_dir,
+        evidence_path,
+        timeout,
+        BrowserInteractionProbeOptions::default(),
+    )
+}
+
+pub fn probe_browser_interaction_against_running_server_with_options(
+    root: &Path,
+    port: u16,
+    run_dir: &Path,
+    evidence_path: &Path,
+    timeout: Duration,
+    options: BrowserInteractionProbeOptions,
+) -> InteractionProbeOutcome {
     let availability = playwright_availability(root);
     let Some(resolution) = availability.resolution().cloned() else {
         let ProbeAvailability::Unavailable(reason) = availability else {
@@ -678,6 +706,10 @@ pub fn probe_browser_interaction_against_running_server(
         .arg(&script_path)
         .arg(&url)
         .arg(evidence_path)
+        .arg(
+            serde_json::to_string(&options)
+                .unwrap_or_else(|_| "{\"persistence_required\":false}".to_string()),
+        )
         .current_dir(root)
         .envs(node_path_env(
             resolution.node_path.as_deref().map(Path::new),
@@ -1127,6 +1159,14 @@ const http = require("http");
 
 const url = process.argv[2];
 const outputPath = process.argv[3];
+const probeOptions = (() => {
+  try {
+    return JSON.parse(process.argv[4] || "{}");
+  } catch (_) {
+    return {};
+  }
+})();
+const persistenceRequired = !!probeOptions.persistence_required;
 const started = Date.now();
 const LAUNCH_TIMEOUT_MS = 20000;
 const GOTO_TIMEOUT_MS = 12000;
@@ -1149,6 +1189,11 @@ let input_state_evaluated_after_start = false;
 let candidate_table = [];
 let input_dispatches = [];
 let state_dimensions_changed = [];
+let persistence_after_reload = "not_evaluated";
+let persistence_changed_dimensions = [];
+let persistence_before_reload_marker = "";
+let persistence_after_reload_marker = "";
+let action_hooks = [];
 let informational_failure_kinds = [];
 let server_check = { ok: false, status: null, error: "" };
 let post_js_surface = null;
@@ -1369,6 +1414,108 @@ function mergeStateDimensionsChanged(keys) {
   state_dimensions_changed.sort();
 }
 
+function retainedChangedStateKeys(inputBeforeText, inputAfterText, beforeReloadText) {
+  const changed = changedTopLevelStateKeys(inputBeforeText, inputAfterText);
+  if (changed.length === 0) return [];
+  const inputBefore = contractStatesFromMarker(inputBeforeText);
+  const inputAfter = contractStatesFromMarker(inputAfterText);
+  const beforeReload = contractStatesFromMarker(beforeReloadText);
+  const retained = new Set();
+  const count = Math.max(inputBefore.length, inputAfter.length, beforeReload.length);
+  for (let index = 0; index < count; index += 1) {
+    const beforeState = inputBefore[index] || {};
+    const afterState = inputAfter[index] || {};
+    const reloadState = beforeReload[index] || {};
+    for (const key of changed) {
+      if (
+        stableStateString(beforeState[key]) !== stableStateString(afterState[key]) &&
+        stableStateString(afterState[key]) === stableStateString(reloadState[key])
+      ) {
+        retained.add(key);
+      }
+    }
+  }
+  return Array.from(retained).sort();
+}
+
+function changedStateKeysPreservedAfterReload(keys, beforeReloadText, afterReloadText) {
+  const beforeReload = contractStatesFromMarker(beforeReloadText);
+  const afterReload = contractStatesFromMarker(afterReloadText);
+  const count = Math.max(beforeReload.length, afterReload.length);
+  for (const key of keys) {
+    let sawKey = false;
+    for (let index = 0; index < count; index += 1) {
+      const beforeState = beforeReload[index] || {};
+      const afterState = afterReload[index] || {};
+      if (Object.prototype.hasOwnProperty.call(beforeState, key)) {
+        sawKey = true;
+      }
+      if (stableStateString(beforeState[key]) !== stableStateString(afterState[key])) {
+        return false;
+      }
+    }
+    if (!sawKey) return false;
+  }
+  return keys.length > 0;
+}
+
+function evaluatePersistenceAfterReload(mode, beforeReloadText, afterReloadText) {
+  if (mode === "contract") {
+    const retained = retainedChangedStateKeys(input_before_marker, input_after_marker, beforeReloadText);
+    persistence_changed_dimensions = retained;
+    if (retained.length === 0) return "not_evaluated";
+    return changedStateKeysPreservedAfterReload(retained, beforeReloadText, afterReloadText)
+      ? "preserved"
+      : "reset";
+  }
+  if (!input_before_marker || !input_after_marker || input_before_marker === input_after_marker) {
+    persistence_changed_dimensions = [];
+    return "not_evaluated";
+  }
+  if (beforeReloadText !== input_after_marker) {
+    persistence_changed_dimensions = [];
+    return "not_evaluated";
+  }
+  persistence_changed_dimensions = ["marker"];
+  return beforeReloadText === afterReloadText ? "preserved" : "reset";
+}
+
+async function waitForAnySurface(page) {
+  const surface = page.locator("canvas, button, [role=button], input, select, textarea, [contenteditable='true'], [data-anvil-action], [data-anvil-state]").first();
+  await surface.waitFor({ timeout: 10000 });
+}
+
+async function evaluatePersistenceReload(page, mode) {
+  if (!persistenceRequired) return;
+  if (!steps.includes("input_state_change")) {
+    steps.push("persistence_reload:not_evaluated");
+    persistence_after_reload = "not_evaluated";
+    return;
+  }
+  mark("persistence_reload");
+  persistence_before_reload_marker = await activeMarker(page, mode);
+  try {
+    await page.reload({ waitUntil: "domcontentloaded", timeout: GOTO_TIMEOUT_MS });
+    await waitForAnySurface(page);
+    await page.waitForTimeout(120);
+    persistence_after_reload_marker = await activeMarker(page, mode);
+    persistence_after_reload = evaluatePersistenceAfterReload(
+      mode,
+      persistence_before_reload_marker,
+      persistence_after_reload_marker
+    );
+    steps.push(
+      persistence_after_reload === "not_evaluated"
+        ? "persistence_reload:not_evaluated"
+        : "persistence_reload"
+    );
+  } catch (err) {
+    persistence_after_reload = "not_evaluated";
+    steps.push("persistence_reload:not_evaluated");
+    informational_failure_kinds.push("persistence_reload_not_evaluated");
+  }
+}
+
 function contractResetWardChange(beforeText, afterText, baselineText) {
   if (!beforeText || !afterText || beforeText === afterText) return false;
   const changed = changedTopLevelStateKeys(beforeText, afterText);
@@ -1415,6 +1562,11 @@ async function contractHookStatus(page) {
     ).trim();
     const primary = document.querySelector('[data-anvil-action="primary"]');
     const restart = document.querySelector('[data-anvil-action="restart"]');
+    const action_hooks = Array.from(document.querySelectorAll("[data-anvil-action]"))
+      .map((el) => (el.getAttribute("data-anvil-action") || "").trim())
+      .filter(Boolean)
+      .filter((value, index, values) => values.indexOf(value) === index)
+      .sort();
     const stateEls = Array.from(document.querySelectorAll("[data-anvil-state]"));
     let valid_state_count = 0;
     let invalid_state_count = 0;
@@ -1443,6 +1595,7 @@ async function contractHookStatus(page) {
       primary_text_excerpt: primary ? textOf(primary).slice(0, 80) : "",
       restart_present: !!restart,
       restart_text_excerpt: restart ? textOf(restart).slice(0, 80) : "",
+      action_hooks,
       state_present,
       state_count: stateEls.length,
       valid_state_count,
@@ -1747,6 +1900,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
     post_js_surface = await surfaceSnapshot(page);
     contract_hooks = await contractHookStatus(page);
     contract_hook_status = contract_hooks.status;
+    action_hooks = contract_hooks.action_hooks || [];
     probe_mode = contract_hooks.usable ? "contract" : "heuristic";
     before_marker = await activeMarker(page, probe_mode);
 
@@ -1812,6 +1966,8 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       await dispatchPostTransitionInputs(page, probe_mode);
     }
 
+    await evaluatePersistenceReload(page, probe_mode);
+
     if (!primary_transition_observed && transitionObserved) {
       informational_failure_kinds.push("primary_start_transition_missing");
     }
@@ -1820,9 +1976,12 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
     const startlessInputObserved = !start_control_found && inputStateChanged;
     const ok = steps.includes("surface_visible")
       && inputStateChanged
-      && ((transitionObserved && input_state_evaluated_after_start) || startlessInputObserved);
+      && ((transitionObserved && input_state_evaluated_after_start) || startlessInputObserved)
+      && (!persistenceRequired || persistence_after_reload !== "reset");
     const recoveryObserved = steps.includes("recovery_transition");
-    const failureKind = interactionFailureKind(
+    const failureKind = persistenceRequired && persistence_after_reload === "reset"
+      ? "persistence_after_reload_reset"
+      : interactionFailureKind(
       transitionObserved || startlessInputObserved,
       input_state_evaluated_after_start || startlessInputObserved,
       inputStateChanged
@@ -1849,6 +2008,11 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       candidate_table,
       input_dispatches,
       state_dimensions_changed,
+      persistence_after_reload,
+      persistence_changed_dimensions,
+      persistence_before_reload_marker,
+      persistence_after_reload_marker,
+      action_hooks,
       informational_failure_kinds,
       steps,
       stage,
@@ -1903,6 +2067,11 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       candidate_table,
       input_dispatches,
       state_dimensions_changed,
+      persistence_after_reload,
+      persistence_changed_dimensions,
+      persistence_before_reload_marker,
+      persistence_after_reload_marker,
+      action_hooks,
       informational_failure_kinds,
       failure_kind: err && err.anvilFailureKind ? err.anvilFailureKind : "probe_script_error",
       navigation_failure_kind: err && err.navigationFailureKind ? err.navigationFailureKind : "",
@@ -2000,6 +2169,11 @@ fn merge_script_stdout_failure_value(mut value: Value, logs: &InteractionStdio) 
             "candidate_table",
             "input_dispatches",
             "state_dimensions_changed",
+            "persistence_after_reload",
+            "persistence_changed_dimensions",
+            "persistence_before_reload_marker",
+            "persistence_after_reload_marker",
+            "action_hooks",
             "informational_failure_kinds",
             "failure_kind",
             "navigation_failure_kind",
@@ -2222,6 +2396,18 @@ fn observation_from_value(
     let candidate_table = interaction_candidate_table(&value);
     let input_dispatches = string_array_field(&value, "input_dispatches");
     let state_dimensions_changed = string_array_field(&value, "state_dimensions_changed");
+    let persistence_after_reload = value
+        .get("persistence_after_reload")
+        .and_then(Value::as_str)
+        .unwrap_or("not_evaluated")
+        .to_string();
+    let persistence_changed_dimensions =
+        string_array_field(&value, "persistence_changed_dimensions");
+    let action_hooks = string_array_field(&value, "action_hooks")
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let primary_transition_observed = value
         .get("primary_start_transition")
         .or_else(|| value.get("primary_transition_observed"))
@@ -2277,6 +2463,19 @@ fn observation_from_value(
         candidate_table,
         input_dispatches,
         state_dimensions_changed,
+        persistence_after_reload,
+        persistence_changed_dimensions,
+        persistence_before_reload_marker: value
+            .get("persistence_before_reload_marker")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        persistence_after_reload_marker: value
+            .get("persistence_after_reload_marker")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        action_hooks,
         primary_transition_observed,
         start_control_found,
         informational_failure_kinds,
@@ -2492,6 +2691,11 @@ fn failure_observation(
         candidate_table: Vec::new(),
         input_dispatches: Vec::new(),
         state_dimensions_changed: Vec::new(),
+        persistence_after_reload: "not_evaluated".to_string(),
+        persistence_changed_dimensions: Vec::new(),
+        persistence_before_reload_marker: String::new(),
+        persistence_after_reload_marker: String::new(),
+        action_hooks: Vec::new(),
         primary_transition_observed: false,
         start_control_found: true,
         informational_failure_kinds: Vec::new(),
@@ -2676,6 +2880,11 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "candidate_table": &observation.candidate_table,
         "input_dispatches": &observation.input_dispatches,
         "state_dimensions_changed": &observation.state_dimensions_changed,
+        "persistence_after_reload": observation.persistence_after_reload,
+        "persistence_changed_dimensions": &observation.persistence_changed_dimensions,
+        "persistence_before_reload_marker": observation.persistence_before_reload_marker,
+        "persistence_after_reload_marker": observation.persistence_after_reload_marker,
+        "action_hooks": &observation.action_hooks,
         "primary_start_transition": observation.primary_transition_observed,
         "start_control_found": observation.start_control_found,
         "primary_start_transition_missing": !observation.primary_transition_observed

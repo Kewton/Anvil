@@ -249,6 +249,8 @@ fn emit_tui_command_stop_with_status(
             "browser_readiness_evidence_path": &completion.browser_readiness_evidence_path,
             "interaction_evidence_status": &completion.interaction_evidence,
             "interaction_evidence_path": &completion.interaction_evidence_path,
+            "state_dimensions_changed": &completion.state_dimensions_changed,
+            "action_hooks": &completion.action_hooks,
             "release_quality_completion": &completion.release_quality_completion,
             "next_action": &event_projection.next_action,
             "recovery_next_action": &event_projection.next_action,

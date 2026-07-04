@@ -206,6 +206,7 @@ pub struct CompletionSnapshot {
     pub interaction_evidence_status: String,
     pub interaction_evidence_path: String,
     pub state_dimensions_changed: Vec<String>,
+    pub action_hooks: Vec<String>,
     pub evidence_arbitration_summary: String,
     pub recovery_prompt_path: String,
     pub recovery_ultra_plan_path: String,
@@ -241,6 +242,7 @@ impl CompletionSnapshot {
             interaction_evidence_status: "not_applicable".to_string(),
             interaction_evidence_path: String::new(),
             state_dimensions_changed: Vec::new(),
+            action_hooks: Vec::new(),
             evidence_arbitration_summary: String::new(),
             recovery_prompt_path: String::new(),
             recovery_ultra_plan_path: String::new(),
@@ -288,6 +290,7 @@ pub struct CompletionProjection {
     pub interaction_evidence: String,
     pub interaction_evidence_path: String,
     pub state_dimensions_changed: Vec<String>,
+    pub action_hooks: Vec<String>,
     pub evidence_arbitration_summary: String,
     pub release_quality_completion: String,
     pub next_action: String,
@@ -404,6 +407,7 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         interaction_evidence: snapshot.interaction_evidence_status.clone(),
         interaction_evidence_path: snapshot.interaction_evidence_path.clone(),
         state_dimensions_changed: snapshot.state_dimensions_changed.clone(),
+        action_hooks: snapshot.action_hooks.clone(),
         evidence_arbitration_summary: snapshot.evidence_arbitration_summary.clone(),
         release_quality_completion,
         next_action,
@@ -1334,6 +1338,7 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .unwrap_or("")
             .to_string(),
         state_dimensions_changed: event_string_array(event, "state_dimensions_changed"),
+        action_hooks: event_string_array(event, "action_hooks"),
         evidence_arbitration_summary: event
             .get("evidence_arbitration_summary")
             .and_then(Value::as_str)
@@ -1571,6 +1576,14 @@ fn render_completion_summary(
                 "none".to_string()
             } else {
                 projection.state_dimensions_changed.join(", ")
+            }
+        ),
+        format!(
+            "Action hooks: {}",
+            if projection.action_hooks.is_empty() {
+                "none".to_string()
+            } else {
+                projection.action_hooks.join(", ")
             }
         ),
         format!("Next action: {}", projection.next_action),
@@ -2331,6 +2344,7 @@ mod tests {
                 "release_gate_status": "pass",
                 "evidence_arbitration_summary": "behavioral (probe ok)",
                 "state_dimensions_changed": ["player", "score"],
+                "action_hooks": ["primary", "restart"],
             }),
         );
         let snapshot = latest_completion_snapshot(Some(&path));
@@ -2350,6 +2364,10 @@ mod tests {
         );
         assert!(
             summary.contains("State dimensions changed: player, score"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Action hooks: primary, restart"),
             "{summary}"
         );
     }

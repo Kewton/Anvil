@@ -60,6 +60,7 @@ struct BehaviorObservation {
     input_state_evaluated_after_start: bool,
     input_state_change: bool,
     recovery_transition: RecoveryTransition,
+    persistence_after_reload: PersistenceAfterReload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,9 +71,18 @@ enum RecoveryTransition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistenceAfterReload {
+    Preserved,
+    Reset,
+    NotEvaluated,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BehavioralDecision {
     Pass(&'static str),
     Fail(&'static str),
+    Unverified(&'static str),
     Static(&'static str),
 }
 
@@ -203,6 +213,18 @@ pub fn arbitrate_final_acceptance(
                     },
                 );
             }
+            BehavioralDecision::Unverified(observed) => {
+                mark_unverified_evidence(report, key, observed);
+                records.insert(
+                    key.clone(),
+                    EvidenceArbitrationRecord {
+                        static_tier: static_tier.clone(),
+                        behavioral_observation: observed.to_string(),
+                        decided_by: "behavioral".to_string(),
+                        final_tier: format!("unverified:{observed}"),
+                    },
+                );
+            }
             BehavioralDecision::Static(observed) => {
                 records.insert(
                     key.clone(),
@@ -283,6 +305,18 @@ fn behavioral_decision(
                     BehavioralDecision::Fail("start_transition_missing")
                 }
             }
+        };
+    }
+    if key == "persistence_evidence" {
+        return match observation.persistence_after_reload {
+            PersistenceAfterReload::Preserved => BehavioralDecision::Pass("preserved_after_reload"),
+            PersistenceAfterReload::Reset => BehavioralDecision::Fail("reset_after_reload"),
+            PersistenceAfterReload::NotEvaluated => BehavioralDecision::Unverified("not_evaluated"),
+            PersistenceAfterReload::Unknown => BehavioralDecision::Static(if observation.ok {
+                "probe_ok_not_mapped"
+            } else {
+                "probe_failed"
+            }),
         };
     }
     if DEEP_BEHAVIOR_KEYS.contains(&key) {
@@ -473,6 +507,7 @@ impl BehaviorObservation {
                     .is_some_and(|marker| !marker.is_empty()));
         let input_state_change = input_state_changed(value, &steps, ok);
         let recovery_transition = recovery_transition(value, &steps);
+        let persistence_after_reload = persistence_after_reload(value, &steps);
         Some(Self {
             ok,
             failure_kind,
@@ -483,6 +518,7 @@ impl BehaviorObservation {
             input_state_evaluated_after_start,
             input_state_change,
             recovery_transition,
+            persistence_after_reload,
         })
     }
 
@@ -560,6 +596,25 @@ fn recovery_transition(value: &Value, steps: &BTreeSet<String>) -> RecoveryTrans
         return RecoveryTransition::NotObserved;
     }
     RecoveryTransition::Unknown
+}
+
+fn persistence_after_reload(value: &Value, steps: &BTreeSet<String>) -> PersistenceAfterReload {
+    match text_field_deep(value, &["persistence_after_reload"]).as_deref() {
+        Some("preserved") => return PersistenceAfterReload::Preserved,
+        Some("reset") => return PersistenceAfterReload::Reset,
+        Some("not_evaluated") => return PersistenceAfterReload::NotEvaluated,
+        Some(_) => {}
+        None => {}
+    }
+    if steps.contains("persistence_reload:preserved") {
+        PersistenceAfterReload::Preserved
+    } else if steps.contains("persistence_reload:reset") {
+        PersistenceAfterReload::Reset
+    } else if steps.contains("persistence_reload:not_evaluated") {
+        PersistenceAfterReload::NotEvaluated
+    } else {
+        PersistenceAfterReload::Unknown
+    }
 }
 
 fn marker_changed(value: &Value, before_key: &str, after_key: &str) -> bool {
@@ -649,6 +704,26 @@ export default function Page() {
   const collision = enemies.some((enemy) => enemy.x > 0);
   if (collision && gameState === "playing") setGameState("gameover");
   return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={restart}>Restart</button><canvas />score enemy collision {score}</main>;
+}
+"#
+    }
+
+    fn todo_persistence_page() -> &'static str {
+        r#""use client";
+import { useEffect, useState } from "react";
+export default function Page() {
+  const [items, setItems] = useState<string[]>(() => {
+    if (typeof window === "undefined") return [];
+    return JSON.parse(localStorage.getItem("todos") || "[]");
+  });
+  const add = () => setItems((value) => [...value, "anvil probe input"]);
+  useEffect(() => {
+    localStorage.setItem("todos", JSON.stringify(items));
+  }, [items]);
+  return <main data-anvil-state={JSON.stringify({ items })}>
+    <button data-anvil-action="primary" onClick={add}>Add</button>
+    <p>{items.join(",")}</p>
+  </main>;
 }
 "#
     }
@@ -1290,6 +1365,226 @@ export default function Page() {
         assert_eq!(
             arbitration.summary,
             "partial (probe infrastructure failure: probe_dependency_missing:playwright_module_missing)"
+        );
+    }
+
+    #[test]
+    fn persistence_reload_preserved_behaviorally_satisfies_persistence_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), todo_persistence_page());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "steps": [
+                    "surface_visible",
+                    "start_transition",
+                    "control_input_dispatched",
+                    "input_state_evaluated_after_start",
+                    "input_state_change",
+                    "persistence_reload"
+                ],
+                "before_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[]}}]}",
+                "after_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[\"anvil probe input\"]}}]}",
+                "input_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[]}}]}",
+                "input_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[\"anvil probe input\"]}}]}",
+                "persistence_before_reload_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[\"anvil probe input\"]}}]}",
+                "persistence_after_reload_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[\"anvil probe input\"]}}]}",
+                "persistence_after_reload": "preserved",
+                "persistence_changed_dimensions": ["items"],
+                "state_dimensions_changed": ["items"],
+                "action_hooks": ["primary"]
+            }),
+        );
+        let required = ["persistence_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("persistence_evidence")
+                .map(String::as_str),
+            Some("strong")
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("persistence_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("preserved_after_reload")
+        );
+    }
+
+    #[test]
+    fn persistence_reload_reset_fails_persistence_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), todo_persistence_page());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": false,
+                "status": "failed",
+                "failure_kind": "persistence_after_reload_reset",
+                "interaction_success": false,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "steps": [
+                    "surface_visible",
+                    "start_transition",
+                    "control_input_dispatched",
+                    "input_state_evaluated_after_start",
+                    "input_state_change",
+                    "persistence_reload"
+                ],
+                "input_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[]}}]}",
+                "input_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[\"anvil probe input\"]}}]}",
+                "persistence_before_reload_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[\"anvil probe input\"]}}]}",
+                "persistence_after_reload_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[]}}]}",
+                "persistence_after_reload": "reset",
+                "persistence_changed_dimensions": ["items"],
+                "state_dimensions_changed": ["items"],
+                "action_hooks": ["primary"]
+            }),
+        );
+        let required = ["persistence_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"persistence_evidence".to_string())
+        );
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("persistence_evidence")
+                .map(String::as_str),
+            Some("absent")
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("persistence_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("reset_after_reload")
+        );
+    }
+
+    #[test]
+    fn persistence_reload_not_evaluated_is_unverified_non_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), todo_persistence_page());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": false,
+                "steps": ["surface_visible", "start_transition", "persistence_reload:not_evaluated"],
+                "input_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[]}}]}",
+                "input_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[]}}]}",
+                "persistence_after_reload": "not_evaluated",
+                "persistence_changed_dimensions": [],
+                "action_hooks": ["primary"]
+            }),
+        );
+        let required = ["persistence_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(report.missing_evidence.is_empty(), "{report:?}");
+        assert!(
+            report
+                .unverified_evidence
+                .contains(&"persistence_evidence:unverified:not_evaluated".to_string())
+        );
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("persistence_evidence")
+                .map(String::as_str),
+            Some("unverified:not_evaluated")
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("persistence_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("not_evaluated")
+        );
+    }
+
+    #[test]
+    fn probe_unavailable_static_persistence_remains_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), todo_persistence_page());
+        let required = ["persistence_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(report.unverified_evidence.is_empty(), "{report:?}");
+        assert_eq!(arbitration.summary, "partial (probe unavailable)");
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("persistence_evidence")
+                .map(String::as_str),
+            Some("strong")
         );
     }
 
