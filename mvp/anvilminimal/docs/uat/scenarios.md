@@ -1,8 +1,10 @@
 # Multi-Scenario UAT Suite
 
-This suite measures tuning against a small task distribution, not a single
-Space Invaders prompt. Run every scenario with the same command shape and
-compare the final acceptance state across the distribution.
+This suite measures tuning against five small task distributions, not a single
+Space Invaders prompt. Run every scenario with the documented command shape and
+compare the final acceptance state across the distribution. `AMBIGUOUS` is the
+no-profile scenario; because successful promotion leads to web release gates on
+this host, it requires the interaction probe just like the Next.js scenarios.
 
 This suite is part of the M6 generality declaration in
 [../generality.md](../generality.md). It is a mandatory regression suite for
@@ -11,7 +13,8 @@ any probe, evidence, or profile change.
 ## Command Shape
 
 Start `anvilminimal` with the normal UAT model/provider options, then enter one
-scenario command in the TUI:
+scenario command in the TUI. Use the exact scenario command; do not add
+`--profile nextjs` to `AMBIGUOUS`.
 
 ```text
 anvilminimal --yes --context-budget 65536 \
@@ -23,24 +26,27 @@ anvilminimal --yes --context-budget 65536 \
 /ultra-plan-run --profile nextjs <SCENARIO_PROMPT>
 ```
 
-Use a fresh empty workdir per scenario. Do not run the three Next.js scenarios
-in parallel because all of them require port 3011. The CLI scenario uses
-`--profile python-cli`, does not bind a port, and must not be treated as a web
-or browser-interaction run.
+Use a fresh empty workdir per scenario. Do not run the three explicit Next.js
+scenarios or the `AMBIGUOUS` scenario in parallel because web-gated runs use
+port 3011. The CLI scenario uses `--profile python-cli`, does not bind a port,
+and must not be treated as a web or browser-interaction run.
 
 ## Preflight Runbook
 
 1. Version check: `anvilminimal --version` must exactly match the intended
    commit or build identifier. Record the full output in the UAT report. A
    version mismatch fails preflight.
-2. Playwright check for Next.js scenarios only: verify that the browser probe
-   can run before starting the scenario. Use the same Node/Playwright
-   environment as the release gate; if it is unavailable, record the
-   probe-unavailable reason and do not count the run as a behavioral pass. This
-   check is not required for `CLI (python-cli profile)`.
-3. Port check for Next.js scenarios only: confirm port 3011 has no leftover
-   listener before each run. If a previous dev server is still alive, stop it
-   and record the cleanup. The CLI scenario has no port.
+2. Playwright check for web-gated scenarios only: verify that the browser probe
+   can run before starting each Next.js or `AMBIGUOUS` run. Use the same
+   Node/Playwright environment as the release gate; if it is unavailable,
+   record the probe-unavailable reason and do not count the run as a behavioral
+   pass. This check is not required for `CLI (python-cli profile)`.
+3. Port check for web-gated scenarios only: never use port 3000; it is
+   permanently occupied on the UAT host. Confirm port 3011 has no leftover
+   listener before each Next.js or `AMBIGUOUS` run. With the default-port
+   policy, no cleanup check for 3000 is needed. If a previous 3011 dev server
+   is still alive, stop it and record the cleanup. The CLI scenario has no
+   port.
 4. Evidence capture: attach `.anvil/runs/<run-id>/events.jsonl`,
    `.anvil/runs/<run-id>/summary.md`, any referenced
    `browser_readiness_evidence_path`, any referenced `interaction_evidence_path`,
@@ -210,3 +216,53 @@ M4 exit criteria:
 The run must traverse the shared runner lifecycle without touching
 nextjs-specific code paths; classification/terminal semantics identical in
 kind.
+
+### AMBIGUOUS (no profile, no stack tokens)
+
+Prompt:
+
+```text
+/ultra-plan-run ちょっとしたメモアプリを作って。ブラウザで使える
+ようにしてください。
+```
+
+Notes:
+
+- No `--profile` flag.
+- The prompt intentionally contains app-intent tokens but no profile or stack
+  tokens. Do not "fix" the scenario by adding Next.js, React, Vite, web app, or
+  another stack token.
+- Preflight must check port 3011 only. Port 3000 is host-occupied and must not
+  be used.
+
+Expected trajectory:
+
+1. Generic start: `tui_command_start` records profile `generic` with no
+   profile inference.
+2. Generic contract bound: `completion_contract_bound` and
+   `generic_contract_bound` record `generic_interactive_contract`,
+   `user_input_handler_evidence`, `stateful_update_evidence`, and
+   `visible_interactive_surface_evidence`.
+3. Scaffold manifest: the planner creates a project manifest in the workspace.
+4. Profile reinferred promotion: if the manifest is known, `profile_reinferred`
+   promotes `generic` to the known profile.
+5. Full-assurance terminal: the promoted profile reaches
+   `ultra_final_acceptance` / `ultra_plan_complete` with full assurance and
+   behavioral verification, including browser readiness and interaction
+   evidence for web profiles.
+
+Events runbook:
+
+```sh
+events=.anvil/runs/<run-id>/events.jsonl
+rg '"event":"tui_command_start"|"event":"generic_contract_bound"|"event":"profile_reinferred"' "$events"
+rg '"event":"dev_server_lifecycle"|"event":"browser_probe"|"event":"ultra_final_acceptance"|"event":"ultra_plan_complete"' "$events"
+rg '"assurance_level":"full"|"final_acceptance_status":"full_success"|"release_gate_status":"pass"|"interaction_evidence_status":"passed"' "$events"
+```
+
+Honest fallback:
+
+- If the planner scaffolds an unknown stack, static-tier termination is correct
+  behavior, not a UAT failure.
+- Record the absence of `profile_reinferred`, the static assurance level, and
+  the scaffolded manifest/stack in the UAT report.

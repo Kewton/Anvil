@@ -12,8 +12,8 @@ Scope S is explicit:
 
 | dimension | in scope |
 |---|---|
-| Profiles | `nextjs`, `python-cli`, and `generic` with static- or reduced-assurance markers |
-| Scenarios | GAME, TOOL, CONTENT, and CLI from [uat/scenarios.md](uat/scenarios.md) |
+| Profiles | `nextjs`, `python-cli`, and `generic`, including the no-profile start path, static/reduced markers, and known-manifest promotion |
+| Scenarios | GAME, TOOL, CONTENT, CLI, and AMBIGUOUS from [uat/scenarios.md](uat/scenarios.md) |
 | Models | UAT evidence from `qwen3.6:27b-coding-nvfp4` main execution with the configured planner model used by the runbook |
 | Languages | Japanese scenario prompts, TypeScript/TSX Next.js output, Python CLI output, and English/Japanese diagnostic text |
 | OS | macOS/Darwin UAT hosts only |
@@ -29,6 +29,17 @@ Within S, "generalized" means:
   `visible_interactive_surface_evidence`) and render static-assurance markers
   only when that contract is verified from source evidence. Generic goals
   without app intent keep the reduced-assurance empty-contract path.
+- No-profile app-intent runs start as `generic`, bind the generic static
+  contract, then may promote to a known profile after a recognized workspace
+  manifest appears. Assurance has three honest tiers: reduced for empty or
+  unsupported generic contracts, static for verified generic source evidence,
+  and full only after a known promoted profile passes its profile and
+  behavioral release gates.
+- Profile promotion is intentionally table-limited. The current promotion table
+  covers known manifests only, such as Next.js package manifests and
+  `python-cli` `pyproject.toml` workspaces. Unknown stacks terminate at the
+  generic static tier honestly; that is a correct terminal state, not a hidden
+  failure.
 - Missing probe evidence, unsupported profile confidence, incomplete behavior
   evidence, or generic goals outside the minimal static contract render
   reduced-assurance markers instead of full success.
@@ -48,6 +59,7 @@ Within S, "generalized" means:
 |---|---|---|
 | Web profile behavior is not Space-Invaders-only; generic interaction, persistence, and content-editing obligations are separately checked. | M2: `test0704-464748_001`, `test0704-464748_002`, and `test0704-48.1 CONTENT re-run` | Not harvested in this source corpus; the regression target is the scenario suite in [uat/scenarios.md](uat/scenarios.md). |
 | Contract inference survives renamed or opaque scenario IDs and English/Japanese prompt variation. | M3: `test0704-49_001`, `test0704-50_001` | Covered by required golden tests `tests/eval/test_acceptance_contract.py::AcceptanceContractTest` and `tests/eval/test_completion_contract_snapshots.py::CompletionContractSnapshotTest`. |
+| No-profile app-intent runs use generic contract binding, then promote only when a known manifest appears. | G1/G2 anchors: `generic_ultra_promotes_to_nextjs_after_workspace_manifest`, `generic_ultra_promotes_to_python_cli_after_pyproject_manifest`, and `generic_ultra_without_manifest_keeps_static_tier`; G3 UAT: `test0704-4030444542434647484814950515354_001` | G3 scaffolded an unknown Vite manifest and correctly stayed in the generic static-tier fallback; the harvested corpus case is tracked by the G4 corpus update. |
 | The runner lifecycle supports a non-web process profile without Next.js probe or port assumptions. | M4: `test0704-51_001` web run and `test0704-51_001` CLI run | The CLI contract is specified in [uat/scenarios.md#cli-python-cli-profile](uat/scenarios.md#cli-python-cli-profile); no app corpus case is expected for the process-only run. |
 | App evidence detectors and interaction probe selection are fixture-backed. | M5 Round A four runs | [test0702_008](../tests/corpus/apps/test0702_008/expectations.toml), [test0703_002](../tests/corpus/apps/test0703_002/expectations.toml), [test0703_005_4](../tests/corpus/apps/test0703_005_4/expectations.toml), [test0704_001](../tests/corpus/apps/test0704_001/expectations.toml) |
 | The second corpus round confirms the same detectors over a new harvested app snapshot. | M5 Round B | [test0704_003](../tests/corpus/apps/test0704_003/expectations.toml) |
@@ -60,6 +72,9 @@ approval:
 
 - `cargo test --test corpus_regression`
 - `cargo test --test generality_guardrails`
+- `cargo test generic_ultra_promotes_to_nextjs_after_workspace_manifest --lib`
+- `cargo test generic_ultra_promotes_to_python_cli_after_pyproject_manifest --lib`
+- `cargo test generic_ultra_without_manifest_keeps_static_tier --lib`
 - `python3 -m unittest tests/eval/test_acceptance_contract.py`
 - `python3 -m unittest tests/eval/test_completion_contract_snapshots.py`
 - `python3 -m unittest tests/eval/test_false_positive_regression.py`
@@ -88,6 +103,9 @@ The declaration does not claim:
 
 - A second web framework. The web-family shared layer has not yet been
   extracted from the Next.js profile boundary.
+- Promotion for arbitrary web frameworks. Unknown manifests remain generic and
+  must stop at the static tier unless a known profile boundary is added with
+  tests and corpus evidence.
 - Non-process domains outside web apps and CLI/process tools.
 - Linux behavior. Current UAT evidence is macOS/Darwin-only.
 - Output depth beyond the observed model pair. Depth and polish remain
