@@ -125,6 +125,9 @@ pub struct BrowserInteractionObservation {
     pub text_entry_target: String,
     pub typed_token: String,
     pub token_echoed: bool,
+    pub echo_latency_ms: Option<u64>,
+    pub token_echoed_after_reload: bool,
+    pub token_echo_after_reload_latency_ms: Option<u64>,
     pub text_input_state_change: bool,
     pub primary_transition_observed: bool,
     pub start_control_found: bool,
@@ -1180,6 +1183,12 @@ const started = Date.now();
 const LAUNCH_TIMEOUT_MS = 20000;
 const GOTO_TIMEOUT_MS = 12000;
 const SERVER_CHECK_TIMEOUT_MS = 5000;
+const RENDER_POLL_INTERVAL_MS = 250;
+const MARKER_POLL_INTERVAL_MS = 80;
+const RENDER_SETTLE_MS = 120;
+const TOKEN_ECHO_SETTLE_MS = 3000;
+const PERSISTENCE_SURFACE_SETTLE_MS = 3000;
+const RELOAD_RENDER_SETTLE_MS = 3000;
 const steps = [];
 let stage = "resolving";
 let before_marker = "";
@@ -1207,6 +1216,9 @@ let text_entry = "not_evaluated";
 let text_entry_target = "";
 let typed_token = `anvil-${Math.random().toString(36).slice(2, 8) || "probe"}`;
 let token_echoed = false;
+let echo_latency_ms = null;
+let token_echoed_after_reload = false;
+let token_echo_after_reload_latency_ms = null;
 let text_input_state_change = false;
 let informational_failure_kinds = [];
 let server_check = { ok: false, status: null, error: "" };
@@ -1339,17 +1351,61 @@ async function gotoWithRetry(page, targetUrl) {
   throw err;
 }
 
-async function markerAfterChange(page, previous, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let current = await marker(page);
-  while (Date.now() < deadline) {
-    if (current !== previous) {
-      return current;
+async function pollRenderedAssertion(page, read, options = {}) {
+  const startedAt = options.startedAt || Date.now();
+  const deadlineAt = options.deadlineAt || (Date.now() + (options.timeoutMs || 0));
+  const intervalMs = options.intervalMs || RENDER_POLL_INTERVAL_MS;
+  const matches = options.matches || ((value) => !!value);
+  let lastValue;
+  while (true) {
+    const value = await read();
+    lastValue = value;
+    if (matches(value)) {
+      return { matched: true, value, latency_ms: Date.now() - startedAt };
     }
-    await page.waitForTimeout(80);
-    current = await marker(page);
+    const now = Date.now();
+    if (now >= deadlineAt) {
+      return { matched: false, value: lastValue, latency_ms: null };
+    }
+    await page.waitForTimeout(Math.min(intervalMs, Math.max(0, deadlineAt - now)));
   }
-  return current;
+}
+
+async function settledRenderedValue(page, read, timeoutMs, intervalMs = RENDER_POLL_INTERVAL_MS) {
+  let lastText = null;
+  let stableSince = 0;
+  const result = await pollRenderedAssertion(page, async () => {
+    const value = await read();
+    let text;
+    try {
+      text = JSON.stringify(value);
+    } catch (_) {
+      text = String(value);
+    }
+    const now = Date.now();
+    if (text === lastText) {
+      if (!stableSince) stableSince = now;
+    } else {
+      lastText = text;
+      stableSince = now;
+    }
+    return { value, stable_for_ms: now - stableSince };
+  }, {
+    timeoutMs,
+    intervalMs,
+    matches: (sample) => !!sample && sample.stable_for_ms >= RENDER_SETTLE_MS
+  });
+  const sample = result.value || {};
+  return Object.prototype.hasOwnProperty.call(sample, "value") ? sample.value : "";
+}
+
+async function markerAfterChange(page, previous, timeoutMs) {
+  const result = await pollRenderedAssertion(page, () => marker(page), {
+    timeoutMs,
+    intervalMs: MARKER_POLL_INTERVAL_MS,
+    matches: (current) => current !== previous
+  });
+  return result.value;
 }
 
 async function contractStateMarker(page) {
@@ -1494,6 +1550,37 @@ function evaluatePersistenceAfterReload(mode, beforeReloadText, afterReloadText)
   return beforeReloadText === afterReloadText ? "preserved" : "reset";
 }
 
+function persistenceMarkerLooksPreserved(mode, beforeReloadText, afterReloadText) {
+  if (mode === "contract") {
+    const retained = retainedChangedStateKeys(input_before_marker, input_after_marker, beforeReloadText);
+    return retained.length > 0
+      && changedStateKeysPreservedAfterReload(retained, beforeReloadText, afterReloadText);
+  }
+  if (!input_before_marker || !input_after_marker || input_before_marker === input_after_marker) {
+    return false;
+  }
+  if (beforeReloadText !== input_after_marker) {
+    return false;
+  }
+  return beforeReloadText === afterReloadText;
+}
+
+async function persistenceMarkerAfterReload(page, mode, beforeReloadText) {
+  const result = await pollRenderedAssertion(page, async () => {
+    const value = await activeMarker(page, mode);
+    return {
+      value,
+      preserved: persistenceMarkerLooksPreserved(mode, beforeReloadText, value)
+    };
+  }, {
+    timeoutMs: RELOAD_RENDER_SETTLE_MS,
+    intervalMs: RENDER_POLL_INTERVAL_MS,
+    matches: (sample) => !!sample && sample.preserved
+  });
+  const sample = result.value || {};
+  return Object.prototype.hasOwnProperty.call(sample, "value") ? sample.value : "";
+}
+
 async function waitForAnySurface(page) {
   const surface = page.locator("canvas, button, [role=button], input, select, textarea, [contenteditable='true'], [data-anvil-action], [data-anvil-state]").first();
   await surface.waitFor({ timeout: 10000 });
@@ -1507,17 +1594,59 @@ async function evaluatePersistenceReload(page, mode) {
     return;
   }
   mark("persistence_reload");
-  const typedTokenWasPresent = text_input_state_change
-    ? await tokenPresentInPersistenceSurface(page, typed_token)
-    : false;
-  persistence_before_reload_marker = await activeMarker(page, mode);
+  let typedTokenWasPresent = false;
+  if (text_input_state_change) {
+    const tokenPresentStartedAt = Date.now();
+    const tokenPresent = await pollTokenPresentInPersistenceSurface(
+      page,
+      typed_token,
+      tokenPresentStartedAt,
+      tokenPresentStartedAt + PERSISTENCE_SURFACE_SETTLE_MS
+    );
+    typedTokenWasPresent = tokenPresent.matched;
+  }
+  persistence_before_reload_marker = await settledRenderedValue(
+    page,
+    () => activeMarker(page, mode),
+    PERSISTENCE_SURFACE_SETTLE_MS
+  );
   try {
     await page.reload({ waitUntil: "domcontentloaded", timeout: GOTO_TIMEOUT_MS });
     await waitForAnySurface(page);
-    await page.waitForTimeout(120);
-    persistence_after_reload_marker = await activeMarker(page, mode);
+    persistence_after_reload_marker = typedTokenWasPresent
+      ? await settledRenderedValue(
+        page,
+        () => activeMarker(page, mode),
+        RELOAD_RENDER_SETTLE_MS
+      )
+      : await persistenceMarkerAfterReload(page, mode, persistence_before_reload_marker);
+    let reloadEcho = { matched: false, value: false, latency_ms: null };
+    if (!token_echoed) {
+      const reloadEchoStartedAt = Date.now();
+      reloadEcho = await pollTokenEchoedOutsideTextEntryTarget(
+        page,
+        typed_token,
+        reloadEchoStartedAt,
+        reloadEchoStartedAt + RELOAD_RENDER_SETTLE_MS
+      );
+      if (reloadEcho.matched) {
+        token_echoed_after_reload = true;
+        token_echo_after_reload_latency_ms = reloadEcho.latency_ms;
+        steps.push("token_echoed_after_reload");
+      }
+    }
     if (typedTokenWasPresent) {
-      const typedTokenSurvived = await tokenPresentInPersistenceSurface(page, typed_token);
+      let typedTokenSurvived = reloadEcho.matched;
+      if (!typedTokenSurvived) {
+        const tokenSurvivedStartedAt = Date.now();
+        const survived = await pollTokenPresentInPersistenceSurface(
+          page,
+          typed_token,
+          tokenSurvivedStartedAt,
+          tokenSurvivedStartedAt + RELOAD_RENDER_SETTLE_MS
+        );
+        typedTokenSurvived = survived.matched;
+      }
       persistence_changed_dimensions = ["typed_token"];
       persistence_after_reload = typedTokenSurvived ? "preserved" : "reset";
     } else {
@@ -1632,16 +1761,12 @@ async function activeMarker(page, mode) {
 }
 
 async function markerAfterActiveChange(page, mode, previous, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let current = await activeMarker(page, mode);
-  while (Date.now() < deadline) {
-    if (current !== previous) {
-      return current;
-    }
-    await page.waitForTimeout(80);
-    current = await activeMarker(page, mode);
-  }
-  return current;
+  const result = await pollRenderedAssertion(page, () => activeMarker(page, mode), {
+    timeoutMs,
+    intervalMs: MARKER_POLL_INTERVAL_MS,
+    matches: (current) => current !== previous
+  });
+  return result.value;
 }
 
 async function controlText(locator) {
@@ -1791,7 +1916,7 @@ async function clickPrimaryActionIfPresent(page) {
   return false;
 }
 
-async function tokenEchoedOutsideTextEntryTarget(page, token) {
+async function tokenEchoedOutsideTextEntryTargetNow(page, token) {
   if (!token) return false;
   return await page.evaluate((value) => {
     const excluded = document.querySelector('[data-anvil-probe-text-target="1"]');
@@ -1812,7 +1937,17 @@ async function tokenEchoedOutsideTextEntryTarget(page, token) {
   }, token);
 }
 
-async function tokenPresentInPersistenceSurface(page, token) {
+async function pollTokenEchoedOutsideTextEntryTarget(page, token, startedAt, deadlineAt) {
+  if (!token) return { matched: false, value: false, latency_ms: null };
+  return await pollRenderedAssertion(page, () => tokenEchoedOutsideTextEntryTargetNow(page, token), {
+    startedAt,
+    deadlineAt,
+    intervalMs: RENDER_POLL_INTERVAL_MS,
+    matches: (found) => found === true
+  });
+}
+
+async function tokenPresentInPersistenceSurfaceNow(page, token) {
   if (!token) return false;
   return await page.evaluate((value) => {
     const bodyText = document.body && document.body.innerText ? document.body.innerText : "";
@@ -1825,6 +1960,16 @@ async function tokenPresentInPersistenceSurface(page, token) {
     }
     return false;
   }, token);
+}
+
+async function pollTokenPresentInPersistenceSurface(page, token, startedAt, deadlineAt) {
+  if (!token) return { matched: false, value: false, latency_ms: null };
+  return await pollRenderedAssertion(page, () => tokenPresentInPersistenceSurfaceNow(page, token), {
+    startedAt,
+    deadlineAt,
+    intervalMs: RENDER_POLL_INTERVAL_MS,
+    matches: (found) => found === true
+  });
 }
 
 async function attemptTextEntry(page, mode) {
@@ -1845,13 +1990,20 @@ async function attemptTextEntry(page, mode) {
     await locator.focus({ timeout: 1200 });
     await page.keyboard.type(typed_token, { delay: 5 });
     await clickPrimaryActionIfPresent(page);
-    await page.waitForTimeout(120);
+    const echoStartedAt = Date.now();
     input_after_marker = await markerAfterActiveChange(page, mode, input_before_marker, 800);
     text_input_state_change = input_before_marker !== input_after_marker;
     if (mode === "contract") {
       mergeStateDimensionsChanged(changedTopLevelStateKeys(input_before_marker, input_after_marker));
     }
-    token_echoed = await tokenEchoedOutsideTextEntryTarget(page, typed_token);
+    const echoResult = await pollTokenEchoedOutsideTextEntryTarget(
+      page,
+      typed_token,
+      echoStartedAt,
+      echoStartedAt + TOKEN_ECHO_SETTLE_MS
+    );
+    token_echoed = echoResult.matched;
+    echo_latency_ms = echoResult.matched ? echoResult.latency_ms : null;
     steps.push("text_entry");
     if (text_input_state_change) {
       steps.push("text_input_state_change");
@@ -2088,7 +2240,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
         steps.push("start_transition");
         initial_start_text = fallback.candidate ? fallback.candidate.text_excerpt : "";
       } else {
-        after_marker = await activeMarker(page, probe_mode);
+        after_marker = await settledRenderedValue(page, () => activeMarker(page, probe_mode), 500);
         primary_transition_observed = false;
       }
     }
@@ -2141,7 +2293,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
     const failureKind = persistenceRequired && persistence_after_reload === "reset"
       ? "persistence_after_reload_reset"
       : tokenEchoRequired && !token_echoed
-        ? "token_echo_missing"
+        ? (token_echoed_after_reload ? "token_echo_after_reload_only" : "token_echo_missing")
       : textEntryRequired && text_entry !== "entered"
         ? "text_entry_missing"
       : textEntryRequired && !text_input_state_change
@@ -2182,6 +2334,9 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       text_entry_target,
       typed_token,
       token_echoed,
+      echo_latency_ms,
+      token_echoed_after_reload,
+      token_echo_after_reload_latency_ms,
       text_input_state_change,
       informational_failure_kinds,
       steps,
@@ -2246,6 +2401,9 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       text_entry_target,
       typed_token,
       token_echoed,
+      echo_latency_ms,
+      token_echoed_after_reload,
+      token_echo_after_reload_latency_ms,
       text_input_state_change,
       informational_failure_kinds,
       failure_kind: err && err.anvilFailureKind ? err.anvilFailureKind : "probe_script_error",
@@ -2353,6 +2511,9 @@ fn merge_script_stdout_failure_value(mut value: Value, logs: &InteractionStdio) 
             "text_entry_target",
             "typed_token",
             "token_echoed",
+            "echo_latency_ms",
+            "token_echoed_after_reload",
+            "token_echo_after_reload_latency_ms",
             "text_input_state_change",
             "informational_failure_kinds",
             "failure_kind",
@@ -2539,6 +2700,15 @@ fn observation_from_value(
         .get("token_echoed")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let echo_latency_ms = value.get("echo_latency_ms").and_then(Value::as_u64);
+    let token_echoed_after_reload = value
+        .get("token_echoed_after_reload")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || steps.iter().any(|step| step == "token_echoed_after_reload");
+    let token_echo_after_reload_latency_ms = value
+        .get("token_echo_after_reload_latency_ms")
+        .and_then(Value::as_u64);
     let text_input_state_change = value
         .get("text_input_state_change")
         .and_then(Value::as_bool)
@@ -2687,6 +2857,9 @@ fn observation_from_value(
         text_entry_target,
         typed_token,
         token_echoed,
+        echo_latency_ms,
+        token_echoed_after_reload,
+        token_echo_after_reload_latency_ms,
         text_input_state_change,
         primary_transition_observed,
         start_control_found,
@@ -2819,7 +2992,14 @@ fn effective_interaction_failure_kind<'a>(
     taxonomy_failure_kind: &'static str,
 ) -> &'a str {
     if taxonomy_failure_kind.is_empty() {
-        return "";
+        return match raw_failure_kind {
+            ""
+            | "browser_interaction_failed"
+            | "start_transition_missing"
+            | "interaction_state_change_missing"
+            | "input_state_change_missing" => "",
+            _ => raw_failure_kind,
+        };
     }
     match raw_failure_kind {
         ""
@@ -2912,6 +3092,9 @@ fn failure_observation(
         text_entry_target: String::new(),
         typed_token: String::new(),
         token_echoed: false,
+        echo_latency_ms: None,
+        token_echoed_after_reload: false,
+        token_echo_after_reload_latency_ms: None,
         text_input_state_change: false,
         primary_transition_observed: false,
         start_control_found: true,
@@ -3106,6 +3289,9 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "text_entry_target": observation.text_entry_target,
         "typed_token": observation.typed_token,
         "token_echoed": observation.token_echoed,
+        "echo_latency_ms": observation.echo_latency_ms,
+        "token_echoed_after_reload": observation.token_echoed_after_reload,
+        "token_echo_after_reload_latency_ms": observation.token_echo_after_reload_latency_ms,
         "text_input_state_change": observation.text_input_state_change,
         "primary_start_transition": observation.primary_transition_observed,
         "start_control_found": observation.start_control_found,
@@ -3423,6 +3609,10 @@ pub fn write_test_node_program_override(root: &Path, node_program: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::process::Command;
+    use std::thread;
 
     #[test]
     fn unavailable_playwright_has_no_evidence_side_effect() {
@@ -3535,6 +3725,514 @@ mod tests {
             true,
             None,
         )
+    }
+
+    fn node_available() -> bool {
+        matches!(
+            Command::new("node")
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status(),
+            Ok(status) if status.success()
+        )
+    }
+
+    fn spawn_probe_http_server() -> Option<(u16, thread::JoinHandle<()>)> {
+        let listener = match TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(listener) => listener,
+            Err(err) => {
+                eprintln!(
+                    "skipping fake interaction probe scenario because loopback bind failed: {err}"
+                );
+                return None;
+            }
+        };
+        let port = listener.local_addr().unwrap().port();
+        if let Err(err) = listener.set_nonblocking(true) {
+            eprintln!(
+                "skipping fake interaction probe scenario because loopback setup failed: {err}"
+            );
+            return None;
+        }
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 1024];
+                        let _ = stream.read(&mut buffer);
+                        let body = "<!doctype html><title>fake probe</title>";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        return;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Some((port, handle))
+    }
+
+    fn install_fake_playwright(root: &Path, scenario: &str) -> PlaywrightResolution {
+        let node_modules = root.join("node_modules");
+        let playwright_dir = node_modules.join("playwright");
+        std::fs::create_dir_all(&playwright_dir).unwrap();
+        std::fs::write(
+            playwright_dir.join("package.json"),
+            "{\"version\":\"0.0.0-fake\"}\n",
+        )
+        .unwrap();
+        let module = r#"const scenario = "__SCENARIO__";
+const ELEMENT_NODE = 1;
+const TEXT_NODE = 3;
+
+class FakeElement {
+  constructor(page, kind, text = "") {
+    this.page = page;
+    this.kind = kind;
+    this.attrs = {};
+    this.disabled = false;
+    this.value = "";
+    this._textContent = text;
+    this.tagName = kind === "textarea" ? "TEXTAREA" : kind === "button" ? "BUTTON" : "DIV";
+    this.nodeType = ELEMENT_NODE;
+  }
+
+  get textContent() {
+    return this.kind === "body" ? this.innerText : this._textContent;
+  }
+
+  set textContent(value) {
+    this._textContent = String(value || "");
+  }
+
+  get innerText() {
+    if (this.kind !== "body") return this.textContent || this.value || "";
+    return this.page.textNodes().map((node) => node.nodeValue).join(" ");
+  }
+
+  getAttribute(name) {
+    if (this.kind === "state" && name === "data-anvil-state") {
+      return JSON.stringify({ status: this.page.statusText });
+    }
+    return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null;
+  }
+
+  setAttribute(name, value) {
+    this.attrs[name] = String(value);
+  }
+
+  contains(node) {
+    return node === this || (node && node.parentElement === this);
+  }
+
+  getBoundingClientRect() {
+    if (this.kind === "button") return { left: 500, top: 300, width: 120, height: 40 };
+    if (this.kind === "textarea") return { left: 400, top: 380, width: 320, height: 80 };
+    return { left: 0, top: 0, width: 20, height: 20 };
+  }
+}
+
+class FakeTextNode {
+  constructor(value, parentElement) {
+    this.nodeType = TEXT_NODE;
+    this.nodeValue = value;
+    this.parentElement = parentElement;
+  }
+}
+
+class FakeDocument {
+  constructor(page) {
+    this.page = page;
+    this.title = "Fake notes";
+    this.body = page.body;
+    this.documentElement = page.root;
+  }
+
+  querySelectorAll(selector) {
+    return this.page.querySelectorAll(selector);
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+
+  createTreeWalker() {
+    const nodes = this.page.textNodes();
+    let index = 0;
+    return {
+      nextNode() {
+        return nodes[index++] || null;
+      }
+    };
+  }
+}
+
+class FakeLocator {
+  constructor(page, selector, elements) {
+    this.page = page;
+    this.selector = selector;
+    this.elements = elements;
+  }
+
+  first() {
+    return new FakeLocator(this.page, this.selector, this.elements.slice(0, 1));
+  }
+
+  nth(index) {
+    return new FakeLocator(this.page, this.selector, this.elements[index] ? [this.elements[index]] : []);
+  }
+
+  async count() {
+    return this.elements.length;
+  }
+
+  async waitFor() {
+    if (!this.elements.length) throw new Error(`no element for ${this.selector}`);
+  }
+
+  async evaluateAll(fn, arg) {
+    this.page.installGlobals();
+    return fn(this.elements, arg);
+  }
+
+  async evaluate(fn, arg) {
+    if (!this.elements.length) throw new Error(`no element for ${this.selector}`);
+    this.page.installGlobals();
+    return fn(this.elements[0], arg);
+  }
+
+  async click() {
+    if (!this.elements.length) throw new Error(`no element for ${this.selector}`);
+    this.page.clickElement(this.elements[0]);
+  }
+
+  async focus() {
+    if (!this.elements.length) throw new Error(`no element for ${this.selector}`);
+    this.page.activeElement = this.elements[0];
+  }
+
+  async fill(value) {
+    if (!this.elements.length) throw new Error(`no element for ${this.selector}`);
+    this.elements[0].value = value;
+    this.page.persistedToken = value;
+    this.page.statusText = "draft updated";
+  }
+
+  async boundingBox() {
+    if (!this.elements.length) return null;
+    const box = this.elements[0].getBoundingClientRect();
+    return { x: box.left, y: box.top, width: box.width, height: box.height };
+  }
+}
+
+class FakePage {
+  constructor() {
+    this.statusText = "ready";
+    this.previewText = "";
+    this.persistedToken = "";
+    this.reloaded = false;
+    this.root = new FakeElement(this, "root");
+    this.body = new FakeElement(this, "body");
+    this.button = new FakeElement(this, "button", "Start");
+    this.textarea = new FakeElement(this, "textarea");
+    this.state = new FakeElement(this, "state");
+    this.activeElement = null;
+    this.keyboard = {
+      type: async (text) => {
+        if (this.activeElement) this.activeElement.value += text;
+        this.persistedToken = text;
+        setTimeout(() => {
+          this.statusText = "draft updated";
+        }, 30);
+        if (scenario === "immediate") {
+          this.previewText = text;
+        } else if (scenario === "delayed") {
+          setTimeout(() => {
+            this.previewText = text;
+          }, 500);
+        }
+      },
+      down: async () => {},
+      up: async () => {}
+    };
+    this.mouse = {
+      click: async () => {}
+    };
+  }
+
+  installGlobals() {
+    global.window = {
+      innerWidth: 1280,
+      innerHeight: 720,
+      getComputedStyle: () => ({ visibility: "visible", display: "block", opacity: "1" })
+    };
+    global.document = new FakeDocument(this);
+    global.Node = { ELEMENT_NODE, TEXT_NODE };
+    global.NodeFilter = { SHOW_TEXT: 4 };
+  }
+
+  querySelectorAll(selector) {
+    const out = [];
+    const add = (el) => {
+      if (el && !out.includes(el)) out.push(el);
+    };
+    for (const raw of String(selector || "").split(",")) {
+      const part = raw.trim();
+      if (!part) continue;
+      if (part === "*") {
+        [this.root, this.body, this.button, this.textarea, this.state].forEach(add);
+        continue;
+      }
+      if (part === "[data-anvil-probe-text-target=\"1\"]" || part === "[data-anvil-probe-text-target='1']") {
+        if (this.textarea.getAttribute("data-anvil-probe-text-target") === "1") add(this.textarea);
+        continue;
+      }
+      if (part.startsWith("[data-anvil-action")) continue;
+      if (part.includes("[data-anvil-state]")) add(this.state);
+      if (part.includes("button") || part.includes("[role=button]") || part.includes("input[type=button]") || part.includes("input[type=submit]")) {
+        add(this.button);
+      }
+      if (
+        part.includes("textarea") ||
+        (part.startsWith("input") && !part.startsWith("input[type=button]") && !part.startsWith("input[type=submit]")) ||
+        part.includes("select")
+      ) {
+        add(this.textarea);
+      }
+    }
+    return out;
+  }
+
+  textNodes() {
+    const nodes = [];
+    const push = (value, parent) => {
+      if (value) nodes.push(new FakeTextNode(value, parent));
+    };
+    push(this.button.textContent, this.button);
+    push(this.statusText, this.body);
+    push(this.previewText, this.body);
+    return nodes;
+  }
+
+  clickElement(el) {
+    if (el === this.button) {
+      this.statusText = this.statusText === "started" ? "restarted" : "started";
+    }
+  }
+
+  locator(selector) {
+    return new FakeLocator(this, selector, this.querySelectorAll(selector));
+  }
+
+  async evaluate(fn, arg) {
+    this.installGlobals();
+    return fn(arg);
+  }
+
+  async goto() {
+    return { status: () => 200 };
+  }
+
+  async reload() {
+    this.reloaded = true;
+    this.statusText = "reloaded";
+    this.textarea.value = this.persistedToken;
+    if (["immediate", "delayed", "reload_only"].includes(scenario)) {
+      this.previewText = this.persistedToken;
+    } else {
+      this.previewText = "";
+    }
+    return { status: () => 200 };
+  }
+
+  async waitForTimeout(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  viewportSize() {
+    return { width: 1280, height: 720 };
+  }
+}
+
+module.exports = {
+  chromium: {
+    launch: async () => ({
+      newPage: async () => new FakePage(),
+      close: async () => {}
+    })
+  }
+};
+"#
+        .replace("__SCENARIO__", scenario);
+        std::fs::write(playwright_dir.join("index.js"), module).unwrap();
+        PlaywrightResolution {
+            module_path: playwright_dir.join("index.js").display().to_string(),
+            module_dir: playwright_dir.display().to_string(),
+            node_path: Some(node_modules.display().to_string()),
+            location: "fake_playwright".to_string(),
+            version: "0.0.0-fake".to_string(),
+        }
+    }
+
+    fn run_fake_probe_scenario(
+        scenario: &str,
+        options: BrowserInteractionProbeOptions,
+    ) -> Option<BrowserInteractionObservation> {
+        if !node_available() {
+            eprintln!("skipping fake interaction probe scenario because node is unavailable");
+            return None;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let resolution = install_fake_playwright(dir.path(), scenario);
+        write_test_availability_override_with_resolution(dir.path(), true, Some(&resolution));
+        let (port, server) = spawn_probe_http_server()?;
+        let run_dir = dir.path().join(".anvil/runs/fake-playwright");
+        let path = run_dir.join("browser-interaction.json");
+        let outcome = probe_browser_interaction_against_running_server_with_options(
+            dir.path(),
+            port,
+            &run_dir,
+            &path,
+            Duration::from_secs(12),
+            options,
+        );
+        let _ = server.join();
+        outcome.observation().cloned()
+    }
+
+    #[test]
+    fn observation_parses_token_echo_latency_and_reload_distinction() {
+        let observation = observe_probe_value(json!({
+            "ok": false,
+            "status": "failed",
+            "failure_kind": "token_echo_after_reload_only",
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
+            "input_state_change": true,
+            "text_entry": "entered",
+            "typed_token": "anvil-note",
+            "token_echoed": false,
+            "echo_latency_ms": Value::Null,
+            "token_echoed_after_reload": true,
+            "token_echo_after_reload_latency_ms": 41,
+            "text_input_state_change": true,
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "text_entry",
+                "text_input_state_change",
+                "token_echo_missing",
+                "persistence_reload",
+                "token_echoed_after_reload"
+            ]
+        }));
+
+        assert!(!observation.ok);
+        assert_eq!(observation.failure_kind, "token_echo_after_reload_only");
+        assert!(!observation.token_echoed);
+        assert_eq!(observation.echo_latency_ms, None);
+        assert!(observation.token_echoed_after_reload);
+        assert_eq!(observation.token_echo_after_reload_latency_ms, Some(41));
+    }
+
+    #[test]
+    fn token_echo_poll_accepts_debounced_preview() {
+        let Some(observation) = run_fake_probe_scenario(
+            "delayed",
+            BrowserInteractionProbeOptions {
+                persistence_required: true,
+                text_entry_required: true,
+                token_echo_required: true,
+            },
+        ) else {
+            return;
+        };
+
+        assert!(observation.ok, "{observation:?}");
+        assert!(observation.token_echoed, "{observation:?}");
+        assert!(!observation.token_echoed_after_reload, "{observation:?}");
+        let latency = observation.echo_latency_ms.expect("echo latency");
+        assert!(
+            (250..=3000).contains(&latency),
+            "expected delayed echo latency inside poll window, got {latency}; {observation:?}"
+        );
+    }
+
+    #[test]
+    fn token_echo_only_after_reload_is_distinct_from_live_preview() {
+        let Some(observation) = run_fake_probe_scenario(
+            "reload_only",
+            BrowserInteractionProbeOptions {
+                persistence_required: true,
+                text_entry_required: true,
+                token_echo_required: true,
+            },
+        ) else {
+            return;
+        };
+
+        assert!(!observation.ok, "{observation:?}");
+        assert!(!observation.token_echoed, "{observation:?}");
+        assert!(observation.token_echoed_after_reload, "{observation:?}");
+        assert_eq!(observation.persistence_after_reload, "preserved");
+        assert_eq!(observation.failure_kind, "token_echo_after_reload_only");
+    }
+
+    #[test]
+    fn token_echo_missing_remains_false_after_full_window() {
+        let Some(observation) = run_fake_probe_scenario(
+            "never",
+            BrowserInteractionProbeOptions {
+                persistence_required: false,
+                text_entry_required: true,
+                token_echo_required: true,
+            },
+        ) else {
+            return;
+        };
+
+        assert!(!observation.ok, "{observation:?}");
+        assert!(!observation.token_echoed, "{observation:?}");
+        assert_eq!(observation.echo_latency_ms, None);
+        assert!(!observation.token_echoed_after_reload, "{observation:?}");
+        assert_eq!(observation.failure_kind, "token_echo_missing");
+        assert!(
+            observation.duration_ms >= 3000,
+            "probe should wait out the echo window before failing; {observation:?}"
+        );
+    }
+
+    #[test]
+    fn immediate_token_echo_still_passes() {
+        let Some(observation) = run_fake_probe_scenario(
+            "immediate",
+            BrowserInteractionProbeOptions {
+                persistence_required: false,
+                text_entry_required: true,
+                token_echo_required: true,
+            },
+        ) else {
+            return;
+        };
+
+        assert!(observation.ok, "{observation:?}");
+        assert!(observation.token_echoed, "{observation:?}");
+        assert!(
+            observation
+                .echo_latency_ms
+                .is_some_and(|latency| latency <= 250),
+            "{observation:?}"
+        );
     }
 
     #[test]

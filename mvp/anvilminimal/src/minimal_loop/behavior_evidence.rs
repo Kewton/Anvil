@@ -64,6 +64,7 @@ struct BehaviorObservation {
     input_state_change: bool,
     text_entry: String,
     token_echoed: bool,
+    token_echoed_after_reload: bool,
     text_input_state_change: bool,
     recovery_transition: RecoveryTransition,
     persistence_after_reload: PersistenceAfterReload,
@@ -295,6 +296,8 @@ fn behavioral_decision(
     if LIVE_PREVIEW_KEYS.contains(&key) {
         return if observation.token_echoed {
             BehavioralDecision::Pass("token_echoed")
+        } else if observation.token_echoed_after_reload {
+            BehavioralDecision::Fail("token_echo_after_reload_only")
         } else if observation.text_entry == "not_applicable" {
             BehavioralDecision::Fail("text_entry_not_applicable")
         } else {
@@ -528,6 +531,9 @@ impl BehaviorObservation {
         let text_entry = text_field_deep(value, &["text_entry"]).unwrap_or_default();
         let token_echoed = bool_field_deep(value, &["token_echoed"]) == Some(true)
             || steps.contains("token_echoed");
+        let token_echoed_after_reload = bool_field_deep(value, &["token_echoed_after_reload"])
+            == Some(true)
+            || steps.contains("token_echoed_after_reload");
         let text_input_state_change = bool_field_deep(value, &["text_input_state_change"])
             == Some(true)
             || steps.contains("text_input_state_change");
@@ -544,6 +550,7 @@ impl BehaviorObservation {
             input_state_change,
             text_entry,
             token_echoed,
+            token_echoed_after_reload,
             text_input_state_change,
             recovery_transition,
             persistence_after_reload,
@@ -1671,6 +1678,84 @@ export default function Page() {
                 .get("live_preview_evidence")
                 .map(|record| record.behavioral_observation.as_str()),
             Some("token_echo_missing")
+        );
+    }
+
+    #[test]
+    fn token_echo_after_reload_only_fails_live_preview_with_distinct_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), notes_live_preview_page());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": false,
+                "status": "failed",
+                "failure_kind": "token_echo_after_reload_only",
+                "interaction_success": false,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "text_entry": "entered",
+                "text_entry_target": "textarea:data-anvil-action=input",
+                "typed_token": "anvil-note",
+                "token_echoed": false,
+                "token_echoed_after_reload": true,
+                "persistence_after_reload": "preserved",
+                "text_input_state_change": true,
+                "steps": [
+                    "surface_visible",
+                    "text_entry",
+                    "text_input_state_change",
+                    "token_echo_missing",
+                    "persistence_reload",
+                    "token_echoed_after_reload"
+                ],
+                "state_dimensions_changed": ["draft"],
+                "persistence_changed_dimensions": ["typed_token"],
+                "action_hooks": ["input"]
+            }),
+        );
+        let required = ["live_preview_evidence", "persistence_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"live_preview_evidence".to_string()),
+            "{report:?}"
+        );
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("persistence_evidence")
+                .map(String::as_str),
+            Some("strong")
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("live_preview_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("token_echo_after_reload_only")
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("persistence_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("preserved_after_reload")
         );
     }
 

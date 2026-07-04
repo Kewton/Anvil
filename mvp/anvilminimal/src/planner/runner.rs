@@ -103,8 +103,10 @@ const PROFILE_REPAIR_FILE_EXCERPT_MAX_CHARS: usize = 2_400;
 const INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT: &str = "keyboard or pointer input must visibly change game state (player position, projectiles, score/health, or state transitions); wire input handlers into the render/update loop.";
 const INTERACTION_START_REPAIR_REQUIREMENT: &str = "primary/start controls must transition the visible app state before input is evaluated; wire the start action into state and render updates.";
 const PERSISTENCE_RELOAD_REPAIR_REQUIREMENT: &str = "load persisted state on mount (e.g. read localStorage in initialization) and write on mutation";
-const TEXT_ECHO_REPAIR_REQUIREMENT: &str = "render the input's content reactively (no manual rebuild) - the typed text must appear in the preview/list";
-const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 13] = [
+const TEXT_ECHO_REPAIR_REQUIREMENT: &str = "token never rendered; render the input's content reactively (no manual rebuild) - the typed text must appear in the preview/list";
+const TEXT_ECHO_AFTER_RELOAD_REPAIR_REQUIREMENT: &str =
+    "preview renders only after reload - make it reactive to input";
+const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 14] = [
     "interaction_state_change_missing",
     "input_state_change_missing_after_start",
     "input_state_change_not_evaluated_after_start",
@@ -114,6 +116,7 @@ const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 13] = [
     "surface_missing",
     "text_entry_missing",
     "text_input_state_change_missing",
+    "token_echo_after_reload_only",
     "token_echo_missing",
     "surface_visible_missing",
     "interactive_surface_missing",
@@ -2156,6 +2159,9 @@ fn verify_plan_final_contract(
             "text_entry_target": text_telemetry.text_entry_target,
             "typed_token": text_telemetry.typed_token,
             "token_echoed": text_telemetry.token_echoed,
+            "echo_latency_ms": text_telemetry.echo_latency_ms,
+            "token_echoed_after_reload": text_telemetry.token_echoed_after_reload,
+            "token_echo_after_reload_latency_ms": text_telemetry.token_echo_after_reload_latency_ms,
             "text_input_state_change": text_telemetry.text_input_state_change,
             "next_action": next_action,
             "recovery_handoff_kind": recovery_handoff
@@ -4727,6 +4733,9 @@ fn ultra_final_acceptance_report_inner(
             "text_entry_target": text_telemetry.text_entry_target,
             "typed_token": text_telemetry.typed_token,
             "token_echoed": text_telemetry.token_echoed,
+            "echo_latency_ms": text_telemetry.echo_latency_ms,
+            "token_echoed_after_reload": text_telemetry.token_echoed_after_reload,
+            "token_echo_after_reload_latency_ms": text_telemetry.token_echo_after_reload_latency_ms,
             "text_input_state_change": text_telemetry.text_input_state_change,
             "next_action": next_action,
             "recovery_handoff_kind": recovery_handoff
@@ -5182,6 +5191,9 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "text_entry_target": observation.text_entry_target.as_str(),
                     "typed_token": observation.typed_token.as_str(),
                     "token_echoed": observation.token_echoed,
+                    "echo_latency_ms": observation.echo_latency_ms,
+                    "token_echoed_after_reload": observation.token_echoed_after_reload,
+                    "token_echo_after_reload_latency_ms": observation.token_echo_after_reload_latency_ms,
                     "text_input_state_change": observation.text_input_state_change,
                     "input_state_evaluated_after_start": observation.input_state_evaluated_after_start,
                     "primary_start_transition": observation.primary_transition_observed,
@@ -8162,7 +8174,8 @@ fn interaction_repair_targets_for_reason(reason: &str) -> Vec<String> {
         || lower.contains("text_input_state_change_missing")
     {
         vec!["input_state_render_wiring".to_string()]
-    } else if lower.contains("token_echo_missing") {
+    } else if lower.contains("token_echo_after_reload_only") || lower.contains("token_echo_missing")
+    {
         vec!["live_preview_render_wiring".to_string()]
     } else if lower.contains("text_entry_missing") {
         vec!["text_input_wiring".to_string()]
@@ -10424,6 +10437,15 @@ fn final_acceptance_behavioral_probe_context(
         if let Some(echoed) = raw_bool_field_deep(value, "token_echoed") {
             lines.push(format!("- token echoed outside input: {echoed}"));
         }
+        if let Some(latency) = raw_u64_field_deep(value, "echo_latency_ms") {
+            lines.push(format!("- token echo latency ms: {latency}"));
+        }
+        if let Some(after_reload) = raw_bool_field_deep(value, "token_echoed_after_reload") {
+            lines.push(format!("- token echoed after reload: {after_reload}"));
+        }
+        if let Some(latency) = raw_u64_field_deep(value, "token_echo_after_reload_latency_ms") {
+            lines.push(format!("- token echo after reload latency ms: {latency}"));
+        }
         if let Some(changed) = raw_bool_field_deep(value, "text_input_state_change") {
             lines.push(format!("- text input state change: {changed}"));
         }
@@ -10493,7 +10515,11 @@ fn final_acceptance_behavioral_probe_context(
             "- concrete requirement: {PERSISTENCE_RELOAD_REPAIR_REQUIREMENT}"
         ));
     }
-    if failure_kind.contains("token_echo_missing") {
+    if failure_kind.contains("token_echo_after_reload_only") {
+        lines.push(format!(
+            "- concrete requirement: {TEXT_ECHO_AFTER_RELOAD_REPAIR_REQUIREMENT}"
+        ));
+    } else if failure_kind.contains("token_echo_missing") {
         lines.push(format!(
             "- concrete requirement: {TEXT_ECHO_REPAIR_REQUIREMENT}"
         ));
@@ -10531,6 +10557,9 @@ fn final_acceptance_recovery_reason(
     } else if failure_kind.contains("persistence_after_reload_reset") {
         out.push_str("; ");
         out.push_str(PERSISTENCE_RELOAD_REPAIR_REQUIREMENT);
+    } else if failure_kind.contains("token_echo_after_reload_only") {
+        out.push_str("; ");
+        out.push_str(TEXT_ECHO_AFTER_RELOAD_REPAIR_REQUIREMENT);
     } else if failure_kind.contains("token_echo_missing") {
         out.push_str("; ");
         out.push_str(TEXT_ECHO_REPAIR_REQUIREMENT);
@@ -10631,6 +10660,9 @@ struct InteractionTextTelemetry {
     text_entry_target: String,
     typed_token: String,
     token_echoed: Option<bool>,
+    echo_latency_ms: Option<u64>,
+    token_echoed_after_reload: Option<bool>,
+    token_echo_after_reload_latency_ms: Option<u64>,
     text_input_state_change: Option<bool>,
 }
 
@@ -10647,6 +10679,12 @@ fn interaction_text_telemetry_from_path(path: &str) -> InteractionTextTelemetry 
         text_entry_target: raw_text_field_deep(&value, &["text_entry_target"]).unwrap_or_default(),
         typed_token: raw_text_field_deep(&value, &["typed_token"]).unwrap_or_default(),
         token_echoed: raw_bool_field_deep(&value, "token_echoed"),
+        echo_latency_ms: raw_u64_field_deep(&value, "echo_latency_ms"),
+        token_echoed_after_reload: raw_bool_field_deep(&value, "token_echoed_after_reload"),
+        token_echo_after_reload_latency_ms: raw_u64_field_deep(
+            &value,
+            "token_echo_after_reload_latency_ms",
+        ),
         text_input_state_change: raw_bool_field_deep(&value, "text_input_state_change"),
     }
 }
@@ -10704,6 +10742,12 @@ fn raw_bool_field_deep(value: &Value, name: &str) -> Option<bool> {
     raw_value_scopes(value)
         .into_iter()
         .find_map(|scope| scope.get(name).and_then(Value::as_bool))
+}
+
+fn raw_u64_field_deep(value: &Value, name: &str) -> Option<u64> {
+    raw_value_scopes(value)
+        .into_iter()
+        .find_map(|scope| scope.get(name).and_then(Value::as_u64))
 }
 
 fn interaction_candidate_prompt_lines(value: &Value) -> Vec<String> {
@@ -16317,6 +16361,24 @@ if __name__ == "__main__":
             guidance.contains("typed text must appear in the preview/list"),
             "{guidance}"
         );
+    }
+
+    #[test]
+    fn token_echo_after_reload_only_repair_guidance_names_reactivity() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "browser_interaction_failed:token_echo_after_reload_only".to_string(),
+        );
+
+        let guidance =
+            final_acceptance_recovery_reason(&report, "acceptance failed", "repair exhausted");
+
+        assert!(
+            guidance.contains("preview renders only after reload"),
+            "{guidance}"
+        );
+        assert!(guidance.contains("make it reactive to input"), "{guidance}");
+        assert!(!guidance.contains("token never rendered"), "{guidance}");
     }
 
     #[test]
