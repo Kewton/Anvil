@@ -73,6 +73,20 @@ KNOWN_PROFILE_TOKENS = [
     "コマンド ライン",
 ]
 
+GENERIC_APP_INTENT_EXCLUSION_TOKENS = [
+    "app entrypoint",
+    "src/app/",
+    "required final artifacts:",
+    "original ultra goal:",
+    "phase id:",
+    "phase task:",
+    "failed phase:",
+    "failed step:",
+    "repair target:",
+    "recovery handoff",
+    "profile:",
+]
+
 
 @dataclass
 class AcceptanceContract:
@@ -161,6 +175,7 @@ def infer_contract_category(scenario: dict[str, Any]) -> str:
         profile in {"", "generic", "default", "none"}
         and has_app_intent(prompt)
         and not has_any(prompt, KNOWN_PROFILE_TOKENS)
+        and not has_any(prompt, GENERIC_APP_INTENT_EXCLUSION_TOKENS)
     ):
         return "generic-interactive-app"
     if has_any(prompt, ["game", "ゲーム", "space invaders", "invader", "シューティング"]):

@@ -693,9 +693,29 @@ impl DomainProfile for GenericProfile {
 }
 
 fn generic_app_intent_goal(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
     signals::contains_app_intent_token(goal)
         && !signals::contains_nextjs_goal_token(goal)
         && !signals::contains_python_cli_goal_token(goal)
+        && !generic_app_intent_excluded_by_internal_or_artifact_context(&lower)
+}
+
+fn generic_app_intent_excluded_by_internal_or_artifact_context(lower: &str) -> bool {
+    [
+        "app entrypoint",
+        "src/app/",
+        "required final artifacts:",
+        "original ultra goal:",
+        "phase id:",
+        "phase task:",
+        "failed phase:",
+        "failed step:",
+        "repair target:",
+        "recovery handoff",
+        "profile:",
+    ]
+    .iter()
+    .any(|token| lower.contains(token))
 }
 
 pub fn domain_profile(profile: &str) -> &'static dyn DomainProfile {

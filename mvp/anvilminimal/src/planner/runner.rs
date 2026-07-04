@@ -12239,6 +12239,18 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
     }
 
     #[test]
+    fn generic_app_entrypoint_artifact_goal_does_not_bind_static_contract() {
+        let goal = "Create app entrypoint\n\nRequired final artifacts:\n- src/app/page.tsx";
+        let capabilities = inferred_required_capabilities("generic", goal);
+        let evidence = inferred_required_evidence("generic", goal, &capabilities);
+        let obligations = inferred_required_obligations("generic", goal, &capabilities);
+
+        assert!(capabilities.is_empty());
+        assert!(evidence.is_empty());
+        assert!(obligations.is_empty());
+    }
+
+    #[test]
     fn generic_profile_ignores_known_profile_phase_prompt_for_static_contract() {
         let goal =
             "Original ultra goal: 3011 port app\nProfile: nextjs\nPhase task: Scaffold project";
@@ -12352,10 +12364,19 @@ export default function Memo() {
         let mut execution = FakeClient::new(vec![
             AssistantReply {
                 content: String::new(),
-                tool_calls: vec![crate::state::ToolCall::new(
-                    "Write",
-                    serde_json::json!({"path":"phase-1.txt","content":"phase one\n"}),
-                )],
+                tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"phase-1.txt","content":"phase one\n"}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({
+                            "path":"arcade.jsx",
+                            "content":"import { useState } from \"react\";\nexport default function Arcade(){\n  const [score, setScore] = useState(0);\n  return <form onSubmit={(event) => { event.preventDefault(); setScore(score + 1); }}><input value={score} onChange={() => setScore(score + 1)} /><button type=\"submit\">Advance</button></form>;\n}\n"
+                        }),
+                    ),
+                ],
                 prompt_tokens: None,
                 completion_tokens: None,
             },
