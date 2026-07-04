@@ -445,7 +445,7 @@ source の verifier command admission は shell control を deterministic eviden
 | --- | --- |
 | priority | P1 |
 | category | `diagnostic_gap` |
-| current_status | open |
+| current_status | partial |
 
 ### 現象
 

@@ -275,7 +275,7 @@ def test_dispatch_commandmate_sends_only_worker_task() -> None:
     assert calls[0][:3] == [
         "commandmatedev",
         "send",
-        "Anvil-feature-issue-1-add-worker-task",
+        "anvil-feature-issue-1-add-worker-task",
     ]
     assert calls[0][3] != "hello"
     assert results[0].commands == (" ".join(calls[0]),)
@@ -346,7 +346,7 @@ def test_commandmate_worktree_id_uses_commandmate_branch_format() -> None:
 
     assert (
         module.commandmate_worktree_id("feature/issue-2-p0-m1-define-v1-sidecar-schema")
-        == "Anvil-feature-issue-2-p0-m1-define-v1-sidecar-schema"
+        == "anvil-feature-issue-2-p0-m1-define-v1-sidecar-schema"
     )
 
 

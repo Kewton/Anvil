@@ -57,8 +57,18 @@ G-S01〜G-S16 は `partial` のまま。
 
 理由:
 
-- 022-9 は運用 gate を実装した段階で、最新の MVP / anvildev same-condition comparison はまだ添付していない。
-- release-grade browser / interaction / TUI run evidence も未添付。
+- 最新の MVP / anvildev same-condition comparison は 2026-06-30 に添付済み。
+- release-grade browser / interaction / TUI run evidence も 2026-06-30 に添付済み。
+- ただし browser readiness は HTTP 500、interaction は canvas 未検出で skipped、manual TUI run は `dependency_setup_missing` で失敗しているため、release gate は full pass ではなく `partial` とする。
+- 現行 `eval-preflight.py` は release evidence の path 存在は検査するが evidence JSON の `ok=false` までは機械判定しないため、`parity_gate_report.json` に失敗内容を明示追記した。
+
+最新証跡:
+
+- `workspace/mvp/eval/022/latest_mvp_vs_anvildev_release_evidence_2026-06-30.md`
+- `workspace/mvp/eval/022/evidence/2026-06-30/browser-readiness.json`
+- `workspace/mvp/eval/022/evidence/2026-06-30/interaction-evidence.json`
+- `workspace/mvp/eval/022/evidence/2026-06-30/tui-events.jsonl`
+- `workspace/mvp/eval/022/parity_gate_report.json`
 
 ## 検証
 
@@ -79,5 +89,4 @@ G-S01〜G-S16 は `partial` のまま。
 
 未実施:
 
-- 最新 MVP / anvildev same-condition cloud comparison。
-- release-grade browser / interaction / TUI run evidence の添付。
+- release evidence content の機械判定強化。現在は path presence gate のため、`ok=false` の証跡を full pass 扱いしないよう report 側で補正している。

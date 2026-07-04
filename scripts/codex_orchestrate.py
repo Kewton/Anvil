@@ -1111,7 +1111,7 @@ def build_commandmate_ls_command(
 
 
 def commandmate_worktree_id(branch_name: str) -> str:
-    return f"{commandmate_repository_name()}-{branch_name.replace('/', '-')}"
+    return f"{commandmate_repository_name()}-{branch_name.replace('/', '-')}".lower()
 
 
 def commandmate_repository_name() -> str:
