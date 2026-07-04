@@ -79,6 +79,7 @@ enum EvidenceKind {
     ScoreOrProgressionEvidence,
     FailureOrCollisionEvidence,
     RestartOrRecoverableStateEvidence,
+    PersistenceEvidence,
     NextJsRouteEvidence,
     RequestedContent,
 }
@@ -102,6 +103,7 @@ impl EvidenceKind {
             Self::ScoreOrProgressionEvidence => "score_or_progression_evidence",
             Self::FailureOrCollisionEvidence => "failure_or_collision_evidence",
             Self::RestartOrRecoverableStateEvidence => "restart_or_recoverable_state_evidence",
+            Self::PersistenceEvidence => "persistence_evidence",
             Self::NextJsRouteEvidence => "nextjs_route_evidence",
             Self::RequestedContent => "requested_content_evidence",
         }
@@ -133,6 +135,7 @@ pub fn evidence_satisfaction_channel(key: &str) -> SatisfactionChannel {
         | "score_or_progression_evidence"
         | "failure_or_collision_evidence"
         | "restart_or_recoverable_state_evidence"
+        | "persistence_evidence"
         | "nextjs_route_evidence" => SatisfactionChannel::SourceScan,
         "test_artifact"
         | "bound_verify_command"
@@ -553,6 +556,8 @@ fn explicit_browser_evidence_failure(
                         "steps",
                         "recovery_transition",
                     );
+            let startless_interaction_observed =
+                surface_visible(value, details) && start_control_absent(value, details);
             if bool_field_deep(value, details, &["canvas_found", "canvas_available"]) == Some(false)
             {
                 return Some("canvas_unavailable".to_string());
@@ -580,7 +585,7 @@ fn explicit_browser_evidence_failure(
             if bool_field_deep(value, details, &["state_changed", "visible_state_changed"])
                 == Some(false)
             {
-                if !transition_observed {
+                if !transition_observed && !startless_interaction_observed {
                     return Some("start_transition_missing".to_string());
                 }
                 if bool_field_deep(value, details, &["input_state_evaluated_after_start"])
@@ -634,9 +639,33 @@ fn browser_evidence_has_required_detail(
                 ],
             ) == Some(true)
                 || string_array_field_contains_deep(value, details, "steps", "input_state_change");
-            transition_observed && input_state_changed
+            input_state_changed
+                && (transition_observed
+                    || (surface_visible(value, details) && start_control_absent(value, details)))
         }
     }
+}
+
+fn surface_visible(value: &Value, details: Option<&Value>) -> bool {
+    bool_field_deep(value, details, &["surface_visible", "interactive_surface"]) == Some(true)
+        || string_array_field_contains_deep(value, details, "steps", "surface_visible")
+}
+
+fn start_control_absent(value: &Value, details: Option<&Value>) -> bool {
+    bool_field_deep(
+        value,
+        details,
+        &[
+            "start_control_found",
+            "start_control_present",
+            "start_like_control_found",
+            "start_like_control_present",
+            "primary_action_found",
+            "primary_action_present",
+            "primary_control_found",
+            "primary_control_present",
+        ],
+    ) == Some(false)
 }
 
 fn browser_evidence_failure_reason(value: &Value, details: Option<&Value>) -> String {
@@ -1033,6 +1062,14 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
                     restart_or_recoverable_state_signal(&workspace),
                     &mut missing_evidence,
                     &mut weak_evidence,
+                    &mut evidence_tiers,
+                );
+            }
+            "persistence_evidence" => {
+                record_bool_evidence_tier(
+                    evidence,
+                    has_persistence_evidence(&workspace),
+                    &mut missing_evidence,
                     &mut evidence_tiers,
                 );
             }
@@ -1506,6 +1543,11 @@ fn evidence_kinds_for_capability(capability: &str) -> Vec<EvidenceKind> {
             EvidenceKind::StatefulUpdateEvidence,
             EvidenceKind::InteractiveUiSourceEvidence,
         ],
+        "persistence" => vec![
+            EvidenceKind::ImplementationArtifact,
+            EvidenceKind::StatefulUpdateEvidence,
+            EvidenceKind::PersistenceEvidence,
+        ],
         "nextjs_route" | "route" => vec![EvidenceKind::NextJsRouteEvidence],
         _ => Vec::new(),
     }
@@ -1790,6 +1832,7 @@ fn source_scanned_evidence_kind(kind: EvidenceKind) -> bool {
             | EvidenceKind::ScoreOrProgressionEvidence
             | EvidenceKind::FailureOrCollisionEvidence
             | EvidenceKind::RestartOrRecoverableStateEvidence
+            | EvidenceKind::PersistenceEvidence
             | EvidenceKind::NextJsRouteEvidence
     )
 }
@@ -1977,6 +2020,10 @@ fn restart_or_recoverable_state_signal(workspace: &WorkspaceEvidence) -> SourceE
     workspace_source_signal(workspace, source_file_restart_or_recoverable_state_signal)
 }
 
+fn has_persistence_evidence(workspace: &WorkspaceEvidence) -> bool {
+    route_bound_source_files(workspace).any(source_file_has_persistence)
+}
+
 fn workspace_source_signal(
     workspace: &WorkspaceEvidence,
     signal_fn: fn(&SourceFile) -> SourceEvidenceSignal,
@@ -2159,6 +2206,9 @@ fn evidence_kinds_for_file(
     ) {
         kinds.push(EvidenceKind::RestartOrRecoverableStateEvidence);
     }
+    if source_file_has_persistence(file) {
+        kinds.push(EvidenceKind::PersistenceEvidence);
+    }
     kinds.sort_by_key(|kind| kind.as_str());
     kinds.dedup();
     kinds
@@ -2258,11 +2308,18 @@ fn source_file_has_interactive_ui(file: &SourceFile) -> bool {
         || content.contains("addEventListener")
         || content.contains("onKeyDown")
         || content.contains("onClick")
+        || lower.contains("onchange")
+        || lower.contains("onsubmit")
         || content.contains("requestAnimationFrame")
         || lower.contains("<canvas"))
         && (lower.contains("keydown")
             || lower.contains("arrow")
             || lower.contains("click")
+            || lower.contains("change")
+            || lower.contains("submit")
+            || lower.contains("<input")
+            || lower.contains("<textarea")
+            || lower.contains("<select")
             || lower.contains("pointer")
             || lower.contains("touch")
             || lower.contains("canvas"))
@@ -2506,6 +2563,21 @@ fn source_file_has_restart_or_recoverable_state_keyword(file: &SourceFile) -> bo
     .any(|needle| lower.contains(needle))
 }
 
+fn source_file_has_persistence(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    [
+        "localstorage",
+        "sessionstorage",
+        "indexeddb",
+        ".setitem(",
+        ".getitem(",
+        "navigator.storage",
+        "caches.open(",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn source_file_user_input_handler_signal(file: &SourceFile) -> SourceEvidenceSignal {
     if !source_file_has_user_input_handler_keyword(file) {
         return SourceEvidenceSignal::Absent;
@@ -2624,6 +2696,8 @@ fn segment_has_state_mutation(segment: &str) -> bool {
         "-=",
         "++",
         "--",
+        "=> set",
+        "=>set",
     ]
     .iter()
     .any(|needle| segment.contains(needle))
@@ -5171,6 +5245,56 @@ export default function Page(){
         assert!(report.passed, "{report:?}");
         assert_eq!(report.browser_readiness_status, "passed");
         assert_eq!(report.interaction_evidence_status, "passed");
+    }
+
+    #[test]
+    fn browser_interaction_accepts_startless_input_state_change() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [draft,setDraft] = useState("");
+  const [items,setItems] = useState<string[]>([]);
+  useEffect(() => {
+    localStorage.setItem("todos", JSON.stringify(items));
+  }, [items]);
+  return <main>
+    <input aria-label="Todo" value={draft} onChange={(event) => setDraft(event.target.value)} />
+    <button onClick={() => setItems([...items, draft])}>Add</button>
+    <p>{draft}</p>
+  </main>;
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":true,"http_status":200,"route_rendered":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("interaction-evidence.json"),
+            r#"{"ok":true,"interaction_performed":true,"surface_visible":true,"start_control_found":false,"input_state_change":true,"input_event_observed":true,"state_changed":true,"steps":["surface_visible","control_input_dispatched","input_state_change"]}"#,
+        )
+        .unwrap();
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["browser_interaction".to_string(), "persistence".to_string()],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(report.passed, "{report:?}");
+        assert_eq!(report.interaction_evidence_status, "passed");
+        assert_eq!(
+            report.evidence_tiers.get("persistence_evidence"),
+            Some(&"strong".to_string())
+        );
     }
 
     #[test]

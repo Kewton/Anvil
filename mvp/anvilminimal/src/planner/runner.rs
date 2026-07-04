@@ -1770,6 +1770,7 @@ fn completion_contract_required(
                 | "adversary_or_challenge"
                 | "progression_or_score"
                 | "failure_or_collision_rule"
+                | "persistence"
                 | "browser_interaction"
                 | "playable_ui"
         )
@@ -4296,6 +4297,7 @@ fn ultra_browser_probe_required(
                     | "player_control"
                     | "user_input_or_action"
                     | "visible_state_change"
+                    | "persistence"
                     | "adversary_or_challenge"
                     | "progression_or_score"
                     | "failure_or_collision_rule"
@@ -4497,6 +4499,39 @@ fn inferred_required_capabilities(profile: &str, goal: &str) -> Vec<String> {
         || lower.contains("game over")
         || goal.contains("ゲーム")
         || goal.contains("シューティング");
+    let persistence_like = lower.contains("localstorage")
+        || lower.contains("local storage")
+        || lower.contains("storage")
+        || lower.contains("persist")
+        || lower.contains("saved")
+        || lower.contains("save")
+        || goal.contains("ローカルストレージ")
+        || goal.contains("保存");
+    let interactive_app_like = lower.contains("button")
+        || lower.contains("form")
+        || lower.contains("keyboard")
+        || lower.contains("input")
+        || lower.contains("interactive")
+        || lower.contains("score")
+        || lower.contains("todo")
+        || lower.contains("markdown")
+        || lower.contains("note")
+        || lower.contains("notes")
+        || lower.contains("editor")
+        || lower.contains("edit")
+        || lower.contains("delete")
+        || lower.contains("filter")
+        || lower.contains("preview")
+        || persistence_like
+        || goal.contains("操作")
+        || goal.contains("追加")
+        || goal.contains("完了")
+        || goal.contains("削除")
+        || goal.contains("フィルタ")
+        || goal.contains("編集")
+        || goal.contains("一覧")
+        || goal.contains("プレビュー")
+        || goal.contains("入力");
     if is_next && game_like {
         merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
         merge_unique_strings(&mut capabilities, &["start_or_restart_flow".to_string()]);
@@ -4507,18 +4542,13 @@ fn inferred_required_capabilities(profile: &str, goal: &str) -> Vec<String> {
             &mut capabilities,
             &["failure_or_collision_rule".to_string()],
         );
-    } else if is_next
-        && (lower.contains("button")
-            || lower.contains("form")
-            || lower.contains("keyboard")
-            || lower.contains("input")
-            || lower.contains("interactive")
-            || lower.contains("score")
-            || goal.contains("操作"))
-    {
+    } else if is_next && interactive_app_like {
         merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
         merge_unique_strings(&mut capabilities, &["user_input_or_action".to_string()]);
         merge_unique_strings(&mut capabilities, &["visible_state_change".to_string()]);
+        if persistence_like {
+            merge_unique_strings(&mut capabilities, &["persistence".to_string()]);
+        }
     }
     capabilities
 }
@@ -4579,6 +4609,7 @@ fn inferred_required_obligations(
                 | "stateful_interaction"
                 | "user_input_or_action"
                 | "visible_state_change"
+                | "persistence"
                 | "adversary_or_challenge"
                 | "progression_or_score"
                 | "failure_or_collision_rule"
@@ -4628,6 +4659,7 @@ fn final_acceptance_release_gate(
                     | "player_control"
                     | "user_input_or_action"
                     | "visible_state_change"
+                    | "persistence"
                     | "adversary_or_challenge"
                     | "progression_or_score"
                     | "failure_or_collision_rule"
@@ -10831,6 +10863,81 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         assert!(prompt.contains("- score_or_progression_evidence"));
         assert!(prompt.contains("- failure_or_collision_evidence"));
         assert!(prompt.contains("- restart_or_recoverable_state_evidence"));
+    }
+
+    #[test]
+    fn uat_scenario_goal_capability_goldens_guard_distribution_drift() {
+        let scenarios = [
+            (
+                "game",
+                "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。",
+                vec![
+                    "stateful_interaction",
+                    "start_or_restart_flow",
+                    "player_control",
+                    "adversary_or_challenge",
+                    "progression_or_score",
+                    "failure_or_collision_rule",
+                ],
+            ),
+            (
+                "tool",
+                "ローカルストレージに保存されるTodoアプリ(追加・完了・削除・フィルタ)をNext.jsアプリとして3011ポートで起動可能に開発してください。",
+                vec![
+                    "stateful_interaction",
+                    "user_input_or_action",
+                    "visible_state_change",
+                    "persistence",
+                ],
+            ),
+            (
+                "content",
+                "Markdownをリアルタイムプレビューできるノートアプリ(編集・保存・一覧)をNext.jsアプリとして3011ポートで開発してください。",
+                vec![
+                    "stateful_interaction",
+                    "user_input_or_action",
+                    "visible_state_change",
+                    "persistence",
+                ],
+            ),
+        ];
+
+        for (name, goal, expected) in scenarios {
+            let actual = inferred_required_capabilities("nextjs", goal);
+            let expected = expected
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "scenario={name}");
+            if name != "game" {
+                assert!(
+                    !actual.contains(&"adversary_or_challenge".to_string()),
+                    "scenario={name}: {actual:?}"
+                );
+                assert!(
+                    !actual.contains(&"failure_or_collision_rule".to_string()),
+                    "scenario={name}: {actual:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn todo_and_notes_capabilities_bind_to_generic_interactive_evidence() {
+        for goal in [
+            "ローカルストレージに保存されるTodoアプリ(追加・完了・削除・フィルタ)をNext.jsアプリとして3011ポートで起動可能に開発してください。",
+            "Markdownをリアルタイムプレビューできるノートアプリ(編集・保存・一覧)をNext.jsアプリとして3011ポートで開発してください。",
+        ] {
+            let capabilities = inferred_required_capabilities("nextjs", goal);
+            let evidence = inferred_required_evidence("nextjs", goal, &capabilities);
+            assert!(evidence.contains(&"nextjs_route_evidence".to_string()));
+            assert!(evidence.contains(&"visible_interactive_surface_evidence".to_string()));
+            assert!(evidence.contains(&"user_input_handler_evidence".to_string()));
+            assert!(evidence.contains(&"stateful_update_evidence".to_string()));
+            assert!(evidence.contains(&"persistence_evidence".to_string()));
+            assert!(!evidence.contains(&"challenge_or_adversary_evidence".to_string()));
+            assert!(!evidence.contains(&"failure_or_collision_evidence".to_string()));
+        }
     }
 
     #[test]

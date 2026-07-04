@@ -58,6 +58,7 @@ struct BehaviorObservation {
     steps: BTreeSet<String>,
     surface_visible: bool,
     start_transition: bool,
+    start_control_absent: bool,
     input_state_evaluated_after_start: bool,
     input_state_change: bool,
     recovery_transition: RecoveryTransition,
@@ -261,6 +262,11 @@ fn behavioral_decision(
     if SURFACE_AND_START_KEYS.contains(&key) {
         return if observation.surface_visible && observation.start_transition {
             BehavioralDecision::Pass("surface_visible+start_transition")
+        } else if observation.surface_visible
+            && observation.start_control_absent
+            && observation.input_state_change
+        {
+            BehavioralDecision::Pass("surface_visible+input_state_change")
         } else if !observation.surface_visible {
             BehavioralDecision::Fail("surface_visible_missing")
         } else {
@@ -465,6 +471,19 @@ impl BehaviorObservation {
         let start_transition = steps.contains("start_transition")
             || bool_field_deep(value, &["start_transition"]) == Some(true)
             || marker_changed;
+        let start_control_absent = bool_field_deep(
+            value,
+            &[
+                "start_control_found",
+                "start_control_present",
+                "start_like_control_found",
+                "start_like_control_present",
+                "primary_action_found",
+                "primary_action_present",
+                "primary_control_found",
+                "primary_control_present",
+            ],
+        ) == Some(false);
         let input_state_evaluated_after_start = bool_field_deep(
             value,
             &[
@@ -487,6 +506,7 @@ impl BehaviorObservation {
             steps,
             surface_visible,
             start_transition,
+            start_control_absent,
             input_state_evaluated_after_start,
             input_state_change,
             recovery_transition,
@@ -834,6 +854,81 @@ export default function Page() {
                 .get("restart_or_recoverable_state_evidence")
                 .map(String::as_str),
             Some("absent")
+        );
+    }
+
+    #[test]
+    fn startless_input_state_change_satisfies_generic_interactive_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [draft, setDraft] = useState("");
+  const [items, setItems] = useState<string[]>([]);
+  return (
+    <main>
+      <input aria-label="Todo" value={draft} onChange={(event) => setDraft(event.target.value)} />
+      <button onClick={() => setItems([...items, draft])}>Add</button>
+      <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul>
+    </main>
+  );
+}
+"#,
+        );
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "surface_visible": true,
+                "start_control_found": false,
+                "steps": [
+                    "surface_visible",
+                    "control_input_dispatched",
+                    "input_state_change"
+                ],
+                "input_before_marker": "items:0,draft:",
+                "input_after_marker": "items:0,draft:buy milk"
+            }),
+        );
+        let required = [
+            "interactive_ui_source_evidence",
+            "visible_interactive_surface_evidence",
+            "non_static_screen_evidence",
+            "user_input_handler_evidence",
+            "stateful_update_evidence",
+        ];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert_eq!(
+            arbitration
+                .records
+                .get("visible_interactive_surface_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("surface_visible+input_state_change")
+        );
+        assert!(
+            !report
+                .missing_evidence
+                .contains(&"visible_interactive_surface_evidence".to_string())
         );
     }
 
