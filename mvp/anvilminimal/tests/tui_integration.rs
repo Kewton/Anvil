@@ -35,6 +35,8 @@ fn config(root: PathBuf) -> Config {
         fresh_session: false,
         no_footer: false,
         profile: "generic".to_string(),
+        profile_explicit: false,
+        profile_inference: None,
         style: "default".to_string(),
         action: Action::Repl,
     }

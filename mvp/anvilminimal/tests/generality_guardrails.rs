@@ -10,6 +10,9 @@ fn generic_profile_reduced_assurance_markers_still_render() {
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/generic/events.jsonl");
     let mut snapshot = CompletionSnapshot::empty();
+    snapshot.assurance_level = "reduced".to_string();
+    snapshot.assurance_reason =
+        anvilminimal::eval_events::GENERIC_REDUCED_ASSURANCE_REASON.to_string();
     snapshot.runtime_acceptance_status = "pass".to_string();
     snapshot.final_acceptance_status = "partial".to_string();
     snapshot.release_gate_status = "partial".to_string();
@@ -53,6 +56,7 @@ fn generic_profile_reduced_assurance_markers_still_render() {
         "- browser_interaction:unverified:generic_profile_reduced_assurance",
         "Interaction verification: interaction_unverified:probe_unavailable",
         "Next action: run_setup_interaction_probe_to_enable_interaction_release_checks",
+        "Assurance: reduced (generic profile — no capability contract, no behavioral verification)",
     ] {
         assert!(
             summary.contains(marker),
@@ -75,7 +79,7 @@ fn nextjs_boundary_erosion_tripwire_keeps_dispatch_sites_audited() {
         ("src/minimal_loop/import_scan.rs".to_string(), 1),
         ("src/planner/lint.rs".to_string(), 2),
         ("src/planner/profile.rs".to_string(), 3),
-        ("src/planner/runner.rs".to_string(), 12),
+        ("src/planner/runner.rs".to_string(), 11),
         ("src/planner/verify.rs".to_string(), 1),
     ]);
     assert_eq!(

@@ -5,6 +5,7 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{Cli, ProviderArg};
+use crate::planner::profile::{ProfileInference, infer_profile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -59,6 +60,8 @@ pub struct Config {
     pub fresh_session: bool,
     pub no_footer: bool,
     pub profile: String,
+    pub profile_explicit: bool,
+    pub profile_inference: Option<ProfileInference>,
     pub style: String,
     pub action: Action,
 }
@@ -83,6 +86,17 @@ impl Config {
         let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
         let action = action_from_cli(&cli)?;
         let eval_events_path = crate::eval_events::path_from_env_or_default(&workspace_root);
+        let profile_explicit = cli.profile.is_some();
+        let profile_inference = if profile_explicit {
+            None
+        } else {
+            infer_profile(action_goal(&action), &workspace_root)
+        };
+        let profile = cli
+            .profile
+            .clone()
+            .or_else(|| profile_inference.map(|inference| inference.profile.to_string()))
+            .unwrap_or_else(|| "generic".to_string());
         Ok(Self {
             workspace_root,
             state_dir,
@@ -103,10 +117,26 @@ impl Config {
             resume: cli.resume,
             fresh_session: cli.fresh_session,
             no_footer: cli.no_footer,
-            profile: cli.profile,
+            profile,
+            profile_explicit,
+            profile_inference,
             style: cli.style,
             action,
         })
+    }
+}
+
+pub fn action_goal(action: &Action) -> Option<&str> {
+    match action {
+        Action::Prompt(goal)
+        | Action::PlanSteps(goal)
+        | Action::PlanRun(goal)
+        | Action::UltraPlan(goal)
+        | Action::UltraPlanRun(goal) => Some(goal.as_str()),
+        Action::Repl
+        | Action::RunPlan(_)
+        | Action::RunUltraPlan(_)
+        | Action::SetupInteractionProbe => None,
     }
 }
 
@@ -237,5 +267,108 @@ mod tests {
         let cli = Cli::parse_from(["anvilminimal", "--provider", "ollama", "--model", "m"]);
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.planner_model, "m");
+    }
+
+    #[test]
+    fn profile_infers_from_goal_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let cli = Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--ultra-plan-run",
+            "Web アプリを作って",
+        ]);
+        let config = Config::from_cli(cli).unwrap();
+        assert_eq!(config.profile, "nextjs");
+        let inference = config.profile_inference.expect("profile inference");
+        assert_eq!(inference.source.as_str(), "goal");
+        assert!(!config.profile_explicit);
+    }
+
+    #[test]
+    fn profile_infers_python_cli_from_goal_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let cli = Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--ultra-plan-run",
+            "Python コマンドラインを作って",
+        ]);
+        let config = Config::from_cli(cli).unwrap();
+        assert_eq!(config.profile, "python-cli");
+        let inference = config.profile_inference.expect("profile inference");
+        assert_eq!(inference.source.as_str(), "goal");
+    }
+
+    #[test]
+    fn profile_infers_from_workspace_manifest_after_goal_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0"}}"#,
+        )
+        .unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let cli = Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--ultra-plan-run",
+            "実装して",
+        ]);
+        let config = Config::from_cli(cli).unwrap();
+        assert_eq!(config.profile, "nextjs");
+        let inference = config.profile_inference.expect("profile inference");
+        assert_eq!(inference.source.as_str(), "workspace");
+    }
+
+    #[test]
+    fn profile_infers_python_cli_from_pyproject_after_goal_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n",
+        )
+        .unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let cli = Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--ultra-plan-run",
+            "実装して",
+        ]);
+        let config = Config::from_cli(cli).unwrap();
+        assert_eq!(config.profile, "python-cli");
+        let inference = config.profile_inference.expect("profile inference");
+        assert_eq!(inference.source.as_str(), "workspace");
+    }
+
+    #[test]
+    fn explicit_generic_profile_suppresses_auto_inference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"x\"\n",
+        )
+        .unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let cli = Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--profile",
+            "generic",
+            "--ultra-plan-run",
+            "Python CLI を作って",
+        ]);
+        let config = Config::from_cli(cli).unwrap();
+        assert_eq!(config.profile, "generic");
+        assert!(config.profile_explicit);
+        assert!(config.profile_inference.is_none());
     }
 }

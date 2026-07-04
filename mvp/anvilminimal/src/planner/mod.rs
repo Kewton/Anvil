@@ -4,6 +4,7 @@ pub mod profile;
 pub mod repair;
 pub mod runner;
 pub mod sanitizer;
+pub mod signals;
 pub mod step_plan;
 pub mod ultra_plan;
 pub mod verify;

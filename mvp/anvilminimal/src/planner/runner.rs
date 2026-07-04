@@ -66,6 +66,7 @@ use crate::planner::repair::{
     workspace_relative_handoff_path,
 };
 use crate::planner::sanitizer::{SanitizerReport, sanitize_step_plan_against_policy};
+use crate::planner::signals;
 use crate::planner::step_plan::{
     PlanStep, StepKind, StepPlan, extract_json_object, parse_generated_step_plan_json,
     parse_step_plan, render_step_plan, repair_generated_step_plan_contract,
@@ -1649,8 +1650,12 @@ fn step_or_phase_is_dependency_setup_purpose(step: &PlanStep, phase_scope: Optio
 
 fn text_mentions_dependency_setup(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    (lower.contains("setup") || lower.contains("install"))
-        && (lower.contains("depend") || lower.contains("workspace") || lower.contains("package"))
+    signals::contains_setup_token(text)
+        && (lower.contains("depend")
+            || lower.contains("workspace")
+            || lower.contains("package")
+            || lower.contains("npm")
+            || text.contains("依存"))
 }
 
 fn should_run_setup_step_dependency_state_lifecycle(
@@ -1818,23 +1823,10 @@ fn completion_contract_required(
         return true;
     }
     let profile = canonical_profile_name(profile);
-    let goal = goal.to_ascii_lowercase();
     let web_or_app_profile = matches!(profile.as_str(), "vite" | "react" | "web");
-    let interactive_goal = [
-        "interactive",
-        "app",
-        "game",
-        "playable",
-        "browser",
-        "canvas",
-        "keyboard",
-        "player",
-        "enemy",
-        "collision",
-        "ゲーム",
-    ]
-    .iter()
-    .any(|needle| goal.contains(needle));
+    let interactive_goal = signals::contains_app_like_token(goal)
+        || signals::contains_browser_probe_token(goal)
+        || signals::contains_canvas_token(goal);
     let interactive_capability = required_capabilities.iter().any(|capability| {
         matches!(
             capability.as_str(),
@@ -2021,6 +2013,7 @@ fn verify_plan_final_contract(
     let action_hooks = interaction_action_hooks_from_path(&release_gate.interaction_evidence_path);
     let text_telemetry =
         interaction_text_telemetry_from_path(&release_gate.interaction_evidence_path);
+    let requested_port = signals::requested_port(&plan.goal, None).map(|requested| requested.port);
     let primary_reason = if !missing_final_artifacts.is_empty() {
         format!(
             "missing final artifacts: {}",
@@ -2071,6 +2064,7 @@ fn verify_plan_final_contract(
         config.eval_events_path.as_deref(),
         json!({
             "event": "plan_final_contract",
+            "requested_port": requested_port,
             "required_final_artifacts": required_paths,
             "missing_final_artifacts": missing_final_artifacts,
             "completion_contract_verification_enabled": external_contract_checked,
@@ -4589,10 +4583,11 @@ fn ultra_final_acceptance_report_inner(
     let release_gate = if production_build_failed {
         production_build_failed_release_gate()
     } else {
+        let signal_text = ultra_plan_signal_text(plan);
         final_acceptance_release_gate(
             config,
             &plan.profile,
-            &plan.goal,
+            &signal_text,
             &required_capabilities,
             Some(&acceptance),
             true,
@@ -4617,6 +4612,9 @@ fn ultra_final_acceptance_report_inner(
     let text_telemetry =
         interaction_text_telemetry_from_path(&release_gate.interaction_evidence_path);
     let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
+    let phase_signal_text = ultra_plan_phase_signal_text(plan);
+    let requested_port = signals::requested_port(&plan.goal, Some(&phase_signal_text))
+        .map(|requested| requested.port);
     let mut compile_errors = profile_report.compile_errors.clone();
     if let Some(report) = external_report.as_ref() {
         for error in &report.compile_errors {
@@ -4680,6 +4678,7 @@ fn ultra_final_acceptance_report_inner(
         json!({
             "event": "ultra_final_acceptance",
             "cycle_index": cycle_index,
+            "requested_port": requested_port,
             "required_paths": required_paths.clone(),
             "missing_paths": missing.clone(),
             "completion_contract_verification_enabled": external_contract_checked,
@@ -4902,54 +4901,24 @@ fn is_katakana(ch: char) -> bool {
 }
 
 fn plan_adherence_stopword(token: &str) -> bool {
-    matches!(
-        token,
-        "acceptance"
-            | "add"
-            | "all"
-            | "and"
-            | "app"
-            | "application"
-            | "build"
-            | "component"
-            | "components"
-            | "complete"
-            | "create"
-            | "current"
-            | "feature"
-            | "features"
-            | "final"
-            | "for"
-            | "from"
-            | "game"
-            | "goal"
-            | "implement"
-            | "implementation"
-            | "interactive"
-            | "into"
-            | "logic"
-            | "next"
-            | "nextjs"
-            | "page"
-            | "phase"
-            | "player"
-            | "preserve"
-            | "project"
-            | "react"
-            | "screen"
-            | "setup"
-            | "state"
-            | "task"
-            | "that"
-            | "the"
-            | "tsx"
-            | "typescript"
-            | "ultra"
-            | "use"
-            | "using"
-            | "verify"
-            | "with"
-    )
+    signals::plan_adherence_stopword(token)
+}
+
+fn ultra_plan_phase_signal_text(plan: &UltraPlan) -> String {
+    plan.phases
+        .iter()
+        .flat_map(|phase| [phase.id.as_str(), phase.prompt.as_str()])
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn ultra_plan_signal_text(plan: &UltraPlan) -> String {
+    let phase_text = ultra_plan_phase_signal_text(plan);
+    if phase_text.is_empty() {
+        plan.goal.clone()
+    } else {
+        format!("{}\n{}", plan.goal, phase_text)
+    }
 }
 
 fn maybe_run_ultra_final_browser_probe(
@@ -4958,20 +4927,27 @@ fn maybe_run_ultra_final_browser_probe(
     required_capabilities: &[String],
     interaction_options: BrowserInteractionProbeOptions,
 ) -> Option<BrowserReadinessObservation> {
-    if !ultra_browser_probe_required(&plan.profile, &plan.goal, required_capabilities)
+    let phase_text = ultra_plan_phase_signal_text(plan);
+    let signal_text = ultra_plan_signal_text(plan);
+    if !ultra_browser_probe_required(&plan.profile, &signal_text, required_capabilities)
         || !ultra_browser_probe_runtime_enabled(config)
     {
         return None;
     }
+    let requested_port = signals::requested_port(&plan.goal, Some(&phase_text));
     let observation = probe_browser_readiness_with_offline_and_interaction_options(
         &config.workspace_root,
         &plan.profile,
-        None,
+        requested_port.map(|requested| requested.port),
         Duration::from_secs(30),
         config.offline,
         interaction_options,
     );
-    emit_browser_probe_event(config, &observation);
+    emit_browser_probe_event(
+        config,
+        &observation,
+        requested_port.map(|requested| requested.port),
+    );
     Some(observation)
 }
 
@@ -4981,9 +4957,12 @@ fn run_ultra_final_browser_checks_before_arbitration(
     required_capabilities: &[String],
     required_evidence: &[String],
 ) -> Option<BrowserReadinessObservation> {
-    if !ultra_browser_probe_required(&plan.profile, &plan.goal, required_capabilities) {
+    let phase_text = ultra_plan_phase_signal_text(plan);
+    let signal_text = ultra_plan_signal_text(plan);
+    if !ultra_browser_probe_required(&plan.profile, &signal_text, required_capabilities) {
         return None;
     }
+    let requested_port = signals::requested_port(&plan.goal, Some(&phase_text));
     let interaction_options =
         browser_interaction_probe_options(required_capabilities, required_evidence);
     let browser_probe = maybe_run_ultra_final_browser_probe(
@@ -4994,8 +4973,9 @@ fn run_ultra_final_browser_checks_before_arbitration(
     );
     let _ = browser_release_gate_with_options(
         config,
-        requires_canvas_surface(&plan.goal, required_capabilities),
+        requires_canvas_surface(&signal_text, required_capabilities),
         interaction_options,
+        requested_port.map(|requested| requested.port),
     );
     browser_probe
 }
@@ -5067,10 +5047,9 @@ fn report_has_production_build_failure(report: &VerificationReport) -> bool {
 
 fn ultra_browser_probe_required(
     profile: &str,
-    goal: &str,
+    signal_text: &str,
     required_capabilities: &[String],
 ) -> bool {
-    let lower = goal.to_ascii_lowercase();
     matches!(profile, "nextjs" | "next-js" | "next.js")
         && (required_capabilities.iter().any(|capability| {
             matches!(
@@ -5084,10 +5063,7 @@ fn ultra_browser_probe_required(
                     | "progression_or_score"
                     | "failure_or_collision_rule"
             )
-        }) || lower.contains("interactive")
-            || lower.contains("game")
-            || lower.contains("keyboard")
-            || goal.contains("ゲーム"))
+        }) || signals::contains_browser_probe_token(signal_text))
 }
 
 fn ultra_browser_probe_runtime_enabled(config: &Config) -> bool {
@@ -5106,7 +5082,11 @@ fn ultra_browser_probe_runtime_enabled(config: &Config) -> bool {
     }
 }
 
-fn emit_browser_probe_event(config: &Config, observation: &BrowserReadinessObservation) {
+fn emit_browser_probe_event(
+    config: &Config,
+    observation: &BrowserReadinessObservation,
+    requested_port: Option<u16>,
+) {
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -5115,6 +5095,7 @@ fn emit_browser_probe_event(config: &Config, observation: &BrowserReadinessObser
             "profile": observation.profile,
             "status": observation.status,
             "ok": observation.ok,
+            "requested_port": requested_port,
             "port": observation.port,
             "route": observation.route,
             "command": observation.command,
@@ -5305,14 +5286,8 @@ fn inferred_required_obligations(
     if !profile_obligations.is_empty() {
         return profile_obligations;
     }
-    let lower = goal.to_ascii_lowercase();
     let is_app_profile = matches!(canonical_profile_name(profile).as_str(), "web" | "vite");
-    let app_like_goal = lower.contains("app")
-        || lower.contains("game")
-        || lower.contains("interactive")
-        || lower.contains("ui")
-        || goal.contains("アプリ")
-        || goal.contains("ゲーム");
+    let app_like_goal = signals::contains_app_like_token(goal);
     if is_app_profile && (app_like_goal || !required_capabilities.is_empty()) {
         return vec!["implementation".to_string()];
     }
@@ -5420,13 +5395,13 @@ fn final_acceptance_release_gate(
     acceptance: Option<&crate::minimal_loop::evidence::RuntimeAcceptanceReport>,
     check_browser_on_runtime_failure: bool,
 ) -> ReleaseGateSummary {
-    let lower = goal.to_ascii_lowercase();
     let is_next = matches!(profile, "nextjs" | "next-js" | "next.js");
     let acceptance_required_evidence = acceptance
         .map(|report| report.evidence_tiers.keys().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
     let interaction_options =
         browser_interaction_probe_options(required_capabilities, &acceptance_required_evidence);
+    let requested_port = signals::requested_port(goal, None);
     let requires_browser = is_next
         && (required_capabilities.iter().any(|capability| {
             matches!(
@@ -5440,10 +5415,7 @@ fn final_acceptance_release_gate(
                     | "progression_or_score"
                     | "failure_or_collision_rule"
             )
-        }) || lower.contains("interactive")
-            || lower.contains("game")
-            || lower.contains("keyboard")
-            || goal.contains("ゲーム"));
+        }) || signals::contains_browser_probe_token(goal));
     let Some(report) = acceptance else {
         return ReleaseGateSummary {
             status: "not_applicable".to_string(),
@@ -5463,6 +5435,7 @@ fn final_acceptance_release_gate(
                 config,
                 requires_canvas_surface(goal, required_capabilities),
                 interaction_options,
+                requested_port.map(|requested| requested.port),
             );
             let mut reasons = vec![report.primary_reason.clone()];
             reasons.extend(std::mem::take(&mut gate.reasons));
@@ -5485,6 +5458,7 @@ fn final_acceptance_release_gate(
                 config,
                 requires_canvas_surface(goal, required_capabilities),
                 interaction_options,
+                requested_port.map(|requested| requested.port),
             )
         } else {
             ReleaseGateSummary {
@@ -5510,6 +5484,7 @@ fn final_acceptance_release_gate(
             config,
             requires_canvas_surface(goal, required_capabilities),
             interaction_options,
+            requested_port.map(|requested| requested.port),
         );
     }
     ReleaseGateSummary {
@@ -5594,9 +5569,8 @@ fn runtime_acceptance_has_buildable_nextjs_boundary(
         .any(|item| item == "implementation")
 }
 
-fn requires_canvas_surface(goal: &str, required_capabilities: &[String]) -> bool {
-    let lower = goal.to_ascii_lowercase();
-    lower.contains("canvas")
+fn requires_canvas_surface(signal_text: &str, required_capabilities: &[String]) -> bool {
+    signals::contains_canvas_token(signal_text)
         && required_capabilities.iter().any(|capability| {
             matches!(
                 capability.as_str(),
@@ -5841,6 +5815,7 @@ fn browser_release_gate_with_expectations(
         config,
         canvas_surface_expected,
         BrowserInteractionProbeOptions::default(),
+        None,
     )
 }
 
@@ -5848,6 +5823,7 @@ fn browser_release_gate_with_options(
     config: &Config,
     canvas_surface_expected: bool,
     interaction_options: BrowserInteractionProbeOptions,
+    requested_port: Option<u16>,
 ) -> ReleaseGateSummary {
     let mut browser = read_release_evidence(
         config,
@@ -5864,7 +5840,7 @@ fn browser_release_gate_with_options(
         ReleaseEvidenceStatus::Unavailable(reason)
             if reason == "browser_readiness_evidence_missing"
     ) {
-        browser = nextjs_dev_route_release_evidence(config, interaction_options);
+        browser = nextjs_dev_route_release_evidence(config, interaction_options, requested_port);
     }
     let interaction = read_release_evidence(
         config,
@@ -5993,10 +5969,15 @@ fn browser_release_gate_with_options(
 fn nextjs_dev_route_release_evidence(
     config: &Config,
     interaction_options: BrowserInteractionProbeOptions,
+    requested_port: Option<u16>,
 ) -> ReleaseEvidence {
     let path = nextjs_dev_route_evidence_path(config);
-    let value =
-        run_nextjs_dev_route_probe_with_interaction_options(config, &path, interaction_options);
+    let value = run_nextjs_dev_route_probe_with_interaction_options(
+        config,
+        &path,
+        interaction_options,
+        requested_port,
+    );
     let status = classify_release_evidence_json(ReleaseEvidenceKind::BrowserReadiness, &value);
     write_release_evidence_json(&path, &value);
     ReleaseEvidence {
@@ -6061,6 +6042,7 @@ fn run_nextjs_dev_route_probe(config: &Config, evidence_path: &Path) -> Value {
         config,
         evidence_path,
         BrowserInteractionProbeOptions::default(),
+        None,
     )
 }
 
@@ -6068,6 +6050,7 @@ fn run_nextjs_dev_route_probe_with_interaction_options(
     config: &Config,
     evidence_path: &Path,
     interaction_options: BrowserInteractionProbeOptions,
+    requested_port: Option<u16>,
 ) -> Value {
     run_nextjs_dev_route_probe_with_runtime(
         config,
@@ -6075,6 +6058,7 @@ fn run_nextjs_dev_route_probe_with_interaction_options(
         dev_server_probe_runtime_enabled(config),
         cleanup_dev_server_child,
         interaction_options,
+        requested_port,
     )
 }
 
@@ -6086,6 +6070,7 @@ fn run_nextjs_dev_route_probe_with_runtime(
     runtime_enabled: bool,
     cleanup_fn: DevServerCleanupFn,
     interaction_options: BrowserInteractionProbeOptions,
+    requested_port: Option<u16>,
 ) -> Value {
     if !runtime_enabled {
         let failure_kind = if cfg!(test) {
@@ -6110,7 +6095,7 @@ fn run_nextjs_dev_route_probe_with_runtime(
         );
     }
 
-    let spec = match load_nextjs_dev_server_probe_spec(&config.workspace_root) {
+    let spec = match load_nextjs_dev_server_probe_spec(&config.workspace_root, requested_port) {
         Ok(spec) => spec,
         Err(failure_kind) => {
             emit_dev_server_unavailable_lifecycle(
@@ -6566,7 +6551,10 @@ fn env_flag_is_true(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn load_nextjs_dev_server_probe_spec(root: &Path) -> Result<NextjsDevServerProbeSpec, String> {
+fn load_nextjs_dev_server_probe_spec(
+    root: &Path,
+    requested_port: Option<u16>,
+) -> Result<NextjsDevServerProbeSpec, String> {
     let manifest_path = root.join("package.json");
     let text = std::fs::read_to_string(&manifest_path)
         .map_err(|_| "browser_unavailable:package_json_missing".to_string())?;
@@ -6583,7 +6571,9 @@ fn load_nextjs_dev_server_probe_spec(root: &Path) -> Result<NextjsDevServerProbe
     if !script_contains_next_dev(script) {
         return Err("browser_unavailable:dev_script_not_next_dev".to_string());
     }
-    let port = parse_next_dev_port(script).unwrap_or(NEXTJS_DEV_SERVER_DEFAULT_PORT);
+    let port = requested_port
+        .or_else(|| parse_next_dev_port(script))
+        .unwrap_or(NEXTJS_DEV_SERVER_DEFAULT_PORT);
     let (package_manager, args) = package_manager_dev_command(root);
     let command_display = std::iter::once(package_manager.as_str())
         .chain(args.iter().map(String::as_str))
@@ -9107,14 +9097,12 @@ fn known_profile_for_setup_fallback(profile: &str) -> bool {
 fn looks_like_setup_phase_goal(goal: &str) -> bool {
     let phase_text = phase_id_and_task_text(goal).unwrap_or_else(|| goal.to_string());
     let lower = phase_text.to_ascii_lowercase();
-    lower.contains("setup")
+    signals::contains_setup_token(&phase_text)
         || lower.contains("set up")
         || lower.contains("scaffold")
         || lower.contains("init")
         || lower.contains("initialize")
         || lower.contains("initialise")
-        || lower.contains("project-setup")
-        || lower.contains("project setup")
 }
 
 fn phase_id_and_task_text(goal: &str) -> Option<String> {
@@ -14976,6 +14964,7 @@ if __name__ == "__main__":
             true,
             cleanup_dev_server_child,
             BrowserInteractionProbeOptions::default(),
+            None,
         );
 
         assert!(
@@ -15032,6 +15021,7 @@ if __name__ == "__main__":
             true,
             forced_cleanup_timeout_after_real_cleanup,
             BrowserInteractionProbeOptions::default(),
+            None,
         );
 
         assert_eq!(evidence.get("ok").and_then(Value::as_bool), Some(true));
@@ -15309,6 +15299,7 @@ if __name__ == "__main__":
             true,
             cleanup_dev_server_child,
             BrowserInteractionProbeOptions::default(),
+            None,
         );
 
         assert_eq!(readiness.get("ok").and_then(Value::as_bool), Some(true));
@@ -15355,6 +15346,7 @@ if __name__ == "__main__":
             true,
             cleanup_dev_server_child,
             BrowserInteractionProbeOptions::default(),
+            None,
         );
 
         assert_eq!(readiness.get("ok").and_then(Value::as_bool), Some(true));
@@ -19371,6 +19363,55 @@ exit 2\n",
         err.raw_os_error() != Some(libc::ESRCH)
     }
 
+    #[test]
+    fn requested_port_overrides_dev_server_probe_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"next dev","build":"next build"},"dependencies":{"next":"x","react":"x","react-dom":"x"}}"#,
+        )
+        .unwrap();
+
+        let spec = load_nextjs_dev_server_probe_spec(dir.path(), Some(4000)).unwrap();
+
+        assert_eq!(spec.port, 4000);
+    }
+
+    #[test]
+    fn dev_server_probe_spec_falls_back_to_script_port_without_request() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"next dev -p 4010","build":"next build"},"dependencies":{"next":"x","react":"x","react-dom":"x"}}"#,
+        )
+        .unwrap();
+
+        let spec = load_nextjs_dev_server_probe_spec(dir.path(), None).unwrap();
+
+        assert_eq!(spec.port, 4010);
+    }
+
+    #[test]
+    fn canvas_surface_gate_uses_ultra_phase_text_and_japanese_tokens() {
+        let plan = UltraPlan {
+            goal: "最高に面白いブラウザ体験を作る".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "implement".to_string(),
+                prompt: "HTML5 Canvas のプレイ画面を実装する".to_string(),
+            }],
+        };
+        let capabilities = vec!["stateful_interaction".to_string()];
+
+        assert!(requires_canvas_surface(
+            &ultra_plan_signal_text(&plan),
+            &capabilities
+        ));
+        assert!(requires_canvas_surface("カンバスを描画する", &capabilities));
+    }
+
     fn config(root: PathBuf) -> Config {
         Config {
             workspace_root: root,
@@ -19393,6 +19434,8 @@ exit 2\n",
             fresh_session: false,
             no_footer: false,
             profile: "generic".to_string(),
+            profile_explicit: false,
+            profile_inference: None,
             style: "default".to_string(),
             action: crate::config::Action::Repl,
         }

@@ -8,12 +8,13 @@ use crate::minimal_loop::import_scan::{
 };
 use crate::planner::profile::ProfileQualityExpectations;
 use crate::planner::profile::profile_failure;
+use crate::planner::signals::requested_port_from_text;
 use crate::planner::verify::{VerificationReport, VerifyStatus};
 
 pub fn generation_rules(intent: &str) -> &'static str {
     match intent {
         "create" => {
-            "- Profile nextjs/create: preserve a real Next.js app contract. Include next/react/react-dom dependencies, keep scripts.build as next build, and end with a build verification phase. Put dependency setup before any npm run build verification when node_modules is not already present; setup instructions may install dependencies, but verify must not contain npm install. If dependency setup is not allowed or cannot run, stop with dependency_missing instead of claiming build success. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, add task-agnostic observability hooks on route-bound UI: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state after each render. When the contract includes start_or_restart_flow, also expose data-anvil-action=\"restart\" on a control that resets observable state and is reachable during use or from a terminal state. If you use Tailwind utility classes or @tailwind directives, include tailwindcss/postcss/autoprefixer and create tailwind.config.* plus postcss.config.*; postcss.config plugins must include BOTH tailwindcss and autoprefixer. Otherwise use plain CSS and do not write Tailwind utility classes. If the goal mentions port 3011, keep scripts.dev as next dev -p 3011 or next dev --port 3011.\n"
+            "- Profile nextjs/create: preserve a real Next.js app contract. Include next/react/react-dom dependencies, keep scripts.build as next build, and end with a build verification phase. Put dependency setup before any npm run build verification when node_modules is not already present; setup instructions may install dependencies, but verify must not contain npm install. If dependency setup is not allowed or cannot run, stop with dependency_missing instead of claiming build success. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, add task-agnostic observability hooks on route-bound UI: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state after each render. When the contract includes start_or_restart_flow, also expose data-anvil-action=\"restart\" on a control that resets observable state and is reachable during use or from a terminal state. If you use Tailwind utility classes or @tailwind directives, include tailwindcss/postcss/autoprefixer and create tailwind.config.* plus postcss.config.*; postcss.config plugins must include BOTH tailwindcss and autoprefixer. Otherwise use plain CSS and do not write Tailwind utility classes. If the goal or plan requests an explicit port, keep scripts.dev on that port with next dev -p <port> or next dev --port <port>.\n"
         }
         "fix" => {
             "- Profile nextjs/fix: preserve the existing Next.js structure and verifier integrity. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, preserve or add task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, preserve or add data-anvil-action=\"restart\" on a control that resets observable state and is reachable during use or from a terminal state. Do not weaken next/react/react-dom dependencies, scripts.build, app/page, layout, or TypeScript configuration to make a failing verifier pass.\n"
@@ -62,13 +63,13 @@ pub fn verify(root: &Path, goal: &str) -> VerificationReport {
     {
         return profile_failure("scripts.dev must run next dev");
     }
-    if goal.contains("3011") {
+    if let Some(port) = requested_port_from_text(goal) {
         let dev = scripts
             .and_then(|scripts| scripts.get("dev"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        if !(dev.contains("next dev") && (dev.contains("-p 3011") || dev.contains("--port 3011"))) {
-            return profile_failure("dev script must run next dev on port 3011");
+        if !script_runs_next_dev_on_port(dev, port) {
+            return profile_failure(format!("dev script must run next dev on port {port}"));
         }
     }
     let Some(entry) = find_entrypoint(&project.path) else {
@@ -141,16 +142,13 @@ pub fn verify_invariant(root: &Path, goal: &str) -> VerificationReport {
     if build.is_some_and(|build| build != "next build" || is_weakened_script(build)) {
         return profile_failure("scripts.build must be next build");
     }
-    if goal.contains("3011") {
+    if let Some(port) = requested_port_from_text(goal) {
         let dev = scripts
             .and_then(|scripts| scripts.get("dev"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        if !dev.is_empty()
-            && !(dev.contains("next dev")
-                && (dev.contains("-p 3011") || dev.contains("--port 3011")))
-        {
-            return profile_failure("dev script must run next dev on port 3011");
+        if !dev.is_empty() && !script_runs_next_dev_on_port(dev, port) {
+            return profile_failure(format!("dev script must run next dev on port {port}"));
         }
     }
     if let Some(reason) = tsconfig_contract_failure(&project.path) {
@@ -171,11 +169,19 @@ pub fn verify_invariant(root: &Path, goal: &str) -> VerificationReport {
     VerificationReport::pass()
 }
 
+fn script_runs_next_dev_on_port(script: &str, port: u16) -> bool {
+    script.contains("next dev")
+        && (script.contains(&format!("-p {port}"))
+            || script.contains(&format!("-p{port}"))
+            || script.contains(&format!("--port {port}"))
+            || script.contains(&format!("--port={port}")))
+}
+
 pub fn guidance(goal: &str) -> String {
-    let port = if goal.contains("3011") {
-        " The dev script must run `next dev -p 3011` or `next dev --port 3011`."
+    let port = if let Some(port) = requested_port_from_text(goal) {
+        format!(" The dev script must run `next dev -p {port}` or `next dev --port {port}`.")
     } else {
-        ""
+        String::new()
     };
     format!(
         "For the nextjs profile, create a runnable Next.js app, not only package metadata. \
@@ -195,10 +201,12 @@ pub fn guidance(goal: &str) -> String {
 }
 
 pub fn runtime_contract(intent: &str, goal: &str) -> String {
-    let port = if goal.contains("3011") {
-        "\n- If a 3011 port requirement exists, keep scripts.dev as next dev -p 3011 or next dev --port 3011."
+    let port = if let Some(port) = requested_port_from_text(goal) {
+        format!(
+            "\n- If a {port} port requirement exists, keep scripts.dev as next dev -p {port} or next dev --port {port}."
+        )
     } else {
-        ""
+        String::new()
     };
     match intent {
         "create" => format!(
@@ -315,7 +323,7 @@ pub fn repair_prompt(root: &Path, goal: &str, report: &VerificationReport) -> St
          Make the smallest bounded change inside the workspace. \
          If package.json exists only in a project subdirectory, continue using that subdirectory. \
          Ensure the app has a concrete playable page and layout, package dependencies, \
-         scripts.build = `next build`, and a dev script on port 3011 when the goal mentions 3011. \
+         scripts.build = `next build`, and a dev script on the requested port when the goal or plan mentions one. \
          Keep a single route-bound implementation; do not leave capability components unimported. \
          If Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer. \
          Use tools for file changes, then stop."
@@ -546,17 +554,18 @@ fn ensure_package_json(root: &Path, goal: &str) -> anyhow::Result<()> {
         ensure_dependency(dev_deps, "autoprefixer", "^10.4.20");
     }
     let scripts = object_entry(&mut package, "scripts");
-    let dev = if goal.contains("3011") {
-        "next dev -p 3011"
+    let requested_port = requested_port_from_text(goal);
+    let dev = if let Some(port) = requested_port {
+        format!("next dev -p {port}")
     } else {
-        "next dev"
+        "next dev".to_string()
     };
-    scripts.insert("dev".to_string(), Value::String(dev.to_string()));
+    scripts.insert("dev".to_string(), Value::String(dev));
     scripts.insert("build".to_string(), Value::String("next build".to_string()));
     scripts.insert(
         "start".to_string(),
-        Value::String(if goal.contains("3011") {
-            "next start -p 3011".to_string()
+        Value::String(if let Some(port) = requested_port {
+            format!("next start -p {port}")
         } else {
             "next start".to_string()
         }),
@@ -1652,13 +1661,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("package.json"),
-            r#"{"dependencies":{"next":"x","react":"x","react-dom":"x"},"scripts":{"build":"next build","dev":"next dev"}}"#,
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev"}}"#,
         )
         .unwrap();
         assert!(matches!(
             verify(dir.path(), "3011").status,
             VerifyStatus::ProfileContractFailed(_)
         ));
+    }
+
+    #[test]
+    fn nextjs_requested_port_is_not_3011_specific() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev"}}"#,
+        )
+        .unwrap();
+        let report = verify_invariant(dir.path(), "4000番ポートで起動");
+        assert!(
+            matches!(
+                report.status,
+                VerifyStatus::ProfileContractFailed(ref reason) if reason.contains("port 4000")
+            ),
+            "{report:?}"
+        );
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 4000"}}"#,
+        )
+        .unwrap();
+        assert!(verify_invariant(dir.path(), "4000番ポートで起動").is_pass());
     }
 
     #[test]

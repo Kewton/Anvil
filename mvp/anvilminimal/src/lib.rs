@@ -121,6 +121,14 @@ fn emit_run_start(config: &Config) {
             "planner_provider": format!("{:?}", config.planner_provider).to_ascii_lowercase(),
             "planner_model": eval_events::body_snippet(&config.planner_model),
             "profile": config.profile,
+            "profile_inferred": config
+                .profile_inference
+                .map(|inference| inference.profile)
+                .unwrap_or(""),
+            "profile_inference_source": config
+                .profile_inference
+                .map(|inference| inference.source.as_str())
+                .unwrap_or(""),
             "style": config.style,
             "action": format!("{:?}", config.action),
             "eval_events_override": eval_events::is_eval_events_override(),
@@ -129,6 +137,17 @@ fn emit_run_start(config: &Config) {
             "build_timestamp": build_info::TIMESTAMP,
         }),
     );
+    if let Some(inference) = config.profile_inference {
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "profile_inferred",
+                "profile": inference.profile,
+                "from": inference.source.as_str(),
+                "lifecycle_stage": "process",
+            }),
+        );
+    }
     if !host_env_contamination.is_empty() {
         eval_events::emit(
             config.eval_events_path.as_deref(),
@@ -155,8 +174,14 @@ fn emit_run_start(config: &Config) {
     eval_events::write_run_summary(
         config.eval_events_path.as_deref(),
         &format!(
-            "Status: running\nAction: {:?}\nEvents: {}{}",
-            config.action, events_path, host_env_line
+            "Status: running\nAction: {:?}\nEvents: {}{}{}",
+            config.action,
+            events_path,
+            config
+                .profile_inference
+                .map(|inference| format!("\n{}", inference.summary_line()))
+                .unwrap_or_default(),
+            host_env_line
         ),
     );
 }
@@ -170,8 +195,9 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "process_failure",
         ),
     };
-    let completion_snapshot =
+    let mut completion_snapshot =
         eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
+    apply_config_completion_metadata(config, &mut completion_snapshot);
     let completion = eval_events::project_completion(ok, &completion_snapshot);
     eval_events::emit(
         config.eval_events_path.as_deref(),
@@ -184,6 +210,10 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "failure_kind": failure_kind,
             "completion_status": &completion.status,
             "task_status": &completion.task_status,
+            "assurance_level": &completion.assurance_level,
+            "assurance_reason": &completion.assurance_reason,
+            "profile_inferred": &completion.profile_inferred,
+            "profile_inference_source": &completion.profile_inference_source,
             "session_status": "process_exited",
             "repl_status": "not_applicable",
             "process_completion_state": &completion.command_completion,
@@ -228,6 +258,20 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
     );
 }
 
+fn apply_config_completion_metadata(
+    config: &Config,
+    snapshot: &mut eval_events::CompletionSnapshot,
+) {
+    if let Some(inference) = config.profile_inference {
+        snapshot.profile_inferred = inference.profile.to_string();
+        snapshot.profile_inference_source = inference.source.as_str().to_string();
+    }
+    if crate::planner::profile::canonical_profile_name(&config.profile) == "generic" {
+        snapshot.assurance_level = "reduced".to_string();
+        snapshot.assurance_reason = eval_events::GENERIC_REDUCED_ASSURANCE_REASON.to_string();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -258,6 +302,8 @@ mod tests {
             fresh_session: false,
             no_footer: false,
             profile: "generic".to_string(),
+            profile_explicit: false,
+            profile_inference: None,
             style: "default".to_string(),
             action: Action::Repl,
         }
@@ -297,7 +343,8 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some(build_info::TIMESTAMP)
         );
-        assert!(event_text.contains("\"task_status\":\"complete\""));
+        assert!(event_text.contains("\"task_status\":\"completed (reduced assurance)\""));
+        assert!(event_text.contains("\"assurance_level\":\"reduced\""));
         assert!(event_text.contains("\"session_status\":\"process_exited\""));
         assert!(event_text.contains("\"repl_status\":\"not_applicable\""));
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
@@ -310,10 +357,32 @@ mod tests {
         assert!(summary.contains("Status: complete"));
         assert!(summary.contains("Command status: completed"));
         assert!(summary.contains("Command completion: completed"));
-        assert!(summary.contains("Task status: complete"));
+        assert!(summary.contains("Task status: completed (reduced assurance)"));
+        assert!(summary.contains(
+            "Assurance: reduced (generic profile — no capability contract, no behavioral verification)"
+        ));
         assert!(summary.contains("Session/REPL status: process_exited"));
         assert!(summary.contains("Final acceptance: not_checked"));
         assert!(summary.contains("Stop reason: completed"));
+    }
+
+    #[test]
+    fn run_lifecycle_keeps_full_profile_assurance_markers_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/test-run/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+
+        emit_run_start(&cfg);
+        let result: anyhow::Result<()> = Ok(());
+        emit_run_stop(&cfg, &result);
+
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(!event_text.contains("\"assurance_level\":\"reduced\""));
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(!summary.contains("Assurance: reduced"));
+        assert!(summary.contains("Task status: complete"));
     }
 
     #[test]

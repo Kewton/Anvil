@@ -7,6 +7,7 @@ use crate::minimal_loop::dependency_setup::{
     self, NodeDependencySetupAuthority, NodeDependencySetupRequirement,
 };
 use crate::minimal_loop::evidence::required_evidence_for_capability;
+use crate::planner::signals;
 use crate::planner::verify::VerificationReport;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -215,6 +216,80 @@ static PYTHON_CLI_PROFILE: crate::planner::profiles::python_cli::PythonCliProfil
     crate::planner::profiles::python_cli::PythonCliProfile;
 static GENERIC_PROFILE: GenericProfile = GenericProfile;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileInferenceSource {
+    Goal,
+    Workspace,
+}
+
+impl ProfileInferenceSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Goal => "goal",
+            Self::Workspace => "workspace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProfileInference {
+    pub profile: &'static str,
+    pub source: ProfileInferenceSource,
+}
+
+impl ProfileInference {
+    pub fn summary_line(self) -> String {
+        format!(
+            "profile_inferred: {} (from: {})",
+            self.profile,
+            self.source.as_str()
+        )
+    }
+}
+
+pub fn infer_profile(goal: Option<&str>, workspace_root: &Path) -> Option<ProfileInference> {
+    if let Some(goal) = goal {
+        if signals::contains_nextjs_goal_token(goal) {
+            return Some(ProfileInference {
+                profile: NEXTJS_PROFILE.id(),
+                source: ProfileInferenceSource::Goal,
+            });
+        }
+        if signals::contains_python_cli_goal_token(goal) {
+            return Some(ProfileInference {
+                profile: PYTHON_CLI_PROFILE.id(),
+                source: ProfileInferenceSource::Goal,
+            });
+        }
+    }
+    if package_json_has_dependency(workspace_root, "next") {
+        return Some(ProfileInference {
+            profile: NEXTJS_PROFILE.id(),
+            source: ProfileInferenceSource::Workspace,
+        });
+    }
+    if workspace_root.join("pyproject.toml").is_file() {
+        return Some(ProfileInference {
+            profile: PYTHON_CLI_PROFILE.id(),
+            source: ProfileInferenceSource::Workspace,
+        });
+    }
+    None
+}
+
+fn package_json_has_dependency(root: &Path, name: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join("package.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    ["dependencies", "devDependencies"]
+        .iter()
+        .filter_map(|key| value.get(*key).and_then(serde_json::Value::as_object))
+        .any(|deps| deps.contains_key(name))
+}
+
 impl DomainProfile for NextjsProfile {
     fn id(&self) -> &'static str {
         "nextjs"
@@ -365,56 +440,10 @@ impl DomainProfile for NextjsProfile {
     }
 
     fn infer_required_capabilities(&self, goal: &str) -> Vec<String> {
-        let lower = goal.to_ascii_lowercase();
         let mut capabilities = Vec::new();
-        let game_like = lower.contains("game")
-            || lower.contains("playable")
-            || lower.contains("canvas")
-            || lower.contains("player")
-            || lower.contains("enemy")
-            || lower.contains("enemies")
-            || lower.contains("adversary")
-            || lower.contains("opponent")
-            || lower.contains("obstacle")
-            || lower.contains("collision")
-            || lower.contains("bullet")
-            || lower.contains("lives")
-            || lower.contains("game over")
-            || goal.contains("ゲーム")
-            || goal.contains("シューティング");
-        let persistence_like = lower.contains("localstorage")
-            || lower.contains("local storage")
-            || lower.contains("storage")
-            || lower.contains("persist")
-            || lower.contains("saved")
-            || lower.contains("save")
-            || goal.contains("ローカルストレージ")
-            || goal.contains("保存");
-        let interactive_app_like = lower.contains("button")
-            || lower.contains("form")
-            || lower.contains("keyboard")
-            || lower.contains("input")
-            || lower.contains("interactive")
-            || lower.contains("score")
-            || lower.contains("todo")
-            || lower.contains("markdown")
-            || lower.contains("note")
-            || lower.contains("notes")
-            || lower.contains("editor")
-            || lower.contains("edit")
-            || lower.contains("delete")
-            || lower.contains("filter")
-            || lower.contains("preview")
-            || persistence_like
-            || goal.contains("操作")
-            || goal.contains("追加")
-            || goal.contains("完了")
-            || goal.contains("削除")
-            || goal.contains("フィルタ")
-            || goal.contains("編集")
-            || goal.contains("一覧")
-            || goal.contains("プレビュー")
-            || goal.contains("入力");
+        let game_like = signals::contains_game_token(goal);
+        let persistence_like = signals::contains_persistence_token(goal);
+        let interactive_app_like = signals::contains_interactive_token(goal);
         if game_like {
             merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
             merge_unique_strings(&mut capabilities, &["start_or_restart_flow".to_string()]);
@@ -438,14 +467,8 @@ impl DomainProfile for NextjsProfile {
 
     fn infer_required_evidence(&self, goal: &str, required_capabilities: &[String]) -> Vec<String> {
         let mut evidence = Vec::new();
-        let lower = goal.to_ascii_lowercase();
-        let app_like_goal = lower.contains("app")
-            || lower.contains("game")
-            || lower.contains("interactive")
-            || lower.contains("ui")
-            || goal.contains("アプリ")
-            || goal.contains("ゲーム")
-            || !required_capabilities.is_empty();
+        let app_like_goal =
+            signals::contains_app_like_token(goal) || !required_capabilities.is_empty();
         if app_like_goal {
             merge_unique_strings(
                 &mut evidence,
@@ -466,13 +489,7 @@ impl DomainProfile for NextjsProfile {
         goal: &str,
         required_capabilities: &[String],
     ) -> Vec<String> {
-        let lower = goal.to_ascii_lowercase();
-        let app_like_goal = lower.contains("app")
-            || lower.contains("game")
-            || lower.contains("interactive")
-            || lower.contains("ui")
-            || goal.contains("アプリ")
-            || goal.contains("ゲーム");
+        let app_like_goal = signals::contains_app_like_token(goal);
         if app_like_goal || !required_capabilities.is_empty() {
             return vec!["implementation".to_string()];
         }
@@ -480,22 +497,9 @@ impl DomainProfile for NextjsProfile {
     }
 
     fn completion_contract_required(&self, goal: &str, required_capabilities: &[String]) -> bool {
-        let goal = goal.to_ascii_lowercase();
-        let interactive_goal = [
-            "interactive",
-            "app",
-            "game",
-            "playable",
-            "browser",
-            "canvas",
-            "keyboard",
-            "player",
-            "enemy",
-            "collision",
-            "ゲーム",
-        ]
-        .iter()
-        .any(|needle| goal.contains(needle));
+        let interactive_goal = signals::contains_app_like_token(goal)
+            || signals::contains_browser_probe_token(goal)
+            || signals::contains_canvas_token(goal);
         let interactive_capability = required_capabilities.iter().any(|capability| {
             matches!(
                 capability.as_str(),

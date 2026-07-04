@@ -87,6 +87,8 @@ impl Drop for TuiCommandCompletionGuard {
 pub struct ParsedSlash {
     pub command: String,
     pub profile: String,
+    pub profile_explicit: bool,
+    pub profile_inference: Option<crate::planner::profile::ProfileInference>,
     pub style: String,
     pub goal: String,
 }
@@ -96,12 +98,23 @@ pub fn parse_slash(line: &str, config: &Config) -> anyhow::Result<ParsedSlash> {
     let Some(command) = args.first() else {
         bail!("empty command");
     };
-    let (profile, style, rest) = parse_profile_style(&args[1..], config);
-    let goal = expand_goal_references(&rest.join(" "), config)?;
+    let parsed_profile = parse_profile_style_details(&args[1..], config);
+    let goal = expand_goal_references(&parsed_profile.rest.join(" "), config)?;
+    let mut profile = parsed_profile.profile;
+    let mut profile_inference = None;
+    if !parsed_profile.profile_explicit
+        && let Some(inference) =
+            crate::planner::profile::infer_profile(Some(&goal), &config.workspace_root)
+    {
+        profile = inference.profile.to_string();
+        profile_inference = Some(inference);
+    }
     Ok(ParsedSlash {
         command: command.clone(),
         profile,
-        style,
+        profile_explicit: parsed_profile.profile_explicit,
+        profile_inference,
+        style: parsed_profile.style,
         goal,
     })
 }
@@ -116,15 +129,37 @@ pub fn handle_command(
     let parsed = parse_slash(line, config)?;
     let mut config = config.clone();
     config.profile = parsed.profile;
+    config.profile_explicit = parsed.profile_explicit;
+    config.profile_inference = parsed.profile_inference;
     config.style = parsed.style;
+    if let Some(inference) = config.profile_inference {
+        crate::eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "profile_inferred",
+                "profile": inference.profile,
+                "from": inference.source.as_str(),
+                "lifecycle_stage": "tui_command",
+                "command": &parsed.command,
+            }),
+        );
+    }
     crate::eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
             "event": "tui_command_start",
             "lifecycle_stage": "tui_command",
-            "command": parsed.command,
-            "profile": config.profile,
-            "style": config.style,
+            "command": &parsed.command,
+            "profile": &config.profile,
+            "profile_inferred": config
+                .profile_inference
+                .map(|inference| inference.profile)
+                .unwrap_or(""),
+            "profile_inference_source": config
+                .profile_inference
+                .map(|inference| inference.source.as_str())
+                .unwrap_or(""),
+            "style": &config.style,
             "goal": crate::eval_events::body_snippet(&parsed.goal),
         }),
     );
@@ -209,8 +244,9 @@ fn emit_tui_command_stop_with_status(
     terminal_status: TuiTerminalStatus,
 ) -> crate::eval_events::CompletionProjection {
     let requested_ok = terminal_status.ok();
-    let completion_snapshot =
+    let mut completion_snapshot =
         crate::eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
+    apply_config_completion_metadata(config, &mut completion_snapshot);
     let completion = crate::eval_events::project_completion(requested_ok, &completion_snapshot);
     let terminal_status = effective_terminal_status(terminal_status, &completion);
     let ok = terminal_status.ok();
@@ -232,6 +268,10 @@ fn emit_tui_command_stop_with_status(
             "stop_reason": stop_reason,
             "completion_status": &completion.status,
             "task_status": &event_projection.task_status,
+            "assurance_level": &completion.assurance_level,
+            "assurance_reason": &completion.assurance_reason,
+            "profile_inferred": &completion.profile_inferred,
+            "profile_inference_source": &completion.profile_inference_source,
             "session_status": "repl_ready",
             "repl_status": "ready",
             "command_completion_state": &event_projection.command_completion,
@@ -290,6 +330,21 @@ fn emit_tui_command_stop_with_status(
         );
     }
     if ok { completion } else { event_projection }
+}
+
+fn apply_config_completion_metadata(
+    config: &Config,
+    snapshot: &mut crate::eval_events::CompletionSnapshot,
+) {
+    if let Some(inference) = config.profile_inference {
+        snapshot.profile_inferred = inference.profile.to_string();
+        snapshot.profile_inference_source = inference.source.as_str().to_string();
+    }
+    if crate::planner::profile::canonical_profile_name(&config.profile) == "generic" {
+        snapshot.assurance_level = "reduced".to_string();
+        snapshot.assurance_reason =
+            crate::eval_events::GENERIC_REDUCED_ASSURANCE_REASON.to_string();
+    }
 }
 
 fn terminal_status_for_result(
@@ -374,7 +429,21 @@ fn event_projection_for_terminal_status(
 }
 
 pub fn parse_profile_style(args: &[String], config: &Config) -> (String, String, Vec<String>) {
+    let parsed = parse_profile_style_details(args, config);
+    (parsed.profile, parsed.style, parsed.rest)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedProfileStyle {
+    profile: String,
+    profile_explicit: bool,
+    style: String,
+    rest: Vec<String>,
+}
+
+fn parse_profile_style_details(args: &[String], config: &Config) -> ParsedProfileStyle {
     let mut profile = config.profile.clone();
+    let mut profile_explicit = config.profile_explicit;
     let mut style = config.style.clone();
     let mut rest = Vec::new();
     let mut i = 0;
@@ -382,6 +451,7 @@ pub fn parse_profile_style(args: &[String], config: &Config) -> (String, String,
         match args[i].as_str() {
             "--profile" if i + 1 < args.len() => {
                 profile = args[i + 1].clone();
+                profile_explicit = true;
                 i += 2;
             }
             "--style" if i + 1 < args.len() => {
@@ -394,7 +464,12 @@ pub fn parse_profile_style(args: &[String], config: &Config) -> (String, String,
             }
         }
     }
-    (profile, style, rest)
+    ParsedProfileStyle {
+        profile,
+        profile_explicit,
+        style,
+        rest,
+    }
 }
 
 pub fn expand_goal_references(goal: &str, config: &Config) -> anyhow::Result<String> {
@@ -459,6 +534,8 @@ mod tests {
             fresh_session: false,
             no_footer: false,
             profile: "generic".to_string(),
+            profile_explicit: false,
+            profile_inference: None,
             style: "default".to_string(),
             action: crate::config::Action::Repl,
         }
@@ -487,6 +564,56 @@ mod tests {
         assert_eq!(parsed.profile, "generic");
         assert_eq!(parsed.style, "default");
         assert_eq!(parsed.goal, "goal");
+    }
+
+    #[test]
+    fn parse_slash_infers_profile_from_goal_when_unset() {
+        let parsed = parse_slash("/ultra-plan-run Web アプリを作って", &config()).unwrap();
+        assert_eq!(parsed.profile, "nextjs");
+        assert_eq!(
+            parsed
+                .profile_inference
+                .expect("profile inference")
+                .source
+                .as_str(),
+            "goal"
+        );
+    }
+
+    #[test]
+    fn parse_slash_explicit_generic_wins_over_inference() {
+        let parsed = parse_slash(
+            "/ultra-plan-run --profile generic Web アプリを作って",
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(parsed.profile, "generic");
+        assert!(parsed.profile_explicit);
+        assert!(parsed.profile_inference.is_none());
+    }
+
+    #[test]
+    fn tui_command_stop_marks_generic_completion_reduced_assurance() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let events = workspace.join(".anvil/runs/test/events.jsonl");
+        std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+        let mut cfg = config();
+        cfg.workspace_root = workspace;
+        cfg.eval_events_path = Some(events.clone());
+
+        let result: anyhow::Result<String> = Ok("done".to_string());
+        let projection = emit_tui_command_stop(&cfg, "/ultra-plan-run", &result);
+
+        assert_eq!(projection.assurance_level, "reduced");
+        assert_eq!(projection.task_status, "completed (reduced assurance)");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains(r#""assurance_level":"reduced""#));
+        assert!(event_text.contains(r#""task_status":"completed (reduced assurance)""#));
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains(
+            "Assurance: reduced (generic profile — no capability contract, no behavioral verification)"
+        ));
     }
 
     #[test]

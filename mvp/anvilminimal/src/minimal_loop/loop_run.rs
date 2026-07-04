@@ -3009,6 +3009,8 @@ mod tests {
             fresh_session: false,
             no_footer: false,
             profile: "generic".to_string(),
+            profile_explicit: false,
+            profile_inference: None,
             style: "default".to_string(),
             action: crate::config::Action::Repl,
         }

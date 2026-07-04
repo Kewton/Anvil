@@ -377,6 +377,8 @@ fn live_openai_responses_no_tool_http_smoke() {
         fresh_session: true,
         no_footer: false,
         profile: "default".to_string(),
+        profile_explicit: false,
+        profile_inference: None,
         style: "balanced".to_string(),
         action: Action::Prompt(String::new()),
     };
@@ -439,6 +441,8 @@ fn live_gemini_interactions_no_tool_http_smoke() {
         fresh_session: true,
         no_footer: false,
         profile: "default".to_string(),
+        profile_explicit: false,
+        profile_inference: None,
         style: "balanced".to_string(),
         action: Action::Prompt(String::new()),
     };
@@ -604,6 +608,8 @@ fn smoke_config(tmp_root: &Path, key_root: PathBuf, provider: Provider) -> Confi
         fresh_session: true,
         no_footer: false,
         profile: "generic".to_string(),
+        profile_explicit: false,
+        profile_inference: None,
         style: "default".to_string(),
         action: Action::Prompt(String::new()),
     }

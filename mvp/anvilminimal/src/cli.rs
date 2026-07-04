@@ -42,8 +42,8 @@ pub struct Cli {
     pub run_ultra_plan: Option<PathBuf>,
     #[arg(long, action = ArgAction::SetTrue)]
     pub setup_interaction_probe: bool,
-    #[arg(long, default_value = "generic")]
-    pub profile: String,
+    #[arg(long)]
+    pub profile: Option<String>,
     #[arg(long, default_value = "default")]
     pub style: String,
     #[arg(long)]
@@ -153,7 +153,15 @@ mod tests {
         ])
         .unwrap();
         assert!(cli.ultra_plan_run);
-        assert_eq!(cli.profile, "nextjs");
+        assert_eq!(cli.profile.as_deref(), Some("nextjs"));
         assert_eq!(cli.trailing_goal().as_deref(), Some("3011 port app"));
+    }
+
+    #[test]
+    fn profile_absent_is_distinguishable_from_explicit_generic() {
+        let implicit = Cli::parse_from(["anvilminimal"]);
+        assert_eq!(implicit.profile, None);
+        let explicit = Cli::parse_from(["anvilminimal", "--profile", "generic"]);
+        assert_eq!(explicit.profile.as_deref(), Some("generic"));
     }
 }

@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 
 const SNIPPET_LIMIT: usize = 500;
 const SUMMARY_LIMIT: usize = 8_000;
+pub const GENERIC_REDUCED_ASSURANCE_REASON: &str =
+    "generic profile — no capability contract, no behavioral verification";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StopReasonParts {
@@ -190,6 +192,10 @@ pub fn append_run_summary(path: Option<&Path>, text: &str) {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionSnapshot {
+    pub assurance_level: String,
+    pub assurance_reason: String,
+    pub profile_inferred: String,
+    pub profile_inference_source: String,
     pub runtime_acceptance_status: String,
     pub final_acceptance_status: String,
     pub release_gate_status: String,
@@ -230,6 +236,10 @@ pub struct CompletionSnapshot {
 impl CompletionSnapshot {
     pub fn empty() -> Self {
         Self {
+            assurance_level: String::new(),
+            assurance_reason: String::new(),
+            profile_inferred: String::new(),
+            profile_inference_source: String::new(),
             runtime_acceptance_status: "not_checked".to_string(),
             final_acceptance_status: "not_checked".to_string(),
             release_gate_status: "not_applicable".to_string(),
@@ -282,6 +292,10 @@ pub struct CompletionProjection {
     pub status: String,
     pub command_completion: String,
     pub task_status: String,
+    pub assurance_level: String,
+    pub assurance_reason: String,
+    pub profile_inferred: String,
+    pub profile_inference_source: String,
     pub runtime_acceptance: String,
     pub final_acceptance: String,
     pub release_gate: String,
@@ -389,10 +403,13 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
     let status = terminal_status(ok, &release_gate, &final_acceptance);
     let interaction_unverified =
         interaction_unverified_probe_unavailable(&release_gate, &snapshot.release_gate_reasons);
+    let base_task_status = task_status(ok, &release_gate, &final_acceptance);
     let task_status = if ok && interaction_unverified {
         "partial (interaction unverified)".to_string()
+    } else if ok && snapshot.assurance_level == "reduced" && base_task_status == "complete" {
+        "completed (reduced assurance)".to_string()
     } else {
-        task_status(ok, &release_gate, &final_acceptance)
+        base_task_status
     };
     let next_action = if ok && interaction_unverified {
         "run_setup_interaction_probe_to_enable_interaction_release_checks".to_string()
@@ -403,6 +420,10 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         status,
         command_completion,
         task_status,
+        assurance_level: snapshot.assurance_level.clone(),
+        assurance_reason: snapshot.assurance_reason.clone(),
+        profile_inferred: snapshot.profile_inferred.clone(),
+        profile_inference_source: snapshot.profile_inference_source.clone(),
         runtime_acceptance,
         final_acceptance,
         release_gate,
@@ -643,6 +664,15 @@ pub fn render_tui_completion_output(output: &str, projection: &CompletionProject
         projection.planner_release_risk,
         projection.next_action
     );
+    if !projection.assurance_level.is_empty() {
+        output.push_str("\nAssurance: ");
+        output.push_str(&projection.assurance_level);
+        if !projection.assurance_reason.is_empty() {
+            output.push_str(" (");
+            output.push_str(&projection.assurance_reason);
+            output.push(')');
+        }
+    }
     if !projection.recovery_ultra_plan_path.is_empty()
         || !projection.suggested_recovery_yaml_command.is_empty()
     {
@@ -1290,6 +1320,26 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
         return None;
     }
     Some(CompletionSnapshot {
+        assurance_level: event
+            .get("assurance_level")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        assurance_reason: event
+            .get("assurance_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        profile_inferred: event
+            .get("profile_inferred")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        profile_inference_source: event
+            .get("profile_inference_source")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         runtime_acceptance_status: event
             .get("runtime_acceptance_status")
             .and_then(Value::as_str)
@@ -1643,6 +1693,23 @@ fn render_completion_summary(
         format!("Recovery next action: {}", projection.next_action),
         format!("Stop reason: {stop_reason}"),
     ]);
+    if !projection.profile_inferred.is_empty() {
+        lines.push(format!(
+            "profile_inferred: {} (from: {})",
+            projection.profile_inferred, projection.profile_inference_source
+        ));
+    }
+    if !projection.assurance_level.is_empty() {
+        let suffix = if projection.assurance_reason.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", projection.assurance_reason)
+        };
+        lines.push(format!(
+            "Assurance: {}{}",
+            projection.assurance_level, suffix
+        ));
+    }
     if !projection.unverified_evidence.is_empty() {
         lines.push("Unverified (probe required):".to_string());
         lines.push(render_summary_bullets(&projection.unverified_evidence));
