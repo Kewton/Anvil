@@ -432,7 +432,7 @@ fn tui_slash_failure_records_run_events_and_failure_stage() {
     assert!(summary.contains("Completion status: incomplete"));
     assert!(summary.contains("Command status: failed"));
     assert!(summary.contains("Task status: failed"));
-    assert!(summary.contains("Process: exited normally (not task success)"));
+    assert!(summary.contains("Process: REPL exited cleanly (not task status)"));
     assert!(summary.contains("Session/REPL status: repl_ready"));
     assert!(summary.contains("Recovery next action: fix_command_failure"));
     assert!(summary.contains("TUI command failed"));

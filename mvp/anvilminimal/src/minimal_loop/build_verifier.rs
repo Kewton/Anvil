@@ -15,6 +15,8 @@ pub struct CompileError {
     pub line: usize,
     pub column: usize,
     pub message: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub excerpt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -554,14 +556,20 @@ pub fn parse_compile_errors(output: &str) -> Vec<CompileError> {
     let mut errors = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         if let Some((path, line_number, column)) = parse_compile_location_line(line) {
+            let details = compile_error_details_after_location(&lines, index);
             let message = compile_message_after_location(&lines, index)
                 .unwrap_or_else(|| "compile error".to_string());
+            let excerpt = details
+                .as_ref()
+                .map(|details| details.excerpt.clone())
+                .unwrap_or_default();
             push_compile_error(
                 &mut errors,
                 CompileError {
                     path,
                     line: line_number,
                     column,
+                    excerpt,
                     symbol: cannot_find_name_symbol(&message),
                     message,
                     route_bound: None,
@@ -590,6 +598,9 @@ fn push_compile_error(errors: &mut Vec<CompileError>, error: CompileError) {
 
 fn parse_compile_location_line(line: &str) -> Option<(String, usize, usize)> {
     let trimmed = trim_compile_line(line);
+    if trimmed.contains(",-[") || trimmed.contains("`-[") {
+        return None;
+    }
     let mut parts = trimmed.rsplitn(3, ':');
     let column = parts.next()?.trim().parse::<usize>().ok()?;
     let line_number = parts.next()?.trim().parse::<usize>().ok()?;
@@ -613,6 +624,7 @@ fn parse_inline_tsc_error(line: &str) -> Option<CompileError> {
         path,
         line: line_number,
         column,
+        excerpt: String::new(),
         symbol: cannot_find_name_symbol(&message),
         message,
         route_bound: None,
@@ -620,19 +632,144 @@ fn parse_inline_tsc_error(line: &str) -> Option<CompileError> {
 }
 
 fn compile_message_after_location(lines: &[&str], location_index: usize) -> Option<String> {
+    compile_error_details_after_location(lines, location_index).map(|details| details.message)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompileErrorDetails {
+    message: String,
+    locator: Option<(String, usize, usize)>,
+    excerpt: String,
+}
+
+fn compile_error_details_after_location(
+    lines: &[&str],
+    location_index: usize,
+) -> Option<CompileErrorDetails> {
     lines
         .iter()
+        .enumerate()
         .skip(location_index + 1)
-        .map(|line| trim_compile_line(line))
-        .find(|line| {
-            !line.is_empty()
+        .find_map(|(index, line)| {
+            let line = trim_compile_line(line);
+            let matched = !line.is_empty()
                 && (line.contains("Type error:")
                     || line.contains("Syntax error:")
                     || line.contains("Syntax Error")
                     || line.starts_with("Error:")
-                    || line.starts_with("error "))
+                    || line.starts_with("error "));
+            if !matched {
+                return None;
+            }
+            Some(compile_error_details_from_message_line(lines, index))
         })
-        .map(ToOwned::to_owned)
+}
+
+fn compile_error_details_from_message_line(
+    lines: &[&str],
+    message_index: usize,
+) -> CompileErrorDetails {
+    let raw_message = trim_compile_line(lines[message_index]);
+    let message = if is_bare_error_line(raw_message) {
+        collect_swc_x_message_lines(lines, message_index)
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| raw_message.to_string())
+    } else {
+        raw_message.to_string()
+    };
+    let locator = swc_frame_locator_after(lines, message_index);
+    let excerpt = compile_excerpt_after_message(lines, message_index);
+    CompileErrorDetails {
+        message,
+        locator,
+        excerpt,
+    }
+}
+
+fn is_bare_error_line(line: &str) -> bool {
+    line.trim() == "Error:"
+}
+
+fn collect_swc_x_message_lines(lines: &[&str], message_index: usize) -> Option<String> {
+    let mut messages = Vec::new();
+    let mut started = false;
+    for line in lines
+        .iter()
+        .skip(message_index + 1)
+        .map(|line| trim_compile_line(line))
+    {
+        if line.is_empty() {
+            if started {
+                break;
+            }
+            continue;
+        }
+        if let Some(message) = line
+            .strip_prefix("x ")
+            .or_else(|| line.strip_prefix("x\t"))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            started = true;
+            messages.push(message.to_string());
+            continue;
+        }
+        if started {
+            break;
+        }
+        if parse_swc_frame_locator(line).is_some() || swc_code_frame_line(line) {
+            break;
+        }
+    }
+    (!messages.is_empty()).then(|| messages.join(" "))
+}
+
+fn swc_frame_locator_after(lines: &[&str], message_index: usize) -> Option<(String, usize, usize)> {
+    lines
+        .iter()
+        .skip(message_index + 1)
+        .take(12)
+        .find_map(|line| parse_swc_frame_locator(line))
+}
+
+fn parse_swc_frame_locator(line: &str) -> Option<(String, usize, usize)> {
+    let trimmed = trim_compile_line(line);
+    let start = trimmed.find(",-[")? + 3;
+    let end = trimmed[start..].find(']')? + start;
+    let location = &trimmed[start..end];
+    let mut parts = location.rsplitn(3, ':');
+    let column = parts.next()?.trim().parse::<usize>().ok()?;
+    let line_number = parts.next()?.trim().parse::<usize>().ok()?;
+    let path = normalize_compile_error_path(parts.next()?.trim())?;
+    compile_error_path_is_supported(&path).then_some((path, line_number, column))
+}
+
+fn compile_excerpt_after_message(lines: &[&str], message_index: usize) -> String {
+    let excerpt = lines
+        .iter()
+        .skip(message_index + 1)
+        .filter_map(|line| {
+            let trimmed = trim_compile_line(line);
+            if swc_code_frame_line(trimmed) {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        })
+        .take(6)
+        .collect::<Vec<_>>();
+    excerpt.join("\n")
+}
+
+fn swc_code_frame_line(line: &str) -> bool {
+    if line.starts_with('|') {
+        return true;
+    }
+    let Some((left, _)) = line.split_once('|') else {
+        return false;
+    };
+    let left = left.trim();
+    left.is_empty() || left.chars().all(|ch| ch.is_ascii_digit())
 }
 
 fn parse_failed_to_compile_module_error(lines: &[&str], errors: &mut Vec<CompileError>) {
@@ -642,40 +779,51 @@ fn parse_failed_to_compile_module_error(lines: &[&str], errors: &mut Vec<Compile
     else {
         return;
     };
-    let Some((index, path)) = lines
-        .iter()
-        .enumerate()
-        .skip(failed_index + 1)
-        .filter_map(|(index, line)| {
-            normalize_compile_error_path(trim_compile_line(line))
-                .filter(|path| compile_error_path_is_supported(path))
-                .map(|path| (index, path))
-        })
-        .next()
+    let Some(message_index) =
+        lines
+            .iter()
+            .enumerate()
+            .skip(failed_index + 1)
+            .find_map(|(line_index, line)| {
+                let line = trim_compile_line(line);
+                (!line.is_empty()
+                    && (line.starts_with("Error:")
+                        || line.contains("Syntax Error")
+                        || line.contains("Syntax error:")
+                        || line.contains("Type error:")))
+                .then_some(line_index)
+            })
     else {
         return;
     };
-    let message = lines
+    let path_before_message = lines
         .iter()
-        .skip(index + 1)
-        .map(|line| trim_compile_line(line))
-        .find(|line| {
-            !line.is_empty()
-                && (line.starts_with("Error:")
-                    || line.contains("Syntax Error")
-                    || line.contains("Syntax error:")
-                    || line.contains("Type error:"))
+        .enumerate()
+        .skip(failed_index + 1)
+        .take(message_index.saturating_sub(failed_index + 1))
+        .filter_map(|(_, line)| {
+            normalize_compile_error_path(trim_compile_line(line))
+                .filter(|path| compile_error_path_is_supported(path))
         })
-        .unwrap_or("Failed to compile")
-        .to_string();
+        .next_back();
+    let details = compile_error_details_from_message_line(lines, message_index);
+    let Some((path, line, column)) = details
+        .locator
+        .as_ref()
+        .map(|(path, line, column)| (path.clone(), *line, *column))
+        .or_else(|| path_before_message.map(|path| (path, 0, 0)))
+    else {
+        return;
+    };
     push_compile_error(
         errors,
         CompileError {
             path,
-            line: 0,
-            column: 0,
-            symbol: cannot_find_name_symbol(&message),
-            message,
+            line,
+            column,
+            excerpt: details.excerpt.clone(),
+            symbol: cannot_find_name_symbol(&details.message),
+            message: details.message,
             route_bound: None,
         },
     );
@@ -997,6 +1145,35 @@ Type error: Cannot find name 'reset'.
         assert_eq!(errors[0].column, 28);
         assert_eq!(errors[0].symbol.as_deref(), Some("reset"));
         assert_eq!(errors[0].route_bound, None);
+    }
+
+    #[test]
+    fn parse_swc_bare_error_frame_extracts_message_location_and_excerpt() {
+        let output = r#"
+> next build
+
+Failed to compile.
+
+Error:
+  x Expected ';', '}' or <eof>
+   ,-[/tmp/anvil/src/app/page.tsx:12:1]
+ 9 |   return (
+10 |     <main>
+11 |       <button>Start</button>
+12 |     </main>
+   |     ^
+13 |   )
+"#;
+
+        let errors = parse_compile_errors(output);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "src/app/page.tsx");
+        assert_eq!(errors[0].line, 12);
+        assert_eq!(errors[0].column, 1);
+        assert_eq!(errors[0].message, "Expected ';', '}' or <eof>");
+        assert!(errors[0].excerpt.contains("12 |"), "{errors:?}");
+        assert!(errors[0].excerpt.contains("|     ^"), "{errors:?}");
     }
 
     #[test]

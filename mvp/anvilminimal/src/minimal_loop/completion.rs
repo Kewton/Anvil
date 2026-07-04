@@ -751,7 +751,22 @@ pub(crate) fn compile_error_repair_guidance(errors: &[CompileError]) -> Vec<Stri
     errors
         .iter()
         .flat_map(|error| {
-            let mut lines = vec![format!("Compile error: {}", error.summary())];
+            let mut lines = vec![
+                format!("Compile error: {}", error.summary()),
+                format!("Compile error location: {}", error.location()),
+                format!("Compile error message: {}", error.message),
+            ];
+            if !error.excerpt.trim().is_empty() {
+                lines.push(format!(
+                    "Compile error excerpt for {}:\n{}",
+                    error.location(),
+                    error.excerpt.trim()
+                ));
+            }
+            lines.push(format!(
+                "You MUST modify {} using the edit tool; a reply without file edits fails this repair.",
+                error.path
+            ));
             if let Some(symbol) = error.symbol.as_deref() {
                 let route_note = if error.route_bound == Some(false) {
                     " - the file is not imported by any route"

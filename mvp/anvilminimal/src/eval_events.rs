@@ -218,6 +218,7 @@ pub struct CompletionSnapshot {
     pub planner_quality_issue_count: usize,
     pub planner_repaired: bool,
     pub planner_release_risk: bool,
+    pub compile_rollback_summaries: Vec<String>,
 }
 
 impl CompletionSnapshot {
@@ -251,6 +252,7 @@ impl CompletionSnapshot {
             planner_quality_issue_count: 0,
             planner_repaired: false,
             planner_release_risk: false,
+            compile_rollback_summaries: Vec::new(),
         }
     }
 
@@ -298,6 +300,7 @@ pub struct CompletionProjection {
     pub planner_quality_issue_count: usize,
     pub planner_repaired: bool,
     pub planner_release_risk: bool,
+    pub compile_rollback_summaries: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -342,6 +345,7 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
     snapshot.planner_quality_issue_count = diagnostics.quality_issue_count;
     snapshot.planner_repaired = diagnostics.repaired();
     snapshot.planner_release_risk = diagnostics.release_risk();
+    snapshot.compile_rollback_summaries = compile_rollback_summaries_from_events(&events);
     recovery_fields.apply_to(&mut snapshot);
     snapshot
 }
@@ -411,7 +415,33 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         planner_quality_issue_count: snapshot.planner_quality_issue_count,
         planner_repaired: snapshot.planner_repaired,
         planner_release_risk: snapshot.planner_release_risk,
+        compile_rollback_summaries: snapshot.compile_rollback_summaries.clone(),
     }
+}
+
+fn compile_rollback_summaries_from_events(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event.get("event").and_then(Value::as_str) == Some("compile_rollback_applied")
+        })
+        .filter_map(|event| {
+            let paths = event_string_array(event, "paths");
+            if paths.is_empty() {
+                return None;
+            }
+            let origins = event_string_array(event, "snapshot_origins");
+            let carry = event_string_array(event, "carry_forward_guidance");
+            let mut summary = format!("paths: {}", paths.join(", "));
+            if !origins.is_empty() {
+                summary.push_str(&format!("; snapshot origin: {}", origins.join(", ")));
+            }
+            if !carry.is_empty() {
+                summary.push_str(&format!("; carry-forward: {}", carry.join("; ")));
+            }
+            Some(summary)
+        })
+        .collect()
 }
 
 fn interaction_unverified_probe_unavailable(release_gate: &str, reasons: &[String]) -> bool {
@@ -1350,6 +1380,7 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .get("planner_release_risk")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        compile_rollback_summaries: Vec::new(),
     })
 }
 
@@ -1583,6 +1614,12 @@ fn render_completion_summary(
             render_summary_bullets(&projection.plan_adherence_missing),
         ]);
     }
+    if !projection.compile_rollback_summaries.is_empty() {
+        lines.push("Compile rollback applied:".to_string());
+        lines.push(render_summary_bullets(
+            &projection.compile_rollback_summaries,
+        ));
+    }
     if !projection.recovery_prompt_path.is_empty()
         || !projection.recovery_ultra_plan_path.is_empty()
         || !projection.suggested_recovery_command.is_empty()
@@ -1707,15 +1744,13 @@ fn session_status(lifecycle_stage: &str) -> &'static str {
 }
 
 fn process_lifecycle_status(projection: &CompletionProjection) -> String {
-    if projection.command_completion == "failed" || projection.task_status == "failed" {
-        "exited normally (not task success)".to_string()
-    } else if matches!(
+    if matches!(
         projection.command_completion.as_str(),
         "aborted" | "interrupted"
     ) {
         projection.command_completion.clone()
     } else {
-        "exited normally".to_string()
+        "REPL exited cleanly (not task status)".to_string()
     }
 }
 
@@ -2228,7 +2263,7 @@ mod tests {
             "{written}"
         );
         assert!(
-            written.contains("Process: exited normally (not task success)"),
+            written.contains("Process: REPL exited cleanly (not task status)"),
             "{written}"
         );
         assert!(!written.contains(&"y".repeat(1_000)));

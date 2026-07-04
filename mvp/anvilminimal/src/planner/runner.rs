@@ -14,7 +14,10 @@ use crate::minimal_loop::behavior_evidence::{self, EvidenceArbitrationReport};
 use crate::minimal_loop::browser_probe::{
     BrowserReadinessObservation, html_surface_markers_json, probe_browser_readiness_with_offline,
 };
-use crate::minimal_loop::build_verifier::{CompileError, emit_dependency_build_lifecycle};
+use crate::minimal_loop::build_verifier::{
+    BuildVerifierLifecycleObservation, BuildVerifierStatus, CompileError,
+    emit_dependency_build_lifecycle,
+};
 use crate::minimal_loop::completion::{
     CompletionContract, compile_error_repair_guidance, evidence_hint_tokens_for_goal,
 };
@@ -520,6 +523,7 @@ struct UltraRunContext {
     pending_final_artifacts: Vec<String>,
     pending_capability_evidence: Vec<String>,
     unresolved_repair_targets: Vec<String>,
+    carry_forward_guidance: Vec<String>,
     truncated: bool,
 }
 
@@ -679,6 +683,7 @@ impl UltraRunContext {
             && self.last_failed_phase.is_none()
             && self.pending_final_artifacts.is_empty()
             && self.pending_capability_evidence.is_empty()
+            && self.carry_forward_guidance.is_empty()
         {
             return "Prior ultra context:\n- none yet".to_string();
         }
@@ -716,6 +721,11 @@ impl UltraRunContext {
             &mut lines,
             "Unresolved repair targets",
             &self.unresolved_repair_targets,
+        );
+        append_context_list(
+            &mut lines,
+            "Carry-forward guidance",
+            &self.carry_forward_guidance,
         );
         if self.truncated {
             lines.push("- Context was truncated to bounded path/failure summaries".to_string());
@@ -1052,6 +1062,16 @@ fn run_step(
         );
     }
     if report.is_pass() {
+        if production_build_lifecycle_passed(&build_lifecycles) {
+            snapshot_last_known_good_sources(
+                config,
+                mode,
+                Some(&step.id),
+                &config.profile,
+                &plan.goal,
+                &step.expected_paths,
+            );
+        }
         return Ok(outcome);
     }
     let first_target = classify_repair_target(&report).as_str().to_string();
@@ -1278,6 +1298,16 @@ fn run_step(
                 }),
             );
             if retry.is_pass() {
+                if production_build_lifecycle_passed(&retry_lifecycles) {
+                    snapshot_last_known_good_sources(
+                        config,
+                        mode,
+                        Some(&step.id),
+                        &config.profile,
+                        &plan.goal,
+                        &step.expected_paths,
+                    );
+                }
                 outcome.primary_failure = None;
                 outcome.stop_reason = repair_stop_reason.clone();
                 return Ok(outcome);
@@ -3195,6 +3225,7 @@ pub fn run_ultra_plan_with_ui(
         let repair_started = Instant::now();
         let mut attempts_run = 0;
         let mut exhausted_reason = "bounded_repair_exhausted".to_string();
+        let mut compile_no_source_change_count = 0usize;
         for attempt in 1..=FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS {
             if repair_started.elapsed() > FINAL_ACCEPTANCE_REPAIR_WALL_CLOCK_CAP {
                 exhausted_reason = "bounded_repair_wall_clock_cap".to_string();
@@ -3202,6 +3233,8 @@ pub fn run_ultra_plan_with_ui(
             }
             attempts_run = attempt;
             let repair_target = classify_repair_target(&acceptance_report);
+            let compile_reanchored_retry =
+                compile_no_source_change_count > 0 && !acceptance_report.compile_errors.is_empty();
             let expected_paths =
                 final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
             let repair_prompt = final_acceptance_repair_prompt(
@@ -3212,6 +3245,7 @@ pub fn run_ultra_plan_with_ui(
                 &expected_paths,
                 &plan_adherence_report(plan, &config.workspace_root).missing,
                 (attempt, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+                compile_reanchored_retry,
             );
             eval_events::emit(
                 config.eval_events_path.as_deref(),
@@ -3227,6 +3261,7 @@ pub fn run_ultra_plan_with_ui(
                     "bounded_repair": true,
                     "max_iterations": repair_config.max_iterations,
                     "shared_execution_session": true,
+                    "compile_reanchored_retry": compile_reanchored_retry,
                     "session_message_count": ultra_session.messages.len(),
                 }),
             );
@@ -3241,6 +3276,31 @@ pub fn run_ultra_plan_with_ui(
                 Ok(outcome) => outcome,
                 Err(err) => {
                     let err_text = err.to_string();
+                    if !acceptance_report.compile_errors.is_empty()
+                        && err_text.contains("missing tool call for action prompt")
+                    {
+                        compile_no_source_change_count += 1;
+                        exhausted_reason = "compile_repair_no_source_change".to_string();
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "final_acceptance_repair_no_source_change",
+                                "lifecycle_stage": "final_acceptance_repair",
+                                "attempt": attempt,
+                                "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                                "failure_kind": "compile_repair_no_source_change",
+                                "repair_target": repair_target.as_str(),
+                                "compile_errors": acceptance_report.compile_errors.clone(),
+                                "repair_error": eval_events::body_snippet(&err_text),
+                                "reanchored_retry": compile_no_source_change_count == 1,
+                                "proceed_to_rollback": compile_no_source_change_count >= 2,
+                            }),
+                        );
+                        if compile_no_source_change_count >= 2 {
+                            break;
+                        }
+                        continue;
+                    }
                     eval_events::emit(
                         config.eval_events_path.as_deref(),
                         json!({
@@ -3256,7 +3316,9 @@ pub fn run_ultra_plan_with_ui(
                     let repair_targets =
                         final_acceptance_recovery_repair_targets(&acceptance_report, repair_target);
                     let missing_signals = verification_missing_signals(&acceptance_report);
-                    let handoff = save_ultra_phase_recovery_handoff(
+                    let failure_evidence =
+                        final_acceptance_recovery_failure_evidence(&acceptance_report, &err_text);
+                    let handoff = save_ultra_phase_recovery_handoff_with_evidence(
                         config,
                         plan,
                         &fallback_phase,
@@ -3267,6 +3329,7 @@ pub fn run_ultra_plan_with_ui(
                             missing_signals: &missing_signals,
                             repair_targets: &repair_targets,
                         },
+                        &failure_evidence,
                     );
                     anyhow::bail!(
                         "{}",
@@ -3304,6 +3367,31 @@ pub fn run_ultra_plan_with_ui(
                     "session_message_count": ultra_session.messages.len(),
                 }),
             );
+            if !acceptance_report.compile_errors.is_empty()
+                && repair_outcome.changed_paths.is_empty()
+            {
+                compile_no_source_change_count += 1;
+                exhausted_reason = "compile_repair_no_source_change".to_string();
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "final_acceptance_repair_no_source_change",
+                        "lifecycle_stage": "final_acceptance_repair",
+                        "attempt": attempt,
+                        "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                        "failure_kind": "compile_repair_no_source_change",
+                        "repair_target": repair_target.as_str(),
+                        "compile_errors": acceptance_report.compile_errors.clone(),
+                        "reanchored_retry": compile_no_source_change_count == 1,
+                        "proceed_to_rollback": compile_no_source_change_count >= 2,
+                    }),
+                );
+                if compile_no_source_change_count >= 2 {
+                    break;
+                }
+                continue;
+            }
+            compile_no_source_change_count = 0;
             if !repair_outcome.changed_paths.is_empty() {
                 clear_final_acceptance_browser_probe_evidence(config);
             }
@@ -3311,6 +3399,34 @@ pub fn run_ultra_plan_with_ui(
             if acceptance_report.is_pass() {
                 break;
             }
+        }
+        if !acceptance_report.is_pass()
+            && !acceptance_report.compile_errors.is_empty()
+            && let Some(rollback) = try_compile_rollback_after_repair_exhaustion(
+                config,
+                plan,
+                &fallback_phase,
+                &acceptance_report,
+                &exhausted_reason,
+            )?
+        {
+            push_context_items_capped(
+                &mut ultra_context.carry_forward_guidance,
+                &rollback.carry_forward_guidance,
+                ULTRA_CONTEXT_MAX_MESSAGES,
+                &mut ultra_context.truncated,
+            );
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "compile_rollback_context_carried",
+                    "paths": rollback.paths,
+                    "snapshot_origins": rollback.snapshot_origins,
+                    "carry_forward_guidance": rollback.carry_forward_guidance,
+                }),
+            );
+            exhausted_reason = "compile_rollback_applied".to_string();
+            acceptance_report = ultra_final_acceptance_report(plan, config)?;
         }
         if !acceptance_report.is_pass() {
             let target = classify_repair_target(&acceptance_report);
@@ -3327,6 +3443,8 @@ pub fn run_ultra_plan_with_ui(
             let repair_targets =
                 final_acceptance_recovery_repair_targets(&acceptance_report, target);
             let missing_signals = verification_missing_signals(&acceptance_report);
+            let failure_evidence =
+                final_acceptance_recovery_failure_evidence(&acceptance_report, &handoff_reason);
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
@@ -3344,7 +3462,7 @@ pub fn run_ultra_plan_with_ui(
                     "exhausted_reason": exhausted_reason.clone(),
                 }),
             );
-            let handoff = save_ultra_phase_recovery_handoff(
+            let handoff = save_ultra_phase_recovery_handoff_with_evidence(
                 config,
                 plan,
                 &fallback_phase,
@@ -3355,6 +3473,7 @@ pub fn run_ultra_plan_with_ui(
                     missing_signals: &missing_signals,
                     repair_targets: &repair_targets,
                 },
+                &failure_evidence,
             );
             anyhow::bail!(
                 "{}",
@@ -3621,6 +3740,19 @@ fn confirm_phase_build_after_profile_repair(
         }),
     );
     if build_report.is_pass() {
+        let expected_paths = step_plan
+            .steps
+            .iter()
+            .flat_map(|step| step.expected_paths.iter().cloned())
+            .collect::<Vec<_>>();
+        snapshot_last_known_good_sources(
+            config,
+            "profile_invariant_repair",
+            Some(&phase.id),
+            &plan.profile,
+            &plan.goal,
+            &expected_paths,
+        );
         profile_report
     } else {
         build_report
@@ -3635,6 +3767,208 @@ fn phase_build_verify_commands(plan: &StepPlan) -> Vec<String> {
         }
     }
     commands
+}
+
+fn production_build_lifecycle_passed(lifecycles: &[BuildVerifierLifecycleObservation]) -> bool {
+    lifecycles
+        .iter()
+        .any(|lifecycle| lifecycle.final_status == BuildVerifierStatus::Passed)
+}
+
+fn snapshot_last_known_good_sources(
+    config: &Config,
+    origin_kind: &str,
+    origin_id: Option<&str>,
+    profile: &str,
+    goal: &str,
+    extra_paths: &[String],
+) {
+    let Some(latest_dir) = snapshot_latest_dir(config) else {
+        return;
+    };
+    let paths = snapshot_source_candidates(&config.workspace_root, profile, goal, extra_paths);
+    let mut saved_paths = Vec::new();
+    let mut snapshot_origins = Vec::new();
+    let mut failures = Vec::new();
+    for rel in paths {
+        let Some(source) = readable_workspace_source_path(&config.workspace_root, &rel) else {
+            continue;
+        };
+        let destination = latest_dir.join(&rel);
+        if let Some(parent) = destination.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            failures.push(format!("{rel}: create snapshot dir failed: {err}"));
+            continue;
+        }
+        match std::fs::copy(&source, &destination) {
+            Ok(_) => {
+                saved_paths.push(rel.clone());
+                snapshot_origins.push(workspace_relative_handoff_path(&destination));
+            }
+            Err(err) => failures.push(format!("{rel}: snapshot copy failed: {err}")),
+        }
+    }
+    if !saved_paths.is_empty() || !failures.is_empty() {
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "compile_snapshot_saved",
+                "origin_kind": origin_kind,
+                "origin_id": origin_id.unwrap_or_default(),
+                "snapshot_paths": saved_paths,
+                "snapshot_origins": snapshot_origins,
+                "snapshot_failures": failures,
+            }),
+        );
+    }
+}
+
+fn snapshot_source_candidates(
+    root: &Path,
+    profile: &str,
+    goal: &str,
+    extra_paths: &[String],
+) -> Vec<String> {
+    let mut paths = Vec::new();
+    merge_source_candidates(&mut paths, extra_paths.iter().map(String::as_str));
+    let profile_paths = profile_expected_paths(root, profile, goal);
+    merge_source_candidates(&mut paths, profile_paths.iter().map(String::as_str));
+    merge_source_candidates(
+        &mut paths,
+        [
+            "src/app/page.tsx",
+            "src/app/page.jsx",
+            "src/app/page.ts",
+            "src/app/page.js",
+            "src/app/layout.tsx",
+            "src/app/layout.jsx",
+            "app/page.tsx",
+            "app/page.jsx",
+            "app/page.ts",
+            "app/page.js",
+            "pages/index.tsx",
+            "pages/index.jsx",
+            "pages/index.ts",
+            "pages/index.js",
+        ],
+    );
+    for dir in ["src/app", "app", "pages", "src/components", "components"] {
+        collect_source_files_under(root, dir, &mut paths, 0);
+    }
+    paths.truncate(128);
+    paths
+}
+
+fn merge_source_candidates<'a>(
+    out: &mut Vec<String>,
+    candidates: impl IntoIterator<Item = &'a str>,
+) {
+    for candidate in candidates {
+        if let Some(rel) = safe_source_rel_path(candidate)
+            && !out.contains(&rel)
+        {
+            out.push(rel);
+        }
+    }
+}
+
+fn collect_source_files_under(root: &Path, rel_dir: &str, out: &mut Vec<String>, depth: usize) {
+    if depth > 4 || out.len() >= 128 {
+        return;
+    }
+    let Some(rel_dir) = safe_dir_rel_path(rel_dir) else {
+        return;
+    };
+    let dir = root.join(&rel_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == "node_modules" || name == ".anvil" || name.starts_with('.') {
+            continue;
+        }
+        let rel = format!("{rel_dir}/{name}").replace('\\', "/");
+        if path.is_dir() {
+            collect_source_files_under(root, &rel, out, depth + 1);
+        } else if let Some(rel) = safe_source_rel_path(&rel)
+            && !out.contains(&rel)
+        {
+            out.push(rel);
+        }
+        if out.len() >= 128 {
+            break;
+        }
+    }
+}
+
+fn snapshot_latest_dir(config: &Config) -> Option<PathBuf> {
+    config
+        .eval_events_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(|run_dir| run_dir.join("snapshots").join("latest"))
+}
+
+fn readable_workspace_source_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    let rel = safe_source_rel_path(rel)?;
+    let path = root.join(rel);
+    if !path.is_file() {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let canonical = path.canonicalize().ok()?;
+    canonical.starts_with(root).then_some(path)
+}
+
+fn writable_workspace_source_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    let rel = safe_source_rel_path(rel)?;
+    let path = root.join(rel);
+    let parent = path.parent()?;
+    let root = root.canonicalize().ok()?;
+    let parent = parent.canonicalize().ok()?;
+    parent.starts_with(root).then_some(path)
+}
+
+fn safe_dir_rel_path(raw: &str) -> Option<String> {
+    let rel = raw.trim().trim_start_matches("./").replace('\\', "/");
+    if rel.is_empty() || rel.starts_with('/') || rel.contains('\0') {
+        return None;
+    }
+    let path = Path::new(&rel);
+    if !path
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let lower = rel.to_ascii_lowercase();
+    if lower == ".anvil"
+        || lower.starts_with(".anvil/")
+        || lower.contains("/.anvil/")
+        || lower == "node_modules"
+        || lower.starts_with("node_modules/")
+        || lower.contains("/node_modules/")
+    {
+        return None;
+    }
+    Some(rel)
+}
+
+fn safe_source_rel_path(raw: &str) -> Option<String> {
+    let rel = safe_dir_rel_path(raw)?;
+    let lower = rel.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" | "bun.lockb" | "cargo.lock"
+    ) {
+        return None;
+    }
+    let path = Path::new(&rel);
+    let ext = path.extension().and_then(|ext| ext.to_str())?;
+    matches!(ext, "tsx" | "ts" | "jsx" | "js" | "mjs" | "cjs" | "css").then_some(rel)
 }
 
 fn is_nextjs_build_verify_command_like(command: &str) -> bool {
@@ -9280,6 +9614,149 @@ fn compile_error_paths(errors: &[CompileError]) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Default)]
+struct CompileRollbackOutcome {
+    paths: Vec<String>,
+    snapshot_origins: Vec<String>,
+    carry_forward_guidance: Vec<String>,
+}
+
+fn try_compile_rollback_after_repair_exhaustion(
+    config: &Config,
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    report: &VerificationReport,
+    exhausted_reason: &str,
+) -> anyhow::Result<Option<CompileRollbackOutcome>> {
+    let failing_paths = compile_error_paths(&report.compile_errors)
+        .into_iter()
+        .filter_map(|path| safe_source_rel_path(&path))
+        .collect::<Vec<_>>();
+    if failing_paths.is_empty() {
+        return Ok(None);
+    }
+    let Some(latest_dir) = snapshot_latest_dir(config) else {
+        emit_compile_rollback_skipped(
+            config,
+            &failing_paths,
+            exhausted_reason,
+            "snapshot_store_missing",
+        );
+        return Ok(None);
+    };
+    let mut snapshot_paths = Vec::new();
+    for rel in &failing_paths {
+        let snapshot = latest_dir.join(rel);
+        if !snapshot.is_file() {
+            emit_compile_rollback_skipped(
+                config,
+                &failing_paths,
+                exhausted_reason,
+                &format!("snapshot_missing:{rel}"),
+            );
+            return Ok(None);
+        }
+        snapshot_paths.push(snapshot);
+    }
+    let mut restored_paths = Vec::new();
+    let mut origins = Vec::new();
+    for (rel, snapshot) in failing_paths.iter().zip(snapshot_paths.iter()) {
+        let Some(destination) = writable_workspace_source_path(&config.workspace_root, rel) else {
+            emit_compile_rollback_skipped(
+                config,
+                &failing_paths,
+                exhausted_reason,
+                &format!("restore_path_rejected:{rel}"),
+            );
+            return Ok(None);
+        };
+        let content = std::fs::read(snapshot)?;
+        std::fs::write(&destination, content)?;
+        restored_paths.push(rel.clone());
+        origins.push(workspace_relative_handoff_path(snapshot));
+    }
+    let rebuild_report = verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
+    if report_has_production_build_failure(&rebuild_report) {
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "compile_rollback_failed",
+                "phase_id": phase.id,
+                "paths": restored_paths,
+                "snapshot_origins": origins,
+                "exhausted_reason": exhausted_reason,
+                "rebuild_reason": eval_events::body_snippet(&rebuild_report.primary_reason()),
+            }),
+        );
+        return Ok(None);
+    }
+    let phase_goal = phase_goal_one_liner(&phase.prompt);
+    let carry_forward_guidance = restored_paths
+        .iter()
+        .map(|path| {
+            format!(
+                "phase {} changes to {} were rolled back; re-apply: {}",
+                phase.id, path, phase_goal
+            )
+        })
+        .collect::<Vec<_>>();
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "compile_rollback_applied",
+            "phase_id": phase.id,
+            "paths": restored_paths.clone(),
+            "snapshot_origins": origins.clone(),
+            "exhausted_reason": exhausted_reason,
+            "carry_forward_guidance": carry_forward_guidance.clone(),
+        }),
+    );
+    eval_events::append_run_summary(
+        config.eval_events_path.as_deref(),
+        &format!(
+            "Compile rollback applied:\n- paths: {}\n- snapshot origin: {}\n- carry-forward: {}",
+            missing_if_empty(&restored_paths.join(", ")),
+            missing_if_empty(&origins.join(", ")),
+            missing_if_empty(&carry_forward_guidance.join("; "))
+        ),
+    );
+    Ok(Some(CompileRollbackOutcome {
+        paths: restored_paths,
+        snapshot_origins: origins,
+        carry_forward_guidance,
+    }))
+}
+
+fn emit_compile_rollback_skipped(
+    config: &Config,
+    failing_paths: &[String],
+    exhausted_reason: &str,
+    reason: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "compile_rollback_skipped",
+            "paths": failing_paths,
+            "exhausted_reason": exhausted_reason,
+            "reason": reason,
+        }),
+    );
+}
+
+fn phase_goal_one_liner(prompt: &str) -> String {
+    let mut line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() > 180 {
+        line = line.chars().take(180).collect::<String>();
+        line.push_str("...");
+    }
+    if line.is_empty() {
+        "restore the rolled-back phase intent".to_string()
+    } else {
+        line
+    }
+}
+
 fn obligation_repair_target_paths(report: &VerificationReport) -> Vec<String> {
     report
         .profile_failures
@@ -9294,6 +9771,7 @@ fn obligation_repair_target_paths(report: &VerificationReport) -> Vec<String> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn final_acceptance_repair_prompt(
     plan: &UltraPlan,
     report: &VerificationReport,
@@ -9302,6 +9780,7 @@ fn final_acceptance_repair_prompt(
     expected_paths: &[String],
     adherence_missing: &[String],
     repair_budget: (usize, usize),
+    compile_reanchored_retry: bool,
 ) -> String {
     let (attempt, max_attempts) = repair_budget;
     let expected = render_prompt_bullets(expected_paths);
@@ -9317,6 +9796,15 @@ fn final_acceptance_repair_prompt(
     let command_failures = render_prompt_bullets(&command_failures);
     let compile_errors =
         render_prompt_bullets(&compile_error_repair_guidance(&report.compile_errors));
+    let compile_retry_mandate = if compile_reanchored_retry && !report.compile_errors.is_empty() {
+        let paths = compile_error_paths(&report.compile_errors).join(", ");
+        format!(
+            "Compile repair retry mandate:\n- The previous compile repair turn changed no files.\n- You MUST edit one of these source files now using the edit tool: {}.\n- A prose-only reply or changed_paths=[] fails this repair.\n\n",
+            missing_if_empty(&paths)
+        )
+    } else {
+        String::new()
+    };
     format!(
         "Repair the final acceptance failure for the current ultra run.\n\n\
 Original ultra goal:\n{goal}\n\n\
@@ -9328,6 +9816,7 @@ Final acceptance failure:\n\
 Missing paths:\n{missing}\n\n\
 Dependency failures:\n{dependencies}\n\n\
 Compile errors:\n{compile_errors}\n\n\
+{compile_retry_mandate}\
 Command failures:\n{command_failures}\n\n\
 Profile failures:\n{profile_failures}\n\n\
 {behavioral_probe_context}\
@@ -9349,6 +9838,7 @@ Bounded repair rules:\n\
         missing = missing,
         dependencies = dependencies,
         compile_errors = compile_errors,
+        compile_retry_mandate = compile_retry_mandate,
         command_failures = command_failures,
         profile_failures = profile_failures,
         behavioral_probe_context = behavioral_probe_context,
@@ -9476,11 +9966,31 @@ fn final_acceptance_recovery_repair_targets(
     report: &VerificationReport,
     fallback: RepairTarget,
 ) -> Vec<String> {
-    if let Some(reason) = final_acceptance_app_behavior_failure_kind(report) {
+    let mut targets = if let Some(reason) = final_acceptance_app_behavior_failure_kind(report) {
         interaction_repair_targets_for_reason(&reason)
     } else {
         vec![fallback.as_str().to_string()]
+    };
+    if !report.compile_errors.is_empty()
+        && !targets.iter().any(|target| target == "fix_compile_error")
+    {
+        targets.insert(0, "fix_compile_error".to_string());
     }
+    targets
+}
+
+fn final_acceptance_recovery_failure_evidence(
+    report: &VerificationReport,
+    reason: &str,
+) -> Vec<String> {
+    let mut evidence = compile_error_repair_guidance(&report.compile_errors)
+        .into_iter()
+        .map(|line| format!("fix_compile_error: {line}"))
+        .collect::<Vec<_>>();
+    if !reason.trim().is_empty() {
+        evidence.push(reason.to_string());
+    }
+    evidence
 }
 
 fn route_bound_implementation_paths(expected_paths: &[String]) -> Vec<String> {
@@ -13958,6 +14468,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             &["src/app/page.tsx".to_string()],
             &[],
             (1, 2),
+            false,
         );
         assert!(prompt.contains("start_transition_missing"), "{prompt}");
         assert!(!prompt.contains("interaction_evidence_missing"), "{prompt}");
@@ -14327,6 +14838,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             &expected_paths,
             &[],
             (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+            false,
         );
         assert!(
             repair_prompt.contains(
@@ -14425,6 +14937,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
                 &expected_paths,
                 &[],
                 (attempt, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+                false,
             );
             let outcome = run_final_acceptance_repair_with_ultra_session(
                 &mut fake,
@@ -14634,6 +15147,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
                 "pause".to_string(),
             ],
             (1, 1),
+            false,
         );
 
         assert!(
@@ -16858,6 +17372,170 @@ exit 2\n"
         .unwrap()
     }
 
+    #[cfg(unix)]
+    fn static_good_page_source() -> &'static str {
+        "export default function Page(){return <main>Recovered static app</main>;}\n"
+    }
+
+    #[cfg(unix)]
+    fn static_broken_page_source() -> &'static str {
+        "export default function Page(){\n  return (\n    <main>\n      <p>Broken</p>\nBROKEN_SYNTAX\n    </main>\n  );\n}\n"
+    }
+
+    #[cfg(unix)]
+    fn write_static_compile_repair_workspace(root: &Path, page: &str) {
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+        for package in ["next", "tailwindcss", "postcss", "autoprefixer"] {
+            let dir = root.join("node_modules").join(package);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("package.json"), "{}").unwrap();
+        }
+        std::fs::write(root.join("package.json"), nextjs_complete_package_json()).unwrap();
+        std::fs::write(root.join("tsconfig.json"), nextjs_tsconfig_json()).unwrap();
+        std::fs::write(root.join("postcss.config.js"), nextjs_postcss_config()).unwrap();
+        std::fs::write(root.join("tailwind.config.ts"), nextjs_tailwind_config_ts()).unwrap();
+        std::fs::write(root.join("src/app/page.tsx"), page).unwrap();
+        std::fs::write(root.join("src/app/layout.tsx"), nextjs_layout_source()).unwrap();
+        std::fs::write(root.join("src/app/globals.css"), nextjs_globals_css()).unwrap();
+        std::fs::write(
+            root.join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        let page_path = root.join("src/app/page.tsx");
+        let script = format!(
+            "#!/bin/sh\n\
+if [ \"$1\" = \"run\" ] && [ \"$2\" = \"build\" ]; then\n\
+  if grep -q 'BROKEN_SYNTAX' src/app/page.tsx; then\n\
+    echo 'Failed to compile.' >&2\n\
+    echo './src/app/page.tsx' >&2\n\
+    echo 'Error:' >&2\n\
+    echo \"  x Expected ';', '}}' or <eof>\" >&2\n\
+    echo '   ,-[{}:12:1]' >&2\n\
+    echo ' 9 |   return (' >&2\n\
+    echo '10 |     <main>' >&2\n\
+    echo '11 |       <p>Broken</p>' >&2\n\
+    echo '12 | BROKEN_SYNTAX' >&2\n\
+    echo '   | ^' >&2\n\
+    exit 1\n\
+  fi\n\
+  echo 'fake build ok'\n\
+  exit 0\n\
+fi\n\
+echo \"unexpected fake npm args: $*\" >&2\n\
+exit 2\n",
+            page_path.display()
+        );
+        let npm = root.join("node_modules/.bin/npm");
+        std::fs::write(&npm, script).unwrap();
+        let mut permissions = std::fs::metadata(&npm).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&npm, permissions).unwrap();
+        let next = root.join("node_modules/.bin/next");
+        std::fs::write(&next, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&next).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(next, permissions).unwrap();
+    }
+
+    fn write_static_build_contract(root: &Path) -> PathBuf {
+        let path = root.join("completion-contract.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "required_paths": ["src/app/page.tsx"],
+                "verify_commands": ["npm run build"],
+                "profile": "nextjs",
+                "goal": "Create a static Next.js page",
+                "required_capabilities": [],
+                "required_evidence": ["implementation_artifact"],
+                "verify_repair_cap": 2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn static_compile_repair_plan() -> UltraPlan {
+        UltraPlan {
+            goal: "Create a static Next.js page".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "phase-one".to_string(),
+                    prompt: "Keep the current compiling static page.".to_string(),
+                },
+                UltraPhase {
+                    id: "phase-two".to_string(),
+                    prompt: "Update the page copy for the final app.".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn static_phase_step_plan_json(verify_build: bool) -> String {
+        serde_json::to_string(&StepPlan {
+            goal: "Create a static Next.js page".to_string(),
+            steps: vec![PlanStep {
+                id: if verify_build {
+                    "verify-static-build".to_string()
+                } else {
+                    "update-static-page".to_string()
+                },
+                kind: if verify_build {
+                    "verify".to_string()
+                } else {
+                    "setup".to_string()
+                },
+                expected_result: "static page is present".to_string(),
+                instruction: if verify_build {
+                    "Verify the current static Next.js page build".to_string()
+                } else {
+                    "Update src/app/page.tsx for the static app".to_string()
+                },
+                expected_paths: if verify_build {
+                    Vec::new()
+                } else {
+                    vec!["src/app/page.tsx".to_string()]
+                },
+                verify: if verify_build {
+                    vec!["npm run build".to_string()]
+                } else {
+                    Vec::new()
+                },
+            }],
+        })
+        .unwrap()
+    }
+
+    fn write_static_page_reply(content: &str) -> AssistantReply {
+        AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/page.tsx","content":content}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }
+    }
+
+    fn read_static_page_reply() -> AssistantReply {
+        AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Read",
+                serde_json::json!({"path":"src/app/page.tsx"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn compile_error_final_acceptance_skips_readiness_probe() {
@@ -16959,6 +17637,7 @@ exit 2\n"
             &expected_paths,
             &[],
             (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+            false,
         );
         let mut execution = FakeClient::new(vec![
             AssistantReply {
@@ -17038,6 +17717,194 @@ exit 2\n"
             event_text.contains("\"browser_readiness_status\":\"passed\""),
             "{event_text}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compile_repair_no_edit_reanchors_once_then_no_snapshot_path_fails_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/no-snapshot/events.jsonl");
+        write_static_compile_repair_workspace(dir.path(), static_good_page_source());
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "generic".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_static_build_contract(dir.path()));
+        let plan = static_compile_repair_plan();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(static_phase_step_plan_json(false)),
+            AssistantReply::text(static_phase_step_plan_json(false)),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            write_static_page_reply(static_good_page_source()),
+            write_static_page_reply(static_broken_page_source()),
+            AssistantReply::text("The compile error is in src/app/page.tsx."),
+            AssistantReply::text("It needs a syntax fix."),
+            AssistantReply::text("The compile error remains in src/app/page.tsx."),
+            AssistantReply::text("It still needs a syntax fix."),
+        ]);
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("ultra final acceptance failed after bounded repair"),
+            "{err}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert_eq!(
+            event_text
+                .matches("\"event\":\"final_acceptance_repair_no_source_change\"")
+                .count(),
+            2,
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"compile_reanchored_retry\":true"),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"failure_kind\":\"compile_repair_no_source_change\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"event\":\"compile_rollback_skipped\""),
+            "{event_text}"
+        );
+        assert!(event_text.contains("snapshot_missing:src/app/page.tsx"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
+            static_broken_page_source()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compile_repair_exhaustion_rolls_back_last_known_good_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/rollback/events.jsonl");
+        write_static_compile_repair_workspace(dir.path(), static_good_page_source());
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "generic".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_static_build_contract(dir.path()));
+        let plan = static_compile_repair_plan();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(static_phase_step_plan_json(true)),
+            AssistantReply::text(static_phase_step_plan_json(false)),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            read_static_page_reply(),
+            write_static_page_reply(static_broken_page_source()),
+            AssistantReply::text("The compile error is in src/app/page.tsx."),
+            AssistantReply::text("It needs a syntax fix."),
+            AssistantReply::text("The compile error remains in src/app/page.tsx."),
+            AssistantReply::text("It still needs a syntax fix."),
+        ]);
+
+        let result =
+            run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap_or_else(|err| {
+                let event_text = std::fs::read_to_string(&events).unwrap_or_default();
+                panic!("{err}\nEvents:\n{event_text}");
+            });
+
+        assert!(result.contains("ultra-plan-run complete"), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
+            static_good_page_source()
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"event\":\"compile_snapshot_saved\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"event\":\"compile_rollback_applied\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"event\":\"compile_rollback_context_carried\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("phase phase-two changes to src/app/page.tsx were rolled back; re-apply: Update the page copy for the final app."),
+            "{event_text}"
+        );
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains("Compile rollback applied:"), "{summary}");
+        assert!(summary.contains("src/app/page.tsx"), "{summary}");
+    }
+
+    #[test]
+    fn compile_error_recovery_handoff_orders_fix_compile_error_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/recovery-order/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events);
+        let plan = static_compile_repair_plan();
+        let mut report = VerificationReport::pass();
+        report.compile_errors.push(CompileError {
+            path: "src/app/page.tsx".to_string(),
+            line: 12,
+            column: 1,
+            message: "Expected ';', '}' or <eof>".to_string(),
+            excerpt: "12 | BROKEN_SYNTAX\n   | ^".to_string(),
+            symbol: None,
+            route_bound: None,
+        });
+        let targets =
+            final_acceptance_recovery_repair_targets(&report, RepairTarget::Implementation);
+        assert_eq!(
+            targets.first().map(String::as_str),
+            Some("fix_compile_error")
+        );
+        let evidence =
+            final_acceptance_recovery_failure_evidence(&report, "compile_repair_no_source_change");
+        assert!(
+            evidence
+                .first()
+                .is_some_and(|line| line.contains("fix_compile_error: Compile error")),
+            "{evidence:?}"
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|line| line.contains("12 | BROKEN_SYNTAX"))
+        );
+
+        let _handoff = save_ultra_phase_recovery_handoff_with_evidence(
+            &cfg,
+            &plan,
+            &plan.phases[1],
+            UltraPhaseRecoveryRequest {
+                failure_kind: "compile_repair_no_source_change",
+                reason: "compile repair did not edit files",
+                missing_paths: &[],
+                missing_signals: &[],
+                repair_targets: &targets,
+            },
+            &evidence,
+        )
+        .expect("recovery handoff");
+
+        let repair_text = std::fs::read_dir(dir.path().join(".anvil/repairs"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .find(|text| text.contains("Failure evidence:"))
+            .expect("repair prompt");
+        let evidence_index = repair_text.find("fix_compile_error").unwrap();
+        let target_index = repair_text
+            .find("Repair targets:\n- fix_compile_error")
+            .unwrap();
+        assert!(evidence_index < target_index, "{repair_text}");
+        let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
+        let repair_phase = &recovery_plan.phases[1].prompt;
+        let evidence_index = repair_phase.find("fix_compile_error").unwrap();
+        let target_index = repair_phase
+            .find("Repair targets:\n- fix_compile_error")
+            .unwrap();
+        assert!(evidence_index < target_index, "{repair_phase}");
     }
 
     #[cfg(unix)]

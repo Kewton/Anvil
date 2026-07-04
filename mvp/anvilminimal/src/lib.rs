@@ -368,7 +368,7 @@ mod tests {
         assert!(summary.contains("Command status: failed"));
         assert!(summary.contains("Command completion: failed"));
         assert!(summary.contains("Task status: failed"));
-        assert!(summary.contains("Process: exited normally (not task success)"));
+        assert!(summary.contains("Process: REPL exited cleanly (not task status)"));
         assert!(summary.contains("Session/REPL status: process_exited"));
         assert!(summary.contains("Recovery next action: fix_command_failure"));
         assert!(summary.contains("Stop reason: boom"));
