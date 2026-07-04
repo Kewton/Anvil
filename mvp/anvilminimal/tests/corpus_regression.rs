@@ -4,6 +4,12 @@ use std::path::Path;
 use anvilminimal::minimal_loop::evidence::verify_runtime_acceptance_with_hints;
 use anvilminimal::minimal_loop::import_scan::route_bound_closure;
 use anvilminimal::minimal_loop::interaction_probe::static_html_probe_selection;
+use anvilminimal::planner::profile::{
+    ProfileSnapshot, profile_expected_paths, profile_generation_rules, profile_guidance,
+    profile_quality_expectations, profile_runtime_contract, profile_setup_scaffold_paths,
+    verify_profile_final, verify_profile_invariant,
+};
+use anvilminimal::planner::profiles::nextjs;
 
 #[derive(Debug, Default)]
 struct CorpusCase {
@@ -53,6 +59,7 @@ fn generated_app_corpus_matches_detector_and_probe_expectations() {
         let expectations_path = case_dir.join("expectations.toml");
         let expectations = parse_expectations(&expectations_path);
         let display = expectations.case_id.as_str();
+        assert_nextjs_profile_matches_direct_impl(&case_dir, display);
 
         let closure = route_bound_closure(&case_dir, "nextjs")
             .into_iter()
@@ -177,6 +184,50 @@ fn generated_app_corpus_matches_detector_and_probe_expectations() {
             }
         }
     }
+}
+
+fn assert_nextjs_profile_matches_direct_impl(case_dir: &Path, display: &str) {
+    let goal = display;
+    assert_eq!(
+        verify_profile_final(case_dir, "nextjs", goal),
+        nextjs::verify(case_dir, goal),
+        "{display}: Next.js final verification changed behind DomainProfile"
+    );
+    assert_eq!(
+        verify_profile_invariant(case_dir, "nextjs", goal, &ProfileSnapshot::None),
+        nextjs::verify_invariant(case_dir, goal),
+        "{display}: Next.js invariant verification changed behind DomainProfile"
+    );
+    assert_eq!(
+        profile_expected_paths(case_dir, "nextjs", goal),
+        nextjs::expected_paths(case_dir, goal),
+        "{display}: Next.js expected paths changed behind DomainProfile"
+    );
+    assert_eq!(
+        profile_setup_scaffold_paths(case_dir, "nextjs"),
+        nextjs::setup_scaffold_paths(case_dir),
+        "{display}: Next.js setup scaffold paths changed behind DomainProfile"
+    );
+    assert_eq!(
+        profile_guidance("nextjs", goal),
+        Some(nextjs::guidance(goal)),
+        "{display}: Next.js guidance changed behind DomainProfile"
+    );
+    assert_eq!(
+        profile_runtime_contract("nextjs", "create", goal),
+        nextjs::runtime_contract("create", goal),
+        "{display}: Next.js runtime contract changed behind DomainProfile"
+    );
+    assert_eq!(
+        profile_generation_rules("nextjs", "implement"),
+        Some(nextjs::generation_rules("implement")),
+        "{display}: Next.js generation rules changed behind DomainProfile"
+    );
+    assert_eq!(
+        profile_quality_expectations(case_dir, "nextjs", goal),
+        nextjs::quality_expectations(case_dir, goal),
+        "{display}: Next.js quality expectations changed behind DomainProfile"
+    );
 }
 
 fn assert_source_only_snapshot(case_dir: &Path) {
