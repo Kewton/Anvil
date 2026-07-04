@@ -230,6 +230,13 @@ pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
     if report
         .profile_failures
         .iter()
+        .any(|reason| missing_required_evidence_includes_behavior_depth_key(reason))
+    {
+        return RepairTarget::Implementation;
+    }
+    if report
+        .profile_failures
+        .iter()
         .any(|reason| missing_required_evidence_includes_source_scan(reason))
     {
         return RepairTarget::CapabilityMissing;
@@ -474,6 +481,20 @@ fn missing_required_evidence_includes_source_scan(reason: &str) -> bool {
     missing_required_evidence_keys(reason)
         .into_iter()
         .any(|key| evidence_satisfaction_channel(key) == SatisfactionChannel::SourceScan)
+}
+
+fn missing_required_evidence_includes_behavior_depth_key(reason: &str) -> bool {
+    missing_required_evidence_keys(reason)
+        .into_iter()
+        .any(|key| {
+            matches!(
+                key,
+                "challenge_or_adversary_evidence"
+                    | "failure_or_collision_evidence"
+                    | "score_or_progression_evidence"
+                    | "restart_or_recoverable_state_evidence"
+            )
+        })
 }
 
 fn app_behavior_probe_failure(reason: &str) -> bool {
@@ -776,7 +797,7 @@ mod tests {
             "missing_required_evidence:failure_or_collision_evidence,restart_or_recoverable_state_evidence",
         );
         let target = classify_repair_target(&report);
-        assert_eq!(target, RepairTarget::CapabilityMissing);
+        assert_eq!(target, RepairTarget::Implementation);
         assert_eq!(
             classify_repair_follow_through(target, &["src/app/page.tsx".to_string()]),
             RepairFollowThrough::TargetMatched

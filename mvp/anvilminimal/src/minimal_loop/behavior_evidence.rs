@@ -12,7 +12,7 @@ const INTERACTION_EVIDENCE_NAMES: &[&str] = &[
     "interaction.json",
 ];
 
-const SURFACE_AND_START_KEYS: &[&str] = &[
+const SURFACE_KEYS: &[&str] = &[
     "interactive_ui_source_evidence",
     "visible_interactive_surface_evidence",
     "non_static_screen_evidence",
@@ -29,11 +29,10 @@ const PROBE_REQUIRED_BEHAVIOR_KEYS: &[&str] = &[
     "restart_or_recoverable_state_evidence",
 ];
 
-const WEAK_BEHAVIOR_CORROBORATED_KEYS: &[&str] = &[
+const DEEP_BEHAVIOR_KEYS: &[&str] = &[
     "score_or_progression_evidence",
     "challenge_or_adversary_evidence",
     "failure_or_collision_evidence",
-    "restart_or_recoverable_state_evidence",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -58,7 +57,6 @@ struct BehaviorObservation {
     steps: BTreeSet<String>,
     surface_visible: bool,
     start_transition: bool,
-    start_control_absent: bool,
     input_state_evaluated_after_start: bool,
     input_state_change: bool,
     recovery_transition: RecoveryTransition,
@@ -75,7 +73,6 @@ enum RecoveryTransition {
 enum BehavioralDecision {
     Pass(&'static str),
     Fail(&'static str),
-    Unverified(&'static str),
     Static(&'static str),
 }
 
@@ -206,18 +203,6 @@ pub fn arbitrate_final_acceptance(
                     },
                 );
             }
-            BehavioralDecision::Unverified(observed) => {
-                mark_unverified_evidence(report, key, observed);
-                records.insert(
-                    key.clone(),
-                    EvidenceArbitrationRecord {
-                        static_tier: static_tier.clone(),
-                        behavioral_observation: observed.to_string(),
-                        decided_by: "behavioral".to_string(),
-                        final_tier: format!("unverified:{observed}"),
-                    },
-                );
-            }
             BehavioralDecision::Static(observed) => {
                 records.insert(
                     key.clone(),
@@ -259,18 +244,11 @@ fn behavioral_decision(
     static_tier: &str,
     observation: &BehaviorObservation,
 ) -> BehavioralDecision {
-    if SURFACE_AND_START_KEYS.contains(&key) {
-        return if observation.surface_visible && observation.start_transition {
-            BehavioralDecision::Pass("surface_visible+start_transition")
-        } else if observation.surface_visible
-            && observation.start_control_absent
-            && observation.input_state_change
-        {
-            BehavioralDecision::Pass("surface_visible+input_state_change")
-        } else if !observation.surface_visible {
-            BehavioralDecision::Fail("surface_visible_missing")
+    if SURFACE_KEYS.contains(&key) {
+        return if observation.surface_visible {
+            BehavioralDecision::Pass("surface_visible")
         } else {
-            BehavioralDecision::Fail("start_transition_missing")
+            BehavioralDecision::Fail("surface_visible_missing")
         };
     }
     if INPUT_STATE_KEYS.contains(&key) {
@@ -285,35 +263,44 @@ fn behavioral_decision(
     if key == "restart_or_recoverable_state_evidence" {
         return match observation.recovery_transition {
             RecoveryTransition::Observed => BehavioralDecision::Pass("recovery_transition"),
-            RecoveryTransition::NotObserved => {
-                BehavioralDecision::Unverified("not_observed_by_probe")
+            RecoveryTransition::NotObserved
+                if observation.start_transition && observation.input_state_change =>
+            {
+                BehavioralDecision::Fail("not_observed_by_probe")
             }
+            RecoveryTransition::NotObserved if observation.start_transition => {
+                BehavioralDecision::Fail("input_state_change_missing_after_start")
+            }
+            RecoveryTransition::NotObserved => BehavioralDecision::Fail("start_transition_missing"),
             RecoveryTransition::Unknown => {
-                if observation.start_transition {
-                    weak_corroboration_or_static(key, static_tier, observation)
+                if observation.ok && static_tier == "strong" {
+                    BehavioralDecision::Static("strong_static_required")
+                } else if observation.start_transition && observation.input_state_change {
+                    BehavioralDecision::Fail("not_observed_by_probe")
+                } else if observation.start_transition {
+                    BehavioralDecision::Fail("input_state_change_missing_after_start")
                 } else {
                     BehavioralDecision::Fail("start_transition_missing")
                 }
             }
         };
     }
-    weak_corroboration_or_static(key, static_tier, observation)
-}
-
-fn weak_corroboration_or_static(
-    key: &str,
-    static_tier: &str,
-    observation: &BehaviorObservation,
-) -> BehavioralDecision {
-    if observation.ok && static_tier == "weak" && WEAK_BEHAVIOR_CORROBORATED_KEYS.contains(&key) {
-        BehavioralDecision::Pass("probe_ok+weak_static_signal")
-    } else {
-        BehavioralDecision::Static(if observation.ok {
-            "probe_ok_not_mapped"
+    if DEEP_BEHAVIOR_KEYS.contains(&key) {
+        return if static_tier == "weak" {
+            BehavioralDecision::Fail("not_observed_by_probe")
         } else {
-            "probe_failed"
-        })
+            BehavioralDecision::Static(if observation.ok {
+                "strong_static_required"
+            } else {
+                "probe_failed"
+            })
+        };
     }
+    BehavioralDecision::Static(if observation.ok {
+        "probe_ok_not_mapped"
+    } else {
+        "probe_failed"
+    })
 }
 
 fn satisfy_evidence(report: &mut RuntimeAcceptanceReport, key: &str, tier: &str) {
@@ -471,19 +458,6 @@ impl BehaviorObservation {
         let start_transition = steps.contains("start_transition")
             || bool_field_deep(value, &["start_transition"]) == Some(true)
             || marker_changed;
-        let start_control_absent = bool_field_deep(
-            value,
-            &[
-                "start_control_found",
-                "start_control_present",
-                "start_like_control_found",
-                "start_like_control_present",
-                "primary_action_found",
-                "primary_action_present",
-                "primary_control_found",
-                "primary_control_present",
-            ],
-        ) == Some(false);
         let input_state_evaluated_after_start = bool_field_deep(
             value,
             &[
@@ -506,7 +480,6 @@ impl BehaviorObservation {
             steps,
             surface_visible,
             start_transition,
-            start_control_absent,
             input_state_evaluated_after_start,
             input_state_change,
             recovery_transition,
@@ -753,7 +726,7 @@ export default function Page() {
     }
 
     #[test]
-    fn probe_ok_corrobates_weak_restart_and_collision() {
+    fn probe_observations_only_corrobate_mapped_weak_keys() {
         let dir = tempfile::tempdir().unwrap();
         write_page(dir.path(), weak_restart_and_collision_page());
         write_interaction(
@@ -790,7 +763,7 @@ export default function Page() {
         let mut report = report_for(dir.path(), &required);
         assert!(!report.passed, "{report:?}");
         arbitrate(dir.path(), &mut report, &required);
-        assert!(report.passed, "{report:?}");
+        assert!(!report.passed, "{report:?}");
         assert_eq!(
             report
                 .evidence_tiers
@@ -803,7 +776,13 @@ export default function Page() {
                 .evidence_tiers
                 .get("failure_or_collision_evidence")
                 .map(String::as_str),
-            Some("weak_behavior_corroborated")
+            Some("absent")
+        );
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"failure_or_collision_evidence".to_string()),
+            "{report:?}"
         );
     }
 
@@ -923,12 +902,152 @@ export default function Page() {
                 .records
                 .get("visible_interactive_surface_evidence")
                 .map(|record| record.behavioral_observation.as_str()),
-            Some("surface_visible+input_state_change")
+            Some("surface_visible")
         );
         assert!(
             !report
                 .missing_evidence
                 .contains(&"visible_interactive_surface_evidence".to_string())
+        );
+    }
+
+    #[test]
+    fn todo_shaped_contract_restart_hook_passes_same_probe_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [draft, setDraft] = useState("");
+  const [items, setItems] = useState<string[]>([]);
+  const state = JSON.stringify({ draft, items });
+  return (
+    <main data-anvil-state={state}>
+      <input aria-label="Todo" value={draft} onChange={(event) => setDraft(event.target.value)} />
+      <button data-anvil-action="primary" onClick={() => setItems([...items, draft])}>Add</button>
+      <button data-anvil-action="restart" onClick={() => { setDraft(""); setItems([]); }}>Clear</button>
+      <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul>
+    </main>
+  );
+}
+"#,
+        );
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "probe_mode": "contract",
+                "contract_hook_status": "usable",
+                "contract_hooks": {
+                    "usable": true,
+                    "primary_present": true,
+                    "restart_present": true,
+                    "valid_state_count": 1
+                },
+                "steps": [
+                    "surface_visible",
+                    "start_transition",
+                    "control_input_dispatched",
+                    "input_state_evaluated_after_start",
+                    "input_state_change",
+                    "recovery_transition"
+                ],
+                "before_marker": "{\"states\":[{\"index\":0,\"state\":{\"draft\":\"\",\"items\":[]}}]}",
+                "after_marker": "{\"states\":[{\"index\":0,\"state\":{\"draft\":\"\",\"items\":[\"anvil probe input\"]}}]}",
+                "input_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"draft\":\"\",\"items\":[\"anvil probe input\"]}}]}",
+                "input_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"draft\":\"x\",\"items\":[\"anvil probe input\"]}}]}",
+                "recovery_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"draft\":\"x\",\"items\":[\"anvil probe input\"]}}]}",
+                "recovery_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"draft\":\"\",\"items\":[]}}]}",
+                "recovery_transition": true,
+                "recovery_transition_status": "observed",
+                "state_dimensions_changed": ["draft"]
+            }),
+        );
+        let required = [
+            "visible_interactive_surface_evidence",
+            "user_input_handler_evidence",
+            "stateful_update_evidence",
+            "restart_or_recoverable_state_evidence",
+        ];
+        let mut report = report_for(dir.path(), &required);
+        arbitrate(dir.path(), &mut report, &required);
+
+        assert!(report.passed, "{report:?}");
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("strong")
+        );
+    }
+
+    #[test]
+    fn probe_ok_does_not_pass_unobserved_weak_failure_key() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [score, setScore] = useState(0);
+  return <main><button onClick={() => setScore(score + 1)}>Start</button><canvas />collision pending score {score}</main>;
+}
+"#,
+        );
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "steps": [
+                    "surface_visible",
+                    "start_transition",
+                    "control_input_dispatched",
+                    "input_state_evaluated_after_start",
+                    "input_state_change"
+                ],
+                "before_marker": "menu",
+                "after_marker": "running",
+                "input_before_marker": "score:0",
+                "input_after_marker": "score:1"
+            }),
+        );
+        let required = ["failure_or_collision_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("failure_or_collision_evidence")
+                .map(String::as_str),
+            Some("weak"),
+            "{report:?}"
+        );
+        arbitrate(dir.path(), &mut report, &required);
+
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"failure_or_collision_evidence".to_string()),
+            "{report:?}"
+        );
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("failure_or_collision_evidence")
+                .map(String::as_str),
+            Some("absent")
         );
     }
 
@@ -1060,7 +1179,7 @@ export default function Page() {
     }
 
     #[test]
-    fn recovery_transition_not_observed_while_probe_ran_is_unverified_not_probe_unavailable() {
+    fn recovery_transition_not_observed_after_start_and_input_is_repairable_missing_evidence() {
         let dir = tempfile::tempdir().unwrap();
         write_cross_file_weak_restart_fixture(dir.path());
         write_interaction(
@@ -1101,16 +1220,20 @@ export default function Page() {
             &[],
         );
 
-        assert!(report.passed, "{report:?}");
-        assert!(report.unverified_evidence.contains(
-            &"restart_or_recoverable_state_evidence:unverified:not_observed_by_probe".to_string()
-        ));
+        assert!(!report.passed, "{report:?}");
+        assert!(report.unverified_evidence.is_empty(), "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"restart_or_recoverable_state_evidence".to_string()),
+            "{report:?}"
+        );
         assert_eq!(
             report
                 .evidence_tiers
                 .get("restart_or_recoverable_state_evidence")
                 .map(String::as_str),
-            Some("unverified:not_observed_by_probe")
+            Some("absent")
         );
         assert_eq!(
             arbitration

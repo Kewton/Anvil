@@ -990,25 +990,25 @@ fn evidence_repair_guidance(failure: &str) -> Vec<String> {
     }
     if failure.contains("challenge_or_adversary_evidence") {
         lines.push(
-            "For challenge_or_adversary_evidence, edit the task implementation artifact to name the adversary entities with a recognizable term (e.g. enemy, invader, or the goal's own term) and wire them to movement/collision."
+            "For challenge_or_adversary_evidence, edit the task implementation artifact to wire a reachable challenge/adversary entity into state evolution, not only a static label."
                 .to_string(),
         );
     }
     if failure.contains("failure_or_collision_evidence") {
         lines.push(
-            "For failure_or_collision_evidence, edit the task implementation artifact to implement bullet/enemy collision or damage detection and a real failure or game-over state transition."
+            "For failure_or_collision_evidence, edit the task implementation artifact to wire a collision/failure conditional that transitions to a reachable failure state."
                 .to_string(),
         );
     }
     if failure.contains("restart_or_recoverable_state_evidence") {
         lines.push(
-            "For restart_or_recoverable_state_evidence, edit the task implementation artifact to wire a handler (e.g. onClick) to a function that resets score AND entities and transitions out of the game-over state."
+            "For restart_or_recoverable_state_evidence, edit the task implementation artifact to provide a reachable terminal/failure state and a restart control (data-anvil-action=\"restart\") that resets observable state."
                 .to_string(),
         );
     }
     if failure.contains("score_or_progression_evidence") {
         lines.push(
-            "For score_or_progression_evidence, edit the task implementation artifact to implement score, level, wave, lives, health, or progress updates driven by gameplay events."
+            "For score_or_progression_evidence, edit the task implementation artifact to wire score/progression updates to meaningful state transitions, not only an isolated counter."
                 .to_string(),
         );
     }
@@ -1641,12 +1641,13 @@ mod tests {
         );
         let feedback = format_verify_feedback_with_contract(&report, Some(&contract));
         assert!(feedback.contains("Target implementation files: src/app/page.tsx"));
-        assert!(feedback.contains("enemy, invader, or the goal's own term"));
-        assert!(feedback.contains("movement/collision"));
-        assert!(feedback.contains("bullet/enemy collision or damage detection"));
-        assert!(feedback.contains("resets score AND entities"));
-        assert!(feedback.contains("transitions out of the game-over state"));
-        assert!(feedback.contains("score, level, wave, lives, health, or progress updates"));
+        assert!(feedback.contains("reachable challenge/adversary entity"));
+        assert!(feedback.contains("not only a static label"));
+        assert!(feedback.contains("collision/failure conditional"));
+        assert!(feedback.contains("reachable failure state"));
+        assert!(feedback.contains("data-anvil-action=\"restart\""));
+        assert!(feedback.contains("resets observable state"));
+        assert!(feedback.contains("score/progression updates"));
         assert!(feedback.contains("state mutations over time or in response to input"));
         assert!(feedback.contains("wire keyboard, pointer, click, touch, or form handlers"));
     }

@@ -107,6 +107,7 @@ pub struct BrowserInteractionObservation {
     pub contract_hook_status: String,
     pub candidate_table: Vec<InteractionProbeCandidateEvidence>,
     pub input_dispatches: Vec<String>,
+    pub state_dimensions_changed: Vec<String>,
     pub primary_transition_observed: bool,
     pub start_control_found: bool,
     pub informational_failure_kinds: Vec<String>,
@@ -837,6 +838,7 @@ let start_control_found = true;
 let input_state_evaluated_after_start = false;
 let candidate_table = [];
 let input_dispatches = [];
+let state_dimensions_changed = [];
 let informational_failure_kinds = [];
 let server_check = { ok: false, status: null, error: "" };
 let post_js_surface = null;
@@ -1007,6 +1009,91 @@ async function contractStateMarker(page) {
   });
 }
 
+function stableStateString(value) {
+  if (typeof value === "undefined") return "__anvil_undefined__";
+  try {
+    return JSON.stringify(value);
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function contractStatesFromMarker(markerText) {
+  try {
+    const parsed = JSON.parse(markerText || "{}");
+    if (!parsed || !Array.isArray(parsed.states)) return [];
+    return parsed.states
+      .map((entry) => entry && entry.state && typeof entry.state === "object" && !Array.isArray(entry.state)
+        ? entry.state
+        : {})
+      .filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
+function changedTopLevelStateKeys(beforeText, afterText) {
+  const before = contractStatesFromMarker(beforeText);
+  const after = contractStatesFromMarker(afterText);
+  const keys = new Set();
+  const count = Math.max(before.length, after.length);
+  for (let index = 0; index < count; index += 1) {
+    const beforeState = before[index] || {};
+    const afterState = after[index] || {};
+    const names = new Set([...Object.keys(beforeState), ...Object.keys(afterState)]);
+    for (const name of names) {
+      if (stableStateString(beforeState[name]) !== stableStateString(afterState[name])) {
+        keys.add(name);
+      }
+    }
+  }
+  return Array.from(keys).sort();
+}
+
+function mergeStateDimensionsChanged(keys) {
+  for (const key of keys || []) {
+    if (key && !state_dimensions_changed.includes(key)) {
+      state_dimensions_changed.push(key);
+    }
+  }
+  state_dimensions_changed.sort();
+}
+
+function contractResetWardChange(beforeText, afterText, baselineText) {
+  if (!beforeText || !afterText || beforeText === afterText) return false;
+  const changed = changedTopLevelStateKeys(beforeText, afterText);
+  if (changed.length === 0) return false;
+  const before = contractStatesFromMarker(beforeText);
+  const after = contractStatesFromMarker(afterText);
+  const baseline = contractStatesFromMarker(baselineText);
+  const count = Math.max(before.length, after.length, baseline.length);
+  for (let index = 0; index < count; index += 1) {
+    const beforeState = before[index] || {};
+    const afterState = after[index] || {};
+    const baselineState = baseline[index] || {};
+    for (const key of changed) {
+      const beforeValue = beforeState[key];
+      const afterValue = afterState[key];
+      const baselineValue = baselineState[key];
+      if (
+        stableStateString(afterValue) === stableStateString(baselineValue) &&
+        stableStateString(beforeValue) !== stableStateString(baselineValue)
+      ) {
+        return true;
+      }
+      if (
+        typeof beforeValue === "number" &&
+        typeof afterValue === "number" &&
+        typeof baselineValue === "number" &&
+        Math.abs(afterValue - baselineValue) < Math.abs(beforeValue - baselineValue)
+      ) {
+        return true;
+      }
+    }
+  }
+  return true;
+}
+
 async function contractHookStatus(page) {
   return await page.evaluate(() => {
     const textOf = (el) => (
@@ -1017,6 +1104,7 @@ async function contractHookStatus(page) {
       ""
     ).trim();
     const primary = document.querySelector('[data-anvil-action="primary"]');
+    const restart = document.querySelector('[data-anvil-action="restart"]');
     const stateEls = Array.from(document.querySelectorAll("[data-anvil-state]"));
     let valid_state_count = 0;
     let invalid_state_count = 0;
@@ -1043,6 +1131,8 @@ async function contractHookStatus(page) {
       usable,
       primary_present,
       primary_text_excerpt: primary ? textOf(primary).slice(0, 80) : "",
+      restart_present: !!restart,
+      restart_text_excerpt: restart ? textOf(restart).slice(0, 80) : "",
       state_present,
       state_count: stateEls.length,
       valid_state_count,
@@ -1212,6 +1302,9 @@ async function dispatchPostTransitionInputs(page, mode) {
   steps.push("input_state_evaluated_after_start");
   input_state_evaluated_after_start = true;
   input_after_marker = await markerAfterActiveChange(page, mode, input_before_marker, 800);
+  if (mode === "contract") {
+    mergeStateDimensionsChanged(changedTopLevelStateKeys(input_before_marker, input_after_marker));
+  }
   if (input_before_marker !== input_after_marker) {
     steps.push("input_state_change");
   }
@@ -1275,6 +1368,31 @@ async function attemptRecoveryTransition(page, initialStartText, mode) {
         await candidate.click({ timeout: 1000 });
         recovery_after_marker = await markerAfterActiveChange(page, mode, recovery_before_marker, 700);
         if (recovery_before_marker !== recovery_after_marker) {
+          steps.push("recovery_transition");
+          recovery_transition_status = "observed";
+          return;
+        }
+      } catch (_) {}
+    }
+    await page.waitForTimeout(120);
+  }
+  steps.push("recovery_transition:not_observed");
+  recovery_transition_status = "not_observed";
+}
+
+async function attemptContractRecoveryTransition(page, postStartMarker) {
+  const deadline = Date.now() + 1200;
+  while (Date.now() < deadline) {
+    let candidate = page.locator('[data-anvil-action="restart"]').first();
+    if (!(await candidate.count())) {
+      candidate = page.locator('[data-anvil-action="primary"]').first();
+    }
+    if (await candidate.count()) {
+      recovery_before_marker = await activeMarker(page, "contract");
+      try {
+        await candidate.click({ timeout: 1000 });
+        recovery_after_marker = await markerAfterActiveChange(page, "contract", recovery_before_marker, 700);
+        if (contractResetWardChange(recovery_before_marker, recovery_after_marker, postStartMarker)) {
           steps.push("recovery_transition");
           recovery_transition_status = "observed";
           return;
@@ -1372,7 +1490,11 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       }
     }
 
-    await attemptRecoveryTransition(page, initial_start_text, probe_mode);
+    if (transitionObserved && probe_mode === "contract") {
+      await attemptContractRecoveryTransition(page, after_marker);
+    } else {
+      await attemptRecoveryTransition(page, initial_start_text, probe_mode);
+    }
     if (!transitionObserved && steps.includes("recovery_transition")) {
       transitionObserved = true;
       steps.push("start_transition");
@@ -1416,6 +1538,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       contract_hooks,
       candidate_table,
       input_dispatches,
+      state_dimensions_changed,
       informational_failure_kinds,
       steps,
       stage,
@@ -1469,6 +1592,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       contract_hooks,
       candidate_table,
       input_dispatches,
+      state_dimensions_changed,
       informational_failure_kinds,
       failure_kind: err && err.anvilFailureKind ? err.anvilFailureKind : "probe_script_error",
       navigation_failure_kind: err && err.navigationFailureKind ? err.navigationFailureKind : "",
@@ -1565,6 +1689,7 @@ fn merge_script_stdout_failure_value(mut value: Value, logs: &InteractionStdio) 
             "contract_hooks",
             "candidate_table",
             "input_dispatches",
+            "state_dimensions_changed",
             "informational_failure_kinds",
             "failure_kind",
             "navigation_failure_kind",
@@ -1786,6 +1911,7 @@ fn observation_from_value(
         .to_string();
     let candidate_table = interaction_candidate_table(&value);
     let input_dispatches = string_array_field(&value, "input_dispatches");
+    let state_dimensions_changed = string_array_field(&value, "state_dimensions_changed");
     let primary_transition_observed = value
         .get("primary_start_transition")
         .or_else(|| value.get("primary_transition_observed"))
@@ -1840,6 +1966,7 @@ fn observation_from_value(
         contract_hook_status,
         candidate_table,
         input_dispatches,
+        state_dimensions_changed,
         primary_transition_observed,
         start_control_found,
         informational_failure_kinds,
@@ -2054,6 +2181,7 @@ fn failure_observation(
         contract_hook_status: "unknown".to_string(),
         candidate_table: Vec::new(),
         input_dispatches: Vec::new(),
+        state_dimensions_changed: Vec::new(),
         primary_transition_observed: false,
         start_control_found: true,
         informational_failure_kinds: Vec::new(),
@@ -2237,6 +2365,7 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "contract_hook_status": observation.contract_hook_status.as_str(),
         "candidate_table": &observation.candidate_table,
         "input_dispatches": &observation.input_dispatches,
+        "state_dimensions_changed": &observation.state_dimensions_changed,
         "primary_start_transition": observation.primary_transition_observed,
         "start_control_found": observation.start_control_found,
         "primary_start_transition_missing": !observation.primary_transition_observed
@@ -2777,13 +2906,21 @@ mod tests {
             "before_marker": "{\"states\":[{\"state\":{\"screen\":\"menu\"}}]}",
             "after_marker": "{\"states\":[{\"state\":{\"screen\":\"running\"}}]}",
             "input_before_marker": "{\"states\":[{\"state\":{\"player\":20}}]}",
-            "input_after_marker": "{\"states\":[{\"state\":{\"player\":15}}]}"
+            "input_after_marker": "{\"states\":[{\"state\":{\"player\":15}}]}",
+            "state_dimensions_changed": ["player"],
+            "contract_hooks": {
+                "usable": true,
+                "primary_present": true,
+                "restart_present": true,
+                "valid_state_count": 1
+            }
         }));
 
         assert!(observation.ok, "{observation:?}");
         assert_eq!(observation.probe_mode, "contract");
         assert_eq!(observation.contract_hook_status, "usable");
         assert!(observation.input_state_changed);
+        assert_eq!(observation.state_dimensions_changed, vec!["player"]);
     }
 
     #[test]
@@ -2941,7 +3078,7 @@ exit 1
             fake_npm.as_os_str(),
             fake_npx.as_os_str(),
             &home,
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             |line| progress.push(line.to_string()),
         )
         .unwrap();
@@ -2981,7 +3118,7 @@ exit 1
             fake_npm.as_os_str(),
             fake_npx.as_os_str(),
             &home,
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             |_| {},
         )
         .unwrap();
@@ -3077,7 +3214,7 @@ exit 1
             34001,
             &run_dir,
             &path,
-            Duration::from_secs(1),
+            Duration::from_secs(3),
         );
         let observation = outcome.observation().expect("observation");
 

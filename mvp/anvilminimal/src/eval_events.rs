@@ -205,6 +205,7 @@ pub struct CompletionSnapshot {
     pub browser_readiness_evidence_path: String,
     pub interaction_evidence_status: String,
     pub interaction_evidence_path: String,
+    pub state_dimensions_changed: Vec<String>,
     pub evidence_arbitration_summary: String,
     pub recovery_prompt_path: String,
     pub recovery_ultra_plan_path: String,
@@ -239,6 +240,7 @@ impl CompletionSnapshot {
             browser_readiness_evidence_path: String::new(),
             interaction_evidence_status: "not_applicable".to_string(),
             interaction_evidence_path: String::new(),
+            state_dimensions_changed: Vec::new(),
             evidence_arbitration_summary: String::new(),
             recovery_prompt_path: String::new(),
             recovery_ultra_plan_path: String::new(),
@@ -285,6 +287,7 @@ pub struct CompletionProjection {
     pub browser_readiness_evidence_path: String,
     pub interaction_evidence: String,
     pub interaction_evidence_path: String,
+    pub state_dimensions_changed: Vec<String>,
     pub evidence_arbitration_summary: String,
     pub release_quality_completion: String,
     pub next_action: String,
@@ -400,6 +403,7 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         browser_readiness_evidence_path: snapshot.browser_readiness_evidence_path.clone(),
         interaction_evidence: snapshot.interaction_evidence_status.clone(),
         interaction_evidence_path: snapshot.interaction_evidence_path.clone(),
+        state_dimensions_changed: snapshot.state_dimensions_changed.clone(),
         evidence_arbitration_summary: snapshot.evidence_arbitration_summary.clone(),
         release_quality_completion,
         next_action,
@@ -1329,6 +1333,7 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        state_dimensions_changed: event_string_array(event, "state_dimensions_changed"),
         evidence_arbitration_summary: event
             .get("evidence_arbitration_summary")
             .and_then(Value::as_str)
@@ -1559,6 +1564,14 @@ fn render_completion_summary(
         format!(
             "Interaction evidence path: {}",
             missing_if_empty(&projection.interaction_evidence_path)
+        ),
+        format!(
+            "State dimensions changed: {}",
+            if projection.state_dimensions_changed.is_empty() {
+                "none".to_string()
+            } else {
+                projection.state_dimensions_changed.join(", ")
+            }
         ),
         format!("Next action: {}", projection.next_action),
         format!("Recovery next action: {}", projection.next_action),
@@ -2317,6 +2330,7 @@ mod tests {
                 "final_acceptance_status": "pass",
                 "release_gate_status": "pass",
                 "evidence_arbitration_summary": "behavioral (probe ok)",
+                "state_dimensions_changed": ["player", "score"],
             }),
         );
         let snapshot = latest_completion_snapshot(Some(&path));
@@ -2332,6 +2346,10 @@ mod tests {
 
         assert!(
             summary.contains("Evidence arbitration: behavioral (probe ok)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("State dimensions changed: player, score"),
             "{summary}"
         );
     }

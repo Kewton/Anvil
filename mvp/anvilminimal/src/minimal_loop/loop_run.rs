@@ -4265,7 +4265,7 @@ export default function Page(){
             RunStopReason::CompletionContractSatisfied
         );
         let event_text = std::fs::read_to_string(events).unwrap();
-        assert!(event_text.contains("\"repair_target\":\"capability_missing\""));
+        assert!(event_text.contains("\"repair_target\":\"implementation\""));
         assert!(event_text.contains("\"repair_follow_through\":\"target_matched\""));
         assert!(!event_text.contains("repair_target_not_followed"));
     }

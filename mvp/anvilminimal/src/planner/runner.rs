@@ -1972,6 +1972,8 @@ fn verify_plan_final_contract(
     let release_quality_completion =
         release_quality_completion_status(&release_gate, final_acceptance_status);
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
+    let state_dimensions_changed =
+        interaction_state_dimensions_changed_from_path(&release_gate.interaction_evidence_path);
     let primary_reason = if !missing_final_artifacts.is_empty() {
         format!(
             "missing final artifacts: {}",
@@ -2104,6 +2106,7 @@ fn verify_plan_final_contract(
             "browser_readiness_evidence_path": release_gate.browser_readiness_evidence_path.clone(),
             "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
+            "state_dimensions_changed": state_dimensions_changed,
             "next_action": next_action,
             "recovery_handoff_kind": recovery_handoff
                 .as_ref()
@@ -4250,6 +4253,8 @@ fn ultra_final_acceptance_report(
     let release_quality_completion =
         release_quality_completion_status(&release_gate, final_acceptance_status);
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
+    let state_dimensions_changed =
+        interaction_state_dimensions_changed_from_path(&release_gate.interaction_evidence_path);
     let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
     let mut compile_errors = profile_report.compile_errors.clone();
     if let Some(report) = external_report.as_ref() {
@@ -4355,6 +4360,7 @@ fn ultra_final_acceptance_report(
             "browser_readiness_evidence_path": release_gate.browser_readiness_evidence_path.clone(),
             "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
+            "state_dimensions_changed": state_dimensions_changed,
             "next_action": next_action,
             "recovery_handoff_kind": recovery_handoff
                 .as_ref()
@@ -4732,6 +4738,7 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "contract_hook_status": observation.contract_hook_status.as_str(),
                     "candidate_table": &observation.candidate_table,
                     "input_dispatches": &observation.input_dispatches,
+                    "state_dimensions_changed": &observation.state_dimensions_changed,
                     "input_state_evaluated_after_start": observation.input_state_evaluated_after_start,
                     "primary_start_transition": observation.primary_transition_observed,
                     "informational_failure_kinds": &observation.informational_failure_kinds,
@@ -5287,19 +5294,19 @@ fn runtime_acceptance_repair_guidance(
     for evidence in &acceptance.missing_evidence {
         match evidence.as_str() {
             "restart_or_recoverable_state_evidence" => guidance.push(
-                "wire a handler (e.g. onClick) to a function that resets score AND entities and transitions out of the game-over state"
+                "provide a reachable terminal/failure state and a restart control (data-anvil-action=\"restart\") that resets observable state"
                     .to_string(),
             ),
             "challenge_or_adversary_evidence" => guidance.push(
-                "add named adversary entities such as enemies or invaders and wire them to movement/collision"
+                "wire a reachable challenge/adversary entity into state evolution, not only a static label"
                     .to_string(),
             ),
             "failure_or_collision_evidence" => guidance.push(
-                "implement collision/damage detection that transitions into a real failure or game-over state"
+                "wire a collision/failure conditional that transitions to a reachable failure state"
                     .to_string(),
             ),
             "score_or_progression_evidence" => guidance.push(
-                "update score, level, wave, lives, health, or progress from gameplay events"
+                "wire score/progression updates to meaningful state transitions, not only an isolated counter"
                     .to_string(),
             ),
             "stateful_update_evidence" => guidance.push(
@@ -7493,6 +7500,11 @@ fn release_recovery_failure_evidence(
                 .map(|item| format!("missing runtime evidence: {item}")),
         );
         evidence.extend(
+            runtime_acceptance_repair_guidance(report)
+                .into_iter()
+                .map(|item| format!("runtime repair guidance: {item}")),
+        );
+        evidence.extend(
             report
                 .unverified_evidence
                 .iter()
@@ -7532,11 +7544,23 @@ fn interaction_probe_failure_evidence_lines(path: &str) -> Vec<String> {
     {
         lines.push(format!("interaction contract hook status: {status}"));
     }
+    if let Some(restart_present) = raw_contract_hook_bool(&value, "restart_present") {
+        lines.push(format!(
+            "interaction restart hook present: {restart_present}"
+        ));
+    }
     let inputs = raw_string_array_field_deep(&value, "input_dispatches");
     if !inputs.is_empty() {
         lines.push(format!(
             "interaction redispatched inputs: {}",
             inputs.join(", ")
+        ));
+    }
+    let state_dimensions = raw_string_array_field_deep(&value, "state_dimensions_changed");
+    if !state_dimensions.is_empty() {
+        lines.push(format!(
+            "interaction state dimensions changed: {}",
+            state_dimensions.join(", ")
         ));
     }
     let info = raw_string_array_field_deep(&value, "informational_failure_kinds");
@@ -7598,6 +7622,13 @@ fn release_recovery_repair_targets(
         targets.extend(interaction_repair_targets_for_reason(&interaction_status));
     }
     if let Some(report) = runtime_acceptance {
+        targets.extend(
+            report
+                .missing_evidence
+                .iter()
+                .filter(|evidence| behavior_depth_evidence_key(evidence))
+                .map(|evidence| format!("implementation:{evidence}")),
+        );
         targets.extend(
             report
                 .obligation_repair_targets
@@ -7672,6 +7703,16 @@ fn interaction_repair_targets_for_reason(reason: &str) -> Vec<String> {
     } else {
         vec!["capability_implementation".to_string()]
     }
+}
+
+fn behavior_depth_evidence_key(evidence: &str) -> bool {
+    matches!(
+        evidence,
+        "challenge_or_adversary_evidence"
+            | "failure_or_collision_evidence"
+            | "score_or_progression_evidence"
+            | "restart_or_recoverable_state_evidence"
+    )
 }
 
 fn dedup_strings(values: Vec<String>) -> Vec<String> {
@@ -9884,6 +9925,16 @@ fn final_acceptance_behavioral_probe_context(
         {
             lines.push(format!("- contract hook status: {status}"));
         }
+        if let Some(restart_present) = raw_contract_hook_bool(value, "restart_present") {
+            lines.push(format!("- restart hook present: {restart_present}"));
+        }
+        let state_dimensions = raw_string_array_field_deep(value, "state_dimensions_changed");
+        if !state_dimensions.is_empty() {
+            lines.push(format!(
+                "- state dimensions changed: {}",
+                state_dimensions.join(", ")
+            ));
+        }
         let info = raw_string_array_field_deep(value, "informational_failure_kinds");
         if !info.is_empty() {
             lines.push(format!(
@@ -10026,6 +10077,15 @@ fn interaction_probe_json_from_report(report: &VerificationReport) -> Option<Val
         .filter(Value::is_object)
 }
 
+fn interaction_state_dimensions_changed_from_path(path: &str) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+        .map(|value| raw_string_array_field_deep(&value, "state_dimensions_changed"))
+        .unwrap_or_default()
+}
+
 fn prompt_marker_excerpt(value: &str) -> String {
     const MAX_CHARS: usize = 600;
     if value.chars().count() <= MAX_CHARS {
@@ -10064,6 +10124,15 @@ fn raw_string_array_field_deep(value: &Value, name: &str) -> Vec<String> {
                 .filter(|items| !items.is_empty())
         })
         .unwrap_or_default()
+}
+
+fn raw_contract_hook_bool(value: &Value, name: &str) -> Option<bool> {
+    raw_value_scopes(value).into_iter().find_map(|scope| {
+        scope
+            .get("contract_hooks")
+            .and_then(|hooks| hooks.get(name))
+            .and_then(Value::as_bool)
+    })
 }
 
 fn interaction_candidate_prompt_lines(value: &Value) -> Vec<String> {
@@ -14996,7 +15065,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
 
     #[test]
     #[cfg(unix)]
-    fn recovery_transition_not_observed_has_unverified_tier_without_setup_remediation() {
+    fn recovery_transition_not_observed_after_probe_success_is_implementation_failure() {
         let _probe_guard = dev_server_probe_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let port = free_local_port();
@@ -15026,10 +15095,12 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
 
         let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
 
-        assert!(report.is_pass(), "{report:?}");
+        assert!(!report.is_pass(), "{report:?}");
         let event_text = std::fs::read_to_string(&events).unwrap();
-        assert!(event_text.contains("unverified:not_observed_by_probe"));
-        assert!(event_text.contains("interaction_unverified:not_observed_by_probe"));
+        assert!(
+            event_text.contains("\"missing_evidence\":[\"restart_or_recoverable_state_evidence\"]")
+        );
+        assert!(!event_text.contains("interaction_unverified:not_observed_by_probe"));
         assert!(!event_text.contains("probe_unavailable"), "{event_text}");
         assert!(
             !event_text.contains("/setup-interaction-probe"),
@@ -15041,7 +15112,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
                 .get("evidence_tiers")
                 .and_then(|tiers| tiers.get("restart_or_recoverable_state_evidence"))
                 .and_then(Value::as_str),
-            Some("unverified:not_observed_by_probe")
+            Some("absent")
         );
     }
 
@@ -15851,7 +15922,7 @@ export default function Page() {
             }],
         };
         let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
-        assert!(report.is_pass(), "{report:?}");
+        assert!(!report.is_pass(), "{report:?}");
         let ultra = latest_event(&events, "ultra_final_acceptance");
         assert_eq!(
             ultra
@@ -15873,18 +15944,32 @@ export default function Page() {
         );
         assert_eq!(
             collision.get("final_tier").and_then(Value::as_str),
-            Some("weak_behavior_corroborated")
+            Some("absent")
         );
         assert_eq!(
             collision.get("decided_by").and_then(Value::as_str),
             Some("behavioral")
         );
         assert_eq!(
+            collision
+                .get("behavioral_observation")
+                .and_then(Value::as_str),
+            Some("not_observed_by_probe")
+        );
+        assert_eq!(
             ultra
                 .get("evidence_tiers")
                 .and_then(|tiers| tiers.get("failure_or_collision_evidence"))
                 .and_then(Value::as_str),
-            Some("weak_behavior_corroborated")
+            Some("absent")
+        );
+        assert_eq!(
+            ultra
+                .get("missing_evidence")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str),
+            Some("failure_or_collision_evidence")
         );
     }
 
