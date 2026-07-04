@@ -1091,18 +1091,13 @@ def browser_readiness_detail_failure(value: dict[str, Any], details: dict[str, A
 
 
 def interaction_has_required_detail(value: dict[str, Any], details: dict[str, Any]) -> bool:
-    return any_true(
-        value,
-        details,
-        "interaction_performed",
-        "basic_interaction",
-        "interaction_success",
-        "input_event_observed",
-        "keyboard_event_observed",
-        "pointer_event_observed",
-        "state_changed",
-        "visible_state_changed",
-    )
+    transition = any_true(value, details, "start_transition", "transition_observed") or list_contains(
+        value, details, "steps", "start_transition"
+    ) or list_contains(value, details, "steps", "recovery_transition")
+    input_state_changed = any_true(
+        value, details, "input_state_change", "state_changed", "visible_state_changed"
+    ) or list_contains(value, details, "steps", "input_state_change")
+    return transition and input_state_changed
 
 
 def interaction_detail_failure(value: dict[str, Any], details: dict[str, Any]) -> str:
@@ -1119,7 +1114,14 @@ def interaction_detail_failure(value: dict[str, Any], details: dict[str, Any]) -
     ):
         return "input_event_missing"
     if any_false(value, details, "state_changed", "visible_state_changed"):
-        return "interaction_state_change_missing"
+        transition = any_true(value, details, "start_transition", "transition_observed") or list_contains(
+            value, details, "steps", "start_transition"
+        ) or list_contains(value, details, "steps", "recovery_transition")
+        if not transition:
+            return "start_transition_missing"
+        if any_false(value, details, "input_state_evaluated_after_start"):
+            return "input_state_change_not_evaluated_after_start"
+        return "input_state_change_missing_after_start"
     return ""
 
 
@@ -1129,6 +1131,15 @@ def any_true(value: dict[str, Any], details: dict[str, Any], *keys: str) -> bool
 
 def any_false(value: dict[str, Any], details: dict[str, Any], *keys: str) -> bool:
     return any(bool_field(value, key) is False or bool_field(details, key) is False for key in keys)
+
+
+def list_contains(value: dict[str, Any], details: dict[str, Any], key: str, needle: str) -> bool:
+    return _list_contains(value, key, needle) or _list_contains(details, key, needle)
+
+
+def _list_contains(value: dict[str, Any], key: str, needle: str) -> bool:
+    raw = value.get(key)
+    return isinstance(raw, list) and needle in raw
 
 
 def bool_field(value: dict[str, Any], *keys: str) -> bool | None:

@@ -538,6 +538,21 @@ fn explicit_browser_evidence_failure(
             }
         }
         BrowserEvidenceKind::Interaction => {
+            let transition_observed =
+                bool_field_deep(value, details, &["start_transition", "transition_observed"])
+                    == Some(true)
+                    || string_array_field_contains_deep(
+                        value,
+                        details,
+                        "steps",
+                        "start_transition",
+                    )
+                    || string_array_field_contains_deep(
+                        value,
+                        details,
+                        "steps",
+                        "recovery_transition",
+                    );
             if bool_field_deep(value, details, &["canvas_found", "canvas_available"]) == Some(false)
             {
                 return Some("canvas_unavailable".to_string());
@@ -565,7 +580,15 @@ fn explicit_browser_evidence_failure(
             if bool_field_deep(value, details, &["state_changed", "visible_state_changed"])
                 == Some(false)
             {
-                return Some("interaction_state_change_missing".to_string());
+                if !transition_observed {
+                    return Some("start_transition_missing".to_string());
+                }
+                if bool_field_deep(value, details, &["input_state_evaluated_after_start"])
+                    == Some(false)
+                {
+                    return Some("input_state_change_not_evaluated_after_start".to_string());
+                }
+                return Some("input_state_change_missing_after_start".to_string());
             }
         }
     }
@@ -586,20 +609,32 @@ fn browser_evidence_has_required_detail(
             ) == Some(true)
         }
         BrowserEvidenceKind::Interaction => {
-            bool_field_deep(
+            let transition_observed =
+                bool_field_deep(value, details, &["start_transition", "transition_observed"])
+                    == Some(true)
+                    || string_array_field_contains_deep(
+                        value,
+                        details,
+                        "steps",
+                        "start_transition",
+                    )
+                    || string_array_field_contains_deep(
+                        value,
+                        details,
+                        "steps",
+                        "recovery_transition",
+                    );
+            let input_state_changed = bool_field_deep(
                 value,
                 details,
                 &[
-                    "interaction_performed",
-                    "basic_interaction",
-                    "interaction_success",
-                    "input_event_observed",
-                    "keyboard_event_observed",
-                    "pointer_event_observed",
+                    "input_state_change",
                     "state_changed",
                     "visible_state_changed",
                 ],
             ) == Some(true)
+                || string_array_field_contains_deep(value, details, "steps", "input_state_change");
+            transition_observed && input_state_changed
         }
     }
 }
@@ -716,6 +751,26 @@ fn text_field(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
         .map(|text| text.trim().to_ascii_lowercase())
+}
+
+fn string_array_field_contains_deep(
+    value: &Value,
+    details: Option<&Value>,
+    key: &str,
+    needle: &str,
+) -> bool {
+    string_array_field_contains(value, key, needle)
+        || details.is_some_and(|details| string_array_field_contains(details, key, needle))
+}
+
+fn string_array_field_contains(value: &Value, key: &str, needle: &str) -> bool {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|item| item == needle)
 }
 
 pub fn required_evidence_for_capability(capability: &str) -> Vec<String> {
@@ -5101,7 +5156,7 @@ export default function Page(){
         .unwrap();
         std::fs::write(
             dir.path().join("interaction-evidence.json"),
-            r#"{"ok":true,"interaction_performed":true,"input_event_observed":true,"state_changed":true}"#,
+            r#"{"ok":true,"interaction_performed":true,"start_transition":true,"input_state_change":true,"input_event_observed":true,"state_changed":true}"#,
         )
         .unwrap();
         let report = verify_runtime_acceptance(

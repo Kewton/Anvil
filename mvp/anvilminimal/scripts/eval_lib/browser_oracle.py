@@ -306,18 +306,13 @@ def browser_unavailable_reason(evidence: dict[str, Any], details: dict[str, Any]
 def saved_browser_evidence_has_required_details(
     evidence: dict[str, Any], details: dict[str, Any]
 ) -> bool:
-    return any_true(evidence, details, "route_rendered", "rendered", "page_loaded", "dom_ready") and any_true(
-        evidence,
-        details,
-        "interaction_performed",
-        "basic_interaction",
-        "interaction_success",
-        "input_event_observed",
-        "keyboard_event_observed",
-        "pointer_event_observed",
-        "state_changed",
-        "visible_state_changed",
+    transition = any_true(evidence, details, "start_transition", "transition_observed") or list_contains(
+        evidence, details, "steps", "start_transition"
+    ) or list_contains(evidence, details, "steps", "recovery_transition")
+    state_changed = any_true(evidence, details, "input_state_change", "state_changed", "visible_state_changed") or list_contains(
+        evidence, details, "steps", "input_state_change"
     )
+    return any_true(evidence, details, "route_rendered", "rendered", "page_loaded", "dom_ready") and transition and state_changed
 
 
 def browser_detail_failure(evidence: dict[str, Any], details: dict[str, Any]) -> str:
@@ -336,7 +331,14 @@ def browser_detail_failure(evidence: dict[str, Any], details: dict[str, Any]) ->
     ):
         return "input_event_missing"
     if any_false(evidence, details, "state_changed", "visible_state_changed"):
-        return "interaction_state_change_missing"
+        transition = any_true(evidence, details, "start_transition", "transition_observed") or list_contains(
+            evidence, details, "steps", "start_transition"
+        ) or list_contains(evidence, details, "steps", "recovery_transition")
+        if not transition:
+            return "start_transition_missing"
+        if any_false(evidence, details, "input_state_evaluated_after_start"):
+            return "input_state_change_not_evaluated_after_start"
+        return "input_state_change_missing_after_start"
     return ""
 
 
@@ -346,6 +348,15 @@ def any_true(evidence: dict[str, Any], details: dict[str, Any], *keys: str) -> b
 
 def any_false(evidence: dict[str, Any], details: dict[str, Any], *keys: str) -> bool:
     return any(bool_field(evidence, key) is False or bool_field(details, key) is False for key in keys)
+
+
+def list_contains(evidence: dict[str, Any], details: dict[str, Any], key: str, needle: str) -> bool:
+    return _list_contains(evidence, key, needle) or _list_contains(details, key, needle)
+
+
+def _list_contains(value: dict[str, Any], key: str, needle: str) -> bool:
+    raw = value.get(key)
+    return isinstance(raw, list) and needle in raw
 
 
 def bool_field(value: dict[str, Any], *keys: str) -> bool | None:

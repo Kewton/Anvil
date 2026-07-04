@@ -322,7 +322,15 @@ class ParityGateReportTest(unittest.TestCase):
             uat.write_text("manual UAT evidence", encoding="utf-8")
             browser.write_text(json.dumps({"ok": True, "http_status": 200, "route_rendered": True}), encoding="utf-8")
             interaction.write_text(
-                json.dumps({"ok": True, "interaction_performed": True, "state_changed": True}),
+                json.dumps(
+                    {
+                        "ok": True,
+                        "interaction_performed": True,
+                        "start_transition": True,
+                        "input_state_change": True,
+                        "state_changed": True,
+                    }
+                ),
                 encoding="utf-8",
             )
             events.write_text(
@@ -512,6 +520,8 @@ class ParityGateReportTest(unittest.TestCase):
                     {
                         "ok": True,
                         "interaction_performed": True,
+                        "start_transition": True,
+                        "input_state_change": True,
                         "state_changed": True,
                         "canvas_found": False,
                     }
@@ -581,7 +591,15 @@ def release_evidence_files(root: Path):
     uat.write_text("manual UAT evidence", encoding="utf-8")
     browser.write_text(json.dumps({"ok": True, "http_status": 200, "route_rendered": True}), encoding="utf-8")
     interaction.write_text(
-        json.dumps({"ok": True, "interaction_performed": True, "state_changed": True}),
+        json.dumps(
+            {
+                "ok": True,
+                "interaction_performed": True,
+                "start_transition": True,
+                "input_state_change": True,
+                "state_changed": True,
+            }
+        ),
         encoding="utf-8",
     )
     events.write_text(

@@ -92,8 +92,12 @@ const DEV_SERVER_ROUTE: &str = "/";
 const DEV_SERVER_LIFECYCLE_STAGES: [&str; 4] = ["start", "wait", "probe", "cleanup"];
 const PROFILE_REPAIR_FILE_EXCERPT_MAX_CHARS: usize = 2_400;
 const INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT: &str = "keyboard or pointer input must visibly change game state (player position, projectiles, score/health, or state transitions); wire input handlers into the render/update loop.";
-const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 6] = [
+const INTERACTION_START_REPAIR_REQUIREMENT: &str = "primary/start controls must transition the visible app state before input is evaluated; wire the start action into state and render updates.";
+const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 9] = [
     "interaction_state_change_missing",
+    "input_state_change_missing_after_start",
+    "input_state_change_not_evaluated_after_start",
+    "primary_start_transition_missing",
     "start_transition_missing",
     "surface_missing",
     "surface_visible_missing",
@@ -4388,6 +4392,13 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "has_canvas": observation.has_canvas,
                     "interactive_control_count": observation.interactive_control_count,
                     "steps": observation.steps,
+                    "probe_mode": observation.probe_mode.as_str(),
+                    "contract_hook_status": observation.contract_hook_status.as_str(),
+                    "candidate_table": &observation.candidate_table,
+                    "input_dispatches": &observation.input_dispatches,
+                    "input_state_evaluated_after_start": observation.input_state_evaluated_after_start,
+                    "primary_start_transition": observation.primary_transition_observed,
+                    "informational_failure_kinds": &observation.informational_failure_kinds,
                     "duration_ms": observation.duration_ms,
                     "evidence_path": observation.evidence_path.display().to_string(),
                     "script_path": observation.script_path.display().to_string(),
@@ -6649,6 +6660,21 @@ fn explicit_release_evidence_failure(
             }
         }
         ReleaseEvidenceKind::Interaction => {
+            let transition_observed =
+                bool_field_deep(value, details, &["start_transition", "transition_observed"])
+                    == Some(true)
+                    || string_array_field_contains_deep(
+                        value,
+                        details,
+                        "steps",
+                        "start_transition",
+                    )
+                    || string_array_field_contains_deep(
+                        value,
+                        details,
+                        "steps",
+                        "recovery_transition",
+                    );
             if bool_field_deep(value, details, &["canvas_found", "canvas_available"]) == Some(false)
             {
                 return Some("canvas_unavailable".to_string());
@@ -6676,7 +6702,15 @@ fn explicit_release_evidence_failure(
             if bool_field_deep(value, details, &["state_changed", "visible_state_changed"])
                 == Some(false)
             {
-                return Some("interaction_state_change_missing".to_string());
+                if !transition_observed {
+                    return Some("start_transition_missing".to_string());
+                }
+                if bool_field_deep(value, details, &["input_state_evaluated_after_start"])
+                    == Some(false)
+                {
+                    return Some("input_state_change_not_evaluated_after_start".to_string());
+                }
+                return Some("input_state_change_missing_after_start".to_string());
             }
         }
     }
@@ -6697,20 +6731,32 @@ fn release_evidence_has_required_detail(
             ) == Some(true)
         }
         ReleaseEvidenceKind::Interaction => {
-            bool_field_deep(
+            let transition_observed =
+                bool_field_deep(value, details, &["start_transition", "transition_observed"])
+                    == Some(true)
+                    || string_array_field_contains_deep(
+                        value,
+                        details,
+                        "steps",
+                        "start_transition",
+                    )
+                    || string_array_field_contains_deep(
+                        value,
+                        details,
+                        "steps",
+                        "recovery_transition",
+                    );
+            let input_state_changed = bool_field_deep(
                 value,
                 details,
                 &[
-                    "interaction_performed",
-                    "basic_interaction",
-                    "interaction_success",
-                    "input_event_observed",
-                    "keyboard_event_observed",
-                    "pointer_event_observed",
+                    "input_state_change",
                     "state_changed",
                     "visible_state_changed",
                 ],
             ) == Some(true)
+                || string_array_field_contains_deep(value, details, "steps", "input_state_change");
+            transition_observed && input_state_changed
         }
     }
 }
@@ -6824,6 +6870,26 @@ fn text_field(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
         .map(|text| text.trim().to_ascii_lowercase())
+}
+
+fn string_array_field_contains_deep(
+    value: &Value,
+    details: Option<&Value>,
+    key: &str,
+    needle: &str,
+) -> bool {
+    string_array_field_contains(value, key, needle)
+        || details.is_some_and(|details| string_array_field_contains(details, key, needle))
+}
+
+fn string_array_field_contains(value: &Value, key: &str, needle: &str) -> bool {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|item| item == needle)
 }
 
 fn release_gate_final_acceptance_status(release_gate: &ReleaseGateSummary) -> &'static str {
@@ -7049,6 +7115,9 @@ fn release_recovery_failure_evidence(
             "interaction evidence path: {}",
             release_gate.interaction_evidence_path
         ));
+        evidence.extend(interaction_probe_failure_evidence_lines(
+            &release_gate.interaction_evidence_path,
+        ));
     }
     if let Some(report) = runtime_acceptance {
         evidence.extend(
@@ -7077,6 +7146,46 @@ fn release_recovery_failure_evidence(
         );
     }
     dedup_strings(evidence)
+}
+
+fn interaction_probe_failure_evidence_lines(path: &str) -> Vec<String> {
+    let Some(value) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+    else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    if let Some(mode) = raw_text_field_deep(&value, &["probe_mode"]).filter(|mode| !mode.is_empty())
+    {
+        lines.push(format!("interaction probe mode: {mode}"));
+    }
+    if let Some(status) =
+        raw_text_field_deep(&value, &["contract_hook_status"]).filter(|status| !status.is_empty())
+    {
+        lines.push(format!("interaction contract hook status: {status}"));
+    }
+    let inputs = raw_string_array_field_deep(&value, "input_dispatches");
+    if !inputs.is_empty() {
+        lines.push(format!(
+            "interaction redispatched inputs: {}",
+            inputs.join(", ")
+        ));
+    }
+    let info = raw_string_array_field_deep(&value, "informational_failure_kinds");
+    if !info.is_empty() {
+        lines.push(format!(
+            "interaction informational findings: {}",
+            info.join(", ")
+        ));
+    }
+    lines.extend(
+        interaction_candidate_prompt_lines(&value)
+            .into_iter()
+            .map(|line| format!("interaction candidate table: {line}")),
+    );
+    lines
 }
 
 fn release_recovery_missing_capabilities(
@@ -7120,7 +7229,7 @@ fn release_recovery_repair_targets(
         targets.push("test_or_evidence".to_string());
     }
     if interaction_status.starts_with("failed:") && !interaction_probe_infrastructure {
-        targets.push("capability_implementation".to_string());
+        targets.extend(interaction_repair_targets_for_reason(&interaction_status));
     }
     if let Some(report) = runtime_acceptance {
         targets.extend(
@@ -7181,6 +7290,22 @@ fn release_recovery_verify_commands(
         commands.push("do not claim release_ready until release gate evidence passes".to_string());
     }
     dedup_strings(commands)
+}
+
+fn interaction_repair_targets_for_reason(reason: &str) -> Vec<String> {
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("input_state_change_missing_after_start")
+        || lower.contains("input_state_change_not_evaluated_after_start")
+        || lower.contains("interaction_state_change_missing")
+    {
+        vec!["input_state_render_wiring".to_string()]
+    } else if lower.contains("start_transition_missing")
+        || lower.contains("primary_start_transition_missing")
+    {
+        vec!["start_control_wiring".to_string()]
+    } else {
+        vec!["capability_implementation".to_string()]
+    }
 }
 
 fn dedup_strings(values: Vec<String>) -> Vec<String> {
@@ -9209,13 +9334,46 @@ fn final_acceptance_behavioral_probe_context(
         return String::new();
     };
     let evidence = interaction_probe_json_from_report(report);
+    let dispatched_inputs = evidence
+        .as_ref()
+        .map(|value| raw_string_array_field_deep(value, "input_dispatches"))
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| {
+            vec![
+                "ArrowLeft keydown".to_string(),
+                "ArrowRight keydown".to_string(),
+                "Space keydown".to_string(),
+                "canvas/center click".to_string(),
+            ]
+        });
     let mut lines = vec![
         "Interaction probe context:".to_string(),
         format!("- failure kind: {failure_kind}"),
-        "- dispatched inputs: ArrowLeft keydown, ArrowRight keydown, Space keydown, canvas click"
-            .to_string(),
+        format!("- dispatched inputs: {}", dispatched_inputs.join(", ")),
     ];
     if let Some(value) = evidence.as_ref() {
+        if let Some(mode) =
+            raw_text_field_deep(value, &["probe_mode"]).filter(|mode| !mode.is_empty())
+        {
+            lines.push(format!("- probe mode: {mode}"));
+        }
+        if let Some(status) = raw_text_field_deep(value, &["contract_hook_status"])
+            .filter(|status| !status.is_empty())
+        {
+            lines.push(format!("- contract hook status: {status}"));
+        }
+        let info = raw_string_array_field_deep(value, "informational_failure_kinds");
+        if !info.is_empty() {
+            lines.push(format!(
+                "- informational probe findings: {}",
+                info.join(", ")
+            ));
+        }
+        let candidates = interaction_candidate_prompt_lines(value);
+        if !candidates.is_empty() {
+            lines.push("- candidate table:".to_string());
+            lines.extend(candidates);
+        }
         for key in [
             "before_marker",
             "after_marker",
@@ -9231,7 +9389,15 @@ fn final_acceptance_behavioral_probe_context(
             }
         }
     }
-    if failure_kind.contains("interaction_state_change_missing") {
+    if failure_kind.contains("start_transition_missing") {
+        lines.push(format!(
+            "- concrete requirement: {INTERACTION_START_REPAIR_REQUIREMENT}"
+        ));
+    }
+    if failure_kind.contains("interaction_state_change_missing")
+        || failure_kind.contains("input_state_change_missing_after_start")
+        || failure_kind.contains("input_state_change_not_evaluated_after_start")
+    {
         lines.push(format!(
             "- concrete requirement: {INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT}"
         ));
@@ -9252,12 +9418,19 @@ fn final_acceptance_recovery_reason(
     let Some(failure_kind) = final_acceptance_app_behavior_failure_kind(report) else {
         return format!("{reason}; final acceptance repair stopped: {exhausted_reason}");
     };
+    let repair_targets = interaction_repair_targets_for_reason(&failure_kind).join(", ");
     let mut out = format!(
-        "{failure_kind}; final acceptance repair stopped: {exhausted_reason}; repair target: capability_implementation"
+        "{failure_kind}; final acceptance repair stopped: {exhausted_reason}; repair target: {repair_targets}"
     );
-    if failure_kind.contains("interaction_state_change_missing") {
+    if failure_kind.contains("interaction_state_change_missing")
+        || failure_kind.contains("input_state_change_missing_after_start")
+        || failure_kind.contains("input_state_change_not_evaluated_after_start")
+    {
         out.push_str("; ");
         out.push_str(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT);
+    } else if failure_kind.contains("start_transition_missing") {
+        out.push_str("; ");
+        out.push_str(INTERACTION_START_REPAIR_REQUIREMENT);
     }
     let context = final_acceptance_behavioral_probe_context(report, &[]);
     if !context.is_empty() {
@@ -9271,8 +9444,8 @@ fn final_acceptance_recovery_repair_targets(
     report: &VerificationReport,
     fallback: RepairTarget,
 ) -> Vec<String> {
-    if final_acceptance_app_behavior_failure_kind(report).is_some() {
-        vec!["capability_implementation".to_string()]
+    if let Some(reason) = final_acceptance_app_behavior_failure_kind(report) {
+        interaction_repair_targets_for_reason(&reason)
     } else {
         vec![fallback.as_str().to_string()]
     }
@@ -9330,6 +9503,53 @@ fn raw_text_field_deep(value: &Value, names: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+fn raw_string_array_field_deep(value: &Value, name: &str) -> Vec<String> {
+    raw_value_scopes(value)
+        .into_iter()
+        .find_map(|scope| {
+            scope
+                .get(name)
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn interaction_candidate_prompt_lines(value: &Value) -> Vec<String> {
+    raw_value_scopes(value)
+        .into_iter()
+        .find_map(|scope| scope.get("candidate_table").and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .take(4)
+        .map(|candidate| {
+            let rank = candidate
+                .get("rank")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let text = candidate
+                .get("text_excerpt")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let changed = candidate
+                .get("changed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            format!(
+                "- rank {rank}: text=\"{}\" changed={changed}",
+                prompt_marker_excerpt(text)
+            )
+        })
+        .collect()
 }
 
 fn raw_value_scopes(value: &Value) -> Vec<&Value> {
@@ -10881,7 +11101,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             "Write",
             serde_json::json!({
                 "path":"interaction-evidence.json",
-                "content":"{\"ok\":true,\"interaction_performed\":true,\"input_event_observed\":true,\"state_changed\":true,\"canvas_found\":true}"
+                "content":"{\"ok\":true,\"interaction_performed\":true,\"start_transition\":true,\"input_state_change\":true,\"input_event_observed\":true,\"state_changed\":true,\"canvas_found\":true}"
             }),
         ));
         app_tool_calls.push(crate::state::ToolCall::new(
@@ -13352,7 +13572,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             "Write",
             serde_json::json!({
                 "path":"interaction-evidence.json",
-                "content":"{\"ok\":true,\"interaction_performed\":true,\"input_event_observed\":true,\"state_changed\":true,\"canvas_found\":true}"
+                "content":"{\"ok\":true,\"interaction_performed\":true,\"start_transition\":true,\"input_state_change\":true,\"input_event_observed\":true,\"state_changed\":true,\"canvas_found\":true}"
             }),
         ));
         let mut execution_replies = vec![
@@ -13368,7 +13588,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
                     "Write",
                     serde_json::json!({
                         "path":"interaction-evidence.json",
-                        "content":"{\"ok\":true,\"interaction_performed\":true,\"input_event_observed\":true,\"state_changed\":true,\"canvas_found\":true}"
+                        "content":"{\"ok\":true,\"interaction_performed\":true,\"start_transition\":true,\"input_state_change\":true,\"input_event_observed\":true,\"state_changed\":true,\"canvas_found\":true}"
                     }),
                 )],
                 prompt_tokens: None,
@@ -13533,7 +13753,12 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             &serde_json::json!({
                 "ok": true,
                 "status": "passed",
-                "steps": ["surface_visible", "start_transition", "control_input_dispatched"],
+                "start_transition": true,
+                "input_state_evaluated_after_start": true,
+                "input_state_change": true,
+                "state_changed": true,
+                "visible_state_changed": true,
+                "steps": ["surface_visible", "start_transition", "control_input_dispatched", "input_state_evaluated_after_start", "input_state_change"],
                 "before_marker": "menu",
                 "after_marker": "running",
                 "duration_ms": 11
@@ -13605,7 +13830,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         );
         assert_eq!(
             release_recovery_repair_targets(&gate, None),
-            vec!["capability_implementation".to_string()]
+            vec!["start_control_wiring".to_string()]
         );
 
         let mut report = VerificationReport::pass();
@@ -13677,13 +13902,16 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             !event_text.contains("/setup-interaction-probe"),
             "{event_text}"
         );
-        assert!(event_text.contains("browser_interaction_failed:interaction_state_change_missing"));
+        assert!(
+            event_text
+                .contains("browser_interaction_failed:input_state_change_missing_after_start")
+        );
         let ultra = latest_event(&events, "ultra_final_acceptance");
         assert_eq!(
             ultra
                 .get("interaction_evidence_status")
                 .and_then(Value::as_str),
-            Some("failed:interaction_state_change_missing")
+            Some("failed:input_state_change_missing_after_start")
         );
         let arbitration = ultra
             .get("evidence_arbitration")
@@ -13697,7 +13925,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             stateful
                 .get("behavioral_observation")
                 .and_then(Value::as_str),
-            Some("input_state_change_missing")
+            Some("input_state_change_missing_after_start")
         );
         assert_eq!(
             stateful.get("final_tier").and_then(Value::as_str),
@@ -13786,8 +14014,9 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             .find(|prompt| prompt.contains("Repair the final acceptance failure"))
             .expect("repair prompt");
         assert!(
-            repair_prompt
-                .contains("ArrowLeft keydown, ArrowRight keydown, Space keydown, canvas click")
+            repair_prompt.contains(
+                "ArrowLeft keydown, ArrowRight keydown, Space keydown, canvas/center click"
+            )
         );
         assert!(repair_prompt.contains("player=20 score=0 health=3"));
         assert!(repair_prompt.contains(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT));
@@ -13857,7 +14086,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
 
         assert!(
             err.contains(
-                "ultra final acceptance failed after bounded repair: browser_interaction_failed:interaction_state_change_missing"
+                "ultra final acceptance failed after bounded repair: browser_interaction_failed:input_state_change_missing_after_start"
             ),
             "{err}"
         );
@@ -13870,14 +14099,14 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             "{event_text}"
         );
         assert!(event_text.contains(
-            "\"failure_kind\":\"browser_interaction_failed:interaction_state_change_missing\""
+            "\"failure_kind\":\"browser_interaction_failed:input_state_change_missing_after_start\""
         ));
         assert!(!event_text.contains("interaction_unverified_probe_unavailable"));
         assert!(!event_text.contains("/setup-interaction-probe"));
         let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
         let recovery_text = render_ultra_plan(&recovery_plan);
         assert!(
-            recovery_text.contains("capability_implementation"),
+            recovery_text.contains("input_state_render_wiring"),
             "{recovery_text}"
         );
         assert!(
@@ -13993,11 +14222,22 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
         );
         assert!(
-            repair_prompt
-                .contains("ArrowLeft keydown, ArrowRight keydown, Space keydown, canvas click")
+            repair_prompt.contains(
+                "ArrowLeft keydown, ArrowRight keydown, Space keydown, canvas/center click"
+            )
         );
         assert!(repair_prompt.contains("player=20 score=0 health=3"));
         assert!(repair_prompt.contains(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT));
+        assert!(
+            repair_prompt.contains("probe mode: heuristic"),
+            "{repair_prompt}"
+        );
+        assert!(
+            repair_prompt.contains("contract hook status: primary_missing"),
+            "{repair_prompt}"
+        );
+        assert!(repair_prompt.contains("candidate table"), "{repair_prompt}");
+        assert!(repair_prompt.contains("rank 2: text=\"Start\" changed=true"));
         assert!(repair_prompt.contains("src/app/page.tsx"));
         let mut fake = FakeClient::new(vec![probe_nextjs_scaffold_reply(
             port,
@@ -14096,13 +14336,13 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         let failure_kind = final_acceptance_app_behavior_failure_kind(&report).unwrap();
         assert_eq!(
             failure_kind,
-            "browser_interaction_failed:interaction_state_change_missing"
+            "browser_interaction_failed:input_state_change_missing_after_start"
         );
         let reason =
             final_acceptance_recovery_reason(&report, &failure_kind, "bounded_repair_exhausted");
         let targets =
             final_acceptance_recovery_repair_targets(&report, classify_repair_target(&report));
-        assert_eq!(targets, vec!["capability_implementation".to_string()]);
+        assert_eq!(targets, vec!["input_state_render_wiring".to_string()]);
         let missing_signals = verification_missing_signals(&report);
         let phase = plan.phases.last().unwrap();
         let _handoff = save_ultra_phase_recovery_handoff(
@@ -14121,7 +14361,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         let recovery_plan = assert_single_recovery_ultra_plan(dir.path());
         let recovery_text = render_ultra_plan(&recovery_plan);
         assert!(
-            recovery_text.contains("capability_implementation"),
+            recovery_text.contains("input_state_render_wiring"),
             "{recovery_text}"
         );
         assert!(
@@ -14397,7 +14637,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         .unwrap();
         std::fs::write(
             dir.path().join("browser-interaction.json"),
-            r#"{"ok":true,"status":"passed","interaction_success":true,"interaction_performed":true,"input_event_observed":true,"state_changed":true,"post_js_has_canvas":true,"post_js_interactive_control_count":1,"canvas_found":true}"#,
+            r#"{"ok":true,"status":"passed","interaction_success":true,"interaction_performed":true,"start_transition":true,"input_state_change":true,"input_event_observed":true,"state_changed":true,"post_js_has_canvas":true,"post_js_interactive_control_count":1,"canvas_found":true}"#,
         )
         .unwrap();
         let report = RuntimeAcceptanceReport {
@@ -14440,7 +14680,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         .unwrap();
         std::fs::write(
             dir.path().join("interaction-evidence.json"),
-            r#"{"ok":true,"interaction_performed":true,"input_event_observed":true,"state_changed":true,"canvas_found":true}"#,
+            r#"{"ok":true,"interaction_performed":true,"start_transition":true,"input_state_change":true,"input_event_observed":true,"state_changed":true,"canvas_found":true}"#,
         )
         .unwrap();
         let plan = StepPlan {
@@ -14489,7 +14729,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         .unwrap();
         std::fs::write(
             dir.path().join("interaction-evidence.json"),
-            r#"{"ok":true,"interaction_performed":true,"state_changed":true,"canvas_found":true}"#,
+            r#"{"ok":true,"interaction_performed":true,"start_transition":true,"input_state_change":true,"state_changed":true,"canvas_found":true}"#,
         )
         .unwrap();
         let plan = StepPlan {
@@ -14542,7 +14782,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         .unwrap();
         std::fs::write(
             dir.path().join("interaction-evidence.json"),
-            r#"{"ok":true,"interaction_performed":true,"state_changed":true,"canvas_found":false}"#,
+            r#"{"ok":true,"interaction_performed":true,"start_transition":true,"input_state_change":true,"state_changed":true,"canvas_found":false}"#,
         )
         .unwrap();
         let plan = StepPlan {
@@ -16238,21 +16478,37 @@ export default function Page(){
 
     fn interaction_state_missing_probe_result() -> Value {
         serde_json::json!({
-            "ok": true,
-            "status": "passed",
-            "interaction_success": true,
-            "interaction_performed": true,
+            "ok": false,
+            "status": "failed",
+            "interaction_success": false,
+            "interaction_performed": false,
             "input_event_observed": true,
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
             "input_state_change": false,
             "state_changed": false,
             "visible_state_changed": false,
-            "steps": ["surface_visible", "start_transition", "control_input_dispatched"],
+            "probe_mode": "heuristic",
+            "contract_hook_status": "primary_missing",
+            "candidate_table": [
+                {"rank": 1, "index": 0, "text_excerpt": "", "changed": false},
+                {"rank": 2, "index": 1, "text_excerpt": "Start", "changed": true}
+            ],
+            "input_dispatches": [
+                "ArrowLeft keydown",
+                "ArrowRight keydown",
+                "Space keydown",
+                "canvas/center click"
+            ],
+            "informational_failure_kinds": ["primary_start_transition_missing"],
+            "steps": ["surface_visible", "start_transition", "control_input_dispatched", "input_state_evaluated_after_start"],
             "before_marker": "screen=menu score=0 health=3",
             "after_marker": "screen=playing score=0 health=3",
             "input_before_marker": "player=20 score=0 health=3",
             "input_after_marker": "player=20 score=0 health=3",
             "recovery_transition": true,
             "recovery_transition_status": "observed",
+            "failure_kind": "input_state_change_missing_after_start",
             "duration_ms": 17
         })
     }
@@ -16264,6 +16520,8 @@ export default function Page(){
             "interaction_success": true,
             "interaction_performed": true,
             "input_event_observed": true,
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
             "input_state_change": true,
             "state_changed": true,
             "visible_state_changed": true,
@@ -16271,6 +16529,7 @@ export default function Page(){
                 "surface_visible",
                 "start_transition",
                 "control_input_dispatched",
+                "input_state_evaluated_after_start",
                 "input_state_change",
                 "recovery_transition"
             ],
@@ -16291,6 +16550,8 @@ export default function Page(){
             "interaction_success": true,
             "interaction_performed": true,
             "input_event_observed": true,
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
             "input_state_change": true,
             "state_changed": true,
             "visible_state_changed": true,
@@ -16298,6 +16559,7 @@ export default function Page(){
                 "surface_visible",
                 "start_transition",
                 "control_input_dispatched",
+                "input_state_evaluated_after_start",
                 "input_state_change",
                 "recovery_transition:not_observed"
             ],

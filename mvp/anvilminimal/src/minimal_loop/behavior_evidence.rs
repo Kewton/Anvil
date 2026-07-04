@@ -58,6 +58,7 @@ struct BehaviorObservation {
     steps: BTreeSet<String>,
     surface_visible: bool,
     start_transition: bool,
+    input_state_evaluated_after_start: bool,
     input_state_change: bool,
     recovery_transition: RecoveryTransition,
 }
@@ -269,8 +270,10 @@ fn behavioral_decision(
     if INPUT_STATE_KEYS.contains(&key) {
         return if observation.input_state_change {
             BehavioralDecision::Pass("input_state_change")
+        } else if observation.start_transition && !observation.input_state_evaluated_after_start {
+            BehavioralDecision::Fail("input_state_change_not_evaluated_after_start")
         } else {
-            BehavioralDecision::Fail("input_state_change_missing")
+            BehavioralDecision::Fail("input_state_change_missing_after_start")
         };
     }
     if key == "restart_or_recoverable_state_evidence" {
@@ -462,6 +465,19 @@ impl BehaviorObservation {
         let start_transition = steps.contains("start_transition")
             || bool_field_deep(value, &["start_transition"]) == Some(true)
             || marker_changed;
+        let input_state_evaluated_after_start = bool_field_deep(
+            value,
+            &[
+                "input_state_evaluated_after_start",
+                "input_evaluated_after_start",
+            ],
+        ) == Some(true)
+            || steps.contains("input_state_evaluated_after_start")
+            || (start_transition
+                && text_field_deep(value, &["input_before_marker"])
+                    .is_some_and(|marker| !marker.is_empty())
+                && text_field_deep(value, &["input_after_marker"])
+                    .is_some_and(|marker| !marker.is_empty()));
         let input_state_change = input_state_changed(value, &steps, ok);
         let recovery_transition = recovery_transition(value, &steps);
         Some(Self {
@@ -471,6 +487,7 @@ impl BehaviorObservation {
             steps,
             surface_visible,
             start_transition,
+            input_state_evaluated_after_start,
             input_state_change,
             recovery_transition,
         })
@@ -511,7 +528,7 @@ fn steps_from_value(value: &Value) -> BTreeSet<String> {
         .collect()
 }
 
-fn input_state_changed(value: &Value, steps: &BTreeSet<String>, ok: bool) -> bool {
+fn input_state_changed(value: &Value, steps: &BTreeSet<String>, _ok: bool) -> bool {
     if bool_field_deep(
         value,
         &[
@@ -534,9 +551,6 @@ fn input_state_changed(value: &Value, steps: &BTreeSet<String>, ok: bool) -> boo
         ) == Some(true)
         || marker_changed(value, "input_before_marker", "input_after_marker")
         || marker_changed(value, "control_before_marker", "control_after_marker")
-        || (ok
-            && steps.contains("control_input_dispatched")
-            && bool_field_deep(value, &["input_event_observed"]) == Some(true))
 }
 
 fn recovery_transition(value: &Value, steps: &BTreeSet<String>) -> RecoveryTransition {

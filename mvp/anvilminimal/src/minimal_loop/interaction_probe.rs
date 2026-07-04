@@ -80,6 +80,14 @@ impl InteractionProbeSetupReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InteractionProbeCandidateEvidence {
+    pub rank: usize,
+    pub index: usize,
+    pub text_excerpt: String,
+    pub changed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BrowserInteractionObservation {
     pub ok: bool,
     pub status: String,
@@ -94,6 +102,13 @@ pub struct BrowserInteractionObservation {
     pub recovery_before_marker: String,
     pub recovery_after_marker: String,
     pub input_state_changed: bool,
+    pub input_state_evaluated_after_start: bool,
+    pub probe_mode: String,
+    pub contract_hook_status: String,
+    pub candidate_table: Vec<InteractionProbeCandidateEvidence>,
+    pub input_dispatches: Vec<String>,
+    pub primary_transition_observed: bool,
+    pub informational_failure_kinds: Vec<String>,
     pub recovery_transition_observed: bool,
     pub recovery_transition_not_observed: bool,
     pub failure_kind: String,
@@ -813,6 +828,14 @@ let input_after_marker = "";
 let recovery_before_marker = "";
 let recovery_after_marker = "";
 let recovery_transition_status = "unknown";
+let probe_mode = "heuristic";
+let contract_hook_status = "unknown";
+let contract_hooks = null;
+let primary_transition_observed = false;
+let input_state_evaluated_after_start = false;
+let candidate_table = [];
+let input_dispatches = [];
+let informational_failure_kinds = [];
 let server_check = { ok: false, status: null, error: "" };
 let post_js_surface = null;
 
@@ -956,6 +979,93 @@ async function markerAfterChange(page, previous, timeoutMs) {
   return current;
 }
 
+async function contractStateMarker(page) {
+  return await page.evaluate(() => {
+    const stable = (value) => {
+      if (Array.isArray(value)) return value.map(stable);
+      if (value && typeof value === "object") {
+        return Object.keys(value).sort().reduce((out, key) => {
+          out[key] = stable(value[key]);
+          return out;
+        }, {});
+      }
+      return value;
+    };
+    const states = Array.from(document.querySelectorAll("[data-anvil-state]"))
+      .map((el, index) => {
+        const raw = el.getAttribute("data-anvil-state") || "";
+        try {
+          return { index, state: stable(JSON.parse(raw)) };
+        } catch (_) {
+          return null;
+        }
+      })
+      .filter(Boolean);
+    return JSON.stringify({ states });
+  });
+}
+
+async function contractHookStatus(page) {
+  return await page.evaluate(() => {
+    const textOf = (el) => (
+      el.getAttribute("aria-label") ||
+      el.getAttribute("title") ||
+      el.textContent ||
+      el.value ||
+      ""
+    ).trim();
+    const primary = document.querySelector('[data-anvil-action="primary"]');
+    const stateEls = Array.from(document.querySelectorAll("[data-anvil-state]"));
+    let valid_state_count = 0;
+    let invalid_state_count = 0;
+    for (const el of stateEls) {
+      try {
+        JSON.parse(el.getAttribute("data-anvil-state") || "");
+        valid_state_count += 1;
+      } catch (_) {
+        invalid_state_count += 1;
+      }
+    }
+    const primary_present = !!primary;
+    const state_present = stateEls.length > 0;
+    const usable = primary_present && valid_state_count > 0;
+    const status = usable
+      ? "usable"
+      : !primary_present
+        ? "primary_missing"
+        : !state_present
+          ? "state_missing"
+          : "state_invalid";
+    return {
+      status,
+      usable,
+      primary_present,
+      primary_text_excerpt: primary ? textOf(primary).slice(0, 80) : "",
+      state_present,
+      state_count: stateEls.length,
+      valid_state_count,
+      invalid_state_count
+    };
+  });
+}
+
+async function activeMarker(page, mode) {
+  return mode === "contract" ? await contractStateMarker(page) : await marker(page);
+}
+
+async function markerAfterActiveChange(page, mode, previous, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let current = await activeMarker(page, mode);
+  while (Date.now() < deadline) {
+    if (current !== previous) {
+      return current;
+    }
+    await page.waitForTimeout(80);
+    current = await activeMarker(page, mode);
+  }
+  return current;
+}
+
 async function controlText(locator) {
   try {
     return await locator.evaluate((el) => (
@@ -967,6 +1077,118 @@ async function controlText(locator) {
     ).trim());
   } catch (_) {
     return "";
+  }
+}
+
+async function rankedControlCandidates(page, skipContractPrimary) {
+  return await page.locator("button,[role=button]").evaluateAll((els, skipPrimary) => {
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 1;
+    const centerX = viewportWidth / 2;
+    const centerY = viewportHeight / 2;
+    const maxDistance = Math.sqrt(centerX * centerX + centerY * centerY) || 1;
+    const textOf = (el) => (
+      el.getAttribute("aria-label") ||
+      el.getAttribute("title") ||
+      el.textContent ||
+      el.value ||
+      ""
+    ).trim().replace(/\s+/g, " ");
+    const visible = (el, box) => {
+      const style = window.getComputedStyle(el);
+      return box.width > 0
+        && box.height > 0
+        && style.visibility !== "hidden"
+        && style.display !== "none"
+        && Number(style.opacity || "1") > 0;
+    };
+    return els
+      .map((el, index) => {
+        const box = el.getBoundingClientRect();
+        const text = textOf(el);
+        const area = Math.round(box.width * box.height);
+        const distance = Math.sqrt(
+          Math.pow((box.left + box.width / 2) - centerX, 2) +
+          Math.pow((box.top + box.height / 2) - centerY, 2)
+        );
+        const centrality_milli = Math.round(Math.max(0, 1 - distance / maxDistance) * 1000);
+        return {
+          index,
+          text_excerpt: text.slice(0, 80),
+          text_len: text.length,
+          text_bucket: text.length >= 2 ? 1 : 0,
+          area,
+          centrality_milli,
+          contract_primary: el.getAttribute("data-anvil-action") === "primary",
+          visible: visible(el, box)
+        };
+      })
+      .filter((candidate) => candidate.visible)
+      .filter((candidate) => !(skipPrimary && candidate.contract_primary))
+      .sort((a, b) =>
+        (b.text_bucket - a.text_bucket) ||
+        (b.area - a.area) ||
+        (b.centrality_milli - a.centrality_milli)
+      )
+      .slice(0, 4)
+      .map((candidate, rank) => ({ ...candidate, rank: rank + 1 }));
+  }, skipContractPrimary);
+}
+
+async function attemptRankedCandidateTransitions(page, mode, skipContractPrimary) {
+  const candidates = await rankedControlCandidates(page, skipContractPrimary);
+  for (const candidate of candidates) {
+    const entry = {
+      rank: candidate.rank,
+      index: candidate.index,
+      text_excerpt: candidate.text_excerpt,
+      area: candidate.area,
+      centrality_milli: candidate.centrality_milli,
+      changed: false
+    };
+    const before = await activeMarker(page, mode);
+    try {
+      await page.locator("button,[role=button]").nth(candidate.index).click({ timeout: 1200 });
+      const after = await markerAfterActiveChange(page, mode, before, 800);
+      entry.changed = before !== after;
+      candidate_table.push(entry);
+      if (entry.changed) {
+        return { observed: true, before, after, source: "candidate", candidate: entry };
+      }
+    } catch (_) {
+      candidate_table.push(entry);
+    }
+  }
+  return { observed: false, before: "", after: "", source: "", candidate: null };
+}
+
+async function dispatchPostTransitionInputs(page, mode) {
+  input_before_marker = await activeMarker(page, mode);
+  const canvas = page.locator("canvas").first();
+  let clicked = false;
+  if (await canvas.count()) {
+    const box = await canvas.boundingBox();
+    if (box) {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      clicked = true;
+    }
+  }
+  if (!clicked) {
+    const viewport = page.viewportSize() || { width: 1280, height: 720 };
+    await page.mouse.click(viewport.width / 2, viewport.height / 2);
+  }
+  input_dispatches.push("canvas/center click");
+  for (const key of ["ArrowLeft", "ArrowRight", "Space"]) {
+    await page.keyboard.down(key);
+    await page.keyboard.up(key);
+    input_dispatches.push(`${key} keydown`);
+  }
+  steps.push("control_input_dispatched");
+  steps.push("input_state_evaluated_after_start");
+  input_state_evaluated_after_start = true;
+  input_after_marker = await markerAfterActiveChange(page, mode, input_before_marker, 800);
+  if (input_before_marker !== input_after_marker) {
+    steps.push("input_state_change");
   }
 }
 
@@ -990,16 +1212,16 @@ async function recoveryCandidateIndex(page, initialStartText) {
   }, initialStartText);
 }
 
-async function attemptRecoveryTransition(page, initialStartText) {
+async function attemptRecoveryTransition(page, initialStartText, mode) {
   const deadline = Date.now() + 1200;
   while (Date.now() < deadline) {
     const index = await recoveryCandidateIndex(page, initialStartText);
     if (index >= 0) {
       const candidate = page.locator("button,[role=button]").nth(index);
-      recovery_before_marker = await marker(page);
+      recovery_before_marker = await activeMarker(page, mode);
       try {
         await candidate.click({ timeout: 1000 });
-        recovery_after_marker = await markerAfterChange(page, recovery_before_marker, 700);
+        recovery_after_marker = await markerAfterActiveChange(page, mode, recovery_before_marker, 700);
         if (recovery_before_marker !== recovery_after_marker) {
           steps.push("recovery_transition");
           recovery_transition_status = "observed";
@@ -1011,6 +1233,13 @@ async function attemptRecoveryTransition(page, initialStartText) {
   }
   steps.push("recovery_transition:not_observed");
   recovery_transition_status = "not_observed";
+}
+
+function interactionFailureKind(transitionObserved, inputEvaluated, inputStateChanged) {
+  if (!transitionObserved) return "start_transition_missing";
+  if (!inputEvaluated) return "input_state_change_not_evaluated_after_start";
+  if (!inputStateChanged) return "input_state_change_missing_after_start";
+  return "";
 }
 
 (async () => {
@@ -1031,46 +1260,79 @@ async function attemptRecoveryTransition(page, initialStartText) {
     mark("navigating");
     await gotoWithRetry(page, url);
     mark("surface_wait");
-    const surface = page.locator("canvas, button, [role=button]").first();
+    const surface = page.locator("canvas, button, [role=button], [data-anvil-action], [data-anvil-state]").first();
     await surface.waitFor({ timeout: 10000 });
     steps.push("surface_visible");
     mark("observing");
     post_js_surface = await surfaceSnapshot(page);
-    before_marker = await marker(page);
+    contract_hooks = await contractHookStatus(page);
+    contract_hook_status = contract_hooks.status;
+    probe_mode = contract_hooks.usable ? "contract" : "heuristic";
+    before_marker = await activeMarker(page, probe_mode);
 
-    const startControl = page.locator("button, [role=button]").first();
     let initial_start_text = "";
-    if (await startControl.count()) {
-      initial_start_text = await controlText(startControl);
-      await startControl.click({ timeout: 5000 });
-    }
-    after_marker = await markerAfterChange(page, before_marker, 800);
-    if (before_marker !== after_marker) {
-      steps.push("start_transition");
-    }
-
-    input_before_marker = await marker(page);
-    const canvas = page.locator("canvas").first();
-    if (await canvas.count()) {
-      const box = await canvas.boundingBox();
-      if (box) {
-        await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    let transitionObserved = false;
+    if (probe_mode === "contract") {
+      const startControl = page.locator('[data-anvil-action="primary"]').first();
+      if (await startControl.count()) {
+        initial_start_text = await controlText(startControl);
+        await startControl.click({ timeout: 5000 });
+        after_marker = await markerAfterActiveChange(page, probe_mode, before_marker, 800);
+        if (before_marker !== after_marker) {
+          primary_transition_observed = true;
+          transitionObserved = true;
+          steps.push("start_transition");
+        } else {
+          steps.push("primary_start_transition_missing");
+        }
+      }
+      if (!transitionObserved) {
+        const fallback = await attemptRankedCandidateTransitions(page, probe_mode, true);
+        if (fallback.observed) {
+          after_marker = fallback.after;
+          transitionObserved = true;
+          steps.push("start_transition");
+        }
+      }
+    } else {
+      const fallback = await attemptRankedCandidateTransitions(page, probe_mode, false);
+      if (fallback.observed) {
+        before_marker = fallback.before;
+        after_marker = fallback.after;
+        transitionObserved = true;
+        primary_transition_observed = candidate_table.length > 0 && candidate_table[0].changed;
+        steps.push("start_transition");
+        initial_start_text = fallback.candidate ? fallback.candidate.text_excerpt : "";
+      } else {
+        after_marker = await activeMarker(page, probe_mode);
+        primary_transition_observed = false;
       }
     }
-    await page.keyboard.press("ArrowLeft");
-    await page.keyboard.press("ArrowRight");
-    await page.keyboard.press("Space");
-    steps.push("control_input_dispatched");
-    input_after_marker = await markerAfterChange(page, input_before_marker, 800);
-    if (input_before_marker !== input_after_marker) {
-      steps.push("input_state_change");
+
+    if (transitionObserved) {
+      await dispatchPostTransitionInputs(page, probe_mode);
     }
 
-    await attemptRecoveryTransition(page, initial_start_text);
+    await attemptRecoveryTransition(page, initial_start_text, probe_mode);
+    if (!transitionObserved && steps.includes("recovery_transition")) {
+      transitionObserved = true;
+      steps.push("start_transition");
+      after_marker = recovery_after_marker;
+      await dispatchPostTransitionInputs(page, probe_mode);
+    }
 
-    const ok = steps.includes("surface_visible") && steps.includes("start_transition");
+    if (!primary_transition_observed && transitionObserved) {
+      informational_failure_kinds.push("primary_start_transition_missing");
+    }
+
     const inputStateChanged = steps.includes("input_state_change");
+    const ok = steps.includes("surface_visible") && transitionObserved && input_state_evaluated_after_start && inputStateChanged;
     const recoveryObserved = steps.includes("recovery_transition");
+    const failureKind = interactionFailureKind(
+      transitionObserved,
+      input_state_evaluated_after_start,
+      inputStateChanged
+    );
     write({
       ok,
       status: ok ? "passed" : "failed",
@@ -1082,6 +1344,16 @@ async function attemptRecoveryTransition(page, initialStartText) {
       visible_state_changed: inputStateChanged,
       recovery_transition: recoveryObserved,
       recovery_transition_status,
+      start_transition: transitionObserved,
+      primary_start_transition: primary_transition_observed,
+      primary_start_transition_missing: !primary_transition_observed && transitionObserved,
+      input_state_evaluated_after_start,
+      probe_mode,
+      contract_hook_status,
+      contract_hooks,
+      candidate_table,
+      input_dispatches,
+      informational_failure_kinds,
       steps,
       stage,
       before_marker,
@@ -1090,7 +1362,7 @@ async function attemptRecoveryTransition(page, initialStartText) {
       input_after_marker,
       recovery_before_marker,
       recovery_after_marker,
-      failure_kind: ok ? "" : "start_transition_missing",
+      failure_kind: ok ? "" : failureKind,
       server_http_status: server_check.status,
       server_check,
       post_js_has_canvas: post_js_surface ? post_js_surface.has_canvas : false,
@@ -1124,6 +1396,16 @@ async function attemptRecoveryTransition(page, initialStartText) {
       visible_state_changed: steps.includes("input_state_change"),
       recovery_transition: steps.includes("recovery_transition"),
       recovery_transition_status,
+      start_transition: steps.includes("start_transition") || steps.includes("recovery_transition"),
+      primary_start_transition: primary_transition_observed,
+      primary_start_transition_missing: !primary_transition_observed && (steps.includes("start_transition") || steps.includes("recovery_transition")),
+      input_state_evaluated_after_start,
+      probe_mode,
+      contract_hook_status,
+      contract_hooks,
+      candidate_table,
+      input_dispatches,
+      informational_failure_kinds,
       failure_kind: err && err.anvilFailureKind ? err.anvilFailureKind : "probe_script_error",
       navigation_failure_kind: err && err.navigationFailureKind ? err.navigationFailureKind : "",
       error: err && err.message ? err.message : String(err),
@@ -1209,6 +1491,16 @@ fn merge_script_stdout_failure_value(mut value: Value, logs: &InteractionStdio) 
             "input_after_marker",
             "recovery_before_marker",
             "recovery_after_marker",
+            "start_transition",
+            "primary_start_transition",
+            "primary_start_transition_missing",
+            "input_state_evaluated_after_start",
+            "probe_mode",
+            "contract_hook_status",
+            "contract_hooks",
+            "candidate_table",
+            "input_dispatches",
+            "informational_failure_kinds",
             "failure_kind",
             "navigation_failure_kind",
             "server_http_status",
@@ -1276,12 +1568,16 @@ fn observation_from_value(
     child_reaped: bool,
     playwright_resolution: Option<PlaywrightResolution>,
 ) -> BrowserInteractionObservation {
-    let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let raw_ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
     let raw_failure_kind = value
         .get("failure_kind")
         .or_else(|| value.get("browser_failure_kind"))
         .and_then(Value::as_str)
-        .unwrap_or(if ok { "" } else { "browser_interaction_failed" })
+        .unwrap_or(if raw_ok {
+            ""
+        } else {
+            "browser_interaction_failed"
+        })
         .to_string();
     let stage = value
         .get("stage")
@@ -1321,16 +1617,6 @@ fn observation_from_value(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let failure_kind = normalized_interaction_failure_kind(
-        ok,
-        &stage,
-        &raw_failure_kind,
-        value_error,
-        &output_excerpt,
-        server_http_status,
-        &server_http_error,
-    );
-    let remediation = interaction_failure_remediation(&failure_kind);
     let duration_ms = value
         .get("duration_ms")
         .and_then(Value::as_u64)
@@ -1347,23 +1633,41 @@ fn observation_from_value(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let input_event_observed = value
-        .get("input_event_observed")
+    let recovery_transition_observed = steps.iter().any(|step| step == "recovery_transition")
+        || value
+            .get("recovery_transition")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let start_transition_observed = steps.iter().any(|step| step == "start_transition")
+        || value
+            .get("start_transition")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || recovery_transition_observed;
+    let input_state_evaluated_after_start = value
+        .get("input_state_evaluated_after_start")
         .and_then(Value::as_bool)
-        .unwrap_or_else(|| steps.iter().any(|step| step == "control_input_dispatched"));
+        .unwrap_or_else(|| {
+            steps
+                .iter()
+                .any(|step| step == "input_state_evaluated_after_start")
+                || (start_transition_observed
+                    && value
+                        .get("input_before_marker")
+                        .and_then(Value::as_str)
+                        .is_some_and(|marker| !marker.is_empty())
+                    && value
+                        .get("input_after_marker")
+                        .and_then(Value::as_str)
+                        .is_some_and(|marker| !marker.is_empty()))
+        });
     let explicit_state_changed = value
         .get("input_state_change")
         .or_else(|| value.get("state_changed"))
         .or_else(|| value.get("visible_state_changed"))
         .and_then(Value::as_bool);
     let input_state_changed = steps.iter().any(|step| step == "input_state_change")
-        || explicit_state_changed == Some(true)
-        || (ok && input_event_observed && explicit_state_changed.is_none());
-    let recovery_transition_observed = steps.iter().any(|step| step == "recovery_transition")
-        || value
-            .get("recovery_transition")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        || explicit_state_changed == Some(true);
     let recovery_transition_not_observed = steps
         .iter()
         .any(|step| step == "recovery_transition:not_observed")
@@ -1372,6 +1676,53 @@ fn observation_from_value(
             .get("recovery_transition_status")
             .and_then(Value::as_str)
             == Some("not_observed");
+    let taxonomy_failure_kind = interaction_taxonomy_failure_kind(
+        start_transition_observed,
+        input_state_evaluated_after_start,
+        input_state_changed,
+    );
+    let ok = raw_ok && taxonomy_failure_kind.is_empty();
+    let effective_raw_failure_kind =
+        effective_interaction_failure_kind(&raw_failure_kind, taxonomy_failure_kind);
+    let failure_kind = normalized_interaction_failure_kind(
+        ok,
+        &stage,
+        effective_raw_failure_kind,
+        value_error,
+        &output_excerpt,
+        server_http_status,
+        &server_http_error,
+    );
+    let remediation = interaction_failure_remediation(&failure_kind);
+    let probe_mode = value
+        .get("probe_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("heuristic")
+        .to_string();
+    let contract_hook_status = value
+        .get("contract_hook_status")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("contract_hooks")
+                .and_then(|hooks| hooks.get("status"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("unknown")
+        .to_string();
+    let candidate_table = interaction_candidate_table(&value);
+    let input_dispatches = string_array_field(&value, "input_dispatches");
+    let primary_transition_observed = value
+        .get("primary_start_transition")
+        .or_else(|| value.get("primary_transition_observed"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            start_transition_observed
+                && !steps
+                    .iter()
+                    .any(|step| step == "primary_start_transition_missing")
+        });
+    let informational_failure_kinds = string_array_field(&value, "informational_failure_kinds");
     BrowserInteractionObservation {
         ok,
         status: if ok { "passed" } else { "failed" }.to_string(),
@@ -1410,6 +1761,13 @@ fn observation_from_value(
             .unwrap_or("")
             .to_string(),
         input_state_changed,
+        input_state_evaluated_after_start,
+        probe_mode,
+        contract_hook_status,
+        candidate_table,
+        input_dispatches,
+        primary_transition_observed,
+        informational_failure_kinds,
         recovery_transition_observed,
         recovery_transition_not_observed,
         failure_kind,
@@ -1474,6 +1832,80 @@ fn usize_value(value: &Value, keys: &[&str]) -> Option<usize> {
         }
     }
     None
+}
+
+fn string_array_field(value: &Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn interaction_candidate_table(value: &Value) -> Vec<InteractionProbeCandidateEvidence> {
+    value
+        .get("candidate_table")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|candidate| InteractionProbeCandidateEvidence {
+            rank: candidate
+                .get("rank")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(0),
+            index: candidate
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(0),
+            text_excerpt: candidate
+                .get("text_excerpt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            changed: candidate
+                .get("changed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+        .collect()
+}
+
+fn interaction_taxonomy_failure_kind(
+    transition_observed: bool,
+    input_evaluated_after_start: bool,
+    input_state_changed: bool,
+) -> &'static str {
+    if !transition_observed {
+        "start_transition_missing"
+    } else if !input_evaluated_after_start {
+        "input_state_change_not_evaluated_after_start"
+    } else if !input_state_changed {
+        "input_state_change_missing_after_start"
+    } else {
+        ""
+    }
+}
+
+fn effective_interaction_failure_kind<'a>(
+    raw_failure_kind: &'a str,
+    taxonomy_failure_kind: &'static str,
+) -> &'a str {
+    if taxonomy_failure_kind.is_empty() {
+        return "";
+    }
+    match raw_failure_kind {
+        ""
+        | "browser_interaction_failed"
+        | "start_transition_missing"
+        | "interaction_state_change_missing"
+        | "input_state_change_missing" => taxonomy_failure_kind,
+        _ => raw_failure_kind,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1542,6 +1974,13 @@ fn failure_observation(
         recovery_before_marker: String::new(),
         recovery_after_marker: String::new(),
         input_state_changed: false,
+        input_state_evaluated_after_start: false,
+        probe_mode: "heuristic".to_string(),
+        contract_hook_status: "unknown".to_string(),
+        candidate_table: Vec::new(),
+        input_dispatches: Vec::new(),
+        primary_transition_observed: false,
+        informational_failure_kinds: Vec::new(),
         recovery_transition_observed: false,
         recovery_transition_not_observed: false,
         failure_kind,
@@ -1610,6 +2049,11 @@ fn normalized_interaction_failure_kind(
     }
     if raw_failure_kind == "app_route_unresponsive" {
         return raw_failure_kind.to_string();
+    }
+    if raw_failure_kind == "interaction_state_change_missing"
+        || raw_failure_kind == "input_state_change_missing"
+    {
+        return "input_state_change_missing_after_start".to_string();
     }
     if raw_failure_kind.starts_with("probe_navigation_failed") {
         if server_http_status.is_some() && server_http_error.trim().is_empty() {
@@ -1710,6 +2154,17 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "input_state_change": observation.input_state_changed,
         "state_changed": observation.input_state_changed,
         "visible_state_changed": observation.input_state_changed,
+        "start_transition": observation.steps.iter().any(|step| step == "start_transition")
+            || observation.recovery_transition_observed,
+        "input_state_evaluated_after_start": observation.input_state_evaluated_after_start,
+        "probe_mode": observation.probe_mode.as_str(),
+        "contract_hook_status": observation.contract_hook_status.as_str(),
+        "candidate_table": &observation.candidate_table,
+        "input_dispatches": &observation.input_dispatches,
+        "primary_start_transition": observation.primary_transition_observed,
+        "primary_start_transition_missing": !observation.primary_transition_observed
+            && observation.steps.iter().any(|step| step == "start_transition"),
+        "informational_failure_kinds": &observation.informational_failure_kinds,
         "recovery_transition": observation.recovery_transition_observed,
         "recovery_transition_status": if observation.recovery_transition_observed {
             "observed"
@@ -2053,7 +2508,12 @@ mod tests {
             &json!({
                 "ok": true,
                 "status": "passed",
-                "steps": ["surface_visible", "start_transition", "control_input_dispatched"],
+                "start_transition": true,
+                "input_state_evaluated_after_start": true,
+                "input_state_change": true,
+                "state_changed": true,
+                "visible_state_changed": true,
+                "steps": ["surface_visible", "start_transition", "control_input_dispatched", "input_state_evaluated_after_start", "input_state_change"],
                 "before_marker": "before",
                 "after_marker": "after",
                 "duration_ms": 17
@@ -2110,6 +2570,184 @@ mod tests {
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("\"ok\": false"));
         assert!(text.contains("start_transition_missing"));
+    }
+
+    fn observe_probe_value(value: Value) -> BrowserInteractionObservation {
+        let dir = tempfile::tempdir().unwrap();
+        observation_from_value(
+            &dir.path().join("browser-interaction.json"),
+            &dir.path().join("browser-interaction-probe.cjs"),
+            "http://127.0.0.1:34001/",
+            value,
+            Instant::now(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+            true,
+            None,
+        )
+    }
+
+    #[test]
+    fn taxonomy_no_control_transition_is_start_transition_missing() {
+        let observation = observe_probe_value(json!({
+            "ok": false,
+            "status": "failed",
+            "steps": ["surface_visible", "control_input_dispatched"],
+            "state_changed": false,
+            "failure_kind": "start_transition_missing"
+        }));
+
+        assert!(!observation.ok);
+        assert_eq!(observation.failure_kind, "start_transition_missing");
+    }
+
+    #[test]
+    fn taxonomy_input_missing_after_start_is_split_from_start_failure() {
+        let observation = observe_probe_value(json!({
+            "ok": false,
+            "status": "failed",
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
+            "input_state_change": false,
+            "state_changed": false,
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "control_input_dispatched",
+                "input_state_evaluated_after_start"
+            ],
+            "failure_kind": "start_transition_missing"
+        }));
+
+        assert!(!observation.ok);
+        assert_eq!(
+            observation.failure_kind,
+            "input_state_change_missing_after_start"
+        );
+    }
+
+    #[test]
+    fn taxonomy_input_not_evaluated_after_start_is_distinct() {
+        let observation = observe_probe_value(json!({
+            "ok": false,
+            "status": "failed",
+            "start_transition": true,
+            "input_state_evaluated_after_start": false,
+            "steps": ["surface_visible", "start_transition"],
+            "failure_kind": "browser_interaction_failed"
+        }));
+
+        assert!(!observation.ok);
+        assert_eq!(
+            observation.failure_kind,
+            "input_state_change_not_evaluated_after_start"
+        );
+    }
+
+    #[test]
+    fn contract_mode_pass_uses_state_json_markers() {
+        let observation = observe_probe_value(json!({
+            "ok": true,
+            "status": "passed",
+            "probe_mode": "contract",
+            "contract_hook_status": "usable",
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
+            "input_state_change": true,
+            "state_changed": true,
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "control_input_dispatched",
+                "input_state_evaluated_after_start",
+                "input_state_change"
+            ],
+            "before_marker": "{\"states\":[{\"state\":{\"screen\":\"menu\"}}]}",
+            "after_marker": "{\"states\":[{\"state\":{\"screen\":\"running\"}}]}",
+            "input_before_marker": "{\"states\":[{\"state\":{\"player\":20}}]}",
+            "input_after_marker": "{\"states\":[{\"state\":{\"player\":15}}]}"
+        }));
+
+        assert!(observation.ok, "{observation:?}");
+        assert_eq!(observation.probe_mode, "contract");
+        assert_eq!(observation.contract_hook_status, "usable");
+        assert!(observation.input_state_changed);
+    }
+
+    #[test]
+    fn heuristic_hook_absent_fallback_records_candidate_table_and_primary_info() {
+        let observation = observe_probe_value(json!({
+            "ok": true,
+            "status": "passed",
+            "probe_mode": "heuristic",
+            "contract_hook_status": "primary_missing",
+            "start_transition": true,
+            "primary_start_transition": false,
+            "input_state_evaluated_after_start": true,
+            "input_state_change": true,
+            "state_changed": true,
+            "candidate_table": [
+                {"rank": 1, "index": 0, "text_excerpt": "", "changed": false},
+                {"rank": 2, "index": 1, "text_excerpt": "Start", "changed": true}
+            ],
+            "input_dispatches": [
+                "canvas/center click",
+                "ArrowLeft keydown",
+                "ArrowRight keydown",
+                "Space keydown"
+            ],
+            "informational_failure_kinds": ["primary_start_transition_missing"],
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "control_input_dispatched",
+                "input_state_evaluated_after_start",
+                "input_state_change"
+            ]
+        }));
+
+        assert!(observation.ok, "{observation:?}");
+        assert_eq!(observation.probe_mode, "heuristic");
+        assert_eq!(observation.contract_hook_status, "primary_missing");
+        assert_eq!(observation.candidate_table.len(), 2);
+        assert!(!observation.candidate_table[0].changed);
+        assert!(observation.candidate_table[1].changed);
+        assert_eq!(
+            observation.informational_failure_kinds,
+            vec!["primary_start_transition_missing".to_string()]
+        );
+    }
+
+    #[test]
+    fn todo_shaped_contract_fixture_passes_same_interaction_contract() {
+        let observation = observe_probe_value(json!({
+            "ok": true,
+            "status": "passed",
+            "probe_mode": "contract",
+            "contract_hook_status": "usable",
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
+            "input_state_change": true,
+            "state_changed": true,
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "control_input_dispatched",
+                "input_state_evaluated_after_start",
+                "input_state_change"
+            ],
+            "before_marker": "{\"states\":[{\"state\":{\"todos\":0,\"filter\":\"all\"}}]}",
+            "after_marker": "{\"states\":[{\"state\":{\"todos\":1,\"filter\":\"all\"}}]}",
+            "input_before_marker": "{\"states\":[{\"state\":{\"todos\":1,\"filter\":\"all\"}}]}",
+            "input_after_marker": "{\"states\":[{\"state\":{\"todos\":1,\"filter\":\"active\"}}]}"
+        }));
+
+        assert!(observation.ok, "{observation:?}");
+        assert_eq!(observation.probe_mode, "contract");
+        assert!(observation.input_state_changed);
     }
 
     #[test]
@@ -2376,7 +3014,7 @@ if [ "$1" = "-e" ]; then
   exit 1
 fi
 cat > "$3" <<'JSON'
-{{"ok":true,"status":"passed","interaction_success":true,"interaction_performed":true,"input_event_observed":true,"state_changed":true,"stage":"observing","steps":["surface_visible","start_transition","control_input_dispatched","input_state_change"],"before_marker":"menu","after_marker":"running"}}
+{{"ok":true,"status":"passed","interaction_success":true,"interaction_performed":true,"input_event_observed":true,"start_transition":true,"input_state_evaluated_after_start":true,"state_changed":true,"stage":"observing","steps":["surface_visible","start_transition","control_input_dispatched","input_state_evaluated_after_start","input_state_change"],"before_marker":"menu","after_marker":"running"}}
 JSON
 exit 0
 "#,

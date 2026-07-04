@@ -13,16 +13,16 @@ use crate::planner::verify::{VerificationReport, VerifyStatus};
 pub fn generation_rules(intent: &str) -> &'static str {
     match intent {
         "create" => {
-            "- Profile nextjs/create: preserve a real Next.js app contract. Include next/react/react-dom dependencies, keep scripts.build as next build, and end with a build verification phase. Put dependency setup before any npm run build verification when node_modules is not already present; setup instructions may install dependencies, but verify must not contain npm install. If dependency setup is not allowed or cannot run, stop with dependency_missing instead of claiming build success. Keep a single route-bound implementation; do not leave capability components unimported. If you use Tailwind utility classes or @tailwind directives, include tailwindcss/postcss/autoprefixer and create tailwind.config.* plus postcss.config.*; postcss.config plugins must include BOTH tailwindcss and autoprefixer. Otherwise use plain CSS and do not write Tailwind utility classes. If the goal mentions port 3011, keep scripts.dev as next dev -p 3011 or next dev --port 3011.\n"
+            "- Profile nextjs/create: preserve a real Next.js app contract. Include next/react/react-dom dependencies, keep scripts.build as next build, and end with a build verification phase. Put dependency setup before any npm run build verification when node_modules is not already present; setup instructions may install dependencies, but verify must not contain npm install. If dependency setup is not allowed or cannot run, stop with dependency_missing instead of claiming build success. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, add task-agnostic observability hooks on route-bound UI: data-anvil-action=\"primary\" on the main start/submit/action control and data-anvil-state with a JSON snapshot of meaningful visible state after each render. If you use Tailwind utility classes or @tailwind directives, include tailwindcss/postcss/autoprefixer and create tailwind.config.* plus postcss.config.*; postcss.config plugins must include BOTH tailwindcss and autoprefixer. Otherwise use plain CSS and do not write Tailwind utility classes. If the goal mentions port 3011, keep scripts.dev as next dev -p 3011 or next dev --port 3011.\n"
         }
         "fix" => {
-            "- Profile nextjs/fix: preserve the existing Next.js structure and verifier integrity. Keep a single route-bound implementation; do not leave capability components unimported. Do not weaken next/react/react-dom dependencies, scripts.build, app/page, layout, or TypeScript configuration to make a failing verifier pass.\n"
+            "- Profile nextjs/fix: preserve the existing Next.js structure and verifier integrity. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, preserve or add task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control and data-anvil-state with a JSON snapshot of meaningful visible state. Do not weaken next/react/react-dom dependencies, scripts.build, app/page, layout, or TypeScript configuration to make a failing verifier pass.\n"
         }
         "research" => {
             "- Profile nextjs/research: inspect the existing app and produce concrete findings. Do not modify source unless the user explicitly asks for fixes.\n"
         }
         _ => {
-            "- Profile nextjs: preserve a real Next.js app when present. Keep next/react/react-dom dependencies, scripts.build as next build, app/ or pages/ entrypoints, and a final build verification phase. Keep a single route-bound implementation; do not leave capability components unimported. Keep styling toolchains internally consistent; if Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n"
+            "- Profile nextjs: preserve a real Next.js app when present. Keep next/react/react-dom dependencies, scripts.build as next build, app/ or pages/ entrypoints, and a final build verification phase. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, add task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control and data-anvil-state with a JSON snapshot of meaningful visible state. Keep styling toolchains internally consistent; if Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n"
         }
     }
 }
@@ -189,7 +189,8 @@ pub fn guidance(goal: &str) -> String {
          If Tailwind is used, package.json must include tailwindcss/postcss/autoprefixer and postcss.config plugins must include BOTH tailwindcss and autoprefixer. \
          For TypeScript/TSX apps, create tsconfig.json before treating the app as complete. \
          Keep a single route-bound implementation; do not leave capability components unimported. \
-         Do not use deprecated moduleResolution=node10 or target=ES5; prefer moduleResolution=bundler and target=ES2017 or newer.{port}"
+         Do not use deprecated moduleResolution=node10 or target=ES5; prefer moduleResolution=bundler and target=ES2017 or newer. \
+         For interactive UI, expose task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control, and data-anvil-state containing JSON for meaningful visible state after each render.{port}"
     )
 }
 
@@ -209,6 +210,7 @@ pub fn runtime_contract(intent: &str, goal: &str) -> String {
 - If using Tailwind utility classes or @tailwind directives, keep the Tailwind toolchain complete: tailwindcss/postcss/autoprefixer dependencies, tailwind.config.*, and postcss.config plugins with BOTH tailwindcss and autoprefixer. Otherwise use plain CSS.\n\
 - Keep TypeScript and app router configuration coherent.\n\
 - Keep a single route-bound implementation; do not leave capability components unimported.\n\
+- For interactive UI, expose data-anvil-action=\"primary\" on the main start/submit/action control and data-anvil-state with a JSON snapshot of meaningful visible state after each render.\n\
 - Do not treat scaffold-only, package-only, or build-only output as complete."
         ),
         "fix" => format!(
@@ -220,6 +222,7 @@ pub fn runtime_contract(intent: &str, goal: &str) -> String {
 - If Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n\
 - Keep TypeScript and app router configuration coherent.\n\
 - Keep a single route-bound implementation; do not leave capability components unimported.\n\
+- For interactive UI, preserve or add data-anvil-action=\"primary\" on the main start/submit/action control and data-anvil-state with a JSON snapshot of meaningful visible state.\n\
 - Do not treat scaffold-only, package-only, or build-only output as complete."
         ),
         "research" | "investigate" => {
@@ -237,6 +240,7 @@ pub fn runtime_contract(intent: &str, goal: &str) -> String {
 {port}\n\
 - Keep styling and TypeScript toolchains internally consistent; if Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n\
 - Keep a single route-bound implementation; do not leave capability components unimported.\n\
+- For interactive UI, expose data-anvil-action=\"primary\" on the main start/submit/action control and data-anvil-state with a JSON snapshot of meaningful visible state.\n\
 - Do not treat scaffold-only, package-only, or build-only output as complete."
         ),
     }
@@ -1625,6 +1629,20 @@ mod tests {
 
     fn package_json() -> &'static str {
         r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#
+    }
+
+    #[test]
+    fn nextjs_guidance_includes_interaction_observability_hooks() {
+        let text = format!(
+            "{}\n{}\n{}",
+            generation_rules("create"),
+            guidance("Create an interactive todo app"),
+            runtime_contract("create", "Create an interactive game")
+        );
+
+        assert!(text.contains("data-anvil-action=\"primary\""), "{text}");
+        assert!(text.contains("data-anvil-state"), "{text}");
+        assert!(text.contains("JSON snapshot"), "{text}");
     }
 
     #[test]

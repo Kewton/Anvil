@@ -80,8 +80,10 @@ class BrowserInteractionOracleTest(unittest.TestCase):
                         "ok": True,
                         "http_status": 200,
                         "route_rendered": True,
+                        "start_transition": True,
                         "interaction_performed": True,
                         "input_event_observed": True,
+                        "input_state_change": True,
                         "state_changed": True,
                     }
                 ),
