@@ -4,6 +4,10 @@ This suite measures tuning against a small task distribution, not a single
 Space Invaders prompt. Run every scenario with the same command shape and
 compare the final acceptance state across the distribution.
 
+This suite is part of the M6 generality declaration in
+[../generality.md](../generality.md). It is a mandatory regression suite for
+any probe, evidence, or profile change.
+
 ## Command Shape
 
 Start `anvilminimal` with the normal UAT model/provider options, then enter one
@@ -26,9 +30,9 @@ or browser-interaction run.
 
 ## Preflight Runbook
 
-1. Version check: `anvilminimal --version` must show the intended commit or a
-   build identifier known to contain that commit. Record the full output in the
-   UAT report.
+1. Version check: `anvilminimal --version` must exactly match the intended
+   commit or build identifier. Record the full output in the UAT report. A
+   version mismatch fails preflight.
 2. Playwright check for Next.js scenarios only: verify that the browser probe
    can run before starting the scenario. Use the same Node/Playwright
    environment as the release gate; if it is unavailable, record the
@@ -44,6 +48,10 @@ or browser-interaction run.
    `.anvil/evidence/python-cli-fixtures/*.csv` for the CLI scenario,
    `.anvil/repairs/*.md`, and `.anvil/plans/recovery-ultra-plan-*.yaml` when
    recovery is offered.
+5. Corpus duty: every UAT anomaly, including false positives, false negatives,
+   probe drift, profile drift, and terminal-state ambiguity, must become a
+   corpus case or be explicitly recorded as out of scope before changing probe,
+   evidence, or profile logic.
 
 ## Scenarios
 

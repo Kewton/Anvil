@@ -79,10 +79,44 @@ jobs:
       - name: cargo test
         run: cargo test --all
 
+  mvp-anvilminimal-guardrails:
+    name: MVP Anvilminimal Guardrails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mvp/anvilminimal -> target
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: corpus harness
+        working-directory: mvp/anvilminimal
+        run: cargo test --test corpus_regression
+      - name: M6 generality guardrails
+        working-directory: mvp/anvilminimal
+        run: cargo test --test generality_guardrails
+      - name: scenario contract-inference golden tests
+        working-directory: mvp/anvilminimal
+        run: |
+          python3 -m unittest tests/eval/test_acceptance_contract.py
+          python3 -m unittest tests/eval/test_completion_contract_snapshots.py
+          python3 -m unittest tests/eval/test_false_positive_regression.py
+
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: [fmt, clippy, msrv, audit, cli-help, test, shellcheck, python]
+    needs:
+      - fmt
+      - clippy
+      - msrv
+      - audit
+      - cli-help
+      - test
+      - mvp-anvilminimal-guardrails
+      - shellcheck
+      - python
     strategy:
       fail-fast: false
       matrix:

@@ -3,6 +3,10 @@
 The regression corpus lives in `tests/corpus/apps/<case-id>`. Each case is a
 source-only snapshot of a generated app plus `expectations.toml`.
 
+The corpus is the fixture side of the M6 generality declaration in
+[generality.md](generality.md). It is mandatory regression coverage for probe,
+evidence, or profile changes.
+
 Harvest a UAT workspace with:
 
 ```sh
@@ -27,5 +31,5 @@ After harvesting, edit `expectations.toml`:
 - `[probe]` is optional. When `html_fixture` is present, the corpus test runs
   the static HTML version of the interaction probe hook/candidate selector.
 
-Every future UAT false positive or false negative should add one case before
-changing detector or probe logic.
+Every UAT anomaly must add one case before changing detector, probe, evidence,
+or profile logic, unless the anomaly is explicitly recorded as out of scope.
