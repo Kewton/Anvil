@@ -12227,6 +12227,31 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
     }
 
     #[test]
+    fn generic_filename_app_py_does_not_bind_static_contract() {
+        let goal = "Create app.py";
+        let capabilities = inferred_required_capabilities("generic", goal);
+        let evidence = inferred_required_evidence("generic", goal, &capabilities);
+        let obligations = inferred_required_obligations("generic", goal, &capabilities);
+
+        assert!(capabilities.is_empty());
+        assert!(evidence.is_empty());
+        assert!(obligations.is_empty());
+    }
+
+    #[test]
+    fn generic_profile_ignores_known_profile_phase_prompt_for_static_contract() {
+        let goal =
+            "Original ultra goal: 3011 port app\nProfile: nextjs\nPhase task: Scaffold project";
+        let capabilities = inferred_required_capabilities("generic", goal);
+        let evidence = inferred_required_evidence("generic", goal, &capabilities);
+        let obligations = inferred_required_obligations("generic", goal, &capabilities);
+
+        assert!(capabilities.is_empty());
+        assert!(evidence.is_empty());
+        assert!(obligations.is_empty());
+    }
+
+    #[test]
     fn generic_contract_binding_emits_matched_intent_token() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");

@@ -68,6 +68,21 @@ class AcceptanceContractTest(unittest.TestCase):
         self.assertEqual(contract.required_obligations, ["implementation"])
         self.assertIn("scaffold_only", contract.forbidden_minimal_outputs)
 
+    def test_generic_phase_prompt_with_known_profile_does_not_bind_static_contract(self):
+        contract = contract_from_scenario(
+            {
+                "profile": "generic",
+                "prompt": "Original ultra goal: 3011 port app\nProfile: nextjs\nPhase task: Scaffold project",
+            }
+        )
+        self.assertNotEqual(contract.category, "generic-interactive-app")
+        self.assertEqual(contract.required_capabilities, [])
+
+    def test_generic_filename_app_py_does_not_bind_static_contract(self):
+        contract = contract_from_scenario({"profile": "generic", "prompt": "Create app.py"})
+        self.assertNotEqual(contract.category, "generic-interactive-app")
+        self.assertEqual(contract.required_capabilities, [])
+
 
 if __name__ == "__main__":
     unittest.main()

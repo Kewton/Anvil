@@ -647,7 +647,7 @@ impl DomainProfile for GenericProfile {
     }
 
     fn infer_required_capabilities(&self, goal: &str) -> Vec<String> {
-        if signals::contains_app_intent_token(goal) {
+        if generic_app_intent_goal(goal) {
             vec![GENERIC_INTERACTIVE_CONTRACT_CAPABILITY.to_string()]
         } else {
             Vec::new()
@@ -655,7 +655,7 @@ impl DomainProfile for GenericProfile {
     }
 
     fn infer_required_evidence(&self, goal: &str, required_capabilities: &[String]) -> Vec<String> {
-        if signals::contains_app_intent_token(goal)
+        if generic_app_intent_goal(goal)
             || required_capabilities
                 .iter()
                 .any(|capability| capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY)
@@ -674,7 +674,7 @@ impl DomainProfile for GenericProfile {
         goal: &str,
         required_capabilities: &[String],
     ) -> Vec<String> {
-        if signals::contains_app_intent_token(goal)
+        if generic_app_intent_goal(goal)
             || required_capabilities
                 .iter()
                 .any(|capability| capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY)
@@ -685,11 +685,17 @@ impl DomainProfile for GenericProfile {
     }
 
     fn completion_contract_required(&self, goal: &str, required_capabilities: &[String]) -> bool {
-        signals::contains_app_intent_token(goal)
+        generic_app_intent_goal(goal)
             || required_capabilities
                 .iter()
                 .any(|capability| capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY)
     }
+}
+
+fn generic_app_intent_goal(goal: &str) -> bool {
+    signals::contains_app_intent_token(goal)
+        && !signals::contains_nextjs_goal_token(goal)
+        && !signals::contains_python_cli_goal_token(goal)
 }
 
 pub fn domain_profile(profile: &str) -> &'static dyn DomainProfile {

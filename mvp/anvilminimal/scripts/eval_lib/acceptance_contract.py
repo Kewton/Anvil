@@ -57,6 +57,22 @@ APP_INTENT_TOKENS = [
     "form",
 ]
 
+KNOWN_PROFILE_TOKENS = [
+    "next.js",
+    "nextjs",
+    "react",
+    "web app",
+    "webアプリ",
+    "web アプリ",
+    "ウェブアプリ",
+    "python",
+    "cli",
+    "command line",
+    "command-line",
+    "コマンドライン",
+    "コマンド ライン",
+]
+
 
 @dataclass
 class AcceptanceContract:
@@ -141,7 +157,11 @@ def infer_contract_category(scenario: dict[str, Any]) -> str:
     prompt = str(scenario.get("prompt", "")).lower()
     category = str(scenario.get("category", "")).lower()
     profile = str(scenario.get("profile", "")).lower()
-    if profile in {"", "generic", "default", "none"} and has_any(prompt, APP_INTENT_TOKENS):
+    if (
+        profile in {"", "generic", "default", "none"}
+        and has_app_intent(prompt)
+        and not has_any(prompt, KNOWN_PROFILE_TOKENS)
+    ):
         return "generic-interactive-app"
     if has_any(prompt, ["game", "ゲーム", "space invaders", "invader", "シューティング"]):
         return "interactive-game"
@@ -235,6 +255,17 @@ def infer_runtime_contract(prompt: str) -> dict[str, Any]:
 
 def has_any(text: str, needles: list[str]) -> bool:
     return any(needle.lower() in text for needle in needles)
+
+
+def has_app_intent(text: str) -> bool:
+    for token in APP_INTENT_TOKENS:
+        if any(ch.isascii() and ch.isalpha() for ch in token):
+            pattern = rf"(?<![A-Za-z0-9_]){re.escape(token.lower())}(?![A-Za-z0-9_./\\])"
+            if re.search(pattern, text):
+                return True
+        elif token in text:
+            return True
+    return False
 
 
 def as_dict(value: Any) -> dict[str, Any]:

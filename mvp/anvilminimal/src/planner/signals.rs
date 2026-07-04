@@ -81,7 +81,7 @@ pub fn contains_app_like_token(text: &str) -> bool {
 }
 
 pub fn matched_app_intent_token(text: &str) -> Option<&'static str> {
-    matched_any(text, APP_INTENT_TOKENS)
+    matched_app_intent(text, APP_INTENT_TOKENS)
 }
 
 pub fn contains_app_intent_token(text: &str) -> bool {
@@ -120,6 +120,32 @@ fn matched_any<'a>(text: &str, tokens: &'a [&'a str]) -> Option<&'a str> {
         } else {
             text.contains(token)
         }
+    })
+}
+
+fn matched_app_intent<'a>(text: &str, tokens: &'a [&'a str]) -> Option<&'a str> {
+    let lower = text.to_ascii_lowercase();
+    tokens.iter().copied().find(|token| {
+        if token.chars().any(|ch| ch.is_ascii_alphabetic()) {
+            contains_ascii_intent_token(&lower, &token.to_ascii_lowercase())
+        } else {
+            text.contains(token)
+        }
+    })
+}
+
+fn contains_ascii_intent_token(lower: &str, token: &str) -> bool {
+    lower.match_indices(token).any(|(index, _)| {
+        let before_ok = lower[..index]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+        let after_index = index + token.len();
+        let after_ok = lower[after_index..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | '.' | '/' | '\\'));
+        before_ok && after_ok
     })
 }
 
