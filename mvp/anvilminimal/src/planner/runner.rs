@@ -12540,6 +12540,429 @@ export default function Memo() {
     }
 
     #[test]
+    fn generic_ultra_promotes_to_nextjs_after_workspace_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Build an interactive browser game on port 3011";
+        let plan = two_phase_ultra_plan(goal, "generic");
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(single_write_step_plan_json(
+                "Create a package manifest",
+                "package.json",
+            )),
+            AssistantReply::text(generated_nextjs_artifact_plan_json(
+                "Complete the promoted Next.js app",
+            )),
+        ]);
+        let mut final_calls = nextjs_interactive_app_tool_calls(interactive_game_page_source());
+        final_calls.remove(0);
+        final_calls.extend(browser_release_evidence_tool_calls());
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({
+                        "path": "package.json",
+                        "content": nextjs_complete_package_json()
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: final_calls,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let promotion = latest_event(&events, "profile_reinferred");
+        assert_eq!(promotion.get("id").and_then(Value::as_str), Some("nextjs"));
+        assert_eq!(promotion.get("at_phase").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            promotion.get("from").and_then(Value::as_str),
+            Some("workspace")
+        );
+        assert!(event_array_contains(
+            &promotion,
+            "delta_capabilities",
+            "stateful_interaction"
+        ));
+        let phase_two_prompt = planner_request_text(&planner, 1);
+        assert!(phase_two_prompt.contains("Profile: nextjs"));
+        assert!(phase_two_prompt.contains("Profile generation rules:"));
+        assert!(phase_two_prompt.contains("data-anvil-action=\"primary\""));
+        assert!(phase_two_prompt.contains("data-anvil-state"));
+        assert!(phase_two_prompt.contains("Unmet final requirements from earlier phases:"));
+        assert!(phase_two_prompt.contains("- nextjs_route_evidence"));
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            final_acceptance.get("profile").and_then(Value::as_str),
+            Some("nextjs")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("assurance_level")
+                .and_then(Value::as_str),
+            Some("full")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("browser_readiness_status")
+                .and_then(Value::as_str),
+            Some("passed")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("interaction_evidence_status")
+                .and_then(Value::as_str),
+            Some("passed")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("release_gate_status")
+                .and_then(Value::as_str),
+            Some("pass")
+        );
+        let complete = latest_event(&events, "ultra_plan_complete");
+        assert_eq!(
+            complete.get("profile").and_then(Value::as_str),
+            Some("nextjs")
+        );
+        assert_eq!(
+            complete.get("assurance_level").and_then(Value::as_str),
+            Some("full")
+        );
+    }
+
+    #[test]
+    fn generic_ultra_promotes_to_python_cli_after_pyproject_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Build a local text transformer";
+        let plan = two_phase_ultra_plan(goal, "generic");
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(single_write_step_plan_json(
+                "Create Python project metadata",
+                "pyproject.toml",
+            )),
+            AssistantReply::text(single_write_step_plan_json(
+                "Implement the promoted Python package",
+                "src/text_tool/main.py",
+            )),
+        ]);
+        let pyproject = r#"[project]
+name = "text-tool"
+version = "0.1.0"
+"#;
+        let main_py = r#"#!/usr/bin/env python3
+import sys
+
+def main() -> None:
+    text = sys.stdin.read().strip()
+    print(f"transformed:{text.upper()}:{len(text)}")
+
+if __name__ == "__main__":
+    main()
+"#;
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"pyproject.toml","content":pyproject}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/text_tool/main.py","content":main_py}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let promotion = latest_event(&events, "profile_reinferred");
+        assert_eq!(
+            promotion.get("id").and_then(Value::as_str),
+            Some("python-cli")
+        );
+        let phase_two_prompt = planner_request_text(&planner, 1);
+        assert!(phase_two_prompt.contains("Profile: python-cli"));
+        assert!(phase_two_prompt.contains("python -m compileall -q src"));
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            final_acceptance.get("profile").and_then(Value::as_str),
+            Some("python-cli")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("assurance_level")
+                .and_then(Value::as_str),
+            Some("full")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("profile_behavior_probe_status")
+                .and_then(Value::as_str),
+            Some("pass")
+        );
+    }
+
+    #[test]
+    fn explicit_generic_profile_does_not_promote_from_workspace_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "generic".to_string();
+        cfg.profile_explicit = true;
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Build an interactive memo app with add and delete actions";
+        let plan = two_phase_ultra_plan(goal, "generic");
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(single_write_step_plan_json(
+                "Create a package manifest",
+                "package.json",
+            )),
+            AssistantReply::text(single_write_step_plan_json(
+                "Create generic app source",
+                "memo.jsx",
+            )),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({
+                        "path": "package.json",
+                        "content": r#"{"dependencies":{"next":"^14.2.0"}}"#
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"memo.jsx","content":generic_interactive_source()}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(!event_text.contains("\"event\":\"profile_reinferred\""));
+        let phase_two_prompt = planner_request_text(&planner, 1);
+        assert!(phase_two_prompt.contains("Profile: generic"));
+        assert!(!phase_two_prompt.contains("Profile: nextjs"));
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            final_acceptance.get("profile").and_then(Value::as_str),
+            Some("generic")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("assurance_level")
+                .and_then(Value::as_str),
+            Some("static")
+        );
+    }
+
+    #[test]
+    fn generic_ultra_without_manifest_keeps_static_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Build an interactive memo app with add and delete actions";
+        let plan = two_phase_ultra_plan(goal, "generic");
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(single_write_step_plan_json("Write notes", "notes.txt")),
+            AssistantReply::text(single_write_step_plan_json(
+                "Create generic app source",
+                "memo.jsx",
+            )),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"notes.txt","content":"scaffold notes"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"memo.jsx","content":generic_interactive_source()}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(!event_text.contains("\"event\":\"profile_reinferred\""));
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            final_acceptance.get("profile").and_then(Value::as_str),
+            Some("generic")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("assurance_level")
+                .and_then(Value::as_str),
+            Some("static")
+        );
+    }
+
+    #[test]
+    fn profile_promotion_occurs_once_and_ignores_later_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Build an interactive browser game on port 3011";
+        let plan = two_phase_ultra_plan(goal, "generic");
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(single_write_step_plan_json(
+                "Create a package manifest",
+                "package.json",
+            )),
+            AssistantReply::text(generated_nextjs_artifact_plan_json(
+                "Complete the promoted app and add another manifest",
+            )),
+        ]);
+        let mut final_calls = nextjs_interactive_app_tool_calls(interactive_game_page_source());
+        final_calls.remove(0);
+        final_calls.push(crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({"path":"pyproject.toml","content":"[project]\nname = \"late-python\"\nversion = \"0.1.0\"\n"}),
+        ));
+        final_calls.extend(browser_release_evidence_tool_calls());
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({
+                        "path": "package.json",
+                        "content": nextjs_complete_package_json()
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: final_calls,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let events_json = events_with_name(&events, "profile_reinferred");
+        assert_eq!(events_json.len(), 1, "{events_json:#?}");
+        assert_eq!(
+            events_json[0].get("id").and_then(Value::as_str),
+            Some("nextjs")
+        );
+        assert_ne!(
+            latest_event(&events, "ultra_final_acceptance")
+                .get("profile")
+                .and_then(Value::as_str),
+            Some("python-cli")
+        );
+    }
+
+    #[test]
+    fn known_profile_run_never_reinfers_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Build an interactive browser game on port 3011";
+        let plan = two_phase_ultra_plan(goal, "nextjs");
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(generated_nextjs_artifact_plan_json(
+                "Create the Next.js app",
+            )),
+            AssistantReply::text(generated_nextjs_artifact_plan_json(
+                "Finish the Next.js app",
+            )),
+        ]);
+        let mut final_calls = nextjs_interactive_app_tool_calls(interactive_game_page_source());
+        final_calls.push(crate::state::ToolCall::new(
+            "Write",
+            serde_json::json!({"path":"pyproject.toml","content":"[project]\nname = \"ignored\"\nversion = \"0.1.0\"\n"}),
+        ));
+        final_calls.extend(browser_release_evidence_tool_calls());
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: nextjs_interactive_app_tool_calls(interactive_game_page_source()),
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: final_calls,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(!event_text.contains("\"event\":\"profile_reinferred\""));
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            final_acceptance.get("profile").and_then(Value::as_str),
+            Some("nextjs")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("assurance_level")
+                .and_then(Value::as_str),
+            Some("full")
+        );
+    }
+
+    #[test]
     fn ultra_run_proceeds_when_step_planner_echoes_phase_prompt_into_goal() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -18340,6 +18763,72 @@ export default function Page() {
         })
     }
 
+    fn two_phase_ultra_plan(goal: &str, profile: &str) -> UltraPlan {
+        UltraPlan {
+            goal: goal.to_string(),
+            profile: profile.to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "scaffold".to_string(),
+                    prompt: "Create the initial scaffold.".to_string(),
+                },
+                UltraPhase {
+                    id: "finish".to_string(),
+                    prompt: "Complete the final behavior and verification evidence.".to_string(),
+                },
+            ],
+        }
+    }
+
+    fn single_write_step_plan_json(goal: &str, path: &str) -> String {
+        serde_json::to_string(&StepPlan {
+            goal: goal.to_string(),
+            steps: vec![PlanStep {
+                id: "write-artifact".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: format!("Create {path}."),
+                expected_paths: vec![path.to_string()],
+                verify: Vec::new(),
+            }],
+        })
+        .unwrap()
+    }
+
+    fn browser_release_evidence_tool_calls() -> Vec<crate::state::ToolCall> {
+        vec![
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({
+                    "path": "browser-readiness.json",
+                    "content": r#"{"ok":true,"http_status":200,"route_rendered":true}"#
+                }),
+            ),
+            crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({
+                    "path": "browser-interaction.json",
+                    "content": r#"{"ok":true,"interaction_performed":true,"start_transition":true,"input_state_change":true,"state_changed":true,"canvas_found":true}"#
+                }),
+            ),
+        ]
+    }
+
+    fn generic_interactive_source() -> &'static str {
+        r#"import { useState } from "react";
+export default function Memo(){
+  const [items, setItems] = useState([]);
+  return <form onSubmit={(event) => { event.preventDefault(); setItems([...items, "note"]); }}>
+    <input onChange={() => setItems([...items, "draft"])} />
+    <button type="submit">Add</button>
+    <ul>{items.map((item, index) => <li key={index}>{item}</li>)}</ul>
+  </form>;
+}
+"#
+    }
+
     fn challenge_ultra_plan() -> UltraPlan {
         UltraPlan {
             goal: "Create a browser challenge screen".to_string(),
@@ -18431,6 +18920,24 @@ export default function Page() {
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .rfind(|value| value.get("event").and_then(Value::as_str) == Some(event))
             .unwrap_or_else(|| panic!("missing event {event} in {}", path.display()))
+    }
+
+    fn events_with_name(path: &Path, event: &str) -> Vec<Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value.get("event").and_then(Value::as_str) == Some(event))
+            .collect()
+    }
+
+    fn event_array_contains(value: &Value, key: &str, needle: &str) -> bool {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|item| item.as_str() == Some(needle))
     }
 
     fn planner_request_text(client: &FakeClient, index: usize) -> String {
