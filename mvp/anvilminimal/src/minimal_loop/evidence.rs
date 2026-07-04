@@ -2398,8 +2398,15 @@ fn source_file_has_challenge_or_adversary(
     file: &SourceFile,
     evidence_hint_tokens: &[String],
 ) -> bool {
+    source_file_has_static_adversary_entity(file)
+        || (source_file_has_goal_adversary_hint(file, evidence_hint_tokens)
+            && source_file_has_position_or_motion_update(file)
+            && source_file_has_adversary_motion_or_interaction_signal(file))
+}
+
+fn source_file_has_static_adversary_entity(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
-    let static_adversary_token = [
+    let has_adversary_token = [
         "enemy",
         "enemies",
         "adversary",
@@ -2425,9 +2432,43 @@ fn source_file_has_challenge_or_adversary(
     ]
     .iter()
     .any(|needle| lower.contains(needle));
-    static_adversary_token
-        || (source_file_has_goal_adversary_hint(file, evidence_hint_tokens)
-            && source_file_has_adversary_motion_or_interaction_signal(file))
+    if !has_adversary_token {
+        return false;
+    }
+    source_text_has_adversary_entity_context(&lower)
+}
+
+fn source_text_has_adversary_entity_context(lower: &str) -> bool {
+    [
+        "x:",
+        "y:",
+        ".x",
+        ".y",
+        "array.from",
+        ".map(",
+        ".foreach(",
+        ".filter(",
+        "setenemies(",
+        "setinvaders(",
+        "enemy =",
+        "enemy=",
+        "enemies =",
+        "enemies=",
+        "invader =",
+        "invader=",
+        "invaders =",
+        "invaders=",
+        "const enemy",
+        "const enemies",
+        "const invader",
+        "const invaders",
+        "let enemy",
+        "let enemies",
+        "let invader",
+        "let invaders",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn source_file_has_goal_adversary_hint(file: &SourceFile, evidence_hint_tokens: &[String]) -> bool {

@@ -4,6 +4,7 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
+use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -130,6 +131,31 @@ pub struct BrowserInteractionObservation {
     pub navigation_failure_kind: String,
     pub has_canvas: Option<bool>,
     pub interactive_control_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StaticHtmlProbeSelection {
+    pub probe_mode: String,
+    pub contract_hook_status: String,
+    pub primary_present: bool,
+    pub primary_text_excerpt: String,
+    pub restart_present: bool,
+    pub restart_text_excerpt: String,
+    pub state_count: usize,
+    pub valid_state_count: usize,
+    pub invalid_state_count: usize,
+    pub candidate_table: Vec<StaticHtmlProbeCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StaticHtmlProbeCandidate {
+    pub rank: usize,
+    pub index: usize,
+    pub text_excerpt: String,
+    pub text_bucket: usize,
+    pub area: i64,
+    pub centrality_milli: i64,
+    pub contract_primary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -802,6 +828,290 @@ pub fn probe_browser_interaction_against_running_server(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+pub fn static_html_probe_selection(html: &str) -> StaticHtmlProbeSelection {
+    let elements = static_probe_elements(html);
+    let primary = elements
+        .iter()
+        .find(|element| element.attr("data-anvil-action") == Some("primary"));
+    let restart = elements
+        .iter()
+        .find(|element| element.attr("data-anvil-action") == Some("restart"));
+    let state_values = static_data_anvil_state_values(html);
+    let valid_state_count = state_values
+        .iter()
+        .filter(|value| serde_json::from_str::<Value>(value).is_ok())
+        .count();
+    let invalid_state_count = state_values.len().saturating_sub(valid_state_count);
+    let primary_present = primary.is_some();
+    let state_present = !state_values.is_empty();
+    let usable = primary_present && valid_state_count > 0;
+    let contract_hook_status = if usable {
+        "usable"
+    } else if !primary_present {
+        "primary_missing"
+    } else if !state_present {
+        "state_missing"
+    } else {
+        "state_invalid"
+    }
+    .to_string();
+    let probe_mode = if usable { "contract" } else { "heuristic" }.to_string();
+    let mut candidates = elements
+        .iter()
+        .enumerate()
+        .filter(|(_, element)| element.is_control() && element.visible())
+        .map(|(index, element)| {
+            let text = element.text_excerpt();
+            StaticHtmlProbeCandidate {
+                rank: 0,
+                index,
+                text_bucket: usize::from(text.len() >= 2),
+                text_excerpt: text,
+                area: element.area(),
+                centrality_milli: element.centrality_milli(),
+                contract_primary: element.attr("data-anvil-action") == Some("primary"),
+            }
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.text_bucket
+            .cmp(&a.text_bucket)
+            .then_with(|| b.area.cmp(&a.area))
+            .then_with(|| b.centrality_milli.cmp(&a.centrality_milli))
+            .then_with(|| a.index.cmp(&b.index))
+    });
+    candidates.truncate(4);
+    for (rank, candidate) in candidates.iter_mut().enumerate() {
+        candidate.rank = rank + 1;
+    }
+    StaticHtmlProbeSelection {
+        probe_mode,
+        contract_hook_status,
+        primary_present,
+        primary_text_excerpt: primary
+            .map(StaticProbeElement::text_excerpt)
+            .unwrap_or_default(),
+        restart_present: restart.is_some(),
+        restart_text_excerpt: restart
+            .map(StaticProbeElement::text_excerpt)
+            .unwrap_or_default(),
+        state_count: state_values.len(),
+        valid_state_count,
+        invalid_state_count,
+        candidate_table: candidates,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StaticProbeElement {
+    tag: String,
+    attrs: Vec<(String, String)>,
+    inner: String,
+}
+
+impl StaticProbeElement {
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn is_control(&self) -> bool {
+        self.tag.eq_ignore_ascii_case("button")
+            || self.attr("role").is_some_and(|role| role == "button")
+    }
+
+    fn visible(&self) -> bool {
+        if self.attr("hidden").is_some() {
+            return false;
+        }
+        let style = self.attr("style").unwrap_or("").to_ascii_lowercase();
+        !style.contains("display:none")
+            && !style.contains("display: none")
+            && !style.contains("visibility:hidden")
+            && !style.contains("visibility: hidden")
+            && !style.contains("opacity:0")
+            && !style.contains("opacity: 0")
+    }
+
+    fn text_excerpt(&self) -> String {
+        let text = self
+            .attr("aria-label")
+            .or_else(|| self.attr("title"))
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| strip_html_tags_static(&self.inner));
+        collapse_whitespace_static(&decode_common_html_entities(&text))
+            .chars()
+            .take(80)
+            .collect()
+    }
+
+    fn area(&self) -> i64 {
+        self.attr("data-anvil-probe-area")
+            .and_then(|value| value.parse::<i64>().ok())
+            .or_else(|| style_dimension_product(self.attr("style").unwrap_or("")))
+            .unwrap_or_else(|| {
+                let width = self
+                    .attr("width")
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let height = self
+                    .attr("height")
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0);
+                if width > 0 && height > 0 {
+                    width * height
+                } else {
+                    let text_len = self.text_excerpt().len() as i64;
+                    (text_len.max(1) * 120).max(1)
+                }
+            })
+    }
+
+    fn centrality_milli(&self) -> i64 {
+        self.attr("data-anvil-probe-centrality")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(500)
+    }
+}
+
+fn static_probe_elements(html: &str) -> Vec<StaticProbeElement> {
+    let mut elements = Vec::new();
+    collect_static_elements(
+        html,
+        Regex::new(r#"(?is)<button\b([^>]*)>(.*?)</\s*button\s*>"#)
+            .expect("valid static button regex"),
+        "button",
+        &mut elements,
+    );
+    collect_static_elements(
+        html,
+        Regex::new(
+            r#"(?is)<([a-z][a-z0-9-]*)\b([^>]*(?:\brole\s*=\s*["']?button["']?|\bdata-anvil-action\s*=)[^>]*)>(.*?)</\s*[a-z][a-z0-9-]*\s*>"#,
+        )
+        .expect("valid static role/action regex"),
+        "",
+        &mut elements,
+    );
+    elements.sort_by_key(|(offset, _)| *offset);
+    let mut out = Vec::new();
+    for (_, element) in elements {
+        if !out.iter().any(|existing: &StaticProbeElement| {
+            existing.tag == element.tag
+                && existing.inner == element.inner
+                && existing.attrs == element.attrs
+        }) {
+            out.push(element);
+        }
+    }
+    out
+}
+
+fn collect_static_elements(
+    html: &str,
+    re: Regex,
+    fixed_tag: &str,
+    out: &mut Vec<(usize, StaticProbeElement)>,
+) {
+    for captures in re.captures_iter(html) {
+        let Some(whole) = captures.get(0) else {
+            continue;
+        };
+        let (tag, attrs, inner) = if fixed_tag.is_empty() {
+            (
+                captures.get(1).map_or("", |m| m.as_str()),
+                captures.get(2).map_or("", |m| m.as_str()),
+                captures.get(3).map_or("", |m| m.as_str()),
+            )
+        } else {
+            (
+                fixed_tag,
+                captures.get(1).map_or("", |m| m.as_str()),
+                captures.get(2).map_or("", |m| m.as_str()),
+            )
+        };
+        out.push((
+            whole.start(),
+            StaticProbeElement {
+                tag: tag.to_ascii_lowercase(),
+                attrs: parse_static_attrs(attrs),
+                inner: inner.to_string(),
+            },
+        ));
+    }
+}
+
+fn static_data_anvil_state_values(html: &str) -> Vec<String> {
+    let tag_re = Regex::new(r#"(?is)<[a-z][a-z0-9-]*\b([^>]*\bdata-anvil-state\s*=)[^>]*>"#)
+        .expect("valid static state tag regex");
+    tag_re
+        .captures_iter(html)
+        .filter_map(|captures| {
+            let attrs = captures.get(0).map_or("", |m| m.as_str());
+            parse_static_attrs(attrs)
+                .into_iter()
+                .find(|(key, _)| key == "data-anvil-state")
+                .map(|(_, value)| decode_common_html_entities(&value))
+        })
+        .collect()
+}
+
+fn parse_static_attrs(raw: &str) -> Vec<(String, String)> {
+    let attr_re =
+        Regex::new(r#"(?is)([a-z_:][-a-z0-9_:.]*)\s*(?:=\s*("([^"]*)"|'([^']*)'|([^\s"'>]+)))?"#)
+            .expect("valid html attribute regex");
+    attr_re
+        .captures_iter(raw)
+        .filter_map(|captures| {
+            let key = captures.get(1)?.as_str().to_ascii_lowercase();
+            let value = captures
+                .get(3)
+                .or_else(|| captures.get(4))
+                .or_else(|| captures.get(5))
+                .map_or("", |m| m.as_str())
+                .to_string();
+            Some((key, value))
+        })
+        .collect()
+}
+
+fn style_dimension_product(style: &str) -> Option<i64> {
+    let width = style_dimension(style, "width")?;
+    let height = style_dimension(style, "height")?;
+    Some(width * height)
+}
+
+fn style_dimension(style: &str, name: &str) -> Option<i64> {
+    let pattern = format!(r#"(?i)\b{}\s*:\s*([0-9]+)px\b"#, regex::escape(name));
+    Regex::new(&pattern)
+        .ok()?
+        .captures(style)?
+        .get(1)?
+        .as_str()
+        .parse::<i64>()
+        .ok()
+}
+
+fn strip_html_tags_static(text: &str) -> String {
+    let tag_re = Regex::new(r#"(?is)<[^>]+>"#).expect("valid html tag regex");
+    tag_re.replace_all(text, " ").to_string()
+}
+
+fn collapse_whitespace_static(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn decode_common_html_entities(text: &str) -> String {
+    text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 fn write_probe_script(path: &Path) -> std::io::Result<()> {

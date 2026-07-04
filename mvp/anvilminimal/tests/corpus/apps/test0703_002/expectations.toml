@@ -1,0 +1,47 @@
+case_id = "test0703_002"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0703_002"
+required_paths = ["package.json", "src/app/page.tsx", "src/types/game.ts"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule", "nextjs_route"]
+required_evidence = ["persistence_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["invader"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/types/game.ts"]
+exclude = []
+
+[evidence]
+build_command_or_dependency_missing_boundary = "Strong"
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+challenge_or_adversary_evidence = "Strong"
+score_or_progression_evidence = "Strong"
+failure_or_collision_evidence = "Strong"
+restart_or_recoverable_state_evidence = "Strong"
+persistence_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_passed"
+
+[probe]
+html_fixture = "fixtures/contract-hooks.html"
+probe_mode = "contract"
+contract_hook_status = "usable"
+primary_present = true
+restart_present = true
+first_candidate_text = "START MISSION"
+first_candidate_index = 0
+candidate_texts = ["START MISSION", "RESTART"]

@@ -1,0 +1,36 @@
+case_id = "test0703_005_4"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0703_005_4"
+required_paths = ["package.json", "src/app/page.tsx", "src/components/SpaceInvaders.tsx"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule", "nextjs_route"]
+required_evidence = []
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["invader"]
+
+[route_closure]
+include = ["src/app/page.tsx"]
+exclude = ["src/components/SpaceInvaders.tsx"]
+
+[evidence]
+build_command_or_dependency_missing_boundary = "Strong"
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+challenge_or_adversary_evidence = "Strong"
+score_or_progression_evidence = "Strong"
+failure_or_collision_evidence = "Strong"
+restart_or_recoverable_state_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = ["route_unbound:src/components/SpaceInvaders.tsx"]
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_passed"
