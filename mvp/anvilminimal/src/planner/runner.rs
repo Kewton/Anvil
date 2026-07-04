@@ -53,11 +53,11 @@ use crate::planner::lint::{
     lint_ultra_plan_report, step_plan_quality_report, step_plan_quality_warnings,
 };
 use crate::planner::profile::{
-    PhaseVerificationMode, ProfileBehaviorProbeReport, ProfileSnapshot, canonical_profile_name,
-    domain_profile, profile_auto_repair, profile_before_phase, profile_expected_paths,
-    profile_generation_rules, profile_guidance, profile_post_step_repair,
-    profile_quality_expectations, profile_runtime_contract, profile_setup_scaffold_paths,
-    verify_profile_final, verify_profile_invariant,
+    GENERIC_INTERACTIVE_CONTRACT_CAPABILITY, PhaseVerificationMode, ProfileBehaviorProbeReport,
+    ProfileSnapshot, canonical_profile_name, domain_profile, profile_auto_repair,
+    profile_before_phase, profile_expected_paths, profile_generation_rules, profile_guidance,
+    profile_post_step_repair, profile_quality_expectations, profile_runtime_contract,
+    profile_setup_scaffold_paths, verify_profile_final, verify_profile_invariant,
 };
 use crate::planner::repair::{
     RecoveryHandoff, RepairContext, build_repair_prompt_with_context, save_recovery_ultra_plan,
@@ -122,6 +122,12 @@ const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 14] = [
     "surface_visible_missing",
     "interactive_surface_missing",
     "canvas_unavailable",
+];
+
+const GENERIC_INTERACTIVE_EVIDENCE_KEYS: [&str; 3] = [
+    "user_input_handler_evidence",
+    "stateful_update_evidence",
+    "visible_interactive_surface_evidence",
 ];
 
 thread_local! {
@@ -1777,7 +1783,7 @@ fn bind_completion_contract_for_acceptance(
             generated: false,
             required,
         };
-        emit_completion_contract_bound(config, scope, &bound);
+        emit_completion_contract_bound(config, scope, profile, goal, &bound);
         return Ok(Some(bound));
     }
     if !required {
@@ -1810,7 +1816,7 @@ fn bind_completion_contract_for_acceptance(
         generated: true,
         required,
     };
-    emit_completion_contract_bound(config, scope, &bound);
+    emit_completion_contract_bound(config, scope, profile, goal, &bound);
     Ok(Some(bound))
 }
 
@@ -1876,7 +1882,13 @@ fn display_path_for_event(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
-fn emit_completion_contract_bound(config: &Config, scope: &str, bound: &BoundCompletionContract) {
+fn emit_completion_contract_bound(
+    config: &Config,
+    scope: &str,
+    profile: &str,
+    goal: &str,
+    bound: &BoundCompletionContract,
+) {
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -1895,6 +1907,28 @@ fn emit_completion_contract_bound(config: &Config, scope: &str, bound: &BoundCom
             "required_obligations": bound.contract.required_obligations.clone(),
         }),
     );
+    if canonical_profile_name(profile) == "generic"
+        && bound
+            .contract
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY)
+        && let Some(matched_intent_token) = signals::matched_app_intent_token(goal)
+    {
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "generic_contract_bound",
+                "session_scope": scope,
+                "matched_intent_token": matched_intent_token,
+                "inferred_keys": GENERIC_INTERACTIVE_EVIDENCE_KEYS,
+                "required_capabilities": bound.contract.required_capabilities.clone(),
+                "required_evidence": bound.contract.required_evidence.clone(),
+                "required_obligations": bound.contract.required_obligations.clone(),
+                "completion_contract_path": bound.path,
+            }),
+        );
+    }
 }
 
 fn verify_plan_final_contract(
@@ -12130,6 +12164,72 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             assert!(!evidence.contains(&"challenge_or_adversary_evidence".to_string()));
             assert!(!evidence.contains(&"failure_or_collision_evidence".to_string()));
         }
+    }
+
+    #[test]
+    fn generic_app_intent_binds_minimal_static_contract() {
+        let goal = "ちょっとしたメモアプリを作って";
+        let capabilities = inferred_required_capabilities("generic", goal);
+        let evidence = inferred_required_evidence("generic", goal, &capabilities);
+        let obligations = inferred_required_obligations("generic", goal, &capabilities);
+
+        assert_eq!(
+            capabilities,
+            vec![GENERIC_INTERACTIVE_CONTRACT_CAPABILITY.to_string()]
+        );
+        assert_eq!(
+            evidence,
+            vec![
+                "user_input_handler_evidence".to_string(),
+                "stateful_update_evidence".to_string(),
+                "visible_interactive_surface_evidence".to_string(),
+            ]
+        );
+        assert_eq!(obligations, vec!["implementation".to_string()]);
+    }
+
+    #[test]
+    fn generic_script_goal_keeps_empty_contract() {
+        let goal = "READMEを整形するスクリプト";
+        let capabilities = inferred_required_capabilities("generic", goal);
+        let evidence = inferred_required_evidence("generic", goal, &capabilities);
+        let obligations = inferred_required_obligations("generic", goal, &capabilities);
+
+        assert!(capabilities.is_empty());
+        assert!(evidence.is_empty());
+        assert!(obligations.is_empty());
+    }
+
+    #[test]
+    fn generic_contract_binding_emits_matched_intent_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.profile = "generic".to_string();
+        let goal = "ちょっとしたメモアプリを作って";
+        let capabilities = inferred_required_capabilities("generic", goal);
+        let evidence = inferred_required_evidence("generic", goal, &capabilities);
+        let obligations = inferred_required_obligations("generic", goal, &capabilities);
+
+        let bound = bind_completion_contract_for_acceptance(
+            &cfg,
+            "ultra-plan-run",
+            "generic",
+            goal,
+            &[],
+            &capabilities,
+            &evidence,
+            &obligations,
+        )
+        .unwrap()
+        .expect("generic app contract should bind");
+
+        assert!(bound.generated);
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"generic_contract_bound""#));
+        assert!(event_text.contains(r#""matched_intent_token":"アプリ""#));
+        assert!(event_text.contains(r#""inferred_keys":["user_input_handler_evidence","stateful_update_evidence","visible_interactive_surface_evidence"]"#));
     }
 
     #[test]

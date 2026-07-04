@@ -59,6 +59,15 @@ class AcceptanceContractTest(unittest.TestCase):
         self.assertEqual(contract.category, "docs-content")
         self.assertEqual(contract.required_obligations, ["acceptance_evidence"])
 
+    def test_generic_app_intent_uses_minimal_static_contract(self):
+        contract = contract_from_scenario(
+            {"profile": "generic", "prompt": "ちょっとしたメモアプリを作って"}
+        )
+        self.assertEqual(contract.category, "generic-interactive-app")
+        self.assertEqual(contract.required_capabilities, ["generic_interactive_contract"])
+        self.assertEqual(contract.required_obligations, ["implementation"])
+        self.assertIn("scaffold_only", contract.forbidden_minimal_outputs)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -71,6 +71,32 @@ class CompletionContractSnapshotTest(unittest.TestCase):
         self.assertNotIn("deferred_verify_requirements", contract)
         self.assertEqual(contract["required_capabilities"], [])
 
+    def test_generic_memo_app_contract_uses_minimal_static_evidence(self):
+        eval_run = load_eval_run()
+        contract = eval_run.completion_contract_for_spec(
+            {
+                "binary_kind": "anvilminimal",
+                "mode": "minimal-loop",
+                "scenario": {
+                    "profile": "generic",
+                    "prompt": "ちょっとしたメモアプリを作って",
+                    "expected_artifacts": [],
+                    "postcheck": {"commands": []},
+                },
+            }
+        )
+        self.assertEqual(contract["required_capabilities"], ["generic_interactive_contract"])
+        self.assertEqual(contract["required_obligations"], ["implementation"])
+        self.assertEqual(
+            contract["required_evidence"],
+            [
+                "user_input_handler_evidence",
+                "stateful_update_evidence",
+                "visible_interactive_surface_evidence",
+            ],
+        )
+        self.assertNotIn("profile", contract)
+
     def test_functional_contract_projects_runtime_capabilities_and_evidence(self):
         eval_run = load_eval_run()
         contract = eval_run.completion_contract_for_spec(

@@ -210,6 +210,8 @@ pub struct NextjsProfile;
 pub struct DataProfile;
 pub struct GenericProfile;
 
+pub const GENERIC_INTERACTIVE_CONTRACT_CAPABILITY: &str = "generic_interactive_contract";
+
 static NEXTJS_PROFILE: NextjsProfile = NextjsProfile;
 static DATA_PROFILE: DataProfile = DataProfile;
 static PYTHON_CLI_PROFILE: crate::planner::profiles::python_cli::PythonCliProfile =
@@ -642,6 +644,51 @@ impl DomainProfile for GenericProfile {
 
     fn dependency_missing_output(&self, output: &str) -> bool {
         generic_dependency_missing_output(output)
+    }
+
+    fn infer_required_capabilities(&self, goal: &str) -> Vec<String> {
+        if signals::contains_app_intent_token(goal) {
+            vec![GENERIC_INTERACTIVE_CONTRACT_CAPABILITY.to_string()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn infer_required_evidence(&self, goal: &str, required_capabilities: &[String]) -> Vec<String> {
+        if signals::contains_app_intent_token(goal)
+            || required_capabilities
+                .iter()
+                .any(|capability| capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY)
+        {
+            return vec![
+                "user_input_handler_evidence".to_string(),
+                "stateful_update_evidence".to_string(),
+                "visible_interactive_surface_evidence".to_string(),
+            ];
+        }
+        Vec::new()
+    }
+
+    fn infer_required_obligations(
+        &self,
+        goal: &str,
+        required_capabilities: &[String],
+    ) -> Vec<String> {
+        if signals::contains_app_intent_token(goal)
+            || required_capabilities
+                .iter()
+                .any(|capability| capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY)
+        {
+            return vec!["implementation".to_string()];
+        }
+        Vec::new()
+    }
+
+    fn completion_contract_required(&self, goal: &str, required_capabilities: &[String]) -> bool {
+        signals::contains_app_intent_token(goal)
+            || required_capabilities
+                .iter()
+                .any(|capability| capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY)
     }
 }
 

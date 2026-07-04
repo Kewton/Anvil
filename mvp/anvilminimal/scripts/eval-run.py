@@ -537,6 +537,11 @@ def required_evidence_for_capability(capability: str) -> list[str]:
         "implementation": ["implementation_artifact"],
         "entrypoint": ["implementation_artifact"],
         "input_output_contract": ["implementation_artifact"],
+        "generic_interactive_contract": [
+            "user_input_handler_evidence",
+            "stateful_update_evidence",
+            "visible_interactive_surface_evidence",
+        ],
         "requested_content": ["requested_content_evidence"],
         "deterministic_test": ["test_artifact", "bound_verify_command"],
         "deterministic_check": [

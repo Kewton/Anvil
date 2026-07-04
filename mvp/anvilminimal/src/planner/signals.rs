@@ -80,6 +80,14 @@ pub fn contains_app_like_token(text: &str) -> bool {
         || contains_interactive_token(text)
 }
 
+pub fn matched_app_intent_token(text: &str) -> Option<&'static str> {
+    matched_any(text, APP_INTENT_TOKENS)
+}
+
+pub fn contains_app_intent_token(text: &str) -> bool {
+    matched_app_intent_token(text).is_some()
+}
+
 pub fn contains_browser_probe_token(text: &str) -> bool {
     contains_any(text, BROWSER_PROBE_TOKENS) || contains_game_token(text)
 }
@@ -101,8 +109,12 @@ pub fn plan_adherence_stopword(token: &str) -> bool {
 }
 
 fn contains_any(text: &str, tokens: &[&str]) -> bool {
+    matched_any(text, tokens).is_some()
+}
+
+fn matched_any<'a>(text: &str, tokens: &'a [&'a str]) -> Option<&'a str> {
     let lower = text.to_ascii_lowercase();
-    tokens.iter().any(|token| {
+    tokens.iter().copied().find(|token| {
         if token.chars().any(|ch| ch.is_ascii_alphabetic()) {
             lower.contains(&token.to_ascii_lowercase())
         } else {
@@ -168,7 +180,33 @@ const INTERACTIVE_TOKENS: &[&str] = &[
     "入力",
 ];
 
-const APP_LIKE_TOKENS: &[&str] = &["app", "ui", "アプリ"];
+const APP_LIKE_TOKENS: &[&str] = &[
+    "app",
+    "application",
+    "tool",
+    "game",
+    "ui",
+    "form",
+    "アプリ",
+    "ツール",
+    "ゲーム",
+    "画面",
+    "フォーム",
+];
+
+const APP_INTENT_TOKENS: &[&str] = &[
+    "アプリ",
+    "app",
+    "application",
+    "ツール",
+    "tool",
+    "ゲーム",
+    "game",
+    "UI",
+    "画面",
+    "フォーム",
+    "form",
+];
 
 const BROWSER_PROBE_TOKENS: &[&str] = &["interactive", "keyboard", "browser", "操作", "入力"];
 

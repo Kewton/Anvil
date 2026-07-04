@@ -39,6 +39,24 @@ DATA_TRANSFORM_CAPABILITIES = [
     "deterministic_check",
 ]
 
+GENERIC_INTERACTIVE_CAPABILITIES = [
+    "generic_interactive_contract",
+]
+
+APP_INTENT_TOKENS = [
+    "アプリ",
+    "app",
+    "application",
+    "ツール",
+    "tool",
+    "ゲーム",
+    "game",
+    "ui",
+    "画面",
+    "フォーム",
+    "form",
+]
+
 
 @dataclass
 class AcceptanceContract:
@@ -123,6 +141,8 @@ def infer_contract_category(scenario: dict[str, Any]) -> str:
     prompt = str(scenario.get("prompt", "")).lower()
     category = str(scenario.get("category", "")).lower()
     profile = str(scenario.get("profile", "")).lower()
+    if profile in {"", "generic", "default", "none"} and has_any(prompt, APP_INTENT_TOKENS):
+        return "generic-interactive-app"
     if has_any(prompt, ["game", "ゲーム", "space invaders", "invader", "シューティング"]):
         return "interactive-game"
     if has_any(prompt, ["cli", "command line", "コマンド", "terminal"]) or category in {"cli", "cli-tool"}:
@@ -146,6 +166,7 @@ def default_capabilities(category: str) -> list[str]:
         "library-with-tests": LIBRARY_WITH_TESTS_CAPABILITIES,
         "docs-content": DOCS_CONTENT_CAPABILITIES,
         "data-transform": DATA_TRANSFORM_CAPABILITIES,
+        "generic-interactive-app": GENERIC_INTERACTIVE_CAPABILITIES,
     }
     return list(mapping.get(category, []))
 
@@ -165,12 +186,13 @@ def default_obligations(category: str) -> list[str]:
         "library-with-tests": ["implementation", "verification"],
         "docs-content": ["acceptance_evidence"],
         "data-transform": ["implementation", "verification", "acceptance_evidence"],
+        "generic-interactive-app": ["implementation"],
     }
     return list(mapping.get(category, []))
 
 
 def default_forbidden_outputs(category: str) -> list[str]:
-    if category in {"interactive-game", "interactive-web-app"}:
+    if category in {"interactive-game", "interactive-web-app", "generic-interactive-app"}:
         return [
             "empty_output",
             "scaffold_only",

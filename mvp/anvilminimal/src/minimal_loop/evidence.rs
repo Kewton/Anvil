@@ -85,6 +85,13 @@ enum EvidenceKind {
     RequestedContent,
 }
 
+const GENERIC_INTERACTIVE_CONTRACT_CAPABILITY: &str = "generic_interactive_contract";
+const GENERIC_INTERACTIVE_EVIDENCE_KEYS: [&str; 3] = [
+    "user_input_handler_evidence",
+    "stateful_update_evidence",
+    "visible_interactive_surface_evidence",
+];
+
 impl EvidenceKind {
     fn as_str(self) -> &'static str {
         match self {
@@ -191,6 +198,7 @@ struct SourceFile {
     comments_stripped_strings_preserved: String,
     scan_content: String,
     route_bound: bool,
+    comment_stripping_supported: bool,
 }
 
 impl SourceFile {
@@ -199,6 +207,7 @@ impl SourceFile {
     }
 
     fn new_with_route_bound(rel: String, content: String, route_bound: bool) -> Self {
+        let comment_stripping_supported = uses_c_family_lexical_comments(&rel);
         let (comments_stripped_strings_preserved, scan_content) = source_scan_texts(&rel, &content);
         Self {
             rel,
@@ -206,6 +215,7 @@ impl SourceFile {
             comments_stripped_strings_preserved,
             scan_content,
             route_bound,
+            comment_stripping_supported,
         }
     }
 
@@ -215,6 +225,10 @@ impl SourceFile {
 
     fn comments_stripped_strings_preserved_text(&self) -> &str {
         &self.comments_stripped_strings_preserved
+    }
+
+    fn comment_stripping_supported(&self) -> bool {
+        self.comment_stripping_supported
     }
 }
 
@@ -929,6 +943,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
         }
     }
 
+    let generic_interactive_contract = generic_interactive_contract_required(required_capabilities);
     let mut missing_evidence = Vec::new();
     let mut weak_evidence = Vec::new();
     let mut diagnostics = Vec::new();
@@ -947,6 +962,9 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
         );
     }
     for evidence in &required {
+        if generic_interactive_contract && generic_interactive_evidence_key(evidence) {
+            continue;
+        }
         match evidence.as_str() {
             "implementation_artifact" => {
                 record_bool_evidence_tier(
@@ -1109,19 +1127,34 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
             }
         }
     }
+    if generic_interactive_contract {
+        record_generic_interactive_contract_evidence(
+            &workspace,
+            &required,
+            &mut missing_evidence,
+            &mut evidence_tiers,
+            &mut diagnostics,
+        );
+    }
 
     collect_weak_verify_evidence(verify_commands, &workspace, &mut weak_evidence);
-    collect_route_unbound_capability_evidence(
-        &workspace,
-        &required,
-        &missing_evidence,
-        evidence_hint_tokens,
-        &mut weak_evidence,
-        &mut diagnostics,
-    );
+    if !generic_interactive_contract {
+        collect_route_unbound_capability_evidence(
+            &workspace,
+            &required,
+            &missing_evidence,
+            evidence_hint_tokens,
+            &mut weak_evidence,
+            &mut diagnostics,
+        );
+    }
     collect_weak_obligation_evidence(&artifact_obligations, &required, &mut weak_evidence);
-    let missing_obligations =
-        missing_required_obligations(required_obligations, &artifact_obligations, &workspace);
+    let missing_obligations = missing_required_obligations(
+        required_obligations,
+        &artifact_obligations,
+        &workspace,
+        generic_interactive_contract,
+    );
     let capability_evidence_bindings = capability_evidence_bindings(
         required_capabilities,
         &artifact_obligations,
@@ -1491,6 +1524,11 @@ fn looks_like_implementation_path(path: &str) -> bool {
 
 fn evidence_kinds_for_capability(capability: &str) -> Vec<EvidenceKind> {
     match capability.trim() {
+        GENERIC_INTERACTIVE_CONTRACT_CAPABILITY => vec![
+            EvidenceKind::UserInputHandlerEvidence,
+            EvidenceKind::StatefulUpdateEvidence,
+            EvidenceKind::VisibleInteractiveSurfaceEvidence,
+        ],
         "implementation" | "entrypoint" | "input_output_contract" => {
             vec![EvidenceKind::ImplementationArtifact]
         }
@@ -1682,6 +1720,17 @@ fn looks_like_source_or_test(rel: &str) -> bool {
         || lower.ends_with(".tsx")
         || lower.ends_with(".py")
         || lower.ends_with(".rs")
+        || lower.ends_with(".html")
+        || lower.ends_with(".htm")
+        || lower.ends_with(".vue")
+        || lower.ends_with(".svelte")
+        || lower.ends_with(".lua")
+        || lower.ends_with(".rb")
+        || lower.ends_with(".php")
+        || lower.ends_with(".swift")
+        || lower.ends_with(".kt")
+        || lower.ends_with(".kts")
+        || lower.ends_with(".dart")
         || lower.ends_with(".md")
 }
 
@@ -1855,6 +1904,120 @@ fn source_scanned_evidence_kind(kind: EvidenceKind) -> bool {
     )
 }
 
+fn generic_interactive_contract_required(required_capabilities: &[String]) -> bool {
+    required_capabilities
+        .iter()
+        .any(|capability| capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY)
+}
+
+fn generic_interactive_evidence_key(evidence: &str) -> bool {
+    GENERIC_INTERACTIVE_EVIDENCE_KEYS.contains(&evidence)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenericSourceEvidenceSignal {
+    Strong,
+    WeakAccepted,
+    Absent,
+}
+
+fn record_generic_interactive_contract_evidence(
+    workspace: &WorkspaceEvidence,
+    required: &BTreeSet<String>,
+    missing_evidence: &mut Vec<String>,
+    evidence_tiers: &mut BTreeMap<String, String>,
+    diagnostics: &mut Vec<String>,
+) {
+    let signals = GENERIC_INTERACTIVE_EVIDENCE_KEYS
+        .iter()
+        .filter(|key| required.contains(**key))
+        .map(|key| (*key, generic_source_evidence_signal(workspace, key)))
+        .collect::<Vec<_>>();
+    let unsupported_keyword_present = signals
+        .iter()
+        .any(|(_, signal)| *signal == GenericSourceEvidenceSignal::WeakAccepted);
+    let any_present = signals
+        .iter()
+        .any(|(_, signal)| *signal != GenericSourceEvidenceSignal::Absent);
+    for (key, signal) in signals {
+        match signal {
+            GenericSourceEvidenceSignal::Strong => {
+                evidence_tiers.insert(key.to_string(), EvidenceTier::Strong.as_str().to_string());
+            }
+            GenericSourceEvidenceSignal::WeakAccepted => {
+                evidence_tiers.insert(
+                    key.to_string(),
+                    EvidenceTier::WeakAcceptedGeneric.as_str().to_string(),
+                );
+            }
+            GenericSourceEvidenceSignal::Absent if unsupported_keyword_present && any_present => {
+                evidence_tiers.insert(
+                    key.to_string(),
+                    EvidenceTier::WeakAcceptedGeneric.as_str().to_string(),
+                );
+                diagnostics.push(format!(
+                    "generic_fail_open_unsupported_language_co_signal_absent:{key}"
+                ));
+            }
+            GenericSourceEvidenceSignal::Absent => {
+                missing_evidence.push(key.to_string());
+                evidence_tiers.insert(key.to_string(), EvidenceTier::Absent.as_str().to_string());
+            }
+        }
+    }
+    diagnostics.sort();
+    diagnostics.dedup();
+}
+
+fn generic_source_evidence_signal(
+    workspace: &WorkspaceEvidence,
+    evidence: &str,
+) -> GenericSourceEvidenceSignal {
+    if workspace
+        .source_files
+        .iter()
+        .any(|file| generic_source_file_has_strong_evidence(file, evidence))
+    {
+        return GenericSourceEvidenceSignal::Strong;
+    }
+    if workspace.source_files.iter().any(|file| {
+        !file.comment_stripping_supported()
+            && generic_source_file_has_keyword_evidence(file, evidence)
+    }) {
+        return GenericSourceEvidenceSignal::WeakAccepted;
+    }
+    GenericSourceEvidenceSignal::Absent
+}
+
+fn generic_source_file_has_strong_evidence(file: &SourceFile, evidence: &str) -> bool {
+    match evidence {
+        "user_input_handler_evidence" => {
+            matches!(
+                source_file_user_input_handler_signal(file),
+                SourceEvidenceSignal::Strong
+            )
+        }
+        "stateful_update_evidence" => source_file_has_stateful_update(file),
+        "visible_interactive_surface_evidence" => source_file_has_visible_interactive_surface(file),
+        _ => false,
+    }
+}
+
+fn generic_source_file_has_keyword_evidence(file: &SourceFile, evidence: &str) -> bool {
+    match evidence {
+        "user_input_handler_evidence" => source_file_has_user_input_handler_keyword(file),
+        "stateful_update_evidence" => {
+            source_file_has_stateful_update(file)
+                || source_file_has_generic_state_update_keyword(file)
+        }
+        "visible_interactive_surface_evidence" => {
+            source_file_has_visible_interactive_surface(file)
+                || source_file_has_generic_visible_surface_keyword(file)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceEvidenceSignal {
     Absent,
@@ -1866,6 +2029,7 @@ enum SourceEvidenceSignal {
 enum EvidenceTier {
     Strong,
     Weak,
+    WeakAcceptedGeneric,
     Absent,
 }
 
@@ -1874,6 +2038,7 @@ impl EvidenceTier {
         match self {
             Self::Strong => "strong",
             Self::Weak => "weak",
+            Self::WeakAcceptedGeneric => "weak_accepted_generic",
             Self::Absent => "absent",
         }
     }
@@ -2267,10 +2432,16 @@ fn missing_required_obligations(
     required_obligations: &[String],
     artifact_obligations: &[ArtifactObligationEvidence],
     workspace: &WorkspaceEvidence,
+    generic_interactive_contract: bool,
 ) -> Vec<String> {
     let mut missing = Vec::new();
     for obligation in normalize_obligation_roles(required_obligations) {
-        if !obligation_role_satisfied(&obligation, artifact_obligations, workspace) {
+        if !obligation_role_satisfied(
+            &obligation,
+            artifact_obligations,
+            workspace,
+            generic_interactive_contract,
+        ) {
             missing.push(obligation);
         }
     }
@@ -2297,6 +2468,7 @@ fn obligation_role_satisfied(
     role: &str,
     artifact_obligations: &[ArtifactObligationEvidence],
     workspace: &WorkspaceEvidence,
+    generic_interactive_contract: bool,
 ) -> bool {
     match role {
         "setup" => workspace.package_json.is_some() || workspace.cargo_toml,
@@ -2312,6 +2484,11 @@ fn obligation_role_satisfied(
             artifact_obligations
                 .iter()
                 .any(|obligation| obligation.satisfies_implementation)
+                || (generic_interactive_contract
+                    && workspace
+                        .source_files
+                        .iter()
+                        .any(|file| artifact_role_for_file(file).satisfies_implementation()))
                 || route_bound_source_files(workspace)
                     .any(|file| artifact_role_for_file(file).satisfies_implementation())
         }
@@ -2388,6 +2565,30 @@ fn source_file_has_visible_interactive_surface(file: &SourceFile) -> bool {
         || lower.contains("tabindex")
 }
 
+fn source_file_has_generic_visible_surface_keyword(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    [
+        "button",
+        "form",
+        "input",
+        "textarea",
+        "select",
+        "screen",
+        "surface",
+        "view",
+        "onclick",
+        "click",
+        "tap",
+        "submit",
+        "画面",
+        "フォーム",
+        "入力",
+        "ボタン",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn source_file_has_user_input_handler_keyword(file: &SourceFile) -> bool {
     let content = file.scan_text();
     let lower = content.to_ascii_lowercase();
@@ -2405,6 +2606,12 @@ fn source_file_has_user_input_handler_keyword(file: &SourceFile) -> bool {
         || lower.contains("keyup")
         || lower.contains("pointerdown")
         || lower.contains("touchstart")
+        || lower.contains("keypressed")
+        || lower.contains("mousepressed")
+        || lower.contains("inputhandler")
+        || lower.contains("input_handler")
+        || lower.contains("handleinput")
+        || lower.contains("handle_input")
 }
 
 fn source_file_has_live_preview(file: &SourceFile) -> bool {
@@ -2438,6 +2645,32 @@ fn source_file_has_stateful_update(file: &SourceFile) -> bool {
         || lower.contains("requestanimationframe")
         || lower.contains("dispatch(")
         || lower.contains("=> set")
+}
+
+fn source_file_has_generic_state_update_keyword(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    [
+        "state",
+        "status",
+        "update(",
+        "update_",
+        "render(",
+        "rerender",
+        "refresh",
+        "set_",
+        "set(",
+        "items",
+        "notes",
+        "todos",
+        "table.insert",
+        "push(",
+        "append(",
+        "score",
+        "count",
+        "counter",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn source_file_has_challenge_or_adversary(
@@ -3955,6 +4188,74 @@ export default function Page() {
         );
         assert!(!report.passed);
         assert_eq!(report.artifact_obligations[0].role, "scaffold");
+    }
+
+    #[test]
+    fn generic_interactive_contract_rejects_scaffold_only_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("app.js"),
+            "export function App(){ return 'Press any key to start'; }\n",
+        )
+        .unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["app.js".to_string()],
+            &[],
+            &[GENERIC_INTERACTIVE_CONTRACT_CAPABILITY.to_string()],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .missing_obligations
+                .contains(&"implementation".to_string()),
+            "{report:?}"
+        );
+        assert_eq!(report.artifact_obligations[0].role, "scaffold");
+    }
+
+    #[test]
+    fn generic_interactive_contract_accepts_lua_keyword_evidence_weakly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("memo.lua"),
+            r#"
+local state = { notes = {}, screen = "form", button = "Add" }
+function love.keypressed(key)
+  table.insert(state.notes, key)
+  state.screen = "list"
+end
+function update_form()
+  state.count = #state.notes
+end
+"#,
+        )
+        .unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["memo.lua".to_string()],
+            &[],
+            &[GENERIC_INTERACTIVE_CONTRACT_CAPABILITY.to_string()],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        for key in GENERIC_INTERACTIVE_EVIDENCE_KEYS {
+            assert_eq!(
+                report.evidence_tiers.get(key).map(String::as_str),
+                Some("weak_accepted_generic"),
+                "{key}: {report:?}"
+            );
+        }
+        assert!(report.weak_evidence.is_empty(), "{report:?}");
     }
 
     #[test]
