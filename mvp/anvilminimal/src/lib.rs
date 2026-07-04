@@ -267,8 +267,15 @@ fn apply_config_completion_metadata(
         snapshot.profile_inference_source = inference.source.as_str().to_string();
     }
     if crate::planner::profile::canonical_profile_name(&config.profile) == "generic" {
-        snapshot.assurance_level = "reduced".to_string();
-        snapshot.assurance_reason = eval_events::GENERIC_REDUCED_ASSURANCE_REASON.to_string();
+        if snapshot.assurance_level == "static" {
+            snapshot.assurance_reason = eval_events::GENERIC_STATIC_ASSURANCE_REASON.to_string();
+        } else {
+            snapshot.assurance_level = "reduced".to_string();
+            snapshot.assurance_reason = eval_events::GENERIC_REDUCED_ASSURANCE_REASON.to_string();
+        }
+    } else {
+        snapshot.assurance_level = "full".to_string();
+        snapshot.assurance_reason.clear();
     }
 }
 
@@ -367,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn run_lifecycle_keeps_full_profile_assurance_markers_absent() {
+    fn run_lifecycle_marks_known_profile_full_assurance_without_task_suffix() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join(".anvil/runs/test-run/events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
@@ -380,9 +387,12 @@ mod tests {
 
         let event_text = std::fs::read_to_string(&events).unwrap();
         assert!(!event_text.contains("\"assurance_level\":\"reduced\""));
+        assert!(event_text.contains("\"assurance_level\":\"full\""));
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
         assert!(!summary.contains("Assurance: reduced"));
+        assert!(summary.contains("Assurance: full"));
         assert!(summary.contains("Task status: complete"));
+        assert!(!summary.contains("completed (full assurance)"));
     }
 
     #[test]

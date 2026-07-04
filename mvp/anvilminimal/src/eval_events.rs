@@ -9,6 +9,7 @@ const SNIPPET_LIMIT: usize = 500;
 const SUMMARY_LIMIT: usize = 8_000;
 pub const GENERIC_REDUCED_ASSURANCE_REASON: &str =
     "generic profile — no capability contract, no behavioral verification";
+pub const GENERIC_STATIC_ASSURANCE_REASON: &str = "generic profile — minimal interactive contract verified statically; no behavioral verification";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StopReasonParts {
@@ -406,6 +407,8 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
     let base_task_status = task_status(ok, &release_gate, &final_acceptance);
     let task_status = if ok && interaction_unverified {
         "partial (interaction unverified)".to_string()
+    } else if ok && snapshot.assurance_level == "static" && base_task_status == "complete" {
+        "completed (static assurance)".to_string()
     } else if ok && snapshot.assurance_level == "reduced" && base_task_status == "complete" {
         "completed (reduced assurance)".to_string()
     } else {

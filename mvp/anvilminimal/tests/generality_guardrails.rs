@@ -70,6 +70,47 @@ fn generic_profile_reduced_assurance_markers_still_render() {
 }
 
 #[test]
+fn generic_profile_static_assurance_markers_render() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/generic-static/events.jsonl");
+    let mut snapshot = CompletionSnapshot::empty();
+    snapshot.assurance_level = "static".to_string();
+    snapshot.assurance_reason =
+        anvilminimal::eval_events::GENERIC_STATIC_ASSURANCE_REASON.to_string();
+    snapshot.runtime_acceptance_status = "pass".to_string();
+    snapshot.final_acceptance_status = "full_success".to_string();
+    snapshot.release_gate_status = "pass".to_string();
+
+    let projection = project_completion(true, &snapshot);
+    assert_eq!(projection.status, "complete");
+    assert_eq!(projection.task_status, "completed (static assurance)");
+    append_completion_summary(
+        Some(&events_path),
+        "process",
+        Some("ultra-plan-run"),
+        Some("/ultra-plan-run --profile generic ちょっとしたメモアプリを作って"),
+        "completed",
+        "",
+        &projection,
+    );
+
+    let summary =
+        std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).expect("summary");
+    for marker in [
+        "Task status: completed (static assurance)",
+        "Runtime acceptance: pass",
+        "Final acceptance: full_success",
+        "Release gate: pass",
+        "Assurance: static (generic profile — minimal interactive contract verified statically; no behavioral verification)",
+    ] {
+        assert!(
+            summary.contains(marker),
+            "missing marker {marker:?}\n{summary}"
+        );
+    }
+}
+
+#[test]
 fn nextjs_boundary_erosion_tripwire_keeps_dispatch_sites_audited() {
     let actual = nextjs_literal_counts_outside_profiles();
     let expected = BTreeMap::from([

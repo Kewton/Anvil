@@ -341,9 +341,17 @@ fn apply_config_completion_metadata(
         snapshot.profile_inference_source = inference.source.as_str().to_string();
     }
     if crate::planner::profile::canonical_profile_name(&config.profile) == "generic" {
-        snapshot.assurance_level = "reduced".to_string();
-        snapshot.assurance_reason =
-            crate::eval_events::GENERIC_REDUCED_ASSURANCE_REASON.to_string();
+        if snapshot.assurance_level == "static" {
+            snapshot.assurance_reason =
+                crate::eval_events::GENERIC_STATIC_ASSURANCE_REASON.to_string();
+        } else {
+            snapshot.assurance_level = "reduced".to_string();
+            snapshot.assurance_reason =
+                crate::eval_events::GENERIC_REDUCED_ASSURANCE_REASON.to_string();
+        }
+    } else {
+        snapshot.assurance_level = "full".to_string();
+        snapshot.assurance_reason.clear();
     }
 }
 
@@ -613,6 +621,41 @@ mod tests {
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
         assert!(summary.contains(
             "Assurance: reduced (generic profile — no capability contract, no behavioral verification)"
+        ));
+    }
+
+    #[test]
+    fn tui_command_stop_preserves_generic_static_assurance() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let events = workspace.join(".anvil/runs/test/events.jsonl");
+        std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+        let mut cfg = config();
+        cfg.workspace_root = workspace;
+        cfg.eval_events_path = Some(events.clone());
+        crate::eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            serde_json::json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "full_success",
+                "release_gate_status": "pass",
+                "assurance_level": "static",
+                "assurance_reason": crate::eval_events::GENERIC_STATIC_ASSURANCE_REASON,
+            }),
+        );
+
+        let result: anyhow::Result<String> = Ok("done".to_string());
+        let projection = emit_tui_command_stop(&cfg, "/ultra-plan-run", &result);
+
+        assert_eq!(projection.assurance_level, "static");
+        assert_eq!(projection.task_status, "completed (static assurance)");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains(r#""assurance_level":"static""#));
+        assert!(event_text.contains(r#""task_status":"completed (static assurance)""#));
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains(
+            "Assurance: static (generic profile — minimal interactive contract verified statically; no behavioral verification)"
         ));
     }
 

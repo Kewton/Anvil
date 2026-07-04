@@ -2039,6 +2039,8 @@ fn verify_plan_final_contract(
     let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
     let runtime_acceptance_status =
         runtime_acceptance_status(runtime_ok, runtime_acceptance.as_ref());
+    let (assurance_level, assurance_reason) =
+        assurance_for_completion(&config.profile, &required_capabilities);
     let release_quality_completion =
         release_quality_completion_status(&release_gate, final_acceptance_status);
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
@@ -2174,6 +2176,8 @@ fn verify_plan_final_contract(
             "runtime_acceptance_passed": runtime_ok,
             "runtime_acceptance_status": runtime_acceptance_status,
             "final_acceptance_status": final_acceptance_status,
+            "assurance_level": assurance_level,
+            "assurance_reason": assurance_reason,
             "release_quality_completion": release_quality_completion,
             "release_gate_status": release_gate.status.clone(),
             "release_gate_reasons": release_gate.reasons.clone(),
@@ -4637,6 +4641,8 @@ fn ultra_final_acceptance_report_inner(
     let profile_behavior_failed = profile_behavior_probe.status == "failed";
     let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
     let runtime_acceptance_status = runtime_acceptance_status(acceptance.passed, Some(&acceptance));
+    let (assurance_level, assurance_reason) =
+        assurance_for_completion(&plan.profile, &required_capabilities);
     let release_quality_completion =
         release_quality_completion_status(&release_gate, final_acceptance_status);
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
@@ -4737,6 +4743,8 @@ fn ultra_final_acceptance_report_inner(
             "compile_errors": compile_errors.clone(),
             "compile_error_failure_kind": if compile_errors.is_empty() { "" } else { "implementation_compile_error" },
             "final_acceptance_status": final_acceptance_status,
+            "assurance_level": assurance_level,
+            "assurance_reason": assurance_reason,
             "release_quality_completion": release_quality_completion,
             "missing_capabilities": acceptance.missing_capabilities.clone(),
             "missing_evidence": acceptance.missing_evidence.clone(),
@@ -7787,6 +7795,24 @@ fn runtime_acceptance_status(
         Some(_) if runtime_ok => "pass",
         Some(_) => "failed",
         None => "not_checked",
+    }
+}
+
+fn assurance_for_completion(
+    profile: &str,
+    required_capabilities: &[String],
+) -> (&'static str, &'static str) {
+    if canonical_profile_name(profile) == "generic" {
+        if required_capabilities
+            .iter()
+            .any(|capability| capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY)
+        {
+            ("static", eval_events::GENERIC_STATIC_ASSURANCE_REASON)
+        } else {
+            ("reduced", eval_events::GENERIC_REDUCED_ASSURANCE_REASON)
+        }
+    } else {
+        ("full", "")
     }
 }
 
@@ -12230,6 +12256,49 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         assert!(event_text.contains(r#""event":"generic_contract_bound""#));
         assert!(event_text.contains(r#""matched_intent_token":"アプリ""#));
         assert!(event_text.contains(r#""inferred_keys":["user_input_handler_evidence","stateful_update_evidence","visible_interactive_surface_evidence"]"#));
+    }
+
+    #[test]
+    fn ultra_final_acceptance_event_carries_generic_static_assurance() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.profile = "generic".to_string();
+        std::fs::write(
+            dir.path().join("memo.jsx"),
+            r#"
+import { useState } from "react";
+export default function Memo() {
+  const [notes, setNotes] = useState([]);
+  return <form onSubmit={() => setNotes([...notes, "x"])}><input /><button>Add</button></form>;
+}
+"#,
+        )
+        .unwrap();
+        let plan = UltraPlan::deterministic(
+            "ちょっとしたメモアプリを作って",
+            "generic",
+            "default",
+            "create",
+        );
+
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(report.is_pass(), "{report:?}");
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            final_acceptance
+                .get("assurance_level")
+                .and_then(Value::as_str),
+            Some("static")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("assurance_reason")
+                .and_then(Value::as_str),
+            Some(eval_events::GENERIC_STATIC_ASSURANCE_REASON)
+        );
     }
 
     #[test]
