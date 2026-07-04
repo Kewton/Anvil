@@ -19,23 +19,29 @@ anvilminimal --yes --context-budget 65536 \
 /ultra-plan-run --profile nextjs <SCENARIO_PROMPT>
 ```
 
-Use a fresh empty workdir per scenario. Do not run the three scenarios in
-parallel because all of them require port 3011.
+Use a fresh empty workdir per scenario. Do not run the three Next.js scenarios
+in parallel because all of them require port 3011. The CLI scenario uses
+`--profile python-cli`, does not bind a port, and must not be treated as a web
+or browser-interaction run.
 
 ## Preflight Runbook
 
 1. Version check: `anvilminimal --version` must show the intended commit or a
    build identifier known to contain that commit. Record the full output in the
    UAT report.
-2. Playwright check: verify that the browser probe can run before starting the
-   scenario. Use the same Node/Playwright environment as the release gate; if it
-   is unavailable, record the probe-unavailable reason and do not count the run
-   as a behavioral pass.
-3. Port check: confirm port 3011 has no leftover listener before each run. If a
-   previous dev server is still alive, stop it and record the cleanup.
+2. Playwright check for Next.js scenarios only: verify that the browser probe
+   can run before starting the scenario. Use the same Node/Playwright
+   environment as the release gate; if it is unavailable, record the
+   probe-unavailable reason and do not count the run as a behavioral pass. This
+   check is not required for `CLI (python-cli profile)`.
+3. Port check for Next.js scenarios only: confirm port 3011 has no leftover
+   listener before each run. If a previous dev server is still alive, stop it
+   and record the cleanup. The CLI scenario has no port.
 4. Evidence capture: attach `.anvil/runs/<run-id>/events.jsonl`,
    `.anvil/runs/<run-id>/summary.md`, any referenced
    `browser_readiness_evidence_path`, any referenced `interaction_evidence_path`,
+   any referenced `profile_behavior_probe_evidence_path`,
+   `.anvil/evidence/python-cli-fixtures/*.csv` for the CLI scenario,
    `.anvil/repairs/*.md`, and `.anvil/plans/recovery-ultra-plan-*.yaml` when
    recovery is offered.
 
@@ -138,3 +144,61 @@ Partial means:
 - Static source contains Markdown or notes labels but lacks route-bound
   stateful input handling.
 
+### CLI (python-cli profile)
+
+Prompt:
+
+```text
+/ultra-plan-run --profile python-cli CSVファイルを読み込み、数値列の
+合計・平均・最大・最小を集計して表形式で標準出力するCLIツールを
+Pythonで開発してください。
+```
+
+Expected capability profile:
+
+- CLI-shaped implementation only: argument/input handling, deterministic
+  stdout output, and missing/invalid file error handling.
+- Python package scaffold with `pyproject.toml` and `src/<package>/main.py`.
+- No web, browser, or interaction-probe evidence. No port. No Playwright
+  prerequisite.
+- `/setup-interaction-probe` is not required for this scenario.
+
+Final acceptance requires:
+
+- The dependency lifecycle completes, including venv creation and pip
+  installation.
+- The Python compile oracle passes with `python -m compileall -q src`.
+- The profile behavior probe runs the CLI against generated fixture CSV input,
+  passes the CSV path as an argument, observes exit 0, observes non-empty stdout,
+  finds computed aggregate values in stdout, and confirms stdout changes when
+  the input CSV changes.
+- Honest terminal state as usual: a full success must have matching
+  `profile_behavior_probe_status: pass`, `final_acceptance_status:
+  full_success`, and `ultra_plan_complete`; partial or incomplete runs must
+  record the missing layer and recovery handoff.
+
+Partial means:
+
+- Dependency setup is blocked or unavailable, so venv/pip lifecycle completion
+  is unverified.
+- Compile passes but the behavior probe is unavailable or fails, so CSV argv
+  handling, aggregate stdout, or input variation remains unverified.
+- The valid CSV behavior passes but missing/invalid file handling is only
+  supported by static source evidence and has not been separately exercised.
+- The run reports partial/incomplete terminal state with concrete recovery
+  targets instead of claiming full success.
+
+Evidence to attach:
+
+- The head of `.anvil/runs/<run-id>/summary.md`.
+- `.anvil/runs/<run-id>/events.jsonl`.
+- `.anvil/evidence/python-cli-behavior.json` and any behavior-probe evidence
+  file(s) it references.
+- Generated sources, especially `pyproject.toml` and `src/<package>/main.py`.
+- The generated fixture CSV file(s) used by the behavior probe.
+
+M4 exit criteria:
+
+The run must traverse the shared runner lifecycle without touching
+nextjs-specific code paths; classification/terminal semantics identical in
+kind.

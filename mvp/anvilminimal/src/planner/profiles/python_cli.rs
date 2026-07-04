@@ -173,7 +173,7 @@ impl DomainProfile for PythonCliProfile {
     fn behavior_probe(
         &self,
         root: &Path,
-        _goal: &str,
+        goal: &str,
         _required_capabilities: &[String],
         offline: bool,
     ) -> anyhow::Result<ProfileBehaviorProbeReport> {
@@ -193,8 +193,11 @@ impl DomainProfile for PythonCliProfile {
                 None,
             );
         };
-        let first = run_cli(root, &entrypoint, "anvil\n")?;
-        let second = run_cli(root, &entrypoint, "profile\n")?;
+        if goal_requests_csv_file_probe(goal) {
+            return run_csv_file_behavior_probe(root, &entrypoint);
+        }
+        let first = run_cli(root, &entrypoint, &[], "anvil\n")?;
+        let second = run_cli(root, &entrypoint, &[], "profile\n")?;
         let mut reasons = Vec::new();
         if first.exit_code != Some(0) {
             reasons.push(format!(
@@ -231,6 +234,144 @@ impl DomainProfile for PythonCliProfile {
             write_behavior_report(root, "failed", reasons, Some(details))
         }
     }
+}
+
+struct CsvProbeFixture {
+    display_path: String,
+    content: &'static str,
+    expected_tokens: &'static [&'static str],
+}
+
+fn goal_requests_csv_file_probe(goal: &str) -> bool {
+    let lower = goal.to_ascii_lowercase();
+    lower.contains("csv")
+        || goal.contains("CSV")
+        || goal.contains("ＣＳＶ")
+        || goal.contains("ファイル")
+            && (goal.contains("合計")
+                || goal.contains("平均")
+                || goal.contains("最大")
+                || goal.contains("最小")
+                || goal.contains("数値"))
+}
+
+fn run_csv_file_behavior_probe(
+    root: &Path,
+    entrypoint: &Path,
+) -> anyhow::Result<ProfileBehaviorProbeReport> {
+    let fixtures = write_csv_probe_fixtures(root)?;
+    let first = run_cli(root, entrypoint, &[fixtures[0].display_path.as_str()], "")?;
+    let second = run_cli(root, entrypoint, &[fixtures[1].display_path.as_str()], "")?;
+    let mut reasons = Vec::new();
+    if first.exit_code != Some(0) {
+        reasons.push(format!(
+            "python_cli_behavior_probe_failed:first_exit_code:{:?}",
+            first.exit_code
+        ));
+    }
+    if second.exit_code != Some(0) {
+        reasons.push(format!(
+            "python_cli_behavior_probe_failed:second_exit_code:{:?}",
+            second.exit_code
+        ));
+    }
+    if first.stdout.trim().is_empty() || second.stdout.trim().is_empty() {
+        reasons.push("python_cli_behavior_probe_failed:stdout_empty".to_string());
+    }
+    if first.stdout == second.stdout {
+        reasons.push("python_cli_behavior_probe_failed:stdout_not_changed_by_input".to_string());
+    }
+    for token in fixtures[0].expected_tokens {
+        if !first.stdout.contains(token) {
+            reasons.push(format!(
+                "python_cli_behavior_probe_failed:first_stdout_missing_aggregate:{token}"
+            ));
+        }
+    }
+    for token in fixtures[1].expected_tokens {
+        if !second.stdout.contains(token) {
+            reasons.push(format!(
+                "python_cli_behavior_probe_failed:second_stdout_missing_aggregate:{token}"
+            ));
+        }
+    }
+    if !contains_any_aggregate_label(&first.stdout) {
+        reasons.push(
+            "python_cli_behavior_probe_failed:first_stdout_missing_aggregate_label".to_string(),
+        );
+    }
+    if !contains_any_aggregate_label(&second.stdout) {
+        reasons.push(
+            "python_cli_behavior_probe_failed:second_stdout_missing_aggregate_label".to_string(),
+        );
+    }
+    let details = json!({
+        "mode": "csv_file_arg",
+        "entrypoint": entrypoint.to_string_lossy(),
+        "first_fixture_csv": fixtures[0].display_path.clone(),
+        "second_fixture_csv": fixtures[1].display_path.clone(),
+        "first_fixture_content": fixtures[0].content,
+        "second_fixture_content": fixtures[1].content,
+        "first_expected_aggregate_tokens": fixtures[0].expected_tokens,
+        "second_expected_aggregate_tokens": fixtures[1].expected_tokens,
+        "first_exit_code": first.exit_code,
+        "second_exit_code": second.exit_code,
+        "first_stdout": eval_events::body_snippet(&first.stdout),
+        "second_stdout": eval_events::body_snippet(&second.stdout),
+        "first_stderr": eval_events::body_snippet(&first.stderr),
+        "second_stderr": eval_events::body_snippet(&second.stderr),
+        "changed_by_input": first.stdout != second.stdout,
+        "argv_invocation": true,
+    });
+    if reasons.is_empty() {
+        write_behavior_report(root, "pass", Vec::new(), Some(details))
+    } else {
+        write_behavior_report(root, "failed", reasons, Some(details))
+    }
+}
+
+fn write_csv_probe_fixtures(root: &Path) -> anyhow::Result<Vec<CsvProbeFixture>> {
+    let dir = root
+        .join(".anvil")
+        .join("evidence")
+        .join("python-cli-fixtures");
+    std::fs::create_dir_all(&dir)?;
+    let specs = [
+        (
+            "input-a.csv",
+            "name,score,count\nalpha,10,2\nbeta,20,4\ngamma,30,6\n",
+            &[
+                "score", "60", "20", "30", "10", "count", "12", "4", "6", "2",
+            ][..],
+        ),
+        (
+            "input-b.csv",
+            "name,score,count\nalpha,3,1\nbeta,9,5\ngamma,12,7\n",
+            &["score", "24", "8", "12", "3", "count", "13", "7", "1"][..],
+        ),
+    ];
+    let mut fixtures = Vec::with_capacity(specs.len());
+    for (file_name, content, expected_tokens) in specs {
+        let path = dir.join(file_name);
+        std::fs::write(&path, content)?;
+        fixtures.push(CsvProbeFixture {
+            display_path: display_path(root, &path),
+            content,
+            expected_tokens,
+        });
+    }
+    Ok(fixtures)
+}
+
+fn contains_any_aggregate_label(stdout: &str) -> bool {
+    let lower = stdout.to_ascii_lowercase();
+    ["sum", "total", "avg", "average", "mean", "max", "min"]
+        .iter()
+        .any(|label| lower.contains(label))
+        || stdout.contains("合計")
+        || stdout.contains("平均")
+        || stdout.contains("最大")
+        || stdout.contains("最小")
 }
 
 fn scaffold_paths(root: &Path) -> Vec<String> {
@@ -490,10 +631,16 @@ struct CliRun {
     stderr: String,
 }
 
-fn run_cli(root: &Path, entrypoint: &Path, stdin_text: &str) -> anyhow::Result<CliRun> {
+fn run_cli(
+    root: &Path,
+    entrypoint: &Path,
+    args: &[&str],
+    stdin_text: &str,
+) -> anyhow::Result<CliRun> {
     let python = python_interpreter(root);
     let mut child = verifier_env::normalized_command_at_root(python, root)
         .arg(entrypoint)
+        .args(args)
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

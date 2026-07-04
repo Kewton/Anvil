@@ -13902,29 +13902,60 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         let mut cfg = config(dir.path().to_path_buf());
         cfg.profile = "python-cli".to_string();
         cfg.eval_events_path = Some(events.clone());
-        let scaffold_plan = r#"{"goal":"Scaffold Python CLI","steps":[{"id":"scaffold","kind":"setup","expected_result":"pass","instruction":"Create pyproject.toml and src/echo_cli/main.py","expected_paths":["pyproject.toml","src/echo_cli/main.py"],"verify":[]}]}"#;
-        let deps_plan = r#"{"goal":"Prepare Python CLI dependencies","steps":[{"id":"deps","kind":"verify","expected_result":"pass","instruction":"Verify dependency readiness and syntax","expected_paths":["pyproject.toml","src/echo_cli/main.py"],"verify":["python -m compileall -q src"]}]}"#;
-        let implement_plan = r#"{"goal":"Implement Python CLI behavior","steps":[{"id":"implement","kind":"implement","expected_result":"pass","instruction":"Implement the CLI so output changes with stdin","expected_paths":["src/echo_cli/main.py"],"verify":["python -m compileall -q src"]}]}"#;
+        let scaffold_plan = r#"{"goal":"Scaffold Python CSV CLI","steps":[{"id":"scaffold","kind":"setup","expected_result":"pass","instruction":"Create pyproject.toml and src/csv_stats/main.py for a CSV file argument CLI","expected_paths":["pyproject.toml","src/csv_stats/main.py"],"verify":[]}]}"#;
+        let deps_plan = r#"{"goal":"Prepare Python CLI dependencies","steps":[{"id":"deps","kind":"verify","expected_result":"pass","instruction":"Verify dependency readiness and syntax","expected_paths":["pyproject.toml","src/csv_stats/main.py"],"verify":["python -m compileall -q src"]}]}"#;
+        let implement_plan = r#"{"goal":"Implement Python CSV CLI behavior","steps":[{"id":"implement","kind":"implement","expected_result":"pass","instruction":"Implement the CLI so it reads a CSV path argument, prints aggregate values, and changes output when the input file changes","expected_paths":["src/csv_stats/main.py"],"verify":["python -m compileall -q src"]}]}"#;
         let mut planner = FakeClient::new(vec![
             AssistantReply::text(scaffold_plan),
             AssistantReply::text(deps_plan),
             AssistantReply::text(implement_plan),
         ]);
         let pyproject = r#"[project]
-name = "echo-cli"
+name = "csv-stats"
 version = "0.1.0"
 
 [project.scripts]
-echo-cli = "echo_cli.main:main"
+csv-stats = "csv_stats.main:main"
 "#;
         let valid_cli = r#"#!/usr/bin/env python3
+import csv
 import sys
+from pathlib import Path
+
+
+def fmt(value: float) -> str:
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
 
 def main() -> None:
-    text = sys.stdin.read().strip()
-    if not text:
-        text = "empty"
-    print(f"echo:{text}")
+    if len(sys.argv) != 2:
+        print("usage: csv-stats <file>", file=sys.stderr)
+        raise SystemExit(2)
+    path = Path(sys.argv[1])
+    if not path.is_file():
+        print(f"missing file: {path}", file=sys.stderr)
+        raise SystemExit(1)
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    numeric = {}
+    for column in (rows[0].keys() if rows else []):
+        values = []
+        for row in rows:
+            try:
+                values.append(float(row[column]))
+            except ValueError:
+                pass
+        if values:
+            numeric[column] = (sum(values), sum(values) / len(values), max(values), min(values))
+    if not numeric:
+        print("no numeric columns", file=sys.stderr)
+        raise SystemExit(1)
+    print("column | sum | average | max | min")
+    for column in sorted(numeric):
+        total, average, maximum, minimum = numeric[column]
+        print(f"{column} | {fmt(total)} | {fmt(average)} | {fmt(maximum)} | {fmt(minimum)}")
 
 if __name__ == "__main__":
     main()
@@ -13933,8 +13964,8 @@ if __name__ == "__main__":
 import sys
 
 def main() -> None:
-    text = sys.stdin.read().strip()
-    if text print(text)
+    path = sys.argv[1]
+    if path print(path)
 
 if __name__ == "__main__":
     main()
@@ -13949,7 +13980,7 @@ if __name__ == "__main__":
                     ),
                     crate::state::ToolCall::new(
                         "Write",
-                        serde_json::json!({"path":"src/echo_cli/main.py","content":valid_cli}),
+                        serde_json::json!({"path":"src/csv_stats/main.py","content":valid_cli}),
                     ),
                 ],
                 prompt_tokens: None,
@@ -13960,7 +13991,7 @@ if __name__ == "__main__":
                 content: String::new(),
                 tool_calls: vec![crate::state::ToolCall::new(
                     "Write",
-                    serde_json::json!({"path":"src/echo_cli/main.py","content":invalid_cli}),
+                    serde_json::json!({"path":"src/csv_stats/main.py","content":invalid_cli}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -13969,7 +14000,7 @@ if __name__ == "__main__":
                 content: String::new(),
                 tool_calls: vec![crate::state::ToolCall::new(
                     "Write",
-                    serde_json::json!({"path":"src/echo_cli/main.py","content":valid_cli}),
+                    serde_json::json!({"path":"src/csv_stats/main.py","content":valid_cli}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -13978,7 +14009,7 @@ if __name__ == "__main__":
                 content: String::new(),
                 tool_calls: vec![crate::state::ToolCall::new(
                     "Write",
-                    serde_json::json!({"path":"src/echo_cli/main.py","content":valid_cli}),
+                    serde_json::json!({"path":"src/csv_stats/main.py","content":valid_cli}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -13987,14 +14018,14 @@ if __name__ == "__main__":
                 content: String::new(),
                 tool_calls: vec![crate::state::ToolCall::new(
                     "Write",
-                    serde_json::json!({"path":"src/echo_cli/main.py","content":valid_cli}),
+                    serde_json::json!({"path":"src/csv_stats/main.py","content":valid_cli}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
             },
         ]);
         let plan = UltraPlan {
-            goal: "Build a Python CLI that echoes changed input".to_string(),
+            goal: "Build a Python CLI that reads a CSV file path argument and prints sum, average, max, and min for numeric columns.".to_string(),
             profile: "python-cli".to_string(),
             style: "default".to_string(),
             intent: "create".to_string(),
@@ -14017,19 +14048,71 @@ if __name__ == "__main__":
         let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
 
         assert_eq!(result, "ultra-plan-run complete: 3 phases");
-        let event_text = std::fs::read_to_string(events).unwrap();
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"event\":\"ultra_phase_scaffold_complete\""));
+        assert!(event_text.contains("\"event\":\"ultra_phase_plan_validated\""));
+        assert!(event_text.contains("\"event\":\"ultra_phase_execute_complete\""));
+        assert!(event_text.contains("\"event\":\"ultra_phase_complete\""));
+        assert!(event_text.contains("\"event\":\"dependency_build_lifecycle\""));
+        assert!(event_text.contains("\"mode\":\"ultra-plan-run\""));
+        assert!(event_text.contains("\"lifecycle_stage\":\"dependency_setup_build\""));
+        assert!(event_text.contains("\"lifecycle_stages\""));
+        assert!(event_text.contains("\"verification_passed\""));
         assert!(event_text.contains("\"event\":\"step_verify_failure\""));
         assert!(event_text.contains("implementation_compile_error"));
         assert!(event_text.contains("\"event\":\"step_verify_repair\""));
         assert!(event_text.contains("\"event\":\"profile_behavior_probe\""));
         assert!(event_text.contains("\"profile\":\"python-cli\""));
         assert!(event_text.contains("\"profile_behavior_probe_status\":\"pass\""));
-        let behavior =
-            std::fs::read_to_string(dir.path().join(".anvil/evidence/python-cli-behavior.json"))
-                .unwrap();
+        assert!(event_text.contains("\"event\":\"ultra_final_acceptance\""));
+        assert!(event_text.contains("\"evidence_arbitration\""));
+        assert!(event_text.contains("\"browser_readiness_status\":\"not_applicable\""));
+        assert!(event_text.contains("\"interaction_evidence_status\":\"not_applicable\""));
+        assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            final_acceptance
+                .get("profile_behavior_probe_status")
+                .and_then(Value::as_str),
+            Some("pass")
+        );
+        let behavior_path = dir.path().join(".anvil/evidence/python-cli-behavior.json");
+        let behavior = std::fs::read_to_string(&behavior_path).unwrap();
+        let behavior_json: Value = serde_json::from_str(&behavior).unwrap();
+        let details = behavior_json.get("details").expect("behavior details");
         assert!(
             behavior.contains("\"changed_by_input\": true"),
             "{behavior}"
+        );
+        assert_eq!(
+            details.get("mode").and_then(Value::as_str),
+            Some("csv_file_arg")
+        );
+        assert_eq!(
+            details.get("argv_invocation").and_then(Value::as_bool),
+            Some(true)
+        );
+        let first_stdout = details
+            .get("first_stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let second_stdout = details
+            .get("second_stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(first_stdout.contains("60"), "{first_stdout}");
+        assert!(first_stdout.contains("20"), "{first_stdout}");
+        assert!(second_stdout.contains("24"), "{second_stdout}");
+        assert!(second_stdout.contains("8"), "{second_stdout}");
+        assert!(
+            dir.path()
+                .join(".anvil/evidence/python-cli-fixtures/input-a.csv")
+                .is_file()
+        );
+        assert!(
+            dir.path()
+                .join(".anvil/evidence/python-cli-fixtures/input-b.csv")
+                .is_file()
         );
     }
 
