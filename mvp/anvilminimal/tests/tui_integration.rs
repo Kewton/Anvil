@@ -223,8 +223,19 @@ fn implement_step_plan_json() -> String {
     step_plan.steps[0].kind = "implement".to_string();
     step_plan.steps[0]
         .expected_paths
-        .push("app.txt".to_string());
+        .push("app.jsx".to_string());
     serde_json::to_string(&step_plan).unwrap()
+}
+
+fn interactive_app_source(label: &str) -> String {
+    format!(
+        r#"import {{ useState }} from "react";
+export default function App() {{
+  const [items, setItems] = useState([]);
+  return <form onSubmit={{(event) => {{ event.preventDefault(); setItems([...items, "{label}"]); }}}}><input onChange={{() => setItems([...items, "{label}"])}} /><button type="submit">Add</button></form>;
+}}
+"#
+    )
 }
 
 #[test]
@@ -330,7 +341,7 @@ fn tui_ultra_plan_run_smoke_fake_clients() {
     step_plan.steps[0].kind = "implement".to_string();
     step_plan.steps[0]
         .expected_paths
-        .push("app.txt".to_string());
+        .push("app.jsx".to_string());
     let step_json = serde_json::to_string(&step_plan).unwrap();
     let plan = anvilminimal::planner::ultra_plan::UltraPlan {
         goal: "build app".to_string(),
@@ -362,7 +373,7 @@ fn tui_ultra_plan_run_smoke_fake_clients() {
                 content: String::new(),
                 tool_calls: vec![ToolCall::new(
                     "Write",
-                    json!({"path":"app.txt","content":"phase1"}),
+                    json!({"path":"app.jsx","content":interactive_app_source("phase1")}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -371,7 +382,7 @@ fn tui_ultra_plan_run_smoke_fake_clients() {
                 content: String::new(),
                 tool_calls: vec![ToolCall::new(
                     "Write",
-                    json!({"path":"app.txt","content":"phase2"}),
+                    json!({"path":"app.jsx","content":interactive_app_source("phase2")}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -639,7 +650,7 @@ fn tui_slash_ultra_plan_completion_records_phase_breakdown_and_acceptance() {
                 content: String::new(),
                 tool_calls: vec![ToolCall::new(
                     "Write",
-                    json!({"path":"app.txt","content":"phase1"}),
+                    json!({"path":"app.jsx","content":interactive_app_source("phase1")}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -648,7 +659,7 @@ fn tui_slash_ultra_plan_completion_records_phase_breakdown_and_acceptance() {
                 content: String::new(),
                 tool_calls: vec![ToolCall::new(
                     "Write",
-                    json!({"path":"app.txt","content":"phase2"}),
+                    json!({"path":"app.jsx","content":interactive_app_source("phase2")}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
