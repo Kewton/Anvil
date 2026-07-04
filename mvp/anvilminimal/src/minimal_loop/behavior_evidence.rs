@@ -558,8 +558,10 @@ impl BehaviorObservation {
     }
 
     fn infrastructure_failure(&self) -> bool {
-        if self.failure_kind == "app_route_unresponsive"
-            || self.failure_kind.starts_with("probe_navigation_failed")
+        if matches!(
+            self.failure_kind.as_str(),
+            "app_route_unresponsive" | "app_route_unstable"
+        ) || self.failure_kind.starts_with("probe_navigation_failed")
         {
             return false;
         }

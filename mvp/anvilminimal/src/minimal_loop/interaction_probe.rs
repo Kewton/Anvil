@@ -12,7 +12,7 @@ use crate::eval_events;
 use crate::minimal_loop::verifier_env;
 
 const AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(10);
-const INTERACTION_TIMEOUT: Duration = Duration::from_secs(60);
+const INTERACTION_TIMEOUT: Duration = Duration::from_secs(120);
 const PROVISION_TIMEOUT: Duration = Duration::from_secs(180);
 const PROBE_SCRIPT_NAME: &str = "browser-interaction-probe.cjs";
 const MANAGED_INTERACTION_PROBE_REL: &[&str] = &[".anvil", "tools", "interaction-probe"];
@@ -149,6 +149,8 @@ pub struct BrowserInteractionObservation {
     pub server_http_status: Option<i64>,
     pub server_http_error: String,
     pub navigation_failure_kind: String,
+    pub cold_start_ms: Option<u64>,
+    pub measured_navigation_ms: Option<u64>,
     pub has_canvas: Option<bool>,
     pub interactive_control_count: Option<usize>,
 }
@@ -1182,6 +1184,8 @@ const tokenEchoRequired = !!probeOptions.token_echo_required;
 const started = Date.now();
 const LAUNCH_TIMEOUT_MS = 20000;
 const GOTO_TIMEOUT_MS = 12000;
+const WARMUP_GOTO_TIMEOUT_MS = 45000;
+const WARMUP_RETRY_DELAY_MS = 2000;
 const SERVER_CHECK_TIMEOUT_MS = 5000;
 const RENDER_POLL_INTERVAL_MS = 250;
 const MARKER_POLL_INTERVAL_MS = 80;
@@ -1223,6 +1227,9 @@ let text_input_state_change = false;
 let informational_failure_kinds = [];
 let server_check = { ok: false, status: null, error: "" };
 let post_js_surface = null;
+let cold_start_ms = null;
+let measured_navigation_ms = null;
+let warmup_attempts = 0;
 
 function write(value) {
   fs.mkdirSync(require("path").dirname(outputPath), { recursive: true });
@@ -1331,24 +1338,48 @@ function navigationFailureDetail(err) {
   return "navigation_error";
 }
 
-async function gotoWithRetry(page, targetUrl) {
+async function warmUpNavigation(page, targetUrl) {
+  const phaseStarted = Date.now();
   let lastErr;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
+    warmup_attempts = attempt;
     try {
-      return await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: GOTO_TIMEOUT_MS });
+      mark("warmup_navigation", { attempt, timeout_ms: WARMUP_GOTO_TIMEOUT_MS });
+      await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: WARMUP_GOTO_TIMEOUT_MS });
+      cold_start_ms = Date.now() - phaseStarted;
+      steps.push(attempt === 1 ? "warmup_navigation" : "warmup_navigation_retry");
+      return;
     } catch (err) {
       lastErr = err;
       if (attempt === 1) {
-        mark("goto_retry", { attempt, error: err && err.message ? err.message : String(err) });
-        await page.waitForTimeout(1000);
+        mark("warmup_navigation_retry", { attempt, error: err && err.message ? err.message : String(err) });
+        await page.waitForTimeout(WARMUP_RETRY_DELAY_MS);
       }
     }
   }
+  cold_start_ms = Date.now() - phaseStarted;
   const detail = navigationFailureDetail(lastErr);
   const err = new Error(lastErr && lastErr.message ? lastErr.message : String(lastErr));
   err.anvilFailureKind = server_check.ok ? "app_route_unresponsive" : "probe_infrastructure_failed:server_unreachable";
-  err.navigationFailureKind = `probe_navigation_failed:${detail}`;
+  err.navigationFailureKind = `probe_warmup_navigation_failed:${detail}`;
   throw err;
+}
+
+async function measuredNavigation(page, targetUrl) {
+  mark("measured_navigation", { timeout_ms: GOTO_TIMEOUT_MS });
+  const startedAt = Date.now();
+  try {
+    await page.reload({ waitUntil: "domcontentloaded", timeout: GOTO_TIMEOUT_MS });
+    measured_navigation_ms = Date.now() - startedAt;
+    steps.push("measured_navigation");
+  } catch (err) {
+    measured_navigation_ms = Date.now() - startedAt;
+    const detail = navigationFailureDetail(err);
+    const wrapped = new Error(err && err.message ? err.message : String(err));
+    wrapped.anvilFailureKind = server_check.ok ? "app_route_unstable" : "probe_infrastructure_failed:server_unreachable";
+    wrapped.navigationFailureKind = `probe_measured_navigation_failed:${detail}`;
+    throw wrapped;
+  }
 }
 
 async function pollRenderedAssertion(page, read, options = {}) {
@@ -2192,8 +2223,8 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       err.anvilFailureKind = "probe_infrastructure_failed:server_unreachable";
       throw err;
     }
-    mark("navigating");
-    await gotoWithRetry(page, url);
+    await warmUpNavigation(page, url);
+    await measuredNavigation(page, url);
     mark("surface_wait");
     const surface = page.locator("canvas, button, [role=button], input, select, textarea, [contenteditable='true'], [data-anvil-action], [data-anvil-state]").first();
     await surface.waitFor({ timeout: 10000 });
@@ -2338,6 +2369,9 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       token_echoed_after_reload,
       token_echo_after_reload_latency_ms,
       text_input_state_change,
+      cold_start_ms,
+      measured_navigation_ms,
+      warmup_attempts,
       informational_failure_kinds,
       steps,
       stage,
@@ -2405,6 +2439,9 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       token_echoed_after_reload,
       token_echo_after_reload_latency_ms,
       text_input_state_change,
+      cold_start_ms,
+      measured_navigation_ms,
+      warmup_attempts,
       informational_failure_kinds,
       failure_kind: err && err.anvilFailureKind ? err.anvilFailureKind : "probe_script_error",
       navigation_failure_kind: err && err.navigationFailureKind ? err.navigationFailureKind : "",
@@ -2515,6 +2552,9 @@ fn merge_script_stdout_failure_value(mut value: Value, logs: &InteractionStdio) 
             "token_echoed_after_reload",
             "token_echo_after_reload_latency_ms",
             "text_input_state_change",
+            "cold_start_ms",
+            "measured_navigation_ms",
+            "warmup_attempts",
             "informational_failure_kinds",
             "failure_kind",
             "navigation_failure_kind",
@@ -2632,6 +2672,8 @@ fn observation_from_value(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let cold_start_ms = value.get("cold_start_ms").and_then(Value::as_u64);
+    let measured_navigation_ms = value.get("measured_navigation_ms").and_then(Value::as_u64);
     let duration_ms = value
         .get("duration_ms")
         .and_then(Value::as_u64)
@@ -2886,6 +2928,8 @@ fn observation_from_value(
         server_http_status,
         server_http_error,
         navigation_failure_kind,
+        cold_start_ms,
+        measured_navigation_ms,
         has_canvas: bool_value(
             &value,
             &[
@@ -3116,6 +3160,8 @@ fn failure_observation(
         server_http_status: None,
         server_http_error: String::new(),
         navigation_failure_kind: String::new(),
+        cold_start_ms: None,
+        measured_navigation_ms: None,
         has_canvas: None,
         interactive_control_count: None,
     };
@@ -3165,7 +3211,10 @@ fn normalized_interaction_failure_kind(
     {
         return raw_failure_kind.to_string();
     }
-    if raw_failure_kind == "app_route_unresponsive" {
+    if matches!(
+        raw_failure_kind,
+        "app_route_unresponsive" | "app_route_unstable"
+    ) {
         return raw_failure_kind.to_string();
     }
     if raw_failure_kind == "interaction_state_change_missing"
@@ -3210,7 +3259,10 @@ fn normalized_interaction_failure_kind(
 }
 
 fn probe_stage_before_observation(stage: &str) -> bool {
-    matches!(stage, "resolving" | "launching" | "navigating")
+    matches!(
+        stage,
+        "resolving" | "launching" | "navigating" | "warmup_navigation" | "measured_navigation"
+    )
 }
 
 fn looks_like_navigation_error(text: &str) -> bool {
@@ -3317,6 +3369,8 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "recovery_before_marker": observation.recovery_before_marker,
         "recovery_after_marker": observation.recovery_after_marker,
         "duration_ms": observation.duration_ms,
+        "cold_start_ms": observation.cold_start_ms,
+        "measured_navigation_ms": observation.measured_navigation_ms,
         "probe": {
             "script_path": observation.script_path.display().to_string(),
             "output_excerpt": observation.output_excerpt,
@@ -3325,6 +3379,12 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
             "stage": observation.stage,
         }
     });
+    if let Some(cold_start_ms) = observation.cold_start_ms {
+        value["probe"]["cold_start_ms"] = json!(cold_start_ms);
+    }
+    if let Some(measured_navigation_ms) = observation.measured_navigation_ms {
+        value["probe"]["measured_navigation_ms"] = json!(measured_navigation_ms);
+    }
     if !observation.failure_kind.is_empty() {
         value["failure_kind"] = json!(observation.failure_kind);
         value["browser_failure_kind"] = json!(observation.failure_kind);
@@ -3941,6 +4001,8 @@ class FakePage {
     this.previewText = "";
     this.persistedToken = "";
     this.reloaded = false;
+    this.gotoCalls = 0;
+    this.reloadCalls = 0;
     this.root = new FakeElement(this, "root");
     this.body = new FakeElement(this, "body");
     this.button = new FakeElement(this, "button", "Start");
@@ -4040,10 +4102,21 @@ class FakePage {
   }
 
   async goto() {
+    this.gotoCalls += 1;
+    if (scenario === "never_responding_page") {
+      throw new Error("page.goto: Timeout 45000ms exceeded");
+    }
+    if (scenario === "slow_first_fast_after" && this.gotoCalls === 1) {
+      await this.waitForTimeout(120);
+    }
     return { status: () => 200 };
   }
 
   async reload() {
+    this.reloadCalls += 1;
+    if (scenario === "measured_reload_fail") {
+      throw new Error("page.reload: Timeout 12000ms exceeded");
+    }
     this.reloaded = true;
     this.statusText = "reloaded";
     this.textarea.value = this.persistedToken;
@@ -4229,8 +4302,92 @@ module.exports = {
         assert!(observation.token_echoed, "{observation:?}");
         assert!(
             observation
+                .cold_start_ms
+                .is_some_and(|duration| duration < 1000),
+            "{observation:?}"
+        );
+        assert!(
+            observation
                 .echo_latency_ms
                 .is_some_and(|latency| latency <= 250),
+            "{observation:?}"
+        );
+    }
+
+    #[test]
+    fn slow_first_navigation_is_warmup_telemetry_not_failure() {
+        let Some(observation) = run_fake_probe_scenario(
+            "slow_first_fast_after",
+            BrowserInteractionProbeOptions {
+                persistence_required: false,
+                text_entry_required: true,
+                token_echo_required: false,
+            },
+        ) else {
+            return;
+        };
+
+        assert!(observation.ok, "{observation:?}");
+        assert_eq!(observation.failure_kind, "");
+        assert!(
+            observation
+                .cold_start_ms
+                .is_some_and(|duration| duration >= 100),
+            "{observation:?}"
+        );
+        assert!(
+            observation
+                .measured_navigation_ms
+                .is_some_and(|duration| duration < 1000),
+            "{observation:?}"
+        );
+    }
+
+    #[test]
+    fn warmup_exhaustion_is_app_route_unresponsive() {
+        let Some(observation) = run_fake_probe_scenario(
+            "never_responding_page",
+            BrowserInteractionProbeOptions::default(),
+        ) else {
+            return;
+        };
+
+        assert!(!observation.ok, "{observation:?}");
+        assert_eq!(observation.failure_kind, "app_route_unresponsive");
+        assert!(
+            observation
+                .navigation_failure_kind
+                .starts_with("probe_warmup_navigation_failed:"),
+            "{observation:?}"
+        );
+        assert!(
+            observation
+                .cold_start_ms
+                .is_some_and(|duration| duration >= 1900),
+            "{observation:?}"
+        );
+    }
+
+    #[test]
+    fn measured_navigation_failure_after_warmup_is_app_route_unstable() {
+        let Some(observation) = run_fake_probe_scenario(
+            "measured_reload_fail",
+            BrowserInteractionProbeOptions::default(),
+        ) else {
+            return;
+        };
+
+        assert!(!observation.ok, "{observation:?}");
+        assert_eq!(observation.failure_kind, "app_route_unstable");
+        assert!(
+            observation
+                .navigation_failure_kind
+                .starts_with("probe_measured_navigation_failed:"),
+            "{observation:?}"
+        );
+        assert!(observation.cold_start_ms.is_some(), "{observation:?}");
+        assert!(
+            observation.measured_navigation_ms.is_some(),
             "{observation:?}"
         );
     }

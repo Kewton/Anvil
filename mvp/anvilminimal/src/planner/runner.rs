@@ -5176,6 +5176,8 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "server_http_status": observation.server_http_status,
                     "server_http_error": observation.server_http_error,
                     "navigation_failure_kind": observation.navigation_failure_kind,
+                    "cold_start_ms": observation.cold_start_ms,
+                    "measured_navigation_ms": observation.measured_navigation_ms,
                     "has_canvas": observation.has_canvas,
                     "interactive_control_count": observation.interactive_control_count,
                     "steps": observation.steps,
@@ -6447,7 +6449,7 @@ fn run_nextjs_dev_route_probe_with_runtime(
                             spec.port,
                             run_dir,
                             &interaction_path,
-                            Duration::from_secs(60),
+                            Duration::from_secs(120),
                             interaction_options,
                         );
                     emit_browser_interaction_probe_event(config, &interaction);
@@ -8012,6 +8014,14 @@ fn interaction_probe_failure_evidence_lines(path: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut lines = Vec::new();
+    if let Some(cold_start_ms) = raw_u64_field_deep(&value, "cold_start_ms")
+        && cold_start_ms > 10_000
+    {
+        let seconds = (cold_start_ms + 500) / 1000;
+        lines.push(format!(
+            "Note: first page load took {seconds}s (cold start; excluded from assertions)"
+        ));
+    }
     if let Some(mode) = raw_text_field_deep(&value, &["probe_mode"]).filter(|mode| !mode.is_empty())
     {
         lines.push(format!("interaction probe mode: {mode}"));
@@ -15303,6 +15313,32 @@ if __name__ == "__main__":
             "{prompt}"
         );
         assert!(!prompt.contains("interaction evidence status"), "{prompt}");
+    }
+
+    #[test]
+    fn interaction_probe_failure_evidence_notes_slow_cold_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("browser-interaction.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "status": "passed",
+                "cold_start_ms": 20_400,
+                "probe_mode": "heuristic"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let lines = interaction_probe_failure_evidence_lines(&path.display().to_string());
+
+        assert!(
+            lines.iter().any(|line| {
+                line == "Note: first page load took 20s (cold start; excluded from assertions)"
+            }),
+            "{lines:?}"
+        );
     }
 
     #[test]
