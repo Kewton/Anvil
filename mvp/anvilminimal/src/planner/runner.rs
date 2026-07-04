@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -27,7 +28,8 @@ use crate::minimal_loop::evidence::{
     verify_runtime_acceptance_with_browser_dirs_and_hints,
 };
 use crate::minimal_loop::import_scan::{
-    MissingImport, format_missing_import_findings, missing_import_target_rel, scan_relative_imports,
+    MissingImport, format_missing_import_findings, missing_import_target_rel, route_bound_closure,
+    scan_relative_imports,
 };
 use crate::minimal_loop::interaction_probe::{self, InteractionProbeOutcome};
 use crate::minimal_loop::loop_run::{
@@ -109,6 +111,23 @@ const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 9] = [
     "canvas_unavailable",
 ];
 
+thread_local! {
+    static FINAL_ACCEPTANCE_CYCLE_INDEX: Cell<usize> = const { Cell::new(0) };
+}
+
+fn current_final_acceptance_cycle_index() -> usize {
+    FINAL_ACCEPTANCE_CYCLE_INDEX.with(Cell::get)
+}
+
+fn with_final_acceptance_cycle<T>(cycle_index: usize, f: impl FnOnce() -> T) -> T {
+    FINAL_ACCEPTANCE_CYCLE_INDEX.with(|cell| {
+        let previous = cell.replace(cycle_index);
+        let result = f();
+        cell.set(previous);
+        result
+    })
+}
+
 #[derive(Debug, Clone)]
 struct RecoveryArtifactValidation {
     prompt_exists: bool,
@@ -127,6 +146,15 @@ struct ReleaseRecoveryHandoffSummary {
     recovery_ultra_plan_path: String,
     suggested_recovery_command: String,
     suggested_recovery_yaml_command: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FinalAcceptanceCycleDelta {
+    cycle_index: usize,
+    resolved_keys: Vec<String>,
+    remaining_keys: Vec<String>,
+    changed_paths: Vec<String>,
+    route_bound_changed_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2331,6 +2359,71 @@ fn verification_missing_signals(report: &VerificationReport) -> Vec<String> {
     out
 }
 
+fn resolved_missing_signals(before: &[String], after: &[String]) -> Vec<String> {
+    let after = after.iter().collect::<BTreeSet<_>>();
+    before
+        .iter()
+        .filter(|key| !after.contains(*key))
+        .cloned()
+        .collect()
+}
+
+fn emit_final_acceptance_cycle_delta(
+    config: &Config,
+    delta: &FinalAcceptanceCycleDelta,
+    passed: bool,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "final_acceptance_cycle_complete",
+            "cycle_index": delta.cycle_index,
+            "ok": passed,
+            "resolved_keys": delta.resolved_keys.clone(),
+            "remaining_keys": delta.remaining_keys.clone(),
+            "changed_paths": delta.changed_paths.clone(),
+            "route_bound_changed_paths": delta.route_bound_changed_paths.clone(),
+            "route_bound_source_changed": !delta.route_bound_changed_paths.is_empty(),
+        }),
+    );
+}
+
+fn append_final_acceptance_cycle_summary(config: &Config, deltas: &[FinalAcceptanceCycleDelta]) {
+    if deltas.is_empty() {
+        return;
+    }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "final_acceptance_cycle_summary",
+            "cycles": deltas
+                .iter()
+                .map(|delta| {
+                    json!({
+                        "cycle_index": delta.cycle_index,
+                        "resolved_keys": delta.resolved_keys.clone(),
+                        "remaining_keys": delta.remaining_keys.clone(),
+                        "changed_paths": delta.changed_paths.clone(),
+                        "route_bound_changed_paths": delta.route_bound_changed_paths.clone(),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }),
+    );
+    let mut lines = vec!["Final acceptance repair cycles:".to_string()];
+    for delta in deltas {
+        lines.push(format!(
+            "- cycle {}: resolved={} remaining={} changed={} route_bound_changed={}",
+            delta.cycle_index,
+            missing_if_empty(&delta.resolved_keys.join(", ")),
+            missing_if_empty(&delta.remaining_keys.join(", ")),
+            missing_if_empty(&delta.changed_paths.join(", ")),
+            missing_if_empty(&delta.route_bound_changed_paths.join(", "))
+        ));
+    }
+    eval_events::append_run_summary(config.eval_events_path.as_deref(), &lines.join("\n"));
+}
+
 fn missing_signals_from_text(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     merge_unique_strings(
@@ -3201,7 +3294,8 @@ pub fn run_ultra_plan_with_ui(
             None,
         );
     }
-    let mut acceptance_report = ultra_final_acceptance_report(plan, config)?;
+    let mut final_acceptance_cycle_deltas = Vec::new();
+    let mut acceptance_report = ultra_final_acceptance_report_with_cycle(plan, config, 0)?;
     if !acceptance_report.is_pass() {
         let initial_reason = acceptance_report.primary_reason();
         let initial_target = classify_repair_target(&acceptance_report);
@@ -3209,6 +3303,7 @@ pub fn run_ultra_plan_with_ui(
             config.eval_events_path.as_deref(),
             json!({
                 "event": "ultra_final_acceptance_failed",
+                "cycle_index": 0,
                 "lifecycle_stage": "final_acceptance",
                 "primary_reason": eval_events::body_snippet(&initial_reason),
                 "repair_target": initial_target.as_str(),
@@ -3239,6 +3334,16 @@ pub fn run_ultra_plan_with_ui(
                 compile_no_source_change_count > 0 && !acceptance_report.compile_errors.is_empty();
             let expected_paths =
                 final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
+            let before_missing_keys = verification_missing_signals(&acceptance_report);
+            let before_route_bound_paths =
+                route_bound_source_paths(&config.workspace_root, &plan.profile);
+            let before_source_snapshot = final_acceptance_source_snapshot(
+                &config.workspace_root,
+                &plan.profile,
+                &plan.goal,
+                &expected_paths,
+                &[],
+            );
             let repair_prompt = final_acceptance_repair_prompt(
                 plan,
                 &acceptance_report,
@@ -3253,6 +3358,7 @@ pub fn run_ultra_plan_with_ui(
                 config.eval_events_path.as_deref(),
                 json!({
                     "event": "final_acceptance_repair_start",
+                    "cycle_index": attempt,
                     "lifecycle_stage": "final_acceptance_repair",
                     "attempt": attempt,
                     "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
@@ -3260,6 +3366,9 @@ pub fn run_ultra_plan_with_ui(
                     "missing_paths": acceptance_report.missing_paths.clone(),
                     "compile_errors": acceptance_report.compile_errors.clone(),
                     "profile_failures": acceptance_report.profile_failures.clone(),
+                    "selected_evidence_keys": before_missing_keys.clone(),
+                    "selected_interaction_failure": final_acceptance_app_behavior_failure_kind(&acceptance_report)
+                        .unwrap_or_default(),
                     "bounded_repair": true,
                     "max_iterations": repair_config.max_iterations,
                     "shared_execution_session": true,
@@ -3287,6 +3396,7 @@ pub fn run_ultra_plan_with_ui(
                             config.eval_events_path.as_deref(),
                             json!({
                                 "event": "final_acceptance_repair_no_source_change",
+                                "cycle_index": attempt,
                                 "lifecycle_stage": "final_acceptance_repair",
                                 "attempt": attempt,
                                 "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
@@ -3307,6 +3417,7 @@ pub fn run_ultra_plan_with_ui(
                         config.eval_events_path.as_deref(),
                         json!({
                             "event": "final_acceptance_repair_failed",
+                            "cycle_index": attempt,
                             "lifecycle_stage": "final_acceptance_repair",
                             "attempt": attempt,
                             "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
@@ -3354,30 +3465,52 @@ pub fn run_ultra_plan_with_ui(
                 ULTRA_CONTEXT_MAX_PATHS,
                 &mut ultra_context.truncated,
             );
+            let after_route_bound_paths =
+                route_bound_source_paths(&config.workspace_root, &plan.profile);
+            let after_source_snapshot = final_acceptance_source_snapshot(
+                &config.workspace_root,
+                &plan.profile,
+                &plan.goal,
+                &expected_paths,
+                &repair_outcome.changed_paths,
+            );
+            let actual_changed_paths =
+                changed_snapshot_paths(&before_source_snapshot, &after_source_snapshot);
+            let route_bound_changed_paths = route_bound_changed_paths(
+                &before_source_snapshot,
+                &after_source_snapshot,
+                &before_route_bound_paths,
+                &after_route_bound_paths,
+            );
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
                     "event": "final_acceptance_repair_complete",
+                    "cycle_index": attempt,
                     "lifecycle_stage": "final_acceptance_repair",
                     "attempt": attempt,
                     "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
                     "repair_target": repair_target.as_str(),
-                    "changed_path_count": repair_outcome.changed_paths.len(),
+                    "changed_path_count": actual_changed_paths.len(),
+                    "reported_changed_path_count": repair_outcome.changed_paths.len(),
+                    "changed_paths": actual_changed_paths.clone(),
+                    "reported_changed_paths": repair_outcome.changed_paths.clone(),
+                    "route_bound_changed_paths": route_bound_changed_paths.clone(),
+                    "route_bound_source_changed": !route_bound_changed_paths.is_empty(),
                     "iterations": repair_outcome.iterations,
                     "tool_calls": repair_outcome.tool_calls,
                     "shared_execution_session": true,
                     "session_message_count": ultra_session.messages.len(),
                 }),
             );
-            if !acceptance_report.compile_errors.is_empty()
-                && repair_outcome.changed_paths.is_empty()
-            {
+            if !acceptance_report.compile_errors.is_empty() && actual_changed_paths.is_empty() {
                 compile_no_source_change_count += 1;
                 exhausted_reason = "compile_repair_no_source_change".to_string();
                 eval_events::emit(
                     config.eval_events_path.as_deref(),
                     json!({
                         "event": "final_acceptance_repair_no_source_change",
+                        "cycle_index": attempt,
                         "lifecycle_stage": "final_acceptance_repair",
                         "attempt": attempt,
                         "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
@@ -3394,10 +3527,37 @@ pub fn run_ultra_plan_with_ui(
                 continue;
             }
             compile_no_source_change_count = 0;
-            if !repair_outcome.changed_paths.is_empty() {
-                clear_final_acceptance_browser_probe_evidence(config);
+            if actual_changed_paths.is_empty() {
+                exhausted_reason = "final_acceptance_repair_no_source_change".to_string();
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "final_acceptance_repair_no_source_change",
+                        "cycle_index": attempt,
+                        "lifecycle_stage": "final_acceptance_repair",
+                        "attempt": attempt,
+                        "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                        "failure_kind": "final_acceptance_repair_no_source_change",
+                        "repair_target": repair_target.as_str(),
+                        "reported_changed_paths": repair_outcome.changed_paths.clone(),
+                        "route_bound_changed_paths": route_bound_changed_paths.clone(),
+                        "reprobe_skipped": true,
+                    }),
+                );
+                break;
             }
-            acceptance_report = ultra_final_acceptance_report(plan, config)?;
+            clear_final_acceptance_browser_probe_evidence(config);
+            acceptance_report = ultra_final_acceptance_report_with_cycle(plan, config, attempt)?;
+            let remaining_keys = verification_missing_signals(&acceptance_report);
+            let delta = FinalAcceptanceCycleDelta {
+                cycle_index: attempt,
+                resolved_keys: resolved_missing_signals(&before_missing_keys, &remaining_keys),
+                remaining_keys,
+                changed_paths: actual_changed_paths,
+                route_bound_changed_paths,
+            };
+            emit_final_acceptance_cycle_delta(config, &delta, acceptance_report.is_pass());
+            final_acceptance_cycle_deltas.push(delta);
             if acceptance_report.is_pass() {
                 break;
             }
@@ -3428,7 +3588,14 @@ pub fn run_ultra_plan_with_ui(
                 }),
             );
             exhausted_reason = "compile_rollback_applied".to_string();
-            acceptance_report = ultra_final_acceptance_report(plan, config)?;
+            acceptance_report = ultra_final_acceptance_report_with_cycle(
+                plan,
+                config,
+                final_acceptance_cycle_deltas
+                    .last()
+                    .map(|delta| delta.cycle_index)
+                    .unwrap_or(0),
+            )?;
         }
         if !acceptance_report.is_pass() {
             let target = classify_repair_target(&acceptance_report);
@@ -3451,6 +3618,7 @@ pub fn run_ultra_plan_with_ui(
                 config.eval_events_path.as_deref(),
                 json!({
                     "event": "final_acceptance_repair_exhausted",
+                    "cycle_index": attempts_run,
                     "lifecycle_stage": "final_acceptance_repair",
                     "attempt": attempts_run,
                     "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
@@ -3464,6 +3632,7 @@ pub fn run_ultra_plan_with_ui(
                     "exhausted_reason": exhausted_reason.clone(),
                 }),
             );
+            append_final_acceptance_cycle_summary(config, &final_acceptance_cycle_deltas);
             let handoff = save_ultra_phase_recovery_handoff_with_evidence(
                 config,
                 plan,
@@ -3486,6 +3655,7 @@ pub fn run_ultra_plan_with_ui(
             );
         }
     }
+    append_final_acceptance_cycle_summary(config, &final_acceptance_cycle_deltas);
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -3863,12 +4033,119 @@ fn snapshot_source_candidates(
     paths
 }
 
+fn final_acceptance_source_snapshot(
+    root: &Path,
+    profile: &str,
+    goal: &str,
+    expected_paths: &[String],
+    extra_paths: &[String],
+) -> BTreeMap<String, Option<Vec<u8>>> {
+    let mut paths = snapshot_source_candidates(root, profile, goal, expected_paths);
+    merge_final_acceptance_snapshot_candidates(
+        &mut paths,
+        expected_paths.iter().map(String::as_str),
+    );
+    merge_final_acceptance_snapshot_candidates(&mut paths, extra_paths.iter().map(String::as_str));
+    merge_final_acceptance_snapshot_candidates(
+        &mut paths,
+        [
+            "package.json",
+            "tsconfig.json",
+            "next.config.js",
+            "next.config.mjs",
+            "next.config.ts",
+            "postcss.config.js",
+            "postcss.config.mjs",
+            "tailwind.config.js",
+            "tailwind.config.ts",
+            "vite.config.js",
+            "vite.config.ts",
+            "Cargo.toml",
+            "pyproject.toml",
+        ],
+    );
+    for path in route_bound_source_paths(root, profile) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    snapshot_paths(root, &paths)
+}
+
+fn route_bound_source_paths(root: &Path, profile: &str) -> Vec<String> {
+    route_bound_closure(root, profile)
+        .into_iter()
+        .filter_map(|path| {
+            path.to_str()
+                .and_then(safe_source_rel_path)
+                .map(|path| path.replace('\\', "/"))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn snapshot_paths(root: &Path, paths: &[String]) -> BTreeMap<String, Option<Vec<u8>>> {
+    let mut snapshot = BTreeMap::new();
+    for path in paths {
+        let Some(rel) = safe_final_acceptance_snapshot_rel_path(path) else {
+            continue;
+        };
+        snapshot.insert(rel.clone(), std::fs::read(root.join(rel)).ok());
+    }
+    snapshot
+}
+
+fn changed_snapshot_paths(
+    before: &BTreeMap<String, Option<Vec<u8>>>,
+    after: &BTreeMap<String, Option<Vec<u8>>>,
+) -> Vec<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| before.get(path) != after.get(path))
+        .collect()
+}
+
+fn route_bound_changed_paths(
+    before: &BTreeMap<String, Option<Vec<u8>>>,
+    after: &BTreeMap<String, Option<Vec<u8>>>,
+    before_route_bound: &[String],
+    after_route_bound: &[String],
+) -> Vec<String> {
+    let route_bound = before_route_bound
+        .iter()
+        .chain(after_route_bound.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    changed_snapshot_paths(before, after)
+        .into_iter()
+        .filter(|path| route_bound.contains(path))
+        .collect()
+}
+
 fn merge_source_candidates<'a>(
     out: &mut Vec<String>,
     candidates: impl IntoIterator<Item = &'a str>,
 ) {
     for candidate in candidates {
         if let Some(rel) = safe_source_rel_path(candidate)
+            && !out.contains(&rel)
+        {
+            out.push(rel);
+        }
+    }
+}
+
+fn merge_final_acceptance_snapshot_candidates<'a>(
+    out: &mut Vec<String>,
+    candidates: impl IntoIterator<Item = &'a str>,
+) {
+    for candidate in candidates {
+        if let Some(rel) = safe_final_acceptance_snapshot_rel_path(candidate)
             && !out.contains(&rel)
         {
             out.push(rel);
@@ -3972,6 +4249,31 @@ fn safe_source_rel_path(raw: &str) -> Option<String> {
     let path = Path::new(&rel);
     let ext = path.extension().and_then(|ext| ext.to_str())?;
     matches!(ext, "tsx" | "ts" | "jsx" | "js" | "mjs" | "cjs" | "css").then_some(rel)
+}
+
+fn safe_final_acceptance_snapshot_rel_path(raw: &str) -> Option<String> {
+    if let Some(rel) = safe_source_rel_path(raw) {
+        return Some(rel);
+    }
+    let rel = safe_dir_rel_path(raw)?;
+    let lower = rel.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "package.json"
+            | "tsconfig.json"
+            | "next.config.js"
+            | "next.config.mjs"
+            | "next.config.ts"
+            | "postcss.config.js"
+            | "postcss.config.mjs"
+            | "tailwind.config.js"
+            | "tailwind.config.ts"
+            | "vite.config.js"
+            | "vite.config.ts"
+            | "cargo.toml"
+            | "pyproject.toml"
+    )
+    .then_some(rel)
 }
 
 fn is_nextjs_build_verify_command_like(command: &str) -> bool {
@@ -4140,9 +4442,28 @@ fn bounded_file_excerpt(content: &str, max_chars: usize) -> String {
     excerpt
 }
 
+#[cfg(test)]
 fn ultra_final_acceptance_report(
     plan: &UltraPlan,
     config: &Config,
+) -> anyhow::Result<VerificationReport> {
+    ultra_final_acceptance_report_with_cycle(plan, config, 0)
+}
+
+fn ultra_final_acceptance_report_with_cycle(
+    plan: &UltraPlan,
+    config: &Config,
+    cycle_index: usize,
+) -> anyhow::Result<VerificationReport> {
+    with_final_acceptance_cycle(cycle_index, || {
+        ultra_final_acceptance_report_inner(plan, config, cycle_index)
+    })
+}
+
+fn ultra_final_acceptance_report_inner(
+    plan: &UltraPlan,
+    config: &Config,
+    cycle_index: usize,
 ) -> anyhow::Result<VerificationReport> {
     let mut required_paths =
         profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
@@ -4326,6 +4647,7 @@ fn ultra_final_acceptance_report(
         config.eval_events_path.as_deref(),
         json!({
             "event": "ultra_final_acceptance",
+            "cycle_index": cycle_index,
             "required_paths": required_paths.clone(),
             "missing_paths": missing.clone(),
             "completion_contract_verification_enabled": external_contract_checked,
@@ -4690,6 +5012,7 @@ fn emit_browser_probe_event(config: &Config, observation: &BrowserReadinessObser
         config.eval_events_path.as_deref(),
         json!({
             "event": "browser_probe",
+            "cycle_index": current_final_acceptance_cycle_index(),
             "profile": observation.profile,
             "status": observation.status,
             "ok": observation.ok,
@@ -4719,6 +5042,7 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                 config.eval_events_path.as_deref(),
                 json!({
                     "event": "browser_interaction_probe",
+                    "cycle_index": current_final_acceptance_cycle_index(),
                     "status": "unavailable",
                     "ok": false,
                     "failure_kind": reason,
@@ -4734,6 +5058,7 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                 config.eval_events_path.as_deref(),
                 json!({
                     "event": "browser_interaction_probe",
+                    "cycle_index": current_final_acceptance_cycle_index(),
                     "status": observation.status,
                     "ok": observation.ok,
                     "failure_kind": observation.failure_kind,
@@ -4954,6 +5279,7 @@ fn emit_profile_behavior_probe_event(
         config.eval_events_path.as_deref(),
         json!({
             "event": "profile_behavior_probe",
+            "cycle_index": current_final_acceptance_cycle_index(),
             "profile": profile,
             "status": report.status,
             "ok": report.status == "pass",
@@ -6540,6 +6866,7 @@ fn emit_dev_server_cleanup_lifecycle_stage(
         config.eval_events_path.as_deref(),
         json!({
             "event": "dev_server_lifecycle",
+            "cycle_index": current_final_acceptance_cycle_index(),
             "profile": "nextjs",
             "stage": "cleanup",
             "ok": ok,
@@ -6632,6 +6959,7 @@ fn emit_dev_server_lifecycle_stage(
         config.eval_events_path.as_deref(),
         json!({
             "event": "dev_server_lifecycle",
+            "cycle_index": current_final_acceptance_cycle_index(),
             "profile": "nextjs",
             "stage": stage,
             "ok": ok,
@@ -15247,6 +15575,313 @@ if __name__ == "__main__":
     }
 
     #[test]
+    #[cfg(unix)]
+    fn final_acceptance_repair_cycle_reprobes_restart_hook_recovery_to_pass() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/restart-cycle/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_overrides(
+            dir.path(),
+            &[
+                recovery_not_observed_probe_result(),
+                interaction_state_changed_probe_result(),
+            ],
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game with restart flow".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "first".to_string(),
+                    prompt: "Scaffold the app".to_string(),
+                },
+                UltraPhase {
+                    id: "final".to_string(),
+                    prompt: "Final implementation pass".to_string(),
+                },
+            ],
+        };
+        let fixed_page = interactive_game_page_with_restart_hook_source();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(generated_nextjs_artifact_plan_json_with_build_verify(
+                "Create buildable app",
+            )),
+            AssistantReply::text(static_phase_step_plan_json(true)),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            probe_nextjs_scaffold_reply(
+                port,
+                interactive_game_page_without_restart_source().to_string(),
+            ),
+            read_static_page_reply(),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":fixed_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let result =
+            run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap_or_else(|err| {
+                let event_text = std::fs::read_to_string(&events).unwrap_or_default();
+                panic!("{err}\nEvents:\n{event_text}");
+            });
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert_eq!(
+            event_text
+                .matches("\"event\":\"ultra_final_acceptance\"")
+                .count(),
+            2,
+            "{event_text}"
+        );
+        assert!(
+            event_text
+                .matches("\"event\":\"browser_interaction_probe\"")
+                .count()
+                >= 2,
+            "{event_text}"
+        );
+        let events_json = read_jsonl_events(&events);
+        let ultra_cycles = events_json
+            .iter()
+            .filter(|event| {
+                event.get("event").and_then(Value::as_str) == Some("ultra_final_acceptance")
+            })
+            .filter_map(|event| event.get("cycle_index").and_then(Value::as_u64))
+            .collect::<Vec<_>>();
+        assert_eq!(ultra_cycles, vec![0, 1], "{event_text}");
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            final_acceptance
+                .get("runtime_acceptance_status")
+                .and_then(Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("evidence_arbitration")
+                .and_then(|arbitration| arbitration.get("restart_or_recoverable_state_evidence"))
+                .and_then(|record| record.get("behavioral_observation"))
+                .and_then(Value::as_str),
+            Some("recovery_transition")
+        );
+        let cycle = latest_event(&events, "final_acceptance_cycle_complete");
+        assert_eq!(cycle.get("cycle_index").and_then(Value::as_u64), Some(1));
+        assert!(
+            cycle
+                .get("resolved_keys")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| item.as_str() == Some("restart_or_recoverable_state_evidence"))),
+            "{cycle}"
+        );
+        assert!(
+            cycle
+                .get("route_bound_changed_paths")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| item.as_str() == Some("src/app/page.tsx"))),
+            "{cycle}"
+        );
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(
+            summary.contains("Final acceptance repair cycles:"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("restart_or_recoverable_state_evidence"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn final_acceptance_no_change_repair_skips_extra_probe_cycle() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/no-change-cycle/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_override(
+            dir.path(),
+            &recovery_not_observed_probe_result(),
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game with restart flow".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "first".to_string(),
+                    prompt: "Scaffold the app".to_string(),
+                },
+                UltraPhase {
+                    id: "final".to_string(),
+                    prompt: "Final implementation pass".to_string(),
+                },
+            ],
+        };
+        let unchanged_page = interactive_game_page_without_restart_source();
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(generated_nextjs_artifact_plan_json_with_build_verify(
+                "Create buildable app",
+            )),
+            AssistantReply::text(static_phase_step_plan_json(true)),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            probe_nextjs_scaffold_reply(port, unchanged_page.to_string()),
+            read_static_page_reply(),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":unchanged_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("ultra final acceptance failed after bounded repair"),
+            "{err}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert_eq!(
+            event_text
+                .matches("\"event\":\"ultra_final_acceptance\"")
+                .count(),
+            1,
+            "{event_text}"
+        );
+        assert_eq!(
+            event_text
+                .matches("\"event\":\"browser_interaction_probe\"")
+                .count(),
+            1,
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"reprobe_skipped\":true"),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"failure_kind\":\"final_acceptance_repair_no_source_change\"")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn final_acceptance_budget_exhaustion_uses_last_cycle_reason() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/last-cycle/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_overrides(
+            dir.path(),
+            &[
+                interaction_state_missing_probe_result(),
+                recovery_not_observed_probe_result(),
+                recovery_not_observed_probe_result(),
+            ],
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game with restart flow".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "first".to_string(),
+                    prompt: "Scaffold the app".to_string(),
+                },
+                UltraPhase {
+                    id: "final".to_string(),
+                    prompt: "Final implementation pass".to_string(),
+                },
+            ],
+        };
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(generated_nextjs_artifact_plan_json_with_build_verify(
+                "Create buildable app",
+            )),
+            AssistantReply::text(static_phase_step_plan_json(true)),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            probe_nextjs_scaffold_reply(
+                port,
+                interactive_game_page_without_restart_source().to_string(),
+            ),
+            read_static_page_reply(),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(101)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(102)),
+        ]);
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("restart_or_recoverable_state_evidence"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("input_state_change_missing_after_start"),
+            "{err}"
+        );
+        let exhausted = latest_event(&events, "final_acceptance_repair_exhausted");
+        assert_eq!(
+            exhausted.get("cycle_index").and_then(Value::as_u64),
+            Some(2)
+        );
+        assert!(
+            exhausted
+                .get("primary_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason.contains("restart_or_recoverable_state_evidence")),
+            "{exhausted}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert_eq!(
+            event_text
+                .matches("\"event\":\"final_acceptance_cycle_complete\"")
+                .count(),
+            2,
+            "{event_text}"
+        );
+    }
+
+    #[test]
     fn interaction_probe_infrastructure_failure_blocks_release_without_static_override() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
@@ -17146,6 +17781,13 @@ export default function Page(){
   return <main><button onClick={fireBullet}>Fire</button><canvas /><p>score {score} enemy collision {gameOver ? "game over" : "playing"}</p></main>;
 }
 "#
+    }
+
+    fn interactive_game_page_with_restart_hook_source() -> String {
+        interactive_game_page_source().replace(
+            "<button onClick={restart}>Restart</button>",
+            "<button data-anvil-action=\"restart\" onClick={restart}>Restart</button>",
+        )
     }
 
     fn generated_data_mutation_plan_json(goal: &str) -> String {
