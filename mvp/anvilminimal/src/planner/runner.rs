@@ -538,6 +538,7 @@ pub fn run_step_plan_with_ui(
         true,
         "plan-run",
         None,
+        None,
     )
     .map(|outcome| outcome.summary)
     .map_err(|err| anyhow::anyhow!("{}", err.message))
@@ -1033,8 +1034,10 @@ fn run_step_plan_with_session_with_ui(
     verify_final_contract: bool,
     mode: &'static str,
     phase_scope: Option<&str>,
+    overall_goal_override: Option<&str>,
 ) -> Result<StepPlanRunOutcome, StepPlanRunError> {
     let mut outcome = StepPlanRunOutcome::for_plan(plan);
+    let overall_goal = overall_goal_override.unwrap_or(&plan.goal);
     let report = lint_step_plan_report_with_workspace(plan, Some(&config.workspace_root));
     if !report.is_pass() {
         emit_planner_error_for_lint(config, "plan-file", &config.planner_model, &report, 0);
@@ -1089,6 +1092,7 @@ fn run_step_plan_with_session_with_ui(
             return Err(StepPlanRunError::from_error("interrupted by user", outcome));
         }
         let prompt_context = StepPromptContext {
+            overall_goal: overall_goal.to_string(),
             required_final_artifacts: required_final_artifacts.clone(),
             prior_expected_paths: prior_expected_paths.clone(),
             final_required_capabilities: final_required_capabilities.clone(),
@@ -1149,6 +1153,7 @@ fn lint_report_is_runtime_repairable_verifier_command(report: &PlanLintReport) -
 
 #[derive(Debug, Clone, Default)]
 struct StepPromptContext {
+    overall_goal: String,
     required_final_artifacts: Vec<String>,
     prior_expected_paths: Vec<String>,
     final_required_capabilities: Vec<String>,
@@ -1216,7 +1221,9 @@ fn run_step(
         stop_reason: Some(format!("{:?}", initial.stop_reason)),
         ..StepRunOutcome::default()
     };
-    if let Err(err) = profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal)
+    let overall_goal = prompt_context.overall_goal.as_str();
+    if let Err(err) =
+        profile_post_step_repair(&config.workspace_root, &config.profile, overall_goal)
     {
         outcome.primary_failure = Some(err.to_string());
         outcome.stop_reason = Some("profile_post_step_repair_error".to_string());
@@ -1266,7 +1273,7 @@ fn run_step(
                 mode,
                 Some(&step.id),
                 &config.profile,
-                &plan.goal,
+                overall_goal,
                 &step.expected_paths,
             );
         }
@@ -1301,7 +1308,7 @@ fn run_step(
     );
     let mut context = RepairContext {
         profile: Some(config.profile.clone()),
-        overall_goal: Some(plan.goal.clone()),
+        overall_goal: Some(overall_goal.to_string()),
         required_final_artifacts: prompt_context.required_final_artifacts.clone(),
         step_instruction: Some(step.instruction.clone()),
         expected_paths: step.expected_paths.clone(),
@@ -1382,7 +1389,7 @@ fn run_step(
                 &repair.missing_obligations,
             );
             merge_unique_strings(&mut outcome.repair_changed_paths, &repair.changed_paths);
-            match profile_post_step_repair(&config.workspace_root, &config.profile, &plan.goal) {
+            match profile_post_step_repair(&config.workspace_root, &config.profile, overall_goal) {
                 Ok(true) => {
                     let package_path = "package.json".to_string();
                     merge_changed_files(&mut context, std::slice::from_ref(&package_path));
@@ -2249,6 +2256,7 @@ fn verify_plan_final_contract(
         config.eval_events_path.as_deref(),
         json!({
             "event": "plan_final_contract",
+            "profile": config.profile,
             "requested_port": requested_port,
             "required_final_artifacts": required_paths,
             "missing_final_artifacts": missing_final_artifacts,
@@ -3256,6 +3264,7 @@ pub fn run_ultra_plan_with_ui(
             false,
             "ultra-plan-run",
             Some(&phase.id),
+            Some(&plan.goal),
         ) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -3885,11 +3894,17 @@ pub fn run_ultra_plan_with_ui(
         }
     }
     append_final_acceptance_cycle_summary(config, &final_acceptance_cycle_deltas);
+    let terminal_capabilities = inferred_required_capabilities(&plan.profile, &plan.goal);
+    let (assurance_level, assurance_reason) =
+        assurance_for_completion(&plan.profile, &terminal_capabilities);
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
             "event": "ultra_plan_complete",
             "total_phases": plan.phases.len(),
+            "profile": plan.profile,
+            "assurance_level": assurance_level,
+            "assurance_reason": assurance_reason,
             "ok": true,
         }),
     );
@@ -4891,6 +4906,15 @@ fn ultra_final_acceptance_report_inner(
         json!({
             "event": "ultra_final_acceptance",
             "cycle_index": cycle_index,
+            "profile": plan.profile,
+            "profile_inferred": config
+                .profile_inference
+                .map(|inference| inference.profile)
+                .unwrap_or(""),
+            "profile_inference_source": config
+                .profile_inference
+                .map(|inference| inference.source.as_str())
+                .unwrap_or(""),
             "requested_port": requested_port,
             "required_paths": required_paths.clone(),
             "missing_paths": missing.clone(),
@@ -10143,11 +10167,11 @@ fn strengthen_step_plan_for_profile(plan: &mut StepPlan, config: &Config) {
     }
 }
 
-fn build_step_prompt(plan: &StepPlan, step: &PlanStep, context: &StepPromptContext) -> String {
+fn build_step_prompt(_plan: &StepPlan, step: &PlanStep, context: &StepPromptContext) -> String {
     let mut prompt = String::new();
     prompt.push_str("Execute exactly one StepPlan step.\n\n");
     prompt.push_str("Overall goal:\n");
-    prompt.push_str(&plan.goal);
+    prompt.push_str(&context.overall_goal);
     prompt.push_str("\n\nCurrent step id:\n");
     prompt.push_str(&step.id);
     prompt.push_str("\n\nCurrent step kind:\n");
@@ -10264,6 +10288,8 @@ fn ultra_phase_prompt(
     let expected_paths = profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
     let expectations =
         profile_quality_expectations(&config.workspace_root, &plan.profile, &plan.goal);
+    let generation_rules =
+        profile_generation_rules(&plan.profile, &plan.intent).unwrap_or("- none\n");
     let runtime_contract = profile_runtime_contract(&plan.profile, &plan.intent, &plan.goal);
     let phase_contract_text = format!("{}\n{}", plan.goal, phase.prompt);
     let required_capabilities = inferred_required_capabilities(&plan.profile, &phase_contract_text);
@@ -10329,7 +10355,7 @@ fn ultra_phase_prompt(
         ""
     };
     format!(
-        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\n{}\n\nProfile runtime contract:\n{}\n{}Deterministic verification preference:\n{}\n{}{}{}",
+        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\n{}\n\nProfile generation rules:\n{}\nProfile runtime contract:\n{}\n{}Deterministic verification preference:\n{}\n{}{}{}",
         plan.goal,
         plan.profile,
         plan.style,
@@ -10340,6 +10366,7 @@ fn ultra_phase_prompt(
         prior_context,
         unmet_final_requirements,
         requested_features,
+        generation_rules,
         runtime_contract,
         route_bound_constraint,
         preferred_verify,
@@ -11546,6 +11573,7 @@ mod tests {
             }],
         };
         let context = StepPromptContext {
+            overall_goal: plan.goal.clone(),
             required_final_artifacts: vec!["src/app/page.tsx".to_string()],
             prior_expected_paths: vec!["package.json".to_string()],
             final_required_capabilities: vec!["player_control".to_string()],

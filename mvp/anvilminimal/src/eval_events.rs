@@ -193,6 +193,7 @@ pub fn append_run_summary(path: Option<&Path>, text: &str) {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionSnapshot {
+    pub profile: String,
     pub assurance_level: String,
     pub assurance_reason: String,
     pub profile_inferred: String,
@@ -237,6 +238,7 @@ pub struct CompletionSnapshot {
 impl CompletionSnapshot {
     pub fn empty() -> Self {
         Self {
+            profile: String::new(),
             assurance_level: String::new(),
             assurance_reason: String::new(),
             profile_inferred: String::new(),
@@ -293,6 +295,7 @@ pub struct CompletionProjection {
     pub status: String,
     pub command_completion: String,
     pub task_status: String,
+    pub profile: String,
     pub assurance_level: String,
     pub assurance_reason: String,
     pub profile_inferred: String,
@@ -423,6 +426,7 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         status,
         command_completion,
         task_status,
+        profile: snapshot.profile.clone(),
         assurance_level: snapshot.assurance_level.clone(),
         assurance_reason: snapshot.assurance_reason.clone(),
         profile_inferred: snapshot.profile_inferred.clone(),
@@ -1323,6 +1327,11 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
         return None;
     }
     Some(CompletionSnapshot {
+        profile: event
+            .get("profile")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         assurance_level: event
             .get("assurance_level")
             .and_then(Value::as_str)
@@ -1696,6 +1705,9 @@ fn render_completion_summary(
         format!("Recovery next action: {}", projection.next_action),
         format!("Stop reason: {stop_reason}"),
     ]);
+    if !projection.profile.is_empty() {
+        lines.push(format!("Profile: {}", projection.profile));
+    }
     if !projection.profile_inferred.is_empty() {
         lines.push(format!(
             "profile_inferred: {} (from: {})",

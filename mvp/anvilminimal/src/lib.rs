@@ -210,6 +210,7 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "failure_kind": failure_kind,
             "completion_status": &completion.status,
             "task_status": &completion.task_status,
+            "profile": &completion.profile,
             "assurance_level": &completion.assurance_level,
             "assurance_reason": &completion.assurance_reason,
             "profile_inferred": &completion.profile_inferred,
@@ -266,7 +267,10 @@ fn apply_config_completion_metadata(
         snapshot.profile_inferred = inference.profile.to_string();
         snapshot.profile_inference_source = inference.source.as_str().to_string();
     }
-    if crate::planner::profile::canonical_profile_name(&config.profile) == "generic" {
+    if snapshot.profile.trim().is_empty() {
+        snapshot.profile = config.profile.clone();
+    }
+    if crate::planner::profile::canonical_profile_name(&snapshot.profile) == "generic" {
         if snapshot.assurance_level == "static" {
             snapshot.assurance_reason = eval_events::GENERIC_STATIC_ASSURANCE_REASON.to_string();
         } else {
