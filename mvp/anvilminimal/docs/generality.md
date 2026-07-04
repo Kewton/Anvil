@@ -12,7 +12,7 @@ Scope S is explicit:
 
 | dimension | in scope |
 |---|---|
-| Profiles | `nextjs`, `python-cli`, and `generic` with reduced-assurance markers |
+| Profiles | `nextjs`, `python-cli`, and `generic` with static- or reduced-assurance markers |
 | Scenarios | GAME, TOOL, CONTENT, and CLI from [uat/scenarios.md](uat/scenarios.md) |
 | Models | UAT evidence from `qwen3.6:27b-coding-nvfp4` main execution with the configured planner model used by the runbook |
 | Languages | Japanese scenario prompts, TypeScript/TSX Next.js output, Python CLI output, and English/Japanese diagnostic text |
@@ -24,8 +24,20 @@ Within S, "generalized" means:
   requiring scenario IDs or one prompt string.
 - Runtime acceptance records full success only when the required profile,
   evidence, and release gate pass.
-- Missing probe evidence, unsupported profile confidence, or incomplete
-  behavior evidence renders reduced-assurance markers instead of full success.
+- Generic app-intent goals bind a minimal static contract
+  (`user_input_handler_evidence`, `stateful_update_evidence`,
+  `visible_interactive_surface_evidence`) and render static-assurance markers
+  only when that contract is verified from source evidence. Generic goals
+  without app intent keep the reduced-assurance empty-contract path.
+- Missing probe evidence, unsupported profile confidence, incomplete behavior
+  evidence, or generic goals outside the minimal static contract render
+  reduced-assurance markers instead of full success.
+- Generic static evidence is source-only. For files outside the comment
+  stripper's supported extension set, keyword-tier evidence is accepted as
+  `weak_accepted_generic`; co-signal absence on those unsupported languages is
+  not a hard failure. This is a stated limit, not behavioral verification.
+- Generic contract binding emits `generic_contract_bound` with the inferred
+  static evidence keys and the matched application-intent token.
 - Every observed UAT anomaly is either explained as out of scope or harvested
   into the corpus before probe, evidence, or profile logic changes.
 - The scenario suite is rerun for any probe, evidence, or profile change.
@@ -55,8 +67,8 @@ approval:
 The corpus harness guards harvested probe/evidence/profile behavior. The
 scenario contract tests are the golden suite for contract inference. The
 false-positive regression protects the "static screen is not a game success"
-boundary. The generality guardrails protect reduced-assurance rendering and the
-Next.js boundary-erosion tripwire.
+boundary. The generality guardrails protect static- and reduced-assurance
+rendering and the Next.js boundary-erosion tripwire.
 
 ## Roadmap Completion
 
