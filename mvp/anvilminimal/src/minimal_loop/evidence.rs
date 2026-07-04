@@ -1946,7 +1946,11 @@ fn verify_command_kind(command: &str, workspace: &WorkspaceEvidence) -> VerifyCo
     {
         return VerifyCommandKind::Build;
     }
-    if lower.starts_with("python3 -m py_compile ") || lower.starts_with("python -m py_compile ") {
+    if lower.starts_with("python3 -m py_compile ")
+        || lower.starts_with("python -m py_compile ")
+        || lower.starts_with("python3 -m compileall ")
+        || lower.starts_with("python -m compileall ")
+    {
         return VerifyCommandKind::StaticSyntax;
     }
     if lower == "cargo test" || lower.starts_with("cargo test ") {

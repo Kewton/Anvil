@@ -651,6 +651,8 @@ fn is_verify_like_command(command: &str) -> bool {
         || lower == "yarn build"
         || lower.starts_with("python -m unittest")
         || lower.starts_with("python3 -m unittest")
+        || lower.starts_with("python -m compileall")
+        || lower.starts_with("python3 -m compileall")
         || lower == "pytest"
         || lower.starts_with("pytest ")
         || lower.contains(" build")
@@ -954,6 +956,8 @@ fn is_strong_verify_command(command: &str) -> bool {
         || lower.starts_with("node ")
         || lower.starts_with("python -m py_compile")
         || lower.starts_with("python3 -m py_compile")
+        || lower.starts_with("python -m compileall")
+        || lower.starts_with("python3 -m compileall")
         || lower.contains(" tsc")
         || lower == "tsc"
 }

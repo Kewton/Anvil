@@ -7,6 +7,7 @@ use crate::minimal_loop::dependency_setup::{
     self, NodeDependencySetupAuthority, NodeDependencySetupObservation, NodeDependencySetupStatus,
 };
 use crate::minimal_loop::verifier_env;
+use crate::planner::profile::{build_oracle_for_command, profile_for_build_requirement};
 use crate::planner::verify::validate_verify_command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -244,16 +245,14 @@ pub fn requirement_from_deferred(
     authority: &str,
     status: &str,
 ) -> Option<BuildVerifierRequirement> {
-    if !is_build_verifier_command(command) {
-        return None;
-    }
+    let (_, oracle) = build_oracle_for_command(profile, command)?;
     Some(BuildVerifierRequirement {
-        command: command.to_string(),
-        profile: profile.map(str::to_string),
+        command: oracle.command,
+        profile: oracle.profile.or_else(|| profile.map(str::to_string)),
         reason: reason.to_string(),
         authority: authority.to_string(),
         status: status.to_string(),
-        requires_dependency_setup: requires_dependency_setup(command),
+        requires_dependency_setup: oracle.requires_dependency_setup,
         required_for_completion: status != "optional",
     })
 }
@@ -266,10 +265,24 @@ pub fn requirement_from_dependency_state(
     authority: &str,
     status: &str,
 ) -> Option<BuildVerifierRequirement> {
+    if let Some((profile_impl, oracle)) = build_oracle_for_command(profile, command) {
+        if profile_impl.dependency_ready(root, command) {
+            return None;
+        }
+        return Some(BuildVerifierRequirement {
+            command: oracle.command,
+            profile: oracle.profile.or_else(|| profile.map(str::to_string)),
+            reason: reason.to_string(),
+            authority: authority.to_string(),
+            status: status.to_string(),
+            requires_dependency_setup: true,
+            required_for_completion: status != "optional",
+        });
+    }
     if !dependency_setup::package_json_declares_dependencies(root) {
         return None;
     }
-    if node_dependency_state_ready(root, profile, command) {
+    if dependency_setup::node_declared_dependencies_ready(root) {
         return None;
     }
     Some(BuildVerifierRequirement {
@@ -290,9 +303,15 @@ pub fn requirement_from_dependency_missing_output(
     authority: &str,
     status: &str,
 ) -> BuildVerifierRequirement {
+    let oracle = build_oracle_for_command(profile, command).map(|(_, oracle)| oracle);
     BuildVerifierRequirement {
-        command: command.to_string(),
-        profile: profile.map(str::to_string),
+        command: oracle
+            .as_ref()
+            .map(|oracle| oracle.command.clone())
+            .unwrap_or_else(|| command.to_string()),
+        profile: oracle
+            .and_then(|oracle| oracle.profile)
+            .or_else(|| profile.map(str::to_string)),
         reason: reason.to_string(),
         authority: authority.to_string(),
         status: status.to_string(),
@@ -305,8 +324,9 @@ pub fn observe_requirement(
     root: &Path,
     requirement: &BuildVerifierRequirement,
 ) -> BuildVerifierObservation {
-    let dependency_ready =
-        !requirement.requires_dependency_setup || dependency_ready(root, &requirement.command);
+    let profile = profile_for_build_requirement(requirement);
+    let dependency_ready = !requirement.requires_dependency_setup
+        || profile.dependency_ready(root, &requirement.command);
     if let Err(err) = validate_verify_command(&requirement.command) {
         return BuildVerifierObservation {
             command: requirement.command.clone(),
@@ -324,8 +344,8 @@ pub fn observe_requirement(
         };
     }
     if !dependency_ready {
-        let foreign_toolchain = foreign_toolchain_for_requirement(root, requirement);
-        let mut primary_reason = dependency_missing_reason(root, &requirement.command);
+        let foreign_toolchain = profile.foreign_toolchain(root, requirement);
+        let mut primary_reason = profile.dependency_missing_reason(root, &requirement.command);
         if let Some(foreign) = foreign_toolchain.as_ref() {
             primary_reason = format!("{primary_reason}; {}", foreign.reason);
         }
@@ -361,9 +381,9 @@ pub fn observe_requirement(
         },
         Err(err) => {
             let reason = err.to_string();
-            let mut compile_errors = parse_compile_errors(&reason);
-            annotate_compile_error_route_binding(root, &mut compile_errors);
-            let status = if is_dependency_missing_output(&reason) {
+            let mut compile_errors = parse_compile_errors_for_requirement(requirement, &reason);
+            profile.annotate_compile_errors(root, &mut compile_errors);
+            let status = if profile.dependency_missing_output(&reason) {
                 BuildVerifierStatus::DependencyMissing
             } else if !compile_errors.is_empty() {
                 BuildVerifierStatus::Failed
@@ -479,13 +499,15 @@ pub(crate) fn observe_dependency_missing_output_lifecycle_with_setup_program_and
         authority: requirement.authority.clone(),
         required_for_completion: requirement.required_for_completion,
         requires_dependency_setup: requirement.requires_dependency_setup,
-        dependency_ready: dependency_ready(root, &requirement.command),
+        dependency_ready: profile_for_build_requirement(requirement)
+            .dependency_ready(root, &requirement.command),
         attempted: true,
         status: BuildVerifierStatus::DependencyMissing,
         primary_reason: snippet.clone(),
         output_snippet: snippet,
         compile_errors: Vec::new(),
-        foreign_toolchain: foreign_toolchain_for_requirement(root, requirement),
+        foreign_toolchain: profile_for_build_requirement(requirement)
+            .foreign_toolchain(root, requirement),
     };
     observe_requirement_lifecycle_from_before(
         root,
@@ -907,125 +929,25 @@ fn strip_ansi_sequences(value: &str) -> String {
     out
 }
 
-fn annotate_compile_error_route_binding(root: &Path, errors: &mut [CompileError]) {
+fn parse_compile_errors_for_requirement(
+    requirement: &BuildVerifierRequirement,
+    output: &str,
+) -> Vec<CompileError> {
+    let profile = profile_for_build_requirement(requirement);
+    let errors = profile.parse_compile_errors(output);
     if errors.is_empty() {
-        return;
-    }
-    let closure = crate::minimal_loop::import_scan::route_bound_closure(root, "nextjs");
-    for error in errors {
-        error.route_bound = Some(closure.contains(Path::new(&error.path)));
+        parse_compile_errors(output)
+    } else {
+        errors
     }
 }
 
 pub fn is_build_verifier_command(command: &str) -> bool {
-    let normalized = command.to_ascii_lowercase();
-    normalized == "npm run build"
-        || normalized == "npm test"
-        || normalized == "npm run test"
-        || normalized == "pnpm build"
-        || normalized == "pnpm test"
-        || normalized == "yarn build"
-        || normalized == "yarn test"
-        || normalized.starts_with("npm run build ")
-        || normalized.starts_with("npm test ")
-        || normalized.starts_with("npm run test ")
-        || normalized.starts_with("pnpm build ")
-        || normalized.starts_with("pnpm test ")
-        || normalized.starts_with("yarn build ")
-        || normalized.starts_with("yarn test ")
-        || normalized.contains("next build")
-        || normalized.contains("cargo build")
+    build_oracle_for_command(None, command).is_some()
 }
 
 pub fn requires_next_binary(command: &str) -> bool {
-    let normalized = command.to_ascii_lowercase();
-    normalized.contains("next build")
-        || normalized.contains("npm run build")
-        || normalized.contains("pnpm build")
-        || normalized.contains("yarn build")
-}
-
-fn requires_dependency_setup(command: &str) -> bool {
-    requires_next_binary(command)
-        || requires_node_test_runner(command)
-        || requires_node_dependency_probe(command)
-}
-
-fn dependency_ready(root: &Path, command: &str) -> bool {
-    if requires_next_binary(command) {
-        if requires_package_manifest(command) && !root.join("package.json").is_file() {
-            return false;
-        }
-        return dependency_setup::next_build_dependencies_ready(root);
-    }
-    if requires_node_test_runner(command) {
-        return dependency_setup::node_test_runner_bindable(root);
-    }
-    if dependency_setup::package_json_declares_dependencies(root) {
-        return dependency_setup::node_declared_dependencies_ready(root);
-    }
-    true
-}
-
-fn foreign_toolchain_for_requirement(
-    root: &Path,
-    requirement: &BuildVerifierRequirement,
-) -> Option<ForeignToolchainObservation> {
-    if !requires_next_binary(&requirement.command)
-        && !matches!(
-            requirement.profile.as_deref(),
-            Some("nextjs" | "next-js" | "next.js")
-        )
-    {
-        return None;
-    }
-    if dependency_setup::next_package_ready(root) {
-        return None;
-    }
-    let resolved = verifier_env::foreign_node_modules_bin_on_path(root, "next")?;
-    Some(ForeignToolchainObservation {
-        tool: "next".to_string(),
-        resolved_path: resolved.display().to_string(),
-        workspace_root: root.display().to_string(),
-        reason: format!(
-            "foreign_toolchain_detected: workspace node_modules/next missing; PATH would resolve next outside workspace at {}",
-            resolved.display()
-        ),
-    })
-}
-
-fn requires_package_manifest(command: &str) -> bool {
-    let normalized = command.to_ascii_lowercase();
-    normalized.starts_with("npm ")
-        || normalized.starts_with("pnpm ")
-        || normalized.starts_with("yarn ")
-}
-
-fn dependency_missing_reason(root: &Path, command: &str) -> String {
-    if requires_next_binary(command) {
-        if requires_package_manifest(command) && !root.join("package.json").is_file() {
-            return "package.json missing before Next.js build verifier".to_string();
-        }
-        dependency_setup::next_build_missing_dependency_reason(root)
-    } else if requires_node_test_runner(command) {
-        "package.json scripts.test missing before Node test verifier".to_string()
-    } else if dependency_setup::package_json_declares_dependencies(root) {
-        dependency_setup::node_declared_dependencies_missing_reason(root)
-    } else {
-        format!("dependency setup missing before `{command}`")
-    }
-}
-
-fn requires_node_test_runner(command: &str) -> bool {
-    let normalized = command.trim().to_ascii_lowercase();
-    normalized == "npm test"
-        || normalized == "npm run test"
-        || normalized == "pnpm test"
-        || normalized == "yarn test"
-        || normalized.starts_with("npm test ")
-        || normalized.starts_with("npm run test ")
-        || normalized.starts_with("pnpm test ")
-        || normalized.starts_with("yarn test ")
+    crate::planner::profile::requires_next_binary(command)
 }
 
 fn dependency_setup_requirement(
@@ -1033,52 +955,26 @@ fn dependency_setup_requirement(
     requirement: &BuildVerifierRequirement,
     setup_authority: NodeDependencySetupAuthority,
 ) -> dependency_setup::NodeDependencySetupRequirement {
-    if requires_next_binary(&requirement.command) {
-        return dependency_setup::requirement_for_next_build(
-            root,
-            requirement.profile.as_deref(),
-            &requirement.reason,
-            setup_authority,
-        );
-    }
-    if requires_node_test_runner(&requirement.command) {
-        return dependency_setup::requirement_for_node_test_runner(
-            root,
-            requirement.profile.as_deref(),
-            &requirement.reason,
-            setup_authority,
-        );
-    }
-    dependency_setup::requirement_for_node_declared_dependencies(
-        root,
-        requirement.profile.as_deref(),
-        &requirement.reason,
-        setup_authority,
-    )
+    profile_for_build_requirement(requirement)
+        .dependency_setup_requirement(root, requirement, setup_authority)
+        .unwrap_or_else(|| {
+            dependency_setup::requirement_for_node_declared_dependencies(
+                root,
+                requirement.profile.as_deref(),
+                &requirement.reason,
+                setup_authority,
+            )
+        })
 }
 
 pub fn is_dependency_missing_output(output: &str) -> bool {
-    let lower = output.to_ascii_lowercase();
-    lower.contains("command not found")
-        || lower.contains("not found")
-        || lower.contains("cannot find module")
-        || lower.contains("module not found")
-        || lower.contains("modulenotfounderror")
-        || lower.contains("can't find crate")
-        || lower.contains("no such file or directory")
+    crate::planner::profile::domain_profile("generic").dependency_missing_output(output)
+        || crate::planner::profile::domain_profile("python-cli").dependency_missing_output(output)
 }
 
 pub fn requires_node_dependency_probe(command: &str) -> bool {
     let lower = command.trim().to_ascii_lowercase();
     (lower.contains("node -e") && lower.contains("require(")) || lower.contains("npx --no-install")
-}
-
-fn node_dependency_state_ready(root: &Path, profile: Option<&str>, command: &str) -> bool {
-    if profile == Some("nextjs") || requires_next_binary(command) {
-        dependency_setup::next_build_dependencies_ready(root)
-    } else {
-        dependency_setup::node_declared_dependencies_ready(root)
-    }
 }
 
 #[cfg(test)]

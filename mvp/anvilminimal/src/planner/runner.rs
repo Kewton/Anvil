@@ -48,8 +48,9 @@ use crate::planner::lint::{
     lint_ultra_plan_report, step_plan_quality_report, step_plan_quality_warnings,
 };
 use crate::planner::profile::{
-    PhaseVerificationMode, ProfileSnapshot, profile_auto_repair, profile_before_phase,
-    profile_expected_paths, profile_generation_rules, profile_guidance, profile_post_step_repair,
+    PhaseVerificationMode, ProfileBehaviorProbeReport, ProfileSnapshot, canonical_profile_name,
+    domain_profile, profile_auto_repair, profile_before_phase, profile_expected_paths,
+    profile_generation_rules, profile_guidance, profile_post_step_repair,
     profile_quality_expectations, profile_runtime_contract, profile_setup_scaffold_paths,
     verify_profile_final, verify_profile_invariant,
 };
@@ -67,8 +68,8 @@ use crate::planner::step_plan::{
 use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
 use crate::planner::verify::{
     VerificationReport, verify_setup_dependency_state_with_setup_observed_with_offline,
-    verify_step_with_setup_observed_with_offline,
-    verify_step_with_setup_observed_with_offline_and_events,
+    verify_step_with_profile_setup_observed_with_offline,
+    verify_step_with_profile_setup_observed_with_offline_and_events,
 };
 use crate::providers::{ChatClient, model_for};
 use crate::state::SessionSnapshot;
@@ -1030,9 +1031,10 @@ fn run_step(
         });
     }
     let (mut report, mut build_lifecycles) =
-        verify_step_with_setup_observed_with_offline_and_events(
+        verify_step_with_profile_setup_observed_with_offline_and_events(
             &config.workspace_root,
             &runtime_step,
+            Some(&config.profile),
             setup_authority,
             config.offline,
             config.eval_events_path.as_deref(),
@@ -1209,13 +1211,15 @@ fn run_step(
                     });
                 }
             }
-            let (retry, retry_lifecycles) = verify_step_with_setup_observed_with_offline_and_events(
-                &config.workspace_root,
-                &runtime_step,
-                setup_authority,
-                config.offline,
-                config.eval_events_path.as_deref(),
-            );
+            let (retry, retry_lifecycles) =
+                verify_step_with_profile_setup_observed_with_offline_and_events(
+                    &config.workspace_root,
+                    &runtime_step,
+                    Some(&config.profile),
+                    setup_authority,
+                    config.offline,
+                    config.eval_events_path.as_deref(),
+                );
             apply_runtime_command_normalizations(&mut runtime_step, &retry);
             context.verify_commands = runtime_step.verify.clone();
             for lifecycle in &retry_lifecycles {
@@ -1770,12 +1774,12 @@ fn completion_contract_required(
     goal: &str,
     required_capabilities: &[String],
 ) -> bool {
-    let profile = profile.to_ascii_lowercase();
+    if domain_profile(profile).completion_contract_required(goal, required_capabilities) {
+        return true;
+    }
+    let profile = canonical_profile_name(profile);
     let goal = goal.to_ascii_lowercase();
-    let web_or_app_profile = matches!(
-        profile.as_str(),
-        "nextjs" | "next-js" | "next.js" | "vite" | "react" | "web"
-    ) || profile.contains("next");
+    let web_or_app_profile = matches!(profile.as_str(), "vite" | "react" | "web");
     let interactive_goal = [
         "interactive",
         "app",
@@ -2211,12 +2215,7 @@ fn fresh_profile_invariant_failure_evidence(
 }
 
 fn profile_missing_relative_imports(root: &Path, profile: &str) -> Vec<MissingImport> {
-    let paths = match profile {
-        "nextjs" | "next-js" | "next.js" => {
-            crate::planner::profiles::nextjs::app_source_paths(root)
-        }
-        _ => Vec::new(),
-    };
+    let paths = domain_profile(profile).source_paths(root);
     if paths.is_empty() {
         return Vec::new();
     }
@@ -3716,9 +3715,10 @@ fn confirm_phase_build_after_profile_repair(
         expected_paths: Vec::new(),
         verify: build_commands.clone(),
     };
-    let (build_report, build_lifecycles) = verify_step_with_setup_observed_with_offline(
+    let (build_report, build_lifecycles) = verify_step_with_profile_setup_observed_with_offline(
         &config.workspace_root,
         &build_step,
+        Some(&plan.profile),
         NodeDependencySetupAuthority::None,
         config.offline,
     );
@@ -4248,6 +4248,14 @@ fn ultra_final_acceptance_report(
             true,
         )
     };
+    let profile_behavior_probe = run_profile_behavior_probe(
+        config,
+        &plan.profile,
+        &plan.goal,
+        &required_capabilities,
+        &profile_report,
+    );
+    let profile_behavior_failed = profile_behavior_probe.status == "failed";
     let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
     let runtime_acceptance_status = runtime_acceptance_status(acceptance.passed, Some(&acceptance));
     let release_quality_completion =
@@ -4274,6 +4282,8 @@ fn ultra_final_acceptance_report(
         !external_contract_ok_after_runtime_arbitration(Some(*report), Some(&acceptance))
     }) {
         report.primary_reason()
+    } else if profile_behavior_failed {
+        profile_behavior_probe.reasons.join("; ")
     } else if !acceptance.passed {
         acceptance.primary_reason.clone()
     } else if matches!(release_gate.status.as_str(), "partial" | "failed") {
@@ -4356,6 +4366,9 @@ fn ultra_final_acceptance_report(
             "inconclusive_reasons": acceptance.inconclusive_reasons.clone(),
             "release_gate_status": release_gate.status.clone(),
             "release_gate_reasons": release_gate.reasons.clone(),
+            "profile_behavior_probe_status": profile_behavior_probe.status,
+            "profile_behavior_probe_reasons": profile_behavior_probe.reasons.clone(),
+            "profile_behavior_probe_evidence_path": profile_behavior_probe.evidence_path.clone().unwrap_or_default(),
             "browser_readiness_status": release_gate.browser_readiness_status.clone(),
             "browser_readiness_evidence_path": release_gate.browser_readiness_evidence_path.clone(),
             "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
@@ -4414,6 +4427,14 @@ fn ultra_final_acceptance_report(
     }
     if contract_binding_missing {
         report.push_profile_failure("completion contract binding required but missing".to_string());
+    }
+    if profile_behavior_failed {
+        for reason in &profile_behavior_probe.reasons {
+            report.push_profile_failure(reason.clone());
+        }
+        if let Some(path) = &profile_behavior_probe.evidence_path {
+            report.push_profile_failure(format!("profile behavior evidence: {path}"));
+        }
     }
     if let Some(external_report) = external_report.filter(|report| {
         !external_contract_ok_after_runtime_arbitration(Some(report), Some(&acceptance))
@@ -4822,76 +4843,7 @@ fn ultra_contract_runtime_acceptance_report(
 }
 
 fn inferred_required_capabilities(profile: &str, goal: &str) -> Vec<String> {
-    let lower = goal.to_ascii_lowercase();
-    let is_next = matches!(profile, "nextjs" | "next-js" | "next.js");
-    let mut capabilities = Vec::new();
-    let game_like = lower.contains("game")
-        || lower.contains("playable")
-        || lower.contains("canvas")
-        || lower.contains("player")
-        || lower.contains("enemy")
-        || lower.contains("enemies")
-        || lower.contains("adversary")
-        || lower.contains("opponent")
-        || lower.contains("obstacle")
-        || lower.contains("collision")
-        || lower.contains("bullet")
-        || lower.contains("lives")
-        || lower.contains("game over")
-        || goal.contains("ゲーム")
-        || goal.contains("シューティング");
-    let persistence_like = lower.contains("localstorage")
-        || lower.contains("local storage")
-        || lower.contains("storage")
-        || lower.contains("persist")
-        || lower.contains("saved")
-        || lower.contains("save")
-        || goal.contains("ローカルストレージ")
-        || goal.contains("保存");
-    let interactive_app_like = lower.contains("button")
-        || lower.contains("form")
-        || lower.contains("keyboard")
-        || lower.contains("input")
-        || lower.contains("interactive")
-        || lower.contains("score")
-        || lower.contains("todo")
-        || lower.contains("markdown")
-        || lower.contains("note")
-        || lower.contains("notes")
-        || lower.contains("editor")
-        || lower.contains("edit")
-        || lower.contains("delete")
-        || lower.contains("filter")
-        || lower.contains("preview")
-        || persistence_like
-        || goal.contains("操作")
-        || goal.contains("追加")
-        || goal.contains("完了")
-        || goal.contains("削除")
-        || goal.contains("フィルタ")
-        || goal.contains("編集")
-        || goal.contains("一覧")
-        || goal.contains("プレビュー")
-        || goal.contains("入力");
-    if is_next && game_like {
-        merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
-        merge_unique_strings(&mut capabilities, &["start_or_restart_flow".to_string()]);
-        merge_unique_strings(&mut capabilities, &["player_control".to_string()]);
-        merge_unique_strings(&mut capabilities, &["adversary_or_challenge".to_string()]);
-        merge_unique_strings(&mut capabilities, &["progression_or_score".to_string()]);
-        merge_unique_strings(
-            &mut capabilities,
-            &["failure_or_collision_rule".to_string()],
-        );
-    } else if is_next && interactive_app_like {
-        merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
-        merge_unique_strings(&mut capabilities, &["user_input_or_action".to_string()]);
-        merge_unique_strings(&mut capabilities, &["visible_state_change".to_string()]);
-        if persistence_like {
-            merge_unique_strings(&mut capabilities, &["persistence".to_string()]);
-        }
-    }
-    capabilities
+    domain_profile(profile).infer_required_capabilities(goal)
 }
 
 fn inferred_required_evidence(
@@ -4899,25 +4851,7 @@ fn inferred_required_evidence(
     goal: &str,
     required_capabilities: &[String],
 ) -> Vec<String> {
-    let mut evidence = Vec::new();
-    let lower = goal.to_ascii_lowercase();
-    let is_next = matches!(profile, "nextjs" | "next-js" | "next.js");
-    let app_like_goal = lower.contains("app")
-        || lower.contains("game")
-        || lower.contains("interactive")
-        || lower.contains("ui")
-        || goal.contains("アプリ")
-        || goal.contains("ゲーム")
-        || !required_capabilities.is_empty();
-    if is_next && app_like_goal {
-        merge_unique_strings(
-            &mut evidence,
-            &[
-                "nextjs_route_evidence".to_string(),
-                "build_command_or_dependency_missing_boundary".to_string(),
-            ],
-        );
-    }
+    let mut evidence = domain_profile(profile).infer_required_evidence(goal, required_capabilities);
     for capability in required_capabilities {
         merge_unique_strings(&mut evidence, &required_evidence_for_capability(capability));
     }
@@ -4929,8 +4863,13 @@ fn inferred_required_obligations(
     goal: &str,
     required_capabilities: &[String],
 ) -> Vec<String> {
+    let profile_obligations =
+        domain_profile(profile).infer_required_obligations(goal, required_capabilities);
+    if !profile_obligations.is_empty() {
+        return profile_obligations;
+    }
     let lower = goal.to_ascii_lowercase();
-    let is_app_profile = matches!(profile, "nextjs" | "next-js" | "next.js" | "web" | "vite");
+    let is_app_profile = matches!(canonical_profile_name(profile).as_str(), "web" | "vite");
     let app_like_goal = lower.contains("app")
         || lower.contains("game")
         || lower.contains("interactive")
@@ -4969,6 +4908,59 @@ struct ReleaseGateSummary {
     browser_readiness_evidence_path: String,
     interaction_evidence_status: String,
     interaction_evidence_path: String,
+}
+
+fn run_profile_behavior_probe(
+    config: &Config,
+    profile: &str,
+    goal: &str,
+    required_capabilities: &[String],
+    profile_report: &VerificationReport,
+) -> ProfileBehaviorProbeReport {
+    if !profile_report.is_pass() {
+        return ProfileBehaviorProbeReport::pass();
+    }
+    match domain_profile(profile).behavior_probe(
+        &config.workspace_root,
+        goal,
+        required_capabilities,
+        config.offline,
+    ) {
+        Ok(report) => {
+            emit_profile_behavior_probe_event(config, profile, &report);
+            report
+        }
+        Err(err) => {
+            let report = ProfileBehaviorProbeReport {
+                status: "failed",
+                reasons: vec![format!("profile_behavior_probe_error: {err}")],
+                evidence_path: None,
+            };
+            emit_profile_behavior_probe_event(config, profile, &report);
+            report
+        }
+    }
+}
+
+fn emit_profile_behavior_probe_event(
+    config: &Config,
+    profile: &str,
+    report: &ProfileBehaviorProbeReport,
+) {
+    if report.status == "pass" && report.reasons.is_empty() && report.evidence_path.is_none() {
+        return;
+    }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "profile_behavior_probe",
+            "profile": profile,
+            "status": report.status,
+            "ok": report.status == "pass",
+            "reasons": report.reasons.clone(),
+            "evidence_path": report.evidence_path.clone().unwrap_or_default(),
+        }),
+    );
 }
 
 fn production_build_failed_release_gate() -> ReleaseGateSummary {
@@ -13268,6 +13260,144 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         assert!(event_text.contains("\"event\":\"final_acceptance_repair_complete\""));
         assert!(!event_text.contains("\"event\":\"profile_repair_complete\""));
         assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
+    }
+
+    #[test]
+    fn ultra_plan_python_cli_profile_runs_compile_repair_and_behavior_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "python-cli".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let scaffold_plan = r#"{"goal":"Scaffold Python CLI","steps":[{"id":"scaffold","kind":"setup","expected_result":"pass","instruction":"Create pyproject.toml and src/echo_cli/main.py","expected_paths":["pyproject.toml","src/echo_cli/main.py"],"verify":[]}]}"#;
+        let deps_plan = r#"{"goal":"Prepare Python CLI dependencies","steps":[{"id":"deps","kind":"verify","expected_result":"pass","instruction":"Verify dependency readiness and syntax","expected_paths":["pyproject.toml","src/echo_cli/main.py"],"verify":["python -m compileall -q src"]}]}"#;
+        let implement_plan = r#"{"goal":"Implement Python CLI behavior","steps":[{"id":"implement","kind":"implement","expected_result":"pass","instruction":"Implement the CLI so output changes with stdin","expected_paths":["src/echo_cli/main.py"],"verify":["python -m compileall -q src"]}]}"#;
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(scaffold_plan),
+            AssistantReply::text(deps_plan),
+            AssistantReply::text(implement_plan),
+        ]);
+        let pyproject = r#"[project]
+name = "echo-cli"
+version = "0.1.0"
+
+[project.scripts]
+echo-cli = "echo_cli.main:main"
+"#;
+        let valid_cli = r#"#!/usr/bin/env python3
+import sys
+
+def main() -> None:
+    text = sys.stdin.read().strip()
+    if not text:
+        text = "empty"
+    print(f"echo:{text}")
+
+if __name__ == "__main__":
+    main()
+"#;
+        let invalid_cli = r#"#!/usr/bin/env python3
+import sys
+
+def main() -> None:
+    text = sys.stdin.read().strip()
+    if text print(text)
+
+if __name__ == "__main__":
+    main()
+"#;
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"pyproject.toml","content":pyproject}),
+                    ),
+                    crate::state::ToolCall::new(
+                        "Write",
+                        serde_json::json!({"path":"src/echo_cli/main.py","content":valid_cli}),
+                    ),
+                ],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("dependency verification complete"),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/echo_cli/main.py","content":invalid_cli}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/echo_cli/main.py","content":valid_cli}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/echo_cli/main.py","content":valid_cli}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/echo_cli/main.py","content":valid_cli}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+        let plan = UltraPlan {
+            goal: "Build a Python CLI that echoes changed input".to_string(),
+            profile: "python-cli".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "scaffold".to_string(),
+                    prompt: "Scaffold the Python CLI".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "deps".to_string(),
+                    prompt: "Prepare dependencies".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "implement".to_string(),
+                    prompt: "Implement CLI behavior".to_string(),
+                },
+            ],
+        };
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 3 phases");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"step_verify_failure\""));
+        assert!(event_text.contains("implementation_compile_error"));
+        assert!(event_text.contains("\"event\":\"step_verify_repair\""));
+        assert!(event_text.contains("\"event\":\"profile_behavior_probe\""));
+        assert!(event_text.contains("\"profile\":\"python-cli\""));
+        assert!(event_text.contains("\"profile_behavior_probe_status\":\"pass\""));
+        let behavior =
+            std::fs::read_to_string(dir.path().join(".anvil/evidence/python-cli-behavior.json"))
+                .unwrap();
+        assert!(
+            behavior.contains("\"changed_by_input\": true"),
+            "{behavior}"
+        );
     }
 
     #[test]

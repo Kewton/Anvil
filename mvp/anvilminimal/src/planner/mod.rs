@@ -10,6 +10,7 @@ pub mod verify;
 pub mod profiles {
     pub mod data;
     pub mod nextjs;
+    pub mod python_cli;
 }
 
 pub use runner::{

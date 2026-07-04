@@ -292,6 +292,23 @@ pub fn verify_step_with_setup_observed_with_offline(
     )
 }
 
+pub fn verify_step_with_profile_setup_observed_with_offline(
+    root: &Path,
+    step: &PlanStep,
+    profile: Option<&str>,
+    setup_authority: NodeDependencySetupAuthority,
+    offline: bool,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+    verify_step_with_profile_setup_observed_with_offline_and_events(
+        root,
+        step,
+        profile,
+        setup_authority,
+        offline,
+        None,
+    )
+}
+
 pub fn verify_step_with_setup_observed_with_offline_and_events(
     root: &Path,
     step: &PlanStep,
@@ -299,9 +316,28 @@ pub fn verify_step_with_setup_observed_with_offline_and_events(
     offline: bool,
     eval_events_path: Option<&Path>,
 ) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+    verify_step_with_profile_setup_observed_with_offline_and_events(
+        root,
+        step,
+        None,
+        setup_authority,
+        offline,
+        eval_events_path,
+    )
+}
+
+pub fn verify_step_with_profile_setup_observed_with_offline_and_events(
+    root: &Path,
+    step: &PlanStep,
+    profile: Option<&str>,
+    setup_authority: NodeDependencySetupAuthority,
+    offline: bool,
+    eval_events_path: Option<&Path>,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
     verify_step_with_setup_observed_with_options(
         root,
         step,
+        profile,
         setup_authority,
         Path::new("npm"),
         offline,
@@ -385,6 +421,7 @@ fn verify_setup_dependency_state_with_setup_observed_inner(
 fn verify_step_with_setup_observed_with_options(
     root: &Path,
     step: &PlanStep,
+    profile: Option<&str>,
     setup_authority: NodeDependencySetupAuthority,
     npm_program: &Path,
     offline: bool,
@@ -406,7 +443,7 @@ fn verify_step_with_setup_observed_with_options(
         }
         if let Some(requirement) = build_verifier::requirement_from_deferred(
             command,
-            build_verifier_profile(command),
+            build_verifier_profile(profile, command),
             "step verify requires build lifecycle",
             setup_authority.as_str(),
             "required",
@@ -430,7 +467,7 @@ fn verify_step_with_setup_observed_with_options(
             && let Some(requirement) = build_verifier::requirement_from_dependency_state(
                 root,
                 command,
-                build_verifier_profile(command),
+                build_verifier_profile(profile, command),
                 "step verify requires dependency setup before command execution",
                 setup_authority.as_str(),
                 "required",
@@ -480,7 +517,7 @@ fn verify_step_with_setup_observed_with_options(
                         let requirement =
                             build_verifier::requirement_from_dependency_missing_output(
                                 command,
-                                build_verifier_profile(command),
+                                build_verifier_profile(profile, command),
                                 "verify command failed with dependency-missing output",
                                 setup_authority.as_str(),
                                 "required",
@@ -1334,22 +1371,16 @@ fn contains_shell_control_syntax(command: &str) -> bool {
     }) || command.contains("$(")
 }
 
-fn is_nextjs_build_command(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    lower == "npm run build"
-        || lower.starts_with("npm run build ")
-        || lower.contains("next build")
-        || lower == "pnpm build"
-        || lower.starts_with("pnpm build ")
-        || lower == "yarn build"
-        || lower.starts_with("yarn build ")
-}
-
-fn build_verifier_profile(command: &str) -> Option<&'static str> {
-    if is_nextjs_build_command(command) {
-        Some("nextjs")
-    } else {
-        None
+fn build_verifier_profile<'a>(profile: Option<&'a str>, command: &str) -> Option<&'a str> {
+    if let Some(profile) = profile
+        && crate::planner::profile::build_oracle_for_command(Some(profile), command).is_some()
+    {
+        return Some(profile);
+    }
+    let (_, oracle) = crate::planner::profile::build_oracle_for_command(None, command)?;
+    match oracle.profile.as_deref() {
+        Some("nextjs") => Some("nextjs"),
+        _ => None,
     }
 }
 
@@ -1827,6 +1858,7 @@ mod tests {
         let (report, lifecycles) = verify_step_with_setup_observed_with_options(
             dir.path(),
             &step,
+            None,
             NodeDependencySetupAuthority::PlanSetupStep,
             &fake_npm,
             false,
@@ -1877,6 +1909,7 @@ mod tests {
         let (initial_report, initial_lifecycles) = verify_step_with_setup_observed_with_options(
             dir.path(),
             &step,
+            None,
             NodeDependencySetupAuthority::PlanSetupStep,
             &fake_npm,
             false,

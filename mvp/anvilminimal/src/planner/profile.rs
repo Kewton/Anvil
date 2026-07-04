@@ -1,5 +1,12 @@
 use std::path::Path;
 
+use crate::minimal_loop::build_verifier::{
+    BuildVerifierRequirement, CompileError, ForeignToolchainObservation,
+};
+use crate::minimal_loop::dependency_setup::{
+    self, NodeDependencySetupAuthority, NodeDependencySetupRequirement,
+};
+use crate::minimal_loop::evidence::required_evidence_for_capability;
 use crate::planner::verify::VerificationReport;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -22,16 +29,676 @@ pub enum PhaseVerificationMode {
     FinalAcceptance,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileBuildOracle {
+    pub command: String,
+    pub profile: Option<String>,
+    pub requires_dependency_setup: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileBehaviorProbeReport {
+    pub status: &'static str,
+    pub reasons: Vec<String>,
+    pub evidence_path: Option<String>,
+}
+
+impl ProfileBehaviorProbeReport {
+    pub fn pass() -> Self {
+        Self {
+            status: "pass",
+            reasons: Vec::new(),
+            evidence_path: None,
+        }
+    }
+}
+
+pub trait DomainProfile: Sync {
+    fn id(&self) -> &'static str;
+
+    fn matches(&self, profile: &str) -> bool {
+        canonical_profile_name(profile) == self.id()
+    }
+
+    fn expected_scaffold_paths(&self, _root: &Path, _goal: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn setup_scaffold_paths(&self, _root: &Path) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn verify_final(&self, _root: &Path, _goal: &str) -> VerificationReport {
+        VerificationReport::pass()
+    }
+
+    fn verify_invariant(
+        &self,
+        _root: &Path,
+        _goal: &str,
+        _snapshot: &ProfileSnapshot,
+    ) -> VerificationReport {
+        VerificationReport::pass()
+    }
+
+    fn before_phase(&self, _root: &Path) -> anyhow::Result<ProfileSnapshot> {
+        Ok(ProfileSnapshot::None)
+    }
+
+    fn after_phase(&self, _root: &Path, _snapshot: &ProfileSnapshot) -> VerificationReport {
+        VerificationReport::pass()
+    }
+
+    fn guidance(&self, _goal: &str) -> Option<String> {
+        None
+    }
+
+    fn runtime_contract(&self, _intent: &str, _goal: &str) -> String {
+        "- Keep changes scoped to the current phase and workspace.".to_string()
+    }
+
+    fn generation_rules(&self, _intent: &str) -> Option<&'static str> {
+        None
+    }
+
+    fn quality_expectations(&self, _root: &Path, _goal: &str) -> ProfileQualityExpectations {
+        ProfileQualityExpectations::default()
+    }
+
+    fn repair_prompt(
+        &self,
+        _root: &Path,
+        _goal: &str,
+        _report: &VerificationReport,
+    ) -> Option<String> {
+        None
+    }
+
+    fn deterministic_repair(
+        &self,
+        _root: &Path,
+        _goal: &str,
+        _report: &VerificationReport,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn post_step_repair(&self, _root: &Path, _goal: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn build_oracle(&self, _command: &str) -> Option<ProfileBuildOracle> {
+        None
+    }
+
+    fn dependency_ready(&self, _root: &Path, _command: &str) -> bool {
+        true
+    }
+
+    fn dependency_missing_reason(&self, _root: &Path, command: &str) -> String {
+        format!("dependency setup missing before `{command}`")
+    }
+
+    fn dependency_setup_requirement(
+        &self,
+        _root: &Path,
+        _requirement: &BuildVerifierRequirement,
+        _setup_authority: NodeDependencySetupAuthority,
+    ) -> Option<NodeDependencySetupRequirement> {
+        None
+    }
+
+    fn dependency_missing_output(&self, _output: &str) -> bool {
+        false
+    }
+
+    fn parse_compile_errors(&self, _output: &str) -> Vec<CompileError> {
+        Vec::new()
+    }
+
+    fn annotate_compile_errors(&self, _root: &Path, _errors: &mut [CompileError]) {}
+
+    fn foreign_toolchain(
+        &self,
+        _root: &Path,
+        _requirement: &BuildVerifierRequirement,
+    ) -> Option<ForeignToolchainObservation> {
+        None
+    }
+
+    fn source_paths(&self, _root: &Path) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn infer_required_capabilities(&self, _goal: &str) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn infer_required_evidence(
+        &self,
+        _goal: &str,
+        _required_capabilities: &[String],
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn infer_required_obligations(
+        &self,
+        _goal: &str,
+        _required_capabilities: &[String],
+    ) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn completion_contract_required(&self, _goal: &str, _required_capabilities: &[String]) -> bool {
+        false
+    }
+
+    fn behavior_probe(
+        &self,
+        _root: &Path,
+        _goal: &str,
+        _required_capabilities: &[String],
+        _offline: bool,
+    ) -> anyhow::Result<ProfileBehaviorProbeReport> {
+        Ok(ProfileBehaviorProbeReport::pass())
+    }
+}
+
+pub struct NextjsProfile;
+pub struct DataProfile;
+pub struct GenericProfile;
+
+static NEXTJS_PROFILE: NextjsProfile = NextjsProfile;
+static DATA_PROFILE: DataProfile = DataProfile;
+static PYTHON_CLI_PROFILE: crate::planner::profiles::python_cli::PythonCliProfile =
+    crate::planner::profiles::python_cli::PythonCliProfile;
+static GENERIC_PROFILE: GenericProfile = GenericProfile;
+
+impl DomainProfile for NextjsProfile {
+    fn id(&self) -> &'static str {
+        "nextjs"
+    }
+
+    fn matches(&self, profile: &str) -> bool {
+        matches!(canonical_profile_name(profile).as_str(), "nextjs")
+    }
+
+    fn expected_scaffold_paths(&self, root: &Path, goal: &str) -> Vec<String> {
+        crate::planner::profiles::nextjs::expected_paths(root, goal)
+    }
+
+    fn setup_scaffold_paths(&self, root: &Path) -> Vec<String> {
+        crate::planner::profiles::nextjs::setup_scaffold_paths(root)
+    }
+
+    fn verify_final(&self, root: &Path, goal: &str) -> VerificationReport {
+        crate::planner::profiles::nextjs::verify(root, goal)
+    }
+
+    fn verify_invariant(
+        &self,
+        root: &Path,
+        goal: &str,
+        _snapshot: &ProfileSnapshot,
+    ) -> VerificationReport {
+        crate::planner::profiles::nextjs::verify_invariant(root, goal)
+    }
+
+    fn guidance(&self, goal: &str) -> Option<String> {
+        Some(crate::planner::profiles::nextjs::guidance(goal))
+    }
+
+    fn runtime_contract(&self, intent: &str, goal: &str) -> String {
+        crate::planner::profiles::nextjs::runtime_contract(intent, goal)
+    }
+
+    fn generation_rules(&self, intent: &str) -> Option<&'static str> {
+        Some(crate::planner::profiles::nextjs::generation_rules(intent))
+    }
+
+    fn quality_expectations(&self, root: &Path, goal: &str) -> ProfileQualityExpectations {
+        crate::planner::profiles::nextjs::quality_expectations(root, goal)
+    }
+
+    fn repair_prompt(
+        &self,
+        root: &Path,
+        goal: &str,
+        report: &VerificationReport,
+    ) -> Option<String> {
+        Some(crate::planner::profiles::nextjs::repair_prompt(
+            root, goal, report,
+        ))
+    }
+
+    fn deterministic_repair(
+        &self,
+        root: &Path,
+        goal: &str,
+        report: &VerificationReport,
+    ) -> anyhow::Result<bool> {
+        crate::planner::profiles::nextjs::auto_repair(root, goal, report)
+    }
+
+    fn post_step_repair(&self, root: &Path, goal: &str) -> anyhow::Result<bool> {
+        crate::planner::profiles::nextjs::repair_manifest_coherence(root, goal)
+    }
+
+    fn build_oracle(&self, command: &str) -> Option<ProfileBuildOracle> {
+        is_nextjs_build_command(command).then(|| ProfileBuildOracle {
+            command: command.to_string(),
+            profile: Some(self.id().to_string()),
+            requires_dependency_setup: true,
+        })
+    }
+
+    fn dependency_ready(&self, root: &Path, command: &str) -> bool {
+        if requires_next_binary(command) {
+            if requires_package_manifest(command) && !root.join("package.json").is_file() {
+                return false;
+            }
+            dependency_setup::next_build_dependencies_ready(root)
+        } else {
+            true
+        }
+    }
+
+    fn dependency_missing_reason(&self, root: &Path, command: &str) -> String {
+        if requires_package_manifest(command) && !root.join("package.json").is_file() {
+            return "package.json missing before Next.js build verifier".to_string();
+        }
+        dependency_setup::next_build_missing_dependency_reason(root)
+    }
+
+    fn dependency_setup_requirement(
+        &self,
+        root: &Path,
+        requirement: &BuildVerifierRequirement,
+        setup_authority: NodeDependencySetupAuthority,
+    ) -> Option<NodeDependencySetupRequirement> {
+        Some(dependency_setup::requirement_for_next_build(
+            root,
+            requirement.profile.as_deref(),
+            &requirement.reason,
+            setup_authority,
+        ))
+    }
+
+    fn dependency_missing_output(&self, output: &str) -> bool {
+        generic_dependency_missing_output(output)
+    }
+
+    fn annotate_compile_errors(&self, root: &Path, errors: &mut [CompileError]) {
+        let closure = crate::minimal_loop::import_scan::route_bound_closure(root, self.id());
+        for error in errors {
+            error.route_bound = Some(closure.contains(Path::new(&error.path)));
+        }
+    }
+
+    fn foreign_toolchain(
+        &self,
+        root: &Path,
+        requirement: &BuildVerifierRequirement,
+    ) -> Option<ForeignToolchainObservation> {
+        if !requires_next_binary(&requirement.command) {
+            return None;
+        }
+        if dependency_setup::next_package_ready(root) {
+            return None;
+        }
+        let resolved =
+            crate::minimal_loop::verifier_env::foreign_node_modules_bin_on_path(root, "next")?;
+        Some(ForeignToolchainObservation {
+            tool: "next".to_string(),
+            resolved_path: resolved.display().to_string(),
+            workspace_root: root.display().to_string(),
+            reason: format!(
+                "foreign_toolchain_detected: workspace node_modules/next missing; PATH would resolve next outside workspace at {}",
+                resolved.display()
+            ),
+        })
+    }
+
+    fn source_paths(&self, root: &Path) -> Vec<String> {
+        crate::planner::profiles::nextjs::app_source_paths(root)
+    }
+
+    fn infer_required_capabilities(&self, goal: &str) -> Vec<String> {
+        let lower = goal.to_ascii_lowercase();
+        let mut capabilities = Vec::new();
+        let game_like = lower.contains("game")
+            || lower.contains("playable")
+            || lower.contains("canvas")
+            || lower.contains("player")
+            || lower.contains("enemy")
+            || lower.contains("enemies")
+            || lower.contains("adversary")
+            || lower.contains("opponent")
+            || lower.contains("obstacle")
+            || lower.contains("collision")
+            || lower.contains("bullet")
+            || lower.contains("lives")
+            || lower.contains("game over")
+            || goal.contains("ゲーム")
+            || goal.contains("シューティング");
+        let persistence_like = lower.contains("localstorage")
+            || lower.contains("local storage")
+            || lower.contains("storage")
+            || lower.contains("persist")
+            || lower.contains("saved")
+            || lower.contains("save")
+            || goal.contains("ローカルストレージ")
+            || goal.contains("保存");
+        let interactive_app_like = lower.contains("button")
+            || lower.contains("form")
+            || lower.contains("keyboard")
+            || lower.contains("input")
+            || lower.contains("interactive")
+            || lower.contains("score")
+            || lower.contains("todo")
+            || lower.contains("markdown")
+            || lower.contains("note")
+            || lower.contains("notes")
+            || lower.contains("editor")
+            || lower.contains("edit")
+            || lower.contains("delete")
+            || lower.contains("filter")
+            || lower.contains("preview")
+            || persistence_like
+            || goal.contains("操作")
+            || goal.contains("追加")
+            || goal.contains("完了")
+            || goal.contains("削除")
+            || goal.contains("フィルタ")
+            || goal.contains("編集")
+            || goal.contains("一覧")
+            || goal.contains("プレビュー")
+            || goal.contains("入力");
+        if game_like {
+            merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
+            merge_unique_strings(&mut capabilities, &["start_or_restart_flow".to_string()]);
+            merge_unique_strings(&mut capabilities, &["player_control".to_string()]);
+            merge_unique_strings(&mut capabilities, &["adversary_or_challenge".to_string()]);
+            merge_unique_strings(&mut capabilities, &["progression_or_score".to_string()]);
+            merge_unique_strings(
+                &mut capabilities,
+                &["failure_or_collision_rule".to_string()],
+            );
+        } else if interactive_app_like {
+            merge_unique_strings(&mut capabilities, &["stateful_interaction".to_string()]);
+            merge_unique_strings(&mut capabilities, &["user_input_or_action".to_string()]);
+            merge_unique_strings(&mut capabilities, &["visible_state_change".to_string()]);
+            if persistence_like {
+                merge_unique_strings(&mut capabilities, &["persistence".to_string()]);
+            }
+        }
+        capabilities
+    }
+
+    fn infer_required_evidence(&self, goal: &str, required_capabilities: &[String]) -> Vec<String> {
+        let mut evidence = Vec::new();
+        let lower = goal.to_ascii_lowercase();
+        let app_like_goal = lower.contains("app")
+            || lower.contains("game")
+            || lower.contains("interactive")
+            || lower.contains("ui")
+            || goal.contains("アプリ")
+            || goal.contains("ゲーム")
+            || !required_capabilities.is_empty();
+        if app_like_goal {
+            merge_unique_strings(
+                &mut evidence,
+                &[
+                    "nextjs_route_evidence".to_string(),
+                    "build_command_or_dependency_missing_boundary".to_string(),
+                ],
+            );
+        }
+        for capability in required_capabilities {
+            merge_unique_strings(&mut evidence, &required_evidence_for_capability(capability));
+        }
+        evidence
+    }
+
+    fn infer_required_obligations(
+        &self,
+        goal: &str,
+        required_capabilities: &[String],
+    ) -> Vec<String> {
+        let lower = goal.to_ascii_lowercase();
+        let app_like_goal = lower.contains("app")
+            || lower.contains("game")
+            || lower.contains("interactive")
+            || lower.contains("ui")
+            || goal.contains("アプリ")
+            || goal.contains("ゲーム");
+        if app_like_goal || !required_capabilities.is_empty() {
+            return vec!["implementation".to_string()];
+        }
+        Vec::new()
+    }
+
+    fn completion_contract_required(&self, goal: &str, required_capabilities: &[String]) -> bool {
+        let goal = goal.to_ascii_lowercase();
+        let interactive_goal = [
+            "interactive",
+            "app",
+            "game",
+            "playable",
+            "browser",
+            "canvas",
+            "keyboard",
+            "player",
+            "enemy",
+            "collision",
+            "ゲーム",
+        ]
+        .iter()
+        .any(|needle| goal.contains(needle));
+        let interactive_capability = required_capabilities.iter().any(|capability| {
+            matches!(
+                capability.as_str(),
+                "stateful_interaction"
+                    | "start_or_restart_flow"
+                    | "player_control"
+                    | "adversary_or_challenge"
+                    | "progression_or_score"
+                    | "failure_or_collision_rule"
+                    | "persistence"
+                    | "browser_interaction"
+                    | "playable_ui"
+            )
+        });
+        interactive_capability || interactive_goal
+    }
+}
+
+impl DomainProfile for DataProfile {
+    fn id(&self) -> &'static str {
+        "data"
+    }
+
+    fn matches(&self, profile: &str) -> bool {
+        matches!(
+            canonical_profile_name(profile).as_str(),
+            "data" | "data-analysis" | "data-pipeline"
+        )
+    }
+
+    fn verify_final(&self, root: &Path, _goal: &str) -> VerificationReport {
+        crate::planner::profiles::data::verify(root)
+    }
+
+    fn before_phase(&self, root: &Path) -> anyhow::Result<ProfileSnapshot> {
+        Ok(ProfileSnapshot::Data(
+            crate::planner::profiles::data::before_phase(root)?,
+        ))
+    }
+
+    fn after_phase(&self, root: &Path, snapshot: &ProfileSnapshot) -> VerificationReport {
+        match snapshot {
+            ProfileSnapshot::Data(snapshot) => {
+                crate::planner::profiles::data::after_phase(root, snapshot)
+            }
+            _ => VerificationReport::pass(),
+        }
+    }
+
+    fn runtime_contract(&self, _intent: &str, _goal: &str) -> String {
+        "- Preserve raw input data.\n\
+- Write derived outputs to explicit output artifacts.\n\
+- Use deterministic checks for generated files when practical."
+            .to_string()
+    }
+}
+
+impl DomainProfile for GenericProfile {
+    fn id(&self) -> &'static str {
+        "generic"
+    }
+
+    fn matches(&self, _profile: &str) -> bool {
+        true
+    }
+
+    fn runtime_contract(&self, _intent: &str, _goal: &str) -> String {
+        "- Keep changes scoped to the current phase and workspace.".to_string()
+    }
+
+    fn generation_rules(&self, profile: &str) -> Option<&'static str> {
+        match profile {
+            "rust" => Some(
+                "- Profile rust: preserve Cargo project semantics. Keep Cargo.toml before cargo check/test verification, do not weaken scripts or tests to hide failures, and end with cargo check or cargo test when practical.\n",
+            ),
+            "python" => Some(
+                "- Profile python: keep dependency setup separate from deterministic verification. Prefer python -m py_compile, pytest, or unittest checks after source files exist. Do not put package installation in verify commands.\n",
+            ),
+            _ => None,
+        }
+    }
+
+    fn build_oracle(&self, command: &str) -> Option<ProfileBuildOracle> {
+        let lower = command.trim().to_ascii_lowercase();
+        let recognized = requires_node_test_runner(command)
+            || requires_node_dependency_probe(command)
+            || lower == "cargo build"
+            || lower.starts_with("cargo build ");
+        recognized.then(|| ProfileBuildOracle {
+            command: command.to_string(),
+            profile: None,
+            requires_dependency_setup: requires_node_test_runner(command)
+                || requires_node_dependency_probe(command),
+        })
+    }
+
+    fn dependency_ready(&self, root: &Path, command: &str) -> bool {
+        if requires_node_test_runner(command) {
+            dependency_setup::node_test_runner_bindable(root)
+        } else if dependency_setup::package_json_declares_dependencies(root) {
+            dependency_setup::node_declared_dependencies_ready(root)
+        } else {
+            true
+        }
+    }
+
+    fn dependency_missing_reason(&self, root: &Path, command: &str) -> String {
+        if requires_node_test_runner(command) {
+            "package.json scripts.test missing before Node test verifier".to_string()
+        } else if dependency_setup::package_json_declares_dependencies(root) {
+            dependency_setup::node_declared_dependencies_missing_reason(root)
+        } else {
+            format!("dependency setup missing before `{command}`")
+        }
+    }
+
+    fn dependency_setup_requirement(
+        &self,
+        root: &Path,
+        requirement: &BuildVerifierRequirement,
+        setup_authority: NodeDependencySetupAuthority,
+    ) -> Option<NodeDependencySetupRequirement> {
+        if requires_node_test_runner(&requirement.command) {
+            return Some(dependency_setup::requirement_for_node_test_runner(
+                root,
+                requirement.profile.as_deref(),
+                &requirement.reason,
+                setup_authority,
+            ));
+        }
+        Some(
+            dependency_setup::requirement_for_node_declared_dependencies(
+                root,
+                requirement.profile.as_deref(),
+                &requirement.reason,
+                setup_authority,
+            ),
+        )
+    }
+
+    fn dependency_missing_output(&self, output: &str) -> bool {
+        generic_dependency_missing_output(output)
+    }
+}
+
+pub fn domain_profile(profile: &str) -> &'static dyn DomainProfile {
+    if NEXTJS_PROFILE.matches(profile) {
+        &NEXTJS_PROFILE
+    } else if PYTHON_CLI_PROFILE.matches(profile) {
+        &PYTHON_CLI_PROFILE
+    } else if DATA_PROFILE.matches(profile) {
+        &DATA_PROFILE
+    } else {
+        &GENERIC_PROFILE
+    }
+}
+
+pub fn build_oracle_for_command(
+    profile: Option<&str>,
+    command: &str,
+) -> Option<(&'static dyn DomainProfile, ProfileBuildOracle)> {
+    if let Some(profile_name) = profile {
+        let profile = domain_profile(profile_name);
+        if let Some(oracle) = profile.build_oracle(command) {
+            return Some((profile, oracle));
+        }
+    }
+    for profile in [
+        &NEXTJS_PROFILE as &'static dyn DomainProfile,
+        &GENERIC_PROFILE as &'static dyn DomainProfile,
+    ] {
+        if let Some(oracle) = profile.build_oracle(command) {
+            return Some((profile, oracle));
+        }
+    }
+    None
+}
+
+pub fn profile_for_build_requirement(
+    requirement: &BuildVerifierRequirement,
+) -> &'static dyn DomainProfile {
+    if let Some(profile) = requirement.profile.as_deref() {
+        return domain_profile(profile);
+    }
+    build_oracle_for_command(None, &requirement.command)
+        .map(|(profile, _)| profile)
+        .unwrap_or(&GENERIC_PROFILE)
+}
+
+pub fn canonical_profile_name(profile: &str) -> String {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "next-js" | "next.js" => "nextjs".to_string(),
+        "python" | "python-cli" | "py-cli" | "py" => "python-cli".to_string(),
+        other => other.to_string(),
+    }
+}
+
 pub fn verify_profile(root: &Path, profile: &str, goal: &str) -> VerificationReport {
     verify_profile_final(root, profile, goal)
 }
 
 pub fn verify_profile_final(root: &Path, profile: &str, goal: &str) -> VerificationReport {
-    match profile {
-        "nextjs" | "next-js" | "next.js" => crate::planner::profiles::nextjs::verify(root, goal),
-        "data" | "data-analysis" | "data-pipeline" => crate::planner::profiles::data::verify(root),
-        _ => VerificationReport::pass(),
-    }
+    domain_profile(profile).verify_final(root, goal)
 }
 
 pub fn verify_profile_invariant(
@@ -40,25 +707,16 @@ pub fn verify_profile_invariant(
     goal: &str,
     snapshot: &ProfileSnapshot,
 ) -> VerificationReport {
-    let snapshot_report = profile_after_phase(root, profile, snapshot);
+    let profile_impl = domain_profile(profile);
+    let snapshot_report = profile_impl.after_phase(root, snapshot);
     if !snapshot_report.is_pass() {
         return snapshot_report;
     }
-    match profile {
-        "nextjs" | "next-js" | "next.js" => {
-            crate::planner::profiles::nextjs::verify_invariant(root, goal)
-        }
-        _ => VerificationReport::pass(),
-    }
+    profile_impl.verify_invariant(root, goal, snapshot)
 }
 
 pub fn profile_before_phase(root: &Path, profile: &str) -> anyhow::Result<ProfileSnapshot> {
-    match profile {
-        "data" | "data-analysis" | "data-pipeline" => Ok(ProfileSnapshot::Data(
-            crate::planner::profiles::data::before_phase(root)?,
-        )),
-        _ => Ok(ProfileSnapshot::None),
-    }
+    domain_profile(profile).before_phase(root)
 }
 
 pub fn profile_after_phase(
@@ -66,26 +724,15 @@ pub fn profile_after_phase(
     profile: &str,
     snapshot: &ProfileSnapshot,
 ) -> VerificationReport {
-    match (profile, snapshot) {
-        ("data" | "data-analysis" | "data-pipeline", ProfileSnapshot::Data(snapshot)) => {
-            crate::planner::profiles::data::after_phase(root, snapshot)
-        }
-        _ => VerificationReport::pass(),
-    }
+    domain_profile(profile).after_phase(root, snapshot)
 }
 
 pub fn profile_guidance(profile: &str, goal: &str) -> Option<String> {
-    match profile {
-        "nextjs" | "next-js" | "next.js" => Some(crate::planner::profiles::nextjs::guidance(goal)),
-        _ => None,
-    }
+    domain_profile(profile).guidance(goal)
 }
 
 pub fn profile_runtime_contract(profile: &str, intent: &str, goal: &str) -> String {
-    match profile {
-        "nextjs" | "next-js" | "next.js" => {
-            crate::planner::profiles::nextjs::runtime_contract(intent, goal)
-        }
+    match canonical_profile_name(profile).as_str() {
         "rust" => "- Preserve Cargo.toml and crate entrypoints.\n\
 - Prefer cargo check or cargo test for deterministic verification.\n\
 - Do not weaken tests or public behavior to hide failures."
@@ -98,45 +745,28 @@ pub fn profile_runtime_contract(profile: &str, intent: &str, goal: &str) -> Stri
 - Keep claims grounded in inspected files.\n\
 - Avoid source-code changes unless the phase explicitly requires them."
             .to_string(),
-        "data" | "data-analysis" | "data-pipeline" => "- Preserve raw input data.\n\
-- Write derived outputs to explicit output artifacts.\n\
-- Use deterministic checks for generated files when practical."
-            .to_string(),
-        _ => "- Keep changes scoped to the current phase and workspace.".to_string(),
+        _ => domain_profile(profile).runtime_contract(intent, goal),
     }
 }
 
 pub fn profile_generation_rules(profile: &str, intent: &str) -> Option<&'static str> {
-    match profile {
-        "nextjs" | "next-js" | "next.js" => {
-            Some(crate::planner::profiles::nextjs::generation_rules(intent))
-        }
+    match canonical_profile_name(profile).as_str() {
         "rust" => Some(
             "- Profile rust: preserve Cargo project semantics. Keep Cargo.toml before cargo check/test verification, do not weaken scripts or tests to hide failures, and end with cargo check or cargo test when practical.\n",
         ),
         "python" => Some(
             "- Profile python: keep dependency setup separate from deterministic verification. Prefer python -m py_compile, pytest, or unittest checks after source files exist. Do not put package installation in verify commands.\n",
         ),
-        _ => None,
+        _ => domain_profile(profile).generation_rules(intent),
     }
 }
 
 pub fn profile_expected_paths(root: &Path, profile: &str, goal: &str) -> Vec<String> {
-    match profile {
-        "nextjs" | "next-js" | "next.js" => {
-            crate::planner::profiles::nextjs::expected_paths(root, goal)
-        }
-        _ => Vec::new(),
-    }
+    domain_profile(profile).expected_scaffold_paths(root, goal)
 }
 
 pub fn profile_setup_scaffold_paths(root: &Path, profile: &str) -> Vec<String> {
-    match profile {
-        "nextjs" | "next-js" | "next.js" => {
-            crate::planner::profiles::nextjs::setup_scaffold_paths(root)
-        }
-        _ => Vec::new(),
-    }
+    domain_profile(profile).setup_scaffold_paths(root)
 }
 
 pub fn profile_quality_expectations(
@@ -144,12 +774,7 @@ pub fn profile_quality_expectations(
     profile: &str,
     goal: &str,
 ) -> ProfileQualityExpectations {
-    match profile {
-        "nextjs" | "next-js" | "next.js" => {
-            crate::planner::profiles::nextjs::quality_expectations(root, goal)
-        }
-        _ => ProfileQualityExpectations::default(),
-    }
+    domain_profile(profile).quality_expectations(root, goal)
 }
 
 pub fn profile_repair_prompt(
@@ -158,12 +783,7 @@ pub fn profile_repair_prompt(
     goal: &str,
     report: &VerificationReport,
 ) -> Option<String> {
-    match profile {
-        "nextjs" | "next-js" | "next.js" => Some(crate::planner::profiles::nextjs::repair_prompt(
-            root, goal, report,
-        )),
-        _ => None,
-    }
+    domain_profile(profile).repair_prompt(root, goal, report)
 }
 
 pub fn profile_auto_repair(
@@ -172,23 +792,71 @@ pub fn profile_auto_repair(
     goal: &str,
     report: &VerificationReport,
 ) -> anyhow::Result<bool> {
-    match profile {
-        "nextjs" | "next-js" | "next.js" => {
-            crate::planner::profiles::nextjs::auto_repair(root, goal, report)
-        }
-        _ => Ok(false),
-    }
+    domain_profile(profile).deterministic_repair(root, goal, report)
 }
 
 pub fn profile_post_step_repair(root: &Path, profile: &str, goal: &str) -> anyhow::Result<bool> {
-    match profile {
-        "nextjs" | "next-js" | "next.js" => {
-            crate::planner::profiles::nextjs::repair_manifest_coherence(root, goal)
-        }
-        _ => Ok(false),
-    }
+    domain_profile(profile).post_step_repair(root, goal)
 }
 
 pub fn profile_failure(reason: impl Into<String>) -> VerificationReport {
     VerificationReport::profile_failed(reason)
+}
+
+fn is_nextjs_build_command(command: &str) -> bool {
+    let normalized = command.to_ascii_lowercase();
+    normalized == "npm run build"
+        || normalized == "pnpm build"
+        || normalized == "yarn build"
+        || normalized.starts_with("npm run build ")
+        || normalized.starts_with("pnpm build ")
+        || normalized.starts_with("yarn build ")
+        || normalized.contains("next build")
+}
+
+pub fn requires_next_binary(command: &str) -> bool {
+    is_nextjs_build_command(command)
+}
+
+fn requires_package_manifest(command: &str) -> bool {
+    let normalized = command.to_ascii_lowercase();
+    normalized.starts_with("npm ")
+        || normalized.starts_with("pnpm ")
+        || normalized.starts_with("yarn ")
+}
+
+fn requires_node_test_runner(command: &str) -> bool {
+    let normalized = command.trim().to_ascii_lowercase();
+    normalized == "npm test"
+        || normalized == "npm run test"
+        || normalized == "pnpm test"
+        || normalized == "yarn test"
+        || normalized.starts_with("npm test ")
+        || normalized.starts_with("npm run test ")
+        || normalized.starts_with("pnpm test ")
+        || normalized.starts_with("yarn test ")
+}
+
+fn requires_node_dependency_probe(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    (lower.contains("node -e") && lower.contains("require(")) || lower.contains("npx --no-install")
+}
+
+fn generic_dependency_missing_output(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("command not found")
+        || lower.contains("not found")
+        || lower.contains("cannot find module")
+        || lower.contains("module not found")
+        || lower.contains("modulenotfounderror")
+        || lower.contains("can't find crate")
+        || lower.contains("no such file or directory")
+}
+
+fn merge_unique_strings(out: &mut Vec<String>, incoming: &[String]) {
+    for item in incoming {
+        if !out.contains(item) {
+            out.push(item.clone());
+        }
+    }
 }

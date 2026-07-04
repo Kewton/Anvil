@@ -16,6 +16,7 @@ pub enum PackageManagerKind {
     Npm,
     Pnpm,
     Yarn,
+    Pip,
     Unknown,
     Mixed,
 }
@@ -26,6 +27,7 @@ impl PackageManagerKind {
             Self::Npm => "npm",
             Self::Pnpm => "pnpm",
             Self::Yarn => "yarn",
+            Self::Pip => "pip",
             Self::Unknown => "unknown",
             Self::Mixed => "mixed",
         }
@@ -38,6 +40,7 @@ pub enum NodeDependencySetupKind {
     NextBuildDependencies,
     NodeDeclaredDependencies,
     NodeTestRunnerManifest,
+    PythonCliDependencies,
 }
 
 impl NodeDependencySetupKind {
@@ -46,6 +49,7 @@ impl NodeDependencySetupKind {
             Self::NextBuildDependencies => "next_build_dependencies",
             Self::NodeDeclaredDependencies => "node_declared_dependencies",
             Self::NodeTestRunnerManifest => "node_test_runner_manifest",
+            Self::PythonCliDependencies => "python_cli_dependencies",
         }
     }
 }
@@ -243,6 +247,55 @@ pub fn node_declared_dependencies_missing_reason(root: &Path) -> String {
         "package.json has no dependency table".to_string()
     } else {
         "node_modules missing for declared package.json dependencies".to_string()
+    }
+}
+
+pub fn python_cli_declares_dependencies(root: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(root.join("pyproject.toml")) else {
+        return false;
+    };
+    let mut in_project = false;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_project = trimmed == "[project]";
+            continue;
+        }
+        if in_project
+            && trimmed.starts_with("dependencies")
+            && trimmed.contains('[')
+            && !trimmed.contains("[]")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn python_cli_dependencies_ready(root: &Path) -> bool {
+    if !python_cli_declares_dependencies(root) {
+        return true;
+    }
+    python_cli_venv_python(root).is_file()
+}
+
+pub fn python_cli_dependencies_missing_reason(root: &Path) -> String {
+    if !root.join("pyproject.toml").is_file() {
+        "pyproject.toml missing before Python dependency verifier".to_string()
+    } else if !python_cli_declares_dependencies(root) {
+        "Python CLI dependencies are not declared".to_string()
+    } else if python_cli_dependencies_ready(root) {
+        "Python CLI dependencies are ready".to_string()
+    } else {
+        "Python CLI dependency setup missing: .venv/bin/python".to_string()
+    }
+}
+
+pub fn python_cli_venv_python(root: &Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        root.join(".venv").join("Scripts").join("python.exe")
+    } else {
+        root.join(".venv").join("bin").join("python")
     }
 }
 
@@ -487,6 +540,36 @@ pub fn requirement_for_node_declared_dependencies(
     }
 }
 
+pub fn requirement_for_python_cli_dependencies(
+    root: &Path,
+    profile: Option<&str>,
+    reason: &str,
+    authority: NodeDependencySetupAuthority,
+) -> NodeDependencySetupRequirement {
+    let mut blocked_reason = None;
+    if !root.join("pyproject.toml").is_file() {
+        blocked_reason = Some("pyproject.toml missing".to_string());
+    } else if !python_cli_declares_dependencies(root) {
+        blocked_reason = Some("pyproject.toml has no project.dependencies table".to_string());
+    } else if python_cli_dependencies_ready(root) {
+        blocked_reason = Some("Python CLI dependencies already present".to_string());
+    } else if !authority.allows_setup() {
+        blocked_reason = Some("dependency setup authority missing".to_string());
+    }
+    let allowed = blocked_reason.is_none();
+    NodeDependencySetupRequirement {
+        profile: profile.map(str::to_string),
+        setup_kind: NodeDependencySetupKind::PythonCliDependencies,
+        package_manager: PackageManagerKind::Pip,
+        project_root: ".".to_string(),
+        reason: reason.to_string(),
+        required_binary: ".venv/bin/python".to_string(),
+        setup_authority: authority,
+        allowed,
+        blocked_reason,
+    }
+}
+
 pub fn run_node_dependency_setup(
     root: &Path,
     requirement: &NodeDependencySetupRequirement,
@@ -529,6 +612,9 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
             requirement.setup_authority,
             "dependency_setup_blocked_offline",
         );
+    }
+    if requirement.setup_kind == NodeDependencySetupKind::PythonCliDependencies {
+        return run_python_cli_dependency_setup(root, requirement);
     }
     if requirement.package_manager == PackageManagerKind::Pnpm
         || requirement.package_manager == PackageManagerKind::Yarn
@@ -672,6 +758,7 @@ fn setup_dependencies_ready(root: &Path, setup_kind: NodeDependencySetupKind) ->
         NodeDependencySetupKind::NextBuildDependencies => next_build_dependencies_ready(root),
         NodeDependencySetupKind::NodeDeclaredDependencies => node_declared_dependencies_ready(root),
         NodeDependencySetupKind::NodeTestRunnerManifest => node_test_runner_bindable(root),
+        NodeDependencySetupKind::PythonCliDependencies => python_cli_dependencies_ready(root),
     }
 }
 
@@ -691,6 +778,13 @@ fn setup_missing_dependency_labels(
             }
         }
         NodeDependencySetupKind::NodeTestRunnerManifest => Vec::new(),
+        NodeDependencySetupKind::PythonCliDependencies => {
+            if python_cli_dependencies_ready(root) {
+                Vec::new()
+            } else {
+                vec![".venv/bin/python".to_string()]
+            }
+        }
     }
 }
 
@@ -704,7 +798,131 @@ fn setup_dependency_label_ready(root: &Path, path: &str) -> bool {
     if let Some(package) = path.strip_prefix("node_modules/") {
         return node_package_installed(root, package);
     }
+    if path == ".venv/bin/python" {
+        return python_cli_venv_python(root).is_file();
+    }
     false
+}
+
+fn run_python_cli_dependency_setup(
+    root: &Path,
+    requirement: &NodeDependencySetupRequirement,
+) -> NodeDependencySetupObservation {
+    let before_venv = root.join(".venv").exists();
+    let started = Instant::now();
+    let mut changed_paths = Vec::new();
+    let command = "python -m venv .venv && .venv/bin/python -m pip install -e .".to_string();
+    let mut child = match verifier_env::normalized_command_at_root("sh", root)
+        .arg("-c")
+        .arg(&command)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            return NodeDependencySetupObservation {
+                status: NodeDependencySetupStatus::Failed,
+                setup_kind: requirement.setup_kind,
+                package_manager: requirement.package_manager,
+                authority: requirement.setup_authority,
+                attempted: true,
+                command,
+                primary_reason: format!("failed to spawn Python dependency setup: {err}"),
+                output_snippet: String::new(),
+                changed_paths,
+                lockfile_present_before: None,
+                lockfile_present_after: None,
+                lockfile_created: None,
+            };
+        }
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = child.wait_with_output().ok();
+                let stdout = output
+                    .as_ref()
+                    .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
+                    .unwrap_or_default();
+                let stderr = output
+                    .as_ref()
+                    .map(|out| String::from_utf8_lossy(&out.stderr).to_string())
+                    .unwrap_or_default();
+                if !before_venv && root.join(".venv").exists() {
+                    changed_paths.push(".venv".to_string());
+                }
+                let ready = python_cli_dependencies_ready(root);
+                let status_kind = if status.success() && ready {
+                    NodeDependencySetupStatus::Passed
+                } else {
+                    NodeDependencySetupStatus::Failed
+                };
+                return NodeDependencySetupObservation {
+                    status: status_kind,
+                    setup_kind: requirement.setup_kind,
+                    package_manager: requirement.package_manager,
+                    authority: requirement.setup_authority,
+                    attempted: true,
+                    command,
+                    primary_reason: if status.success() && ready {
+                        "Python CLI dependency setup passed".to_string()
+                    } else if status.success() {
+                        "Python CLI dependency setup completed but .venv/bin/python is missing"
+                            .to_string()
+                    } else {
+                        format!("Python CLI dependency setup failed: {status}")
+                    },
+                    output_snippet: eval_events::body_snippet(&format!("{stderr}\n{stdout}")),
+                    changed_paths,
+                    lockfile_present_before: None,
+                    lockfile_present_after: None,
+                    lockfile_created: None,
+                };
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return NodeDependencySetupObservation {
+                    status: NodeDependencySetupStatus::Failed,
+                    setup_kind: requirement.setup_kind,
+                    package_manager: requirement.package_manager,
+                    authority: requirement.setup_authority,
+                    attempted: true,
+                    command,
+                    primary_reason: format!("Python CLI dependency setup wait failed: {err}"),
+                    output_snippet: String::new(),
+                    changed_paths,
+                    lockfile_present_before: None,
+                    lockfile_present_after: None,
+                    lockfile_created: None,
+                };
+            }
+        }
+        if started.elapsed() >= SETUP_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return NodeDependencySetupObservation {
+                status: NodeDependencySetupStatus::TimedOut,
+                setup_kind: requirement.setup_kind,
+                package_manager: requirement.package_manager,
+                authority: requirement.setup_authority,
+                attempted: true,
+                command,
+                primary_reason: format!(
+                    "Python CLI dependency setup timed out after {} ms",
+                    SETUP_TIMEOUT.as_millis()
+                ),
+                output_snippet: String::new(),
+                changed_paths,
+                lockfile_present_before: None,
+                lockfile_present_after: None,
+                lockfile_created: None,
+            };
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn run_node_test_runner_manifest_setup(
@@ -985,6 +1203,48 @@ mod tests {
         );
         assert!(requirement.allowed);
         assert_eq!(requirement.package_manager, PackageManagerKind::Npm);
+    }
+
+    #[test]
+    fn python_cli_dependency_setup_is_authority_gated_and_offline_aware() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            r#"[project]
+name = "demo-cli"
+version = "0.1.0"
+dependencies = ["requests"]
+"#,
+        )
+        .unwrap();
+        let blocked = requirement_for_python_cli_dependencies(
+            dir.path(),
+            Some("python-cli"),
+            "deps",
+            NodeDependencySetupAuthority::None,
+        );
+        assert!(!blocked.allowed);
+        assert_eq!(
+            blocked.blocked_reason.as_deref(),
+            Some("dependency setup authority missing")
+        );
+
+        let allowed = requirement_for_python_cli_dependencies(
+            dir.path(),
+            Some("python-cli"),
+            "deps",
+            NodeDependencySetupAuthority::PlanSetupStep,
+        );
+        assert!(allowed.allowed);
+        let observed = run_node_dependency_setup_with_program_and_offline(
+            dir.path(),
+            &allowed,
+            Path::new("npm"),
+            true,
+        );
+        assert_eq!(observed.status, NodeDependencySetupStatus::Blocked);
+        assert_eq!(observed.primary_reason, "dependency_setup_blocked_offline");
+        assert!(!observed.attempted);
     }
 
     #[test]
