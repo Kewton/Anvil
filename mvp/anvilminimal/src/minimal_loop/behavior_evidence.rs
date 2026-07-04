@@ -20,6 +20,8 @@ const SURFACE_KEYS: &[&str] = &[
 
 const INPUT_STATE_KEYS: &[&str] = &["user_input_handler_evidence", "stateful_update_evidence"];
 
+const LIVE_PREVIEW_KEYS: &[&str] = &["live_preview_evidence", "requested_content_evidence"];
+
 const PROBE_REQUIRED_BEHAVIOR_KEYS: &[&str] = &[
     "interactive_ui_source_evidence",
     "visible_interactive_surface_evidence",
@@ -27,6 +29,7 @@ const PROBE_REQUIRED_BEHAVIOR_KEYS: &[&str] = &[
     "user_input_handler_evidence",
     "stateful_update_evidence",
     "restart_or_recoverable_state_evidence",
+    "live_preview_evidence",
 ];
 
 const DEEP_BEHAVIOR_KEYS: &[&str] = &[
@@ -59,6 +62,9 @@ struct BehaviorObservation {
     start_transition: bool,
     input_state_evaluated_after_start: bool,
     input_state_change: bool,
+    text_entry: String,
+    token_echoed: bool,
+    text_input_state_change: bool,
     recovery_transition: RecoveryTransition,
     persistence_after_reload: PersistenceAfterReload,
 }
@@ -274,12 +280,25 @@ fn behavioral_decision(
         };
     }
     if INPUT_STATE_KEYS.contains(&key) {
-        return if observation.input_state_change {
+        return if observation.text_input_state_change {
+            BehavioralDecision::Pass("text_input_state_change")
+        } else if observation.input_state_change {
             BehavioralDecision::Pass("input_state_change")
+        } else if observation.failure_kind == "text_input_state_change_missing" {
+            BehavioralDecision::Fail("text_input_state_change_missing")
         } else if observation.start_transition && !observation.input_state_evaluated_after_start {
             BehavioralDecision::Fail("input_state_change_not_evaluated_after_start")
         } else {
             BehavioralDecision::Fail("input_state_change_missing_after_start")
+        };
+    }
+    if LIVE_PREVIEW_KEYS.contains(&key) {
+        return if observation.token_echoed {
+            BehavioralDecision::Pass("token_echoed")
+        } else if observation.text_entry == "not_applicable" {
+            BehavioralDecision::Fail("text_entry_not_applicable")
+        } else {
+            BehavioralDecision::Fail("token_echo_missing")
         };
     }
     if key == "restart_or_recoverable_state_evidence" {
@@ -506,6 +525,12 @@ impl BehaviorObservation {
                 && text_field_deep(value, &["input_after_marker"])
                     .is_some_and(|marker| !marker.is_empty()));
         let input_state_change = input_state_changed(value, &steps, ok);
+        let text_entry = text_field_deep(value, &["text_entry"]).unwrap_or_default();
+        let token_echoed = bool_field_deep(value, &["token_echoed"]) == Some(true)
+            || steps.contains("token_echoed");
+        let text_input_state_change = bool_field_deep(value, &["text_input_state_change"])
+            == Some(true)
+            || steps.contains("text_input_state_change");
         let recovery_transition = recovery_transition(value, &steps);
         let persistence_after_reload = persistence_after_reload(value, &steps);
         Some(Self {
@@ -517,6 +542,9 @@ impl BehaviorObservation {
             start_transition,
             input_state_evaluated_after_start,
             input_state_change,
+            text_entry,
+            token_echoed,
+            text_input_state_change,
             recovery_transition,
             persistence_after_reload,
         })
@@ -558,6 +586,11 @@ fn steps_from_value(value: &Value) -> BTreeSet<String> {
 }
 
 fn input_state_changed(value: &Value, steps: &BTreeSet<String>, _ok: bool) -> bool {
+    if bool_field_deep(value, &["text_input_state_change"]) == Some(true)
+        || steps.contains("text_input_state_change")
+    {
+        return true;
+    }
     if bool_field_deep(
         value,
         &[
@@ -576,6 +609,7 @@ fn input_state_changed(value: &Value, steps: &BTreeSet<String>, _ok: bool) -> bo
                 "input_state_change",
                 "state_changed",
                 "visible_state_changed",
+                "text_input_state_change",
             ],
         ) == Some(true)
         || marker_changed(value, "input_before_marker", "input_after_marker")
@@ -723,6 +757,35 @@ export default function Page() {
   return <main data-anvil-state={JSON.stringify({ items })}>
     <button data-anvil-action="primary" onClick={add}>Add</button>
     <p>{items.join(",")}</p>
+  </main>;
+}
+"#
+    }
+
+    fn notes_live_preview_page() -> &'static str {
+        r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [draft, setDraft] = useState("");
+  return <main data-anvil-state={JSON.stringify({ draft })}>
+    <textarea data-anvil-action="input" value={draft} onChange={(event) => setDraft(event.target.value)} />
+    <section aria-label="Preview">{draft}</section>
+  </main>;
+}
+"#
+    }
+
+    fn todo_text_entry_page() -> &'static str {
+        r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [draft, setDraft] = useState("");
+  const [items, setItems] = useState<string[]>([]);
+  const add = () => setItems((value) => draft ? [...value, draft] : value);
+  return <main data-anvil-state={JSON.stringify({ draft, items })}>
+    <input data-anvil-action="input" value={draft} onChange={(event) => setDraft(event.target.value)} />
+    <button data-anvil-action="primary" onClick={add}>Add</button>
+    <ul>{items.map((item) => <li key={item}>{item}</li>)}</ul>
   </main>;
 }
 "#
@@ -1423,6 +1486,241 @@ export default function Page() {
                 .map(String::as_str),
             Some("strong")
         );
+        assert_eq!(
+            arbitration
+                .records
+                .get("persistence_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("preserved_after_reload")
+        );
+    }
+
+    #[test]
+    fn notes_text_entry_echo_behaviorally_satisfies_live_preview_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), notes_live_preview_page());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "text_entry": "entered",
+                "text_entry_target": "textarea:data-anvil-action=input",
+                "typed_token": "anvil-note",
+                "token_echoed": true,
+                "text_input_state_change": true,
+                "steps": [
+                    "surface_visible",
+                    "text_entry",
+                    "text_input_state_change",
+                    "token_echoed"
+                ],
+                "input_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"draft\":\"\"}}]}",
+                "input_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"draft\":\"anvil-note\"}}]}",
+                "state_dimensions_changed": ["draft"],
+                "action_hooks": ["input"]
+            }),
+        );
+        let required = [
+            "user_input_handler_evidence",
+            "stateful_update_evidence",
+            "live_preview_evidence",
+        ];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("live_preview_evidence")
+                .map(String::as_str),
+            Some("strong")
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("live_preview_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("token_echoed")
+        );
+    }
+
+    #[test]
+    fn todo_text_entry_primary_add_echo_satisfies_input_and_preview_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), todo_text_entry_page());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "text_entry": "entered",
+                "text_entry_target": "input:data-anvil-action=input",
+                "typed_token": "anvil-todo",
+                "token_echoed": true,
+                "text_input_state_change": true,
+                "steps": [
+                    "surface_visible",
+                    "text_entry",
+                    "text_input_state_change",
+                    "token_echoed"
+                ],
+                "input_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"draft\":\"\",\"items\":[]}}]}",
+                "input_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"draft\":\"anvil-todo\",\"items\":[\"anvil-todo\"]}}]}",
+                "state_dimensions_changed": ["draft", "items"],
+                "action_hooks": ["input", "primary"]
+            }),
+        );
+        let required = [
+            "user_input_handler_evidence",
+            "stateful_update_evidence",
+            "live_preview_evidence",
+        ];
+        let mut report = report_for(dir.path(), &required);
+        arbitrate(dir.path(), &mut report, &required);
+
+        assert!(report.passed, "{report:?}");
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("user_input_handler_evidence")
+                .map(String::as_str),
+            Some("strong")
+        );
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("live_preview_evidence")
+                .map(String::as_str),
+            Some("strong")
+        );
+    }
+
+    #[test]
+    fn token_echo_missing_fails_live_preview_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), notes_live_preview_page());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": false,
+                "status": "failed",
+                "failure_kind": "token_echo_missing",
+                "interaction_success": false,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "text_entry": "entered",
+                "text_entry_target": "textarea:data-anvil-action=input",
+                "typed_token": "anvil-note",
+                "token_echoed": false,
+                "text_input_state_change": true,
+                "steps": [
+                    "surface_visible",
+                    "text_entry",
+                    "text_input_state_change",
+                    "token_echo_missing"
+                ],
+                "state_dimensions_changed": ["draft"],
+                "action_hooks": ["input"]
+            }),
+        );
+        let required = ["live_preview_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"live_preview_evidence".to_string()),
+            "{report:?}"
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("live_preview_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("token_echo_missing")
+        );
+    }
+
+    #[test]
+    fn persistence_reload_prefers_typed_token_survival_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), todo_persistence_page());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "text_entry": "entered",
+                "text_entry_target": "input:data-anvil-action=input",
+                "typed_token": "anvil-persist",
+                "token_echoed": true,
+                "text_input_state_change": true,
+                "steps": [
+                    "surface_visible",
+                    "text_entry",
+                    "text_input_state_change",
+                    "token_echoed",
+                    "persistence_reload"
+                ],
+                "persistence_after_reload": "preserved",
+                "persistence_changed_dimensions": ["typed_token"],
+                "persistence_before_reload_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[\"anvil-persist\"]}}]}",
+                "persistence_after_reload_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[\"anvil-persist\"]}}]}",
+                "action_hooks": ["input", "primary"]
+            }),
+        );
+        let required = ["persistence_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
         assert_eq!(
             arbitration
                 .records

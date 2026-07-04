@@ -103,7 +103,8 @@ const PROFILE_REPAIR_FILE_EXCERPT_MAX_CHARS: usize = 2_400;
 const INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT: &str = "keyboard or pointer input must visibly change game state (player position, projectiles, score/health, or state transitions); wire input handlers into the render/update loop.";
 const INTERACTION_START_REPAIR_REQUIREMENT: &str = "primary/start controls must transition the visible app state before input is evaluated; wire the start action into state and render updates.";
 const PERSISTENCE_RELOAD_REPAIR_REQUIREMENT: &str = "load persisted state on mount (e.g. read localStorage in initialization) and write on mutation";
-const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 10] = [
+const TEXT_ECHO_REPAIR_REQUIREMENT: &str = "render the input's content reactively (no manual rebuild) - the typed text must appear in the preview/list";
+const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 13] = [
     "interaction_state_change_missing",
     "input_state_change_missing_after_start",
     "input_state_change_not_evaluated_after_start",
@@ -111,6 +112,9 @@ const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 10] = [
     "primary_start_transition_missing",
     "start_transition_missing",
     "surface_missing",
+    "text_entry_missing",
+    "text_input_state_change_missing",
+    "token_echo_missing",
     "surface_visible_missing",
     "interactive_surface_missing",
     "canvas_unavailable",
@@ -2012,6 +2016,8 @@ fn verify_plan_final_contract(
     let state_dimensions_changed =
         interaction_state_dimensions_changed_from_path(&release_gate.interaction_evidence_path);
     let action_hooks = interaction_action_hooks_from_path(&release_gate.interaction_evidence_path);
+    let text_telemetry =
+        interaction_text_telemetry_from_path(&release_gate.interaction_evidence_path);
     let primary_reason = if !missing_final_artifacts.is_empty() {
         format!(
             "missing final artifacts: {}",
@@ -2146,6 +2152,11 @@ fn verify_plan_final_contract(
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "state_dimensions_changed": state_dimensions_changed,
             "action_hooks": action_hooks,
+            "text_entry": text_telemetry.text_entry,
+            "text_entry_target": text_telemetry.text_entry_target,
+            "typed_token": text_telemetry.typed_token,
+            "token_echoed": text_telemetry.token_echoed,
+            "text_input_state_change": text_telemetry.text_input_state_change,
             "next_action": next_action,
             "recovery_handoff_kind": recovery_handoff
                 .as_ref()
@@ -4597,6 +4608,8 @@ fn ultra_final_acceptance_report_inner(
     let state_dimensions_changed =
         interaction_state_dimensions_changed_from_path(&release_gate.interaction_evidence_path);
     let action_hooks = interaction_action_hooks_from_path(&release_gate.interaction_evidence_path);
+    let text_telemetry =
+        interaction_text_telemetry_from_path(&release_gate.interaction_evidence_path);
     let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
     let mut compile_errors = profile_report.compile_errors.clone();
     if let Some(report) = external_report.as_ref() {
@@ -4710,6 +4723,11 @@ fn ultra_final_acceptance_report_inner(
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "state_dimensions_changed": state_dimensions_changed,
             "action_hooks": action_hooks,
+            "text_entry": text_telemetry.text_entry,
+            "text_entry_target": text_telemetry.text_entry_target,
+            "typed_token": text_telemetry.typed_token,
+            "token_echoed": text_telemetry.token_echoed,
+            "text_input_state_change": text_telemetry.text_input_state_change,
             "next_action": next_action,
             "recovery_handoff_kind": recovery_handoff
                 .as_ref()
@@ -4977,6 +4995,37 @@ fn browser_interaction_probe_options(
     required_capabilities: &[String],
     required_evidence: &[String],
 ) -> BrowserInteractionProbeOptions {
+    let text_entry_required = required_capabilities
+        .iter()
+        .chain(required_evidence.iter())
+        .any(|value| {
+            let lower = value.to_ascii_lowercase();
+            lower.contains("text")
+                || lower.contains("editor")
+                || lower.contains("note")
+                || lower.contains("todo")
+                || lower.contains("content")
+                || lower.contains("preview")
+                || lower.contains("render")
+                || lower == "input_output_contract"
+                || lower == "requested_content"
+                || lower == "requested_content_evidence"
+                || lower == "live_preview"
+                || lower == "live_preview_evidence"
+        });
+    let token_echo_required = required_capabilities
+        .iter()
+        .chain(required_evidence.iter())
+        .any(|value| {
+            let lower = value.to_ascii_lowercase();
+            lower.contains("preview")
+                || lower.contains("render")
+                || lower.contains("content")
+                || lower == "requested_content"
+                || lower == "requested_content_evidence"
+                || lower == "live_preview"
+                || lower == "live_preview_evidence"
+        });
     BrowserInteractionProbeOptions {
         persistence_required: required_capabilities
             .iter()
@@ -4984,6 +5033,8 @@ fn browser_interaction_probe_options(
             || required_evidence
                 .iter()
                 .any(|evidence| evidence == "persistence_evidence"),
+        text_entry_required,
+        token_echo_required,
     }
 }
 
@@ -5127,6 +5178,11 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "persistence_after_reload": observation.persistence_after_reload.as_str(),
                     "persistence_changed_dimensions": &observation.persistence_changed_dimensions,
                     "action_hooks": &observation.action_hooks,
+                    "text_entry": observation.text_entry.as_str(),
+                    "text_entry_target": observation.text_entry_target.as_str(),
+                    "typed_token": observation.typed_token.as_str(),
+                    "token_echoed": observation.token_echoed,
+                    "text_input_state_change": observation.text_input_state_change,
                     "input_state_evaluated_after_start": observation.input_state_evaluated_after_start,
                     "primary_start_transition": observation.primary_transition_observed,
                     "informational_failure_kinds": &observation.informational_failure_kinds,
@@ -5667,6 +5723,9 @@ fn runtime_acceptance_repair_guidance(
             ),
             "persistence_evidence" => {
                 guidance.push(PERSISTENCE_RELOAD_REPAIR_REQUIREMENT.to_string())
+            }
+            "live_preview_evidence" | "requested_content_evidence" => {
+                guidance.push(TEXT_ECHO_REPAIR_REQUIREMENT.to_string())
             }
             "challenge_or_adversary_evidence" => guidance.push(
                 "wire a reachable challenge/adversary entity into state evolution, not only a static label"
@@ -8100,8 +8159,13 @@ fn interaction_repair_targets_for_reason(reason: &str) -> Vec<String> {
     if lower.contains("input_state_change_missing_after_start")
         || lower.contains("input_state_change_not_evaluated_after_start")
         || lower.contains("interaction_state_change_missing")
+        || lower.contains("text_input_state_change_missing")
     {
         vec!["input_state_render_wiring".to_string()]
+    } else if lower.contains("token_echo_missing") {
+        vec!["live_preview_render_wiring".to_string()]
+    } else if lower.contains("text_entry_missing") {
+        vec!["text_input_wiring".to_string()]
     } else if lower.contains("persistence_after_reload_reset") {
         vec!["persistence_state_wiring".to_string()]
     } else if lower.contains("start_transition_missing")
@@ -8121,6 +8185,7 @@ fn behavior_depth_evidence_key(evidence: &str) -> bool {
             | "score_or_progression_evidence"
             | "restart_or_recoverable_state_evidence"
             | "persistence_evidence"
+            | "live_preview_evidence"
     )
 }
 
@@ -10341,6 +10406,27 @@ fn final_acceptance_behavioral_probe_context(
         if !action_hooks.is_empty() {
             lines.push(format!("- action hooks: {}", action_hooks.join(", ")));
         }
+        if let Some(status) =
+            raw_text_field_deep(value, &["text_entry"]).filter(|status| !status.is_empty())
+        {
+            lines.push(format!("- text entry: {status}"));
+        }
+        if let Some(target) =
+            raw_text_field_deep(value, &["text_entry_target"]).filter(|target| !target.is_empty())
+        {
+            lines.push(format!("- text entry target: {target}"));
+        }
+        if let Some(token) =
+            raw_text_field_deep(value, &["typed_token"]).filter(|token| !token.is_empty())
+        {
+            lines.push(format!("- typed token: {token}"));
+        }
+        if let Some(echoed) = raw_bool_field_deep(value, "token_echoed") {
+            lines.push(format!("- token echoed outside input: {echoed}"));
+        }
+        if let Some(changed) = raw_bool_field_deep(value, "text_input_state_change") {
+            lines.push(format!("- text input state change: {changed}"));
+        }
         let state_dimensions = raw_string_array_field_deep(value, "state_dimensions_changed");
         if !state_dimensions.is_empty() {
             lines.push(format!(
@@ -10396,6 +10482,7 @@ fn final_acceptance_behavioral_probe_context(
     if failure_kind.contains("interaction_state_change_missing")
         || failure_kind.contains("input_state_change_missing_after_start")
         || failure_kind.contains("input_state_change_not_evaluated_after_start")
+        || failure_kind.contains("text_input_state_change_missing")
     {
         lines.push(format!(
             "- concrete requirement: {INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT}"
@@ -10404,6 +10491,11 @@ fn final_acceptance_behavioral_probe_context(
     if failure_kind.contains("persistence_after_reload_reset") {
         lines.push(format!(
             "- concrete requirement: {PERSISTENCE_RELOAD_REPAIR_REQUIREMENT}"
+        ));
+    }
+    if failure_kind.contains("token_echo_missing") {
+        lines.push(format!(
+            "- concrete requirement: {TEXT_ECHO_REPAIR_REQUIREMENT}"
         ));
     }
     let route_paths = route_bound_implementation_paths(expected_paths);
@@ -10429,6 +10521,7 @@ fn final_acceptance_recovery_reason(
     if failure_kind.contains("interaction_state_change_missing")
         || failure_kind.contains("input_state_change_missing_after_start")
         || failure_kind.contains("input_state_change_not_evaluated_after_start")
+        || failure_kind.contains("text_input_state_change_missing")
     {
         out.push_str("; ");
         out.push_str(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT);
@@ -10438,6 +10531,9 @@ fn final_acceptance_recovery_reason(
     } else if failure_kind.contains("persistence_after_reload_reset") {
         out.push_str("; ");
         out.push_str(PERSISTENCE_RELOAD_REPAIR_REQUIREMENT);
+    } else if failure_kind.contains("token_echo_missing") {
+        out.push_str("; ");
+        out.push_str(TEXT_ECHO_REPAIR_REQUIREMENT);
     }
     let context = final_acceptance_behavioral_probe_context(report, &[]);
     if !context.is_empty() {
@@ -10529,6 +10625,32 @@ fn interaction_action_hooks_from_path(path: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[derive(Debug, Clone, Default)]
+struct InteractionTextTelemetry {
+    text_entry: String,
+    text_entry_target: String,
+    typed_token: String,
+    token_echoed: Option<bool>,
+    text_input_state_change: Option<bool>,
+}
+
+fn interaction_text_telemetry_from_path(path: &str) -> InteractionTextTelemetry {
+    let Some(value) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+    else {
+        return InteractionTextTelemetry::default();
+    };
+    InteractionTextTelemetry {
+        text_entry: raw_text_field_deep(&value, &["text_entry"]).unwrap_or_default(),
+        text_entry_target: raw_text_field_deep(&value, &["text_entry_target"]).unwrap_or_default(),
+        typed_token: raw_text_field_deep(&value, &["typed_token"]).unwrap_or_default(),
+        token_echoed: raw_bool_field_deep(&value, "token_echoed"),
+        text_input_state_change: raw_bool_field_deep(&value, "text_input_state_change"),
+    }
+}
+
 fn prompt_marker_excerpt(value: &str) -> String {
     const MAX_CHARS: usize = 600;
     if value.chars().count() <= MAX_CHARS {
@@ -10576,6 +10698,12 @@ fn raw_contract_hook_bool(value: &Value, name: &str) -> Option<bool> {
             .and_then(|hooks| hooks.get(name))
             .and_then(Value::as_bool)
     })
+}
+
+fn raw_bool_field_deep(value: &Value, name: &str) -> Option<bool> {
+    raw_value_scopes(value)
+        .into_iter()
+        .find_map(|scope| scope.get(name).and_then(Value::as_bool))
 }
 
 fn interaction_candidate_prompt_lines(value: &Value) -> Vec<String> {
@@ -16172,6 +16300,26 @@ if __name__ == "__main__":
     }
 
     #[test]
+    fn token_echo_missing_runtime_guidance_names_live_preview_repair() {
+        let report = RuntimeAcceptanceReport {
+            missing_evidence: vec!["live_preview_evidence".to_string()],
+            ..RuntimeAcceptanceReport::default()
+        };
+
+        let guidance = runtime_acceptance_repair_guidance(&report).join("\n");
+
+        assert!(
+            guidance.contains("render the input's content reactively"),
+            "{guidance}"
+        );
+        assert!(guidance.contains("no manual rebuild"), "{guidance}");
+        assert!(
+            guidance.contains("typed text must appear in the preview/list"),
+            "{guidance}"
+        );
+    }
+
+    #[test]
     fn browser_interaction_probe_options_require_reload_only_for_persistence_contract() {
         let game = browser_interaction_probe_options(
             &[
@@ -16191,6 +16339,29 @@ if __name__ == "__main__":
         let by_evidence =
             browser_interaction_probe_options(&[], &["persistence_evidence".to_string()]);
         assert!(by_evidence.persistence_required);
+    }
+
+    #[test]
+    fn browser_interaction_probe_options_require_text_echo_for_preview_contracts() {
+        let game = browser_interaction_probe_options(
+            &[
+                "stateful_interaction".to_string(),
+                "player_control".to_string(),
+            ],
+            &["stateful_update_evidence".to_string()],
+        );
+        assert!(!game.text_entry_required);
+        assert!(!game.token_echo_required);
+
+        let requested_content =
+            browser_interaction_probe_options(&["requested_content".to_string()], &[]);
+        assert!(requested_content.text_entry_required);
+        assert!(requested_content.token_echo_required);
+
+        let live_preview =
+            browser_interaction_probe_options(&[], &["live_preview_evidence".to_string()]);
+        assert!(live_preview.text_entry_required);
+        assert!(live_preview.token_echo_required);
     }
 
     #[test]

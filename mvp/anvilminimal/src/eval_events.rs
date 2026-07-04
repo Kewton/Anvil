@@ -207,6 +207,10 @@ pub struct CompletionSnapshot {
     pub interaction_evidence_path: String,
     pub state_dimensions_changed: Vec<String>,
     pub action_hooks: Vec<String>,
+    pub text_entry_target: String,
+    pub typed_token: String,
+    pub token_echoed: String,
+    pub text_input_state_change: String,
     pub evidence_arbitration_summary: String,
     pub recovery_prompt_path: String,
     pub recovery_ultra_plan_path: String,
@@ -243,6 +247,10 @@ impl CompletionSnapshot {
             interaction_evidence_path: String::new(),
             state_dimensions_changed: Vec::new(),
             action_hooks: Vec::new(),
+            text_entry_target: String::new(),
+            typed_token: String::new(),
+            token_echoed: String::new(),
+            text_input_state_change: String::new(),
             evidence_arbitration_summary: String::new(),
             recovery_prompt_path: String::new(),
             recovery_ultra_plan_path: String::new(),
@@ -291,6 +299,10 @@ pub struct CompletionProjection {
     pub interaction_evidence_path: String,
     pub state_dimensions_changed: Vec<String>,
     pub action_hooks: Vec<String>,
+    pub text_entry_target: String,
+    pub typed_token: String,
+    pub token_echoed: String,
+    pub text_input_state_change: String,
     pub evidence_arbitration_summary: String,
     pub release_quality_completion: String,
     pub next_action: String,
@@ -408,6 +420,10 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         interaction_evidence_path: snapshot.interaction_evidence_path.clone(),
         state_dimensions_changed: snapshot.state_dimensions_changed.clone(),
         action_hooks: snapshot.action_hooks.clone(),
+        text_entry_target: snapshot.text_entry_target.clone(),
+        typed_token: snapshot.typed_token.clone(),
+        token_echoed: snapshot.token_echoed.clone(),
+        text_input_state_change: snapshot.text_input_state_change.clone(),
         evidence_arbitration_summary: snapshot.evidence_arbitration_summary.clone(),
         release_quality_completion,
         next_action,
@@ -1339,6 +1355,18 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .to_string(),
         state_dimensions_changed: event_string_array(event, "state_dimensions_changed"),
         action_hooks: event_string_array(event, "action_hooks"),
+        text_entry_target: event
+            .get("text_entry_target")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        typed_token: event
+            .get("typed_token")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        token_echoed: event_bool_or_string(event, "token_echoed"),
+        text_input_state_change: event_bool_or_string(event, "text_input_state_change"),
         evidence_arbitration_summary: event
             .get("evidence_arbitration_summary")
             .and_then(Value::as_str)
@@ -1406,6 +1434,18 @@ fn event_string_array(event: &Value, field: &str) -> Vec<String> {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
                 .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn event_bool_or_string(event: &Value, field: &str) -> String {
+    event
+        .get(field)
+        .and_then(|value| {
+            value
+                .as_bool()
+                .map(|flag| flag.to_string())
+                .or_else(|| value.as_str().map(ToOwned::to_owned))
         })
         .unwrap_or_default()
 }
@@ -1585,6 +1625,19 @@ fn render_completion_summary(
             } else {
                 projection.action_hooks.join(", ")
             }
+        ),
+        format!(
+            "Text entry target: {}",
+            missing_if_empty(&projection.text_entry_target)
+        ),
+        format!("Typed token: {}", missing_if_empty(&projection.typed_token)),
+        format!(
+            "Token echoed: {}",
+            missing_if_empty(&projection.token_echoed)
+        ),
+        format!(
+            "Text input state change: {}",
+            missing_if_empty(&projection.text_input_state_change)
         ),
         format!("Next action: {}", projection.next_action),
         format!("Recovery next action: {}", projection.next_action),
@@ -2345,6 +2398,10 @@ mod tests {
                 "evidence_arbitration_summary": "behavioral (probe ok)",
                 "state_dimensions_changed": ["player", "score"],
                 "action_hooks": ["primary", "restart"],
+                "text_entry_target": "textarea:data-anvil-action=input",
+                "typed_token": "anvil-note",
+                "token_echoed": true,
+                "text_input_state_change": true,
             }),
         );
         let snapshot = latest_completion_snapshot(Some(&path));
@@ -2368,6 +2425,16 @@ mod tests {
         );
         assert!(
             summary.contains("Action hooks: primary, restart"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Text entry target: textarea:data-anvil-action=input"),
+            "{summary}"
+        );
+        assert!(summary.contains("Typed token: anvil-note"), "{summary}");
+        assert!(summary.contains("Token echoed: true"), "{summary}");
+        assert!(
+            summary.contains("Text input state change: true"),
             "{summary}"
         );
     }

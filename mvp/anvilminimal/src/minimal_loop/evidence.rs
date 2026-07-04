@@ -80,6 +80,7 @@ enum EvidenceKind {
     FailureOrCollisionEvidence,
     RestartOrRecoverableStateEvidence,
     PersistenceEvidence,
+    LivePreviewEvidence,
     NextJsRouteEvidence,
     RequestedContent,
 }
@@ -104,6 +105,7 @@ impl EvidenceKind {
             Self::FailureOrCollisionEvidence => "failure_or_collision_evidence",
             Self::RestartOrRecoverableStateEvidence => "restart_or_recoverable_state_evidence",
             Self::PersistenceEvidence => "persistence_evidence",
+            Self::LivePreviewEvidence => "live_preview_evidence",
             Self::NextJsRouteEvidence => "nextjs_route_evidence",
             Self::RequestedContent => "requested_content_evidence",
         }
@@ -136,6 +138,7 @@ pub fn evidence_satisfaction_channel(key: &str) -> SatisfactionChannel {
         | "failure_or_collision_evidence"
         | "restart_or_recoverable_state_evidence"
         | "persistence_evidence"
+        | "live_preview_evidence"
         | "nextjs_route_evidence" => SatisfactionChannel::SourceScan,
         "test_artifact"
         | "bound_verify_command"
@@ -1073,6 +1076,14 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
                     &mut evidence_tiers,
                 );
             }
+            "live_preview_evidence" => {
+                record_bool_evidence_tier(
+                    evidence,
+                    has_live_preview_evidence(&workspace),
+                    &mut missing_evidence,
+                    &mut evidence_tiers,
+                );
+            }
             "nextjs_route_evidence" => {
                 record_bool_evidence_tier(
                     evidence,
@@ -1547,6 +1558,13 @@ fn evidence_kinds_for_capability(capability: &str) -> Vec<EvidenceKind> {
             EvidenceKind::ImplementationArtifact,
             EvidenceKind::StatefulUpdateEvidence,
             EvidenceKind::PersistenceEvidence,
+        ],
+        "live_preview" | "content_render" | "rendered_content" => vec![
+            EvidenceKind::ImplementationArtifact,
+            EvidenceKind::VisibleInteractiveSurfaceEvidence,
+            EvidenceKind::UserInputHandlerEvidence,
+            EvidenceKind::StatefulUpdateEvidence,
+            EvidenceKind::LivePreviewEvidence,
         ],
         "nextjs_route" | "route" => vec![EvidenceKind::NextJsRouteEvidence],
         _ => Vec::new(),
@@ -2028,6 +2046,10 @@ fn has_persistence_evidence(workspace: &WorkspaceEvidence) -> bool {
     route_bound_source_files(workspace).any(source_file_has_persistence)
 }
 
+fn has_live_preview_evidence(workspace: &WorkspaceEvidence) -> bool {
+    route_bound_source_files(workspace).any(source_file_has_live_preview)
+}
+
 fn workspace_source_signal(
     workspace: &WorkspaceEvidence,
     signal_fn: fn(&SourceFile) -> SourceEvidenceSignal,
@@ -2383,6 +2405,26 @@ fn source_file_has_user_input_handler_keyword(file: &SourceFile) -> bool {
         || lower.contains("keyup")
         || lower.contains("pointerdown")
         || lower.contains("touchstart")
+}
+
+fn source_file_has_live_preview(file: &SourceFile) -> bool {
+    let lower = file.scan_text().to_ascii_lowercase();
+    let has_text_entry = lower.contains("<textarea")
+        || lower.contains("<input")
+        || lower.contains("contenteditable")
+        || lower.contains("data-anvil-action=\"input\"")
+        || lower.contains("data-anvil-action='input'");
+    let has_render_surface = lower.contains("preview")
+        || lower.contains("プレビュー")
+        || lower.contains("<section")
+        || lower.contains("<article")
+        || lower.contains("<ul")
+        || lower.contains("<li")
+        || lower.contains("markdown")
+        || lower.contains("list")
+        || lower.contains("items.map")
+        || lower.contains("notes.map");
+    has_text_entry && has_render_surface && source_file_has_stateful_update(file)
 }
 
 fn source_file_has_stateful_update(file: &SourceFile) -> bool {

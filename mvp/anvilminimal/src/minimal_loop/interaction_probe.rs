@@ -91,6 +91,8 @@ pub struct InteractionProbeCandidateEvidence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 pub struct BrowserInteractionProbeOptions {
     pub persistence_required: bool,
+    pub text_entry_required: bool,
+    pub token_echo_required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -119,6 +121,11 @@ pub struct BrowserInteractionObservation {
     pub persistence_before_reload_marker: String,
     pub persistence_after_reload_marker: String,
     pub action_hooks: Vec<String>,
+    pub text_entry: String,
+    pub text_entry_target: String,
+    pub typed_token: String,
+    pub token_echoed: bool,
+    pub text_input_state_change: bool,
     pub primary_transition_observed: bool,
     pub start_control_found: bool,
     pub informational_failure_kinds: Vec<String>,
@@ -1167,6 +1174,8 @@ const probeOptions = (() => {
   }
 })();
 const persistenceRequired = !!probeOptions.persistence_required;
+const textEntryRequired = !!probeOptions.text_entry_required;
+const tokenEchoRequired = !!probeOptions.token_echo_required;
 const started = Date.now();
 const LAUNCH_TIMEOUT_MS = 20000;
 const GOTO_TIMEOUT_MS = 12000;
@@ -1194,6 +1203,11 @@ let persistence_changed_dimensions = [];
 let persistence_before_reload_marker = "";
 let persistence_after_reload_marker = "";
 let action_hooks = [];
+let text_entry = "not_evaluated";
+let text_entry_target = "";
+let typed_token = `anvil-${Math.random().toString(36).slice(2, 8) || "probe"}`;
+let token_echoed = false;
+let text_input_state_change = false;
 let informational_failure_kinds = [];
 let server_check = { ok: false, status: null, error: "" };
 let post_js_surface = null;
@@ -1493,17 +1507,26 @@ async function evaluatePersistenceReload(page, mode) {
     return;
   }
   mark("persistence_reload");
+  const typedTokenWasPresent = text_input_state_change
+    ? await tokenPresentInPersistenceSurface(page, typed_token)
+    : false;
   persistence_before_reload_marker = await activeMarker(page, mode);
   try {
     await page.reload({ waitUntil: "domcontentloaded", timeout: GOTO_TIMEOUT_MS });
     await waitForAnySurface(page);
     await page.waitForTimeout(120);
     persistence_after_reload_marker = await activeMarker(page, mode);
-    persistence_after_reload = evaluatePersistenceAfterReload(
-      mode,
-      persistence_before_reload_marker,
-      persistence_after_reload_marker
-    );
+    if (typedTokenWasPresent) {
+      const typedTokenSurvived = await tokenPresentInPersistenceSurface(page, typed_token);
+      persistence_changed_dimensions = ["typed_token"];
+      persistence_after_reload = typedTokenSurvived ? "preserved" : "reset";
+    } else {
+      persistence_after_reload = evaluatePersistenceAfterReload(
+        mode,
+        persistence_before_reload_marker,
+        persistence_after_reload_marker
+      );
+    }
     steps.push(
       persistence_after_reload === "not_evaluated"
         ? "persistence_reload:not_evaluated"
@@ -1715,6 +1738,133 @@ async function attemptRankedCandidateTransitions(page, mode, skipContractPrimary
     }
   }
   return { observed: false, before: "", after: "", source: "", candidate: null };
+}
+
+async function textEntryCandidate(page) {
+  return await page.locator('textarea, input:not([type]), input[type=""], input[type="text"], input[type="search"], [contenteditable=""], [contenteditable="true"]').evaluateAll((els) => {
+    const visible = (el, box) => {
+      const style = window.getComputedStyle(el);
+      return box.width > 0
+        && box.height > 0
+        && style.visibility !== "hidden"
+        && style.display !== "none"
+        && Number(style.opacity || "1") > 0
+        && !el.disabled
+        && el.getAttribute("aria-hidden") !== "true";
+    };
+    return els
+      .map((el, index) => {
+        const box = el.getBoundingClientRect();
+        const hook = (el.getAttribute("data-anvil-action") || "").trim();
+        const tag = (el.tagName || "").toLowerCase();
+        return {
+          index,
+          tag,
+          hook,
+          area: Math.round(box.width * box.height),
+          visible: visible(el, box)
+        };
+      })
+      .filter((candidate) => candidate.visible)
+      .sort((a, b) =>
+        ((b.hook === "input") - (a.hook === "input")) ||
+        (b.area - a.area)
+      )[0] || null;
+  });
+}
+
+async function clickPrimaryActionIfPresent(page) {
+  const primary = page.locator('[data-anvil-action="primary"]').first();
+  if (await primary.count()) {
+    try {
+      await primary.click({ timeout: 1200 });
+      return true;
+    } catch (_) {}
+  }
+  const candidates = await rankedControlCandidates(page, false);
+  for (const candidate of candidates) {
+    try {
+      await page.locator("button,[role=button]").nth(candidate.index).click({ timeout: 1200 });
+      return true;
+    } catch (_) {}
+  }
+  return false;
+}
+
+async function tokenEchoedOutsideTextEntryTarget(page, token) {
+  if (!token) return false;
+  return await page.evaluate((value) => {
+    const excluded = document.querySelector('[data-anvil-probe-text-target="1"]');
+    const isExcluded = (node) => {
+      if (!excluded || !node) return false;
+      const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+      return !!element && (element === excluded || excluded.contains(element));
+    };
+    const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+    let node = walker.nextNode();
+    while (node) {
+      if (!isExcluded(node) && (node.nodeValue || "").includes(value)) {
+        return true;
+      }
+      node = walker.nextNode();
+    }
+    return false;
+  }, token);
+}
+
+async function tokenPresentInPersistenceSurface(page, token) {
+  if (!token) return false;
+  return await page.evaluate((value) => {
+    const bodyText = document.body && document.body.innerText ? document.body.innerText : "";
+    if (bodyText.includes(value)) return true;
+    for (const el of Array.from(document.querySelectorAll("input, textarea"))) {
+      if ((el.value || "").includes(value)) return true;
+    }
+    for (const el of Array.from(document.querySelectorAll("[data-anvil-state]"))) {
+      if ((el.getAttribute("data-anvil-state") || "").includes(value)) return true;
+    }
+    return false;
+  }, token);
+}
+
+async function attemptTextEntry(page, mode) {
+  const candidate = await textEntryCandidate(page);
+  if (!candidate) {
+    text_entry = "not_applicable";
+    steps.push("text_entry:not_applicable");
+    return false;
+  }
+  text_entry = "entered";
+  text_entry_target = `${candidate.tag}:${candidate.hook ? `data-anvil-action=${candidate.hook}` : "no-hook"}`;
+  const locator = page.locator('textarea, input:not([type]), input[type=""], input[type="text"], input[type="search"], [contenteditable=""], [contenteditable="true"]').nth(candidate.index);
+  input_before_marker = await activeMarker(page, mode);
+  try {
+    await locator.evaluate((el) => {
+      el.setAttribute("data-anvil-probe-text-target", "1");
+    });
+    await locator.focus({ timeout: 1200 });
+    await page.keyboard.type(typed_token, { delay: 5 });
+    await clickPrimaryActionIfPresent(page);
+    await page.waitForTimeout(120);
+    input_after_marker = await markerAfterActiveChange(page, mode, input_before_marker, 800);
+    text_input_state_change = input_before_marker !== input_after_marker;
+    if (mode === "contract") {
+      mergeStateDimensionsChanged(changedTopLevelStateKeys(input_before_marker, input_after_marker));
+    }
+    token_echoed = await tokenEchoedOutsideTextEntryTarget(page, typed_token);
+    steps.push("text_entry");
+    if (text_input_state_change) {
+      steps.push("text_input_state_change");
+      steps.push("input_state_change");
+    }
+    steps.push(token_echoed ? "token_echoed" : "token_echo_missing");
+    return text_input_state_change;
+  } catch (err) {
+    text_entry = "failed";
+    informational_failure_kinds.push("text_entry_failed");
+    steps.push("text_entry:failed");
+    return false;
+  }
 }
 
 async function hasStartLikeControl(page) {
@@ -1943,7 +2093,9 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       }
     }
 
-    if (transitionObserved) {
+    const textEntryObserved = await attemptTextEntry(page, probe_mode);
+
+    if (transitionObserved && !textEntryObserved) {
       await dispatchPostTransitionInputs(page, probe_mode);
     }
 
@@ -1963,7 +2115,9 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       transitionObserved = true;
       steps.push("start_transition");
       after_marker = recovery_after_marker;
-      await dispatchPostTransitionInputs(page, probe_mode);
+      if (!textEntryObserved) {
+        await dispatchPostTransitionInputs(page, probe_mode);
+      }
     }
 
     await evaluatePersistenceReload(page, probe_mode);
@@ -1972,18 +2126,29 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       informational_failure_kinds.push("primary_start_transition_missing");
     }
 
-    const inputStateChanged = steps.includes("input_state_change");
-    const startlessInputObserved = !start_control_found && inputStateChanged;
+    const inputStateChanged = textEntryRequired
+      ? text_input_state_change
+      : steps.includes("input_state_change") || text_input_state_change;
+    const textInputObserved = text_entry === "entered" && text_input_state_change;
+    const inputEvaluated = input_state_evaluated_after_start || textInputObserved;
+    const startlessInputObserved = (!start_control_found && inputStateChanged) || textInputObserved;
     const ok = steps.includes("surface_visible")
       && inputStateChanged
-      && ((transitionObserved && input_state_evaluated_after_start) || startlessInputObserved)
+      && ((transitionObserved && inputEvaluated) || startlessInputObserved)
+      && (!tokenEchoRequired || token_echoed)
       && (!persistenceRequired || persistence_after_reload !== "reset");
     const recoveryObserved = steps.includes("recovery_transition");
     const failureKind = persistenceRequired && persistence_after_reload === "reset"
       ? "persistence_after_reload_reset"
+      : tokenEchoRequired && !token_echoed
+        ? "token_echo_missing"
+      : textEntryRequired && text_entry !== "entered"
+        ? "text_entry_missing"
+      : textEntryRequired && !text_input_state_change
+        ? "text_input_state_change_missing"
       : interactionFailureKind(
       transitionObserved || startlessInputObserved,
-      input_state_evaluated_after_start || startlessInputObserved,
+      inputEvaluated || startlessInputObserved,
       inputStateChanged
     );
     write({
@@ -1991,7 +2156,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       status: ok ? "passed" : "failed",
       interaction_success: ok,
       interaction_performed: ok,
-      input_event_observed: steps.includes("control_input_dispatched"),
+      input_event_observed: steps.includes("control_input_dispatched") || text_entry === "entered",
       input_state_change: inputStateChanged,
       state_changed: inputStateChanged,
       visible_state_changed: inputStateChanged,
@@ -2013,6 +2178,11 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       persistence_before_reload_marker,
       persistence_after_reload_marker,
       action_hooks,
+      text_entry,
+      text_entry_target,
+      typed_token,
+      token_echoed,
+      text_input_state_change,
       informational_failure_kinds,
       steps,
       stage,
@@ -2072,6 +2242,11 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       persistence_before_reload_marker,
       persistence_after_reload_marker,
       action_hooks,
+      text_entry,
+      text_entry_target,
+      typed_token,
+      token_echoed,
+      text_input_state_change,
       informational_failure_kinds,
       failure_kind: err && err.anvilFailureKind ? err.anvilFailureKind : "probe_script_error",
       navigation_failure_kind: err && err.navigationFailureKind ? err.navigationFailureKind : "",
@@ -2174,6 +2349,11 @@ fn merge_script_stdout_failure_value(mut value: Value, logs: &InteractionStdio) 
             "persistence_before_reload_marker",
             "persistence_after_reload_marker",
             "action_hooks",
+            "text_entry",
+            "text_entry_target",
+            "typed_token",
+            "token_echoed",
+            "text_input_state_change",
             "informational_failure_kinds",
             "failure_kind",
             "navigation_failure_kind",
@@ -2340,8 +2520,33 @@ fn observation_from_value(
         .or_else(|| value.get("state_changed"))
         .or_else(|| value.get("visible_state_changed"))
         .and_then(Value::as_bool);
+    let text_entry = value
+        .get("text_entry")
+        .and_then(Value::as_str)
+        .unwrap_or("not_evaluated")
+        .to_string();
+    let text_entry_target = value
+        .get("text_entry_target")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let typed_token = value
+        .get("typed_token")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let token_echoed = value
+        .get("token_echoed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let text_input_state_change = value
+        .get("text_input_state_change")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || steps.iter().any(|step| step == "text_input_state_change");
     let input_state_changed = steps.iter().any(|step| step == "input_state_change")
-        || explicit_state_changed == Some(true);
+        || explicit_state_changed == Some(true)
+        || text_input_state_change;
     let recovery_transition_not_observed = steps
         .iter()
         .any(|step| step == "recovery_transition:not_observed")
@@ -2358,7 +2563,9 @@ fn observation_from_value(
     let surface_visible = steps.iter().any(|step| step == "surface_visible")
         || value.get("surface_visible").and_then(Value::as_bool) == Some(true)
         || value.get("interactive_surface").and_then(Value::as_bool) == Some(true);
-    let startless_input_observed = !start_control_found && surface_visible && input_state_changed;
+    let text_input_observed = text_entry == "entered" && text_input_state_change;
+    let startless_input_observed =
+        (!start_control_found && surface_visible && input_state_changed) || text_input_observed;
     let taxonomy_failure_kind = interaction_taxonomy_failure_kind(
         start_transition_observed || startless_input_observed,
         input_state_evaluated_after_start || startless_input_observed,
@@ -2476,6 +2683,11 @@ fn observation_from_value(
             .unwrap_or("")
             .to_string(),
         action_hooks,
+        text_entry,
+        text_entry_target,
+        typed_token,
+        token_echoed,
+        text_input_state_change,
         primary_transition_observed,
         start_control_found,
         informational_failure_kinds,
@@ -2696,6 +2908,11 @@ fn failure_observation(
         persistence_before_reload_marker: String::new(),
         persistence_after_reload_marker: String::new(),
         action_hooks: Vec::new(),
+        text_entry: "not_evaluated".to_string(),
+        text_entry_target: String::new(),
+        typed_token: String::new(),
+        token_echoed: false,
+        text_input_state_change: false,
         primary_transition_observed: false,
         start_control_found: true,
         informational_failure_kinds: Vec::new(),
@@ -2885,6 +3102,11 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "persistence_before_reload_marker": observation.persistence_before_reload_marker,
         "persistence_after_reload_marker": observation.persistence_after_reload_marker,
         "action_hooks": &observation.action_hooks,
+        "text_entry": observation.text_entry,
+        "text_entry_target": observation.text_entry_target,
+        "typed_token": observation.typed_token,
+        "token_echoed": observation.token_echoed,
+        "text_input_state_change": observation.text_input_state_change,
         "primary_start_transition": observation.primary_transition_observed,
         "start_control_found": observation.start_control_found,
         "primary_start_transition_missing": !observation.primary_transition_observed
