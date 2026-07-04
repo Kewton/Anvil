@@ -54,10 +54,11 @@ use crate::planner::lint::{
 };
 use crate::planner::profile::{
     GENERIC_INTERACTIVE_CONTRACT_CAPABILITY, PhaseVerificationMode, ProfileBehaviorProbeReport,
-    ProfileSnapshot, canonical_profile_name, domain_profile, profile_auto_repair,
-    profile_before_phase, profile_expected_paths, profile_generation_rules, profile_guidance,
-    profile_post_step_repair, profile_quality_expectations, profile_runtime_contract,
-    profile_setup_scaffold_paths, verify_profile_final, verify_profile_invariant,
+    ProfileInferenceSource, ProfileSnapshot, canonical_profile_name, domain_profile, infer_profile,
+    profile_auto_repair, profile_before_phase, profile_expected_paths, profile_generation_rules,
+    profile_guidance, profile_post_step_repair, profile_quality_expectations,
+    profile_runtime_contract, profile_setup_scaffold_paths, verify_profile_final,
+    verify_profile_invariant,
 };
 use crate::planner::repair::{
     RecoveryHandoff, RepairContext, build_repair_prompt_with_context, save_recovery_ultra_plan,
@@ -575,10 +576,39 @@ struct UltraRunContext {
     truncated: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ProfilePromotionState {
+    eligible: bool,
+    promoted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfilePromotion {
+    id: String,
+    at_phase: usize,
+    phase_id: String,
+    delta_capabilities: Vec<String>,
+    delta_requirements: Vec<String>,
+}
+
 const ULTRA_CONTEXT_MAX_PHASES: usize = 12;
 const ULTRA_CONTEXT_MAX_PATHS: usize = 24;
 const ULTRA_CONTEXT_MAX_MESSAGES: usize = 10;
 const ULTRA_PROMPT_GUIDANCE_MAX_LINES: usize = 8;
+
+impl ProfilePromotionState {
+    fn for_run(plan: &UltraPlan, config: &Config) -> Self {
+        Self {
+            eligible: canonical_profile_name(&plan.profile) == "generic"
+                && !config.profile_explicit,
+            promoted: false,
+        }
+    }
+
+    fn can_promote(&self, plan: &UltraPlan) -> bool {
+        self.eligible && !self.promoted && canonical_profile_name(&plan.profile) == "generic"
+    }
+}
 
 impl UltraRunContext {
     fn new(pending_final_artifacts: Vec<String>) -> Self {
@@ -780,6 +810,125 @@ impl UltraRunContext {
         }
         lines.join("\n")
     }
+}
+
+fn try_promote_profile_at_phase_boundary(
+    config: &mut Config,
+    plan: &mut UltraPlan,
+    context: &mut UltraRunContext,
+    final_expected_paths: &mut Vec<String>,
+    promotion_state: &mut ProfilePromotionState,
+    phase: &UltraPhase,
+    index: usize,
+) -> anyhow::Result<Option<ProfilePromotion>> {
+    if !promotion_state.can_promote(plan) {
+        return Ok(None);
+    }
+    let Some(inference) = infer_profile(None, &config.workspace_root) else {
+        return Ok(None);
+    };
+    if inference.source != ProfileInferenceSource::Workspace {
+        return Ok(None);
+    }
+    let promoted = canonical_profile_name(inference.profile);
+    if promoted == "generic" || promoted == canonical_profile_name(&plan.profile) {
+        return Ok(None);
+    }
+
+    let generic_capabilities = inferred_required_capabilities("generic", &plan.goal);
+    let generic_evidence = inferred_required_evidence("generic", &plan.goal, &generic_capabilities);
+    let mut promoted_capabilities = inferred_required_capabilities(&promoted, &plan.goal);
+    let mut promoted_evidence =
+        inferred_required_evidence(&promoted, &plan.goal, &promoted_capabilities);
+    let mut promoted_obligations =
+        inferred_required_obligations(&promoted, &plan.goal, &promoted_capabilities);
+    let promoted_paths = profile_expected_paths(&config.workspace_root, &promoted, &plan.goal);
+    let bound_contract = bind_completion_contract_for_acceptance(
+        config,
+        "ultra-plan-run",
+        &promoted,
+        &plan.goal,
+        &promoted_paths,
+        &promoted_capabilities,
+        &promoted_evidence,
+        &promoted_obligations,
+    )?;
+    if let Some(contract) = bound_contract.as_ref().map(|bound| &bound.contract) {
+        merge_unique_strings(&mut promoted_capabilities, &contract.required_capabilities);
+        merge_unique_strings(&mut promoted_evidence, &contract.required_evidence);
+        merge_unique_strings(&mut promoted_obligations, &contract.required_obligations);
+    }
+    merge_unique_strings(
+        &mut promoted_evidence,
+        &inferred_required_evidence(&promoted, &plan.goal, &promoted_capabilities),
+    );
+
+    let delta_capabilities =
+        ordered_string_difference(&promoted_capabilities, &generic_capabilities);
+    let mut generic_requirements = generic_capabilities.clone();
+    merge_unique_strings(&mut generic_requirements, &generic_evidence);
+    let mut promoted_requirements = promoted_capabilities.clone();
+    merge_unique_strings(&mut promoted_requirements, &promoted_evidence);
+    let delta_requirements =
+        ordered_string_difference(&promoted_requirements, &generic_requirements);
+    push_context_items_capped(
+        &mut context.pending_capability_evidence,
+        &delta_requirements,
+        ULTRA_CONTEXT_MAX_MESSAGES,
+        &mut context.truncated,
+    );
+
+    plan.profile = promoted.clone();
+    config.profile = promoted.clone();
+    config.profile_inference = Some(inference);
+    *final_expected_paths =
+        profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+    context.pending_final_artifacts =
+        missing_final_artifacts(&config.workspace_root, final_expected_paths);
+    promotion_state.promoted = true;
+
+    let promotion = ProfilePromotion {
+        id: promoted,
+        at_phase: index + 1,
+        phase_id: phase.id.clone(),
+        delta_capabilities,
+        delta_requirements,
+    };
+    emit_profile_reinferred(config, &promotion);
+    Ok(Some(promotion))
+}
+
+fn ordered_string_difference(values: &[String], baseline: &[String]) -> Vec<String> {
+    let baseline = baseline.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    values
+        .iter()
+        .filter(|value| !baseline.contains(value.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn emit_profile_reinferred(config: &Config, promotion: &ProfilePromotion) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "profile_reinferred",
+            "id": promotion.id,
+            "profile": promotion.id,
+            "at_phase": promotion.at_phase,
+            "phase_id": promotion.phase_id,
+            "from": "workspace",
+            "from_profile": "generic",
+            "to_profile": promotion.id,
+            "delta_capabilities": promotion.delta_capabilities.clone(),
+            "delta_requirements": promotion.delta_requirements.clone(),
+        }),
+    );
+    let line = format!(
+        "Profile promoted: generic -> {} (workspace evidence, phase {})",
+        promotion.id, promotion.at_phase
+    );
+    eprintln!("{line}");
+    eval_events::write_run_summary(config.eval_events_path.as_deref(), &line);
 }
 
 impl StepPlanRunOutcome {
@@ -2984,20 +3133,26 @@ pub fn run_ultra_plan_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<String> {
+    let mut active_plan = plan.clone();
+    let mut active_config = config.clone();
+    let plan = &mut active_plan;
+    let config = &mut active_config;
     let report = lint_ultra_plan_report(plan);
     if !report.is_pass() {
         emit_planner_error_for_lint(config, "ultra-plan-file", &config.planner_model, &report, 0);
         anyhow::bail!("{}", report.primary_message());
     }
-    let final_expected_paths =
+    let mut final_expected_paths =
         profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
     let mut ultra_context = UltraRunContext::new(missing_final_artifacts(
         &config.workspace_root,
         &final_expected_paths,
     ));
     let mut ultra_session = SessionSnapshot::new();
+    let mut promotion_state = ProfilePromotionState::for_run(plan, config);
     emit_ultra_context_initialized(config, plan, &ultra_context, ultra_session.messages.len());
-    for (index, phase) in plan.phases.iter().enumerate() {
+    let phases = plan.phases.clone();
+    for (index, phase) in phases.iter().enumerate() {
         if ui.interrupted() {
             anyhow::bail!("interrupted by user");
         }
@@ -3314,6 +3469,15 @@ pub fn run_ultra_plan_with_ui(
                 None,
                 None,
             );
+            let _ = try_promote_profile_at_phase_boundary(
+                config,
+                plan,
+                &mut ultra_context,
+                &mut final_expected_paths,
+                &mut promotion_state,
+                phase,
+                index,
+            )?;
             continue;
         }
         let final_invariant_reason =
@@ -3349,6 +3513,15 @@ pub fn run_ultra_plan_with_ui(
             None,
             None,
         );
+        let _ = try_promote_profile_at_phase_boundary(
+            config,
+            plan,
+            &mut ultra_context,
+            &mut final_expected_paths,
+            &mut promotion_state,
+            phase,
+            index,
+        )?;
     }
     let mut final_acceptance_cycle_deltas = Vec::new();
     let mut acceptance_report = ultra_final_acceptance_report_with_cycle(plan, config, 0)?;
