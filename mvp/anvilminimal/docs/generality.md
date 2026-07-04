@@ -97,6 +97,18 @@ rendering and the Next.js boundary-erosion tripwire.
 | M5 Corpus harvest | 2026-07-04 | Round A four corpus cases plus Round B corpus case. |
 | M6 Declaration and guardrails | 2026-07-04 | This document, cross-references, and `generality_guardrails` tests. |
 
+## Generic Assurance Track Completion
+
+Status: complete on 2026-07-05.
+
+| milestone | completion date | evidence |
+|---|---|---|
+| G0 Scope | 2026-07-04 | Generic assurance scope and limits recorded in Scope S. |
+| G1 Generic contract binding | 2026-07-04 | `generic_contract_bound` event and generic static contract tests. |
+| G2 Known-manifest promotion | 2026-07-04 | `generic_ultra_promotes_to_nextjs_after_workspace_manifest`, `generic_ultra_promotes_to_python_cli_after_pyproject_manifest`, and `generic_ultra_without_manifest_keeps_static_tier`. |
+| G3 Ambiguous UAT evidence | 2026-07-04 | `test0704-4030444542434647484814950515354_001` no-profile memo app run. |
+| G4 Codification | 2026-07-05 | Default Next.js no-port policy, AMBIGUOUS scenario runbook, G3 corpus harvest, and [mechanism-ledger.md#generic-assurance-track-cross-reference](mechanism-ledger.md#generic-assurance-track-cross-reference). |
+
 ## Out Of Scope
 
 The declaration does not claim:

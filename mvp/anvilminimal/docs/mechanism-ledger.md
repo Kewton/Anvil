@@ -16,6 +16,18 @@ documentation and test guardrails only, with no behavior changes.
 | M5 | complete | 2026-07-04 | [generality.md#clause-evidence](generality.md#clause-evidence) |
 | M6 | complete | 2026-07-04 | [generality.md](generality.md) |
 
+## Generic Assurance Track Cross-Reference
+
+Status: complete on 2026-07-05.
+
+| milestone | status | date | reference |
+|---|---|---|---|
+| G0 | complete | 2026-07-04 | Generic assurance scope established in [generality.md#scope-s](generality.md#scope-s). |
+| G1 | complete | 2026-07-04 | Generic contract binding guarded by `generic_contract_bound` and runner tests. |
+| G2 | complete | 2026-07-04 | Known-manifest promotion covered by `generic_ultra_promotes_to_nextjs_after_workspace_manifest` and `generic_ultra_promotes_to_python_cli_after_pyproject_manifest`. |
+| G3 | complete | 2026-07-04 | Ambiguous no-profile UAT run `test0704-4030444542434647484814950515354_001`. |
+| G4 | complete | 2026-07-05 | Default-port policy, fifth UAT scenario, scope update, G3 corpus harvest, and this closure ledger. |
+
 ## Required Fields
 
 - mechanism id

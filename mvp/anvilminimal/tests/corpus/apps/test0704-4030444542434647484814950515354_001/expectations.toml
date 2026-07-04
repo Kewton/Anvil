@@ -1,0 +1,28 @@
+case_id = "test0704-4030444542434647484814950515354_001"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-4030444542434647484814950515354_001"
+required_paths = ["package.json", "src/App.tsx"]
+verify_commands = []
+required_capabilities = ["generic_interactive_contract"]
+required_evidence = ["user_input_handler_evidence", "stateful_update_evidence", "visible_interactive_surface_evidence"]
+required_obligations = ["implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["メモアプリ", "memo"]
+
+[route_closure]
+include = []
+exclude = []
+
+[evidence]
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+nextjs_route_evidence = "Absent"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"

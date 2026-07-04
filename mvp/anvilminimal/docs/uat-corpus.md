@@ -15,6 +15,18 @@ mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
   test0704_003
 ```
 
+The first ambiguous no-profile harvest from G3 is:
+
+```sh
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-4030444542434647484814950515354_001 \
+  test0704-4030444542434647484814950515354_001
+```
+
+That case intentionally records an unknown Vite stack as a generic static-tier
+fallback. It should not be rewritten into a Next.js fixture unless a future
+profile explicitly supports that stack.
+
 The script copies `src/**`, `package.json`, and common Next.js/TypeScript/
 Tailwind/PostCSS config files. It intentionally does not copy `node_modules`,
 `.next`, `.anvil`, lockfiles, logs, screenshots, or other generated artifacts.
