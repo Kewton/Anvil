@@ -12368,7 +12368,7 @@ mod tests {
     #[test]
     fn verify_policy_error_gets_corrective_retry() {
         let dir = tempfile::tempdir().unwrap();
-        let invalid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js || node check2.js"]}]}"#;
+        let invalid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js | node check2.js"]}]}"#;
         let valid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js","node check2.js"]}]}"#;
         let mut planner = FakeClient::new(vec![
             AssistantReply::text(invalid),
@@ -12686,7 +12686,7 @@ mod tests {
     #[test]
     fn invalid_planner_lint_does_not_save_plan_file() {
         let dir = tempfile::tempdir().unwrap();
-        let invalid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js || node check2.js"]}]}"#;
+        let invalid = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js | node check2.js"]}]}"#;
         let mut planner = FakeClient::new(vec![
             AssistantReply::text(invalid),
             AssistantReply::text(invalid),
@@ -13107,7 +13107,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         let weak = r#"{"goal":"Build a Next.js game app","steps":[{"id":"make-app","kind":"implement","expected_result":"pass","instruction":"Create package.json and src/app/page.tsx for the game app","expected_paths":["package.json","src/app/page.tsx"],"verify":[]}]}"#;
-        let degraded = r#"{"goal":"Build a Next.js game app","steps":[{"id":"bad","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js || node check2.js"]}]}"#;
+        let degraded = r#"{"goal":"Build a Next.js game app","steps":[{"id":"bad","kind":"implement","expected_result":"pass","instruction":"Create app","expected_paths":["package.json"],"verify":["node check.js | node check2.js"]}]}"#;
         let mut planner = FakeClient::new(vec![
             AssistantReply::text(weak),
             AssistantReply::text(degraded),
