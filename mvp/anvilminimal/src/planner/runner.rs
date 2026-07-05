@@ -1257,6 +1257,27 @@ impl StepPlanRunError {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct UltraRunSetupAuthorityState {
+    reasons: Vec<String>,
+}
+
+impl UltraRunSetupAuthorityState {
+    fn authority(&self) -> NodeDependencySetupAuthority {
+        if self.reasons.is_empty() {
+            NodeDependencySetupAuthority::None
+        } else {
+            NodeDependencySetupAuthority::PlanSetupStep
+        }
+    }
+
+    fn grant(&mut self, reason: &str) {
+        if !self.reasons.iter().any(|existing| existing == reason) {
+            self.reasons.push(reason.to_string());
+        }
+    }
+}
+
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn run_step_plan_with_session_with_ui(
     client: &mut dyn ChatClient,
@@ -1268,6 +1289,33 @@ fn run_step_plan_with_session_with_ui(
     mode: &'static str,
     phase_scope: Option<&str>,
     overall_goal_override: Option<&str>,
+) -> Result<StepPlanRunOutcome, StepPlanRunError> {
+    run_step_plan_with_session_with_ui_and_run_authority(
+        client,
+        session,
+        plan,
+        config,
+        ui,
+        verify_final_contract,
+        mode,
+        phase_scope,
+        overall_goal_override,
+        None,
+    )
+}
+
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+fn run_step_plan_with_session_with_ui_and_run_authority(
+    client: &mut dyn ChatClient,
+    session: &mut SessionSnapshot,
+    plan: &StepPlan,
+    config: &Config,
+    ui: &dyn InteractionUi,
+    verify_final_contract: bool,
+    mode: &'static str,
+    phase_scope: Option<&str>,
+    overall_goal_override: Option<&str>,
+    mut run_setup_authority: Option<&mut UltraRunSetupAuthorityState>,
 ) -> Result<StepPlanRunOutcome, StepPlanRunError> {
     let mut outcome = StepPlanRunOutcome::for_plan(plan);
     let overall_goal = overall_goal_override.unwrap_or(&plan.goal);
@@ -1334,6 +1382,10 @@ fn run_step_plan_with_session_with_ui(
                 .as_ref()
                 .and_then(|bound| bound.fs_path.clone()),
         };
+        let run_authority = run_setup_authority
+            .as_deref()
+            .map(UltraRunSetupAuthorityState::authority)
+            .unwrap_or(NodeDependencySetupAuthority::None);
         match run_step(
             client,
             session,
@@ -1345,6 +1397,7 @@ fn run_step_plan_with_session_with_ui(
             mode,
             contract_enforcement,
             phase_scope,
+            run_authority,
         ) {
             Ok(step_outcome) => {
                 outcome.completed_steps += 1;
@@ -1354,6 +1407,11 @@ fn run_step_plan_with_session_with_ui(
                 outcome.merge_step(&err.outcome);
                 return Err(StepPlanRunError::from_error(err.message, outcome));
             }
+        }
+        if let Some(state) = run_setup_authority.as_deref_mut()
+            && step_carries_setup_authority(plan, step, phase_scope)
+        {
+            state.grant("phase_setup_step");
         }
         merge_unique_strings(&mut prior_expected_paths, &step.expected_paths);
     }
@@ -1406,6 +1464,7 @@ fn run_step(
     mode: &'static str,
     contract_enforcement: ContractEnforcement,
     phase_scope: Option<&str>,
+    run_setup_authority: NodeDependencySetupAuthority,
 ) -> Result<StepRunOutcome, StepRunError> {
     let mut runtime_step = step.clone();
     let instruction = build_step_prompt(plan, step, prompt_context);
@@ -1422,8 +1481,9 @@ fn run_step(
     {
         step_config.completion_contract_path = Some(path);
     }
-    let setup_authority = step_verify_setup_authority(plan, step);
-    let contract_setup_authority = step_contract_setup_authority(plan, step, phase_scope);
+    let setup_authority = step_verify_setup_authority(plan, step, run_setup_authority);
+    let contract_setup_authority =
+        step_contract_setup_authority(plan, step, phase_scope, run_setup_authority);
     let step_options = step_run_session_options(
         step,
         contract_enforcement,
@@ -1998,12 +2058,16 @@ fn run_step(
     Err(StepRunError { message, outcome })
 }
 
-fn step_verify_setup_authority(plan: &StepPlan, step: &PlanStep) -> NodeDependencySetupAuthority {
+fn step_verify_setup_authority(
+    plan: &StepPlan,
+    step: &PlanStep,
+    fallback: NodeDependencySetupAuthority,
+) -> NodeDependencySetupAuthority {
     if step.step_kind() == StepKind::Setup {
         return NodeDependencySetupAuthority::PlanSetupStep;
     }
     if step.step_kind() != StepKind::Verify {
-        return NodeDependencySetupAuthority::None;
+        return fallback;
     }
     let prior_setup_exists = plan
         .steps
@@ -2013,7 +2077,7 @@ fn step_verify_setup_authority(plan: &StepPlan, step: &PlanStep) -> NodeDependen
     if prior_setup_exists {
         NodeDependencySetupAuthority::PlanSetupStep
     } else {
-        NodeDependencySetupAuthority::None
+        fallback
     }
 }
 
@@ -2021,6 +2085,7 @@ fn step_contract_setup_authority(
     _plan: &StepPlan,
     step: &PlanStep,
     phase_scope: Option<&str>,
+    fallback: NodeDependencySetupAuthority,
 ) -> NodeDependencySetupAuthority {
     if step.step_kind() != StepKind::Implement {
         return NodeDependencySetupAuthority::None;
@@ -2028,8 +2093,23 @@ fn step_contract_setup_authority(
     if step_or_phase_is_dependency_setup_purpose(step, phase_scope) {
         NodeDependencySetupAuthority::PlanSetupStep
     } else {
-        NodeDependencySetupAuthority::None
+        fallback
     }
+}
+
+fn step_carries_setup_authority(
+    plan: &StepPlan,
+    step: &PlanStep,
+    phase_scope: Option<&str>,
+) -> bool {
+    step_verify_setup_authority(plan, step, NodeDependencySetupAuthority::None).allows_setup()
+        || step_contract_setup_authority(
+            plan,
+            step,
+            phase_scope,
+            NodeDependencySetupAuthority::None,
+        )
+        .allows_setup()
 }
 
 fn step_or_phase_is_dependency_setup_purpose(step: &PlanStep, phase_scope: Option<&str>) -> bool {
@@ -3391,6 +3471,7 @@ pub fn run_ultra_plan_with_ui(
     ));
     let mut ultra_session = SessionSnapshot::new();
     let mut promotion_state = ProfilePromotionState::for_run(plan, config);
+    let mut setup_authority_state = UltraRunSetupAuthorityState::default();
     emit_ultra_context_initialized(config, plan, &ultra_context, ultra_session.messages.len());
     let phases = plan.phases.clone();
     for (index, phase) in phases.iter().enumerate() {
@@ -3488,7 +3569,7 @@ pub fn run_ultra_plan_with_ui(
         );
         save_step_plan(&config.workspace_root, &step_plan)?;
         let final_phase = index + 1 == plan.phases.len();
-        let step_outcome = match run_step_plan_with_session_with_ui(
+        let step_outcome = match run_step_plan_with_session_with_ui_and_run_authority(
             execution,
             &mut ultra_session,
             &step_plan,
@@ -3498,6 +3579,7 @@ pub fn run_ultra_plan_with_ui(
             "ultra-plan-run",
             Some(&phase.id),
             Some(&plan.goal),
+            Some(&mut setup_authority_state),
         ) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -3711,7 +3793,7 @@ pub fn run_ultra_plan_with_ui(
                 None,
                 None,
             );
-            let _ = try_promote_profile_at_phase_boundary(
+            if try_promote_profile_at_phase_boundary(
                 config,
                 plan,
                 &mut ultra_context,
@@ -3719,7 +3801,11 @@ pub fn run_ultra_plan_with_ui(
                 &mut promotion_state,
                 phase,
                 index,
-            )?;
+            )?
+            .is_some()
+            {
+                setup_authority_state.grant("profile_promotion");
+            }
             continue;
         }
         let final_invariant_reason =
@@ -3755,7 +3841,7 @@ pub fn run_ultra_plan_with_ui(
             None,
             None,
         );
-        let _ = try_promote_profile_at_phase_boundary(
+        if try_promote_profile_at_phase_boundary(
             config,
             plan,
             &mut ultra_context,
@@ -3763,7 +3849,11 @@ pub fn run_ultra_plan_with_ui(
             &mut promotion_state,
             phase,
             index,
-        )?;
+        )?
+        .is_some()
+        {
+            setup_authority_state.grant("profile_promotion");
+        }
     }
     let mut final_acceptance_cycle_deltas = Vec::new();
     let mut acceptance_report = ultra_final_acceptance_report_with_cycle(plan, config, 0)?;
@@ -11727,11 +11817,21 @@ mod tests {
         };
 
         assert_eq!(
-            step_contract_setup_authority(&without_setup, &implement, None),
+            step_contract_setup_authority(
+                &without_setup,
+                &implement,
+                None,
+                NodeDependencySetupAuthority::None
+            ),
             NodeDependencySetupAuthority::None
         );
         assert_eq!(
-            step_contract_setup_authority(&with_setup_implement, &setup_implement, None),
+            step_contract_setup_authority(
+                &with_setup_implement,
+                &setup_implement,
+                None,
+                NodeDependencySetupAuthority::None
+            ),
             NodeDependencySetupAuthority::PlanSetupStep
         );
         assert_eq!(
@@ -11739,6 +11839,52 @@ mod tests {
                 &without_setup,
                 &implement,
                 Some("workspace-and-dependencies-setup"),
+                NodeDependencySetupAuthority::None,
+            ),
+            NodeDependencySetupAuthority::PlanSetupStep
+        );
+    }
+
+    #[test]
+    fn ultra_run_setup_authority_falls_back_for_later_verify_and_contract_steps() {
+        let plan = StepPlan {
+            goal: "verify promoted app".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "implement".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Implement the app".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "verify".to_string(),
+                    kind: "verify".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Run build".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: vec!["npm run build".to_string()],
+                },
+            ],
+        };
+        let implement = &plan.steps[0];
+        let verify = &plan.steps[1];
+
+        assert_eq!(
+            step_verify_setup_authority(&plan, verify, NodeDependencySetupAuthority::None),
+            NodeDependencySetupAuthority::None
+        );
+        assert_eq!(
+            step_verify_setup_authority(&plan, verify, NodeDependencySetupAuthority::PlanSetupStep),
+            NodeDependencySetupAuthority::PlanSetupStep
+        );
+        assert_eq!(
+            step_contract_setup_authority(
+                &plan,
+                implement,
+                None,
+                NodeDependencySetupAuthority::PlanSetupStep
             ),
             NodeDependencySetupAuthority::PlanSetupStep
         );
