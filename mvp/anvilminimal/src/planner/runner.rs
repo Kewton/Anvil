@@ -6094,6 +6094,7 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "input_dispatches": &observation.input_dispatches,
                     "state_dimensions_changed": &observation.state_dimensions_changed,
                     "persistence_after_reload": observation.persistence_after_reload.as_str(),
+                    "persistence_after_reload_reason": observation.persistence_after_reload_reason.as_str(),
                     "persistence_changed_dimensions": &observation.persistence_changed_dimensions,
                     "action_hooks": &observation.action_hooks,
                     "text_entry": observation.text_entry.as_str(),
@@ -11627,6 +11628,11 @@ fn final_acceptance_behavioral_probe_context(
             .filter(|status| !status.is_empty())
         {
             lines.push(format!("- persistence after reload: {status}"));
+        }
+        if let Some(reason) = raw_text_field_deep(value, &["persistence_after_reload_reason"])
+            .filter(|reason| !reason.is_empty())
+        {
+            lines.push(format!("- persistence after reload reason: {reason}"));
         }
         let persisted_dimensions =
             raw_string_array_field_deep(value, "persistence_changed_dimensions");

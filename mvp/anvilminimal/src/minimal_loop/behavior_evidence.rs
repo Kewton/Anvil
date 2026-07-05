@@ -81,8 +81,27 @@ enum RecoveryTransition {
 enum PersistenceAfterReload {
     Preserved,
     Reset,
-    NotEvaluated,
+    NotEvaluated(PersistenceNotEvaluatedReason),
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistenceNotEvaluatedReason {
+    NoMutationObserved,
+    NoTextEntrySurface,
+    ReloadFailed,
+    Unknown,
+}
+
+impl PersistenceNotEvaluatedReason {
+    fn unverified_status(self) -> &'static str {
+        match self {
+            Self::NoMutationObserved => "not_evaluated:no_mutation_observed",
+            Self::NoTextEntrySurface => "not_evaluated:no_text_entry_surface",
+            Self::ReloadFailed => "not_evaluated:reload_failed",
+            Self::Unknown => "not_evaluated",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,7 +352,9 @@ fn behavioral_decision(
         return match observation.persistence_after_reload {
             PersistenceAfterReload::Preserved => BehavioralDecision::Pass("preserved_after_reload"),
             PersistenceAfterReload::Reset => BehavioralDecision::Fail("reset_after_reload"),
-            PersistenceAfterReload::NotEvaluated => BehavioralDecision::Unverified("not_evaluated"),
+            PersistenceAfterReload::NotEvaluated(reason) => {
+                BehavioralDecision::Unverified(reason.unverified_status())
+            }
             PersistenceAfterReload::Unknown => BehavioralDecision::Static(if observation.ok {
                 "probe_ok_not_mapped"
             } else {
@@ -645,7 +666,9 @@ fn persistence_after_reload(value: &Value, steps: &BTreeSet<String>) -> Persiste
     match text_field_deep(value, &["persistence_after_reload"]).as_deref() {
         Some("preserved") => return PersistenceAfterReload::Preserved,
         Some("reset") => return PersistenceAfterReload::Reset,
-        Some("not_evaluated") => return PersistenceAfterReload::NotEvaluated,
+        Some("not_evaluated") => {
+            return PersistenceAfterReload::NotEvaluated(persistence_not_evaluated_reason(value));
+        }
         Some(_) => {}
         None => {}
     }
@@ -654,9 +677,18 @@ fn persistence_after_reload(value: &Value, steps: &BTreeSet<String>) -> Persiste
     } else if steps.contains("persistence_reload:reset") {
         PersistenceAfterReload::Reset
     } else if steps.contains("persistence_reload:not_evaluated") {
-        PersistenceAfterReload::NotEvaluated
+        PersistenceAfterReload::NotEvaluated(persistence_not_evaluated_reason(value))
     } else {
         PersistenceAfterReload::Unknown
+    }
+}
+
+fn persistence_not_evaluated_reason(value: &Value) -> PersistenceNotEvaluatedReason {
+    match text_field_deep(value, &["persistence_after_reload_reason"]).as_deref() {
+        Some("no_mutation_observed") => PersistenceNotEvaluatedReason::NoMutationObserved,
+        Some("no_text_entry_surface") => PersistenceNotEvaluatedReason::NoTextEntrySurface,
+        Some("reload_failed") => PersistenceNotEvaluatedReason::ReloadFailed,
+        _ => PersistenceNotEvaluatedReason::Unknown,
     }
 }
 
@@ -1940,6 +1972,64 @@ export default function Page() {
                 .get("persistence_evidence")
                 .map(|record| record.behavioral_observation.as_str()),
             Some("not_evaluated")
+        );
+    }
+
+    #[test]
+    fn persistence_reload_not_evaluated_reason_is_preserved_in_unverified_status() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), todo_persistence_page());
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "steps": ["surface_visible", "start_transition", "input_state_change", "persistence_reload:not_evaluated"],
+                "input_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[]}}]}",
+                "input_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"items\":[\"probe\"]}}]}",
+                "persistence_after_reload": "not_evaluated",
+                "persistence_after_reload_reason": "no_mutation_observed",
+                "persistence_changed_dimensions": [],
+                "action_hooks": ["primary"]
+            }),
+        );
+        let required = ["persistence_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(
+            report.unverified_evidence.contains(
+                &"persistence_evidence:unverified:not_evaluated:no_mutation_observed".to_string()
+            ),
+            "{report:?}"
+        );
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("persistence_evidence")
+                .map(String::as_str),
+            Some("unverified:not_evaluated:no_mutation_observed")
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("persistence_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("not_evaluated:no_mutation_observed")
         );
     }
 
