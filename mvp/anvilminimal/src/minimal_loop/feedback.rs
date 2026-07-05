@@ -17,6 +17,12 @@ pub fn empty_response() -> String {
     "The previous assistant response was empty. Continue the task by calling the appropriate tool, or provide a concise final answer if no tool is needed.".to_string()
 }
 
+pub fn empty_response_reformulated(step_instruction: &str) -> String {
+    format!(
+        "The previous assistant response was empty again. Continue this exact step now:\n\n{step_instruction}\n\nRespond with tool calls for any workspace inspection, edits, setup, or verification needed for this step. Do not send an empty response."
+    )
+}
+
 pub fn completion_without_write() -> String {
     "The task appears to require workspace changes, but no Write/Edit tool call has happened yet. Create or modify the required files before final response, or explain why no file change is required.".to_string()
 }

@@ -129,6 +129,7 @@ const ARTIFACT_RECOVERY_ATTEMPT_LIMIT: usize = 3;
 const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 1;
 const RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT: usize = 2;
 const MALFORMED_NATIVE_TOOL_RETRY_LIMIT: usize = 2;
+const EMPTY_RESPONSE_RECOVERY_EXTRA_ITERATIONS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptArtifactExtraction {
@@ -655,6 +656,7 @@ pub(crate) fn run_session_with_outcome_with_options(
     let mut write_or_edit_seen = false;
     let mut no_tool_feedbacks = 0usize;
     let mut empty_feedbacks = 0usize;
+    let mut empty_fresh_retry_pending = false;
     let mut changed_paths: Vec<String> = Vec::new();
     let mut tool_call_count = 0usize;
     let contract_runtime_enabled = options.contract_runtime_enabled();
@@ -672,7 +674,8 @@ pub(crate) fn run_session_with_outcome_with_options(
             + 1
     } else {
         config.max_iterations
-    };
+    }
+    .saturating_add(EMPTY_RESPONSE_RECOVERY_EXTRA_ITERATIONS);
     session
         .messages
         .push(ConversationMessage::user(user_prompt.to_string()));
@@ -689,18 +692,48 @@ pub(crate) fn run_session_with_outcome_with_options(
         } else {
             Vec::new()
         };
-        let request_messages = build_request_messages(
-            &session.messages,
-            &specs,
-            &config.workspace_root,
-            pending_feedback.as_deref(),
-            profile_guidance.as_deref(),
-            if native_tools_enabled {
-                ToolPromptMode::Native
-            } else {
-                ToolPromptMode::XmlFallback
-            },
-        );
+        let empty_fresh_retry_active = empty_fresh_retry_pending;
+        let fresh_retry_messages;
+        let request_messages = if empty_fresh_retry_active {
+            empty_fresh_retry_pending = false;
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "empty_response_escalation",
+                    "stage": "fresh_session_retry",
+                    "attempt": empty_feedbacks + 1,
+                    "session_scope": options.scope.as_str(),
+                    "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+                    "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+                }),
+            );
+            fresh_retry_messages = vec![ConversationMessage::user(user_prompt.to_string())];
+            build_request_messages(
+                &fresh_retry_messages,
+                &specs,
+                &config.workspace_root,
+                None,
+                profile_guidance.as_deref(),
+                if native_tools_enabled {
+                    ToolPromptMode::Native
+                } else {
+                    ToolPromptMode::XmlFallback
+                },
+            )
+        } else {
+            build_request_messages(
+                &session.messages,
+                &specs,
+                &config.workspace_root,
+                pending_feedback.as_deref(),
+                profile_guidance.as_deref(),
+                if native_tools_enabled {
+                    ToolPromptMode::Native
+                } else {
+                    ToolPromptMode::XmlFallback
+                },
+            )
+        };
         let label = format!("{} {}", client.label(), config.model);
         let chat_result = {
             let _guard = ui.before_model_call(&label);
@@ -809,6 +842,22 @@ pub(crate) fn run_session_with_outcome_with_options(
             tool_calls.push(call);
         }
         tool_call_count += tool_calls.len();
+        let empty_reply_without_tools = tool_calls.is_empty() && reply.content.trim().is_empty();
+        if !empty_reply_without_tools && (empty_feedbacks > 0 || empty_fresh_retry_active) {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "empty_response_recovered",
+                    "after_empty_responses": empty_feedbacks,
+                    "fresh_session_retry": empty_fresh_retry_active,
+                    "session_scope": options.scope.as_str(),
+                    "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+                    "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+                }),
+            );
+            empty_feedbacks = 0;
+            empty_fresh_retry_pending = false;
+        }
         session.messages.push(ConversationMessage::assistant(
             reply.content.clone(),
             tool_calls.clone(),
@@ -843,12 +892,70 @@ pub(crate) fn run_session_with_outcome_with_options(
                 pending_feedback = Some(super::feedback::missing_artifacts(&missing));
                 continue;
             }
-            if reply.content.trim().is_empty() && empty_feedbacks < 1 {
-                empty_feedbacks += 1;
+            if reply.content.trim().is_empty() {
                 session.messages.pop();
                 last_blocking_reason = Some("empty assistant response".to_string());
-                pending_feedback = Some(super::feedback::empty_response());
-                continue;
+                if empty_fresh_retry_active {
+                    return stop_for_model_empty_response(
+                        config,
+                        user_prompt,
+                        &options,
+                        &changed_paths,
+                        verify_attempts,
+                        tool_call_count,
+                        last_blocking_reason,
+                        last_provider_error,
+                        empty_feedbacks + 1,
+                    );
+                }
+                empty_feedbacks += 1;
+                match empty_feedbacks {
+                    1 => {
+                        emit_empty_response_escalation(
+                            config,
+                            &options,
+                            "nudge_1",
+                            empty_feedbacks,
+                        );
+                        pending_feedback = Some(super::feedback::empty_response());
+                        continue;
+                    }
+                    2 => {
+                        emit_empty_response_escalation(
+                            config,
+                            &options,
+                            "nudge_2",
+                            empty_feedbacks,
+                        );
+                        pending_feedback =
+                            Some(super::feedback::empty_response_reformulated(user_prompt));
+                        continue;
+                    }
+                    3 => {
+                        emit_empty_response_escalation(
+                            config,
+                            &options,
+                            "fresh_session_retry_scheduled",
+                            empty_feedbacks,
+                        );
+                        pending_feedback = None;
+                        empty_fresh_retry_pending = true;
+                        continue;
+                    }
+                    _ => {
+                        return stop_for_model_empty_response(
+                            config,
+                            user_prompt,
+                            &options,
+                            &changed_paths,
+                            verify_attempts,
+                            tool_call_count,
+                            last_blocking_reason,
+                            last_provider_error,
+                            empty_feedbacks,
+                        );
+                    }
+                }
             }
             if options.requires_action_tool_feedback(write_or_edit_seen, tool_call_count)
                 && looks_like_action_prompt(user_prompt)
@@ -2130,6 +2237,188 @@ fn reachability_action_labels(reachability: &RepairReachability) -> Vec<&'static
         .collect()
 }
 
+fn emit_empty_response_escalation(
+    config: &Config,
+    options: &RunSessionOptions,
+    stage: &str,
+    attempt: usize,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "empty_response_escalation",
+            "stage": stage,
+            "attempt": attempt,
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+        }),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stop_for_model_empty_response(
+    config: &Config,
+    user_prompt: &str,
+    options: &RunSessionOptions,
+    changed_paths: &[String],
+    verify_attempts: usize,
+    tool_calls: usize,
+    last_blocking_reason: Option<String>,
+    last_provider_error: Option<String>,
+    empty_response_count: usize,
+) -> anyhow::Result<RunSessionOutcome> {
+    let failure_kind = "model_empty_response";
+    let recovery_paths = save_model_empty_response_handoff(
+        config,
+        user_prompt,
+        options,
+        changed_paths,
+        empty_response_count,
+    );
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "loop_stop",
+            "reason": failure_kind,
+            "missing_paths": [],
+            "verify_attempts": verify_attempts,
+            "tool_calls": tool_calls,
+            "empty_response_count": empty_response_count,
+            "last_blocking_reason": last_blocking_reason,
+            "last_provider_error": last_provider_error.as_deref().map(eval_events::body_snippet),
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+            "recovery_prompt_path": recovery_paths
+                .as_ref()
+                .map(|paths| paths.prompt_path.as_str())
+                .unwrap_or(""),
+            "recovery_ultra_plan_path": recovery_paths
+                .as_ref()
+                .map(|paths| paths.yaml_path.as_str())
+                .unwrap_or(""),
+            "recovery_yaml_missing": recovery_paths.is_none(),
+        }),
+    );
+    bail!(render_minimal_recovery_stop_reason(
+        format!(
+            "{failure_kind}: assistant returned empty responses after bounded recovery ({empty_response_count})"
+        ),
+        recovery_paths.as_ref(),
+    ))
+}
+
+fn save_model_empty_response_handoff(
+    config: &Config,
+    user_prompt: &str,
+    options: &RunSessionOptions,
+    changed_paths: &[String],
+    empty_response_count: usize,
+) -> Option<MinimalRecoveryPaths> {
+    let failure_kind = "model_empty_response";
+    let profile = if config.profile.trim().is_empty() {
+        "generic"
+    } else {
+        config.profile.as_str()
+    };
+    let failed_phase = options
+        .phase_scope
+        .clone()
+        .or_else(|| Some("minimal-loop".to_string()));
+    let failed_step = options
+        .step_kind
+        .map(|kind| kind.as_str().to_string())
+        .or_else(|| Some("model-call".to_string()));
+    let handoff = crate::planner::repair::RecoveryHandoff {
+        profile: profile.to_string(),
+        original_goal: user_prompt.to_string(),
+        failed_phase,
+        failed_step,
+        failure_kind: failure_kind.to_string(),
+        failure_evidence: vec![
+            "model_empty_response: assistant returned empty responses after two nudges and one fresh-session retry".to_string(),
+            format!("empty_response_count: {empty_response_count}"),
+        ],
+        missing_paths: Vec::new(),
+        missing_capabilities: Vec::new(),
+        verify_commands: Vec::new(),
+        changed_paths: changed_paths.to_vec(),
+        repair_targets: vec!["resume_step_with_tool_calls".to_string()],
+    };
+    let prompt_path = match crate::planner::repair::save_ultra_recovery_prompt(
+        &config.workspace_root,
+        "model-empty-response",
+        &handoff,
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "recovery_prompt_save_failed",
+                    "recovery_handoff_kind": failure_kind,
+                    "reason": eval_events::body_snippet(&err.to_string()),
+                    "status": "incomplete",
+                }),
+            );
+            return None;
+        }
+    };
+    let yaml_path = match crate::planner::repair::save_recovery_ultra_plan(
+        &config.workspace_root,
+        "model-empty-response",
+        &handoff,
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            let prompt_display =
+                crate::planner::repair::workspace_relative_handoff_path(&prompt_path);
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "recovery_ultra_plan_save_failed",
+                    "recovery_handoff_kind": failure_kind,
+                    "recovery_prompt_path": prompt_display,
+                    "reason": eval_events::body_snippet(&err.to_string()),
+                    "recovery_yaml_missing": true,
+                    "status": "incomplete",
+                }),
+            );
+            return None;
+        }
+    };
+    let suggested_prompt_command =
+        crate::planner::repair::suggested_ultra_recovery_command(&prompt_path, profile);
+    let suggested_yaml_command =
+        crate::planner::repair::suggested_recovery_ultra_plan_command(&yaml_path);
+    let prompt_display = crate::planner::repair::workspace_relative_handoff_path(&prompt_path);
+    let yaml_display = crate::planner::repair::workspace_relative_handoff_path(&yaml_path);
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "recovery_prompt_saved",
+            "recovery_handoff_kind": failure_kind,
+            "recovery_prompt_path": &prompt_display,
+            "recovery_ultra_plan_path": &yaml_display,
+            "recovery_yaml_missing": false,
+            "recovery_yaml_roundtrip_ok": true,
+            "suggested_recovery_command": suggested_prompt_command,
+            "suggested_recovery_yaml_command": suggested_yaml_command,
+            "recovery_profile": profile,
+            "local_repair_exhausted": true,
+            "failure_kind": failure_kind,
+            "status": "incomplete",
+        }),
+    );
+    Some(MinimalRecoveryPaths {
+        prompt_path: prompt_display,
+        yaml_path: yaml_display,
+        suggested_prompt_command,
+        suggested_yaml_command,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct MinimalRecoveryPaths {
     prompt_path: String,
@@ -2987,6 +3276,39 @@ mod tests {
         }
     }
 
+    struct RecordingFake {
+        replies: Vec<anyhow::Result<AssistantReply>>,
+        requests: Vec<Vec<ConversationMessage>>,
+    }
+
+    impl ChatClient for RecordingFake {
+        fn label(&self) -> &str {
+            "recording-fake"
+        }
+        fn supports_native_tools(&self, _model: &str) -> bool {
+            true
+        }
+        fn chat(
+            &mut self,
+            _model: &str,
+            messages: &[ConversationMessage],
+            _tools: &[crate::tools::registry::ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            self.requests.push(messages.to_vec());
+            self.replies.remove(0)
+        }
+    }
+
+    fn empty_reply() -> AssistantReply {
+        AssistantReply {
+            content: String::new(),
+            tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
+        }
+    }
+
     fn config(root: std::path::PathBuf) -> Config {
         Config {
             workspace_root: root,
@@ -3055,6 +3377,179 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "ok"
         );
+    }
+
+    #[test]
+    fn repeated_empty_responses_stop_as_model_empty_response_with_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 1;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(empty_reply()),
+                Ok(empty_reply()),
+                Ok(empty_reply()),
+                Ok(empty_reply()),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "Create the content editor setup artifacts.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("model_empty_response"), "{err}");
+        assert!(err.contains("recovery prompt saved:"), "{err}");
+        let events = event_values(&events);
+        let stages = events
+            .iter()
+            .filter(|event| {
+                event.get("event").and_then(Value::as_str) == Some("empty_response_escalation")
+            })
+            .map(|event| {
+                event
+                    .get("stage")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                "nudge_1",
+                "nudge_2",
+                "fresh_session_retry_scheduled",
+                "fresh_session_retry"
+            ]
+        );
+        let stop = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("loop_stop"))
+            .unwrap();
+        assert_eq!(
+            stop.get("reason").and_then(Value::as_str),
+            Some("model_empty_response")
+        );
+        let recovery = events
+            .iter()
+            .find(|event| {
+                event.get("event").and_then(Value::as_str) == Some("recovery_prompt_saved")
+            })
+            .unwrap();
+        let prompt_path = recovery
+            .get("recovery_prompt_path")
+            .and_then(Value::as_str)
+            .unwrap();
+        let prompt = std::fs::read_to_string(dir.path().join(prompt_path)).unwrap();
+        assert!(prompt.contains("model_empty_response"), "{prompt}");
+    }
+
+    #[test]
+    fn empty_response_recovery_at_second_nudge_continues_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 2;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(empty_reply()),
+                Ok(empty_reply()),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "Create the requested file.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert!(dir.path().join("a.txt").is_file());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"stage\":\"nudge_1\""));
+        assert!(event_text.contains("\"stage\":\"nudge_2\""));
+        assert!(event_text.contains("\"event\":\"empty_response_recovered\""));
+        assert!(!event_text.contains("model_empty_response"));
+    }
+
+    #[test]
+    fn empty_response_fresh_session_retry_uses_step_only_context_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 2;
+        let mut fake = RecordingFake {
+            replies: vec![
+                Ok(empty_reply()),
+                Ok(empty_reply()),
+                Ok(empty_reply()),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"a.txt","content":"ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+            requests: Vec::new(),
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "Create the requested file with a tool call.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert_eq!(fake.requests.len(), 5);
+        let fresh_request = &fake.requests[3];
+        assert_eq!(
+            fresh_request
+                .iter()
+                .filter(|message| message.role == "user"
+                    && message.content == "Create the requested file with a tool call.")
+                .count(),
+            1
+        );
+        assert!(
+            fresh_request
+                .iter()
+                .all(|message| message.role != "assistant" && message.role != "tool"),
+            "{fresh_request:?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"stage\":\"fresh_session_retry\""));
+        assert!(event_text.contains("\"fresh_session_retry\":true"));
+        assert!(!event_text.contains("model_empty_response"));
     }
 
     #[test]
