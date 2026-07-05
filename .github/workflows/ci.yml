@@ -97,6 +97,9 @@ jobs:
       - name: M6 generality guardrails
         working-directory: mvp/anvilminimal
         run: cargo test --test generality_guardrails
+      - name: conformance matrix
+        working-directory: mvp/anvilminimal
+        run: cargo test --test conformance
       - name: scenario contract-inference golden tests
         working-directory: mvp/anvilminimal
         run: |

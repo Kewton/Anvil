@@ -52,6 +52,11 @@ Within S, "generalized" means:
 - Every observed UAT anomaly is either explained as out of scope or harvested
   into the corpus before probe, evidence, or profile logic changes.
 - The scenario suite is rerun for any probe, evidence, or profile change.
+- Any new `DomainProfile` or execution pathway must add a row to
+  `tests/conformance/` and pass `cargo test --test conformance`. The
+  conformance matrix is the definition of done for shared runner/profile
+  interface contracts; new rows reuse the named assertions instead of adding
+  pathway-specific copies.
 
 Named guarantees produced by the Generic Assurance Track:
 
@@ -80,7 +85,7 @@ Named guarantees produced by the Generic Assurance Track:
 | The runner lifecycle supports a non-web process profile without Next.js probe or port assumptions. | M4: `test0704-51_001` web run and `test0704-51_001` CLI run | The CLI contract is specified in [uat/scenarios.md#cli-python-cli-profile](uat/scenarios.md#cli-python-cli-profile); no app corpus case is expected for the process-only run. |
 | App evidence detectors and interaction probe selection are fixture-backed. | M5 Round A four runs | [test0702_008](../tests/corpus/apps/test0702_008/expectations.toml), [test0703_002](../tests/corpus/apps/test0703_002/expectations.toml), [test0703_005_4](../tests/corpus/apps/test0703_005_4/expectations.toml), [test0704_001](../tests/corpus/apps/test0704_001/expectations.toml) |
 | The second corpus round confirms the same detectors over a new harvested app snapshot. | M5 Round B | [test0704_003](../tests/corpus/apps/test0704_003/expectations.toml) |
-| Guardrails are permanent and cheap enough to run in CI. | M6 docs and tests | `cargo test --test corpus_regression`, `cargo test --test generality_guardrails`, plus the scenario contract golden tests named below. |
+| Guardrails are permanent and cheap enough to run in CI. | M6 docs and tests | `cargo test --test corpus_regression`, `cargo test --test generality_guardrails`, `cargo test --test conformance`, plus the scenario contract golden tests named below. |
 
 ## Required Gates
 
@@ -89,6 +94,7 @@ approval:
 
 - `cargo test --test corpus_regression`
 - `cargo test --test generality_guardrails`
+- `cargo test --test conformance`
 - `cargo test generic_ultra_promotes_to_nextjs_after_workspace_manifest --lib`
 - `cargo test generic_ultra_promotes_to_python_cli_after_pyproject_manifest --lib`
 - `cargo test generic_ultra_without_manifest_keeps_static_tier --lib`
@@ -97,10 +103,11 @@ approval:
 - `python3 -m unittest tests/eval/test_false_positive_regression.py`
 
 The corpus harness guards harvested probe/evidence/profile behavior. The
-scenario contract tests are the golden suite for contract inference. The
-false-positive regression protects the "static screen is not a game success"
-boundary. The generality guardrails protect static- and reduced-assurance
-rendering and the Next.js boundary-erosion tripwire.
+conformance matrix guards shared interface contracts for profiles and
+execution pathways. The scenario contract tests are the golden suite for
+contract inference. The false-positive regression protects the "static screen
+is not a game success" boundary. The generality guardrails protect static- and
+reduced-assurance rendering and the Next.js boundary-erosion tripwire.
 
 ## Roadmap Completion
 

@@ -34,7 +34,21 @@ the trait.
    rollback, and recovery handoff paths work unchanged.
 6. Emit behavior evidence through the profile behavior probe, not by bypassing
    final acceptance.
-7. Add proof tests that run through the same plan or ultra-plan runner paths.
+7. Add or update one row in the conformance matrix under
+   `tests/conformance/`. The row must exercise the profile through the normal
+   plan or ultra-plan runner path with fake clients and probe overrides, then
+   pass the reusable interface-contract checkers.
+8. Add focused profile proof tests for domain-specific outputs only after the
+   shared conformance row passes.
 
 Do not add provider abstractions, profile-specific runner branches, or
 profile-specific repair loops.
+
+## Definition Of Done
+
+A new profile is not complete until `cargo test --test conformance` passes with
+its matrix row. The conformance suite owns the shared runner/profile interface
+contracts: earned assurance, monotonic rebind, authority symmetry,
+detect/repair pairing, honest terminal records, oracle tri-state handling, and
+degradation labeling. New profiles add rows, not bespoke copies of those
+assertions.
