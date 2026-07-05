@@ -94,6 +94,9 @@ pub fn run_session<C: MinimalChatClient>(
 
     let mut iterations = 0usize;
     while iterations < config.max_iterations {
+        if crate::signal_interrupt::interrupted() {
+            return Err("interrupted".to_string());
+        }
         iterations += 1;
         let available_tools = tool_specs_for_mode(&registry, config.mode);
         let request_tools = if native_tools_enabled {

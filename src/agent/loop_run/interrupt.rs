@@ -41,7 +41,7 @@ pub(super) struct InterruptFlag {
 
 impl InterruptFlag {
     pub(super) fn is_set(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        self.flag.load(Ordering::SeqCst) || crate::signal_interrupt::interrupted()
     }
 
     /// Test-only constructor used by `turn.rs` integration tests to drive

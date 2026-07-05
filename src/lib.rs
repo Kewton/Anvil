@@ -14,6 +14,7 @@ pub(crate) mod provider_timeout;
 pub mod repo_graph;
 pub mod safety;
 pub mod session;
+pub(crate) mod signal_interrupt;
 pub mod system_prompt;
 pub(crate) mod terminal_outcome;
 pub mod tools;
@@ -41,6 +42,9 @@ use session::sessions_cli;
 use session::store::{SessionStore, reconcile_resume_state};
 
 pub fn run_cli(args: CliArgs) -> Result<(), String> {
+    if let Err(err) = signal_interrupt::install_sigint_handler() {
+        eprintln!("warning: {err}");
+    }
     // --debug deprecation is emitted here because the flag only exists on the
     // CLI; env/config deprecations are collected inside `Config::load`.
     if args.debug {
@@ -136,6 +140,7 @@ pub fn run_cli(args: CliArgs) -> Result<(), String> {
         .join("logs")
         .join("llm-io.jsonl");
     logging::init_logging(config.log_level, &log_path)?;
+    let _terminal_interrupt_guard = signal_interrupt::TerminalInterruptGuard::start();
 
     // Issue #471: structured eval log. Failure is warn-only (DR3-002).
     let eval_log_path = state_root
