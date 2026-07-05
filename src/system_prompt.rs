@@ -238,10 +238,10 @@ fn multistep_rule_for_profile(task_profile: TaskProfile) -> &'static str {
 fn path_rule_for_profile(task_profile: TaskProfile) -> &'static str {
     match task_profile {
         TaskProfile::Coding | TaskProfile::Ui => {
-            "16. Use repository-relative paths (e.g. 'app/page.tsx' or 'src/app/page.tsx', depending on the actual repo layout) for Read, Write, and Edit. Never invent absolute paths from memory such as '/Users/...' or '/home/...'."
+            "16. Use repository-relative paths (e.g. 'app/page.tsx' or 'src/app/page.tsx', depending on the actual repo layout) for Read, Write, and Edit. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form. Never invent absolute paths from memory such as '/Users/...' or '/home/...'."
         }
         TaskProfile::Generic | TaskProfile::Content | TaskProfile::Research => {
-            "16. Use repository-relative paths (e.g. 'summary.json', 'output.csv', or 'docs/runbook.md') for Read, Write, and Edit. Never invent absolute paths from memory such as '/Users/...' or '/home/...'."
+            "16. Use repository-relative paths (e.g. 'summary.json', 'output.csv', or 'docs/runbook.md') for Read, Write, and Edit. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form. Never invent absolute paths from memory such as '/Users/...' or '/home/...'."
         }
     }
 }
@@ -284,10 +284,14 @@ fn render_tool_catalog(allowed_tools: Option<&[&str]>) -> String {
 fn tool_catalog_description(name: &str) -> Option<&'static str> {
     match name {
         "Bash" => Some("- Bash(command): run a shell command in the project directory"),
-        "Read" => Some("- Read(path[, start_line, end_line]): read a file or list a directory"),
-        "Write" => Some("- Write(path, content): create or overwrite a file"),
+        "Read" => Some(
+            "- Read(path[, start_line, end_line]): read a file or list a directory. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.",
+        ),
+        "Write" => Some(
+            "- Write(path, content): create or overwrite a file. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.",
+        ),
         "Edit" => Some(
-            "- Edit(path, old_string, new_string[, replace_all]): replace exact text in an existing file",
+            "- Edit(path, old_string, new_string[, replace_all]): replace exact text in an existing file. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.",
         ),
         "Glob" => Some("- Glob(pattern): find files by glob pattern"),
         "Grep" => Some("- Grep(pattern[, glob, case_sensitive]): search repository text"),
@@ -346,6 +350,7 @@ mod tests {
         assert!(prompt.contains("- Read(path"));
         assert!(prompt.contains("- Write(path"));
         assert!(prompt.contains("- Edit(path"));
+        assert!(prompt.contains("Paths must be workspace-relative"));
     }
 
     #[test]
@@ -384,6 +389,7 @@ mod tests {
         assert!(prompt.contains("'summary.json'"));
         assert!(prompt.contains("'output.csv'"));
         assert!(prompt.contains("'docs/runbook.md'"));
+        assert!(prompt.contains("Paths must be workspace-relative"));
         assert!(prompt.contains("For multi-step artifact tasks"));
         assert!(!prompt.contains("local-first coding agent"));
         assert!(!prompt.contains("Next.js apps"));
@@ -406,6 +412,7 @@ mod tests {
         assert!(prompt.contains("You are Anvil, a local-first coding agent."));
         assert!(prompt.contains("Next.js apps"));
         assert!(prompt.contains("app/page.tsx"));
+        assert!(prompt.contains("Paths must be workspace-relative"));
         assert!(prompt.contains("scaffold → install → implement → verify"));
         assert!(prompt.contains("HTML/JS"));
     }

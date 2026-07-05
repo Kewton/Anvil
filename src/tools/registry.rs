@@ -400,7 +400,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Read",
-            "Read a text file or list a directory. Use repository-relative paths.",
+            "Read a text file or list a directory. Use repository-relative paths. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -413,7 +413,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Write",
-            "Create or overwrite a file. Parent directories are created automatically. Use repository-relative paths.",
+            "Create or overwrite a file. Parent directories are created automatically. Use repository-relative paths. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -425,7 +425,7 @@ fn default_tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "Edit",
-            "Replace exact text in an existing file. Use repository-relative paths.",
+            "Replace exact text in an existing file. Use repository-relative paths. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -929,6 +929,10 @@ mod tests {
             assert!(
                 description.contains("repository-relative paths"),
                 "{tool_name} description should reinforce repository-relative paths: {description}"
+            );
+            assert!(
+                description.contains("Paths must be workspace-relative"),
+                "{tool_name} description should require workspace-relative path form: {description}"
             );
             assert!(
                 !description.contains("Absolute paths are preferred"),

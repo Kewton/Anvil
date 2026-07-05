@@ -32,7 +32,7 @@ Rules:\n\
 3. Never use sudo or destructive shell commands.\n\
 4. If you say you will create, edit, read, or verify something, call the tool in that same response.\n\
 5. Final answers must describe completed work, not planned next steps. Do not end with phrases like \"I will create\", \"Let me verify\", or \"Now I'll edit\".\n\
-6. Use repository-relative paths under the project root.\n\
+6. Use repository-relative paths under the project root. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.\n\
 7. If a tool fails, try a different local approach or explain the blocker.\n\
 8. Do not invent files, outputs, tests, or command results you have not observed.\n\
 9. In Plan mode, only inspect files and produce a plan; do not edit.\n\
@@ -79,7 +79,7 @@ Rules:\n\
 3. Never use sudo or destructive shell commands.\n\
 4. If you say you will create, edit, read, or verify something, call the tool in that same response.\n\
 5. Final answers must describe completed work, not planned next steps. Do not end with phrases like \"I will create\", \"Let me verify\", or \"Now I'll edit\".\n\
-6. Use repository-relative paths under the project root.\n\
+6. Use repository-relative paths under the project root. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.\n\
 7. If a tool fails, try a different local approach or explain the blocker.\n\
 8. Do not invent files, outputs, tests, or command results you have not observed.\n\
 9. In Plan mode, only inspect files and produce a plan; do not edit.\n\
@@ -88,9 +88,9 @@ Project root: /workspace/project\n\
 \n\
 Tools:\n\
 - Bash: Run read-only inspection, build/test, or local script validation commands in the project directory. Do not use Bash to create files or directories; use Write for file creation because Write creates parent directories automatically. Offline mode blocks networked, mutating, or general shell commands.\n\
-- Read: Read a text file or list a directory. Use repository-relative paths.\n\
-- Write: Create or overwrite a file. Parent directories are created automatically. Use repository-relative paths.\n\
-- Edit: Replace exact text in an existing file. Use repository-relative paths.\n\
+- Read: Read a text file or list a directory. Use repository-relative paths. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.\n\
+- Write: Create or overwrite a file. Parent directories are created automatically. Use repository-relative paths. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.\n\
+- Edit: Replace exact text in an existing file. Use repository-relative paths. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.\n\
 - Glob: Find files by glob pattern.\n\
 - Grep: Search repository text.\n\
 \n\
@@ -124,7 +124,7 @@ Rules:\n\
 3. Never use sudo or destructive shell commands.\n\
 4. If you say you will create, edit, read, or verify something, call the tool in that same response.\n\
 5. Final answers must describe completed work, not planned next steps. Do not end with phrases like \"I will create\", \"Let me verify\", or \"Now I'll edit\".\n\
-6. Use repository-relative paths under the project root.\n\
+6. Use repository-relative paths under the project root. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.\n\
 7. If a tool fails, try a different local approach or explain the blocker.\n\
 8. Do not invent files, outputs, tests, or command results you have not observed.\n\
 9. In Plan mode, only inspect files and produce a plan; do not edit.\n\
@@ -133,9 +133,9 @@ Project root: /workspace/project\n\
 \n\
 Tools:\n\
 - Bash: Run read-only inspection, build/test, or local script validation commands in the project directory. Do not use Bash to create files or directories; use Write for file creation because Write creates parent directories automatically. Offline mode blocks networked, mutating, or general shell commands.\n\
-- Read: Read a text file or list a directory. Use repository-relative paths.\n\
-- Write: Create or overwrite a file. Parent directories are created automatically. Use repository-relative paths.\n\
-- Edit: Replace exact text in an existing file. Use repository-relative paths.\n\
+- Read: Read a text file or list a directory. Use repository-relative paths. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.\n\
+- Write: Create or overwrite a file. Parent directories are created automatically. Use repository-relative paths. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.\n\
+- Edit: Replace exact text in an existing file. Use repository-relative paths. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form.\n\
 - Glob: Find files by glob pattern.\n\
 - Grep: Search repository text.\n\
 \n\

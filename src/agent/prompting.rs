@@ -146,7 +146,7 @@ where
     let _ = cwd;
     let path_examples = runtime_path_examples_for_profile(task_profile);
     messages.push(ConversationMessage::system(format!(
-        "Current project root is {}. All repository files live under this path. Use repository-relative paths ({path_examples}) for Read, Write, and Edit. Never use absolute paths from other projects, user directories, or your memory such as '/Users/...' or '/home/...'.",
+        "Current project root is {}. All repository files live under this path. Use repository-relative paths ({path_examples}) for Read, Write, and Edit. Paths must be workspace-relative; absolute paths are auto-normalized when safe but relative is the required form. Never use absolute paths from other projects, user directories, or your memory such as '/Users/...' or '/home/...'.",
         work_root.display(),
     )));
     if let Some(instructions) = load_project_instructions(cwd, work_root) {
@@ -1646,6 +1646,7 @@ mod tests {
         assert!(combined.contains("'summary.json'"));
         assert!(combined.contains("'output.csv'"));
         assert!(combined.contains("'docs/runbook.md'"));
+        assert!(combined.contains("Paths must be workspace-relative"));
         assert!(!combined.contains("app/page.tsx"));
         assert!(!combined.contains("src/app/page.tsx"));
     }
@@ -1670,6 +1671,7 @@ mod tests {
 
         assert!(combined.contains("'app/page.tsx'"));
         assert!(combined.contains("'src/app/page.tsx'"));
+        assert!(combined.contains("Paths must be workspace-relative"));
     }
 
     #[test]
