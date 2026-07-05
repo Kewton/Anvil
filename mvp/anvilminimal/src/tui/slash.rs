@@ -398,6 +398,8 @@ fn emit_tui_command_stop_with_status(
             "completion_status": &completion.status,
             "task_status": &event_projection.task_status,
             "profile": &completion.profile,
+            "effective_profile": &completion.effective_profile,
+            "contract_origin": &completion.contract_origin,
             "assurance_level": &completion.assurance_level,
             "assurance_reason": &completion.assurance_reason,
             "profile_inferred": &completion.profile_inferred,
@@ -416,8 +418,12 @@ fn emit_tui_command_stop_with_status(
             "external_contract_checked": completion.external_contract_checked,
             "external_contract_ok": completion.external_contract_ok,
             "release_gate_reasons": &completion.release_gate_reasons,
+            "browser_readiness_applicable": completion.browser_readiness_applicable,
+            "browser_readiness_execution_status": &completion.browser_readiness_execution_status,
             "browser_readiness_status": &completion.browser_readiness,
             "browser_readiness_evidence_path": &completion.browser_readiness_evidence_path,
+            "interaction_evidence_applicable": completion.interaction_evidence_applicable,
+            "interaction_evidence_execution_status": &completion.interaction_evidence_execution_status,
             "interaction_evidence_status": &completion.interaction_evidence,
             "interaction_evidence_path": &completion.interaction_evidence_path,
             "state_dimensions_changed": &completion.state_dimensions_changed,
@@ -863,6 +869,9 @@ mod tests {
             cfg.eval_events_path.as_deref(),
             serde_json::json!({
                 "event": "ultra_final_acceptance",
+                "profile": "nextjs",
+                "effective_profile": "nextjs",
+                "contract_origin": "promoted_union",
                 "runtime_acceptance_status": "pass",
                 "final_acceptance_status": "partial",
                 "release_gate_status": "partial",
@@ -870,8 +879,12 @@ mod tests {
                     "interaction_unverified:probe_unavailable",
                     crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
                 ],
+                "browser_readiness_applicable": true,
+                "browser_readiness_execution_status": "performed",
                 "browser_readiness_status": "passed",
                 "browser_readiness_evidence_path": "browser-readiness.json",
+                "interaction_evidence_applicable": true,
+                "interaction_evidence_execution_status": "unavailable",
                 "interaction_evidence_status": "unavailable:playwright_not_installed",
                 "interaction_evidence_path": "",
                 "completion_contract_verification_enabled": true,
@@ -898,6 +911,30 @@ mod tests {
         assert!(tui_stop.contains(r#""status":"partial""#), "{tui_stop}");
         assert!(
             tui_stop.contains(r#""task_status":"partial (interaction unverified)""#),
+            "{tui_stop}"
+        );
+        assert!(
+            tui_stop.contains(r#""effective_profile":"nextjs""#),
+            "{tui_stop}"
+        );
+        assert!(
+            tui_stop.contains(r#""contract_origin":"promoted_union""#),
+            "{tui_stop}"
+        );
+        assert!(
+            tui_stop.contains(r#""browser_readiness_applicable":true"#),
+            "{tui_stop}"
+        );
+        assert!(
+            tui_stop.contains(r#""browser_readiness_execution_status":"performed""#),
+            "{tui_stop}"
+        );
+        assert!(
+            tui_stop.contains(r#""interaction_evidence_applicable":true"#),
+            "{tui_stop}"
+        );
+        assert!(
+            tui_stop.contains(r#""interaction_evidence_execution_status":"unavailable""#),
             "{tui_stop}"
         );
         let summary = std::fs::read_to_string(events.with_file_name("summary.md")).unwrap();

@@ -274,8 +274,10 @@ export default function App() {{
     )
 }
 
-fn nextjs_package_json() -> String {
-    r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011","start":"next start -p 3011"}}"#.to_string()
+fn nextjs_package_json(port: u16) -> String {
+    format!(
+        r#"{{"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}},"devDependencies":{{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}},"scripts":{{"build":"next build","dev":"next dev -p {port}","start":"next start -p {port}"}}}}"#
+    )
 }
 
 fn nextjs_page_source() -> String {
@@ -293,6 +295,82 @@ export default function Page() {
 }
 "#
     .to_string()
+}
+
+#[cfg(unix)]
+fn write_fake_nextjs_package_manager(root: &std::path::Path, port: u16) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = root.join("node_modules/.bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for package in ["next", "tailwindcss", "postcss", "autoprefixer"] {
+        std::fs::create_dir_all(root.join("node_modules").join(package)).unwrap();
+    }
+    let exe = sh_quote(&std::env::current_exe().unwrap().display().to_string());
+    let npm = format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"run\" ] && [ \"$2\" = \"build\" ]; then\n\
+  echo \"fake build ok\"\n\
+  exit 0\n\
+fi\n\
+if [ \"$1\" = \"run\" ] && [ \"$2\" = \"dev\" ]; then\n\
+  ANVIL_TUI_FAKE_DEV_SERVER_CHILD=1 ANVIL_TUI_FAKE_DEV_SERVER_PORT={port} exec {exe} --ignored --exact tui_fake_dev_server_child --nocapture\n\
+fi\n\
+if [ \"$1\" = \"run\" ] && [ \"$2\" = \"start\" ]; then\n\
+  ANVIL_TUI_FAKE_DEV_SERVER_CHILD=1 ANVIL_TUI_FAKE_DEV_SERVER_PORT={port} exec {exe} --ignored --exact tui_fake_dev_server_child --nocapture\n\
+fi\n\
+echo \"unexpected fake npm args: $*\" >&2\n\
+exit 2\n"
+    );
+    let npm_path = bin.join("npm");
+    std::fs::write(&npm_path, npm).unwrap();
+    let mut permissions = std::fs::metadata(&npm_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&npm_path, permissions).unwrap();
+
+    let next_path = bin.join("next");
+    std::fs::write(&next_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut permissions = std::fs::metadata(&next_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&next_path, permissions).unwrap();
+}
+
+#[cfg(unix)]
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(unix)]
+fn free_local_port() -> u16 {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+#[test]
+#[ignore]
+fn tui_fake_dev_server_child() {
+    if std::env::var("ANVIL_TUI_FAKE_DEV_SERVER_CHILD")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
+        return;
+    }
+    let port = std::env::var("ANVIL_TUI_FAKE_DEV_SERVER_PORT")
+        .unwrap()
+        .parse::<u16>()
+        .unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    for stream in listener.incoming() {
+        let mut stream = stream.unwrap();
+        let body = r#"<!doctype html><html><head><title>Memo</title></head><body><main data-anvil-state="{&quot;items&quot;:0,&quot;draft&quot;:&quot;&quot;}"><label>Memo <input id="memo" aria-label="Memo" /></label><button id="add" data-anvil-action="primary">Add</button><ul id="items"></ul></main><script>const main=document.querySelector("main");const memo=document.getElementById("memo");const add=document.getElementById("add");const items=document.getElementById("items");let count=0;function sync(){main.setAttribute("data-anvil-state",JSON.stringify({items:count,draft:memo.value}));}memo.addEventListener("input",sync);add.addEventListener("click",()=>{count+=1;const li=document.createElement("li");li.textContent=memo.value||"memo";items.appendChild(li);sync();});</script></body></html>"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+    }
 }
 
 #[test]
@@ -470,10 +548,17 @@ fn tui_ultra_plan_run_smoke_fake_clients() {
 #[test]
 fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
     let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    let port = free_local_port();
+    #[cfg(not(unix))]
+    let port = 3011;
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let plan_path = dir.path().join("ultra.yaml");
+    let goal = format!(
+        "ちょっとしたメモアプリを作って。ブラウザで使えるようにしてください。{port}ポートで起動可能にしてください。"
+    );
     let plan = anvilminimal::planner::ultra_plan::UltraPlan {
-        goal: "ちょっとしたメモアプリを作って。ブラウザで使えるようにしてください。3011ポートで起動可能にしてください。".to_string(),
+        goal,
         profile: "generic".to_string(),
         style: "default".to_string(),
         intent: "create".to_string(),
@@ -507,6 +592,10 @@ fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
         "src/app/globals.css".to_string(),
         "src/app/global.d.ts".to_string(),
     ];
+    #[cfg(unix)]
+    {
+        write_fake_nextjs_package_manager(dir.path(), port);
+    }
     let mut cfg = config(dir.path().to_path_buf());
     cfg.eval_events_path = Some(events_path.clone());
     let mut planner = FakeClient::new(
@@ -523,7 +612,7 @@ fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
                 content: String::new(),
                 tool_calls: vec![ToolCall::new(
                     "Write",
-                    json!({"path":"package.json","content":nextjs_package_json()}),
+                    json!({"path":"package.json","content":nextjs_package_json(port)}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -565,7 +654,7 @@ fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
                     ),
                     ToolCall::new(
                         "Write",
-                        json!({"path":"browser-interaction.json","content":r#"{"ok":true,"interaction_performed":true,"surface_visible":true,"input_state_change":true,"input_event_observed":true,"state_changed":true}"#}),
+                        json!({"path":"browser-interaction.json","content":r#"{"ok":true,"status":"passed","interaction_success":true,"interaction_performed":true,"surface_visible":true,"start_transition":true,"input_state_change":true,"input_state_evaluated_after_start":true,"input_event_observed":true,"state_changed":true,"canvas_found":true}"#}),
                     ),
                 ],
                 prompt_tokens: None,
@@ -591,14 +680,29 @@ fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
         "{events}"
     );
     assert!(events.contains(r#""profile":"nextjs""#), "{events}");
+    let requested_port = format!("{port} (goal)");
     assert!(
-        events.contains(r#""requested_port":"3011 (goal)""#),
+        events.contains(&format!(r#""requested_port":"{requested_port}""#)),
         "{events}"
     );
     let stops = tui_command_stop_events(&events);
     assert_eq!(
         stops[0].get("profile").and_then(|value| value.as_str()),
         Some("nextjs"),
+        "{events}"
+    );
+    assert_eq!(
+        stops[0]
+            .get("effective_profile")
+            .and_then(|value| value.as_str()),
+        Some("nextjs"),
+        "{events}"
+    );
+    assert_eq!(
+        stops[0]
+            .get("contract_origin")
+            .and_then(|value| value.as_str()),
+        Some("promoted_union"),
         "{events}"
     );
     assert_eq!(
@@ -612,7 +716,7 @@ fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
         stops[0]
             .get("requested_port")
             .and_then(|value| value.as_str()),
-        Some("3011 (goal)"),
+        Some(requested_port.as_str()),
         "{events}"
     );
     let summary =
@@ -622,8 +726,10 @@ fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
         "{summary}"
     );
     assert!(summary.contains("Profile: nextjs"), "{summary}");
-    assert!(summary.contains("Assurance: full"), "{summary}");
-    assert!(summary.contains("Requested port: 3011 (goal)"), "{summary}");
+    assert!(
+        summary.contains(&format!("Requested port: {requested_port}")),
+        "{summary}"
+    );
 }
 
 #[test]

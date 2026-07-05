@@ -3320,7 +3320,8 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "url": observation.url,
         "interaction_success": observation.ok,
         "interaction_performed": observation.ok,
-        "input_event_observed": observation.steps.iter().any(|step| step == "control_input_dispatched"),
+        "input_event_observed": observation.steps.iter().any(|step| step == "control_input_dispatched")
+            || observation.text_entry == "entered",
         "input_state_change": observation.input_state_changed,
         "state_changed": observation.input_state_changed,
         "visible_state_changed": observation.input_state_changed,
@@ -4216,6 +4217,35 @@ module.exports = {
         assert_eq!(observation.echo_latency_ms, None);
         assert!(observation.token_echoed_after_reload);
         assert_eq!(observation.token_echo_after_reload_latency_ms, Some(41));
+    }
+
+    #[test]
+    fn normalized_interaction_json_preserves_text_entry_input_event() {
+        let observation = observe_probe_value(json!({
+            "ok": true,
+            "status": "passed",
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
+            "input_state_change": true,
+            "state_changed": true,
+            "text_entry": "entered",
+            "text_input_state_change": true,
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "text_entry",
+                "text_input_state_change",
+                "input_state_change",
+                "token_echoed"
+            ]
+        }));
+
+        let value = interaction_observation_json(&observation);
+
+        assert_eq!(
+            value.get("input_event_observed").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

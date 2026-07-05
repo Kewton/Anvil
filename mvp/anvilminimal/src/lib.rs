@@ -212,6 +212,8 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "completion_status": &completion.status,
             "task_status": &completion.task_status,
             "profile": &completion.profile,
+            "effective_profile": &completion.effective_profile,
+            "contract_origin": &completion.contract_origin,
             "assurance_level": &completion.assurance_level,
             "assurance_reason": &completion.assurance_reason,
             "profile_inferred": &completion.profile_inferred,
@@ -231,8 +233,12 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "external_contract_checked": completion.external_contract_checked,
             "external_contract_ok": completion.external_contract_ok,
             "release_gate_reasons": &completion.release_gate_reasons,
+            "browser_readiness_applicable": completion.browser_readiness_applicable,
+            "browser_readiness_execution_status": &completion.browser_readiness_execution_status,
             "browser_readiness_status": &completion.browser_readiness,
             "browser_readiness_evidence_path": &completion.browser_readiness_evidence_path,
+            "interaction_evidence_applicable": completion.interaction_evidence_applicable,
+            "interaction_evidence_execution_status": &completion.interaction_evidence_execution_status,
             "interaction_evidence_status": &completion.interaction_evidence,
             "interaction_evidence_path": &completion.interaction_evidence_path,
             "release_quality_completion": &completion.release_quality_completion,
@@ -380,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn run_lifecycle_marks_known_profile_full_assurance_without_task_suffix() {
+    fn run_lifecycle_does_not_label_known_profile_full_without_acceptance() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join(".anvil/runs/test-run/events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
@@ -392,11 +398,11 @@ mod tests {
         emit_run_stop(&cfg, &result);
 
         let event_text = std::fs::read_to_string(&events).unwrap();
-        assert!(!event_text.contains("\"assurance_level\":\"reduced\""));
-        assert!(event_text.contains("\"assurance_level\":\"full\""));
+        assert!(event_text.contains("\"assurance_level\":\"reduced\""));
+        assert!(!event_text.contains("\"assurance_level\":\"full\""));
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
-        assert!(!summary.contains("Assurance: reduced"));
-        assert!(summary.contains("Assurance: full"));
+        assert!(summary.contains("Assurance: reduced"));
+        assert!(!summary.contains("Assurance: full"));
         assert!(summary.contains("Task status: complete"));
         assert!(!summary.contains("completed (full assurance)"));
     }

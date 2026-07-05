@@ -1125,6 +1125,46 @@ fn emit_profile_reinferred(config: &Config, promotion: &ProfilePromotion) {
     eval_events::write_run_summary(config.eval_events_path.as_deref(), &line);
 }
 
+fn contract_origin_for_acceptance(config: &Config) -> &'static str {
+    if config
+        .eval_events_path
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|text| {
+            text.lines()
+                .any(|line| line.contains(r#""event":"profile_reinferred""#))
+        })
+    {
+        "promoted_union"
+    } else {
+        "initial"
+    }
+}
+
+fn carry_recorded_promotion_contract_requirements(
+    config: &Config,
+    effective_profile: &str,
+    goal: &str,
+    requirements: &mut ContractRequirements,
+) {
+    if contract_origin_for_acceptance(config) != "promoted_union"
+        || canonical_profile_name(effective_profile) == "generic"
+    {
+        return;
+    }
+    let generic_requirements = inferred_contract_requirements("generic", goal);
+    carry_pre_promotion_contract_requirements(
+        effective_profile,
+        goal,
+        &generic_requirements,
+        requirements,
+    );
+    merge_unique_strings(
+        &mut requirements.evidence,
+        &inferred_required_evidence(effective_profile, goal, &requirements.capabilities),
+    );
+}
+
 impl StepPlanRunOutcome {
     fn for_plan(plan: &StepPlan) -> Self {
         Self {
@@ -4910,6 +4950,20 @@ fn ultra_final_acceptance_report_inner(
         inferred_required_obligations(&effective_profile, &plan.goal, &required_capabilities);
     let mut required_evidence =
         inferred_required_evidence(&effective_profile, &plan.goal, &required_capabilities);
+    let mut requirements = ContractRequirements {
+        capabilities: required_capabilities,
+        evidence: required_evidence,
+        obligations: required_obligations,
+    };
+    carry_recorded_promotion_contract_requirements(
+        config,
+        &effective_profile,
+        &plan.goal,
+        &mut requirements,
+    );
+    required_capabilities = requirements.capabilities;
+    required_evidence = requirements.evidence;
+    required_obligations = requirements.obligations;
     let mut evidence_hint_tokens = evidence_hint_tokens_for_goal(&plan.goal);
     let bound_contract = bind_completion_contract_for_acceptance(
         config,
@@ -5001,7 +5055,7 @@ fn ultra_final_acceptance_report_inner(
         &required_evidence,
         &required_obligations,
     );
-    let release_gate = if production_build_failed {
+    let mut release_gate = if production_build_failed {
         production_build_failed_release_gate()
     } else {
         let signal_text = ultra_plan_signal_text(plan);
@@ -5014,6 +5068,28 @@ fn ultra_final_acceptance_report_inner(
             true,
         )
     };
+    let signal_text = ultra_plan_signal_text(plan);
+    let gate_telemetry = acceptance_gate_telemetry(
+        &effective_profile,
+        &signal_text,
+        &required_capabilities,
+        &required_evidence,
+        &release_gate,
+    );
+    if acceptance.passed
+        && external_ok
+        && let Some(reason) = acceptance_gates_disconnected_reason(&gate_telemetry, &release_gate)
+    {
+        release_gate.status = "failed".to_string();
+        release_gate.reasons = dedup_strings(
+            release_gate
+                .reasons
+                .iter()
+                .cloned()
+                .chain(std::iter::once(reason))
+                .collect(),
+        );
+    }
     let profile_behavior_probe = run_profile_behavior_probe(
         config,
         &effective_profile,
@@ -5024,8 +5100,14 @@ fn ultra_final_acceptance_report_inner(
     let profile_behavior_failed = profile_behavior_probe.status == "failed";
     let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
     let runtime_acceptance_status = runtime_acceptance_status(acceptance.passed, Some(&acceptance));
-    let (assurance_level, assurance_reason) =
-        assurance_for_completion(&effective_profile, &required_capabilities);
+    let (assurance_level, assurance_reason) = earned_assurance_for_completion(
+        &effective_profile,
+        &required_capabilities,
+        !contract_required || (external_contract_checked && !contract_binding_missing),
+        final_acceptance_status,
+        &release_gate,
+        &gate_telemetry,
+    );
     let release_quality_completion =
         release_quality_completion_status(&release_gate, final_acceptance_status);
     let next_action = release_gate_next_action(&release_gate, final_acceptance_status);
@@ -5103,6 +5185,7 @@ fn ultra_final_acceptance_report_inner(
             "cycle_index": cycle_index,
             "profile": effective_profile.clone(),
             "effective_profile": effective_profile.clone(),
+            "contract_origin": contract_origin_for_acceptance(config),
             "profile_inferred": config
                 .profile_inference
                 .map(|inference| inference.profile)
@@ -5157,8 +5240,12 @@ fn ultra_final_acceptance_report_inner(
             "profile_behavior_probe_status": profile_behavior_probe.status,
             "profile_behavior_probe_reasons": profile_behavior_probe.reasons.clone(),
             "profile_behavior_probe_evidence_path": profile_behavior_probe.evidence_path.clone().unwrap_or_default(),
+            "browser_readiness_applicable": gate_telemetry.browser_readiness_applicable,
+            "browser_readiness_execution_status": gate_telemetry.browser_readiness_execution_status.clone(),
             "browser_readiness_status": release_gate.browser_readiness_status.clone(),
             "browser_readiness_evidence_path": release_gate.browser_readiness_evidence_path.clone(),
+            "interaction_evidence_applicable": gate_telemetry.interaction_evidence_applicable,
+            "interaction_evidence_execution_status": gate_telemetry.interaction_evidence_execution_status.clone(),
             "interaction_evidence_status": release_gate.interaction_evidence_status.clone(),
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "state_dimensions_changed": state_dimensions_changed,
@@ -5657,6 +5744,20 @@ fn ultra_contract_runtime_acceptance_report(
         inferred_required_obligations(&effective_profile, &plan.goal, &required_capabilities);
     let mut required_evidence =
         inferred_required_evidence(&effective_profile, &plan.goal, &required_capabilities);
+    let mut requirements = ContractRequirements {
+        capabilities: required_capabilities,
+        evidence: required_evidence,
+        obligations: required_obligations,
+    };
+    carry_recorded_promotion_contract_requirements(
+        config,
+        &effective_profile,
+        &plan.goal,
+        &mut requirements,
+    );
+    required_capabilities = requirements.capabilities;
+    required_evidence = requirements.evidence;
+    required_obligations = requirements.obligations;
     let mut evidence_hint_tokens = evidence_hint_tokens_for_goal(&plan.goal);
     let bound_contract = bind_completion_contract_for_acceptance(
         config,
@@ -5761,6 +5862,14 @@ struct ReleaseGateSummary {
     browser_readiness_evidence_path: String,
     interaction_evidence_status: String,
     interaction_evidence_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcceptanceGateTelemetry {
+    browser_readiness_applicable: bool,
+    browser_readiness_execution_status: String,
+    interaction_evidence_applicable: bool,
+    interaction_evidence_execution_status: String,
 }
 
 fn run_profile_behavior_probe(
@@ -5937,6 +6046,108 @@ fn final_acceptance_release_gate(
         interaction_evidence_status: "not_applicable".to_string(),
         interaction_evidence_path: String::new(),
     }
+}
+
+fn acceptance_gate_telemetry(
+    profile: &str,
+    signal_text: &str,
+    required_capabilities: &[String],
+    required_evidence: &[String],
+    release_gate: &ReleaseGateSummary,
+) -> AcceptanceGateTelemetry {
+    let browser_applicable =
+        ultra_browser_probe_required(profile, signal_text, required_capabilities);
+    let interaction_applicable =
+        browser_applicable && interaction_gate_required(required_capabilities, required_evidence);
+    AcceptanceGateTelemetry {
+        browser_readiness_applicable: browser_applicable,
+        browser_readiness_execution_status: gate_execution_status(
+            &release_gate.browser_readiness_status,
+        ),
+        interaction_evidence_applicable: interaction_applicable,
+        interaction_evidence_execution_status: gate_execution_status(
+            &release_gate.interaction_evidence_status,
+        ),
+    }
+}
+
+fn interaction_gate_required(
+    required_capabilities: &[String],
+    required_evidence: &[String],
+) -> bool {
+    required_capabilities
+        .iter()
+        .chain(required_evidence.iter())
+        .any(|requirement| {
+            matches!(
+                requirement.as_str(),
+                "stateful_interaction"
+                    | "player_control"
+                    | "user_input_or_action"
+                    | "visible_state_change"
+                    | "persistence"
+                    | "adversary_or_challenge"
+                    | "progression_or_score"
+                    | "failure_or_collision_rule"
+                    | "browser_interaction"
+                    | "playable_ui"
+                    | "interactive_ui_source_evidence"
+                    | "visible_interactive_surface_evidence"
+                    | "user_input_handler_evidence"
+                    | "stateful_update_evidence"
+                    | "non_static_screen_evidence"
+                    | "persistence_evidence"
+                    | "challenge_or_adversary_evidence"
+                    | "score_or_progression_evidence"
+                    | "failure_or_collision_evidence"
+            )
+        })
+}
+
+fn gate_execution_status(status: &str) -> String {
+    if gate_status_disconnected(status) {
+        "disconnected".to_string()
+    } else if status == "passed" {
+        "performed".to_string()
+    } else if status.starts_with("failed") {
+        "performed_failed".to_string()
+    } else if status.starts_with("unavailable") {
+        "unavailable".to_string()
+    } else {
+        status.to_string()
+    }
+}
+
+fn gate_status_disconnected(status: &str) -> bool {
+    let status = status.trim();
+    status.is_empty()
+        || matches!(status, "not_applicable" | "not_checked" | "skipped")
+        || status.starts_with("skipped:")
+}
+
+fn acceptance_gates_disconnected_reason(
+    telemetry: &AcceptanceGateTelemetry,
+    release_gate: &ReleaseGateSummary,
+) -> Option<String> {
+    let mut disconnected = Vec::new();
+    if telemetry.browser_readiness_applicable
+        && gate_status_disconnected(&release_gate.browser_readiness_status)
+    {
+        disconnected.push(format!(
+            "browser_readiness_status={}",
+            release_gate.browser_readiness_status
+        ));
+    }
+    if telemetry.interaction_evidence_applicable
+        && gate_status_disconnected(&release_gate.interaction_evidence_status)
+    {
+        disconnected.push(format!(
+            "interaction_evidence_status={}",
+            release_gate.interaction_evidence_status
+        ));
+    }
+    (!disconnected.is_empty())
+        .then(|| format!("acceptance_gates_disconnected:{}", disconnected.join(",")))
 }
 
 fn runtime_acceptance_unverified_release_reasons(
@@ -8188,6 +8399,75 @@ fn assurance_for_completion(
     } else {
         ("full", "")
     }
+}
+
+fn earned_assurance_for_completion(
+    profile: &str,
+    required_capabilities: &[String],
+    contract_bound: bool,
+    final_acceptance_status: &str,
+    release_gate: &ReleaseGateSummary,
+    gate_telemetry: &AcceptanceGateTelemetry,
+) -> (String, String) {
+    let (base_level, base_reason) = assurance_for_completion(profile, required_capabilities);
+    if base_level != "full" {
+        return (base_level.to_string(), base_reason.to_string());
+    }
+    if final_acceptance_status == "partial" || release_gate.status == "partial" {
+        return (
+            "partial".to_string(),
+            release_gate
+                .reasons
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "acceptance_partial".to_string()),
+        );
+    }
+    if final_acceptance_status != "full_success" || release_gate.status == "failed" {
+        return (
+            "reduced".to_string(),
+            release_gate
+                .reasons
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "acceptance_not_full_success".to_string()),
+        );
+    }
+    if canonical_profile_name(profile).is_empty() {
+        return (
+            "partial".to_string(),
+            "effective_profile_unknown".to_string(),
+        );
+    }
+    if !contract_bound {
+        return (
+            "partial".to_string(),
+            "completion_contract_not_bound".to_string(),
+        );
+    }
+    if gate_telemetry.browser_readiness_applicable
+        && gate_telemetry.browser_readiness_execution_status != "performed"
+    {
+        return (
+            "partial".to_string(),
+            format!(
+                "browser_readiness_not_performed:{}",
+                gate_telemetry.browser_readiness_execution_status
+            ),
+        );
+    }
+    if gate_telemetry.interaction_evidence_applicable
+        && gate_telemetry.interaction_evidence_execution_status != "performed"
+    {
+        return (
+            "partial".to_string(),
+            format!(
+                "interaction_evidence_not_performed:{}",
+                gate_telemetry.interaction_evidence_execution_status
+            ),
+        );
+    }
+    ("full".to_string(), String::new())
 }
 
 fn release_quality_completion_status(
@@ -12866,6 +13146,138 @@ export default function Memo() {
         );
     }
 
+    #[test]
+    fn ambiguous_generic_app_promotion_keeps_union_contract_and_earns_full_after_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "ちょっとしたメモアプリを作って";
+        let plan = two_phase_ultra_plan(goal, "generic");
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(single_write_step_plan_json(
+                "Create a package manifest",
+                "package.json",
+            )),
+            AssistantReply::text(generated_nextjs_artifact_plan_json(
+                "Complete the promoted Next.js app",
+            )),
+        ]);
+        let mut final_calls = nextjs_interactive_app_tool_calls(interactive_game_page_source());
+        final_calls.remove(0);
+        final_calls.extend(browser_release_evidence_tool_calls());
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({
+                        "path": "package.json",
+                        "content": nextjs_complete_package_json()
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: final_calls,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let promotion = latest_event(&events, "profile_reinferred");
+        assert_eq!(promotion.get("id").and_then(Value::as_str), Some("nextjs"));
+        assert_eq!(
+            promotion.get("contract_origin").and_then(Value::as_str),
+            Some("promoted_union")
+        );
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            final_acceptance
+                .get("effective_profile")
+                .and_then(Value::as_str),
+            Some("nextjs")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("contract_origin")
+                .and_then(Value::as_str),
+            Some("promoted_union")
+        );
+        for evidence in GENERIC_INTERACTIVE_EVIDENCE_KEYS {
+            assert!(
+                event_array_contains(&final_acceptance, "required_evidence", evidence),
+                "{evidence} missing from {final_acceptance}"
+            );
+        }
+        for evidence in [
+            "nextjs_route_evidence",
+            "build_command_or_dependency_missing_boundary",
+        ] {
+            assert!(
+                event_array_contains(&final_acceptance, "required_evidence", evidence),
+                "{evidence} missing from {final_acceptance}"
+            );
+        }
+        for capability in [
+            "stateful_interaction",
+            "user_input_or_action",
+            "visible_state_change",
+        ] {
+            assert!(
+                event_array_contains(&final_acceptance, "required_capabilities", capability),
+                "{capability} missing from {final_acceptance}"
+            );
+        }
+        assert_eq!(
+            final_acceptance
+                .get("browser_readiness_applicable")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            final_acceptance
+                .get("browser_readiness_execution_status")
+                .and_then(Value::as_str),
+            Some("performed")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("interaction_evidence_applicable")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            final_acceptance
+                .get("interaction_evidence_execution_status")
+                .and_then(Value::as_str),
+            Some("performed")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("browser_readiness_status")
+                .and_then(Value::as_str),
+            Some("passed")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("interaction_evidence_status")
+                .and_then(Value::as_str),
+            Some("passed")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("assurance_level")
+                .and_then(Value::as_str),
+            Some("full")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn ultra_final_acceptance_uses_effective_profile_over_stale_config_profile() {
@@ -12919,6 +13331,55 @@ export default function Memo() {
                 .and_then(Value::as_str),
             Some("passed")
         );
+    }
+
+    #[test]
+    fn applicable_interaction_gates_disconnected_force_loud_failure() {
+        let required_capabilities = vec![
+            "stateful_interaction".to_string(),
+            "user_input_or_action".to_string(),
+            "visible_state_change".to_string(),
+        ];
+        let required_evidence = vec![
+            "user_input_handler_evidence".to_string(),
+            "stateful_update_evidence".to_string(),
+        ];
+        let mut release_gate = ReleaseGateSummary {
+            status: "not_applicable".to_string(),
+            reasons: Vec::new(),
+            browser_readiness_status: "not_applicable".to_string(),
+            browser_readiness_evidence_path: String::new(),
+            interaction_evidence_status: "skipped".to_string(),
+            interaction_evidence_path: String::new(),
+        };
+        let telemetry = acceptance_gate_telemetry(
+            "nextjs",
+            "Create an interactive browser app",
+            &required_capabilities,
+            &required_evidence,
+            &release_gate,
+        );
+
+        let reason = acceptance_gates_disconnected_reason(&telemetry, &release_gate)
+            .expect("disconnected gates should be loud");
+        release_gate.status = "failed".to_string();
+        release_gate.reasons.push(reason.clone());
+        let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
+        let (assurance_level, assurance_reason) = earned_assurance_for_completion(
+            "nextjs",
+            &required_capabilities,
+            true,
+            final_acceptance_status,
+            &release_gate,
+            &telemetry,
+        );
+
+        assert_eq!(final_acceptance_status, "incomplete");
+        assert_eq!(assurance_level, "reduced");
+        assert!(reason.contains("acceptance_gates_disconnected"));
+        assert!(reason.contains("browser_readiness_status=not_applicable"));
+        assert!(reason.contains("interaction_evidence_status=skipped"));
+        assert!(assurance_reason.contains("acceptance_gates_disconnected"));
     }
 
     #[test]
@@ -13698,6 +14159,12 @@ if __name__ == "__main__":
         assert!(event_text.contains("\"runtime_acceptance_status\":\"partial\""));
         assert!(event_text.contains("\"final_acceptance_status\":\"partial\""));
         assert!(event_text.contains("\"release_gate_status\":\"partial\""));
+        assert_eq!(
+            final_acceptance
+                .get("assurance_level")
+                .and_then(Value::as_str),
+            Some("partial")
+        );
         assert!(
             final_acceptance
                 .get("unverified_evidence")

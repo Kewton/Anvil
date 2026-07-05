@@ -194,6 +194,8 @@ pub fn append_run_summary(path: Option<&Path>, text: &str) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionSnapshot {
     pub profile: String,
+    pub effective_profile: String,
+    pub contract_origin: String,
     pub assurance_level: String,
     pub assurance_reason: String,
     pub profile_inferred: String,
@@ -210,8 +212,12 @@ pub struct CompletionSnapshot {
     pub external_contract_ok: bool,
     pub release_gate_reasons: Vec<String>,
     pub unverified_evidence: Vec<String>,
+    pub browser_readiness_applicable: bool,
+    pub browser_readiness_execution_status: String,
     pub browser_readiness_status: String,
     pub browser_readiness_evidence_path: String,
+    pub interaction_evidence_applicable: bool,
+    pub interaction_evidence_execution_status: String,
     pub interaction_evidence_status: String,
     pub interaction_evidence_path: String,
     pub state_dimensions_changed: Vec<String>,
@@ -240,6 +246,8 @@ impl CompletionSnapshot {
     pub fn empty() -> Self {
         Self {
             profile: String::new(),
+            effective_profile: String::new(),
+            contract_origin: "initial".to_string(),
             assurance_level: String::new(),
             assurance_reason: String::new(),
             profile_inferred: String::new(),
@@ -256,8 +264,12 @@ impl CompletionSnapshot {
             external_contract_ok: false,
             release_gate_reasons: Vec::new(),
             unverified_evidence: Vec::new(),
+            browser_readiness_applicable: false,
+            browser_readiness_execution_status: "not_applicable".to_string(),
             browser_readiness_status: "not_applicable".to_string(),
             browser_readiness_evidence_path: String::new(),
+            interaction_evidence_applicable: false,
+            interaction_evidence_execution_status: "not_applicable".to_string(),
             interaction_evidence_status: "not_applicable".to_string(),
             interaction_evidence_path: String::new(),
             state_dimensions_changed: Vec::new(),
@@ -298,6 +310,8 @@ pub struct CompletionProjection {
     pub command_completion: String,
     pub task_status: String,
     pub profile: String,
+    pub effective_profile: String,
+    pub contract_origin: String,
     pub assurance_level: String,
     pub assurance_reason: String,
     pub profile_inferred: String,
@@ -314,8 +328,12 @@ pub struct CompletionProjection {
     pub external_contract_ok: bool,
     pub release_gate_reasons: Vec<String>,
     pub unverified_evidence: Vec<String>,
+    pub browser_readiness_applicable: bool,
+    pub browser_readiness_execution_status: String,
     pub browser_readiness: String,
     pub browser_readiness_evidence_path: String,
+    pub interaction_evidence_applicable: bool,
+    pub interaction_evidence_execution_status: String,
     pub interaction_evidence: String,
     pub interaction_evidence_path: String,
     pub state_dimensions_changed: Vec<String>,
@@ -421,12 +439,14 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
     let status = terminal_status(ok, &release_gate, &final_acceptance);
     let interaction_unverified =
         interaction_unverified_probe_unavailable(&release_gate, &snapshot.release_gate_reasons);
+    let (assurance_level, assurance_reason) =
+        projected_assurance_from_snapshot(snapshot, &release_gate, &final_acceptance);
     let base_task_status = task_status(ok, &release_gate, &final_acceptance);
     let task_status = if ok && interaction_unverified {
         "partial (interaction unverified)".to_string()
-    } else if ok && snapshot.assurance_level == "static" && base_task_status == "complete" {
+    } else if ok && assurance_level == "static" && base_task_status == "complete" {
         "completed (static assurance)".to_string()
-    } else if ok && snapshot.assurance_level == "reduced" && base_task_status == "complete" {
+    } else if ok && assurance_level == "reduced" && base_task_status == "complete" {
         "completed (reduced assurance)".to_string()
     } else {
         base_task_status
@@ -441,8 +461,10 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         command_completion,
         task_status,
         profile: snapshot.profile.clone(),
-        assurance_level: snapshot.assurance_level.clone(),
-        assurance_reason: snapshot.assurance_reason.clone(),
+        effective_profile: snapshot_effective_profile(snapshot),
+        contract_origin: snapshot.contract_origin.clone(),
+        assurance_level,
+        assurance_reason,
         profile_inferred: snapshot.profile_inferred.clone(),
         profile_inference_source: snapshot.profile_inference_source.clone(),
         requested_port: snapshot.requested_port.clone(),
@@ -457,8 +479,14 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         external_contract_ok: snapshot.external_contract_ok,
         release_gate_reasons: snapshot.release_gate_reasons.clone(),
         unverified_evidence: snapshot.unverified_evidence.clone(),
+        browser_readiness_applicable: snapshot.browser_readiness_applicable,
+        browser_readiness_execution_status: snapshot.browser_readiness_execution_status.clone(),
         browser_readiness: snapshot.browser_readiness_status.clone(),
         browser_readiness_evidence_path: snapshot.browser_readiness_evidence_path.clone(),
+        interaction_evidence_applicable: snapshot.interaction_evidence_applicable,
+        interaction_evidence_execution_status: snapshot
+            .interaction_evidence_execution_status
+            .clone(),
         interaction_evidence: snapshot.interaction_evidence_status.clone(),
         interaction_evidence_path: snapshot.interaction_evidence_path.clone(),
         state_dimensions_changed: snapshot.state_dimensions_changed.clone(),
@@ -484,6 +512,81 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         planner_release_risk: snapshot.planner_release_risk,
         compile_rollback_summaries: snapshot.compile_rollback_summaries.clone(),
     }
+}
+
+fn snapshot_effective_profile(snapshot: &CompletionSnapshot) -> String {
+    if snapshot.effective_profile.trim().is_empty() {
+        snapshot.profile.clone()
+    } else {
+        snapshot.effective_profile.clone()
+    }
+}
+
+fn projected_assurance_from_snapshot(
+    snapshot: &CompletionSnapshot,
+    release_gate: &str,
+    final_acceptance: &str,
+) -> (String, String) {
+    let mut level = snapshot.assurance_level.clone();
+    let mut reason = snapshot.assurance_reason.clone();
+    if level != "full" {
+        return (level, reason);
+    }
+    let effective_profile = snapshot_effective_profile(snapshot);
+    if effective_profile.trim().is_empty() {
+        return (
+            "partial".to_string(),
+            "effective_profile_unknown".to_string(),
+        );
+    }
+    if final_acceptance == "partial" || release_gate == "partial" {
+        return (
+            "partial".to_string(),
+            snapshot
+                .release_gate_reasons
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "acceptance_partial".to_string()),
+        );
+    }
+    if final_acceptance != "full_success" || release_gate == "failed" {
+        level = "reduced".to_string();
+        reason = snapshot
+            .release_gate_reasons
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "acceptance_not_full_success".to_string());
+        return (level, reason);
+    }
+    if !snapshot.completion_contract_verification_enabled && !snapshot.external_contract_checked {
+        return (
+            "partial".to_string(),
+            "completion_contract_not_bound".to_string(),
+        );
+    }
+    if snapshot.browser_readiness_applicable
+        && snapshot.browser_readiness_execution_status != "performed"
+    {
+        return (
+            "partial".to_string(),
+            format!(
+                "browser_readiness_not_performed:{}",
+                snapshot.browser_readiness_execution_status
+            ),
+        );
+    }
+    if snapshot.interaction_evidence_applicable
+        && snapshot.interaction_evidence_execution_status != "performed"
+    {
+        return (
+            "partial".to_string(),
+            format!(
+                "interaction_evidence_not_performed:{}",
+                snapshot.interaction_evidence_execution_status
+            ),
+        );
+    }
+    (level, reason)
 }
 
 fn compile_rollback_summaries_from_events(events: &[Value]) -> Vec<String> {
@@ -1347,6 +1450,17 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        effective_profile: event
+            .get("effective_profile")
+            .and_then(Value::as_str)
+            .or_else(|| event.get("profile").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string(),
+        contract_origin: event
+            .get("contract_origin")
+            .and_then(Value::as_str)
+            .unwrap_or("initial")
+            .to_string(),
         assurance_level: event
             .get("assurance_level")
             .and_then(Value::as_str)
@@ -1415,6 +1529,15 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .unwrap_or(false),
         release_gate_reasons: event_string_array(event, "release_gate_reasons"),
         unverified_evidence: event_string_array(event, "unverified_evidence"),
+        browser_readiness_applicable: event
+            .get("browser_readiness_applicable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        browser_readiness_execution_status: event
+            .get("browser_readiness_execution_status")
+            .and_then(Value::as_str)
+            .unwrap_or("not_applicable")
+            .to_string(),
         browser_readiness_status: event
             .get("browser_readiness_status")
             .and_then(Value::as_str)
@@ -1424,6 +1547,15 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .get("browser_readiness_evidence_path")
             .and_then(Value::as_str)
             .unwrap_or("")
+            .to_string(),
+        interaction_evidence_applicable: event
+            .get("interaction_evidence_applicable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        interaction_evidence_execution_status: event
+            .get("interaction_evidence_execution_status")
+            .and_then(Value::as_str)
+            .unwrap_or("not_applicable")
             .to_string(),
         interaction_evidence_status: event
             .get("interaction_evidence_status")
@@ -1511,19 +1643,20 @@ struct ProfileReinferenceFields {
     source: String,
     at_phase: Option<u64>,
     requested_port: String,
+    contract_origin: String,
 }
 
 impl ProfileReinferenceFields {
     fn apply_to(self, snapshot: &mut CompletionSnapshot) {
         snapshot.profile = self.to_profile.clone();
+        snapshot.effective_profile = self.to_profile.clone();
         snapshot.profile_inferred = self.to_profile;
         snapshot.profile_inference_source = self.source;
+        if !self.contract_origin.is_empty() {
+            snapshot.contract_origin = self.contract_origin;
+        }
         if !self.requested_port.is_empty() {
             snapshot.requested_port = self.requested_port;
-        }
-        if crate::planner::profile::canonical_profile_name(&snapshot.profile) != "generic" {
-            snapshot.assurance_level = "full".to_string();
-            snapshot.assurance_reason.clear();
         }
     }
 }
@@ -1573,6 +1706,11 @@ fn profile_reinference_fields(event: &Value) -> Option<ProfileReinferenceFields>
             .get("requested_port")
             .and_then(Value::as_str)
             .unwrap_or("")
+            .to_string(),
+        contract_origin: event
+            .get("contract_origin")
+            .and_then(Value::as_str)
+            .unwrap_or("promoted_union")
             .to_string(),
     })
 }
@@ -1722,6 +1860,11 @@ fn render_completion_summary(
         format!("Command status: {}", projection.command_completion),
         format!("Command completion: {}", projection.command_completion),
         format!("Task status: {}", projection.task_status),
+        format!(
+            "Effective profile: {}",
+            missing_if_empty(&projection.effective_profile)
+        ),
+        format!("Contract origin: {}", projection.contract_origin),
         format!("Runtime acceptance: {}", projection.runtime_acceptance),
         format!("Final acceptance: {}", projection.final_acceptance),
         format!("Release gate: {}", projection.release_gate),
@@ -1751,6 +1894,22 @@ fn render_completion_summary(
             projection.external_contract_checked
         ),
         format!("external_contract_ok={}", projection.external_contract_ok),
+        format!(
+            "browser_readiness_applicable={}",
+            projection.browser_readiness_applicable
+        ),
+        format!(
+            "browser_readiness_execution_status={}",
+            projection.browser_readiness_execution_status
+        ),
+        format!(
+            "interaction_evidence_applicable={}",
+            projection.interaction_evidence_applicable
+        ),
+        format!(
+            "interaction_evidence_execution_status={}",
+            projection.interaction_evidence_execution_status
+        ),
         format!("Planner repaired: {}", projection.planner_repaired),
         format!("Planner release risk: {}", projection.planner_release_risk),
         format!(
@@ -2396,17 +2555,59 @@ mod tests {
                 "from": "workspace",
                 "at_phase": 1,
                 "requested_port": "3011 (goal)",
+                "contract_origin": "promoted_union",
             }),
         );
 
         let snapshot = latest_completion_snapshot(Some(&path));
 
         assert_eq!(snapshot.profile, "nextjs");
+        assert_eq!(snapshot.effective_profile, "nextjs");
         assert_eq!(snapshot.profile_inferred, "nextjs");
         assert_eq!(snapshot.profile_inference_source, "workspace");
         assert_eq!(snapshot.requested_port, "3011 (goal)");
-        assert_eq!(snapshot.assurance_level, "full");
+        assert_eq!(snapshot.contract_origin, "promoted_union");
+        assert!(snapshot.assurance_level.is_empty());
         assert!(snapshot.assurance_reason.is_empty());
+    }
+
+    #[test]
+    fn completion_projection_downgrades_full_when_applicable_gates_are_disconnected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "profile": "nextjs",
+                "effective_profile": "nextjs",
+                "contract_origin": "promoted_union",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "full_success",
+                "release_gate_status": "not_applicable",
+                "completion_contract_verification_enabled": true,
+                "external_contract_checked": true,
+                "external_contract_ok": true,
+                "assurance_level": "full",
+                "browser_readiness_applicable": true,
+                "browser_readiness_execution_status": "disconnected",
+                "browser_readiness_status": "not_applicable",
+                "interaction_evidence_applicable": true,
+                "interaction_evidence_execution_status": "disconnected",
+                "interaction_evidence_status": "not_applicable",
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(true, &snapshot);
+
+        assert_eq!(projection.effective_profile, "nextjs");
+        assert_eq!(projection.contract_origin, "promoted_union");
+        assert_eq!(projection.assurance_level, "partial");
+        assert_eq!(
+            projection.assurance_reason,
+            "browser_readiness_not_performed:disconnected"
+        );
     }
 
     #[test]
