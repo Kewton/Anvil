@@ -53,13 +53,30 @@ Within S, "generalized" means:
   into the corpus before probe, evidence, or profile logic changes.
 - The scenario suite is rerun for any probe, evidence, or profile change.
 
+Named guarantees produced by the Generic Assurance Track:
+
+- **Monotonic promotion rebind**: when a generic app-intent run promotes to a
+  known profile, the promoted contract is a union. Generic interactive
+  requirements remain bound and known-profile requirements are added;
+  requirements never decrease during promotion.
+- **Earned assurance**: `full` assurance is computed from executed gate
+  statuses. A promoted interactive web run cannot earn full assurance from
+  disconnected or `not_applicable` browser readiness / interaction gates; those
+  gaps fail loudly as `acceptance_gates_disconnected`.
+- **Authority symmetry**: dependency needs created by runtime manifests,
+  repairs, or promotion are paired with runtime-sanctioned install authority.
+  Without that authority, the terminal state is an explicit
+  `dependency_setup_authority_required` failure, not a repair loop or full
+  success.
+
 ## Clause Evidence
 
 | clause | run evidence | harvested corpus |
 |---|---|---|
 | Web profile behavior is not Space-Invaders-only; generic interaction, persistence, and content-editing obligations are separately checked. | M2: `test0704-464748_001`, `test0704-464748_002`, and `test0704-48.1 CONTENT re-run` | Not harvested in this source corpus; the regression target is the scenario suite in [uat/scenarios.md](uat/scenarios.md). |
 | Contract inference survives renamed or opaque scenario IDs and English/Japanese prompt variation. | M3: `test0704-49_001`, `test0704-50_001` | Covered by required golden tests `tests/eval/test_acceptance_contract.py::AcceptanceContractTest` and `tests/eval/test_completion_contract_snapshots.py::CompletionContractSnapshotTest`. |
-| No-profile app-intent runs use generic contract binding, then promote only when a known manifest appears. | G1/G2 anchors: `generic_ultra_promotes_to_nextjs_after_workspace_manifest`, `generic_ultra_promotes_to_python_cli_after_pyproject_manifest`, and `generic_ultra_without_manifest_keeps_static_tier`; G3 UAT: `test0704-4030444542434647484814950515354_001` | G3 scaffolded an unknown Vite manifest and correctly stayed in the generic static-tier fallback; the harvested corpus case is tracked by the G4 corpus update. |
+| No-profile app-intent runs use generic contract binding and terminate honestly at the generic static tier when the scaffolded manifest is unknown. | Static-tier fallback, live-proven: `test0704-4030444542434647484814950515354_001` scaffolded a Vite/React manifest, emitted no `profile_reinferred`, and ended without pretending to run promoted web gates; report: `../../../workspace/management/runs/uat-test0704-4030444542434647484814950515354-001/uat-report.md`. | [test0704-4030444542434647484814950515354_001](../tests/corpus/apps/test0704-4030444542434647484814950515354_001/expectations.toml) |
+| No-profile app-intent runs promote only when a known manifest appears, preserving generic obligations and earning full only through executed web gates. | Promotion path, live-proven: final G3 revalidation `test0704-403044454243464748481495051535455565758_000`, run id `019f30c7-da99-7d83-a715-1db6b6a6a3b6`, recorded `profile_reinferred`, `contract_origin=promoted_union`, dependency reconciliation, browser readiness HTTP 200, interaction probe execution, and `assurance_level=full`; report: `../../../workspace/management/runs/uat-test0704-403044454243464748481495051535455565758-000/uat-report.md`. | [test0704-403044454243464748481495051535455565758_000](../tests/corpus/apps/test0704-403044454243464748481495051535455565758_000/expectations.toml) |
 | The runner lifecycle supports a non-web process profile without Next.js probe or port assumptions. | M4: `test0704-51_001` web run and `test0704-51_001` CLI run | The CLI contract is specified in [uat/scenarios.md#cli-python-cli-profile](uat/scenarios.md#cli-python-cli-profile); no app corpus case is expected for the process-only run. |
 | App evidence detectors and interaction probe selection are fixture-backed. | M5 Round A four runs | [test0702_008](../tests/corpus/apps/test0702_008/expectations.toml), [test0703_002](../tests/corpus/apps/test0703_002/expectations.toml), [test0703_005_4](../tests/corpus/apps/test0703_005_4/expectations.toml), [test0704_001](../tests/corpus/apps/test0704_001/expectations.toml) |
 | The second corpus round confirms the same detectors over a new harvested app snapshot. | M5 Round B | [test0704_003](../tests/corpus/apps/test0704_003/expectations.toml) |
