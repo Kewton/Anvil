@@ -1,14 +1,14 @@
 use std::path::Path;
 use std::process::Stdio;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::bounded_process::{self, BoundedProcessOutcomeKind};
 use crate::eval_events;
 use crate::minimal_loop::verifier_env;
 
-const SETUP_TIMEOUT: Duration = Duration::from_secs(120);
+pub const SETUP_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +129,10 @@ pub struct NodeDependencySetupObservation {
     pub output_snippet: String,
     pub changed_paths: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub lockfile_present_before: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lockfile_present_after: Option<bool>,
@@ -151,6 +155,8 @@ impl NodeDependencySetupObservation {
             primary_reason: "dependency setup not required".to_string(),
             output_snippet: String::new(),
             changed_paths: Vec::new(),
+            duration_ms: None,
+            timeout_ms: None,
             lockfile_present_before: None,
             lockfile_present_after: None,
             lockfile_created: None,
@@ -173,6 +179,8 @@ impl NodeDependencySetupObservation {
             primary_reason: reason.into(),
             output_snippet: String::new(),
             changed_paths: Vec::new(),
+            duration_ms: None,
+            timeout_ms: None,
             lockfile_present_before: None,
             lockfile_present_after: None,
             lockfile_created: None,
@@ -591,6 +599,38 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
     npm_program: &Path,
     offline: bool,
 ) -> NodeDependencySetupObservation {
+    run_node_dependency_setup_with_program_timeout_and_offline(
+        root,
+        requirement,
+        npm_program,
+        offline,
+        SETUP_TIMEOUT,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_node_dependency_setup_with_program_timeout(
+    root: &Path,
+    requirement: &NodeDependencySetupRequirement,
+    npm_program: &Path,
+    timeout: Duration,
+) -> NodeDependencySetupObservation {
+    run_node_dependency_setup_with_program_timeout_and_offline(
+        root,
+        requirement,
+        npm_program,
+        false,
+        timeout,
+    )
+}
+
+fn run_node_dependency_setup_with_program_timeout_and_offline(
+    root: &Path,
+    requirement: &NodeDependencySetupRequirement,
+    npm_program: &Path,
+    offline: bool,
+    timeout: Duration,
+) -> NodeDependencySetupObservation {
     if !requirement.allowed {
         return NodeDependencySetupObservation::blocked(
             requirement.setup_kind,
@@ -614,7 +654,7 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
         );
     }
     if requirement.setup_kind == NodeDependencySetupKind::PythonCliDependencies {
-        return run_python_cli_dependency_setup(root, requirement);
+        return run_python_cli_dependency_setup(root, requirement, timeout);
     }
     if requirement.package_manager == PackageManagerKind::Pnpm
         || requirement.package_manager == PackageManagerKind::Yarn
@@ -630,15 +670,15 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
     let before_lock = root.join("package-lock.json").exists();
     let before_missing = setup_missing_dependency_labels(root, requirement.setup_kind);
     let started = Instant::now();
-    let mut child = match verifier_env::normalized_command_at_root(npm_program, root)
+    let mut command = verifier_env::normalized_command_at_root(npm_program, root);
+    command
         .args(["install", "--ignore-scripts"])
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
+        .stderr(Stdio::piped());
+    let output = match bounded_process::run_with_timeout(&mut command, timeout) {
+        Ok(output) => output,
         Err(err) => {
             return NodeDependencySetupObservation {
                 status: NodeDependencySetupStatus::Failed,
@@ -650,106 +690,73 @@ pub(crate) fn run_node_dependency_setup_with_program_and_offline(
                 primary_reason: format!("failed to spawn npm: {err}"),
                 output_snippet: String::new(),
                 changed_paths: Vec::new(),
+                duration_ms: Some(started.elapsed().as_millis()),
+                timeout_ms: Some(timeout.as_millis()),
                 lockfile_present_before: Some(before_lock),
                 lockfile_present_after: Some(root.join("package-lock.json").exists()),
                 lockfile_created: Some(!before_lock && root.join("package-lock.json").exists()),
             };
         }
     };
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child.wait_with_output().ok();
-                let stdout = output
-                    .as_ref()
-                    .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
-                    .unwrap_or_default();
-                let stderr = output
-                    .as_ref()
-                    .map(|out| String::from_utf8_lossy(&out.stderr).to_string())
-                    .unwrap_or_default();
-                let combined = format!("{stderr}\n{stdout}");
-                let mut changed_paths = Vec::new();
-                if !before_lock && root.join("package-lock.json").exists() {
-                    changed_paths.push("package-lock.json".to_string());
-                }
-                for path in before_missing {
-                    if setup_dependency_label_ready(root, &path) {
-                        changed_paths.push(path);
-                    }
-                }
-                let after_lock = root.join("package-lock.json").exists();
-                let required_ready = setup_dependencies_ready(root, requirement.setup_kind);
-                let status_kind = if status.success() && required_ready {
-                    NodeDependencySetupStatus::Passed
-                } else {
-                    NodeDependencySetupStatus::Failed
-                };
-                return NodeDependencySetupObservation {
-                    status: status_kind,
-                    setup_kind: requirement.setup_kind,
-                    package_manager: requirement.package_manager,
-                    authority: requirement.setup_authority,
-                    attempted: true,
-                    command: "npm install --ignore-scripts".to_string(),
-                    primary_reason: if status.success() && required_ready {
-                        "dependency setup passed".to_string()
-                    } else if status.success() {
-                        format!(
-                            "dependency setup completed but required dependencies are still missing: {}",
-                            setup_missing_dependency_labels(root, requirement.setup_kind)
-                                .join(", ")
-                        )
-                    } else {
-                        format!("dependency setup failed: {status}")
-                    },
-                    output_snippet: eval_events::body_snippet(&combined),
-                    changed_paths,
-                    lockfile_present_before: Some(before_lock),
-                    lockfile_present_after: Some(after_lock),
-                    lockfile_created: Some(!before_lock && after_lock),
-                };
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return NodeDependencySetupObservation {
-                    status: NodeDependencySetupStatus::Failed,
-                    setup_kind: requirement.setup_kind,
-                    package_manager: requirement.package_manager,
-                    authority: requirement.setup_authority,
-                    attempted: true,
-                    command: "npm install --ignore-scripts".to_string(),
-                    primary_reason: format!("dependency setup wait failed: {err}"),
-                    output_snippet: String::new(),
-                    changed_paths: Vec::new(),
-                    lockfile_present_before: Some(before_lock),
-                    lockfile_present_after: Some(root.join("package-lock.json").exists()),
-                    lockfile_created: Some(!before_lock && root.join("package-lock.json").exists()),
-                };
-            }
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stderr}\n{stdout}");
+    let mut changed_paths = Vec::new();
+    if !before_lock && root.join("package-lock.json").exists() {
+        changed_paths.push("package-lock.json".to_string());
+    }
+    for path in before_missing {
+        if setup_dependency_label_ready(root, &path) {
+            changed_paths.push(path);
         }
-        if started.elapsed() >= SETUP_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return NodeDependencySetupObservation {
-                status: NodeDependencySetupStatus::TimedOut,
-                setup_kind: requirement.setup_kind,
-                package_manager: requirement.package_manager,
-                authority: requirement.setup_authority,
-                attempted: true,
-                command: "npm install --ignore-scripts".to_string(),
-                primary_reason: format!(
-                    "dependency setup timed out after {} ms",
-                    SETUP_TIMEOUT.as_millis()
-                ),
-                output_snippet: String::new(),
-                changed_paths: Vec::new(),
-                lockfile_present_before: Some(before_lock),
-                lockfile_present_after: Some(root.join("package-lock.json").exists()),
-                lockfile_created: Some(!before_lock && root.join("package-lock.json").exists()),
-            };
+    }
+    let after_lock = root.join("package-lock.json").exists();
+    let required_ready = setup_dependencies_ready(root, requirement.setup_kind);
+    let status_success = output.success();
+    let status_kind = match output.kind {
+        BoundedProcessOutcomeKind::TimedOut => NodeDependencySetupStatus::TimedOut,
+        BoundedProcessOutcomeKind::Exited if status_success && required_ready => {
+            NodeDependencySetupStatus::Passed
         }
-        thread::sleep(Duration::from_millis(20));
+        BoundedProcessOutcomeKind::Exited | BoundedProcessOutcomeKind::Cancelled => {
+            NodeDependencySetupStatus::Failed
+        }
+    };
+    NodeDependencySetupObservation {
+        status: status_kind,
+        setup_kind: requirement.setup_kind,
+        package_manager: requirement.package_manager,
+        authority: requirement.setup_authority,
+        attempted: true,
+        command: "npm install --ignore-scripts".to_string(),
+        primary_reason: match output.kind {
+            BoundedProcessOutcomeKind::TimedOut => format!(
+                "dependency_setup_timeout: dependency setup timed out after {} ms; remediation: retry when network or local resource contention is resolved",
+                timeout.as_millis()
+            ),
+            BoundedProcessOutcomeKind::Cancelled => "dependency setup cancelled".to_string(),
+            BoundedProcessOutcomeKind::Exited if status_success && required_ready => {
+                "dependency setup passed".to_string()
+            }
+            BoundedProcessOutcomeKind::Exited if status_success => format!(
+                "dependency setup completed but required dependencies are still missing: {}",
+                setup_missing_dependency_labels(root, requirement.setup_kind).join(", ")
+            ),
+            BoundedProcessOutcomeKind::Exited => format!(
+                "dependency setup failed: {}",
+                output
+                    .status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "unknown status".to_string())
+            ),
+        },
+        output_snippet: eval_events::body_snippet(&combined),
+        changed_paths,
+        duration_ms: Some(output.elapsed.as_millis()),
+        timeout_ms: Some(timeout.as_millis()),
+        lockfile_present_before: Some(before_lock),
+        lockfile_present_after: Some(after_lock),
+        lockfile_created: Some(!before_lock && after_lock),
     }
 }
 
@@ -807,21 +814,22 @@ fn setup_dependency_label_ready(root: &Path, path: &str) -> bool {
 fn run_python_cli_dependency_setup(
     root: &Path,
     requirement: &NodeDependencySetupRequirement,
+    timeout: Duration,
 ) -> NodeDependencySetupObservation {
     let before_venv = root.join(".venv").exists();
     let started = Instant::now();
     let mut changed_paths = Vec::new();
-    let command = "python -m venv .venv && .venv/bin/python -m pip install -e .".to_string();
-    let mut child = match verifier_env::normalized_command_at_root("sh", root)
+    let command_text = "python -m venv .venv && .venv/bin/python -m pip install -e .".to_string();
+    let mut command = verifier_env::normalized_command_at_root("sh", root);
+    command
         .arg("-c")
-        .arg(&command)
+        .arg(&command_text)
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
+        .stderr(Stdio::piped());
+    let output = match bounded_process::run_with_timeout(&mut command, timeout) {
+        Ok(output) => output,
         Err(err) => {
             return NodeDependencySetupObservation {
                 status: NodeDependencySetupStatus::Failed,
@@ -829,99 +837,70 @@ fn run_python_cli_dependency_setup(
                 package_manager: requirement.package_manager,
                 authority: requirement.setup_authority,
                 attempted: true,
-                command,
+                command: command_text.clone(),
                 primary_reason: format!("failed to spawn Python dependency setup: {err}"),
                 output_snippet: String::new(),
                 changed_paths,
+                duration_ms: Some(started.elapsed().as_millis()),
+                timeout_ms: Some(timeout.as_millis()),
                 lockfile_present_before: None,
                 lockfile_present_after: None,
                 lockfile_created: None,
             };
         }
     };
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child.wait_with_output().ok();
-                let stdout = output
-                    .as_ref()
-                    .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
-                    .unwrap_or_default();
-                let stderr = output
-                    .as_ref()
-                    .map(|out| String::from_utf8_lossy(&out.stderr).to_string())
-                    .unwrap_or_default();
-                if !before_venv && root.join(".venv").exists() {
-                    changed_paths.push(".venv".to_string());
-                }
-                let ready = python_cli_dependencies_ready(root);
-                let status_kind = if status.success() && ready {
-                    NodeDependencySetupStatus::Passed
-                } else {
-                    NodeDependencySetupStatus::Failed
-                };
-                return NodeDependencySetupObservation {
-                    status: status_kind,
-                    setup_kind: requirement.setup_kind,
-                    package_manager: requirement.package_manager,
-                    authority: requirement.setup_authority,
-                    attempted: true,
-                    command,
-                    primary_reason: if status.success() && ready {
-                        "Python CLI dependency setup passed".to_string()
-                    } else if status.success() {
-                        "Python CLI dependency setup completed but .venv/bin/python is missing"
-                            .to_string()
-                    } else {
-                        format!("Python CLI dependency setup failed: {status}")
-                    },
-                    output_snippet: eval_events::body_snippet(&format!("{stderr}\n{stdout}")),
-                    changed_paths,
-                    lockfile_present_before: None,
-                    lockfile_present_after: None,
-                    lockfile_created: None,
-                };
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return NodeDependencySetupObservation {
-                    status: NodeDependencySetupStatus::Failed,
-                    setup_kind: requirement.setup_kind,
-                    package_manager: requirement.package_manager,
-                    authority: requirement.setup_authority,
-                    attempted: true,
-                    command,
-                    primary_reason: format!("Python CLI dependency setup wait failed: {err}"),
-                    output_snippet: String::new(),
-                    changed_paths,
-                    lockfile_present_before: None,
-                    lockfile_present_after: None,
-                    lockfile_created: None,
-                };
-            }
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !before_venv && root.join(".venv").exists() {
+        changed_paths.push(".venv".to_string());
+    }
+    let ready = python_cli_dependencies_ready(root);
+    let status_success = output.success();
+    let status_kind = match output.kind {
+        BoundedProcessOutcomeKind::TimedOut => NodeDependencySetupStatus::TimedOut,
+        BoundedProcessOutcomeKind::Exited if status_success && ready => {
+            NodeDependencySetupStatus::Passed
         }
-        if started.elapsed() >= SETUP_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return NodeDependencySetupObservation {
-                status: NodeDependencySetupStatus::TimedOut,
-                setup_kind: requirement.setup_kind,
-                package_manager: requirement.package_manager,
-                authority: requirement.setup_authority,
-                attempted: true,
-                command,
-                primary_reason: format!(
-                    "Python CLI dependency setup timed out after {} ms",
-                    SETUP_TIMEOUT.as_millis()
-                ),
-                output_snippet: String::new(),
-                changed_paths,
-                lockfile_present_before: None,
-                lockfile_present_after: None,
-                lockfile_created: None,
-            };
+        BoundedProcessOutcomeKind::Exited | BoundedProcessOutcomeKind::Cancelled => {
+            NodeDependencySetupStatus::Failed
         }
-        thread::sleep(Duration::from_millis(20));
+    };
+    NodeDependencySetupObservation {
+        status: status_kind,
+        setup_kind: requirement.setup_kind,
+        package_manager: requirement.package_manager,
+        authority: requirement.setup_authority,
+        attempted: true,
+        command: command_text,
+        primary_reason: match output.kind {
+            BoundedProcessOutcomeKind::TimedOut => format!(
+                "dependency_setup_timeout: Python CLI dependency setup timed out after {} ms; remediation: retry when network or local resource contention is resolved",
+                timeout.as_millis()
+            ),
+            BoundedProcessOutcomeKind::Cancelled => {
+                "Python CLI dependency setup cancelled".to_string()
+            }
+            BoundedProcessOutcomeKind::Exited if status_success && ready => {
+                "Python CLI dependency setup passed".to_string()
+            }
+            BoundedProcessOutcomeKind::Exited if status_success => {
+                "Python CLI dependency setup completed but .venv/bin/python is missing".to_string()
+            }
+            BoundedProcessOutcomeKind::Exited => format!(
+                "Python CLI dependency setup failed: {}",
+                output
+                    .status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "unknown status".to_string())
+            ),
+        },
+        output_snippet: eval_events::body_snippet(&format!("{stderr}\n{stdout}")),
+        changed_paths,
+        duration_ms: Some(output.elapsed.as_millis()),
+        timeout_ms: Some(timeout.as_millis()),
+        lockfile_present_before: None,
+        lockfile_present_after: None,
+        lockfile_created: None,
     }
 }
 
@@ -949,6 +928,8 @@ fn run_node_test_runner_manifest_setup(
             primary_reason: format!("node test runner manifest {}", completion.action.as_str()),
             output_snippet: String::new(),
             changed_paths: vec!["package.json".to_string()],
+            duration_ms: None,
+            timeout_ms: None,
             lockfile_present_before: None,
             lockfile_present_after: None,
             lockfile_created: None,
@@ -963,6 +944,8 @@ fn run_node_test_runner_manifest_setup(
             primary_reason: format!("failed to write package.json: {err}"),
             output_snippet: String::new(),
             changed_paths: Vec::new(),
+            duration_ms: None,
+            timeout_ms: None,
             lockfile_present_before: None,
             lockfile_present_after: None,
             lockfile_created: None,
@@ -1380,6 +1363,45 @@ dependencies = ["requests"]
         assert_eq!(
             observation.primary_reason,
             "dependency_setup_blocked_offline"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dependency_setup_timeout_classifies_hanging_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        write_package(dir.path(), r#"{"dependencies":{"left-pad":"^1.3.0"}}"#);
+        let fake_npm = dir.path().join("fake-npm");
+        fs::write(&fake_npm, "#!/bin/sh\nsleep 5\n").unwrap();
+        let mut permissions = fs::metadata(&fake_npm).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_npm, permissions).unwrap();
+        let requirement = requirement_for_node_declared_dependencies(
+            dir.path(),
+            None,
+            "dependency probe",
+            NodeDependencySetupAuthority::PlanSetupStep,
+        );
+
+        let observation = run_node_dependency_setup_with_program_timeout(
+            dir.path(),
+            &requirement,
+            &fake_npm,
+            Duration::from_millis(100),
+        );
+
+        assert_eq!(observation.status, NodeDependencySetupStatus::TimedOut);
+        assert!(
+            observation
+                .primary_reason
+                .contains("dependency_setup_timeout")
+        );
+        assert_eq!(observation.timeout_ms, Some(100));
+        assert!(
+            observation.duration_ms.unwrap_or_default() < 2_000,
+            "{observation:?}"
         );
     }
 

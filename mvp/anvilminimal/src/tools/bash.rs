@@ -1,11 +1,12 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::bounded_process::{self, BoundedProcessOutcomeKind};
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_STREAM_BYTES: usize = 24_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,9 +35,21 @@ impl BashOutcome {
 }
 
 pub fn run(command: &str, root: &Path, offline: bool) -> anyhow::Result<String> {
-    let outcome = run_structured(command, root, offline, DEFAULT_TIMEOUT, || false)?;
+    run_with_timeout(command, root, offline, DEFAULT_TIMEOUT)
+}
+
+fn run_with_timeout(
+    command: &str,
+    root: &Path,
+    offline: bool,
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let outcome = run_structured(command, root, offline, timeout, || false)?;
     if outcome.kind == BashOutcomeKind::Blocked {
         bail!("{}", outcome.summary);
+    }
+    if outcome.kind == BashOutcomeKind::Timeout {
+        bail!("command_timeout: {command}\n{}", format_outcome(&outcome));
     }
     Ok(format_outcome(&outcome))
 }
@@ -75,72 +88,50 @@ where
     let mut process = Command::new("sh");
     process.arg("-c").arg(command).current_dir(root);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        process.process_group(0);
-    }
-    let mut child = process
-        .spawn()
+    let output = bounded_process::run_with_timeout_and_cancel(&mut process, timeout, is_cancelled)
         .with_context(|| format!("failed to spawn command: {command}"))?;
 
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let output = child.wait_with_output()?;
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    match output.kind {
+        BoundedProcessOutcomeKind::Exited => {
+            let status = output
+                .status
+                .context("bounded process exited without status")?;
             let kind = if status.success() {
                 BashOutcomeKind::Success
             } else {
                 BashOutcomeKind::CommandFailed
             };
-            return Ok(BashOutcome {
+            Ok(BashOutcome {
                 kind,
                 status: Some(status.to_string()),
                 stdout: truncate_stream(&stdout),
                 stderr: truncate_stream(&stderr),
-                elapsed_ms: started.elapsed().as_millis(),
+                elapsed_ms: output.elapsed.as_millis(),
                 summary: build_summary(command, kind, &stdout, &stderr),
-            });
+            })
         }
-        if is_cancelled() {
-            terminate_child(&mut child);
-            let output = child.wait_with_output()?;
-            return Ok(BashOutcome {
-                kind: BashOutcomeKind::Cancelled,
-                status: None,
-                stdout: truncate_stream(&String::from_utf8_lossy(&output.stdout)),
-                stderr: truncate_stream(&String::from_utf8_lossy(&output.stderr)),
-                elapsed_ms: started.elapsed().as_millis(),
-                summary: "command cancelled".to_string(),
-            });
-        }
-        if started.elapsed() >= timeout {
-            terminate_child(&mut child);
-            let output = child.wait_with_output()?;
-            return Ok(BashOutcome {
-                kind: BashOutcomeKind::Timeout,
-                status: None,
-                stdout: truncate_stream(&String::from_utf8_lossy(&output.stdout)),
-                stderr: truncate_stream(&String::from_utf8_lossy(&output.stderr)),
-                elapsed_ms: started.elapsed().as_millis(),
-                summary: format!("command timed out after {} ms", timeout.as_millis()),
-            });
-        }
-        thread::sleep(Duration::from_millis(20));
+        BoundedProcessOutcomeKind::Cancelled => Ok(BashOutcome {
+            kind: BashOutcomeKind::Cancelled,
+            status: None,
+            stdout: truncate_stream(&stdout),
+            stderr: truncate_stream(&stderr),
+            elapsed_ms: output.elapsed.as_millis(),
+            summary: "command cancelled".to_string(),
+        }),
+        BoundedProcessOutcomeKind::TimedOut => Ok(BashOutcome {
+            kind: BashOutcomeKind::Timeout,
+            status: None,
+            stdout: truncate_stream(&stdout),
+            stderr: truncate_stream(&stderr),
+            elapsed_ms: output.elapsed.as_millis(),
+            summary: format!(
+                "command_timeout: command timed out after {} ms",
+                timeout.as_millis()
+            ),
+        }),
     }
-}
-
-fn terminate_child(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(format!("-{}", child.id()))
-            .status();
-        thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
 }
 
 fn format_outcome(outcome: &BashOutcome) -> String {
@@ -274,6 +265,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.kind, BashOutcomeKind::Timeout);
+    }
+
+    #[test]
+    fn bash_timeout_returns_tool_error_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = run_with_timeout("sleep 2", dir.path(), false, Duration::from_millis(50))
+            .expect_err("timeout should return a tool error");
+        assert!(err.to_string().contains("command_timeout"), "{err}");
     }
 
     #[test]

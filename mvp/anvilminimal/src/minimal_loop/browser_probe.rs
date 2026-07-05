@@ -1,12 +1,13 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::bounded_process;
 use crate::eval_events;
 use crate::minimal_loop::build_verifier::{self, BuildVerifierStatus};
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
@@ -244,12 +245,7 @@ fn probe_browser_readiness_with_options(
     for (key, value) in &spec.command.env {
         command.env(key, value);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let child = match command.spawn() {
+    let child = match bounded_process::spawn_child(&mut command) {
         Ok(child) => child,
         Err(err) => {
             return finish_without_spawn(
@@ -771,17 +767,7 @@ impl Drop for ChildGuard {
 }
 
 fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(format!("-{}", child.id()))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
+    bounded_process::terminate_process_group(child);
 }
 
 fn output_excerpt(output: &std::process::Output) -> String {
@@ -1146,7 +1132,7 @@ mod tests {
 
     fn run_ignored_browser_probe_harness(test_name: &str) -> std::process::ExitStatus {
         let exe = std::env::current_exe().unwrap();
-        Command::new(exe)
+        std::process::Command::new(exe)
             .args(["--ignored", "--exact", test_name, "--nocapture"])
             .env("NODE_ENV", "production")
             .env("NODE_OPTIONS", "--require ./host-hook.js")

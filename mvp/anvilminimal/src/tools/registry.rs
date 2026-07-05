@@ -207,6 +207,8 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
         "read_directory"
     } else if message.contains("dangerous command blocked") {
         "dangerous_command"
+    } else if message.contains("command_timeout") {
+        "command_timeout"
     } else if message.contains("verify_command_policy_error") {
         "verify_command_policy_error"
     } else if message.contains("edit_anchor_not_found") {
@@ -230,6 +232,7 @@ pub fn recoverable_tool_error(err: &anyhow::Error) -> bool {
         "missing_arg"
             | "unknown_tool"
             | "path_not_found_recoverable"
+            | "command_timeout"
             | "verify_command_policy_error"
             | "invalid_glob"
             | "read_directory"
@@ -515,6 +518,13 @@ mod tests {
         assert_eq!(tool_error_kind(&err), "missing_arg");
         assert!(recoverable_tool_error(&err));
         assert_eq!(missing_arg_name(&err).as_deref(), Some("pattern"));
+    }
+
+    #[test]
+    fn classifies_bash_command_timeout_as_recoverable() {
+        let err = anyhow::anyhow!("command_timeout: sleep 999");
+        assert_eq!(tool_error_kind(&err), "command_timeout");
+        assert!(recoverable_tool_error(&err));
     }
 
     #[test]

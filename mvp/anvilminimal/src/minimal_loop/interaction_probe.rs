@@ -8,6 +8,7 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::bounded_process::{self, BoundedProcessOutcomeKind};
 use crate::eval_events;
 use crate::minimal_loop::verifier_env;
 
@@ -492,49 +493,26 @@ fn run_setup_command(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let started = Instant::now();
-    let mut child = command
-        .spawn()
+    let output = bounded_process::run_with_timeout(&mut command, timeout)
         .with_context(|| format!("failed to spawn {}", program.to_string_lossy()))?;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let _ = child.wait();
-                if status.success() {
-                    return Ok(());
-                }
-                bail!(
-                    "command failed: {} {}\n{}",
-                    program.to_string_lossy(),
-                    args.join(" "),
-                    setup_command_excerpt(&stdout_path, &stderr_path)
-                );
-            }
-            Ok(None) => {}
-            Err(err) => {
-                terminate_child_group(&mut child);
-                let _ = child.wait();
-                return Err(err).context("failed to wait for interaction probe setup command");
-            }
-        }
-        if started.elapsed() >= timeout {
-            terminate_child_group(&mut child);
-            let _ = child.wait();
-            bail!(
-                "command timed out after {} ms: {} {}\n{}",
-                timeout.as_millis(),
-                program.to_string_lossy(),
-                args.join(" "),
-                setup_command_excerpt(&stdout_path, &stderr_path)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if output.kind == BoundedProcessOutcomeKind::TimedOut {
+        bail!(
+            "command timed out after {} ms: {} {}\n{}",
+            timeout.as_millis(),
+            program.to_string_lossy(),
+            args.join(" "),
+            setup_command_excerpt(&stdout_path, &stderr_path)
+        );
     }
+    if !output.success() {
+        bail!(
+            "command failed: {} {}\n{}",
+            program.to_string_lossy(),
+            args.join(" "),
+            setup_command_excerpt(&stdout_path, &stderr_path)
+        );
+    }
+    Ok(())
 }
 
 fn setup_command_excerpt(stdout_path: &Path, stderr_path: &Path) -> String {
@@ -564,39 +542,14 @@ fn node_path_env(node_path: Option<&Path>) -> Vec<(&'static str, OsString)> {
 
 fn run_command_stdout(command: &mut std::process::Command) -> Option<String> {
     command.stdout(Stdio::piped()).stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let output = match bounded_process::run_with_timeout(command, AVAILABILITY_TIMEOUT) {
+        Ok(output) => output,
         Err(_) => return None,
     };
-    let deadline = Instant::now() + AVAILABILITY_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let output = child.wait_with_output().ok()?;
-                return if status.success() {
-                    Some(String::from_utf8_lossy(&output.stdout).to_string())
-                } else {
-                    None
-                };
-            }
-            Ok(None) => {}
-            Err(_) => {
-                terminate_child_group(&mut child);
-                let _ = child.wait();
-                return None;
-            }
-        }
-        if Instant::now() >= deadline {
-            terminate_child_group(&mut child);
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    if output.kind == BoundedProcessOutcomeKind::Exited && output.success() {
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        None
     }
 }
 
@@ -730,12 +683,7 @@ pub fn probe_browser_interaction_against_running_server_with_options(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    let mut child = match command.spawn() {
+    let mut child = match bounded_process::spawn_child(&mut command) {
         Ok(child) => child,
         Err(err) => {
             let observation = failure_observation(
@@ -3557,17 +3505,7 @@ fn write_text(path: &Path, text: &str) {
 }
 
 fn terminate_child_group(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        if let Ok(pid) = i32::try_from(child.id()) {
-            // SAFETY: the process-group id is derived from a child spawned by this probe.
-            let _ = unsafe { libc::kill(-pid, libc::SIGTERM) };
-            std::thread::sleep(Duration::from_millis(50));
-            // SAFETY: the process-group id is derived from a child spawned by this probe.
-            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
-        }
-    }
-    let _ = child.kill();
+    bounded_process::terminate_process_group(child);
 }
 
 #[cfg(test)]

@@ -1288,6 +1288,11 @@ pub(crate) fn run_session_with_outcome_with_options(
                     batch_had_recoverable_tool_error = true;
                     let kind = tool_error_kind(&err);
                     let repeats = recoverable_tool_error_state.record(&call.name, &err);
+                    let duration_ms = if kind == "command_timeout" {
+                        extract_elapsed_ms(&err.to_string())
+                    } else {
+                        None
+                    };
                     eval_events::emit(
                         config.eval_events_path.as_deref(),
                         json!({
@@ -1296,6 +1301,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                             "error_kind": kind,
                             "missing_arg": missing_arg_name(&err),
                             "repeat_count": repeats,
+                            "duration_ms": duration_ms,
                         }),
                     );
                     if repeats > RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT {
@@ -2306,6 +2312,13 @@ fn emit_empty_response_escalation(
             "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
         }),
     );
+}
+
+fn extract_elapsed_ms(message: &str) -> Option<u64> {
+    message.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("elapsed_ms:")?.trim();
+        value.parse::<u64>().ok()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

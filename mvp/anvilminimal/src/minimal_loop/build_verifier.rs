@@ -196,6 +196,14 @@ pub fn emit_dependency_build_lifecycle(
             "setup_kind": lifecycle.setup.as_ref().map(|setup| setup.setup_kind.as_str()).unwrap_or("none"),
             "setup_command": lifecycle.setup.as_ref().map(|setup| setup.command.as_str()).unwrap_or(""),
             "setup_changed_paths": lifecycle.setup.as_ref().map(|setup| setup.changed_paths.clone()).unwrap_or_default(),
+            "setup_duration_ms": lifecycle.setup.as_ref().and_then(|setup| setup.duration_ms),
+            "setup_timeout_ms": lifecycle.setup.as_ref().and_then(|setup| setup.timeout_ms),
+            "setup_timeout_classification": lifecycle
+                .setup
+                .as_ref()
+                .filter(|setup| setup.status == NodeDependencySetupStatus::TimedOut)
+                .map(|_| "dependency_setup_timeout")
+                .unwrap_or(""),
             "setup_lockfile_present_before": lifecycle.setup.as_ref().and_then(|setup| setup.lockfile_present_before),
             "setup_lockfile_present_after": lifecycle.setup.as_ref().and_then(|setup| setup.lockfile_present_after),
             "setup_lockfile_created": lifecycle.setup.as_ref().and_then(|setup| setup.lockfile_created),

@@ -1,10 +1,11 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::json;
 
+use crate::bounded_process::{self, BoundedProcessOutcomeKind};
 use crate::eval_events;
 use crate::minimal_loop::build_verifier::{BuildVerifierRequirement, CompileError};
 use crate::minimal_loop::dependency_setup::{
@@ -640,40 +641,34 @@ fn run_cli(
     stdin_text: &str,
 ) -> anyhow::Result<CliRun> {
     let python = python_interpreter(root);
-    let mut child = verifier_env::normalized_command_at_root(python, root)
+    let mut command = verifier_env::normalized_command_at_root(python, root);
+    command
         .arg(entrypoint)
         .args(args)
         .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = bounded_process::spawn_child(&mut command)?;
     if let Some(stdin) = child.stdin.as_mut() {
         stdin.write_all(stdin_text.as_bytes())?;
     }
     drop(child.stdin.take());
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            let output = child.wait_with_output()?;
-            return Ok(CliRun {
-                exit_code: status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            });
-        }
-        if started.elapsed() >= PROBE_TIMEOUT {
-            let _ = child.kill();
-            let output = child.wait_with_output()?;
-            return Ok(CliRun {
-                exit_code: None,
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: "python_cli_behavior_probe_timeout\n".to_string()
-                    + &String::from_utf8_lossy(&output.stderr),
-            });
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    let output = bounded_process::wait_with_timeout(child, PROBE_TIMEOUT)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.kind == BoundedProcessOutcomeKind::TimedOut {
+        return Ok(CliRun {
+            exit_code: None,
+            stdout,
+            stderr: "python_cli_behavior_probe_timeout\n".to_string() + &stderr,
+        });
     }
+    Ok(CliRun {
+        exit_code: output.status.and_then(|status| status.code()),
+        stdout,
+        stderr,
+    })
 }
 
 fn python_interpreter(root: &Path) -> PathBuf {

@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
+use crate::bounded_process;
 use crate::config::Config;
 use crate::eval_events;
 use crate::minimal_loop::behavior_evidence::{self, EvidenceArbitrationReport};
@@ -1363,6 +1361,13 @@ fn reconcile_run_dependency_setup(
             "command": setup.command.clone(),
             "added": setup.changed_paths.clone(),
             "primary_reason": eval_events::body_snippet(&setup.primary_reason),
+            "duration_ms": setup.duration_ms,
+            "timeout_ms": setup.timeout_ms,
+            "classification": if setup.status == NodeDependencySetupStatus::TimedOut {
+                "dependency_setup_timeout"
+            } else {
+                ""
+            },
             "offline": config.offline,
         }),
     );
@@ -7245,10 +7250,7 @@ fn run_nextjs_dev_route_probe_with_runtime(
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log))
         .env("PORT", spec.port.to_string());
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = match command.spawn() {
+    let mut child = match bounded_process::spawn_child(&mut command) {
         Ok(child) => child,
         Err(err) => {
             let failure_kind = dev_server_spawn_failure_kind(&err);
