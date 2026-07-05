@@ -184,6 +184,16 @@ pub(crate) struct BlockReason {
     pub category: BlockCategory,
 }
 
+pub(crate) const RUNTIME_TRANSFORM_SHELL_CONTROL_SPLIT: &str = "shell_control_split";
+pub(crate) const RUNTIME_TRANSFORM_CD_AND_CWD: &str = "cd_and_cwd";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeCommandNormalization {
+    pub commands: Vec<String>,
+    pub cwd: PathBuf,
+    pub transform_kind: Option<&'static str>,
+}
+
 /// Issue #461: Render the canonical Err string for a `BlockReason`. The
 /// returned string MUST start with `"blocked dangerous command fragment: "`
 /// so that `classify_bash_dispatch_err` (`registry.rs:217-225`) maps it to
@@ -473,12 +483,19 @@ pub fn run_with_outcome(
     explicit_timeout: Option<Duration>,
     env_policy: Option<BashEnvPolicy>,
 ) -> Result<(String, BashExecutionOutcome), String> {
-    let normalized =
+    let mut normalized =
         normalize_background_command(&normalize_noninteractive_scaffold_command(command));
     if let Some(reason) = check_blocked_command(&normalized) {
         return Err(render_block_error(&reason));
     }
-    let classification = classify_command_for_execution(&normalized, cwd);
+    let mut effective_cwd = cwd.to_path_buf();
+    if let Some(runtime_normalization) = normalize_cd_wrapper_command_at_runtime(&normalized, cwd)?
+    {
+        log_verify_command_normalized_at_runtime(command, &runtime_normalization);
+        normalized = runtime_normalization.commands.join(" && ");
+        effective_cwd = runtime_normalization.cwd;
+    }
+    let classification = classify_command_for_execution(&normalized, &effective_cwd);
     if let Some(cd_wrapper) = classification.cd_wrapper.as_ref() {
         log_cd_wrapper_reclassified(cd_wrapper, classification.class);
     }
@@ -487,7 +504,7 @@ pub fn run_with_outcome(
 
     let mut cmd = Command::new("sh");
     cmd.args(["-lc", &normalized])
-        .current_dir(cwd)
+        .current_dir(&effective_cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -759,6 +776,136 @@ fn parse_cd_dir(segment: &str) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(dir))
+}
+
+pub(crate) fn normalize_verify_command_at_runtime(
+    command: &str,
+    cwd: &Path,
+) -> Result<RuntimeCommandNormalization, String> {
+    let trimmed = command.trim();
+    let parts = split_shell_control_segments(trimmed);
+    let has_control = parts
+        .iter()
+        .any(|part| matches!(*part, "&&" | "||" | "|" | ";"));
+    if !has_control {
+        return Ok(RuntimeCommandNormalization {
+            commands: vec![trimmed.to_string()],
+            cwd: cwd.to_path_buf(),
+            transform_kind: None,
+        });
+    }
+
+    let commands = and_split_commands(trimmed)?;
+    if let Some(cd_dir) = commands.first().and_then(|segment| parse_cd_dir(segment)) {
+        if commands.len() < 2 {
+            return Err(format!(
+                "verify command cd wrapper has no command after cd: {command}"
+            ));
+        }
+        return Ok(RuntimeCommandNormalization {
+            commands: commands[1..].to_vec(),
+            cwd: resolve_cd_dir_under_root(cwd, &cd_dir)?,
+            transform_kind: Some(RUNTIME_TRANSFORM_CD_AND_CWD),
+        });
+    }
+
+    Ok(RuntimeCommandNormalization {
+        commands,
+        cwd: cwd.to_path_buf(),
+        transform_kind: Some(RUNTIME_TRANSFORM_SHELL_CONTROL_SPLIT),
+    })
+}
+
+fn normalize_cd_wrapper_command_at_runtime(
+    command: &str,
+    cwd: &Path,
+) -> Result<Option<RuntimeCommandNormalization>, String> {
+    let parts = split_shell_control_segments(command.trim());
+    if parts.len() < 3 || parts.get(1) != Some(&"&&") {
+        return Ok(None);
+    }
+    let Some(cd_dir) = parse_cd_dir(parts[0]) else {
+        return Ok(None);
+    };
+    if parts.iter().any(|part| matches!(*part, "||" | "|" | ";")) {
+        return Ok(None);
+    }
+    let commands = and_split_commands(command)?;
+    if commands.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(RuntimeCommandNormalization {
+        commands: commands[1..].to_vec(),
+        cwd: resolve_cd_dir_under_root(cwd, &cd_dir)?,
+        transform_kind: Some(RUNTIME_TRANSFORM_CD_AND_CWD),
+    }))
+}
+
+fn and_split_commands(command: &str) -> Result<Vec<String>, String> {
+    let parts = split_shell_control_segments(command);
+    if parts.iter().any(|part| matches!(*part, "||" | "|" | ";")) {
+        return Err(format!(
+            "verify command contains shell control syntax: {command}"
+        ));
+    }
+
+    let mut commands = Vec::new();
+    let mut expect_command = true;
+    for part in parts {
+        if part == "&&" {
+            if expect_command {
+                return Err(format!("verify command has empty shell segment: {command}"));
+            }
+            expect_command = true;
+            continue;
+        }
+
+        let segment = part.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if !expect_command {
+            return Err(format!(
+                "verify command has adjacent shell segments without &&: {command}"
+            ));
+        }
+        commands.push(segment.to_string());
+        expect_command = false;
+    }
+
+    if commands.is_empty() || expect_command {
+        return Err(format!("verify command has empty shell segment: {command}"));
+    }
+    Ok(commands)
+}
+
+fn resolve_cd_dir_under_root(root: &Path, dir: &Path) -> Result<PathBuf, String> {
+    let resolved = crate::safety::path_guard::resolve_user_path(root, &dir.to_string_lossy())?;
+    if !resolved.is_dir() {
+        return Err(format!(
+            "cd target is not a workspace directory: {}",
+            dir.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn log_verify_command_normalized_at_runtime(
+    original: &str,
+    normalization: &RuntimeCommandNormalization,
+) {
+    let Some(transform_kind) = normalization.transform_kind else {
+        return;
+    };
+    crate::logging::log_llm_event(
+        "verify_command_normalized_at_runtime",
+        serde_json::json!({
+            "original": original,
+            "commands": &normalization.commands,
+            "cwd": normalization.cwd.to_string_lossy(),
+            "transform_kind": transform_kind,
+        }),
+    );
 }
 
 fn cd_dir_is_cwd_or_descendant(cwd: &Path, dir: &Path) -> bool {
@@ -1838,6 +1985,28 @@ mod tests {
         assert_eq!(classification.class, BashCommandClass::BuildTest);
         assert!(classification.cd_wrapper.is_some());
         assert!(enforce_offline_policy(&cmd, classification.class, true).is_ok());
+    }
+
+    #[test]
+    fn cd_wrapper_runtime_runs_tail_with_target_cwd() {
+        let dir = tempdir().unwrap();
+        let app_dir = dir.path().join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("marker.txt"), "ok").unwrap();
+
+        let (_text, outcome) = run_with_outcome(
+            "cd app && cat marker.txt",
+            dir.path(),
+            None,
+            false,
+            Some(Duration::from_secs(5)),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.command, "cat marker.txt");
+        assert_eq!(outcome.stdout, "ok");
+        assert_eq!(outcome.class, BashCommandClass::ReadOnly);
     }
 
     #[test]

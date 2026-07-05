@@ -1806,6 +1806,76 @@ mod tests {
     }
 
     #[test]
+    fn runtime_verify_splits_safe_and_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), "a").unwrap();
+        std::fs::write(temp.path().join("b.txt"), "b").unwrap();
+        let step = PlanStep {
+            id: "verify".into(),
+            kind: StepKind::Verify,
+            instruction: "verify".into(),
+            expected_paths: vec![],
+            verify: vec!["cat a.txt && cat b.txt".into()],
+            expected_result: VerifyExpectedResult::Pass,
+        };
+
+        let report = verify_step(temp.path(), &step);
+
+        assert!(report.success, "{:?}", report.failures);
+    }
+
+    #[test]
+    fn runtime_verify_normalizes_cd_and_python_smoke_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let cli_dir = temp.path().join("src/csv_stats_cli");
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::write(cli_dir.join("main.py"), "print('ok')\n").unwrap();
+        std::fs::write(
+            cli_dir.join("smoke-check.py"),
+            "from pathlib import Path\nassert Path('main.py').is_file()\n",
+        )
+        .unwrap();
+        let step = PlanStep {
+            id: "verify-cli".into(),
+            kind: StepKind::Verify,
+            instruction: "verify cli".into(),
+            expected_paths: vec!["src/csv_stats_cli/main.py".into()],
+            verify: vec!["cd src/csv_stats_cli && python smoke-check.py".into()],
+            expected_result: VerifyExpectedResult::Pass,
+        };
+
+        let report = verify_step(temp.path(), &step);
+
+        assert!(report.success, "{:?}", report.failures);
+    }
+
+    #[test]
+    fn runtime_verify_still_rejects_pipes() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a.txt"), "a").unwrap();
+        let step = PlanStep {
+            id: "verify".into(),
+            kind: StepKind::Verify,
+            instruction: "verify".into(),
+            expected_paths: vec![],
+            verify: vec!["cat a.txt | cat".into()],
+            expected_result: VerifyExpectedResult::Pass,
+        };
+
+        let report = verify_step(temp.path(), &step);
+
+        assert!(!report.success);
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.contains("shell control syntax")),
+            "{:?}",
+            report.failures
+        );
+    }
+
+    #[test]
     fn shell_like_instruction_is_rejected() {
         let plan = StepPlan {
             goal: "x".into(),

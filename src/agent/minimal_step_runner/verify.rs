@@ -180,11 +180,21 @@ pub(super) fn normalize_relative_path(path: &Path) -> Option<PathBuf> {
 }
 
 fn run_verify_command(work_root: &Path, command: &str) -> Result<(), String> {
+    let normalization =
+        crate::tools::bash::normalize_verify_command_at_runtime(command, work_root)?;
+    crate::tools::bash::log_verify_command_normalized_at_runtime(command, &normalization);
+    for segment in &normalization.commands {
+        run_single_verify_command(work_root, &normalization.cwd, segment)?;
+    }
+    Ok(())
+}
+
+fn run_single_verify_command(work_root: &Path, cwd: &Path, command: &str) -> Result<(), String> {
     validate_verify_command(command)?;
     let output = Command::new("sh")
         .arg("-lc")
         .arg(command)
-        .current_dir(work_root)
+        .current_dir(cwd)
         .output()
         .map_err(|err| format!("failed to run: {err}"))?;
     if output.status.success() {
