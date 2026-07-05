@@ -84,6 +84,37 @@ impl ChatClient for FakeClient {
     }
 }
 
+struct PanicClient {
+    label: &'static str,
+    message: &'static str,
+}
+
+impl PanicClient {
+    fn new(label: &'static str, message: &'static str) -> Self {
+        Self { label, message }
+    }
+}
+
+impl ChatClient for PanicClient {
+    fn label(&self) -> &str {
+        self.label
+    }
+
+    fn supports_native_tools(&self, _model: &str) -> bool {
+        true
+    }
+
+    fn chat(
+        &mut self,
+        _model: &str,
+        _messages: &[ConversationMessage],
+        _tools: &[ToolSpec],
+        _native_tools_enabled: bool,
+    ) -> anyhow::Result<AssistantReply> {
+        panic!("{}", self.message);
+    }
+}
+
 #[derive(Default)]
 struct FakeUi {
     events: Mutex<Vec<String>>,
@@ -775,6 +806,61 @@ fn tui_slash_completion_guard_records_aborted_on_panic() {
     assert!(summary.contains("Completed phases:\n- none"));
     assert!(summary.contains("Failed phases:\n- none"));
     assert!(summary.contains("Pending phases:\n- none"));
+}
+
+#[test]
+fn tui_slash_ultra_panic_records_diagnostics_and_terminal_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+    let plan_path = write_ultra_plan(dir.path());
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    let step_json = implement_step_plan_json();
+    let mut planner = FakeClient::new("planner", vec![AssistantReply::text(step_json)]);
+    let mut execution = PanicClient::new("exec", "simulated ultra panic 日本語");
+    let ui = FakeUi::default();
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = anvilminimal::tui::slash::handle_command(
+            &format!("/run-ultra-plan {plan_path}"),
+            &cfg,
+            &mut planner,
+            &mut execution,
+            &ui,
+        );
+    }));
+    assert!(panic.is_err());
+
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    let panic_event = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| {
+            event
+                .get("event")
+                .and_then(|value| value.as_str())
+                .is_some_and(|name| name == "panic_caught")
+        })
+        .unwrap_or_else(|| panic!("missing panic_caught in {events}"));
+    assert_eq!(
+        panic_event.get("message").and_then(|value| value.as_str()),
+        Some("simulated ultra panic 日本語"),
+        "{panic_event}"
+    );
+    assert!(
+        panic_event
+            .get("location")
+            .and_then(|value| value.as_str())
+            .is_some_and(|location| location.contains("tests/tui_integration.rs:")),
+        "{panic_event}"
+    );
+    assert_exactly_one_tui_stop(&events, "aborted");
+    assert!(events.contains("\"failure_kind\":\"tui_command_aborted\""));
+    let summary =
+        std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
+    assert_terminal_summary(&summary, "aborted");
+    assert!(summary.contains("Command status: aborted"));
+    assert!(summary.contains("Failure kind: tui_command_aborted"));
 }
 
 #[test]

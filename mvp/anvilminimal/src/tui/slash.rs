@@ -1,10 +1,16 @@
+use std::any::Any;
+use std::panic::{AssertUnwindSafe, PanicHookInfo};
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::bail;
 use serde_json::json;
 
 use crate::config::Config;
 use crate::providers::ChatClient;
+
+static PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
+type PanicHook = Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiTerminalStatus {
@@ -64,6 +70,76 @@ impl TuiCommandCompletionGuard {
             emit_tui_command_stop_with_status(&self.config, &self.command, result, status);
         self.finalized = true;
         completion
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanicDiagnostic {
+    message: String,
+    location: String,
+}
+
+struct PanicHookGuard {
+    previous: Option<PanicHook>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl PanicHookGuard {
+    fn install(diagnostic: Arc<Mutex<Option<PanicDiagnostic>>>) -> Self {
+        let lock = PANIC_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let mut diagnostic = diagnostic
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *diagnostic = Some(PanicDiagnostic::from_hook(info));
+        }));
+        Self {
+            previous: Some(previous),
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for PanicHookGuard {
+    fn drop(&mut self) {
+        let _ = std::panic::take_hook();
+        if let Some(previous) = self.previous.take() {
+            std::panic::set_hook(previous);
+        }
+    }
+}
+
+impl PanicDiagnostic {
+    fn from_hook(info: &PanicHookInfo<'_>) -> Self {
+        let location = info
+            .location()
+            .map(|location| {
+                format!(
+                    "{}:{}:{}",
+                    location.file(),
+                    location.line(),
+                    location.column()
+                )
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        Self {
+            message: panic_payload_message(info.payload()),
+            location,
+        }
+    }
+
+    fn from_payload(payload: &(dyn Any + Send)) -> Self {
+        Self {
+            message: panic_payload_message(payload),
+            location: "unknown".to_string(),
+        }
+    }
+
+    fn stop_reason(&self) -> String {
+        format!("panic caught: {} at {}", self.message, self.location)
     }
 }
 
@@ -164,50 +240,76 @@ pub fn handle_command(
         }),
     );
     let completion_guard = TuiCommandCompletionGuard::new(&config, &parsed.command);
-    let result = (|| match parsed.command.as_str() {
-        "/plan-steps" => {
-            let plan =
-                crate::planner::generate_step_plan_with_ui(planner, &parsed.goal, &config, ui)?;
-            let path = crate::planner::save_step_plan(&config.workspace_root, &plan)?;
-            Ok(path.display().to_string())
-        }
-        "/plan-run" => crate::planner::generate_and_run_step_plan_with_ui(
-            planner,
-            execution,
-            &parsed.goal,
-            &config,
-            ui,
-        ),
-        "/run-plan" => {
-            crate::planner::run_plan_file_with_ui(execution, Path::new(&parsed.goal), &config, ui)
-        }
-        "/ultra-plan" => {
-            let plan =
-                crate::planner::generate_ultra_plan_with_ui(planner, &parsed.goal, &config, ui)?;
-            let path = crate::planner::save_ultra_plan(&config.workspace_root, &plan)?;
-            Ok(path.display().to_string())
-        }
-        "/ultra-plan-run" => crate::planner::generate_and_run_ultra_plan_with_ui(
-            planner,
-            execution,
-            &parsed.goal,
-            &config,
-            ui,
-        ),
-        "/run-ultra-plan" => crate::planner::run_ultra_plan_file_with_ui(
-            planner,
-            execution,
-            Path::new(&parsed.goal),
-            &config,
-            ui,
-        ),
-        "/setup-interaction-probe" => {
-            let report =
+    let panic_diagnostic = Arc::new(Mutex::new(None));
+    let panic_hook_guard = PanicHookGuard::install(Arc::clone(&panic_diagnostic));
+    let command_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        match parsed.command.as_str() {
+            "/plan-steps" => {
+                let plan =
+                    crate::planner::generate_step_plan_with_ui(planner, &parsed.goal, &config, ui)?;
+                let path = crate::planner::save_step_plan(&config.workspace_root, &plan)?;
+                Ok(path.display().to_string())
+            }
+            "/plan-run" => crate::planner::generate_and_run_step_plan_with_ui(
+                planner,
+                execution,
+                &parsed.goal,
+                &config,
+                ui,
+            ),
+            "/run-plan" => crate::planner::run_plan_file_with_ui(
+                execution,
+                Path::new(&parsed.goal),
+                &config,
+                ui,
+            ),
+            "/ultra-plan" => {
+                let plan = crate::planner::generate_ultra_plan_with_ui(
+                    planner,
+                    &parsed.goal,
+                    &config,
+                    ui,
+                )?;
+                let path = crate::planner::save_ultra_plan(&config.workspace_root, &plan)?;
+                Ok(path.display().to_string())
+            }
+            "/ultra-plan-run" => crate::planner::generate_and_run_ultra_plan_with_ui(
+                planner,
+                execution,
+                &parsed.goal,
+                &config,
+                ui,
+            ),
+            "/run-ultra-plan" => crate::planner::run_ultra_plan_file_with_ui(
+                planner,
+                execution,
+                Path::new(&parsed.goal),
+                &config,
+                ui,
+            ),
+            "/setup-interaction-probe" => {
+                let report =
                 crate::minimal_loop::interaction_probe::setup_interaction_probe_with_stdout_progress()?;
-            Ok(report.summary_lines().join("\n"))
+                Ok(report.summary_lines().join("\n"))
+            }
+            other => bail!("unknown slash command: {other}"),
         }
-        other => bail!("unknown slash command: {other}"),
-    })();
+    }));
+    drop(panic_hook_guard);
+    let result = match command_result {
+        Ok(result) => result,
+        Err(payload) => {
+            let diagnostic = panic_diagnostic
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .unwrap_or_else(|| PanicDiagnostic::from_payload(payload.as_ref()));
+            emit_panic_caught(&config, &parsed.command, &diagnostic);
+            let result = Err(anyhow::anyhow!(diagnostic.stop_reason()));
+            let _ = completion_guard.finalize(&result, TuiTerminalStatus::Aborted);
+            std::panic::resume_unwind(payload);
+        }
+    };
     let terminal_status = terminal_status_for_result(&result, ui);
     let completion = completion_guard.finalize(&result, terminal_status);
     if let Err(err) = &result {
@@ -226,6 +328,33 @@ pub fn handle_command(
         eprintln!("{notice}");
     }
     result.map(|output| crate::eval_events::render_tui_completion_output(&output, &completion))
+}
+
+fn emit_panic_caught(config: &Config, command: &str, diagnostic: &PanicDiagnostic) {
+    crate::eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "panic_caught",
+            "lifecycle_stage": "tui_command",
+            "command": command,
+            "status": "aborted",
+            "failure_kind": "panic",
+            "message": crate::eval_events::body_snippet(&diagnostic.message),
+            "location": diagnostic.location,
+            "panic_message": crate::eval_events::body_snippet(&diagnostic.message),
+            "panic_location": diagnostic.location,
+        }),
+    );
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 #[cfg(test)]
