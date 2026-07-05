@@ -615,8 +615,16 @@ struct ProfilePromotion {
     at_phase: usize,
     phase_id: String,
     requested_port: Option<String>,
+    contract_origin: String,
     delta_capabilities: Vec<String>,
     delta_requirements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ContractRequirements {
+    capabilities: Vec<String>,
+    evidence: Vec<String>,
+    obligations: Vec<String>,
 }
 
 const ULTRA_CONTEXT_MAX_PHASES: usize = 12;
@@ -863,13 +871,44 @@ fn try_promote_profile_at_phase_boundary(
         return Ok(None);
     }
 
-    let generic_capabilities = inferred_required_capabilities("generic", &plan.goal);
-    let generic_evidence = inferred_required_evidence("generic", &plan.goal, &generic_capabilities);
-    let mut promoted_capabilities = inferred_required_capabilities(&promoted, &plan.goal);
-    let mut promoted_evidence =
-        inferred_required_evidence(&promoted, &plan.goal, &promoted_capabilities);
-    let mut promoted_obligations =
-        inferred_required_obligations(&promoted, &plan.goal, &promoted_capabilities);
+    let generic_paths = profile_expected_paths(&config.workspace_root, "generic", &plan.goal);
+    let mut generic_requirements = inferred_contract_requirements("generic", &plan.goal);
+    let pre_promotion_contract = bind_completion_contract_for_acceptance(
+        config,
+        "ultra-plan-run-pre-promotion",
+        "generic",
+        &plan.goal,
+        &generic_paths,
+        &generic_requirements.capabilities,
+        &generic_requirements.evidence,
+        &generic_requirements.obligations,
+    )?;
+    if let Some(contract) = pre_promotion_contract.as_ref().map(|bound| &bound.contract) {
+        merge_unique_strings(
+            &mut generic_requirements.capabilities,
+            &contract.required_capabilities,
+        );
+        merge_unique_strings(
+            &mut generic_requirements.evidence,
+            &contract.required_evidence,
+        );
+        merge_unique_strings(
+            &mut generic_requirements.obligations,
+            &contract.required_obligations,
+        );
+    }
+
+    let mut promoted_requirements = inferred_contract_requirements(&promoted, &plan.goal);
+    carry_pre_promotion_contract_requirements(
+        &promoted,
+        &plan.goal,
+        &generic_requirements,
+        &mut promoted_requirements,
+    );
+    merge_unique_strings(
+        &mut promoted_requirements.evidence,
+        &inferred_required_evidence(&promoted, &plan.goal, &promoted_requirements.capabilities),
+    );
     let promoted_paths = profile_expected_paths(&config.workspace_root, &promoted, &plan.goal);
     let bound_contract = bind_completion_contract_for_acceptance(
         config,
@@ -877,28 +916,78 @@ fn try_promote_profile_at_phase_boundary(
         &promoted,
         &plan.goal,
         &promoted_paths,
-        &promoted_capabilities,
-        &promoted_evidence,
-        &promoted_obligations,
+        &promoted_requirements.capabilities,
+        &promoted_requirements.evidence,
+        &promoted_requirements.obligations,
     )?;
     if let Some(contract) = bound_contract.as_ref().map(|bound| &bound.contract) {
-        merge_unique_strings(&mut promoted_capabilities, &contract.required_capabilities);
-        merge_unique_strings(&mut promoted_evidence, &contract.required_evidence);
-        merge_unique_strings(&mut promoted_obligations, &contract.required_obligations);
+        merge_unique_strings(
+            &mut promoted_requirements.capabilities,
+            &contract.required_capabilities,
+        );
+        merge_unique_strings(
+            &mut promoted_requirements.evidence,
+            &contract.required_evidence,
+        );
+        merge_unique_strings(
+            &mut promoted_requirements.obligations,
+            &contract.required_obligations,
+        );
     }
     merge_unique_strings(
-        &mut promoted_evidence,
-        &inferred_required_evidence(&promoted, &plan.goal, &promoted_capabilities),
+        &mut promoted_requirements.evidence,
+        &inferred_required_evidence(&promoted, &plan.goal, &promoted_requirements.capabilities),
     );
 
-    let delta_capabilities =
-        ordered_string_difference(&promoted_capabilities, &generic_capabilities);
-    let mut generic_requirements = generic_capabilities.clone();
-    merge_unique_strings(&mut generic_requirements, &generic_evidence);
-    let mut promoted_requirements = promoted_capabilities.clone();
-    merge_unique_strings(&mut promoted_requirements, &promoted_evidence);
+    let mapped_generic_capabilities = mapped_pre_promotion_capabilities_for_profile(
+        &promoted,
+        &generic_requirements.capabilities,
+    );
+    debug_assert!(
+        mapped_generic_capabilities
+            .iter()
+            .all(|capability| promoted_requirements.capabilities.contains(capability)),
+        "profile promotion dropped a pre-promotion capability"
+    );
+    debug_assert!(
+        generic_requirements
+            .evidence
+            .iter()
+            .all(|evidence| promoted_requirements.evidence.contains(evidence)),
+        "profile promotion dropped pre-promotion evidence"
+    );
+    debug_assert!(
+        generic_requirements
+            .obligations
+            .iter()
+            .all(|obligation| promoted_requirements.obligations.contains(obligation)),
+        "profile promotion dropped pre-promotion obligations"
+    );
+
+    let delta_capabilities = ordered_string_difference(
+        &promoted_requirements.capabilities,
+        &generic_requirements.capabilities,
+    );
+    let mut generic_requirement_keys = generic_requirements.capabilities.clone();
+    merge_unique_strings(
+        &mut generic_requirement_keys,
+        &generic_requirements.evidence,
+    );
+    merge_unique_strings(
+        &mut generic_requirement_keys,
+        &generic_requirements.obligations,
+    );
+    let mut promoted_requirement_keys = promoted_requirements.capabilities.clone();
+    merge_unique_strings(
+        &mut promoted_requirement_keys,
+        &promoted_requirements.evidence,
+    );
+    merge_unique_strings(
+        &mut promoted_requirement_keys,
+        &promoted_requirements.obligations,
+    );
     let delta_requirements =
-        ordered_string_difference(&promoted_requirements, &generic_requirements);
+        ordered_string_difference(&promoted_requirement_keys, &generic_requirement_keys);
     push_context_items_capped(
         &mut context.pending_capability_evidence,
         &delta_requirements,
@@ -925,6 +1014,7 @@ fn try_promote_profile_at_phase_boundary(
             Some(&ultra_plan_phase_signal_text(plan)),
         )
         .map(|requested| requested.telemetry),
+        contract_origin: "promoted_union".to_string(),
         delta_capabilities,
         delta_requirements,
     };
@@ -941,6 +1031,74 @@ fn ordered_string_difference(values: &[String], baseline: &[String]) -> Vec<Stri
         .collect()
 }
 
+fn inferred_contract_requirements(profile: &str, goal: &str) -> ContractRequirements {
+    let capabilities = inferred_required_capabilities(profile, goal);
+    ContractRequirements {
+        evidence: inferred_required_evidence(profile, goal, &capabilities),
+        obligations: inferred_required_obligations(profile, goal, &capabilities),
+        capabilities,
+    }
+}
+
+fn carry_pre_promotion_contract_requirements(
+    promoted_profile: &str,
+    goal: &str,
+    pre_promotion: &ContractRequirements,
+    promoted: &mut ContractRequirements,
+) {
+    merge_unique_strings(
+        &mut promoted.capabilities,
+        &mapped_pre_promotion_capabilities_for_profile(
+            promoted_profile,
+            &pre_promotion.capabilities,
+        ),
+    );
+    if pre_promotion
+        .capabilities
+        .iter()
+        .any(|capability| capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY)
+        && signals::contains_app_intent_token(goal)
+    {
+        merge_unique_strings(
+            &mut promoted.capabilities,
+            &interactive_app_capabilities_for_profile(promoted_profile),
+        );
+    }
+    merge_unique_strings(&mut promoted.evidence, &pre_promotion.evidence);
+    merge_unique_strings(&mut promoted.obligations, &pre_promotion.obligations);
+}
+
+fn mapped_pre_promotion_capabilities_for_profile(
+    promoted_profile: &str,
+    capabilities: &[String],
+) -> Vec<String> {
+    let mut mapped = Vec::new();
+    for capability in capabilities {
+        if capability == GENERIC_INTERACTIVE_CONTRACT_CAPABILITY {
+            let equivalents = interactive_app_capabilities_for_profile(promoted_profile);
+            if equivalents.is_empty() {
+                merge_unique_strings(&mut mapped, std::slice::from_ref(capability));
+            } else {
+                merge_unique_strings(&mut mapped, &equivalents);
+            }
+        } else {
+            merge_unique_strings(&mut mapped, std::slice::from_ref(capability));
+        }
+    }
+    mapped
+}
+
+fn interactive_app_capabilities_for_profile(profile: &str) -> Vec<String> {
+    match canonical_profile_name(profile).as_str() {
+        "nextjs" | "react" | "vite" | "web" => vec![
+            "stateful_interaction".to_string(),
+            "user_input_or_action".to_string(),
+            "visible_state_change".to_string(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 fn emit_profile_reinferred(config: &Config, promotion: &ProfilePromotion) {
     eval_events::emit(
         config.eval_events_path.as_deref(),
@@ -954,6 +1112,7 @@ fn emit_profile_reinferred(config: &Config, promotion: &ProfilePromotion) {
             "from_profile": "generic",
             "to_profile": promotion.id,
             "requested_port": promotion.requested_port.clone(),
+            "contract_origin": promotion.contract_origin,
             "delta_capabilities": promotion.delta_capabilities.clone(),
             "delta_requirements": promotion.delta_requirements.clone(),
         }),
@@ -12423,6 +12582,53 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             ]
         );
         assert_eq!(obligations, vec!["implementation".to_string()]);
+    }
+
+    #[test]
+    fn promoted_contract_union_never_drops_generic_interactive_requirements() {
+        let goal = "ちょっとしたメモアプリを作って";
+        let generic = inferred_contract_requirements("generic", goal);
+        let mut promoted = inferred_contract_requirements("nextjs", goal);
+
+        assert!(promoted.capabilities.is_empty());
+        carry_pre_promotion_contract_requirements("nextjs", goal, &generic, &mut promoted);
+        merge_unique_strings(
+            &mut promoted.evidence,
+            &inferred_required_evidence("nextjs", goal, &promoted.capabilities),
+        );
+
+        for capability in [
+            "stateful_interaction",
+            "user_input_or_action",
+            "visible_state_change",
+        ] {
+            assert!(
+                promoted.capabilities.contains(&capability.to_string()),
+                "{capability} missing from {promoted:?}"
+            );
+        }
+        for evidence in GENERIC_INTERACTIVE_EVIDENCE_KEYS {
+            assert!(
+                promoted.evidence.contains(&evidence.to_string()),
+                "{evidence} missing from {promoted:?}"
+            );
+        }
+        assert!(
+            promoted
+                .evidence
+                .contains(&"nextjs_route_evidence".to_string())
+        );
+        assert!(
+            promoted
+                .evidence
+                .contains(&"build_command_or_dependency_missing_boundary".to_string())
+        );
+        assert!(
+            generic
+                .obligations
+                .iter()
+                .all(|obligation| promoted.obligations.contains(obligation))
+        );
     }
 
     #[test]
