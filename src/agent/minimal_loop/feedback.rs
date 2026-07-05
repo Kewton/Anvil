@@ -11,6 +11,12 @@ pub struct FeedbackState {
     edit_anchor_sent: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RequestedArtifactNearMiss {
+    pub expected_path: String,
+    pub actual_path: String,
+}
+
 impl FeedbackState {
     pub fn empty_response(&mut self) -> Option<String> {
         if self.empty_response_sent {
@@ -42,15 +48,32 @@ impl FeedbackState {
         ))
     }
 
-    pub fn requested_artifacts_missing(&mut self, missing_paths: &[String]) -> Option<String> {
+    pub fn requested_artifacts_missing_with_near_misses(
+        &mut self,
+        missing_paths: &[String],
+        near_misses: &[RequestedArtifactNearMiss],
+    ) -> Option<String> {
         if self.requested_artifact_sent || missing_paths.is_empty() {
             return None;
         }
         self.requested_artifact_sent = true;
         let list = missing_paths.join(", ");
-        Some(format!(
+        let mut message = format!(
             "{MINIMAL_FEEDBACK_PREFIX}\nThe requested file(s) are still missing: {list}. Create them with Write now, or explain the blocker if they should not be created."
-        ))
+        );
+        if !near_misses.is_empty() {
+            message.push_str("\n\nNEAR-MISS candidates from the actual tree:");
+            for near_miss in near_misses {
+                message.push_str(&format!(
+                    "\n- expected `{}`; found `{}`; remedy: move the artifact to the expected path (`{}`), or create the expected module re-exporting it from `{}`.",
+                    near_miss.expected_path,
+                    near_miss.actual_path,
+                    near_miss.expected_path,
+                    near_miss.actual_path
+                ));
+            }
+        }
+        Some(message)
     }
 
     pub fn missing_relative_imports(&self, missing_imports: &[String]) -> String {
@@ -117,12 +140,12 @@ mod tests {
         assert!(state.completion_without_write().is_none());
         assert!(
             state
-                .requested_artifacts_missing(&["src/main.rs".to_string()])
+                .requested_artifacts_missing_with_near_misses(&["src/main.rs".to_string()], &[])
                 .is_some()
         );
         assert!(
             state
-                .requested_artifacts_missing(&["src/main.rs".to_string()])
+                .requested_artifacts_missing_with_near_misses(&["src/main.rs".to_string()], &[])
                 .is_none()
         );
         assert!(state.missing_tool_call("fix src/lib.rs").is_some());
@@ -142,6 +165,29 @@ mod tests {
                 .malformed_tool_call_xml_fallback("tool call parser failed")
                 .starts_with(MINIMAL_FEEDBACK_PREFIX)
         );
+    }
+
+    #[test]
+    fn requested_artifact_feedback_lists_near_misses() {
+        let mut state = FeedbackState::default();
+
+        let feedback = state
+            .requested_artifacts_missing_with_near_misses(
+                &["src/csv_stats_cli/main.py".to_string()],
+                &[RequestedArtifactNearMiss {
+                    expected_path: "src/csv_stats_cli/main.py".to_string(),
+                    actual_path: "src/csv_stats/main.py".to_string(),
+                }],
+            )
+            .unwrap();
+
+        assert!(feedback.contains("NEAR-MISS candidates"));
+        assert!(
+            feedback
+                .contains("expected `src/csv_stats_cli/main.py`; found `src/csv_stats/main.py`")
+        );
+        assert!(feedback.contains("move the artifact to the expected path"));
+        assert!(feedback.contains("create the expected module re-exporting it"));
     }
 
     #[test]

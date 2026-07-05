@@ -13,7 +13,7 @@ use crate::tools::registry::{ToolContext, ToolRegistry, ToolSpec};
 use crate::util::workspace_paths::WorkspacePolicy;
 
 use super::compact::compact_if_needed;
-use super::feedback::FeedbackState;
+use super::feedback::{FeedbackState, RequestedArtifactNearMiss};
 use super::prompt::{PromptToolMode, build_system_prompt};
 
 pub const NO_COMPLETION_WITHOUT_WRITE_FEEDBACK_FLAG: &str =
@@ -162,13 +162,17 @@ pub fn run_session<C: MinimalChatClient>(
             }
             let missing_requested_artifacts =
                 missing_requested_artifact_paths(&config.work_root, &requested_artifact_paths);
-            if should_send_requested_artifact_feedback(config, &missing_requested_artifacts)
-                && let Some(feedback) =
-                    feedback_state.requested_artifacts_missing(&missing_requested_artifacts)
-            {
-                discard_last_no_tool_assistant_message(session);
-                pending_feedback = Some(feedback);
-                continue;
+            if should_send_requested_artifact_feedback(config, &missing_requested_artifacts) {
+                let near_misses =
+                    requested_artifact_near_misses(&config.work_root, &missing_requested_artifacts);
+                if let Some(feedback) = feedback_state.requested_artifacts_missing_with_near_misses(
+                    &missing_requested_artifacts,
+                    &near_misses,
+                ) {
+                    discard_last_no_tool_assistant_message(session);
+                    pending_feedback = Some(feedback);
+                    continue;
+                }
             }
             let missing_relative_imports =
                 missing_relative_imports(&config.work_root, &changed_source_paths);
@@ -305,6 +309,144 @@ fn missing_requested_artifact_paths(work_root: &Path, paths: &[String]) -> Vec<S
         .iter()
         .filter(|path| !work_root.join(path).is_file())
         .cloned()
+        .collect()
+}
+
+fn requested_artifact_near_misses(
+    work_root: &Path,
+    missing_paths: &[String],
+) -> Vec<RequestedArtifactNearMiss> {
+    if missing_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let actual_paths = collect_workspace_file_paths(work_root);
+    let mut near_misses = BTreeSet::new();
+    for expected in missing_paths {
+        let expected_path = Path::new(expected);
+        for actual in &actual_paths {
+            if actual == expected {
+                continue;
+            }
+            let actual_path = Path::new(actual);
+            if is_requested_artifact_near_miss(expected_path, actual_path) {
+                near_misses.insert(RequestedArtifactNearMiss {
+                    expected_path: expected.clone(),
+                    actual_path: actual.clone(),
+                });
+            }
+        }
+    }
+    near_misses.into_iter().collect()
+}
+
+fn collect_workspace_file_paths(work_root: &Path) -> Vec<String> {
+    let mut files = BTreeSet::new();
+    let mut dirs = vec![PathBuf::new()];
+    while let Some(relative_dir) = dirs.pop() {
+        let absolute_dir = work_root.join(&relative_dir);
+        let Ok(entries) = std::fs::read_dir(&absolute_dir) else {
+            continue;
+        };
+        let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let relative_path = relative_dir.join(file_name.as_ref());
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if should_skip_near_miss_dir(&file_name) {
+                    continue;
+                }
+                dirs.push(relative_path);
+            } else if file_type.is_file()
+                && let Some(path) = path_to_slash_string(&relative_path)
+            {
+                files.insert(path);
+            }
+        }
+    }
+    files.into_iter().collect()
+}
+
+fn should_skip_near_miss_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | ".anvil" | ".next" | "target" | "node_modules" | "dist" | "build"
+    )
+}
+
+fn is_requested_artifact_near_miss(expected: &Path, actual: &Path) -> bool {
+    let same_filename = expected.file_name() == actual.file_name();
+    if same_filename && parent_component_distance(expected, actual) <= 2 {
+        return true;
+    }
+
+    same_directory_stem_prefix(expected, actual)
+        && (same_filename || same_extension(expected, actual))
+}
+
+fn parent_component_distance(expected: &Path, actual: &Path) -> usize {
+    let expected_parent = normal_components(expected.parent().unwrap_or_else(|| Path::new("")));
+    let actual_parent = normal_components(actual.parent().unwrap_or_else(|| Path::new("")));
+    let common = expected_parent
+        .iter()
+        .zip(actual_parent.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    (expected_parent.len() - common) + (actual_parent.len() - common)
+}
+
+fn same_directory_stem_prefix(expected: &Path, actual: &Path) -> bool {
+    let Some(expected_dir) = parent_dir_name(expected) else {
+        return false;
+    };
+    let Some(actual_dir) = parent_dir_name(actual) else {
+        return false;
+    };
+    one_is_directory_stem_prefix(&expected_dir, &actual_dir)
+}
+
+fn parent_dir_name(path: &Path) -> Option<String> {
+    path.parent()?
+        .file_name()?
+        .to_str()
+        .map(|name| name.to_ascii_lowercase())
+}
+
+fn one_is_directory_stem_prefix(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let (short, long) = if left.len() < right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    long.strip_prefix(short)
+        .and_then(|suffix| suffix.as_bytes().first().copied())
+        .is_some_and(|byte| matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn same_extension(expected: &Path, actual: &Path) -> bool {
+    matches!(
+        (
+            expected.extension().and_then(|ext| ext.to_str()),
+            actual.extension().and_then(|ext| ext.to_str())
+        ),
+        (Some(expected), Some(actual)) if expected.eq_ignore_ascii_case(actual)
+    )
+}
+
+fn normal_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => part.to_str().map(|part| part.to_string()),
+            _ => None,
+        })
         .collect()
 }
 
@@ -1016,6 +1158,52 @@ mod tests {
                 .any(|m| m.content.starts_with(MINIMAL_FEEDBACK_PREFIX)),
             "ephemeral feedback must not be persisted to the session"
         );
+    }
+
+    #[test]
+    fn requested_artifact_feedback_lists_wrong_directory_near_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = MockClient::default();
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "src/csv_stats/main.py", "content": "def main():\n    pass\n"}),
+            )],
+        );
+        client.push_reply("Created src/csv_stats/main.py.", Vec::new());
+        client.push_reply(
+            "",
+            vec![tool_call(
+                "Write",
+                json!({"path": "src/csv_stats_cli/main.py", "content": "from src.csv_stats.main import *\n"}),
+            )],
+        );
+        client.push_reply("done", Vec::new());
+        let mut session = SessionSnapshot::default();
+
+        let reply = run_session(
+            &mut client,
+            "qwen3:8b",
+            &mut session,
+            "Create src/csv_stats_cli/main.py.",
+            &config(temp.path().to_path_buf(), 5),
+        )
+        .unwrap();
+
+        assert_eq!(reply, "done");
+        assert!(temp.path().join("src/csv_stats/main.py").is_file());
+        assert!(temp.path().join("src/csv_stats_cli/main.py").is_file());
+        assert_eq!(client.feedback_messages.len(), 1);
+        let feedback = &client.feedback_messages[0];
+        assert!(feedback.contains("NEAR-MISS candidates"));
+        assert!(
+            feedback
+                .contains("expected `src/csv_stats_cli/main.py`; found `src/csv_stats/main.py`"),
+            "got: {feedback}"
+        );
+        assert!(feedback.contains("move the artifact to the expected path"));
+        assert!(feedback.contains("create the expected module re-exporting it"));
     }
 
     #[test]
