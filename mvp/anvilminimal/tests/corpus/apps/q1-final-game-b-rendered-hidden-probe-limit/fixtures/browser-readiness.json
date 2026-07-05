@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "status": "ready",
+  "http_status": 200,
+  "route": "/",
+  "route_rendered": true,
+  "route_rendered_quality": "rendered_without_expected_surface",
+  "has_canvas": false,
+  "interactive_control_count": 0,
+  "surface_marker_authority": "ssr"
+}

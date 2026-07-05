@@ -1,0 +1,16 @@
+{
+  "ok": false,
+  "status": "failed",
+  "server_http_status": 200,
+  "browser_failure_kind": "probe_script_error",
+  "failure_kind": "probe_script_error",
+  "failure_category": "app",
+  "stage": "surface_wait",
+  "interaction_performed": false,
+  "interaction_success": false,
+  "contract_hook_status": "unknown",
+  "probe_mode": "heuristic",
+  "text_entry": "not_evaluated",
+  "persistence_after_reload": "not_evaluated",
+  "persistence_after_reload_reason": "no_text_entry_surface"
+}

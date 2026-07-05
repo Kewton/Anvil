@@ -27,6 +27,29 @@ That case intentionally records an unknown Vite stack as a generic static-tier
 fallback. It should not be rewritten into a Next.js fixture unless a future
 profile explicitly supports that stack.
 
+The Q1-final quality-track harvests are:
+
+```sh
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-999-Q1-62_001/tool_a \
+  q1-final-tool-a-persistence-not-evaluated
+
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-999-Q1-62_001/game_b \
+  q1-final-game-b-rendered-hidden-probe-limit
+```
+
+`q1-final-tool-a-persistence-not-evaluated` records a behavioral partial where
+the interaction probe executed and observed Todo mutation, but
+`persistence_after_reload=not_evaluated` carried the rendered reason
+`no_mutation_observed`.
+
+`q1-final-game-b-rendered-hidden-probe-limit` records an HTTP-200 page whose
+hydrated served DOM had a visible canvas and primary action, but the probe's
+surface wait selected a hidden leading `data-anvil-state` node before later
+visible controls. This is a known probe calibration limit and must remain an
+honest failed fixture until the probe selection is changed deliberately.
+
 The script copies `src/**`, `package.json`, and common Next.js/TypeScript/
 Tailwind/PostCSS config files. It intentionally does not copy `node_modules`,
 `.next`, `.anvil`, lockfiles, logs, screenshots, or other generated artifacts.
@@ -42,6 +65,11 @@ After harvesting, edit `expectations.toml`:
   detector reasons.
 - `[probe]` is optional. When `html_fixture` is present, the corpus test runs
   the static HTML version of the interaction probe hook/candidate selector.
+- `[json_fields]` is optional. Use
+  `fixtures/<file>.json:<field.path> = "<expected>"` to pin harvested runtime
+  evidence fields that are not source evidence, such as
+  `persistence_after_reload_reason` or a served-DOM calibration note. Keep
+  these JSON files under `fixtures/`; do not copy `.anvil` wholesale.
 
 Every UAT anomaly must add one case before changing detector, probe, evidence,
 or profile logic, unless the anomaly is explicitly recorded as out of scope.

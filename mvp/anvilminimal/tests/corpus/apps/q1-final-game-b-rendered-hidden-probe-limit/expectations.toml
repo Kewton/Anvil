@@ -1,0 +1,48 @@
+case_id = "q1-final-game-b-rendered-hidden-probe-limit"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-999-Q1-62_001/game_b"
+required_paths = ["package.json", "src/app/page.tsx"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule", "nextjs_route"]
+required_evidence = ["nextjs_route_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["invader", "laser", "score"]
+
+[route_closure]
+include = ["src/app/page.tsx"]
+exclude = []
+
+[evidence]
+build_command_or_dependency_missing_boundary = "Strong"
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+challenge_or_adversary_evidence = "Strong"
+score_or_progression_evidence = "Strong"
+failure_or_collision_evidence = "Strong"
+restart_or_recoverable_state_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_passed"
+
+[json_fields]
+fixtures/browser-readiness.json:http_status = "200"
+fixtures/browser-readiness.json:route_rendered_quality = "rendered_without_expected_surface"
+fixtures/browser-interaction.json:server_http_status = "200"
+fixtures/browser-interaction.json:browser_failure_kind = "probe_script_error"
+fixtures/browser-interaction.json:stage = "surface_wait"
+fixtures/browser-interaction.json:persistence_after_reload_reason = "no_text_entry_surface"
+fixtures/served-dom-visible-surface.json:visible_surface = "true"
+fixtures/served-dom-visible-surface.json:hidden_state_first = "true"
+fixtures/served-dom-visible-surface.json:visible_canvas = "true"
+fixtures/served-dom-visible-surface.json:visible_primary_action = "true"

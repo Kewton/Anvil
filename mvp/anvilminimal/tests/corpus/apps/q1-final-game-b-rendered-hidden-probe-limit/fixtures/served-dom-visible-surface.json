@@ -1,0 +1,10 @@
+{
+  "title": "Space Invaders - Retro Neon Edition",
+  "visible_surface": true,
+  "hidden_state_first": true,
+  "visible_control_count": 6,
+  "visible_canvas": true,
+  "visible_primary_action": true,
+  "first_visible_text": "SOUND ON",
+  "primary_action_text": "ENGAGE INVADERS"
+}

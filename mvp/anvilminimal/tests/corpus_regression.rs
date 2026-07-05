@@ -28,6 +28,7 @@ struct CorpusCase {
     diagnostics_contains: Vec<String>,
     compile_expect: String,
     probe: Option<ProbeExpectation>,
+    json_fields: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -182,6 +183,10 @@ fn generated_app_corpus_matches_detector_and_probe_expectations() {
                     "{display}: candidate text prefix; full={actual:?}"
                 );
             }
+        }
+
+        for (selector, expected) in &expectations.json_fields {
+            assert_json_field(&case_dir, display, selector, expected);
         }
     }
 }
@@ -340,6 +345,10 @@ fn parse_expectations(path: &Path) -> CorpusCase {
                     _ => panic!("{}:{}: unknown probe key {key}", path.display(), index + 1),
                 }
             }
+            "json_fields" => {
+                case.json_fields
+                    .insert(key.to_string(), parse_string(value));
+            }
             _ => panic!(
                 "{}:{}: unknown expectations section [{}]",
                 path.display(),
@@ -357,6 +366,41 @@ fn parse_expectations(path: &Path) -> CorpusCase {
             .to_string();
     }
     case
+}
+
+fn assert_json_field(case_dir: &Path, display: &str, selector: &str, expected: &str) {
+    let Some((fixture, field_path)) = selector.split_once(':') else {
+        panic!("{display}: json_fields selector must be <fixture>:<field>, got {selector}");
+    };
+    let json_path = case_dir.join(fixture);
+    let text = std::fs::read_to_string(&json_path)
+        .unwrap_or_else(|err| panic!("{display}: failed to read {}: {err}", json_path.display()));
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("{display}: invalid json {}: {err}", json_path.display()));
+    let actual = json_scalar_at_path(&value, field_path).unwrap_or_else(|| {
+        panic!(
+            "{display}: json field {field_path} missing or non-scalar in {}",
+            json_path.display()
+        )
+    });
+    assert_eq!(
+        actual, expected,
+        "{display}: json field mismatch for {selector}"
+    );
+}
+
+fn json_scalar_at_path(value: &serde_json::Value, path: &str) -> Option<String> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.get(segment)?;
+    }
+    match current {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Null => Some("null".to_string()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => None,
+    }
 }
 
 fn strip_comment(line: &str) -> &str {

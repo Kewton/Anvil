@@ -1,0 +1,41 @@
+case_id = "q1-final-tool-a-persistence-not-evaluated"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-999-Q1-62_001/tool_a"
+required_paths = ["package.json", "src/app/page.tsx"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "user_input_or_action", "visible_state_change", "nextjs_route"]
+required_evidence = ["user_input_handler_evidence", "stateful_update_evidence", "visible_interactive_surface_evidence", "persistence_evidence", "nextjs_route_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["todo", "localStorage"]
+
+[route_closure]
+include = ["src/app/page.tsx"]
+exclude = []
+
+[evidence]
+build_command_or_dependency_missing_boundary = "Strong"
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+persistence_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_passed"
+
+[json_fields]
+fixtures/browser-interaction.json:ok = "true"
+fixtures/browser-interaction.json:interaction_success = "true"
+fixtures/browser-interaction.json:persistence_after_reload = "not_evaluated"
+fixtures/browser-interaction.json:persistence_after_reload_reason = "no_mutation_observed"
+fixtures/browser-interaction.json:text_entry = "entered"
+fixtures/browser-interaction.json:text_input_state_change = "true"

@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "status": "passed",
+  "interaction_success": true,
+  "interaction_performed": true,
+  "server_http_status": 200,
+  "stage": "persistence_reload",
+  "state_changed": true,
+  "visible_state_changed": true,
+  "text_entry": "entered",
+  "text_entry_target": "input:data-anvil-action=input",
+  "text_input_state_change": true,
+  "input_state_change": true,
+  "persistence_after_reload": "not_evaluated",
+  "persistence_after_reload_reason": "no_mutation_observed"
+}
