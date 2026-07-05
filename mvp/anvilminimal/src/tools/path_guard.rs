@@ -2,28 +2,90 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
 
+const EXPECTED_PATH_FORM: &str = "use workspace-relative paths";
+
 pub fn validate_workspace_relative(raw: &str) -> anyhow::Result<()> {
     if raw.is_empty() {
         bail!("path is empty");
     }
     if raw.as_bytes().contains(&0) {
-        bail!("path contains NUL byte");
+        bail!("path contains NUL byte; {EXPECTED_PATH_FORM}");
     }
     if looks_like_windows_absolute(raw) {
-        bail!("absolute path is not allowed");
+        bail!("absolute path is not allowed; {EXPECTED_PATH_FORM}");
     }
     let path = Path::new(raw);
     if path.is_absolute() {
-        bail!("absolute path is not allowed");
+        bail!("absolute path is not allowed; {EXPECTED_PATH_FORM}");
     }
     for component in path.components() {
         match component {
-            Component::ParentDir => bail!("path may not contain .."),
-            Component::Prefix(_) | Component::RootDir => bail!("absolute path is not allowed"),
+            Component::ParentDir => bail!("path may not contain ..; {EXPECTED_PATH_FORM}"),
+            Component::Prefix(_) | Component::RootDir => {
+                bail!("absolute path is not allowed; {EXPECTED_PATH_FORM}")
+            }
             _ => {}
         }
     }
     Ok(())
+}
+
+pub fn normalize_absolute_workspace_path(root: &Path, raw: &str) -> anyhow::Result<Option<String>> {
+    if raw.as_bytes().contains(&0) {
+        bail!("path contains NUL byte; {EXPECTED_PATH_FORM}");
+    }
+    if looks_like_windows_absolute(raw) {
+        bail!("absolute path is not allowed; {EXPECTED_PATH_FORM}");
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Ok(None);
+    }
+    reject_parent_components(path)?;
+    let root = root
+        .canonicalize()
+        .context("workspace root is not accessible")?;
+    let canonical = canonicalize_with_missing_leaf(path).with_context(|| {
+        format!("path escapes workspace or parent is not accessible; {EXPECTED_PATH_FORM}")
+    })?;
+    ensure_inside(&root, &canonical)?;
+    let relative = canonical
+        .strip_prefix(&root)
+        .context("path escapes workspace")?;
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    Ok(Some(if relative.is_empty() {
+        ".".to_string()
+    } else {
+        relative
+    }))
+}
+
+pub fn normalize_absolute_workspace_glob(root: &Path, raw: &str) -> anyhow::Result<Option<String>> {
+    if raw.as_bytes().contains(&0) {
+        bail!("path contains NUL byte; {EXPECTED_PATH_FORM}");
+    }
+    if looks_like_windows_absolute(raw) {
+        bail!("absolute path is not allowed; {EXPECTED_PATH_FORM}");
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Ok(None);
+    }
+    reject_parent_components(path)?;
+    let Some((base, suffix)) = split_absolute_glob_base(raw) else {
+        return normalize_absolute_workspace_path(root, raw);
+    };
+    let Some(base_relative) = normalize_absolute_workspace_path(root, base)? else {
+        return Ok(None);
+    };
+    let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+    if base_relative == "." {
+        Ok(Some(suffix.to_string()))
+    } else if suffix.is_empty() {
+        Ok(Some(base_relative))
+    } else {
+        Ok(Some(format!("{base_relative}/{suffix}")))
+    }
 }
 
 pub fn resolve_existing(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
@@ -87,9 +149,50 @@ fn nearest_existing_parent(path: &Path) -> anyhow::Result<PathBuf> {
 
 fn ensure_inside(root: &Path, candidate: &Path) -> anyhow::Result<()> {
     if !candidate.starts_with(root) {
-        bail!("path escapes workspace");
+        bail!("path escapes workspace; {EXPECTED_PATH_FORM}");
     }
     Ok(())
+}
+
+fn reject_parent_components(path: &Path) -> anyhow::Result<()> {
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            bail!("path may not contain ..; {EXPECTED_PATH_FORM}");
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_with_missing_leaf(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        let Some(name) = cursor.file_name() else {
+            bail!("path escapes workspace or parent is not accessible; {EXPECTED_PATH_FORM}");
+        };
+        missing.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            bail!("path escapes workspace or parent is not accessible; {EXPECTED_PATH_FORM}");
+        };
+        cursor = parent;
+    }
+    let mut resolved = cursor.canonicalize().with_context(|| {
+        format!("path escapes workspace or parent is not accessible; {EXPECTED_PATH_FORM}")
+    })?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn split_absolute_glob_base(raw: &str) -> Option<(&str, &str)> {
+    let meta = raw.find(['*', '?', '[', '{'])?;
+    let split = raw[..meta].rfind('/')?;
+    if split == 0 {
+        Some(("/", &raw[split + 1..]))
+    } else {
+        Some((&raw[..split], &raw[split + 1..]))
+    }
 }
 
 fn strip_redundant_root_prefix(root: &Path, raw: &str) -> PathBuf {

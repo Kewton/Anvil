@@ -4,10 +4,14 @@ use anyhow::bail;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::eval_events;
 use crate::mode::ExecutionMode;
 
 use super::args_recovery::recover_tool_arguments;
-use super::path_guard::{resolve_existing, resolve_for_create, resolve_optional_existing};
+use super::path_guard::{
+    normalize_absolute_workspace_glob, normalize_absolute_workspace_path, resolve_existing,
+    resolve_for_create, resolve_optional_existing,
+};
 use super::workspace_policy::{WorkspacePolicy, ensure_tool_path_allowed};
 
 #[derive(Debug, Clone)]
@@ -18,6 +22,7 @@ pub struct ToolContext {
     pub interactive_approval: bool,
     pub offline: bool,
     pub workspace_policy: WorkspacePolicy,
+    pub eval_events_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,7 +76,8 @@ impl ToolRegistry {
             }
             "Read" => {
                 let raw = required_string(arguments, "path")?;
-                let path = resolve_existing(&context.root, raw)?;
+                let normalized = normalize_path_arg(context, "Read", raw)?;
+                let path = resolve_existing(&context.root, &normalized)?;
                 ensure_tool_path_allowed(&context.root, &path, context.workspace_policy)?;
                 crate::tools::read::run(
                     &context.root,
@@ -83,13 +89,15 @@ impl ToolRegistry {
             }
             "Write" => {
                 let raw = required_string(arguments, "path")?;
-                let path = resolve_for_create(&context.root, raw)?;
+                let normalized = normalize_path_arg(context, "Write", raw)?;
+                let path = resolve_for_create(&context.root, &normalized)?;
                 let content = required_string(arguments, "content")?;
                 crate::tools::write::run(&path, content)
             }
             "Edit" => {
                 let raw = required_string(arguments, "path")?;
-                let path = resolve_optional_existing(&context.root, raw)?;
+                let normalized = normalize_path_arg(context, "Edit", raw)?;
+                let path = resolve_optional_existing(&context.root, &normalized)?;
                 let old = required_string(arguments, "old_string")?;
                 let new = required_string(arguments, "new_string")?;
                 let replace_all = arguments
@@ -100,11 +108,16 @@ impl ToolRegistry {
             }
             "Glob" => {
                 let pattern = required_string(arguments, "pattern")?;
-                crate::tools::glob::run(&context.root, pattern, context.workspace_policy)
+                let normalized = normalize_glob_arg(context, "Glob", pattern)?;
+                crate::tools::glob::run(&context.root, &normalized, context.workspace_policy)
             }
             "Grep" => {
                 let pattern = required_string(arguments, "pattern")?;
-                let glob = arguments.get("glob").and_then(Value::as_str);
+                let glob = arguments
+                    .get("glob")
+                    .and_then(Value::as_str)
+                    .map(|glob| normalize_glob_arg(context, "Grep", glob))
+                    .transpose()?;
                 let case_sensitive = arguments
                     .get("case_sensitive")
                     .and_then(Value::as_bool)
@@ -112,7 +125,7 @@ impl ToolRegistry {
                 crate::tools::grep::run(
                     &context.root,
                     pattern,
-                    glob,
+                    glob.as_deref(),
                     case_sensitive,
                     context.workspace_policy,
                 )
@@ -120,6 +133,38 @@ impl ToolRegistry {
             other => bail!("unknown tool: {other}"),
         }
     }
+}
+
+fn normalize_path_arg(context: &ToolContext, tool: &str, raw: &str) -> anyhow::Result<String> {
+    match normalize_absolute_workspace_path(&context.root, raw)? {
+        Some(normalized) => {
+            emit_path_normalized(context, tool, raw, &normalized);
+            Ok(normalized)
+        }
+        None => Ok(raw.to_string()),
+    }
+}
+
+fn normalize_glob_arg(context: &ToolContext, tool: &str, raw: &str) -> anyhow::Result<String> {
+    match normalize_absolute_workspace_glob(&context.root, raw)? {
+        Some(normalized) => {
+            emit_path_normalized(context, tool, raw, &normalized);
+            Ok(normalized)
+        }
+        None => Ok(raw.to_string()),
+    }
+}
+
+fn emit_path_normalized(context: &ToolContext, tool: &str, original: &str, normalized: &str) {
+    eval_events::emit(
+        context.eval_events_path.as_deref(),
+        json!({
+            "event": "tool_args_path_normalized",
+            "tool": tool,
+            "original": original,
+            "normalized": normalized,
+        }),
+    );
 }
 
 fn enforce_mode(name: &str, mode: ExecutionMode) -> anyhow::Result<()> {
@@ -267,6 +312,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
         };
         assert!(
             registry
@@ -286,6 +332,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
         };
         registry
             .execute("Write", &json!({"path":"a/b.txt","content":"ok"}), &context)
@@ -294,6 +341,167 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a/b.txt")).unwrap(),
             "ok"
         );
+    }
+
+    #[test]
+    fn absolute_internal_write_is_normalized_and_audited() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+        };
+        let absolute = dir.path().join("src/app/page.tsx");
+
+        registry
+            .execute(
+                "Write",
+                &json!({"path": absolute.display().to_string(), "content":"ok"}),
+                &context,
+            )
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&absolute).unwrap(), "ok");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"tool_args_path_normalized""#));
+        assert!(event_text.contains(r#""tool":"Write""#));
+        assert!(event_text.contains(r#""normalized":"src/app/page.tsx""#));
+    }
+
+    #[test]
+    fn absolute_outside_write_is_rejected_as_path_confinement() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
+        };
+        let outside_path = outside.path().join("escape.txt");
+
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path": outside_path.display().to_string(), "content":"no"}),
+                &context,
+            )
+            .unwrap_err();
+
+        assert_eq!(tool_error_kind(&err), "path_confinement_error");
+        assert!(err.to_string().contains("use workspace-relative paths"));
+        assert!(!outside_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_internal_write_through_symlink_escape_is_rejected() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("out")).unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
+        };
+        let raw = dir.path().join("out/escape.txt");
+
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path": raw.display().to_string(), "content":"no"}),
+                &context,
+            )
+            .unwrap_err();
+
+        assert_eq!(tool_error_kind(&err), "path_confinement_error");
+        assert!(!outside.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn relative_write_behavior_does_not_emit_normalization_event() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+        };
+
+        let output = registry
+            .execute(
+                "Write",
+                &json!({"path":"notes/new.md","content":"ok"}),
+                &context,
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes/new.md")).unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            output,
+            format!(
+                "wrote {}",
+                dir.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("notes/new.md")
+                    .display()
+            )
+        );
+        assert!(
+            !events.exists(),
+            "relative paths must not be rewritten or audited as normalized"
+        );
+    }
+
+    #[test]
+    fn dot_dot_traversal_still_rejected() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
+        };
+
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path":"safe/../escape.txt","content":"no"}),
+                &context,
+            )
+            .unwrap_err();
+
+        assert_eq!(tool_error_kind(&err), "path_confinement_error");
+        assert!(err.to_string().contains("use workspace-relative paths"));
+        assert!(!dir.path().join("escape.txt").exists());
     }
 
     #[test]
@@ -322,6 +530,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
         };
         let err = registry
             .execute("Read", &json!({"path":".anvil/session.json"}), &context)
@@ -344,6 +553,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
         };
         let output = registry
             .execute("Glob", &json!({"pattern":"**/*"}), &context)
@@ -364,6 +574,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
         };
         let err = registry
             .execute("Read", &json!({"path":"workdir/a.txt"}), &context)
@@ -393,6 +604,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
         };
         registry
             .execute(
@@ -418,6 +630,7 @@ mod tests {
             interactive_approval: false,
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
         };
         let err = registry
             .execute(

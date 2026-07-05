@@ -1175,6 +1175,7 @@ pub(crate) fn run_session_with_outcome_with_options(
             interactive_approval: false,
             offline: config.offline,
             workspace_policy: crate::tools::workspace_policy::WorkspacePolicy::for_task_request(),
+            eval_events_path: config.eval_events_path.clone(),
         };
         let mut names_seen = BTreeSet::new();
         let mut batch_had_edit = false;

@@ -120,6 +120,7 @@ MVP_EVENT_STAGE: dict[str, str] = {
     "step_verify_failure": "verify_failed",
     "step_verify_repair": "repair_attempted",
     "tool_call_raw": "tool_requested",
+    "tool_args_path_normalized": "tool_requested",
     "tool_args_recovered": "tool_requested",
     "tool_execute": "tool_executed",
     "tool_validation_error": "tool_requested",

@@ -276,6 +276,7 @@ fn provider_probe_tool_args_recovery_classification_by_provider() {
             interactive_approval: false,
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
         };
 
         let recoverable = provider_write_call(provider, "provider-probe.txt", "ok")
