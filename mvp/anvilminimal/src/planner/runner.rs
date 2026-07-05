@@ -17,13 +17,15 @@ use crate::minimal_loop::browser_probe::{
     probe_browser_readiness_with_offline_and_interaction_options,
 };
 use crate::minimal_loop::build_verifier::{
-    BuildVerifierLifecycleObservation, BuildVerifierStatus, CompileError,
-    emit_dependency_build_lifecycle,
+    BuildVerifierLifecycleObservation, BuildVerifierObservation, BuildVerifierRequirement,
+    BuildVerifierStatus, CompileError, emit_dependency_build_lifecycle,
 };
 use crate::minimal_loop::completion::{
     CompletionContract, compile_error_repair_guidance, evidence_hint_tokens_for_goal,
 };
-use crate::minimal_loop::dependency_setup::{self, NodeDependencySetupAuthority};
+use crate::minimal_loop::dependency_setup::{
+    self, NodeDependencySetupAuthority, NodeDependencySetupRequirement, NodeDependencySetupStatus,
+};
 use crate::minimal_loop::evidence::{
     RuntimeAcceptanceReport, comment_stripped_source_corpus, required_evidence_for_capability,
     verify_runtime_acceptance_with_browser_dirs_and_hints,
@@ -1278,6 +1280,197 @@ impl UltraRunSetupAuthorityState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyReconciliationTrigger {
+    Promotion,
+    ManifestRepair,
+}
+
+impl DependencyReconciliationTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Promotion => "promotion",
+            Self::ManifestRepair => "manifest_repair",
+        }
+    }
+}
+
+fn reconcile_run_dependency_setup(
+    config: &Config,
+    profile: &str,
+    trigger: DependencyReconciliationTrigger,
+    setup_authority: &UltraRunSetupAuthorityState,
+) -> anyhow::Result<Option<Vec<String>>> {
+    let authority = setup_authority.authority();
+    let Some(requirement) =
+        dependency_reconciliation_requirement(&config.workspace_root, profile, trigger, authority)
+    else {
+        return Ok(None);
+    };
+    let setup = dependency_setup::run_node_dependency_setup_with_program_and_offline(
+        &config.workspace_root,
+        &requirement,
+        Path::new("npm"),
+        config.offline,
+    );
+    let lifecycle = dependency_reconciliation_lifecycle(&requirement, setup.clone());
+    emit_dependency_build_lifecycle(
+        config.eval_events_path.as_deref(),
+        "ultra-plan-run",
+        Some(trigger.as_str()),
+        &lifecycle,
+    );
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "dependency_setup_reconciliation",
+            "trigger": trigger.as_str(),
+            "profile": canonical_profile_name(profile),
+            "authority": authority.as_str(),
+            "setup_kind": setup.setup_kind.as_str(),
+            "status": setup.status.as_str(),
+            "attempted": setup.attempted,
+            "command": setup.command.clone(),
+            "added": setup.changed_paths.clone(),
+            "primary_reason": eval_events::body_snippet(&setup.primary_reason),
+            "offline": config.offline,
+        }),
+    );
+    match setup.status {
+        NodeDependencySetupStatus::Passed | NodeDependencySetupStatus::NotRequired => {
+            Ok(Some(setup.changed_paths))
+        }
+        NodeDependencySetupStatus::Blocked
+            if setup.primary_reason == "dependency_setup_blocked_offline" =>
+        {
+            anyhow::bail!("dependency_setup_blocked_offline")
+        }
+        NodeDependencySetupStatus::Blocked => {
+            anyhow::bail!("dependency_setup_blocked: {}", setup.primary_reason)
+        }
+        NodeDependencySetupStatus::Failed | NodeDependencySetupStatus::TimedOut => {
+            anyhow::bail!(
+                "dependency_setup_lifecycle_failed: {}",
+                setup.primary_reason
+            )
+        }
+        NodeDependencySetupStatus::Attempted => {
+            anyhow::bail!("dependency_setup_lifecycle_failed: dependency setup did not finish")
+        }
+    }
+}
+
+fn dependency_reconciliation_requirement(
+    root: &Path,
+    profile: &str,
+    trigger: DependencyReconciliationTrigger,
+    authority: NodeDependencySetupAuthority,
+) -> Option<NodeDependencySetupRequirement> {
+    let reason = format!("{} dependency reconciliation", trigger.as_str());
+    match canonical_profile_name(profile).as_str() {
+        "nextjs"
+            if dependency_setup::package_json_declares_dependencies(root)
+                && !dependency_setup::next_build_dependencies_ready(root) =>
+        {
+            Some(dependency_setup::requirement_for_next_build(
+                root,
+                Some("nextjs"),
+                &reason,
+                authority,
+            ))
+        }
+        "python-cli" | "python_cli"
+            if dependency_setup::python_cli_declares_dependencies(root)
+                && !dependency_setup::python_cli_dependencies_ready(root) =>
+        {
+            Some(dependency_setup::requirement_for_python_cli_dependencies(
+                root,
+                Some("python-cli"),
+                &reason,
+                authority,
+            ))
+        }
+        _ if dependency_setup::package_json_declares_dependencies(root)
+            && !dependency_setup::node_declared_dependencies_ready(root) =>
+        {
+            Some(
+                dependency_setup::requirement_for_node_declared_dependencies(
+                    root,
+                    Some(&canonical_profile_name(profile)),
+                    &reason,
+                    authority,
+                ),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn dependency_reconciliation_lifecycle(
+    requirement: &NodeDependencySetupRequirement,
+    setup: dependency_setup::NodeDependencySetupObservation,
+) -> BuildVerifierLifecycleObservation {
+    let before = BuildVerifierObservation {
+        command: "dependency reconciliation".to_string(),
+        profile: requirement.profile.clone(),
+        authority: requirement.setup_authority.as_str().to_string(),
+        required_for_completion: true,
+        requires_dependency_setup: true,
+        dependency_ready: false,
+        attempted: false,
+        status: BuildVerifierStatus::DependencyMissing,
+        primary_reason: requirement.reason.clone(),
+        output_snippet: String::new(),
+        compile_errors: Vec::new(),
+        foreign_toolchain: None,
+    };
+    let after_status = match setup.status {
+        NodeDependencySetupStatus::Passed | NodeDependencySetupStatus::NotRequired => {
+            BuildVerifierStatus::Passed
+        }
+        NodeDependencySetupStatus::Blocked | NodeDependencySetupStatus::TimedOut => {
+            BuildVerifierStatus::Blocked
+        }
+        NodeDependencySetupStatus::Failed | NodeDependencySetupStatus::Attempted => {
+            BuildVerifierStatus::Failed
+        }
+    };
+    let after = (after_status == BuildVerifierStatus::Passed).then(|| BuildVerifierObservation {
+        command: "dependency reconciliation".to_string(),
+        profile: requirement.profile.clone(),
+        authority: requirement.setup_authority.as_str().to_string(),
+        required_for_completion: true,
+        requires_dependency_setup: true,
+        dependency_ready: true,
+        attempted: false,
+        status: BuildVerifierStatus::Passed,
+        primary_reason: "dependency setup reconciliation passed".to_string(),
+        output_snippet: String::new(),
+        compile_errors: Vec::new(),
+        foreign_toolchain: None,
+    });
+    let final_reason = after
+        .as_ref()
+        .map(|observation| observation.primary_reason.clone())
+        .unwrap_or_else(|| setup.primary_reason.clone());
+    BuildVerifierLifecycleObservation {
+        requirement: BuildVerifierRequirement {
+            command: "dependency reconciliation".to_string(),
+            profile: requirement.profile.clone(),
+            reason: requirement.reason.clone(),
+            authority: requirement.setup_authority.as_str().to_string(),
+            status: "required".to_string(),
+            requires_dependency_setup: true,
+            required_for_completion: true,
+        },
+        before_setup: before,
+        setup: Some(setup),
+        after_setup: after,
+        final_status: after_status,
+        final_reason,
+    }
+}
+
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn run_step_plan_with_session_with_ui(
     client: &mut dyn ChatClient,
@@ -1382,10 +1575,6 @@ fn run_step_plan_with_session_with_ui_and_run_authority(
                 .as_ref()
                 .and_then(|bound| bound.fs_path.clone()),
         };
-        let run_authority = run_setup_authority
-            .as_deref()
-            .map(UltraRunSetupAuthorityState::authority)
-            .unwrap_or(NodeDependencySetupAuthority::None);
         match run_step(
             client,
             session,
@@ -1397,7 +1586,7 @@ fn run_step_plan_with_session_with_ui_and_run_authority(
             mode,
             contract_enforcement,
             phase_scope,
-            run_authority,
+            run_setup_authority.as_deref_mut(),
         ) {
             Ok(step_outcome) => {
                 outcome.completed_steps += 1;
@@ -1464,7 +1653,7 @@ fn run_step(
     mode: &'static str,
     contract_enforcement: ContractEnforcement,
     phase_scope: Option<&str>,
-    run_setup_authority: NodeDependencySetupAuthority,
+    mut run_setup_authority: Option<&mut UltraRunSetupAuthorityState>,
 ) -> Result<StepRunOutcome, StepRunError> {
     let mut runtime_step = step.clone();
     let instruction = build_step_prompt(plan, step, prompt_context);
@@ -1481,9 +1670,13 @@ fn run_step(
     {
         step_config.completion_contract_path = Some(path);
     }
-    let setup_authority = step_verify_setup_authority(plan, step, run_setup_authority);
+    let run_authority = run_setup_authority
+        .as_deref()
+        .map(UltraRunSetupAuthorityState::authority)
+        .unwrap_or(NodeDependencySetupAuthority::None);
+    let setup_authority = step_verify_setup_authority(plan, step, run_authority);
     let contract_setup_authority =
-        step_contract_setup_authority(plan, step, phase_scope, run_setup_authority);
+        step_contract_setup_authority(plan, step, phase_scope, run_authority);
     let step_options = step_run_session_options(
         step,
         contract_enforcement,
@@ -1515,16 +1708,35 @@ fn run_step(
         ..StepRunOutcome::default()
     };
     let overall_goal = prompt_context.overall_goal.as_str();
-    if let Err(err) =
-        profile_post_step_repair(&config.workspace_root, &config.profile, overall_goal)
-    {
-        outcome.primary_failure = Some(err.to_string());
-        outcome.stop_reason = Some("profile_post_step_repair_error".to_string());
-        outcome.partial = true;
-        return Err(StepRunError {
-            message: err.to_string(),
-            outcome,
-        });
+    match profile_post_step_repair(&config.workspace_root, &config.profile, overall_goal) {
+        Ok(true) => {
+            if let Some(state) = run_setup_authority.as_deref_mut() {
+                state.grant("manifest_repair");
+                if let Err(err) = reconcile_run_dependency_setup(
+                    config,
+                    &config.profile,
+                    DependencyReconciliationTrigger::ManifestRepair,
+                    state,
+                ) {
+                    let message = err.to_string();
+                    outcome.primary_failure = Some(message.clone());
+                    outcome.stop_reason =
+                        Some("dependency_setup_reconciliation_failed".to_string());
+                    outcome.partial = true;
+                    return Err(StepRunError { message, outcome });
+                }
+            }
+        }
+        Ok(false) => {}
+        Err(err) => {
+            outcome.primary_failure = Some(err.to_string());
+            outcome.stop_reason = Some("profile_post_step_repair_error".to_string());
+            outcome.partial = true;
+            return Err(StepRunError {
+                message: err.to_string(),
+                outcome,
+            });
+        }
     }
     let (mut report, mut build_lifecycles) =
         verify_step_with_profile_setup_observed_with_offline_and_events(
@@ -1684,6 +1896,22 @@ fn run_step(
             merge_unique_strings(&mut outcome.repair_changed_paths, &repair.changed_paths);
             match profile_post_step_repair(&config.workspace_root, &config.profile, overall_goal) {
                 Ok(true) => {
+                    if let Some(state) = run_setup_authority.as_deref_mut() {
+                        state.grant("manifest_repair");
+                        if let Err(err) = reconcile_run_dependency_setup(
+                            config,
+                            &config.profile,
+                            DependencyReconciliationTrigger::ManifestRepair,
+                            state,
+                        ) {
+                            let message = err.to_string();
+                            outcome.primary_failure = Some(message.clone());
+                            outcome.stop_reason =
+                                Some("dependency_setup_reconciliation_failed".to_string());
+                            outcome.partial = true;
+                            return Err(StepRunError { message, outcome });
+                        }
+                    }
                     let package_path = "package.json".to_string();
                     merge_changed_files(&mut context, std::slice::from_ref(&package_path));
                     merge_unique_strings(
@@ -3681,6 +3909,7 @@ pub fn run_ultra_plan_with_ui(
                 &final_expected_paths,
                 ui,
                 invariant_report,
+                &mut setup_authority_state,
             )?;
         }
         if !invariant_report.is_pass() {
@@ -3805,6 +4034,12 @@ pub fn run_ultra_plan_with_ui(
             .is_some()
             {
                 setup_authority_state.grant("profile_promotion");
+                reconcile_run_dependency_setup(
+                    config,
+                    &plan.profile,
+                    DependencyReconciliationTrigger::Promotion,
+                    &setup_authority_state,
+                )?;
             }
             continue;
         }
@@ -3853,6 +4088,12 @@ pub fn run_ultra_plan_with_ui(
         .is_some()
         {
             setup_authority_state.grant("profile_promotion");
+            reconcile_run_dependency_setup(
+                config,
+                &plan.profile,
+                DependencyReconciliationTrigger::Promotion,
+                &setup_authority_state,
+            )?;
         }
     }
     let mut final_acceptance_cycle_deltas = Vec::new();
@@ -4251,6 +4492,7 @@ fn repair_intermediate_profile_invariant(
     final_expected_paths: &[String],
     ui: &dyn InteractionUi,
     failed_report: VerificationReport,
+    setup_authority_state: &mut UltraRunSetupAuthorityState,
 ) -> anyhow::Result<VerificationReport> {
     let mut retry = failed_report.clone();
     let deterministic_error = match profile_auto_repair(
@@ -4260,6 +4502,15 @@ fn repair_intermediate_profile_invariant(
         &failed_report,
     ) {
         Ok(changed) => {
+            if changed {
+                setup_authority_state.grant("manifest_repair");
+                reconcile_run_dependency_setup(
+                    config,
+                    &plan.profile,
+                    DependencyReconciliationTrigger::ManifestRepair,
+                    setup_authority_state,
+                )?;
+            }
             retry = verify_profile_invariant(
                 &config.workspace_root,
                 &plan.profile,
