@@ -81,7 +81,7 @@ use crate::planner::verify::{
     verify_step_with_profile_setup_observed_with_offline,
     verify_step_with_profile_setup_observed_with_offline_and_events,
 };
-use crate::providers::{ChatClient, model_for};
+use crate::providers::{AssistantReply, ChatClient, model_for};
 use crate::state::SessionSnapshot;
 use crate::tools::path_guard::resolve_existing;
 use crate::tui::status::UiStatus;
@@ -92,6 +92,8 @@ const STEP_TURN_MAX_ITERATIONS: usize = 8;
 const STEP_REPAIR_MAX_ITERATIONS: usize = 6;
 const STEP_REPAIR_MAX_TURNS: usize = 4;
 const STEP_REPAIR_IDENTICAL_NO_CHANGE_LIMIT: usize = 2;
+const PLANNER_PROVIDER_REQUEST_ATTEMPTS: usize = 2;
+const PLANNER_PROVIDER_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(80);
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
 const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 2;
 const FINAL_ACCEPTANCE_COMPILE_NO_SNAPSHOT_EXTRA_ATTEMPTS: usize = 1;
@@ -319,6 +321,35 @@ pub fn generate_step_plan(
     generate_step_plan_with_ui(client, goal, config, &NOOP_UI)
 }
 
+fn planner_chat_with_request_retry(
+    client: &mut dyn ChatClient,
+    model: &str,
+    messages: &[crate::state::ConversationMessage],
+    ui: &dyn InteractionUi,
+) -> anyhow::Result<AssistantReply> {
+    let mut last_error = None;
+    for request_attempt in 1..=PLANNER_PROVIDER_REQUEST_ATTEMPTS {
+        let result = {
+            let _guard = ui.before_model_call(&format!("planner {} {model}", client.label()));
+            client.chat(model, messages, &[], false)
+        };
+        match result {
+            Ok(reply) => return Ok(reply),
+            Err(err) => {
+                last_error = Some(err.to_string());
+                if request_attempt < PLANNER_PROVIDER_REQUEST_ATTEMPTS {
+                    std::thread::sleep(PLANNER_PROVIDER_REQUEST_RETRY_DELAY);
+                }
+            }
+        }
+    }
+    anyhow::bail!(
+        "provider request failed after {} attempts: {}",
+        PLANNER_PROVIDER_REQUEST_ATTEMPTS,
+        last_error.unwrap_or_else(|| "unknown provider error".to_string())
+    )
+}
+
 pub fn generate_step_plan_with_ui(
     client: &mut dyn ChatClient,
     goal: &str,
@@ -342,10 +373,7 @@ pub fn generate_step_plan_with_ui(
     let mut lint_categories_seen = BTreeSet::new();
     for attempt in 1..=3 {
         let messages = step_plan_messages(&prompt);
-        let reply = {
-            let _guard = ui.before_model_call(&format!("planner {} {model}", client.label()));
-            client.chat(model, &messages, &[], false)?
-        };
+        let reply = planner_chat_with_request_retry(client, model, &messages, ui)?;
         ui.publish_status(UiStatus::for_model_reply(
             config,
             model,
@@ -3490,10 +3518,7 @@ pub fn generate_ultra_plan_with_ui(
             &config.style,
             intent,
         );
-        let reply = {
-            let _guard = ui.before_model_call(&format!("planner {} {model}", client.label()));
-            client.chat(model, &messages, &[], false)?
-        };
+        let reply = planner_chat_with_request_retry(client, model, &messages, ui)?;
         ui.publish_status(UiStatus::for_model_reply(
             config,
             model,
@@ -12896,6 +12921,22 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
     }
 
     #[test]
+    fn step_plan_generation_retries_transient_provider_request_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut planner = FlakyClient::new(
+            1,
+            "transient provider unavailable",
+            vec![AssistantReply::text(generated_step_plan_json("goal"))],
+        );
+
+        let plan =
+            generate_step_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
+
+        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(plan.goal, "goal");
+    }
+
+    #[test]
     fn planner_prompt_ollama_request_contract() {
         let messages = step_plan_messages(&build_step_plan_user_prompt(
             "goal",
@@ -12966,6 +13007,23 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
         ]);
         let plan =
             generate_ultra_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
+        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(plan.goal, "goal");
+        assert_eq!(plan.phases.len(), 2);
+    }
+
+    #[test]
+    fn ultra_plan_generation_retries_transient_provider_request_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut planner = FlakyClient::new(
+            1,
+            "transient provider unavailable",
+            vec![AssistantReply::text(generated_ultra_plan_yaml("goal"))],
+        );
+
+        let plan =
+            generate_ultra_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
+
         assert_eq!(planner.messages.len(), 2);
         assert_eq!(plan.goal, "goal");
         assert_eq!(plan.phases.len(), 2);
@@ -15672,6 +15730,52 @@ if __name__ == "__main__":
         assert!(summary.contains("Recovery UltraPlan YAML saved:"));
         assert!(summary.contains("Suggested YAML command:"));
         assert!(summary.contains("Recovery artifact check:"));
+    }
+
+    #[test]
+    fn ultra_phase_scaffold_provider_error_names_terminal_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let mut planner = FlakyClient::new(
+            PLANNER_PROVIDER_REQUEST_ATTEMPTS,
+            "transient provider unavailable",
+            Vec::new(),
+        );
+        let mut execution = FakeClient::new(Vec::new());
+        let plan = UltraPlan {
+            goal: "Build an interactive web game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "web-game-scaffold".to_string(),
+                    prompt: "Scaffold the interactive web game".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "final-verify".to_string(),
+                    prompt: "Verify the interactive web game".to_string(),
+                },
+            ],
+        };
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(planner.messages.len(), PLANNER_PROVIDER_REQUEST_ATTEMPTS);
+        assert!(err.contains("phase scaffold failed"), "{err}");
+        assert!(
+            err.contains("provider request failed after 2 attempts"),
+            "{err}"
+        );
+        assert!(err.contains("transient provider unavailable"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"planner_error_kind\":\"phase_scaffold_error\""));
+        assert!(event_text.contains("transient provider unavailable"));
     }
 
     #[test]
@@ -20274,6 +20378,52 @@ export default function Page() {
             self.messages.push(messages.to_vec());
             if self.replies.is_empty() {
                 anyhow::bail!("fake client exhausted")
+            }
+            Ok(self.replies.remove(0))
+        }
+    }
+
+    struct FlakyClient {
+        replies: Vec<AssistantReply>,
+        messages: Vec<Vec<ConversationMessage>>,
+        failures_remaining: usize,
+        failure_message: String,
+    }
+
+    impl FlakyClient {
+        fn new(
+            failures_remaining: usize,
+            failure_message: impl Into<String>,
+            replies: Vec<AssistantReply>,
+        ) -> Self {
+            Self {
+                replies,
+                messages: Vec::new(),
+                failures_remaining,
+                failure_message: failure_message.into(),
+            }
+        }
+    }
+
+    impl ChatClient for FlakyClient {
+        fn label(&self) -> &str {
+            "flaky"
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            messages: &[ConversationMessage],
+            _tools: &[ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            self.messages.push(messages.to_vec());
+            if self.failures_remaining > 0 {
+                self.failures_remaining -= 1;
+                anyhow::bail!("{}", self.failure_message);
+            }
+            if self.replies.is_empty() {
+                anyhow::bail!("flaky client exhausted")
             }
             Ok(self.replies.remove(0))
         }
