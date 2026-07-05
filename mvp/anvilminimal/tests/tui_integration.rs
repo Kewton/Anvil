@@ -75,6 +75,11 @@ impl ChatClient for FakeClient {
         _native_tools_enabled: bool,
     ) -> anyhow::Result<AssistantReply> {
         self.requests.push(messages.to_vec());
+        assert!(
+            !self.replies.is_empty(),
+            "{} fake replies exhausted",
+            self.label
+        );
         Ok(self.replies.remove(0))
     }
 }
@@ -236,6 +241,27 @@ export default function App() {{
 }}
 "#
     )
+}
+
+fn nextjs_package_json() -> String {
+    r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011","start":"next start -p 3011"}}"#.to_string()
+}
+
+fn nextjs_page_source() -> String {
+    r#""use client";
+import { useState } from "react";
+
+export default function Page() {
+  const [draft, setDraft] = useState("");
+  const [items, setItems] = useState<string[]>([]);
+  return <main data-anvil-state={items.length}>
+    <input aria-label="Memo" value={draft} onChange={(event) => setDraft(event.target.value)} />
+    <button data-anvil-action="primary" onClick={() => setItems([...items, draft])}>Add</button>
+    <ul>{items.map((item, index) => <li key={index}>{item}</li>)}</ul>
+  </main>;
+}
+"#
+    .to_string()
 }
 
 #[test]
@@ -408,6 +434,165 @@ fn tui_ultra_plan_run_smoke_fake_clients() {
     );
     let second_request = format!("{:?}", execution.requests[1]);
     assert!(second_request.contains("phase1"));
+}
+
+#[test]
+fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+    let plan_path = dir.path().join("ultra.yaml");
+    let plan = anvilminimal::planner::ultra_plan::UltraPlan {
+        goal: "ちょっとしたメモアプリを作って。ブラウザで使えるようにしてください。3011ポートで起動可能にしてください。".to_string(),
+        profile: "generic".to_string(),
+        style: "default".to_string(),
+        intent: "create".to_string(),
+        phases: vec![
+            anvilminimal::planner::ultra_plan::UltraPhase {
+                id: "setup-framework".to_string(),
+                prompt: "Create the package manifest".to_string(),
+            },
+            anvilminimal::planner::ultra_plan::UltraPhase {
+                id: "implement-ui".to_string(),
+                prompt: "Create the promoted Next.js route".to_string(),
+            },
+        ],
+    };
+    std::fs::write(
+        &plan_path,
+        anvilminimal::planner::ultra_plan::render_ultra_plan(&plan),
+    )
+    .unwrap();
+    let mut setup_step = anvilminimal::planner::step_plan::StepPlan::single("create package");
+    setup_step.steps[0].kind = "setup".to_string();
+    setup_step.steps[0].expected_paths = vec!["package.json".to_string()];
+    let mut route_step = anvilminimal::planner::step_plan::StepPlan::single("create route");
+    route_step.steps[0].kind = "implement".to_string();
+    route_step.steps[0].expected_paths = vec![
+        "tsconfig.json".to_string(),
+        "postcss.config.js".to_string(),
+        "tailwind.config.ts".to_string(),
+        "src/app/layout.tsx".to_string(),
+        "src/app/page.tsx".to_string(),
+        "src/app/globals.css".to_string(),
+        "src/app/global.d.ts".to_string(),
+    ];
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    let mut planner = FakeClient::new(
+        "planner",
+        vec![
+            AssistantReply::text(serde_json::to_string(&setup_step).unwrap()),
+            AssistantReply::text(serde_json::to_string(&route_step).unwrap()),
+        ],
+    );
+    let mut execution = FakeClient::new(
+        "exec",
+        vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"package.json","content":nextjs_package_json()}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/layout.tsx","content":"export default function RootLayout({ children }: { children: React.ReactNode }) { return <html><body>{children}</body></html>; }"}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"tsconfig.json","content":r#"{"compilerOptions":{"target":"ES2017","lib":["dom","dom.iterable","esnext"],"allowJs":true,"skipLibCheck":true,"strict":true,"noEmit":true,"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler","resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve","incremental":true,"plugins":[{"name":"next"}]},"include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],"exclude":["node_modules"]}"#}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"postcss.config.js","content":"module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };"}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"tailwind.config.ts","content":"import type { Config } from 'tailwindcss';\nconst config: Config = { content: ['./src/app/**/*.{js,ts,jsx,tsx,mdx}'], theme: { extend: {} }, plugins: [] };\nexport default config;\n"}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/page.tsx","content":nextjs_page_source()}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/globals.css","content":"body { font-family: sans-serif; }"}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/global.d.ts","content":"declare module '*.css';"}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"browser-readiness.json","content":r#"{"ok":true,"http_status":200,"route_rendered":true}"#}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"browser-interaction.json","content":r#"{"ok":true,"interaction_performed":true,"surface_visible":true,"input_state_change":true,"input_event_observed":true,"state_changed":true}"#}),
+                    ),
+                ],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ],
+    );
+    let ui = FakeUi::default();
+
+    let output = anvilminimal::tui::slash::handle_command(
+        "/run-ultra-plan ultra.yaml",
+        &cfg,
+        &mut planner,
+        &mut execution,
+        &ui,
+    )
+    .unwrap();
+
+    assert!(output.contains("ultra-plan-run complete"));
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    assert!(
+        events.contains(r#""event":"profile_reinferred""#),
+        "{events}"
+    );
+    assert!(events.contains(r#""profile":"nextjs""#), "{events}");
+    assert!(
+        events.contains(r#""requested_port":"3011 (goal)""#),
+        "{events}"
+    );
+    let stops = tui_command_stop_events(&events);
+    assert_eq!(
+        stops[0].get("profile").and_then(|value| value.as_str()),
+        Some("nextjs"),
+        "{events}"
+    );
+    assert_eq!(
+        stops[0]
+            .get("assurance_level")
+            .and_then(|value| value.as_str()),
+        Some("full"),
+        "{events}"
+    );
+    assert_eq!(
+        stops[0]
+            .get("requested_port")
+            .and_then(|value| value.as_str()),
+        Some("3011 (goal)"),
+        "{events}"
+    );
+    let summary =
+        std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
+    assert!(
+        summary.contains("Profile promoted: generic -> nextjs"),
+        "{summary}"
+    );
+    assert!(summary.contains("Profile: nextjs"), "{summary}");
+    assert!(summary.contains("Assurance: full"), "{summary}");
+    assert!(summary.contains("Requested port: 3011 (goal)"), "{summary}");
 }
 
 #[test]

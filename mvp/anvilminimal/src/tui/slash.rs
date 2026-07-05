@@ -273,6 +273,7 @@ fn emit_tui_command_stop_with_status(
             "assurance_reason": &completion.assurance_reason,
             "profile_inferred": &completion.profile_inferred,
             "profile_inference_source": &completion.profile_inference_source,
+            "requested_port": &completion.requested_port,
             "session_status": "repl_ready",
             "repl_status": "ready",
             "command_completion_state": &event_projection.command_completion,

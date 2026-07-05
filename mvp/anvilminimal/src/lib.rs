@@ -216,6 +216,7 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "assurance_reason": &completion.assurance_reason,
             "profile_inferred": &completion.profile_inferred,
             "profile_inference_source": &completion.profile_inference_source,
+            "requested_port": &completion.requested_port,
             "session_status": "process_exited",
             "repl_status": "not_applicable",
             "process_completion_state": &completion.command_completion,

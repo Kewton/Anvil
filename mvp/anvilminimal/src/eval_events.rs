@@ -198,6 +198,7 @@ pub struct CompletionSnapshot {
     pub assurance_reason: String,
     pub profile_inferred: String,
     pub profile_inference_source: String,
+    pub requested_port: String,
     pub runtime_acceptance_status: String,
     pub final_acceptance_status: String,
     pub release_gate_status: String,
@@ -243,6 +244,7 @@ impl CompletionSnapshot {
             assurance_reason: String::new(),
             profile_inferred: String::new(),
             profile_inference_source: String::new(),
+            requested_port: String::new(),
             runtime_acceptance_status: "not_checked".to_string(),
             final_acceptance_status: "not_checked".to_string(),
             release_gate_status: "not_applicable".to_string(),
@@ -300,6 +302,7 @@ pub struct CompletionProjection {
     pub assurance_reason: String,
     pub profile_inferred: String,
     pub profile_inference_source: String,
+    pub requested_port: String,
     pub runtime_acceptance: String,
     pub final_acceptance: String,
     pub release_gate: String,
@@ -370,11 +373,22 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
         .collect::<Vec<_>>();
     let diagnostics = planner_diagnostics_from_events(&events);
     let recovery_fields = latest_recovery_fields(&events);
-    let mut snapshot = events
-        .iter()
-        .filter_map(snapshot_from_completion_event)
-        .next_back()
-        .unwrap_or_else(CompletionSnapshot::empty);
+    let mut snapshot = CompletionSnapshot::empty();
+    let mut latest_completion_index = None;
+    for (index, event) in events.iter().enumerate() {
+        if let Some(next) = snapshot_from_completion_event(event) {
+            snapshot = next;
+            latest_completion_index = Some(index);
+        }
+    }
+    if let Some(reinference) = latest_profile_reinference_after(&events, latest_completion_index) {
+        reinference.apply_to(&mut snapshot);
+    }
+    if snapshot.requested_port.is_empty()
+        && let Some(requested_port) = latest_requested_port(&events)
+    {
+        snapshot.requested_port = requested_port;
+    }
     snapshot.planner_verify_normalization_count = diagnostics.verify_normalization_count;
     snapshot.planner_retry_count = diagnostics.retry_count;
     snapshot.planner_quality_warning_count = diagnostics.quality_warning_count;
@@ -431,6 +445,7 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         assurance_reason: snapshot.assurance_reason.clone(),
         profile_inferred: snapshot.profile_inferred.clone(),
         profile_inference_source: snapshot.profile_inference_source.clone(),
+        requested_port: snapshot.requested_port.clone(),
         runtime_acceptance,
         final_acceptance,
         release_gate,
@@ -1352,6 +1367,11 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        requested_port: event
+            .get("requested_port")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         runtime_acceptance_status: event
             .get("runtime_acceptance_status")
             .and_then(Value::as_str)
@@ -1482,6 +1502,89 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .unwrap_or(false),
         compile_rollback_summaries: Vec::new(),
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileReinferenceFields {
+    from_profile: String,
+    to_profile: String,
+    source: String,
+    at_phase: Option<u64>,
+    requested_port: String,
+}
+
+impl ProfileReinferenceFields {
+    fn apply_to(self, snapshot: &mut CompletionSnapshot) {
+        snapshot.profile = self.to_profile.clone();
+        snapshot.profile_inferred = self.to_profile;
+        snapshot.profile_inference_source = self.source;
+        if !self.requested_port.is_empty() {
+            snapshot.requested_port = self.requested_port;
+        }
+        if crate::planner::profile::canonical_profile_name(&snapshot.profile) != "generic" {
+            snapshot.assurance_level = "full".to_string();
+            snapshot.assurance_reason.clear();
+        }
+    }
+}
+
+fn latest_profile_reinference_after(
+    events: &[Value],
+    latest_completion_index: Option<usize>,
+) -> Option<ProfileReinferenceFields> {
+    let min_index = latest_completion_index.map(|index| index + 1).unwrap_or(0);
+    events
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, event)| {
+            *index >= min_index
+                && event
+                    .get("event")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == "profile_reinferred")
+        })
+        .and_then(|(_, event)| profile_reinference_fields(event))
+}
+
+fn profile_reinference_fields(event: &Value) -> Option<ProfileReinferenceFields> {
+    let to_profile = event
+        .get("to_profile")
+        .or_else(|| event.get("profile"))
+        .or_else(|| event.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    Some(ProfileReinferenceFields {
+        from_profile: event
+            .get("from_profile")
+            .and_then(Value::as_str)
+            .unwrap_or("generic")
+            .to_string(),
+        to_profile,
+        source: event
+            .get("from")
+            .and_then(Value::as_str)
+            .unwrap_or("workspace")
+            .to_string(),
+        at_phase: event.get("at_phase").and_then(Value::as_u64),
+        requested_port: event
+            .get("requested_port")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn latest_requested_port(events: &[Value]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| event.get("requested_port").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn event_string_array(event: &Value, field: &str) -> Vec<String> {
@@ -1622,6 +1725,7 @@ fn render_completion_summary(
         format!("Runtime acceptance: {}", projection.runtime_acceptance),
         format!("Final acceptance: {}", projection.final_acceptance),
         format!("Release gate: {}", projection.release_gate),
+        format!("Requested port: {}", missing_if_empty(&projection.requested_port)),
         format!(
             "Evidence arbitration: {}",
             missing_if_empty(&projection.evidence_arbitration_summary)
@@ -1858,12 +1962,42 @@ fn render_tui_command_completion_summary(
         insert_at,
         format!("Completion status: {}", projection.status),
     );
+    if let Some(line) = latest_profile_promotion_summary_line(events)
+        && !lines.iter().any(|existing| existing == &line)
+    {
+        let profile_index = lines
+            .iter()
+            .position(|line| line.starts_with("Profile:"))
+            .unwrap_or(lines.len());
+        lines.insert(profile_index, line);
+    }
     lines.push(String::new());
     lines.push(render_phase_breakdown_for_summary(
         &phase_breakdown_for_tui_summary(events, previous_summary, terminal_status),
         terminal_status,
     ));
     lines.join("\n")
+}
+
+fn latest_profile_promotion_summary_line(events: &[Value]) -> Option<String> {
+    let fields = events
+        .iter()
+        .rev()
+        .find(|event| {
+            event
+                .get("event")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "profile_reinferred")
+        })
+        .and_then(profile_reinference_fields)?;
+    let phase = fields
+        .at_phase
+        .map(|phase| format!(", phase {phase}"))
+        .unwrap_or_default();
+    Some(format!(
+        "Profile promoted: {} -> {} ({} evidence{})",
+        fields.from_profile, fields.to_profile, fields.source, phase
+    ))
 }
 
 fn render_phase_breakdown_for_summary(breakdown: &PhaseBreakdown, terminal_status: &str) -> String {
@@ -2247,6 +2381,32 @@ mod tests {
         assert!(summary.contains("completion_contract_path_merge_enabled=true"));
         assert!(summary.contains("external_contract_checked=true"));
         assert!(summary.contains("external_contract_ok=true"));
+    }
+
+    #[test]
+    fn latest_completion_snapshot_reflects_profile_reinferred_after_generic_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "profile_reinferred",
+                "from_profile": "generic",
+                "to_profile": "nextjs",
+                "from": "workspace",
+                "at_phase": 1,
+                "requested_port": "3011 (goal)",
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+
+        assert_eq!(snapshot.profile, "nextjs");
+        assert_eq!(snapshot.profile_inferred, "nextjs");
+        assert_eq!(snapshot.profile_inference_source, "workspace");
+        assert_eq!(snapshot.requested_port, "3011 (goal)");
+        assert_eq!(snapshot.assurance_level, "full");
+        assert!(snapshot.assurance_reason.is_empty());
     }
 
     #[test]

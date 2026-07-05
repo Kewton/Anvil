@@ -614,6 +614,7 @@ struct ProfilePromotion {
     id: String,
     at_phase: usize,
     phase_id: String,
+    requested_port: Option<String>,
     delta_capabilities: Vec<String>,
     delta_requirements: Vec<String>,
 }
@@ -918,6 +919,12 @@ fn try_promote_profile_at_phase_boundary(
         id: promoted,
         at_phase: index + 1,
         phase_id: phase.id.clone(),
+        requested_port: effective_requested_port(
+            &plan.profile,
+            &plan.goal,
+            Some(&ultra_plan_phase_signal_text(plan)),
+        )
+        .map(|requested| requested.telemetry),
         delta_capabilities,
         delta_requirements,
     };
@@ -946,6 +953,7 @@ fn emit_profile_reinferred(config: &Config, promotion: &ProfilePromotion) {
             "from": "workspace",
             "from_profile": "generic",
             "to_profile": promotion.id,
+            "requested_port": promotion.requested_port.clone(),
             "delta_capabilities": promotion.delta_capabilities.clone(),
             "delta_requirements": promotion.delta_requirements.clone(),
         }),
