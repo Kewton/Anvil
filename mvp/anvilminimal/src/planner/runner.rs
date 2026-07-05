@@ -21,7 +21,8 @@ use crate::minimal_loop::build_verifier::{
     BuildVerifierStatus, CompileError, emit_dependency_build_lifecycle,
 };
 use crate::minimal_loop::completion::{
-    CompletionContract, compile_error_repair_guidance, evidence_hint_tokens_for_goal,
+    CompileRepairPromptProtection, CompletionContract, compile_error_repair_guidance,
+    compile_repair_prompt_section, evidence_hint_tokens_for_goal,
 };
 use crate::minimal_loop::dependency_setup::{
     self, NodeDependencySetupAuthority, NodeDependencySetupRequirement, NodeDependencySetupStatus,
@@ -93,6 +94,7 @@ const STEP_REPAIR_MAX_TURNS: usize = 4;
 const STEP_REPAIR_IDENTICAL_NO_CHANGE_LIMIT: usize = 2;
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
 const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 2;
+const FINAL_ACCEPTANCE_COMPILE_NO_SNAPSHOT_EXTRA_ATTEMPTS: usize = 1;
 const FINAL_ACCEPTANCE_REPAIR_WALL_CLOCK_CAP: Duration = Duration::from_secs(240);
 const NEXTJS_DEV_SERVER_DEFAULT_PORT: u16 = 3011;
 const NEXTJS_DEV_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(8);
@@ -1852,6 +1854,9 @@ fn run_step(
     if current_reachability.reachable {
         for attempt in 1..=STEP_REPAIR_MAX_TURNS {
             context.repair_attempt = Some(attempt);
+            context.compile_reanchored_retry =
+                no_change_repairs > 0 && !current_report.compile_errors.is_empty();
+            context.compile_narrow_no_snapshot_retry = false;
             let repair_prompt =
                 build_repair_prompt_with_context(&step.id, &current_report, &context);
             let repair = run_session_with_outcome_with_options(
@@ -4125,7 +4130,14 @@ pub fn run_ultra_plan_with_ui(
         let mut attempts_run = 0;
         let mut exhausted_reason = "bounded_repair_exhausted".to_string();
         let mut compile_no_source_change_count = 0usize;
-        for attempt in 1..=FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS {
+        let mut compile_no_snapshot_narrow_retry_used = false;
+        let mut max_repair_attempts = FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS;
+        for attempt in 1..=FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS
+            + FINAL_ACCEPTANCE_COMPILE_NO_SNAPSHOT_EXTRA_ATTEMPTS
+        {
+            if attempt > max_repair_attempts {
+                break;
+            }
             if repair_started.elapsed() > FINAL_ACCEPTANCE_REPAIR_WALL_CLOCK_CAP {
                 exhausted_reason = "bounded_repair_wall_clock_cap".to_string();
                 break;
@@ -4134,6 +4146,9 @@ pub fn run_ultra_plan_with_ui(
             let repair_target = classify_repair_target(&acceptance_report);
             let compile_reanchored_retry =
                 compile_no_source_change_count > 0 && !acceptance_report.compile_errors.is_empty();
+            let compile_narrow_no_snapshot_retry = compile_no_snapshot_narrow_retry_used
+                && compile_no_source_change_count >= FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS
+                && !acceptance_report.compile_errors.is_empty();
             let expected_paths =
                 final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
             let before_missing_keys = verification_missing_signals(&acceptance_report);
@@ -4155,6 +4170,7 @@ pub fn run_ultra_plan_with_ui(
                 &plan_adherence_report(plan, &config.workspace_root).missing,
                 (attempt, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
                 compile_reanchored_retry,
+                compile_narrow_no_snapshot_retry,
             );
             eval_events::emit(
                 config.eval_events_path.as_deref(),
@@ -4175,6 +4191,7 @@ pub fn run_ultra_plan_with_ui(
                     "max_iterations": repair_config.max_iterations,
                     "shared_execution_session": true,
                     "compile_reanchored_retry": compile_reanchored_retry,
+                    "compile_narrow_no_snapshot_retry": compile_narrow_no_snapshot_retry,
                     "session_message_count": ultra_session.messages.len(),
                 }),
             );
@@ -4207,10 +4224,29 @@ pub fn run_ultra_plan_with_ui(
                                 "compile_errors": acceptance_report.compile_errors.clone(),
                                 "repair_error": eval_events::body_snippet(&err_text),
                                 "reanchored_retry": compile_no_source_change_count == 1,
+                                "narrow_no_snapshot_retry": compile_narrow_no_snapshot_retry,
                                 "proceed_to_rollback": compile_no_source_change_count >= 2,
                             }),
                         );
                         if compile_no_source_change_count >= 2 {
+                            if should_run_compile_no_snapshot_narrow_retry(
+                                config,
+                                &acceptance_report,
+                                compile_no_snapshot_narrow_retry_used,
+                            ) {
+                                compile_no_snapshot_narrow_retry_used = true;
+                                max_repair_attempts = FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS
+                                    + FINAL_ACCEPTANCE_COMPILE_NO_SNAPSHOT_EXTRA_ATTEMPTS;
+                                exhausted_reason =
+                                    "compile_repair_no_snapshot_narrow_retry".to_string();
+                                emit_compile_no_snapshot_narrow_retry(
+                                    config,
+                                    attempt,
+                                    &acceptance_report,
+                                    "repair_error",
+                                );
+                                continue;
+                            }
                             break;
                         }
                         continue;
@@ -4320,10 +4356,28 @@ pub fn run_ultra_plan_with_ui(
                         "repair_target": repair_target.as_str(),
                         "compile_errors": acceptance_report.compile_errors.clone(),
                         "reanchored_retry": compile_no_source_change_count == 1,
+                        "narrow_no_snapshot_retry": compile_narrow_no_snapshot_retry,
                         "proceed_to_rollback": compile_no_source_change_count >= 2,
                     }),
                 );
                 if compile_no_source_change_count >= 2 {
+                    if should_run_compile_no_snapshot_narrow_retry(
+                        config,
+                        &acceptance_report,
+                        compile_no_snapshot_narrow_retry_used,
+                    ) {
+                        compile_no_snapshot_narrow_retry_used = true;
+                        max_repair_attempts = FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS
+                            + FINAL_ACCEPTANCE_COMPILE_NO_SNAPSHOT_EXTRA_ATTEMPTS;
+                        exhausted_reason = "compile_repair_no_snapshot_narrow_retry".to_string();
+                        emit_compile_no_snapshot_narrow_retry(
+                            config,
+                            attempt,
+                            &acceptance_report,
+                            "no_source_change",
+                        );
+                        continue;
+                    }
                     break;
                 }
                 continue;
@@ -4406,9 +4460,13 @@ pub fn run_ultra_plan_with_ui(
             let reason = behavior_failure
                 .clone()
                 .unwrap_or_else(|| report_reason.clone());
-            let failure_kind = behavior_failure
-                .clone()
-                .unwrap_or_else(|| "final_acceptance_repair_exhausted".to_string());
+            let failure_kind = if !acceptance_report.compile_errors.is_empty() {
+                "implementation_compile_error".to_string()
+            } else {
+                behavior_failure
+                    .clone()
+                    .unwrap_or_else(|| "final_acceptance_repair_exhausted".to_string())
+            };
             let handoff_reason =
                 final_acceptance_recovery_reason(&acceptance_report, &reason, &exhausted_reason);
             let repair_targets =
@@ -11328,6 +11386,51 @@ fn emit_compile_rollback_skipped(
     );
 }
 
+fn should_run_compile_no_snapshot_narrow_retry(
+    config: &Config,
+    report: &VerificationReport,
+    already_used: bool,
+) -> bool {
+    !already_used
+        && !report.compile_errors.is_empty()
+        && !compile_rollback_snapshot_available(config, report)
+}
+
+fn compile_rollback_snapshot_available(config: &Config, report: &VerificationReport) -> bool {
+    let failing_paths = compile_error_paths(&report.compile_errors)
+        .into_iter()
+        .filter_map(|path| safe_source_rel_path(&path))
+        .collect::<Vec<_>>();
+    if failing_paths.is_empty() {
+        return false;
+    }
+    let Some(latest_dir) = snapshot_latest_dir(config) else {
+        return false;
+    };
+    failing_paths
+        .iter()
+        .all(|rel| latest_dir.join(rel).is_file())
+}
+
+fn emit_compile_no_snapshot_narrow_retry(
+    config: &Config,
+    attempt: usize,
+    report: &VerificationReport,
+    trigger: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "compile_no_snapshot_narrow_retry",
+            "attempt": attempt,
+            "next_attempt": attempt + 1,
+            "trigger": trigger,
+            "compile_errors": report.compile_errors.clone(),
+            "primary_reason": eval_events::body_snippet(&report.primary_reason()),
+        }),
+    );
+}
+
 fn phase_goal_one_liner(prompt: &str) -> String {
     let mut line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() > 180 {
@@ -11365,6 +11468,7 @@ fn final_acceptance_repair_prompt(
     adherence_missing: &[String],
     repair_budget: (usize, usize),
     compile_reanchored_retry: bool,
+    compile_narrow_no_snapshot_retry: bool,
 ) -> String {
     let (attempt, max_attempts) = repair_budget;
     let expected = render_prompt_bullets(expected_paths);
@@ -11378,17 +11482,13 @@ fn final_acceptance_repair_prompt(
         final_acceptance_behavioral_probe_context(report, expected_paths);
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
-    let compile_errors =
-        render_prompt_bullets(&compile_error_repair_guidance(&report.compile_errors));
-    let compile_retry_mandate = if compile_reanchored_retry && !report.compile_errors.is_empty() {
-        let paths = compile_error_paths(&report.compile_errors).join(", ");
-        format!(
-            "Compile repair retry mandate:\n- The previous compile repair turn changed no files.\n- You MUST edit one of these source files now using the edit tool: {}.\n- A prose-only reply or changed_paths=[] fails this repair.\n\n",
-            missing_if_empty(&paths)
-        )
-    } else {
-        String::new()
-    };
+    let compile_errors = compile_repair_prompt_section(
+        &report.compile_errors,
+        CompileRepairPromptProtection {
+            reanchored_retry: compile_reanchored_retry,
+            narrow_no_snapshot_retry: compile_narrow_no_snapshot_retry,
+        },
+    );
     format!(
         "Repair the final acceptance failure for the current ultra run.\n\n\
 Original ultra goal:\n{goal}\n\n\
@@ -11400,7 +11500,6 @@ Final acceptance failure:\n\
 Missing paths:\n{missing}\n\n\
 Dependency failures:\n{dependencies}\n\n\
 Compile errors:\n{compile_errors}\n\n\
-{compile_retry_mandate}\
 Command failures:\n{command_failures}\n\n\
 Profile failures:\n{profile_failures}\n\n\
 {behavioral_probe_context}\
@@ -11422,7 +11521,6 @@ Bounded repair rules:\n\
         missing = missing,
         dependencies = dependencies,
         compile_errors = compile_errors,
-        compile_retry_mandate = compile_retry_mandate,
         command_failures = command_failures,
         profile_failures = profile_failures,
         behavioral_probe_context = behavioral_probe_context,
@@ -17620,6 +17718,7 @@ if __name__ == "__main__":
             &[],
             (1, 2),
             false,
+            false,
         );
         assert!(prompt.contains("start_transition_missing"), "{prompt}");
         assert!(!prompt.contains("interaction_evidence_missing"), "{prompt}");
@@ -18016,6 +18115,7 @@ if __name__ == "__main__":
             &[],
             (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
             false,
+            false,
         );
         assert!(
             repair_prompt.contains(
@@ -18114,6 +18214,7 @@ if __name__ == "__main__":
                 &expected_paths,
                 &[],
                 (attempt, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+                false,
                 false,
             );
             let outcome = run_final_acceptance_repair_with_ultra_session(
@@ -18633,6 +18734,7 @@ if __name__ == "__main__":
                 "pause".to_string(),
             ],
             (1, 1),
+            false,
             false,
         );
 
@@ -20004,7 +20106,7 @@ export default function Page() {
                 verify: Vec::new(),
             }],
         };
-        let replies = (0..10)
+        let replies = (0..20)
             .map(|_| AssistantReply {
                 content: String::new(),
                 tool_calls: vec![crate::state::ToolCall::new(
@@ -20019,7 +20121,7 @@ export default function Page() {
         let err = run_step_plan(&mut fake, &plan, &cfg)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("max_iterations (8)"));
+        assert!(err.contains("max_iterations (8)"), "{err}");
     }
 
     #[test]
@@ -21431,6 +21533,7 @@ exit 2\n",
             &[],
             (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
             false,
+            false,
         );
         let mut execution = FakeClient::new(vec![
             AssistantReply {
@@ -21483,6 +21586,14 @@ exit 2\n",
             repair_prompt.contains("src/components/SpaceInvaders.tsx:137:28"),
             "{repair_prompt}"
         );
+        assert!(
+            repair_prompt.contains("Compile repair edit mandate"),
+            "{repair_prompt}"
+        );
+        assert!(
+            repair_prompt.contains("You MUST modify src/components/SpaceInvaders.tsx"),
+            "{repair_prompt}"
+        );
         assert!(repair_prompt.contains("define reset"), "{repair_prompt}");
         assert!(
             repair_prompt.contains("replace the reference with an existing handler"),
@@ -21514,7 +21625,7 @@ exit 2\n",
 
     #[test]
     #[cfg(unix)]
-    fn compile_repair_no_edit_reanchors_once_then_no_snapshot_path_fails_as_before() {
+    fn compile_repair_no_edit_reanchors_then_no_snapshot_gets_narrow_retry() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join(".anvil/runs/no-snapshot/events.jsonl");
         write_static_compile_repair_workspace(dir.path(), static_good_page_source());
@@ -21534,6 +21645,8 @@ exit 2\n",
             AssistantReply::text("It needs a syntax fix."),
             AssistantReply::text("The compile error remains in src/app/page.tsx."),
             AssistantReply::text("It still needs a syntax fix."),
+            AssistantReply::text("Only fix the compile frame in src/app/page.tsx."),
+            AssistantReply::text("No restructuring is needed."),
         ]);
 
         let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
@@ -21544,12 +21657,14 @@ exit 2\n",
             err.contains("ultra final acceptance failed after bounded repair"),
             "{err}"
         );
+        assert!(err.contains("implementation_compile_error"), "{err}");
+        assert!(err.contains("src/app/page.tsx"), "{err}");
         let event_text = std::fs::read_to_string(&events).unwrap();
         assert_eq!(
             event_text
                 .matches("\"event\":\"final_acceptance_repair_no_source_change\"")
                 .count(),
-            2,
+            3,
             "{event_text}"
         );
         assert!(
@@ -21557,7 +21672,23 @@ exit 2\n",
             "{event_text}"
         );
         assert!(
+            event_text.contains("\"event\":\"compile_no_snapshot_narrow_retry\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"compile_narrow_no_snapshot_retry\":true"),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"narrow_no_snapshot_retry\":true"),
+            "{event_text}"
+        );
+        assert!(
             event_text.contains("\"failure_kind\":\"compile_repair_no_source_change\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"failure_kind\":\"implementation_compile_error\""),
             "{event_text}"
         );
         assert!(

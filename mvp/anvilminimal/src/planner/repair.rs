@@ -1,6 +1,9 @@
 use std::path::Path;
 
 use crate::eval_events;
+use crate::minimal_loop::completion::{
+    CompileRepairPromptProtection, compile_repair_prompt_section,
+};
 use crate::minimal_loop::repair_target::classify_repair_target;
 use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
 use crate::planner::verify::VerificationReport;
@@ -22,6 +25,8 @@ pub struct RepairContext {
     pub initial_stop_reason: Option<String>,
     pub repair_stop_reason: Option<String>,
     pub progress_warning: Option<String>,
+    pub compile_reanchored_retry: bool,
+    pub compile_narrow_no_snapshot_retry: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,6 +85,16 @@ Make the smallest bounded change, then stop.",
     if !context.verify_commands.is_empty() {
         prompt.push_str("\n\nVerification commands for this step:\n");
         prompt.push_str(&bullet_list(&context.verify_commands));
+    }
+    if !report.compile_errors.is_empty() {
+        prompt.push_str("\n\nCompile errors:\n");
+        prompt.push_str(&compile_repair_prompt_section(
+            &report.compile_errors,
+            CompileRepairPromptProtection {
+                reanchored_retry: context.compile_reanchored_retry,
+                narrow_no_snapshot_retry: context.compile_narrow_no_snapshot_retry,
+            },
+        ));
     }
     if let Some(expected) = &context.expected_result {
         prompt.push_str("\n\nExpected verification result:\n");
@@ -373,6 +388,7 @@ Primary failure: {}\n\n\
 Repair target: {}\n\n\
 ## Missing Paths\n{}\n\n\
 ## Command Failures\n{}\n\n\
+## Compile Errors\n{}\n\n\
 ## Verifier Command False Negatives\n{}\n\n\
 ## Dependency Missing\n{}\n\n\
 ## Profile Failures\n{}\n\n\
@@ -401,6 +417,13 @@ Suggested command:\n\
                 .iter()
                 .map(|failure| format!("{}: {}", failure.command, failure.reason))
                 .collect::<Vec<_>>()
+        ),
+        compile_repair_prompt_section(
+            &report.compile_errors,
+            CompileRepairPromptProtection {
+                reanchored_retry: context.compile_reanchored_retry,
+                narrow_no_snapshot_retry: context.compile_narrow_no_snapshot_retry,
+            }
         ),
         list_or_none(
             &report
@@ -463,6 +486,7 @@ fn shell_quote_token(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::minimal_loop::build_verifier::CompileError;
 
     #[test]
     fn repair_exhausted_report_contains_missing_paths() {
@@ -517,6 +541,42 @@ mod tests {
         assert!(prompt.contains("Expected verification result:"));
         assert!(prompt.contains("attempt 1/4"));
         assert!(prompt.contains("Repair target:"));
+    }
+
+    #[test]
+    fn repair_prompt_includes_compile_frame_excerpt_and_edit_mandate() {
+        let mut report = VerificationReport::pass();
+        report.push_compile_errors(
+            "npm run build",
+            vec![CompileError {
+                path: "src/app/page.tsx".to_string(),
+                line: 801,
+                column: 35,
+                message: "Type error: Expected 0 arguments, but got 1.".to_string(),
+                excerpt:
+                    "799 | if (inv.hp <= 0) {\n800 |   // Destroyed!\n801 |   synth.playExplosion(false);\n|                         ^"
+                        .to_string(),
+                symbol: None,
+                route_bound: Some(true),
+            }],
+        );
+        let context = RepairContext {
+            compile_reanchored_retry: true,
+            ..RepairContext::default()
+        };
+        let prompt = build_repair_prompt_with_context("verify-nextjs-build", &report, &context);
+        assert!(
+            prompt.contains("Compile error: src/app/page.tsx:801:35"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Compile error excerpt"), "{prompt}");
+        assert!(prompt.contains("synth.playExplosion(false)"), "{prompt}");
+        assert!(
+            prompt.contains("You MUST modify src/app/page.tsx"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Compile repair edit mandate"), "{prompt}");
+        assert!(prompt.contains("Compile repair re-anchor"), "{prompt}");
     }
 
     #[test]

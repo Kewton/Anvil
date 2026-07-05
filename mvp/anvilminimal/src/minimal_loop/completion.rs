@@ -621,8 +621,16 @@ pub(crate) fn format_verify_feedback_with_contract(
             report.missing_paths.join(", ")
         ));
     }
-    for guidance in compile_error_repair_guidance(&report.compile_errors) {
-        lines.push(guidance);
+    if !report.compile_errors.is_empty() {
+        lines.push("Compile repair details:".to_string());
+        lines.extend(
+            compile_repair_prompt_section(
+                &report.compile_errors,
+                CompileRepairPromptProtection::default(),
+            )
+            .lines()
+            .map(str::to_string),
+        );
     }
     for reason in &report.dependency_missing {
         lines.push(format!("Dependency missing: {reason}"));
@@ -781,6 +789,57 @@ pub(crate) fn compile_error_repair_guidance(errors: &[CompileError]) -> Vec<Stri
             lines
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CompileRepairPromptProtection {
+    pub reanchored_retry: bool,
+    pub narrow_no_snapshot_retry: bool,
+}
+
+pub(crate) fn compile_repair_prompt_section(
+    errors: &[CompileError],
+    protection: CompileRepairPromptProtection,
+) -> String {
+    if errors.is_empty() {
+        return "- none".to_string();
+    }
+    let mut lines = compile_error_repair_guidance(errors);
+    let paths = errors
+        .iter()
+        .map(|error| error.path.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    lines.push(format!(
+        "Compile repair edit mandate: edit one of these source files using the edit tool: {}.",
+        paths.join(", ")
+    ));
+    lines.push(
+        "Do not answer in prose only; a repair response without a source edit fails this compile repair."
+            .to_string(),
+    );
+    if protection.reanchored_retry {
+        lines.push(format!(
+            "Compile repair re-anchor: the previous compile repair turn changed no files. You MUST edit one of these source files now: {}.",
+            paths.join(", ")
+        ));
+    }
+    if protection.narrow_no_snapshot_retry {
+        lines.push(
+            "No rollback snapshot is available for this compile failure. This is one narrow compile-only repair turn: fix these lines; do not restructure."
+                .to_string(),
+        );
+        lines.push(
+            "Use ONLY the compile error frames above as the repair scope; avoid unrelated cleanup, redesign, dependency churn, or feature work."
+                .to_string(),
+        );
+    }
+    lines
+        .into_iter()
+        .map(|line| format!("- {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn normalize_unique_list(values: Vec<String>) -> Vec<String> {
