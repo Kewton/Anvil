@@ -19,6 +19,7 @@ const SANITIZED_GOAL_MAX_CHARS: usize = 600;
 pub struct SanitizerReport {
     pub goal_truncations: Vec<SanitizedGoalTruncationRecord>,
     pub normalized_commands: Vec<SanitizedCommandNormalizationRecord>,
+    pub shell_control_splits: Vec<SanitizedShellControlSplitRecord>,
     pub removed_commands: Vec<SanitizedCommandRecord>,
     pub substituted_commands: Vec<SanitizedSubstitutionRecord>,
     pub moved_commands: Vec<SanitizedMoveRecord>,
@@ -47,6 +48,15 @@ pub struct SanitizedCommandNormalizationRecord {
     pub original_command: String,
     pub normalized_command: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedShellControlSplitRecord {
+    pub kind: String,
+    pub step_id: String,
+    pub original_command: String,
+    pub fragments: Vec<String>,
+    pub dropped_fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +92,7 @@ impl SanitizerReport {
     pub fn is_empty(&self) -> bool {
         self.goal_truncations.is_empty()
             && self.normalized_commands.is_empty()
+            && self.shell_control_splits.is_empty()
             && self.removed_commands.is_empty()
             && self.substituted_commands.is_empty()
             && self.moved_commands.is_empty()
@@ -98,6 +109,7 @@ pub fn sanitize_step_plan_against_policy(
     let mut report = SanitizerReport::default();
     normalize_oversized_goal(plan, &mut report);
     normalize_repairable_verify_commands(plan, &mut report);
+    sanitize_shell_control_verify_commands(plan, &mut report);
     remove_setup_or_dev_server_verify_commands(plan, &mut report);
     let should_retype_manifest_step = !report.removed_commands.is_empty()
         || !diagnose_step_plan_dependency_order(plan, workspace_root).is_empty();
@@ -108,6 +120,166 @@ pub fn sanitize_step_plan_against_policy(
     normalize_empty_verify_steps(plan, &mut report);
     dedupe_verify_commands(plan);
     report
+}
+
+fn sanitize_shell_control_verify_commands(plan: &mut StepPlan, report: &mut SanitizerReport) {
+    for step in &mut plan.steps {
+        let original_verify = std::mem::take(&mut step.verify);
+        let mut sanitized = Vec::with_capacity(original_verify.len());
+        for command in original_verify {
+            let Some(split) = split_sanitizable_shell_control_verify_command(&command) else {
+                sanitized.push(command);
+                continue;
+            };
+            sanitized.extend(split.fragments.iter().cloned());
+            report
+                .shell_control_splits
+                .push(SanitizedShellControlSplitRecord {
+                    kind: "shell_control_split".to_string(),
+                    step_id: step.id.clone(),
+                    original_command: command,
+                    fragments: split.fragments,
+                    dropped_fallback: split.dropped_fallback,
+                });
+        }
+        step.verify = sanitized;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellControlSplit {
+    fragments: Vec<String>,
+    dropped_fallback: Option<String>,
+}
+
+fn split_sanitizable_shell_control_verify_command(command: &str) -> Option<ShellControlSplit> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (main, dropped_fallback) = split_once_outside_quotes(trimmed, "||")
+        .map(|(main, fallback)| {
+            (
+                main.trim(),
+                Some(fallback.trim().to_string()).filter(|value| !value.is_empty()),
+            )
+        })
+        .unwrap_or((trimmed, None));
+    let fragments = split_on_sequence_and_semicolon_outside_quotes(main)?;
+    if dropped_fallback.is_none() && fragments.len() <= 1 {
+        return None;
+    }
+    let mut normalized_fragments = Vec::with_capacity(fragments.len());
+    for fragment in fragments {
+        let normalized = normalize_shell_split_fragment(fragment)?;
+        normalized_fragments.push(normalized);
+    }
+    if normalized_fragments.is_empty() {
+        return None;
+    }
+    Some(ShellControlSplit {
+        fragments: normalized_fragments,
+        dropped_fallback,
+    })
+}
+
+fn normalize_shell_split_fragment(fragment: &str) -> Option<String> {
+    let diagnosis = diagnose_verify_command(fragment);
+    match diagnosis.violation {
+        Some(
+            VerifyCommandViolationKind::Empty | VerifyCommandViolationKind::ShellControlSyntax,
+        ) => None,
+        _ => Some(diagnosis.normalized),
+    }
+}
+
+fn split_once_outside_quotes<'a>(text: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    let index = find_outside_quotes(text, needle)?;
+    Some((&text[..index], &text[(index + needle.len())..]))
+}
+
+fn split_on_sequence_and_semicolon_outside_quotes(text: &str) -> Option<Vec<&str>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut single = false;
+    let mut double = false;
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match byte {
+            b'\'' if !double => {
+                single = !single;
+                index += 1;
+            }
+            b'"' if !single => {
+                double = !double;
+                index += 1;
+            }
+            b'&' if !single && !double && index + 1 < bytes.len() && bytes[index + 1] == b'&' => {
+                push_shell_split_fragment(text, start, index, &mut out)?;
+                index += 2;
+                start = index;
+            }
+            b';' if !single && !double => {
+                push_shell_split_fragment(text, start, index, &mut out)?;
+                index += 1;
+                start = index;
+            }
+            b'|' | b'<' | b'>' | b'`' | b'\n' | b'\r' | b'\\' if !single && !double => {
+                return None;
+            }
+            b'&' if !single && !double => return None,
+            b'$' if !single && !double && index + 1 < bytes.len() && bytes[index + 1] == b'(' => {
+                return None;
+            }
+            _ => index += 1,
+        }
+    }
+    if single || double {
+        return None;
+    }
+    push_shell_split_fragment(text, start, text.len(), &mut out)?;
+    Some(out)
+}
+
+fn push_shell_split_fragment<'a>(
+    text: &'a str,
+    start: usize,
+    end: usize,
+    out: &mut Vec<&'a str>,
+) -> Option<()> {
+    let fragment = text[start..end].trim();
+    if fragment.is_empty() {
+        return None;
+    }
+    out.push(fragment);
+    Some(())
+}
+
+fn find_outside_quotes(text: &str, needle: &str) -> Option<usize> {
+    let mut single = false;
+    let mut double = false;
+    let bytes = text.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' if !double => {
+                single = !single;
+                index += 1;
+            }
+            b'"' if !single => {
+                double = !double;
+                index += 1;
+            }
+            _ if !single && !double && bytes[index..].starts_with(needle_bytes) => {
+                return Some(index);
+            }
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn normalize_repairable_verify_commands(plan: &mut StepPlan, report: &mut SanitizerReport) {
@@ -708,6 +880,106 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
         assert!(
             lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
             "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn sanitizer_splits_shell_control_verify_commands_and_drops_fallback_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Verify content scaffold artifacts".to_string(),
+            steps: vec![PlanStep {
+                id: "verify-content-app".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify build and route artifacts".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string(), "package.json".to_string()],
+                verify: vec![
+                    r#"python -m compileall -q src && test -f src/app/page.tsx; grep -q "-p 3011" package.json || echo fallback"#.to_string(),
+                ],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.shell_control_splits.len(), 1);
+        assert_eq!(report.shell_control_splits[0].kind, "shell_control_split");
+        assert_eq!(
+            report.shell_control_splits[0].dropped_fallback.as_deref(),
+            Some("echo fallback")
+        );
+        assert_eq!(
+            plan.steps[0].verify,
+            vec![
+                "python -m compileall -q src",
+                "test -f src/app/page.tsx",
+                r#"grep -q -- "-p 3011" package.json"#,
+            ]
+        );
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+        let second = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+        assert!(second.is_empty(), "{second:?}");
+    }
+
+    #[test]
+    fn sanitizer_rechecks_split_fragments_with_existing_policy_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Create package manifest".to_string(),
+            steps: vec![PlanStep {
+                id: "create-manifest".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create package.json".to_string(),
+                expected_paths: vec!["package.json".to_string()],
+                verify: vec!["npm install && test -f package.json".to_string()],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.shell_control_splits.len(), 1);
+        assert_eq!(report.removed_commands.len(), 1);
+        assert_eq!(report.removed_commands[0].command, "npm install");
+        assert_eq!(plan.steps[0].kind, "setup");
+        assert_eq!(plan.steps[0].verify, vec!["test -f package.json"]);
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn sanitizer_leaves_pipes_for_existing_lint_retry_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Verify content scaffold artifacts".to_string(),
+            steps: vec![PlanStep {
+                id: "verify-content-app".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify build and route artifacts".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: vec!["npm run build | cat".to_string()],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+        let lint = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+
+        assert!(report.shell_control_splits.is_empty(), "{report:?}");
+        assert_eq!(plan.steps[0].verify, vec!["npm run build | cat"]);
+        assert!(
+            lint.errors.iter().any(|err| {
+                err.category == "verify_policy"
+                    && err
+                        .message
+                        .contains("verify command may not use shell control syntax")
+            }),
+            "{lint:?}"
         );
     }
 

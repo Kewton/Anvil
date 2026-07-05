@@ -10073,7 +10073,13 @@ fn emit_planner_plan_sanitized(
                 "kind": &record.kind,
                 "original_len": record.original_len,
                 "new_len": record.new_len,
-            })).collect::<Vec<_>>(),
+            })).chain(report.shell_control_splits.iter().map(|record| json!({
+                "kind": &record.kind,
+                "step_id": &record.step_id,
+                "original_command": eval_events::body_snippet(&record.original_command),
+                "fragments": record.fragments.iter().map(|fragment| eval_events::body_snippet(fragment)).collect::<Vec<_>>(),
+                "dropped_fallback": record.dropped_fallback.as_deref().map(eval_events::body_snippet),
+            }))).collect::<Vec<_>>(),
             "goal_truncations": report.goal_truncations.iter().map(|record| json!({
                 "kind": &record.kind,
                 "original_len": record.original_len,
@@ -10084,6 +10090,13 @@ fn emit_planner_plan_sanitized(
                 "original_command": eval_events::body_snippet(&record.original_command),
                 "normalized_command": eval_events::body_snippet(&record.normalized_command),
                 "reason": eval_events::body_snippet(&record.reason),
+            })).collect::<Vec<_>>(),
+            "shell_control_splits": report.shell_control_splits.iter().map(|record| json!({
+                "kind": &record.kind,
+                "step_id": &record.step_id,
+                "original_command": eval_events::body_snippet(&record.original_command),
+                "fragments": record.fragments.iter().map(|fragment| eval_events::body_snippet(fragment)).collect::<Vec<_>>(),
+                "dropped_fallback": record.dropped_fallback.as_deref().map(eval_events::body_snippet),
             })).collect::<Vec<_>>(),
             "removed_commands": report.removed_commands.iter().map(|record| json!({
                 "step_id": &record.step_id,
