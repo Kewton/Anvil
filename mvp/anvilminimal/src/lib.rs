@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+pub mod bounded_process;
 pub mod build_info;
 pub mod cli;
 pub mod config;
