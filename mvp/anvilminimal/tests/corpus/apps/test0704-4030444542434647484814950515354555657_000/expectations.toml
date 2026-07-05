@@ -1,0 +1,35 @@
+case_id = "test0704-4030444542434647484814950515354555657_000"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-4030444542434647484814950515354555657_000"
+required_paths = ["package.json", "app/page.tsx"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "user_input_or_action", "visible_state_change", "nextjs_route"]
+required_evidence = ["user_input_handler_evidence", "stateful_update_evidence", "visible_interactive_surface_evidence", "nextjs_route_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["メモアプリ", "memo"]
+
+[route_closure]
+include = ["app/page.tsx"]
+exclude = []
+
+[evidence]
+build_command_or_dependency_missing_boundary = "Strong"
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+# Declared-but-not-ready dependency fixture: package.json declares
+# tailwindcss/postcss/autoprefixer; source-only corpus intentionally omits
+# node_modules, preserving the instruction-58 reconciliation shape.
+expect = "build_failed"

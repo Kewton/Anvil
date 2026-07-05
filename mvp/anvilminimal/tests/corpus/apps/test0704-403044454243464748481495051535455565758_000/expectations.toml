@@ -1,0 +1,40 @@
+case_id = "test0704-403044454243464748481495051535455565758_000"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-403044454243464748481495051535455565758_000"
+required_paths = ["package.json", "src/app/page.tsx"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "user_input_or_action", "visible_state_change", "nextjs_route"]
+required_evidence = ["user_input_handler_evidence", "stateful_update_evidence", "visible_interactive_surface_evidence", "nextjs_route_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["メモアプリ", "memo"]
+
+[route_closure]
+include = ["src/app/page.tsx"]
+exclude = []
+
+[evidence]
+build_command_or_dependency_missing_boundary = "Strong"
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_passed"
+
+[probe]
+html_fixture = "fixtures/contract-hooks.html"
+probe_mode = "contract"
+contract_hook_status = "usable"
+primary_present = true
+restart_present = false
+first_candidate_text = "追加"
