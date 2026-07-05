@@ -22,11 +22,11 @@ Status: complete on 2026-07-05.
 
 | milestone | status | date | reference |
 |---|---|---|---|
-| G0 | complete | 2026-07-04 | Generic assurance scope established in [generality.md#scope-s](generality.md#scope-s). |
+| G0 | complete | 2026-07-04 | Generic assurance scope and named guarantees established in [generality.md#scope-s](generality.md#scope-s). |
 | G1 | complete | 2026-07-04 | Generic contract binding guarded by `generic_contract_bound` and runner tests. |
 | G2 | complete | 2026-07-04 | Known-manifest promotion covered by `generic_ultra_promotes_to_nextjs_after_workspace_manifest` and `generic_ultra_promotes_to_python_cli_after_pyproject_manifest`. |
-| G3 | complete | 2026-07-04 | Ambiguous no-profile UAT run `test0704-4030444542434647484814950515354_001`. |
-| G4 | complete | 2026-07-05 | Default-port policy, fifth UAT scenario, scope update, G3 corpus harvest, and this closure ledger. |
+| G3 | complete | 2026-07-05 | Ambiguous no-profile evidence includes static-tier fallback `test0704-4030444542434647484814950515354_001` and final promotion run `test0704-403044454243464748481495051535455565758_000`. |
+| G4 | complete | 2026-07-05 | Default-port policy, AMBIGUOUS runbook hardening, final G3 corpus harvest, and this closure ledger. |
 
 ## Promotion-Path Incident Chain
 

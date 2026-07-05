@@ -260,6 +260,27 @@ rg '"event":"dev_server_lifecycle"|"event":"browser_probe"|"event":"ultra_final_
 rg '"assurance_level":"full"|"final_acceptance_status":"full_success"|"release_gate_status":"pass"|"interaction_evidence_status":"passed"' "$events"
 ```
 
+Closure checklist:
+
+- Quote the actual `profile_reinferred` event line for any promoted run. If no
+  promotion happens, quote the absence check and the static-tier terminal line.
+- Quote the actual line carrying `contract_origin`. Promoted interactive runs
+  must show `contract_origin=promoted_union`.
+- Quote dependency reconciliation lines when dependency setup is triggered,
+  including the event that shows the dependency need and the event that shows
+  setup authority / install status.
+- Quote the actual browser readiness and interaction execution values:
+  `browser_readiness_status` or `browser_readiness_execution_status`, and
+  `interaction_evidence_status` or `interaction_evidence_execution_status`.
+  `not_applicable` is disqualifying for promoted interactive web runs.
+- Quote the earned-assurance line from `ultra_final_acceptance` or
+  `ultra_plan_complete`, including `assurance_level`,
+  `final_acceptance_status`, `release_gate_status`, and the gate-status fields
+  used to earn it.
+
+Reviewer rule: assurance labels are never accepted without their gate-status
+fields.
+
 Honest fallback:
 
 - If the planner scaffolds an unknown stack, static-tier termination is correct
