@@ -12,7 +12,7 @@ use anvilminimal::tui::status::UiStatus;
 use anvilminimal::tui::{InteractionUi, UiGuard};
 use serde_json::{Value, json};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MatrixScenario {
     Nextjs,
     PythonCli,
@@ -158,7 +158,452 @@ fn conformance_matrix_runs_ultra_lifecycle_paths() {
         if matches!(scenario, MatrixScenario::GenericPromoted) {
             assert_has_event(&trace, "profile_reinferred");
         }
+        assert_conformance_contracts(&trace);
     }
+}
+
+#[test]
+fn conformance_negative_monotonic_rebind_catches_smaller_rebind() {
+    let trace = Trace {
+        scenario: MatrixScenario::GenericPromoted,
+        events: vec![
+            json!({
+                "event": "generic_contract_bound",
+                "required_capabilities": ["stateful_interaction", "user_input_or_action"],
+                "required_evidence": ["user_input_handler_evidence"],
+                "required_obligations": ["implementation"]
+            }),
+            json!({
+                "event": "profile_reinferred",
+                "contract_origin": "promoted_union",
+                "id": "nextjs"
+            }),
+            json!({
+                "event": "ultra_final_acceptance",
+                "contract_origin": "promoted_union",
+                "required_capabilities": ["stateful_interaction"],
+                "required_evidence": [],
+                "required_obligations": ["implementation"]
+            }),
+        ],
+        summary: format!(
+            "{}\nStatus: completed\n",
+            anvilminimal::build_info::summary_line()
+        ),
+        output: String::new(),
+    };
+
+    assert_contract_fails("monotonic_rebind", check_monotonic_rebind(&trace));
+}
+
+#[test]
+fn conformance_negative_earned_assurance_catches_disconnected_gate() {
+    let trace = Trace {
+        scenario: MatrixScenario::Nextjs,
+        events: vec![json!({
+            "event": "ultra_final_acceptance",
+            "assurance_level": "full",
+            "final_acceptance_status": "full_success",
+            "release_gate_status": "pass",
+            "browser_readiness_applicable": true,
+            "browser_readiness_execution_status": "not_applicable",
+            "browser_readiness_status": "not_applicable",
+            "interaction_evidence_applicable": true,
+            "interaction_evidence_execution_status": "not_applicable",
+            "interaction_evidence_status": "skipped"
+        })],
+        summary: format!(
+            "{}\nStatus: completed\n",
+            anvilminimal::build_info::summary_line()
+        ),
+        output: String::new(),
+    };
+
+    assert_contract_fails("earned_assurance", check_earned_assurance(&trace));
+}
+
+#[test]
+fn conformance_honest_terminal_covers_simulated_panic_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let events_path = root.join(".anvil/runs/conformance-panic/events.jsonl");
+    let plan = UltraPlan {
+        goal: "Create a panic probe artifact".to_string(),
+        profile: "generic".to_string(),
+        style: "default".to_string(),
+        intent: "create".to_string(),
+        phases: vec![
+            UltraPhase {
+                id: "panic".to_string(),
+                prompt: "Create the panic probe.".to_string(),
+            },
+            UltraPhase {
+                id: "unused".to_string(),
+                prompt: "This phase is never reached.".to_string(),
+            },
+        ],
+    };
+    std::fs::write(root.join("ultra.yaml"), render_ultra_plan(&plan)).unwrap();
+    let mut cfg = config(root.to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    let mut planner = FakeClient::new(
+        "planner",
+        vec![AssistantReply::text(step_plan_json(
+            "Create panic probe",
+            "implement",
+            vec!["panic.txt".to_string()],
+            Vec::new(),
+        ))],
+    );
+    let mut execution = PanicClient::new("execution", "simulated conformance panic");
+    let ui = FakeUi::default();
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = anvilminimal::tui::slash::handle_command(
+            "/run-ultra-plan ultra.yaml",
+            &cfg,
+            &mut planner,
+            &mut execution,
+            &ui,
+        );
+    }));
+    assert!(panic.is_err());
+
+    let trace = Trace {
+        scenario: MatrixScenario::GenericStatic,
+        events: read_events(&events_path),
+        summary: std::fs::read_to_string(events_path.parent().unwrap().join("summary.md"))
+            .unwrap_or_default(),
+        output: String::new(),
+    };
+    assert_has_event(&trace, "panic_caught");
+    check_honest_terminal(&trace).unwrap_or_else(|err| panic!("{err}"));
+}
+
+fn assert_conformance_contracts(trace: &Trace) {
+    for (name, result) in [
+        ("earned_assurance", check_earned_assurance(trace)),
+        ("monotonic_rebind", check_monotonic_rebind(trace)),
+        ("authority_symmetry", check_authority_symmetry(trace)),
+        ("detect_repair_pairing", check_detect_repair_pairing(trace)),
+        ("honest_terminal", check_honest_terminal(trace)),
+        ("oracle_tristate", check_oracle_tristate(trace)),
+        ("degradation_labeling", check_degradation_labeling(trace)),
+    ] {
+        result.unwrap_or_else(|err| panic!("{} failed for {}: {err}", name, trace.scenario.name()));
+    }
+}
+
+fn assert_contract_fails(name: &str, result: Result<(), String>) {
+    assert!(
+        result.is_err(),
+        "{name} checker accepted a deliberately invalid trace"
+    );
+}
+
+fn check_earned_assurance(trace: &Trace) -> Result<(), String> {
+    for event in completion_events(trace) {
+        if string_field(event, "assurance_level") != Some("full") {
+            continue;
+        }
+        let event_name = string_field(event, "event").unwrap_or("<unknown>");
+        if let Some(status) = string_field(event, "final_acceptance_status")
+            && !matches!(status, "full_success" | "pass")
+        {
+            return Err(format!(
+                "earned_assurance: {event_name} has full assurance but final_acceptance_status={status}"
+            ));
+        }
+        if let Some(status) = string_field(event, "release_gate_status")
+            && matches!(
+                status,
+                "partial" | "failed" | "not_applicable" | "not_checked"
+            )
+        {
+            let applicable = bool_field(event, "browser_readiness_applicable").unwrap_or(false)
+                || bool_field(event, "interaction_evidence_applicable").unwrap_or(false);
+            if applicable {
+                return Err(format!(
+                    "earned_assurance: {event_name} has full assurance but release_gate_status={status}"
+                ));
+            }
+        }
+        for gate in ["browser_readiness", "interaction_evidence"] {
+            let applicable_key = format!("{gate}_applicable");
+            if bool_field(event, &applicable_key) != Some(true) {
+                continue;
+            }
+            let status_key = format!("{gate}_status");
+            let execution_key = format!("{gate}_execution_status");
+            let status = string_field(event, &status_key).unwrap_or("");
+            let execution = string_field(event, &execution_key).unwrap_or("");
+            if disconnected_gate_status(status) || status.starts_with("unavailable:") {
+                return Err(format!(
+                    "earned_assurance: {event_name} has full assurance with disconnected {status_key}={status}"
+                ));
+            }
+            if !matches!(execution, "performed" | "performed_failed") {
+                return Err(format!(
+                    "earned_assurance: {event_name} has full assurance with non-executed {execution_key}={execution}"
+                ));
+            }
+            if status != "passed" {
+                return Err(format!(
+                    "earned_assurance: {event_name} has full assurance but {status_key}={status}"
+                ));
+            }
+        }
+        if string_array(event, "release_gate_reasons")
+            .iter()
+            .any(|reason| reason.contains("acceptance_gates_disconnected"))
+        {
+            return Err(format!(
+                "earned_assurance: {event_name} accepted full assurance despite acceptance_gates_disconnected"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_monotonic_rebind(trace: &Trace) -> Result<(), String> {
+    let Some(promotion_index) = trace
+        .events
+        .iter()
+        .position(|event| string_field(event, "event") == Some("profile_reinferred"))
+    else {
+        return Ok(());
+    };
+
+    let mut prior_capabilities = Vec::new();
+    let mut prior_evidence = Vec::new();
+    let mut prior_obligations = Vec::new();
+    for event in &trace.events[..promotion_index] {
+        if matches!(
+            string_field(event, "event"),
+            Some("generic_contract_bound" | "completion_contract_bound")
+        ) {
+            merge_strings(
+                &mut prior_capabilities,
+                string_array(event, "required_capabilities"),
+            );
+            merge_strings(
+                &mut prior_evidence,
+                string_array(event, "required_evidence"),
+            );
+            merge_strings(
+                &mut prior_obligations,
+                string_array(event, "required_obligations"),
+            );
+        }
+    }
+    if prior_capabilities.is_empty() && prior_evidence.is_empty() && prior_obligations.is_empty() {
+        return Ok(());
+    }
+    let final_contract = trace.events[promotion_index + 1..]
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                string_field(event, "event"),
+                Some(
+                    "ultra_final_acceptance" | "ultra_plan_complete" | "completion_contract_bound"
+                )
+            ) && (event.get("required_capabilities").is_some()
+                || event.get("required_evidence").is_some()
+                || event.get("required_obligations").is_some())
+        })
+        .ok_or_else(|| {
+            "monotonic_rebind: promoted trace has no final contract event".to_string()
+        })?;
+
+    assert_subset(
+        "monotonic_rebind",
+        "required_capabilities",
+        &prior_capabilities,
+        &string_array(final_contract, "required_capabilities"),
+    )?;
+    assert_subset(
+        "monotonic_rebind",
+        "required_evidence",
+        &prior_evidence,
+        &string_array(final_contract, "required_evidence"),
+    )?;
+    assert_subset(
+        "monotonic_rebind",
+        "required_obligations",
+        &prior_obligations,
+        &string_array(final_contract, "required_obligations"),
+    )
+}
+
+fn check_authority_symmetry(trace: &Trace) -> Result<(), String> {
+    for (index, event) in trace.events.iter().enumerate() {
+        if string_field(event, "event") != Some("dependency_build_lifecycle") {
+            continue;
+        }
+        let requires_setup = bool_field(event, "requires_dependency_setup").unwrap_or(false);
+        let setup_attempted = bool_field(event, "setup_attempted").unwrap_or(false);
+        let setup_authority = string_field(event, "setup_authority").unwrap_or("");
+        let setup_status = string_field(event, "setup_status").unwrap_or("");
+        let final_status = string_field(event, "final_status").unwrap_or("");
+        if setup_attempted && matches!(setup_authority, "" | "none") {
+            return Err(format!(
+                "authority_symmetry: setup attempted without sanctioned authority in {event}"
+            ));
+        }
+        if setup_attempted && matches!(setup_status, "setup_authority_missing" | "blocked") {
+            return Err(format!(
+                "authority_symmetry: setup attempted but setup_status={setup_status} in {event}"
+            ));
+        }
+        if requires_setup
+            && dependency_blocked_status(final_status)
+            && !has_later_handoff_or_repair(&trace.events[index + 1..])
+        {
+            return Err(format!(
+                "authority_symmetry: dependency need ended as {final_status} without install lifecycle or handoff"
+            ));
+        }
+    }
+
+    if trace
+        .events
+        .iter()
+        .any(|event| string_field(event, "event") == Some("profile_reinferred"))
+    {
+        let has_reconciliation = trace.events.iter().any(|event| {
+            string_field(event, "event") == Some("dependency_setup_reconciliation")
+                && matches!(
+                    string_field(event, "status"),
+                    Some("passed" | "blocked" | "failed")
+                )
+        });
+        if trace.scenario == MatrixScenario::GenericPromoted && !has_reconciliation {
+            return Err(
+                "authority_symmetry: promoted pathway did not record dependency reconciliation"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn check_detect_repair_pairing(trace: &Trace) -> Result<(), String> {
+    for (index, event) in trace.events.iter().enumerate() {
+        if !classification_requires_pairing(event) {
+            continue;
+        }
+        if event_has_repair_or_handoff(event)
+            || has_later_handoff_or_repair(&trace.events[index + 1..])
+        {
+            continue;
+        }
+        return Err(format!(
+            "detect_repair_pairing: failure classification stranded at event {event}"
+        ));
+    }
+    Ok(())
+}
+
+fn check_honest_terminal(trace: &Trace) -> Result<(), String> {
+    let stops = events_named(&trace.events, "tui_command_stop");
+    if stops.len() != 1 {
+        return Err(format!(
+            "honest_terminal: expected exactly one tui_command_stop, saw {}",
+            stops.len()
+        ));
+    }
+    let stop = stops[0];
+    let status = string_field(stop, "status").unwrap_or("");
+    if !matches!(
+        status,
+        "completed" | "partial" | "failed" | "aborted" | "interrupted"
+    ) {
+        return Err(format!(
+            "honest_terminal: status {status:?} outside closed set"
+        ));
+    }
+    if status == "running" || status.is_empty() {
+        return Err("honest_terminal: terminal status is absent/running".to_string());
+    }
+    for key in [
+        "build_commit",
+        "build_timestamp",
+        "effective_profile",
+        "contract_origin",
+    ] {
+        if string_field(stop, key).unwrap_or("").trim().is_empty() {
+            return Err(format!(
+                "honest_terminal: missing {key} on tui_command_stop"
+            ));
+        }
+    }
+    if !trace
+        .summary
+        .starts_with(&anvilminimal::build_info::summary_line())
+    {
+        return Err("honest_terminal: summary is missing Build stamp".to_string());
+    }
+    if !trace.summary.contains("Status: ") || trace.summary.contains("Status: running") {
+        return Err("honest_terminal: summary has absent/running status".to_string());
+    }
+    Ok(())
+}
+
+fn check_oracle_tristate(trace: &Trace) -> Result<(), String> {
+    for event in &trace.events {
+        let text = event.to_string();
+        if text.contains("OracleError")
+            && string_field(event, "repair_target") == Some("implementation")
+        {
+            return Err(format!(
+                "oracle_tristate: OracleError produced implementation repair target in {event}"
+            ));
+        }
+        let deterministic_failure = text.contains("deterministic")
+            && (bool_field(event, "ok") == Some(false)
+                || string_field(event, "status")
+                    .is_some_and(|status| matches!(status, "failed" | "incomplete")));
+        if deterministic_failure && !(text.contains("ArtifactFail") || text.contains("OracleError"))
+        {
+            return Err(format!(
+                "oracle_tristate: deterministic verify failure lacks ArtifactFail/OracleError in {event}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_degradation_labeling(trace: &Trace) -> Result<(), String> {
+    for event in completion_events(trace) {
+        let degraded_probe = ["browser_readiness_status", "interaction_evidence_status"]
+            .iter()
+            .filter_map(|key| string_field(event, key))
+            .any(|status| {
+                status.starts_with("unavailable:")
+                    || status.contains("probe_unavailable")
+                    || status.contains("probe_dependency_missing")
+            });
+        if !degraded_probe {
+            continue;
+        }
+        if string_field(event, "assurance_level") == Some("full") {
+            return Err(format!(
+                "degradation_labeling: probe unavailable path reported full assurance in {event}"
+            ));
+        }
+        let event_text = event.to_string();
+        let has_remediation = event_text.contains("remediation")
+            || event_text.contains("probe")
+            || trace.summary.contains("remediation")
+            || trace.summary.contains("probe");
+        if !has_remediation {
+            return Err(format!(
+                "degradation_labeling: degraded probe path lacks remediation text in {event}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn run_matrix_scenario(scenario: MatrixScenario) -> Trace {
@@ -433,6 +878,37 @@ impl ChatClient for FakeClient {
             anyhow::bail!("{} fake replies exhausted", self.label);
         }
         Ok(self.replies.remove(0))
+    }
+}
+
+struct PanicClient {
+    label: &'static str,
+    message: &'static str,
+}
+
+impl PanicClient {
+    fn new(label: &'static str, message: &'static str) -> Self {
+        Self { label, message }
+    }
+}
+
+impl ChatClient for PanicClient {
+    fn label(&self) -> &str {
+        self.label
+    }
+
+    fn supports_native_tools(&self, _model: &str) -> bool {
+        true
+    }
+
+    fn chat(
+        &mut self,
+        _model: &str,
+        _messages: &[ConversationMessage],
+        _tools: &[ToolSpec],
+        _native_tools_enabled: bool,
+    ) -> anyhow::Result<AssistantReply> {
+        panic!("{}", self.message);
     }
 }
 
@@ -902,6 +1378,116 @@ fn assert_has_event(trace: &Trace, name: &str) {
         trace.scenario.name(),
         render_events(&trace.events)
     );
+}
+
+fn completion_events(trace: &Trace) -> Vec<&Value> {
+    trace
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                string_field(event, "event"),
+                Some("ultra_final_acceptance" | "ultra_plan_complete" | "tui_command_stop")
+            )
+        })
+        .collect()
+}
+
+fn string_field<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
+    event.get(key).and_then(Value::as_str)
+}
+
+fn bool_field(event: &Value, key: &str) -> Option<bool> {
+    event.get(key).and_then(Value::as_bool)
+}
+
+fn string_array(event: &Value, key: &str) -> Vec<String> {
+    event
+        .get(key)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn disconnected_gate_status(status: &str) -> bool {
+    matches!(status, "" | "not_applicable" | "not_checked" | "skipped")
+}
+
+fn merge_strings(target: &mut Vec<String>, values: Vec<String>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
+fn assert_subset(
+    contract: &str,
+    key: &str,
+    expected_subset: &[String],
+    actual: &[String],
+) -> Result<(), String> {
+    for expected in expected_subset {
+        if !actual.contains(expected) {
+            return Err(format!(
+                "{contract}: {key} dropped prior requirement {expected:?}; final={actual:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn dependency_blocked_status(status: &str) -> bool {
+    status.contains("dependency_missing")
+        || status.contains("setup_blocked")
+        || status.contains("authority_required")
+        || status.contains("blocked")
+}
+
+fn classification_requires_pairing(event: &Value) -> bool {
+    let event_name = string_field(event, "event").unwrap_or("");
+    if matches!(
+        event_name,
+        "ultra_final_acceptance_failed"
+            | "step_verify_failure"
+            | "final_acceptance_repair_failed"
+            | "ultra_phase_failed"
+            | "repair_unreachable"
+    ) {
+        return true;
+    }
+    if event_name == "tui_command_stop" && bool_field(event, "ok") == Some(false) {
+        return true;
+    }
+    string_field(event, "failure_kind").is_some_and(|kind| !kind.is_empty() && kind != "none")
+}
+
+fn event_has_repair_or_handoff(event: &Value) -> bool {
+    string_field(event, "repair_target")
+        .is_some_and(|value| !value.is_empty() && value != "unknown" && value != "none")
+        || string_field(event, "recovery_handoff_kind").is_some_and(|value| !value.is_empty())
+        || string_field(event, "recovery_prompt_path").is_some_and(|value| !value.is_empty())
+        || string_field(event, "suggested_recovery_yaml_command")
+            .is_some_and(|value| !value.is_empty())
+        || string_field(event, "reason")
+            .is_some_and(|reason| reason.contains("dependency_setup_authority_required"))
+}
+
+fn has_later_handoff_or_repair(events: &[Value]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            string_field(event, "event"),
+            Some(
+                "repair_unreachable"
+                    | "recovery_prompt_saved"
+                    | "final_acceptance_repair_start"
+                    | "step_verify_repair"
+            )
+        ) || event_has_repair_or_handoff(event)
+    })
 }
 
 fn render_events(events: &[Value]) -> String {
