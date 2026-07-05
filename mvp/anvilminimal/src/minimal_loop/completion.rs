@@ -670,10 +670,17 @@ pub(crate) fn format_verify_feedback_with_contract(
             failure.command,
             eval_events::body_snippet(&failure.reason)
         ));
-        lines.push(
-            "The verify command is malformed; the artifact may already satisfy the requirement."
-                .to_string(),
-        );
+        if failure.reason.contains("verify_command_timeout") {
+            lines.push(
+                "The verify command hangs - replace it with a bounded check. Do not spend implementation-edit turns on this OracleError unless a separate artifact failure is present."
+                    .to_string(),
+            );
+        } else {
+            lines.push(
+                "The verify command is malformed; the artifact may already satisfy the requirement."
+                    .to_string(),
+            );
+        }
     }
     for failure in &report.profile_failures {
         lines.push(format!("Profile contract failed: {failure}"));

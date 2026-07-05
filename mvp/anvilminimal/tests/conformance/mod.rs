@@ -295,6 +295,10 @@ fn assert_conformance_contracts(trace: &Trace) {
             "bounded_provider_turns",
             check_bounded_provider_turns(trace),
         ),
+        (
+            "bounded_verify_commands",
+            check_bounded_verify_commands(trace),
+        ),
         ("oracle_tristate", check_oracle_tristate(trace)),
         ("degradation_labeling", check_degradation_labeling(trace)),
     ] {
@@ -622,6 +626,36 @@ fn check_bounded_provider_turns(trace: &Trace) -> Result<(), String> {
         .any(|event| string_field(event, "reason") == Some("provider_turn_timeout"))
     {
         return Err("bounded_provider_turns: provider timeout lacks honest loop_stop".to_string());
+    }
+    Ok(())
+}
+
+fn check_bounded_verify_commands(trace: &Trace) -> Result<(), String> {
+    for event in events_named(&trace.events, "verify_command_timeout") {
+        if event.to_string().contains("ArtifactFail") {
+            return Err(format!(
+                "bounded_verify_commands: verify timeout became ArtifactFail in {event}"
+            ));
+        }
+        if string_field(event, "classification") != Some("OracleError") {
+            return Err(format!(
+                "bounded_verify_commands: verify timeout lacks OracleError in {event}"
+            ));
+        }
+        if string_field(event, "repair_target") == Some("implementation") {
+            return Err(format!(
+                "bounded_verify_commands: verify timeout targeted implementation in {event}"
+            ));
+        }
+    }
+    for stop in events_named(&trace.events, "tui_command_stop") {
+        if string_field(stop, "status") == Some("interrupted")
+            && stop.to_string().contains("verify_command_timeout")
+        {
+            return Err(
+                "bounded_verify_commands: verify timeout required human interruption".to_string(),
+            );
+        }
     }
     Ok(())
 }

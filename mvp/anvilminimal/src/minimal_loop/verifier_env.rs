@@ -9,7 +9,8 @@ use anyhow::{Context, bail};
 
 use crate::tools::bash::{BashOutcome, BashOutcomeKind};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(120);
+const PYTHON_CLI_PYTEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_STREAM_BYTES: usize = 24_000;
 pub const ENV_NODE_ENV_CONFLICT_KIND: &str = "env_node_env_conflict";
 pub const ENV_NODE_ENV_REMEDIATION: &str = "unset NODE_ENV or run via env -u NODE_ENV";
@@ -156,7 +157,7 @@ pub fn with_env_node_env_remediation(output: &str) -> String {
 }
 
 pub fn run_checked(command: &str, root: &Path, offline: bool) -> anyhow::Result<String> {
-    let outcome = run_structured(command, root, offline, DEFAULT_TIMEOUT)?;
+    let outcome = run_structured(command, root, offline, DEFAULT_VERIFY_TIMEOUT)?;
     let formatted = format_outcome(&outcome);
     if !outcome.is_success() {
         if is_dev_or_start_verify_command(command) && is_env_node_env_conflict_output(&formatted) {
@@ -167,12 +168,45 @@ pub fn run_checked(command: &str, root: &Path, offline: bool) -> anyhow::Result<
     Ok(formatted)
 }
 
-pub(crate) fn run_structured_for_verify(
+pub(crate) fn run_structured_for_verify_with_profile(
+    command: &str,
+    root: &Path,
+    profile: Option<&str>,
+    offline: bool,
+) -> anyhow::Result<BashOutcome> {
+    run_structured(
+        command,
+        root,
+        offline,
+        verify_timeout_for_command(command, profile),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_structured_for_verify_with_timeout(
     command: &str,
     root: &Path,
     offline: bool,
+    timeout: Duration,
 ) -> anyhow::Result<BashOutcome> {
-    run_structured(command, root, offline, DEFAULT_TIMEOUT)
+    run_structured(command, root, offline, timeout)
+}
+
+pub(crate) fn verify_timeout_for_command(command: &str, profile: Option<&str>) -> Duration {
+    if profile == Some("python-cli") && is_pytest_verify_command(command) {
+        return PYTHON_CLI_PYTEST_TIMEOUT;
+    }
+    DEFAULT_VERIFY_TIMEOUT
+}
+
+fn is_pytest_verify_command(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower == "pytest"
+        || lower.starts_with("pytest ")
+        || lower == "python -m pytest"
+        || lower.starts_with("python -m pytest ")
+        || lower == "python3 -m pytest"
+        || lower.starts_with("python3 -m pytest ")
 }
 
 pub(crate) fn format_verify_outcome(outcome: &BashOutcome) -> String {
@@ -411,6 +445,34 @@ mod tests {
         let truncated = truncate_stream(&value);
         assert!(truncated.contains("verifier output truncated"));
         assert!(truncated.starts_with(&"x".repeat(MAX_STREAM_BYTES - 1)));
+    }
+
+    #[test]
+    fn verify_timeout_kills_process_group_and_reports_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = run_structured_for_verify_with_timeout(
+            "sleep 5",
+            dir.path(),
+            false,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.kind, BashOutcomeKind::Timeout);
+        assert!(outcome.elapsed_ms < 2_000, "{outcome:?}");
+        assert!(outcome.summary.contains("command timed out"), "{outcome:?}");
+    }
+
+    #[test]
+    fn python_cli_pytest_uses_profile_timeout_cap() {
+        assert_eq!(
+            verify_timeout_for_command("python -m pytest", Some("python-cli")),
+            PYTHON_CLI_PYTEST_TIMEOUT
+        );
+        assert_eq!(
+            verify_timeout_for_command("python -m pytest", Some("generic")),
+            DEFAULT_VERIFY_TIMEOUT
+        );
     }
 
     fn run_ignored_self_test(test_name: &str, envs: &[(&str, &str)]) -> std::process::ExitStatus {

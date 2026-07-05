@@ -7,7 +7,10 @@ use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::verifier_env;
 use crate::planner::step_plan::{ExpectedResult, PlanStep};
 use crate::tools::path_guard::{resolve_existing, validate_workspace_relative};
-use crate::{eval_events, tools::bash::BashOutcome};
+use crate::{
+    eval_events,
+    tools::bash::{BashOutcome, BashOutcomeKind},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyStatus {
@@ -488,7 +491,13 @@ fn verify_step_with_setup_observed_with_options(
             }
             continue;
         }
-        match run_verify_command_with_runtime_oracle(command, root, false, eval_events_path) {
+        match run_verify_command_with_runtime_oracle(
+            command,
+            root,
+            profile,
+            false,
+            eval_events_path,
+        ) {
             VerifyCommandRunResult::Passed {
                 output,
                 normalization,
@@ -584,16 +593,17 @@ enum VerifyCommandRunResult {
 fn run_verify_command_with_runtime_oracle(
     command: &str,
     root: &Path,
+    profile: Option<&str>,
     offline: bool,
     eval_events_path: Option<&Path>,
 ) -> VerifyCommandRunResult {
-    match verifier_env::run_structured_for_verify(command, root, offline) {
+    match verifier_env::run_structured_for_verify_with_profile(command, root, profile, offline) {
         Ok(outcome) if outcome.is_success() => VerifyCommandRunResult::Passed {
             output: verifier_env::format_verify_outcome(&outcome),
             normalization: None,
         },
         Ok(outcome) => {
-            handle_failed_verify_command(command, root, offline, eval_events_path, outcome)
+            handle_failed_verify_command(command, root, profile, offline, eval_events_path, outcome)
         }
         Err(err) => VerifyCommandRunResult::Failed {
             command: command.to_string(),
@@ -605,11 +615,23 @@ fn run_verify_command_with_runtime_oracle(
 fn handle_failed_verify_command(
     command: &str,
     root: &Path,
+    profile: Option<&str>,
     offline: bool,
     eval_events_path: Option<&Path>,
     outcome: BashOutcome,
 ) -> VerifyCommandRunResult {
     let formatted = verifier_env::format_verify_outcome(&outcome);
+    if outcome.kind == BashOutcomeKind::Timeout {
+        return handle_verify_command_timeout(
+            command,
+            root,
+            profile,
+            offline,
+            eval_events_path,
+            &formatted,
+            outcome.elapsed_ms,
+        );
+    }
     if !is_verify_command_tool_usage_error(command, &outcome) {
         return VerifyCommandRunResult::Failed {
             command: command.to_string(),
@@ -628,7 +650,12 @@ fn handle_failed_verify_command(
             reason: verify_command_false_negative_reason(command, &formatted),
         };
     }
-    match verifier_env::run_structured_for_verify(&repair.normalized, root, offline) {
+    match verifier_env::run_structured_for_verify_with_profile(
+        &repair.normalized,
+        root,
+        profile,
+        offline,
+    ) {
         Ok(repaired_outcome) if repaired_outcome.is_success() => {
             eval_events::emit(
                 eval_events_path,
@@ -670,6 +697,143 @@ fn handle_failed_verify_command(
             reason: verify_command_false_negative_reason(command, &err.to_string()),
         },
     }
+}
+
+fn handle_verify_command_timeout(
+    command: &str,
+    root: &Path,
+    profile: Option<&str>,
+    offline: bool,
+    eval_events_path: Option<&Path>,
+    formatted: &str,
+    elapsed_ms: u128,
+) -> VerifyCommandRunResult {
+    let substitution = verify_timeout_substitution(command, root, profile);
+    if let Some(substitution) = substitution {
+        eval_events::emit(
+            eval_events_path,
+            serde_json::json!({
+                "event": "verify_command_timeout",
+                "classification": "OracleError",
+                "repair_target": "verifier_command",
+                "command": eval_events::body_snippet(command),
+                "elapsed_ms": elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                "guidance": "the verify command hangs - replace it with a bounded check",
+                "substitution_attempted": true,
+                "substitution_command": eval_events::body_snippet(&substitution),
+            }),
+        );
+        match verifier_env::run_structured_for_verify_with_profile(
+            &substitution,
+            root,
+            profile,
+            offline,
+        ) {
+            Ok(substitution_outcome) if substitution_outcome.is_success() => {
+                eval_events::emit(
+                    eval_events_path,
+                    serde_json::json!({
+                        "event": "verify_command_timeout_substitution",
+                        "classification": "OracleError",
+                        "original": eval_events::body_snippet(command),
+                        "substitution": eval_events::body_snippet(&substitution),
+                        "status": "passed",
+                    }),
+                );
+                return VerifyCommandRunResult::Passed {
+                    output: verifier_env::format_verify_outcome(&substitution_outcome),
+                    normalization: Some(RuntimeCommandNormalization {
+                        original: command.to_string(),
+                        repaired: substitution,
+                    }),
+                };
+            }
+            Ok(substitution_outcome) => {
+                let substitution_formatted =
+                    verifier_env::format_verify_outcome(&substitution_outcome);
+                return VerifyCommandRunResult::FalseNegative {
+                    command: command.to_string(),
+                    reason: verify_command_timeout_reason(
+                        command,
+                        formatted,
+                        Some(&substitution),
+                        Some(&substitution_formatted),
+                    ),
+                };
+            }
+            Err(err) => {
+                return VerifyCommandRunResult::FalseNegative {
+                    command: command.to_string(),
+                    reason: verify_command_timeout_reason(
+                        command,
+                        formatted,
+                        Some(&substitution),
+                        Some(&err.to_string()),
+                    ),
+                };
+            }
+        }
+    }
+    eval_events::emit(
+        eval_events_path,
+        serde_json::json!({
+            "event": "verify_command_timeout",
+            "classification": "OracleError",
+            "repair_target": "verifier_command",
+            "command": eval_events::body_snippet(command),
+            "elapsed_ms": elapsed_ms.min(u128::from(u64::MAX)) as u64,
+            "guidance": "the verify command hangs - replace it with a bounded check",
+            "substitution_attempted": false,
+        }),
+    );
+    VerifyCommandRunResult::FalseNegative {
+        command: command.to_string(),
+        reason: verify_command_timeout_reason(command, formatted, None, None),
+    }
+}
+
+fn verify_command_timeout_reason(
+    command: &str,
+    tool_error: &str,
+    substitution: Option<&str>,
+    substitution_error: Option<&str>,
+) -> String {
+    let mut reason = format!(
+        "OracleError: verify_command_timeout:{command}: the verify command hangs - replace it with a bounded check; tool_error={}",
+        eval_events::body_snippet(tool_error)
+    );
+    if let Some(substitution) = substitution {
+        reason.push_str("; substitution_attempted=");
+        reason.push_str(substitution);
+    }
+    if let Some(error) = substitution_error {
+        reason.push_str("; substitution_error=");
+        reason.push_str(&eval_events::body_snippet(error));
+    }
+    reason
+}
+
+fn verify_timeout_substitution(
+    command: &str,
+    root: &Path,
+    profile: Option<&str>,
+) -> Option<String> {
+    if profile != Some("python-cli") || !is_pytest_verify_command(command) {
+        return None;
+    }
+    root.join("src")
+        .is_dir()
+        .then(|| "python -m compileall -q src".to_string())
+}
+
+fn is_pytest_verify_command(command: &str) -> bool {
+    let lower = command.trim().to_ascii_lowercase();
+    lower == "pytest"
+        || lower.starts_with("pytest ")
+        || lower == "python -m pytest"
+        || lower.starts_with("python -m pytest ")
+        || lower == "python3 -m pytest"
+        || lower.starts_with("python3 -m pytest ")
 }
 
 fn verify_command_false_negative_reason(command: &str, tool_error: &str) -> String {
@@ -2098,6 +2262,88 @@ mod tests {
             reachability.blocked_requirements,
             vec!["deterministic_verify_command_bug".to_string()]
         );
+    }
+
+    #[test]
+    fn verify_timeout_is_oracle_error_false_negative_not_implementation() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let outcome = verifier_env::run_structured_for_verify_with_timeout(
+            "sleep 5",
+            dir.path(),
+            false,
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+
+        let result = handle_failed_verify_command(
+            "sleep 5",
+            dir.path(),
+            None,
+            false,
+            Some(&events),
+            outcome,
+        );
+
+        let VerifyCommandRunResult::FalseNegative { command, reason } = result else {
+            panic!("expected false negative, got {result:?}");
+        };
+        assert_eq!(command, "sleep 5");
+        assert!(reason.contains("OracleError"), "{reason}");
+        assert!(
+            reason.contains("verify_command_timeout:sleep 5"),
+            "{reason}"
+        );
+        assert!(reason.contains("the verify command hangs"), "{reason}");
+        let mut report = VerificationReport::pass();
+        report.push_verifier_command_false_negative(command, reason);
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::VerifierCommand
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"verify_command_timeout\""));
+        assert!(event_text.contains("\"classification\":\"OracleError\""));
+        assert!(event_text.contains("\"repair_target\":\"verifier_command\""));
+        assert!(!event_text.contains("\"repair_target\":\"implementation\""));
+    }
+
+    #[test]
+    fn python_cli_pytest_timeout_uses_compileall_substitution_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        std::fs::create_dir_all(dir.path().join("src/anvil_app")).unwrap();
+        std::fs::write(dir.path().join("src/anvil_app/main.py"), "print('ok')\n").unwrap();
+        let timeout = BashOutcome {
+            kind: BashOutcomeKind::Timeout,
+            status: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            elapsed_ms: 60_000,
+            summary: "command timed out after 60000 ms".to_string(),
+        };
+
+        let result = handle_failed_verify_command(
+            "python -m pytest",
+            dir.path(),
+            Some("python-cli"),
+            false,
+            Some(&events),
+            timeout,
+        );
+
+        let VerifyCommandRunResult::Passed { normalization, .. } = result else {
+            panic!("expected substitution pass, got {result:?}");
+        };
+        let normalization = normalization.unwrap();
+        assert_eq!(normalization.original, "python -m pytest");
+        assert_eq!(normalization.repaired, "python -m compileall -q src");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"verify_command_timeout\""));
+        assert!(event_text.contains("\"classification\":\"OracleError\""));
+        assert!(event_text.contains("\"substitution_attempted\":true"));
+        assert!(event_text.contains("\"event\":\"verify_command_timeout_substitution\""));
+        assert!(event_text.contains("\"status\":\"passed\""));
     }
 
     fn run_ignored_verify_harness(test_name: &str) -> std::process::ExitStatus {
