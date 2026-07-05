@@ -13446,6 +13446,7 @@ export default function Memo() {
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
+        write_fake_npm_dependency_installer(dir.path());
         let goal = "Build an interactive browser game on port 3011";
         let plan = two_phase_ultra_plan(goal, "generic");
         let mut planner = FakeClient::new(vec![
@@ -13549,6 +13550,7 @@ export default function Memo() {
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
+        write_fake_npm_dependency_installer(dir.path());
         let goal = "ちょっとしたメモアプリを作って";
         let plan = two_phase_ultra_plan(goal, "generic");
         let mut planner = FakeClient::new(vec![
@@ -13987,6 +13989,7 @@ if __name__ == "__main__":
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
+        write_fake_npm_dependency_installer(dir.path());
         let goal = "Build an interactive browser game on port 3011";
         let plan = two_phase_ultra_plan(goal, "generic");
         let mut planner = FakeClient::new(vec![
@@ -14044,12 +14047,261 @@ if __name__ == "__main__":
     }
 
     #[test]
+    #[cfg(unix)]
+    fn promoted_manifest_repair_reconciles_dependencies_before_later_build_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        write_fake_npm_dependency_installer(dir.path());
+        let goal = "Build a static product page on port 3011";
+        let plan = two_phase_ultra_plan(goal, "generic");
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(single_write_step_plan_json(
+                "Create a lean package manifest",
+                "package.json",
+            )),
+            AssistantReply::text(generated_nextjs_artifact_plan_json_with_build_verify(
+                "Complete the promoted Next.js product page",
+            )),
+        ]);
+        let page = "export default function Page(){return <main className=\"min-h-screen\"><h1>Product Page</h1><p>Ready on port 3011</p></main>;}\n";
+        let mut final_calls = nextjs_interactive_app_tool_calls(page);
+        final_calls.remove(0);
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({
+                        "path": "package.json",
+                        "content": nextjs_lean_package_json()
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: final_calls,
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let package = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        assert!(package.contains("\"autoprefixer\""), "{package}");
+        assert!(dir.path().join("node_modules/autoprefixer").is_dir());
+        let reconciliations = events_with_name(&events, "dependency_setup_reconciliation");
+        assert!(
+            reconciliations.iter().any(|event| {
+                event.get("trigger").and_then(Value::as_str) == Some("promotion")
+                    && event.get("status").and_then(Value::as_str) == Some("passed")
+            }),
+            "{reconciliations:#?}"
+        );
+        assert!(
+            reconciliations.iter().any(|event| {
+                event.get("trigger").and_then(Value::as_str) == Some("manifest_repair")
+                    && event.get("status").and_then(Value::as_str) == Some("passed")
+                    && event_array_contains(event, "added", "node_modules/autoprefixer")
+            }),
+            "{reconciliations:#?}"
+        );
+        let build_lifecycles = events_with_name(&events, "dependency_build_lifecycle");
+        assert!(
+            build_lifecycles.iter().any(|event| {
+                event.get("step_id").and_then(Value::as_str) == Some("create-nextjs-artifacts")
+                    && event.get("setup_status").and_then(Value::as_str) == Some("not_required")
+                    && event.get("final_status").and_then(Value::as_str) == Some("passed")
+            }),
+            "{build_lifecycles:#?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(!event_text.contains("dependency_setup_authority_required"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ultra_run_level_authority_installs_missing_dependencies_without_current_setup_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        write_nextjs_profile_workspace(
+            dir.path(),
+            Some(nextjs_globals_css()),
+            Some(nextjs_postcss_config()),
+            Some(nextjs_tsconfig_json()),
+        );
+        crate::planner::profiles::nextjs::repair_manifest_coherence(
+            dir.path(),
+            "Verify promoted Next.js app",
+        )
+        .unwrap();
+        write_fake_npm_dependency_installer(dir.path());
+        let plan = StepPlan {
+            goal: "Verify promoted Next.js app".to_string(),
+            steps: vec![PlanStep {
+                id: "later-build".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify the existing promoted app build".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: vec!["npm run build".to_string()],
+            }],
+        };
+        let mut run_authority = UltraRunSetupAuthorityState::default();
+        run_authority.grant("profile_promotion");
+        let mut session = SessionSnapshot::new();
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("No source changes needed."),
+        ]);
+
+        let outcome = run_step_plan_with_session_with_ui_and_run_authority(
+            &mut fake,
+            &mut session,
+            &plan,
+            &cfg,
+            &NOOP_UI,
+            false,
+            "ultra-plan-run",
+            Some("later-phase"),
+            Some("Verify promoted Next.js app"),
+            Some(&mut run_authority),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.completed_steps, 1);
+        assert!(dir.path().join("node_modules/autoprefixer").is_dir());
+        let build_lifecycles = events_with_name(&events, "dependency_build_lifecycle");
+        assert!(
+            build_lifecycles.iter().any(|event| {
+                event.get("step_id").and_then(Value::as_str) == Some("later-build")
+                    && event.get("setup_status").and_then(Value::as_str) == Some("passed")
+                    && event.get("setup_authority").and_then(Value::as_str)
+                        == Some("plan_setup_step")
+                    && event.get("final_status").and_then(Value::as_str) == Some("passed")
+            }),
+            "{build_lifecycles:#?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(!event_text.contains("dependency_setup_authority_required"));
+    }
+
+    #[test]
+    fn plan_run_without_setup_step_keeps_dependency_setup_authority_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        write_nextjs_profile_workspace(
+            dir.path(),
+            Some(nextjs_globals_css()),
+            Some(nextjs_postcss_config()),
+            Some(nextjs_tsconfig_json()),
+        );
+        let plan = StepPlan {
+            goal: "Verify Next.js app without setup authority".to_string(),
+            steps: vec![PlanStep {
+                id: "plain-build".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify the existing app build".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: vec!["npm run build".to_string()],
+            }],
+        };
+        let mut fake = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Bash",
+                    serde_json::json!({"command":"true"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply::text("No source changes needed."),
+        ]);
+
+        let err = run_step_plan(&mut fake, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("dependency_setup_authority_required"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"setup_authority\":\"none\""));
+        assert!(!event_text.contains("\"event\":\"dependency_setup_reconciliation\""));
+    }
+
+    #[test]
+    fn offline_promotion_dependency_reconciliation_stops_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.offline = true;
+        let goal = "Build an interactive browser game on port 3011";
+        let plan = two_phase_ultra_plan(goal, "generic");
+        let mut planner = FakeClient::new(vec![AssistantReply::text(single_write_step_plan_json(
+            "Create a package manifest",
+            "package.json",
+        ))]);
+        let mut execution = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({
+                    "path": "package.json",
+                    "content": nextjs_lean_package_json()
+                }),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("dependency_setup_blocked_offline"), "{err}");
+        let reconciliations = events_with_name(&events, "dependency_setup_reconciliation");
+        assert!(
+            reconciliations.iter().any(|event| {
+                event.get("trigger").and_then(Value::as_str) == Some("promotion")
+                    && event.get("status").and_then(Value::as_str) == Some("blocked")
+                    && event.get("primary_reason").and_then(Value::as_str)
+                        == Some("dependency_setup_blocked_offline")
+            }),
+            "{reconciliations:#?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(!event_text.contains("\"event\":\"ultra_plan_complete\""));
+    }
+
+    #[test]
     fn known_profile_run_never_reinfers_profile() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
+        write_fake_npm_dependency_installer(dir.path());
         let goal = "Build an interactive browser game on port 3011";
         let plan = two_phase_ultra_plan(goal, "nextjs");
         let mut planner = FakeClient::new(vec![
@@ -14476,6 +14728,7 @@ if __name__ == "__main__":
         let mut cfg = config(dir.path().to_path_buf());
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
+        write_fake_npm_dependency_installer(dir.path());
         let phase_plan = generated_nextjs_artifact_plan_json("Create and verify the game app");
         let mut planner_replies = Vec::new();
         for _ in 0..8 {
@@ -16127,6 +16380,7 @@ if __name__ == "__main__":
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
+        write_fake_npm_dependency_installer(dir.path());
         let scaffold_plan = generated_nextjs_fixture_plan_json_with_kind(
             "scaffold phase",
             "check_scaffold.py",
@@ -16235,6 +16489,7 @@ if __name__ == "__main__":
         let mut cfg = config(dir.path().to_path_buf());
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
+        write_fake_npm_dependency_installer(dir.path());
         let step_json = generated_nextjs_artifact_plan_json("Scaffold project");
         let mut planner = FakeClient::new(
             (0..3)
@@ -20125,6 +20380,10 @@ export default function Memo(){
         r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011","start":"next start -p 3011"}}"#
     }
 
+    fn nextjs_lean_package_json() -> &'static str {
+        r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011","start":"next start -p 3011"}}"#
+    }
+
     fn explicit_port_goal(goal: &str, port: u16) -> String {
         format!("{goal} on port {port}")
     }
@@ -20504,6 +20763,97 @@ exit 2\n"
         let mut permissions = std::fs::metadata(&next_path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
         std::fs::set_permissions(next_path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_fake_npm_dependency_installer(root: &Path) {
+        let bin = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = r#"#!/bin/sh
+set -eu
+install_pkg() {
+  name="$1"
+  if grep -q "\"$name\"" package.json 2>/dev/null; then
+    mkdir -p "node_modules/$name"
+    printf '{"name":"%s"}\n' "$name" > "node_modules/$name/package.json"
+  fi
+}
+if [ "$1" = "install" ]; then
+  mkdir -p node_modules/.bin
+  install_pkg next
+  install_pkg react
+  install_pkg react-dom
+  install_pkg typescript
+  install_pkg @types/node
+  install_pkg @types/react
+  install_pkg @types/react-dom
+  install_pkg tailwindcss
+  install_pkg postcss
+  install_pkg autoprefixer
+  if [ -d node_modules/next ]; then
+    printf '#!/bin/sh\nexit 0\n' > node_modules/.bin/next
+    chmod +x node_modules/.bin/next
+  fi
+  printf '{"lockfileVersion":3}\n' > package-lock.json
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "build" ]; then
+  test -x node_modules/.bin/next || { echo "next missing" >&2; exit 1; }
+  if grep -q "\"tailwindcss\"" package.json 2>/dev/null; then
+    test -d node_modules/tailwindcss || { echo "tailwindcss missing" >&2; exit 1; }
+    test -d node_modules/postcss || { echo "postcss missing" >&2; exit 1; }
+    test -d node_modules/autoprefixer || { echo "autoprefixer missing" >&2; exit 1; }
+  fi
+  echo "fake build ok"
+  exit 0
+fi
+echo "unexpected fake npm args: $*" >&2
+exit 2
+"#;
+        let path = bin.join("npm");
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn write_fake_npm_dependency_installer(root: &Path) {
+        let bin = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = r#"@echo off
+setlocal
+if "%1"=="install" (
+  if exist package.json (
+    findstr /c:"\"next\"" package.json >nul && mkdir node_modules\next 2>nul
+    findstr /c:"\"tailwindcss\"" package.json >nul && mkdir node_modules\tailwindcss 2>nul
+    findstr /c:"\"postcss\"" package.json >nul && mkdir node_modules\postcss 2>nul
+    findstr /c:"\"autoprefixer\"" package.json >nul && mkdir node_modules\autoprefixer 2>nul
+    if exist node_modules\next (
+      echo @echo off> node_modules\.bin\next.cmd
+      echo exit /b 0>> node_modules\.bin\next.cmd
+      echo {"name":"next"}> node_modules\next\package.json
+    )
+    if exist node_modules\tailwindcss echo {"name":"tailwindcss"}> node_modules\tailwindcss\package.json
+    if exist node_modules\postcss echo {"name":"postcss"}> node_modules\postcss\package.json
+    if exist node_modules\autoprefixer echo {"name":"autoprefixer"}> node_modules\autoprefixer\package.json
+  )
+  echo {"lockfileVersion":3}> package-lock.json
+  exit /b 0
+)
+if "%1"=="run" if "%2"=="build" (
+  if not exist node_modules\.bin\next.cmd exit /b 1
+  if exist node_modules\tailwindcss (
+    if not exist node_modules\postcss exit /b 1
+    if not exist node_modules\autoprefixer exit /b 1
+  )
+  echo fake build ok
+  exit /b 0
+)
+echo unexpected fake npm args: %*
+exit /b 2
+"#;
+        std::fs::write(bin.join("npm.cmd"), script).unwrap();
     }
 
     #[cfg(unix)]
