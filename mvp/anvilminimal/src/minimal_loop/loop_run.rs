@@ -2307,6 +2307,7 @@ fn emit_empty_response_escalation(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_provider_turn_duration(
     config: &Config,
     options: &RunSessionOptions,
