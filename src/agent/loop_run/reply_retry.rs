@@ -239,7 +239,7 @@ fn maybe_handle_assistant_reply_timeout_error(
     recovery_dispatch_gate: RecoveryDispatchGate,
     retry_state: &mut AssistantReplyRetryState,
 ) -> Option<AssistantReplyRetryDecision> {
-    if !err.to_ascii_lowercase().contains("timed out") {
+    if !lifecycle::is_provider_turn_timeout(err) {
         return None;
     }
     if recovery_dispatch_gate.allows_deterministic_fallback()
@@ -290,7 +290,12 @@ fn maybe_handle_assistant_reply_timeout_error(
         );
         return Some(AssistantReplyRetryDecision::Retry);
     }
-    None
+    retry_state.provider_turn_timeout_retry_count += 1;
+    if retry_state.provider_turn_timeout_retry_count > 1 {
+        return Some(AssistantReplyRetryDecision::Fail(err.to_string()));
+    }
+    thread::sleep(Duration::from_secs(2));
+    Some(AssistantReplyRetryDecision::Retry)
 }
 
 fn maybe_handle_assistant_reply_transport_error(

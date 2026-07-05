@@ -8,9 +8,9 @@
 //!   (`downgraded_native_tools`, `retries_remaining`,
 //!   `tool_call_format_retries_remaining`, `extra_transport_retries`,
 //!   `transport_retry_count`, `focused_edit_timeout_retry_count`,
-//!   `tool_call_format_retry_count`) + `new(chat_retries, message_count)`
-//!   constructor that doubles the transport budget on long
-//!   conversations.
+//!   `provider_turn_timeout_retry_count`, `tool_call_format_retry_count`) +
+//!   `new(chat_retries, message_count)` constructor that doubles the transport
+//!   budget on long conversations.
 //! - `AssistantReplyRetryDecision` — `Retry` / `ReturnReply(reply)` /
 //!   `Fail(err)` triplet returned by the per-attempt handler so the
 //!   driver can drive the loop accordingly.
@@ -27,6 +27,7 @@ pub(super) struct AssistantReplyRetryState {
     pub(super) extra_transport_retries: usize,
     pub(super) transport_retry_count: usize,
     pub(super) focused_edit_timeout_retry_count: usize,
+    pub(super) provider_turn_timeout_retry_count: usize,
     pub(super) tool_call_format_retry_count: usize,
 }
 
@@ -45,6 +46,7 @@ impl AssistantReplyRetryState {
             extra_transport_retries: if message_count >= 12 { 4 } else { 2 },
             transport_retry_count: 0,
             focused_edit_timeout_retry_count: 0,
+            provider_turn_timeout_retry_count: 0,
             tool_call_format_retry_count: 0,
         }
     }

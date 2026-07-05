@@ -977,6 +977,8 @@ pub(super) fn actor_loop_pre_reply_request_error(
     }
     let reason = if super::lifecycle::is_tool_call_format_error(&err) {
         ExitReason::ToolCallFormatError
+    } else if super::lifecycle::is_provider_turn_timeout(&err) {
+        ExitReason::ProviderTurnTimeout
     } else {
         ExitReason::TransportError
     };

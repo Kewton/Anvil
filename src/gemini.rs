@@ -8,6 +8,7 @@ use crate::api_keys::load_api_key;
 use crate::logging;
 use crate::ollama::parsing::{AssistantReply, tool_names, truncate_for_log};
 use crate::ollama::xml_fallback::{ToolCall, extract_tool_calls, strip_think_tags};
+use crate::provider_timeout;
 use crate::session::store::ConversationMessage;
 use crate::tools::registry::ToolSpec;
 
@@ -17,6 +18,7 @@ const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 pub struct GeminiClient {
     api_key: String,
     http: Client,
+    timeout_secs: u64,
     max_predict: usize,
 }
 
@@ -34,14 +36,12 @@ impl GeminiClient {
         if api_key.trim().is_empty() {
             return Err("GEMINI_API_KEY is empty".to_string());
         }
-        let http = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(timeout_secs))
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
+        let http = provider_timeout::blocking_client(timeout_secs)
             .map_err(|err| format!("failed to create Gemini HTTP client: {err}"))?;
         Ok(Self {
             api_key,
             http,
+            timeout_secs,
             max_predict,
         })
     }
@@ -93,7 +93,7 @@ impl GeminiClient {
                         "error": err.to_string(),
                     }),
                 );
-                format!("failed to contact Gemini generateContent API: {err}")
+                self.map_transport_error("generateContent API", err)
             })?;
 
         if !response.status().is_success() {
@@ -116,7 +116,7 @@ impl GeminiClient {
 
         let body = response
             .text()
-            .map_err(|err| format!("failed to decode Gemini response: {err}"))?;
+            .map_err(|err| self.map_response_body_error("response", err))?;
         logging::log_llm_event(
             "gemini.generate.response_raw",
             json!({
@@ -133,6 +133,32 @@ impl GeminiClient {
         messages: &[ConversationMessage],
     ) -> Result<AssistantReply, String> {
         self.chat(model, messages, &[])
+    }
+
+    fn map_transport_error(&self, operation: &str, err: reqwest::Error) -> String {
+        if err.is_timeout() {
+            provider_timeout::provider_turn_timeout_message(
+                "Gemini",
+                operation,
+                self.timeout_secs,
+                err,
+            )
+        } else {
+            format!("failed to contact Gemini {operation}: {err}")
+        }
+    }
+
+    fn map_response_body_error(&self, response_label: &str, err: reqwest::Error) -> String {
+        if err.is_timeout() {
+            provider_timeout::provider_turn_timeout_message(
+                "Gemini",
+                response_label,
+                self.timeout_secs,
+                err,
+            )
+        } else {
+            format!("failed to decode Gemini {response_label}: {err}")
+        }
     }
 }
 

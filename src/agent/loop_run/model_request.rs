@@ -1,6 +1,7 @@
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::logging;
 use crate::model_capabilities::model_capabilities;
 use crate::ollama::client::{AssistantReply, OllamaClient};
 use crate::session::store::ConversationMessage;
@@ -132,21 +133,24 @@ pub(super) fn request_non_streaming_assistant_reply(
     timeout_override_secs: Option<u64>,
     max_predict_override: Option<usize>,
 ) -> Result<AssistantReply, String> {
-    let client = if let Some(max_predict) = max_predict_override {
-        client.clone_with_overrides(client.timeout_secs(), max_predict)?
+    let timeout_secs = effective_non_streaming_timeout_secs(
+        model,
+        native_tools_enabled,
+        client.timeout_secs(),
+        timeout_override_secs,
+    );
+    let max_predict = max_predict_override.unwrap_or_else(|| client.max_predict());
+    let client = if timeout_secs != client.timeout_secs() || max_predict_override.is_some() {
+        client.clone_with_overrides(timeout_secs, max_predict)?
     } else {
         client.clone()
     };
     let model = model.to_string();
     let tool_specs = tool_specs.to_vec();
     let owned_messages = messages.to_vec();
-    let timeout = Duration::from_secs(effective_non_streaming_timeout_secs(
-        &model,
-        native_tools_enabled,
-        client.timeout_secs(),
-        timeout_override_secs,
-    ));
+    let timeout = Duration::from_secs(timeout_secs);
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let started = Instant::now();
 
     std::thread::spawn(move || {
         let result =
@@ -155,21 +159,46 @@ pub(super) fn request_non_streaming_assistant_reply(
     });
 
     match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "assistant reply timed out after {}s",
-            timeout.as_secs()
-        )),
+        Ok(result) => {
+            logging::log_llm_event(
+                "provider.turn.elapsed",
+                serde_json::json!({
+                    "transport": "worker",
+                    "timeout_secs": timeout_secs,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "outcome": if result.is_ok() { "ok" } else { "error" },
+                }),
+            );
+            result
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            logging::log_llm_event(
+                "provider.turn.elapsed",
+                serde_json::json!({
+                    "transport": "worker",
+                    "timeout_secs": timeout_secs,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "outcome": "provider_turn_timeout",
+                }),
+            );
+            Err(provider_turn_timeout_error(timeout_secs))
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err("assistant reply worker disconnected".to_string())
         }
     }
 }
 
+pub(super) fn provider_turn_timeout_error(timeout_secs: u64) -> String {
+    format!("provider_turn_timeout: assistant reply timed out after {timeout_secs}s")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::store::ConversationMessage;
+    use std::io::Read;
+    use std::net::TcpListener;
     use std::path::Path;
 
     #[test]
@@ -247,5 +276,46 @@ mod tests {
         );
 
         assert!(plan.use_streaming_transport);
+    }
+
+    fn stalled_provider_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(6));
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn non_streaming_worker_enforces_provider_turn_bound() {
+        let client =
+            OllamaClient::new_with_timeout_and_options(stalled_provider_url(), 30, 1024, 32)
+                .expect("client");
+        let messages = vec![ConversationMessage::user("hello".to_string())];
+
+        let started = Instant::now();
+        let err = request_non_streaming_assistant_reply(
+            &client,
+            "qwen-test",
+            &messages,
+            &[],
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("provider_turn_timeout"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "worker bound was not enforced: {:?}",
+            started.elapsed()
+        );
     }
 }

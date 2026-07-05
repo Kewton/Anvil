@@ -52,7 +52,7 @@ impl GenericTerminalState {
             "tool_call_format_error" | "empty_responses" | "no_tool_calls" => {
                 GenericTerminalState::ModelOutputFailure
             }
-            "transport_error" => GenericTerminalState::TransportFailure,
+            "transport_error" | "provider_turn_timeout" => GenericTerminalState::TransportFailure,
             "interrupted" => GenericTerminalState::Interrupted,
             _ => GenericTerminalState::ControlLoopExhausted,
         }
@@ -84,6 +84,7 @@ mod tests {
             ("empty_responses", "model_output_failure"),
             ("no_tool_calls", "model_output_failure"),
             ("transport_error", "transport_failure"),
+            ("provider_turn_timeout", "transport_failure"),
             ("interrupted", "interrupted"),
         ];
 

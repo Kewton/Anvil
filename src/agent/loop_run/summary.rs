@@ -197,10 +197,10 @@ impl RunTerminalOutcome {
                 missing_deliverables: NO_MISSING_DELIVERABLES,
                 missing_evidence: NO_MISSING_EVIDENCE,
             },
-            ExitReason::TransportError => Self {
+            ExitReason::TransportError | ExitReason::ProviderTurnTimeout => Self {
                 state: RunState::SafeStopped,
                 generic_state: GenericTerminalState::TransportFailure,
-                legacy_label: "transport_error",
+                legacy_label: reason.legacy_label(),
                 missing_deliverables: NO_MISSING_DELIVERABLES,
                 missing_evidence: NO_MISSING_EVIDENCE,
             },
@@ -264,6 +264,7 @@ pub(super) enum ExitReason {
     PlanIncomplete,
     ToolCallFormatError,
     TransportError,
+    ProviderTurnTimeout,
     Interrupted,
     /// Issue #651 Task 4.2: `CompletionDecision::SafeStop` with the
     /// `VerifierWeak` reason — a structurally runnable verifier was
@@ -345,6 +346,7 @@ impl ExitReason {
             ExitReason::PlanIncomplete => "plan_incomplete",
             ExitReason::ToolCallFormatError => "tool_call_format_error",
             ExitReason::TransportError => "transport_error",
+            ExitReason::ProviderTurnTimeout => "provider_turn_timeout",
             ExitReason::Interrupted => "interrupted",
             ExitReason::SafeStopVerifierWeak => "safe_stop_verifier_weak",
             ExitReason::SafeStopVerifierMissing => "safe_stop_verifier_missing",
@@ -375,6 +377,7 @@ impl ExitReason {
                 "assistant emitted malformed or truncated tool calls repeatedly"
             }
             ExitReason::TransportError => "transport error: request failed after retries",
+            ExitReason::ProviderTurnTimeout => "provider turn timed out after retry",
             ExitReason::Interrupted => "",
             ExitReason::SafeStopVerifierWeak => {
                 "assistant stopped: structured verifier could not bind the task's owned test artifact"
@@ -564,6 +567,7 @@ mod tests {
             ExitReason::PlanIncomplete,
             ExitReason::ToolCallFormatError,
             ExitReason::TransportError,
+            ExitReason::ProviderTurnTimeout,
             ExitReason::Interrupted,
             ExitReason::SafeStopVerifierWeak,
             ExitReason::SafeStopVerifierMissing,
@@ -632,6 +636,12 @@ mod tests {
                 GenericTerminalState::EvidenceBindingFailed,
                 "evidence_binding_failed",
                 "safe_stop_verifier_weak",
+            ),
+            (
+                ExitReason::ProviderTurnTimeout,
+                GenericTerminalState::TransportFailure,
+                "transport_failure",
+                "provider_turn_timeout",
             ),
             (
                 ExitReason::RepairExhausted,
@@ -863,6 +873,7 @@ mod tests {
         assert!(!ExitReason::PlanIncomplete.is_success());
         assert!(!ExitReason::ToolCallFormatError.is_success());
         assert!(!ExitReason::TransportError.is_success());
+        assert!(!ExitReason::ProviderTurnTimeout.is_success());
         assert!(!ExitReason::Interrupted.is_success());
         assert!(!ExitReason::SafeStopVerifierWeak.is_success());
         assert!(!ExitReason::SafeStopVerifierMissing.is_success());
@@ -876,6 +887,19 @@ mod tests {
         assert!(ExitReason::SafeStopVerifierMissing.keeps_repl_alive());
         assert!(ExitReason::RepairExhausted.keeps_repl_alive());
         assert!(ExitReason::RepairSafeStop.keeps_repl_alive());
+    }
+
+    #[test]
+    fn provider_turn_timeout_summary_is_explicit_transport_failure() {
+        let s = stats(1, 1, 2, vec![], 0);
+        let out = format_run_summary(ExitReason::ProviderTurnTimeout, &s);
+        assert!(out.starts_with("✘ provider_turn_timeout"), "got: {out}");
+        let outcome = RunTerminalOutcome::from_exit_reason(ExitReason::ProviderTurnTimeout);
+        assert_eq!(
+            outcome.generic_state,
+            GenericTerminalState::TransportFailure
+        );
+        assert_eq!(outcome.legacy_label_for_eval(), "provider_turn_timeout");
     }
 
     #[test]

@@ -153,11 +153,21 @@ pub(super) fn is_tool_call_format_error(error: &str) -> bool {
         .contains("tool call parser failed:")
 }
 
+pub(super) fn is_provider_turn_timeout(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("provider_turn_timeout")
+        || lower.contains("assistant reply timed out")
+        || lower.contains("provider timed out")
+        || lower.contains("request timed out")
+        || lower.contains("operation timed out")
+        || lower.contains("timed out")
+}
+
 pub(super) fn is_transport_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("failed to contact ollama chat api")
         || lower.contains("error sending request for url")
-        || lower.contains("timed out")
+        || is_provider_turn_timeout(error)
         || lower.contains("connection reset")
         || lower.contains("connection refused")
         || lower.contains("broken pipe")

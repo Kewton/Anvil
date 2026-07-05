@@ -1175,7 +1175,7 @@ fn classify_terminal_outcome_with_context(
         "missing_verification" | "verifier_failed" | "safe_stop_verifier_weak" => {
             "verification_failure"
         }
-        "transport_error" => "transport_failure",
+        "transport_error" | "provider_turn_timeout" => "transport_failure",
         "interrupted" => "interrupted",
         _ => "control_loop_failure",
     }

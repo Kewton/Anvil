@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -152,7 +152,7 @@ where
     let mut completion_tokens: Option<u64> = None;
 
     for line in reader.lines() {
-        let line = line.map_err(|err| format!("failed to read streaming response: {err}"))?;
+        let line = line.map_err(map_streaming_read_error)?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -206,7 +206,7 @@ where
     let mut completion_tokens: Option<u64> = None;
 
     for line in reader.lines() {
-        let line = line.map_err(|err| format!("failed to read streaming response: {err}"))?;
+        let line = line.map_err(map_streaming_read_error)?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -262,6 +262,19 @@ pub(crate) fn truncate_for_log(text: &str, max_chars: usize) -> String {
     }
     let truncated = text.chars().take(max_chars).collect::<String>();
     format!("{truncated}\n...[truncated]")
+}
+
+fn map_streaming_read_error(err: io::Error) -> String {
+    let lower = err.to_string().to_ascii_lowercase();
+    if err.kind() == io::ErrorKind::TimedOut
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("deadline")
+    {
+        format!("provider_turn_timeout: streaming response timed out: {err}")
+    } else {
+        format!("failed to read streaming response: {err}")
+    }
 }
 
 fn finalize_reply(

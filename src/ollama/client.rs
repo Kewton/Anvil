@@ -6,6 +6,7 @@ use crate::ollama::parsing::{
     parse_streaming_chat_response, parse_streaming_generate_response, tool_names, truncate_for_log,
 };
 use crate::ollama::transport::GenerateTransport;
+use crate::provider_timeout;
 use crate::session::store::ConversationMessage;
 use crate::tools::registry::ToolSpec;
 
@@ -46,10 +47,7 @@ impl OllamaClient {
         context_window: usize,
         max_predict: usize,
     ) -> Result<Self, String> {
-        let http = Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(timeout_secs))
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
+        let http = provider_timeout::blocking_client(timeout_secs)
             .map_err(|err| format!("failed to create HTTP client: {err}"))?;
         Ok(Self {
             base_url,
@@ -62,6 +60,10 @@ impl OllamaClient {
 
     pub fn timeout_secs(&self) -> u64 {
         self.timeout_secs
+    }
+
+    pub fn max_predict(&self) -> usize {
+        self.max_predict
     }
 
     pub fn clone_with_overrides(
@@ -82,7 +84,7 @@ impl OllamaClient {
             .http
             .get(format!("{}/api/tags", self.base_url))
             .send()
-            .map_err(|err| format!("failed to contact Ollama: {err}"))?;
+            .map_err(|err| self.map_transport_error("tags API", err))?;
         if !response.status().is_success() {
             return Err(format!("Ollama /api/tags failed: {}", response.status()));
         }
@@ -285,7 +287,7 @@ impl OllamaClient {
                         "error": err.to_string(),
                     }),
                 );
-                format!("failed to contact Ollama generate API: {err}")
+                self.map_transport_error("generate API", err)
             })?;
 
         if !response.status().is_success() {
@@ -309,7 +311,7 @@ impl OllamaClient {
         } else {
             let body = response
                 .text()
-                .map_err(|err| format!("failed to decode Ollama generate response: {err}"))?;
+                .map_err(|err| self.map_response_body_error("generate response", err))?;
             logging::log_llm_event(
                 "ollama.generate.response_raw",
                 json!({
@@ -395,7 +397,7 @@ impl OllamaClient {
                         "error": err.to_string(),
                     }),
                 );
-                format!("failed to contact Ollama chat API: {err}")
+                self.map_transport_error("chat API", err)
             })?;
 
         if !response.status().is_success() {
@@ -419,7 +421,7 @@ impl OllamaClient {
         } else {
             let body = response
                 .text()
-                .map_err(|err| format!("failed to decode Ollama chat response: {err}"))?;
+                .map_err(|err| self.map_response_body_error("chat response", err))?;
             logging::log_llm_event(
                 "ollama.chat.response_raw",
                 json!({
@@ -429,6 +431,32 @@ impl OllamaClient {
                 }),
             );
             parse_chat_response(&body, &tool_names_vec)
+        }
+    }
+
+    fn map_transport_error(&self, operation: &str, err: reqwest::Error) -> String {
+        if err.is_timeout() {
+            provider_timeout::provider_turn_timeout_message(
+                "Ollama",
+                operation,
+                self.timeout_secs,
+                err,
+            )
+        } else {
+            format!("failed to contact Ollama {operation}: {err}")
+        }
+    }
+
+    fn map_response_body_error(&self, response_label: &str, err: reqwest::Error) -> String {
+        if err.is_timeout() {
+            provider_timeout::provider_turn_timeout_message(
+                "Ollama",
+                response_label,
+                self.timeout_secs,
+                err,
+            )
+        } else {
+            format!("failed to decode Ollama {response_label}: {err}")
         }
     }
 }
