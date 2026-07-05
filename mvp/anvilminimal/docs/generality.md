@@ -74,6 +74,57 @@ Named guarantees produced by the Generic Assurance Track:
   `dependency_setup_authority_required` failure, not a repair loop or full
   success.
 
+## Recommended Model Tier
+
+Production-quality implementation outcomes require an implementation model in
+the `gemini-3.5-flash` class or above. Lower-tier models remain safe: the
+honest-degradation guarantees still require partial, reduced, failed, or
+handoff terminal states instead of false full success. They do not, however,
+produce the same full-pass rate.
+
+Measured evidence:
+
+- M5 harvest runs used `gemini-3.1-flash-lite` for implementation with
+  `gemini-3.5-flash` planning. The harvested distribution was 0 full / 2
+  partial / 2 failed / 1 not-checked early harvest: `test0702_008` was an
+  early/not-checked harvest, `test0703_002` failed on missing completion
+  evidence, `test0703_005_4` was partial because the probe was unavailable,
+  `test0704_001` was partial on interaction state-change evidence, and
+  `test0704_003` failed on start-transition behavior.
+- Q1-final used `gemini-3.5-flash` as the implementation and planner model on
+  build `0604a76b` and produced 8/8 honest terminal states: 6 full, 1 reasoned
+  partial, and 1 behavioral failed.
+
+## Q1 Final Quality Baseline
+
+Q1 final is the standing quality baseline as of 2026-07-05. The judgment rule
+has two parts:
+
+- **Mandatory stranding elimination**: every sampled run must terminate
+  honestly with a closed terminal state, concrete status/reason fields, and a
+  recovery handoff when the run is not full. Max-iteration, human-interrupt,
+  absent terminal status, and false-full exits disqualify the round.
+- **Distribution over samples**: after the mandatory condition passes, quality
+  is judged by the distribution over at least two samples per scenario.
+
+Q1-final matrix (`test0704-999-Q1-62_001`, implementation/planner model
+`gemini-3.5-flash`, build `0604a76b`):
+
+| scenario/run | run id | terminal status | primary reason | key telemetry |
+|---|---|---|---|---|
+| CLI a | `019f318c-9931-7350-a720-c3840f640968` | full | none | `python-cli`, `contract_origin=initial`, external contract OK, browser/interaction not applicable for non-web, assurance full |
+| CLI b | `019f3193-227e-7251-ba45-d32d61762737` | full | none | `python-cli`, `contract_origin=initial`, external contract OK, browser/interaction not applicable for non-web, assurance full |
+| TOOL a | `019f319b-aef6-7961-8ff6-15a4ad7a253e` | reasoned partial | `interaction_unverified:not_evaluated:no_mutation_observed` | browser readiness performed/passed, interaction performed/passed, state dimension `todos`, `persistence_after_reload_reason=no_mutation_observed`, recovery prompt/YAML recorded |
+| TOOL b | `019f31a1-ff5f-7040-866d-3e405fc43e39` | full | none | browser readiness performed/passed, interaction performed/passed, state dimension `todos`, release gate pass, assurance full |
+| CONTENT a | `019f31a9-7700-7c12-b947-9597eca40d16` | full | none | browser readiness performed/passed, interaction performed/passed, state dimension `currentContent`, token echoed, assurance full |
+| CONTENT b | `019f31af-8988-7042-bea6-19f7aae0fccf` | full | none | browser readiness performed/passed, interaction performed/passed, state dimension `contentLength`, token echoed, assurance full |
+| GAME a | `019f31b4-632c-7413-b322-34f0f8db8e91` | full | none | browser readiness performed/passed, interaction performed/passed, state dimension `bulletsCount`, primary/restart hooks, assurance full |
+| GAME b | `019f31c0-14f5-7c53-898f-4612c883da3f` | behavioral failed | `missing_required_evidence:interactive_ui_source_evidence`; `browser_interaction_failed:probe_script_error` | browser readiness HTTP 200, interaction performed_failed at `surface_wait`, recovery prompt/YAML recorded; served-DOM inspection showed visible canvas and primary action after a hidden first `data-anvil-state`, so this is a harvested probe-calibration limit, not a false full |
+
+Result: Q1-final concludes the quality track for the current scoped host/model
+pair with 8/8 honest termination and a 6 full / 1 reasoned partial / 1
+behavioral failed distribution.
+
 ## Clause Evidence
 
 | clause | run evidence | harvested corpus |

@@ -36,6 +36,15 @@ Status: complete on 2026-07-05.
 | UTF-8 boundary panic during promoted evidence scanning: substring extraction sliced inside a Japanese character and aborted before final acceptance. | `../../../workspace/management/runs/uat-test0704-403044454243464748481495051535455-000/uat-report.md` | Instruction 56 routed truncation through char-boundary helpers, including `floor_char_boundary` / `truncate_at_char_boundary`, and wrapped TUI slash-command execution with a terminal panic guard. | Multibyte truncation tests cover the helper path; `panic_caught` events distinguish a Rust panic from user abort or model failure. |
 | Dependency setup authority required after promotion: package state declared `autoprefixer`, but later verify/build lacked authority to reconcile missing installed dependencies. | `../../../workspace/management/runs/uat-test0704-4030444542434647484814950515354555657-000/uat-report.md` | Instruction 58 added run-level setup authority after promotion/manifest repair and boundary reconciliation for declared Node dependencies. | Later verify/contract steps inherit sanctioned setup authority when the run created the dependency need; absent authority still ends as `dependency_setup_authority_required`. |
 
+## Boundedness Guarantees
+
+Permanent invariant: no pathway may require human interruption.
+
+| mechanism | instruction | guarantee | permanent guard |
+|---|---|---|---|
+| Provider-turn wall-clock bound | 62 B | Every chat/provider turn emits duration telemetry, is capped by configuration, retries once on `provider_turn_timeout`, then terminates with an honest terminal handoff instead of requiring manual interruption. | `tests/conformance` named assertion `bounded_provider_turns`; unit coverage for `provider_turn_timeout` terminal records and recovery handoff. |
+| Verify-command wall-clock bound | 62 C | Deterministic verify commands are capped per command/profile, the process group is killed on expiry, and timeout is classified as `OracleError` / `verify_command_timeout:<command>` with bounded-check repair guidance, never as an implementation-edit target. | `tests/conformance` named assertion `bounded_verify_commands`; verifier tests for process-group kill, OracleError classification, and python-cli timeout substitution. |
+
 ## Required Fields
 
 - mechanism id
