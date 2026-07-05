@@ -291,6 +291,10 @@ fn assert_conformance_contracts(trace: &Trace) {
             "known_profile_contract_bound",
             check_known_profile_contract_bound(trace),
         ),
+        (
+            "bounded_provider_turns",
+            check_bounded_provider_turns(trace),
+        ),
         ("oracle_tristate", check_oracle_tristate(trace)),
         ("degradation_labeling", check_degradation_labeling(trace)),
     ] {
@@ -580,6 +584,44 @@ fn check_known_profile_contract_bound(trace: &Trace) -> Result<(), String> {
         return Err(format!(
             "known_profile_contract_bound: explicit known profile {expected_profile} bound an empty completion contract"
         ));
+    }
+    Ok(())
+}
+
+fn check_bounded_provider_turns(trace: &Trace) -> Result<(), String> {
+    let duration_events = events_named(&trace.events, "provider_turn_duration");
+    if duration_events.is_empty() {
+        return Err(
+            "bounded_provider_turns: no provider turn duration telemetry emitted".to_string(),
+        );
+    }
+    for stop in events_named(&trace.events, "tui_command_stop") {
+        if string_field(stop, "status") == Some("interrupted")
+            || string_field(stop, "command_completion_state") == Some("interrupted")
+            || string_field(stop, "task_status") == Some("interrupted")
+        {
+            return Err(format!(
+                "bounded_provider_turns: pathway required human interruption in {stop}"
+            ));
+        }
+    }
+    let timeout_events = events_named(&trace.events, "provider_turn_timeout");
+    if timeout_events.is_empty() {
+        return Ok(());
+    }
+    if !timeout_events
+        .iter()
+        .any(|event| bool_field(event, "terminal") == Some(true))
+    {
+        return Err(
+            "bounded_provider_turns: provider timeout did not reach terminal handoff".to_string(),
+        );
+    }
+    if !events_named(&trace.events, "loop_stop")
+        .iter()
+        .any(|event| string_field(event, "reason") == Some("provider_turn_timeout"))
+    {
+        return Err("bounded_provider_turns: provider timeout lacks honest loop_stop".to_string());
     }
     Ok(())
 }

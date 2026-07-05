@@ -23,6 +23,12 @@ pub fn empty_response_reformulated(step_instruction: &str) -> String {
     )
 }
 
+pub fn provider_turn_timeout(timeout_secs: u64) -> String {
+    format!(
+        "The previous provider turn exceeded the configured wall-clock cap of {timeout_secs}s and was discarded. Continue the same step now with the required tool calls or a concise final answer. Do not repeat long deliberation."
+    )
+}
+
 pub fn completion_without_write() -> String {
     "The task appears to require workspace changes, but no Write/Edit tool call has happened yet. Create or modify the required files before final response, or explain why no file change is required.".to_string()
 }

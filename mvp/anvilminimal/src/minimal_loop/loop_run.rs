@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use serde_json::{Value, json};
@@ -657,6 +658,7 @@ pub(crate) fn run_session_with_outcome_with_options(
     let mut no_tool_feedbacks = 0usize;
     let mut empty_feedbacks = 0usize;
     let mut empty_fresh_retry_pending = false;
+    let mut provider_turn_timeouts = 0usize;
     let mut changed_paths: Vec<String> = Vec::new();
     let mut tool_call_count = 0usize;
     let contract_runtime_enabled = options.contract_runtime_enabled();
@@ -735,6 +737,7 @@ pub(crate) fn run_session_with_outcome_with_options(
             )
         };
         let label = format!("{} {}", client.label(), config.model);
+        let provider_turn_started = Instant::now();
         let chat_result = {
             let _guard = ui.before_model_call(&label);
             client.chat(
@@ -744,6 +747,54 @@ pub(crate) fn run_session_with_outcome_with_options(
                 native_tools_enabled,
             )
         };
+        let provider_turn_elapsed = provider_turn_started.elapsed();
+        let provider_turn_timed_out =
+            provider_turn_elapsed >= Duration::from_secs(config.chat_timeout_secs);
+        emit_provider_turn_duration(
+            config,
+            &options,
+            client.label(),
+            request_tools.len(),
+            native_tools_enabled,
+            provider_turn_elapsed,
+            provider_turn_timed_out,
+            chat_result.is_ok(),
+            provider_turn_timeouts + 1,
+        );
+        if provider_turn_timed_out {
+            provider_turn_timeouts += 1;
+            let terminal = provider_turn_timeouts > 1;
+            emit_provider_turn_timeout(config, &options, provider_turn_timeouts, terminal);
+            if terminal {
+                return stop_for_provider_turn_timeout(
+                    config,
+                    user_prompt,
+                    &options,
+                    &changed_paths,
+                    verify_attempts,
+                    tool_call_count,
+                    last_blocking_reason,
+                    provider_turn_timeouts,
+                    provider_turn_elapsed,
+                );
+            }
+            pending_feedback = Some(super::feedback::provider_turn_timeout(
+                config.chat_timeout_secs,
+            ));
+            continue;
+        } else if provider_turn_timeouts > 0 {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "provider_turn_timeout_recovered",
+                    "after_timeouts": provider_turn_timeouts,
+                    "session_scope": options.scope.as_str(),
+                    "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+                    "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+                }),
+            );
+            provider_turn_timeouts = 0;
+        }
         let reply = match chat_result {
             Ok(reply) => {
                 pending_feedback = None;
@@ -2256,6 +2307,225 @@ fn emit_empty_response_escalation(
     );
 }
 
+fn emit_provider_turn_duration(
+    config: &Config,
+    options: &RunSessionOptions,
+    provider: &str,
+    tool_count: usize,
+    native_tools_enabled: bool,
+    elapsed: Duration,
+    timed_out: bool,
+    ok: bool,
+    attempt: usize,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "provider_turn_duration",
+            "provider": provider,
+            "model": &config.model,
+            "elapsed_ms": elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            "timeout_ms": Duration::from_secs(config.chat_timeout_secs).as_millis().min(u128::from(u64::MAX)) as u64,
+            "timeout_secs": config.chat_timeout_secs,
+            "timed_out": timed_out,
+            "ok": ok,
+            "attempt": attempt,
+            "tools": tool_count,
+            "native_tools_enabled": native_tools_enabled,
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+        }),
+    );
+}
+
+fn emit_provider_turn_timeout(
+    config: &Config,
+    options: &RunSessionOptions,
+    attempt: usize,
+    terminal: bool,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "provider_turn_timeout",
+            "classification": "provider_turn_timeout",
+            "attempt": attempt,
+            "retry_limit": 1,
+            "terminal": terminal,
+            "timeout_secs": config.chat_timeout_secs,
+            "next_action": if terminal { "terminal_handoff" } else { "retry_once" },
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+        }),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stop_for_provider_turn_timeout(
+    config: &Config,
+    user_prompt: &str,
+    options: &RunSessionOptions,
+    changed_paths: &[String],
+    verify_attempts: usize,
+    tool_calls: usize,
+    last_blocking_reason: Option<String>,
+    timeout_count: usize,
+    elapsed: Duration,
+) -> anyhow::Result<RunSessionOutcome> {
+    let failure_kind = "provider_turn_timeout";
+    let recovery_paths =
+        save_provider_turn_timeout_handoff(config, user_prompt, options, changed_paths);
+    let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "loop_stop",
+            "reason": failure_kind,
+            "missing_paths": [],
+            "verify_attempts": verify_attempts,
+            "tool_calls": tool_calls,
+            "provider_turn_timeout_count": timeout_count,
+            "provider_turn_elapsed_ms": elapsed_ms,
+            "provider_turn_timeout_secs": config.chat_timeout_secs,
+            "last_blocking_reason": last_blocking_reason,
+            "last_provider_error": failure_kind,
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+            "recovery_prompt_path": recovery_paths
+                .as_ref()
+                .map(|paths| paths.prompt_path.as_str())
+                .unwrap_or(""),
+            "recovery_ultra_plan_path": recovery_paths
+                .as_ref()
+                .map(|paths| paths.yaml_path.as_str())
+                .unwrap_or(""),
+            "recovery_yaml_missing": recovery_paths.is_none(),
+        }),
+    );
+    bail!(render_minimal_recovery_stop_reason(
+        format!(
+            "{failure_kind}: provider turn exceeded the configured wall-clock cap after one retry (timeout_secs={}, elapsed_ms={elapsed_ms})",
+            config.chat_timeout_secs
+        ),
+        recovery_paths.as_ref(),
+    ))
+}
+
+fn save_provider_turn_timeout_handoff(
+    config: &Config,
+    user_prompt: &str,
+    options: &RunSessionOptions,
+    changed_paths: &[String],
+) -> Option<MinimalRecoveryPaths> {
+    let failure_kind = "provider_turn_timeout";
+    let profile = if config.profile.trim().is_empty() {
+        "generic"
+    } else {
+        config.profile.as_str()
+    };
+    let failed_phase = options
+        .phase_scope
+        .clone()
+        .or_else(|| Some("minimal-loop".to_string()));
+    let failed_step = options
+        .step_kind
+        .map(|kind| kind.as_str().to_string())
+        .or_else(|| Some("model-call".to_string()));
+    let handoff = crate::planner::repair::RecoveryHandoff {
+        profile: profile.to_string(),
+        original_goal: user_prompt.to_string(),
+        failed_phase,
+        failed_step,
+        failure_kind: failure_kind.to_string(),
+        failure_evidence: vec![
+            format!(
+                "provider_turn_timeout: provider exceeded configured wall-clock cap of {}s twice",
+                config.chat_timeout_secs
+            ),
+            "The run terminated honestly instead of requiring human interruption.".to_string(),
+        ],
+        missing_paths: Vec::new(),
+        missing_capabilities: Vec::new(),
+        verify_commands: Vec::new(),
+        changed_paths: changed_paths.to_vec(),
+        repair_targets: vec!["retry_with_bounded_provider_turns".to_string()],
+    };
+    let prompt_path = match crate::planner::repair::save_ultra_recovery_prompt(
+        &config.workspace_root,
+        "provider-turn-timeout",
+        &handoff,
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "recovery_prompt_save_failed",
+                    "recovery_handoff_kind": failure_kind,
+                    "reason": eval_events::body_snippet(&err.to_string()),
+                    "status": "incomplete",
+                }),
+            );
+            return None;
+        }
+    };
+    let yaml_path = match crate::planner::repair::save_recovery_ultra_plan(
+        &config.workspace_root,
+        "provider-turn-timeout",
+        &handoff,
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            let prompt_display =
+                crate::planner::repair::workspace_relative_handoff_path(&prompt_path);
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "recovery_ultra_plan_save_failed",
+                    "recovery_handoff_kind": failure_kind,
+                    "recovery_prompt_path": prompt_display,
+                    "reason": eval_events::body_snippet(&err.to_string()),
+                    "recovery_yaml_missing": true,
+                    "status": "incomplete",
+                }),
+            );
+            return None;
+        }
+    };
+    let suggested_prompt_command =
+        crate::planner::repair::suggested_ultra_recovery_command(&prompt_path, profile);
+    let suggested_yaml_command =
+        crate::planner::repair::suggested_recovery_ultra_plan_command(&yaml_path);
+    let prompt_display = crate::planner::repair::workspace_relative_handoff_path(&prompt_path);
+    let yaml_display = crate::planner::repair::workspace_relative_handoff_path(&yaml_path);
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "recovery_prompt_saved",
+            "recovery_handoff_kind": failure_kind,
+            "recovery_prompt_path": &prompt_display,
+            "recovery_ultra_plan_path": &yaml_display,
+            "recovery_yaml_missing": false,
+            "recovery_yaml_roundtrip_ok": true,
+            "suggested_recovery_command": suggested_prompt_command,
+            "suggested_recovery_yaml_command": suggested_yaml_command,
+            "recovery_profile": profile,
+            "local_repair_exhausted": true,
+            "failure_kind": failure_kind,
+            "status": "incomplete",
+        }),
+    );
+    Some(MinimalRecoveryPaths {
+        prompt_path: prompt_display,
+        yaml_path: yaml_display,
+        suggested_prompt_command,
+        suggested_yaml_command,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stop_for_model_empty_response(
     config: &Config,
@@ -3276,6 +3546,30 @@ mod tests {
         }
     }
 
+    struct DelayedFake {
+        replies: Vec<(Duration, anyhow::Result<AssistantReply>)>,
+    }
+
+    impl ChatClient for DelayedFake {
+        fn label(&self) -> &str {
+            "delayed-fake"
+        }
+        fn supports_native_tools(&self, _model: &str) -> bool {
+            true
+        }
+        fn chat(
+            &mut self,
+            _model: &str,
+            _messages: &[ConversationMessage],
+            _tools: &[crate::tools::registry::ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            let (delay, reply) = self.replies.remove(0);
+            std::thread::sleep(delay);
+            reply
+        }
+    }
+
     struct RecordingFake {
         replies: Vec<anyhow::Result<AssistantReply>>,
         requests: Vec<Vec<ConversationMessage>>,
@@ -3450,6 +3744,91 @@ mod tests {
             .unwrap();
         let prompt = std::fs::read_to_string(dir.path().join(prompt_path)).unwrap();
         assert!(prompt.contains("model_empty_response"), "{prompt}");
+    }
+
+    #[test]
+    fn provider_turn_timeout_retries_once_then_stops_with_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.chat_timeout_secs = 0;
+        let mut fake = DelayedFake {
+            replies: vec![
+                (
+                    Duration::from_millis(1),
+                    Ok(AssistantReply::text("discarded first reply")),
+                ),
+                (
+                    Duration::from_millis(1),
+                    Ok(AssistantReply::text("discarded second reply")),
+                ),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+
+        let err = run_session_with_outcome_with_ui(
+            &mut fake,
+            &mut session,
+            "Create a bounded provider turn artifact.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("provider_turn_timeout"), "{err}");
+        assert!(err.contains("recovery prompt saved:"), "{err}");
+        let events = event_values(&events);
+        let durations = events
+            .iter()
+            .filter(|event| {
+                event.get("event").and_then(Value::as_str) == Some("provider_turn_duration")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(durations.len(), 2, "{events:?}");
+        assert!(durations.iter().all(|event| {
+            event
+                .get("timed_out")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        }));
+        let timeouts = events
+            .iter()
+            .filter(|event| {
+                event.get("event").and_then(Value::as_str) == Some("provider_turn_timeout")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(timeouts.len(), 2, "{events:?}");
+        assert_eq!(
+            timeouts[0].get("terminal").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            timeouts[1].get("terminal").and_then(Value::as_bool),
+            Some(true)
+        );
+        let stop = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("loop_stop"))
+            .unwrap();
+        assert_eq!(
+            stop.get("reason").and_then(Value::as_str),
+            Some("provider_turn_timeout")
+        );
+        let recovery = events
+            .iter()
+            .find(|event| {
+                event.get("event").and_then(Value::as_str) == Some("recovery_prompt_saved")
+            })
+            .unwrap();
+        let prompt_path = recovery
+            .get("recovery_prompt_path")
+            .and_then(Value::as_str)
+            .unwrap();
+        let prompt = std::fs::read_to_string(dir.path().join(prompt_path)).unwrap();
+        assert!(prompt.contains("provider_turn_timeout"), "{prompt}");
     }
 
     #[test]
