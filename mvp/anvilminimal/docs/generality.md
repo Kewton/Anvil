@@ -185,6 +185,25 @@ Status: complete on 2026-07-05.
 | G3 Ambiguous UAT evidence | 2026-07-05 | Two live evidence entries: static-tier fallback `test0704-4030444542434647484814950515354_001` and final promoted full-assurance run `test0704-403044454243464748481495051535455565758_000`. |
 | G4 Codification | 2026-07-05 | Default Next.js no-port policy, AMBIGUOUS scenario runbook hardening, G3 corpus harvest, and [mechanism-ledger.md#generic-assurance-track-cross-reference](mechanism-ledger.md#generic-assurance-track-cross-reference). |
 
+## Quality Track Completion
+
+Status: Q1 concluded on 2026-07-05.
+
+| milestone | completion date | evidence |
+|---|---|---|
+| Q1 model-tier baseline | 2026-07-05 | Recommended model tier and M5/Q1-final distributions recorded in [Recommended Model Tier](#recommended-model-tier). |
+| Q1 final round | 2026-07-05 | `test0704-999-Q1-62_001`: 8 runs, 8/8 honest termination, 6 full / 1 reasoned partial / 1 behavioral failed on `gemini-3.5-flash`. |
+| Q1 residual corpus harvest | 2026-07-05 | TOOL a persistence reason and GAME b rendered-hidden probe-limit fixtures in [Clause Evidence](#clause-evidence). |
+| Q1 boundedness closure | 2026-07-05 | Provider-turn and verify-command wall-clock invariants recorded in [mechanism-ledger.md#boundedness-guarantees](mechanism-ledger.md#boundedness-guarantees). |
+
+Optional backlog after Q1:
+
+| optional track | trigger |
+|---|---|
+| Second web profile / web-family layer | Start when a non-Next.js web stack needs first-class promotion, shared web obligations, or release-gate parity. Until then, unknown manifests remain generic/static by design. |
+| Linux run | Start before claiming Linux host parity, adding Linux-specific release support, or treating Darwin UAT results as portable. |
+| English-goal run | Start before claiming English prompt-distribution parity or using English-goal quality as release/marketing evidence. |
+
 ## Out Of Scope
 
 The declaration does not claim:

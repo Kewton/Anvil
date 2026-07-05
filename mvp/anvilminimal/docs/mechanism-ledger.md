@@ -28,6 +28,17 @@ Status: complete on 2026-07-05.
 | G3 | complete | 2026-07-05 | Ambiguous no-profile evidence includes static-tier fallback `test0704-4030444542434647484814950515354_001` and final promotion run `test0704-403044454243464748481495051535455565758_000`. |
 | G4 | complete | 2026-07-05 | Default-port policy, AMBIGUOUS runbook hardening, final G3 corpus harvest, and this closure ledger. |
 
+## Quality Track Cross-Reference
+
+Status: Q1 concluded on 2026-07-05.
+
+| milestone | status | date | reference |
+|---|---|---|---|
+| Q1 model-tier baseline | complete | 2026-07-05 | [generality.md#recommended-model-tier](generality.md#recommended-model-tier) |
+| Q1 final round | complete | 2026-07-05 | [generality.md#q1-final-quality-baseline](generality.md#q1-final-quality-baseline) |
+| Q1 residual corpus harvest | complete | 2026-07-05 | [generality.md#clause-evidence](generality.md#clause-evidence) |
+| Q1 boundedness closure | complete | 2026-07-05 | [boundedness-guarantees](#boundedness-guarantees) |
+
 ## Promotion-Path Incident Chain
 
 | incident | committed evidence | fix | permanent guard |
