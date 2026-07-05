@@ -269,14 +269,11 @@ fn format_outcome(outcome: &BashOutcome) -> String {
 }
 
 fn truncate_stream(value: &str) -> String {
-    if value.len() <= MAX_STREAM_BYTES {
-        return value.to_string();
-    }
-    let mut out = value[..MAX_STREAM_BYTES].to_string();
-    out.push_str(&format!(
-        "\n[anvilminimal: verifier output truncated at {MAX_STREAM_BYTES} bytes]"
-    ));
-    out
+    crate::util::excerpt_with_newline_marker(
+        value,
+        MAX_STREAM_BYTES,
+        &format!("[anvilminimal: verifier output truncated at {MAX_STREAM_BYTES} bytes]"),
+    )
 }
 
 fn build_summary(command: &str, kind: BashOutcomeKind, stdout: &str, stderr: &str) -> String {
@@ -406,6 +403,14 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn verifier_stream_truncation_handles_multibyte_boundary() {
+        let value = format!("{}{}", "x".repeat(MAX_STREAM_BYTES - 1), "除外");
+        let truncated = truncate_stream(&value);
+        assert!(truncated.contains("verifier output truncated"));
+        assert!(truncated.starts_with(&"x".repeat(MAX_STREAM_BYTES - 1)));
     }
 
     fn run_ignored_self_test(test_name: &str, envs: &[(&str, &str)]) -> std::process::ExitStatus {

@@ -825,6 +825,28 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
     }
 
     #[test]
+    fn sanitizer_goal_truncation_handles_japanese_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: format!("Phase task: {}{}", "日本語".repeat(1_400), "除外"),
+            steps: vec![PlanStep {
+                id: "create-readme".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create README.md".to_string(),
+                expected_paths: vec!["README.md".to_string()],
+                verify: vec!["test -f README.md".to_string()],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.goal_truncations.len(), 1);
+        assert!(plan.goal.chars().count() <= SANITIZED_GOAL_MAX_CHARS);
+        assert!(plan.goal.is_char_boundary(plan.goal.len()));
+    }
+
+    #[test]
     fn sanitizer_does_not_alter_valid_plan() {
         let dir = tempfile::tempdir().unwrap();
         let mut plan = StepPlan {

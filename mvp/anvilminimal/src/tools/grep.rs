@@ -123,13 +123,9 @@ fn summarize_hits(hits: &[String]) -> String {
     if joined.len() <= MAX_GREP_BYTES && hits.len() < MAX_GREP_HITS {
         return joined;
     }
-    let mut end = MAX_GREP_BYTES.min(joined.len());
-    while !joined.is_char_boundary(end) {
-        end -= 1;
-    }
     format!(
         "{}\n[anvilminimal: grep output truncated; showing at most {} hits / {} bytes]",
-        &joined[..end],
+        crate::util::truncate_at_char_boundary(&joined, MAX_GREP_BYTES),
         MAX_GREP_HITS,
         MAX_GREP_BYTES
     )
@@ -155,6 +151,17 @@ mod tests {
             WorkspacePolicy::NormalTask,
         )
         .unwrap();
+        assert!(output.contains("grep output truncated"));
+    }
+
+    #[test]
+    fn grep_summary_handles_multibyte_boundary() {
+        let hits = vec![format!(
+            "file.txt:1:{}{}",
+            "x".repeat(MAX_GREP_BYTES),
+            "除外"
+        )];
+        let output = summarize_hits(&hits);
         assert!(output.contains("grep output truncated"));
     }
 

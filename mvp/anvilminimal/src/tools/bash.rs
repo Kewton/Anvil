@@ -187,14 +187,11 @@ pub fn blocked_reason(command: &str, offline: bool) -> Option<String> {
 }
 
 fn truncate_stream(value: &str) -> String {
-    if value.len() <= MAX_STREAM_BYTES {
-        return value.to_string();
-    }
-    let mut out = value[..MAX_STREAM_BYTES].to_string();
-    out.push_str(&format!(
-        "\n[anvilminimal: bash output truncated at {MAX_STREAM_BYTES} bytes]"
-    ));
-    out
+    crate::util::excerpt_with_newline_marker(
+        value,
+        MAX_STREAM_BYTES,
+        &format!("[anvilminimal: bash output truncated at {MAX_STREAM_BYTES} bytes]"),
+    )
 }
 
 fn build_summary(command: &str, kind: BashOutcomeKind, stdout: &str, stderr: &str) -> String {
@@ -303,6 +300,14 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.kind, BashOutcomeKind::Success);
         assert!(outcome.stdout.contains("bash output truncated"));
+    }
+
+    #[test]
+    fn bash_stream_truncation_handles_multibyte_boundary() {
+        let value = format!("{}{}", "x".repeat(MAX_STREAM_BYTES - 1), "日本語");
+        let truncated = truncate_stream(&value);
+        assert!(truncated.contains("bash output truncated"));
+        assert!(truncated.len() >= MAX_STREAM_BYTES);
     }
 
     #[test]

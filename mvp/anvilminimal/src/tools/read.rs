@@ -94,17 +94,10 @@ fn summarize_large_file(content: &str) -> String {
 }
 
 fn truncate_with_marker(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut end = max_bytes.min(value.len());
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n[anvilminimal: output truncated at {} bytes]",
-        &value[..end],
-        max_bytes
+    crate::util::excerpt_with_newline_marker(
+        value,
+        max_bytes,
+        &format!("[anvilminimal: output truncated at {max_bytes} bytes]"),
     )
 }
 
@@ -119,6 +112,13 @@ mod tests {
         std::fs::write(&path, "x".repeat(MAX_READ_BYTES + 100)).unwrap();
         let output = run(dir.path(), &path, None, None, WorkspacePolicy::NormalTask).unwrap();
         assert!(output.contains("file summarized") || output.contains("output truncated"));
+    }
+
+    #[test]
+    fn read_truncation_handles_multibyte_boundary() {
+        let value = format!("{}{}", "x".repeat(MAX_READ_BYTES - 1), "日本語");
+        let output = truncate_with_marker(&value, MAX_READ_BYTES);
+        assert!(output.contains("output truncated"));
     }
 
     #[test]

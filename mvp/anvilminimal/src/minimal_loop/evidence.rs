@@ -2985,7 +2985,7 @@ fn handler_segments(lower: &str) -> Vec<&str> {
     ] {
         for (index, _) in lower.match_indices(needle) {
             let end = lower.len().min(index + 500);
-            segments.push(&lower[index..end]);
+            segments.push(&lower[index..crate::util::floor_char_boundary(lower, end)]);
         }
     }
     segments
@@ -3427,7 +3427,7 @@ fn function_body_span(lower: &str, search_start: usize) -> Option<(usize, usize)
     let body_start = lower[search_start..].find('{')? + search_start;
     let body_end = find_matching_delimiter(lower, body_start, b'{', b'}')
         .map(|end| end + 1)
-        .unwrap_or_else(|| lower.len().min(body_start + 1500));
+        .unwrap_or_else(|| crate::util::floor_char_boundary(lower, body_start + 1500));
     Some((body_start, body_end))
 }
 
@@ -3528,7 +3528,7 @@ fn segment_has_generic_entity_fresh_reset(segment: &str) -> bool {
             && segment.as_bytes().get(after_name) == Some(&b'(')
         {
             after_name += 1;
-            let argument_window_end = segment.len().min(after_name + 240);
+            let argument_window_end = crate::util::floor_char_boundary(segment, after_name + 240);
             if let Some(argument_window) = segment.get(after_name..argument_window_end)
                 && [
                     "[", "create", "initial", "init", "spawn", "make", "build", "default",
@@ -3631,7 +3631,7 @@ fn identifier_starts_property_access(segment: &str, identifier_start: usize) -> 
 }
 
 fn assignment_value_starts_with_fresh_entity(segment: &str, value_start: usize) -> bool {
-    let window_end = segment.len().min(value_start + 240);
+    let window_end = crate::util::floor_char_boundary(segment, value_start + 240);
     let Some(window) = segment.get(value_start..window_end) else {
         return false;
     };
@@ -5683,6 +5683,19 @@ export default function Page(){
             report.evidence_tiers.get("persistence_evidence"),
             Some(&"strong".to_string())
         );
+    }
+
+    #[test]
+    fn handler_segments_handles_japanese_boundary_after_input_handler() {
+        let mut lower = "onclick".to_string();
+        lower.push_str(&"x".repeat(497));
+        lower.push_str("除外日本語");
+
+        let segments = handler_segments(&lower);
+
+        assert_eq!(segments.len(), 1);
+        assert!(segments[0].len() <= 500);
+        assert!(lower.starts_with(segments[0]));
     }
 
     #[test]

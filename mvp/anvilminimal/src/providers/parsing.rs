@@ -1,13 +1,10 @@
 use serde_json::{Value, json};
 
 use crate::tools::registry::ToolSpec;
+use crate::util;
 
 pub fn truncate_for_log(value: &str, max: usize) -> String {
-    if value.len() <= max {
-        value.to_string()
-    } else {
-        format!("{}...[truncated]", &value[..max])
-    }
+    util::excerpt_with_marker(value, max, "...[truncated]")
 }
 
 pub fn tool_names(tools: &[ToolSpec]) -> Vec<String> {
@@ -56,5 +53,13 @@ mod tests {
         let sanitized = sanitize_schema(&value);
         assert!(sanitized.get("$schema").is_none());
         assert_eq!(sanitized["properties"]["a"]["type"], "string");
+    }
+
+    #[test]
+    fn truncate_for_log_handles_multibyte_boundary() {
+        let value = "prefix日本語除外suffix";
+        let truncated = truncate_for_log(value, 10);
+        assert!(truncated.starts_with("prefix日"));
+        assert!(truncated.ends_with("...[truncated]"));
     }
 }

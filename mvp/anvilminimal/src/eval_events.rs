@@ -2151,6 +2151,15 @@ mod tests {
     }
 
     #[test]
+    fn body_snippet_and_summary_body_handle_multibyte_caps() {
+        let body = format!("{}{}", "日本語".repeat(220), "除外");
+        let snippet = body_snippet(&body);
+        assert!(snippet.chars().count() <= SNIPPET_LIMIT);
+        let summary = summary_body(&format!("{}\n{}", "日本語".repeat(1_000), body));
+        assert!(summary.chars().count() <= SUMMARY_LIMIT);
+    }
+
+    #[test]
     fn stop_reason_renderer_preserves_path_and_command_lines() {
         let recovery_yaml =
             ".anvil/plans/recovery-ultra-plan-final-acceptance-test0703-002-long-name.yaml";

@@ -12,6 +12,7 @@ pub mod repl;
 pub mod state;
 pub mod tools;
 pub mod tui;
+pub mod util;
 
 use anyhow::Context;
 use cli::Cli;
