@@ -280,6 +280,62 @@ fn conformance_honest_terminal_covers_simulated_panic_exit() {
     check_honest_terminal(&trace).unwrap_or_else(|err| panic!("{err}"));
 }
 
+#[test]
+fn conformance_boundedness_covers_hanging_dependency_setup() {
+    let trace = Trace {
+        scenario: MatrixScenario::Nextjs,
+        events: vec![
+            json!({
+                "event": "provider_turn_duration",
+                "elapsed_ms": 10,
+                "timed_out": false,
+            }),
+            json!({
+                "event": "dependency_build_lifecycle",
+                "setup_status": "timed_out",
+                "setup_attempted": true,
+                "setup_timeout_classification": "dependency_setup_timeout",
+                "setup_duration_ms": 100,
+                "setup_timeout_ms": 100,
+                "final_status": "blocked",
+            }),
+            terminal_stop("failed"),
+        ],
+        summary: terminal_summary("failed"),
+        output: String::new(),
+    };
+
+    check_honest_terminal(&trace).unwrap_or_else(|err| panic!("{err}"));
+    check_bounded_child_processes(&trace).unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+fn conformance_boundedness_covers_hanging_bash_tool() {
+    let trace = Trace {
+        scenario: MatrixScenario::GenericStatic,
+        events: vec![
+            json!({
+                "event": "provider_turn_duration",
+                "elapsed_ms": 10,
+                "timed_out": false,
+            }),
+            json!({
+                "event": "tool_validation_error",
+                "name": "Bash",
+                "error_kind": "command_timeout",
+                "duration_ms": 100,
+                "repeat_count": 1,
+            }),
+            terminal_stop("partial"),
+        ],
+        summary: terminal_summary("partial"),
+        output: String::new(),
+    };
+
+    check_honest_terminal(&trace).unwrap_or_else(|err| panic!("{err}"));
+    check_bounded_child_processes(&trace).unwrap_or_else(|err| panic!("{err}"));
+}
+
 fn assert_conformance_contracts(trace: &Trace) {
     for (name, result) in [
         ("earned_assurance", check_earned_assurance(trace)),
@@ -298,6 +354,10 @@ fn assert_conformance_contracts(trace: &Trace) {
         (
             "bounded_verify_commands",
             check_bounded_verify_commands(trace),
+        ),
+        (
+            "bounded_child_processes",
+            check_bounded_child_processes(trace),
         ),
         ("oracle_tristate", check_oracle_tristate(trace)),
         ("degradation_labeling", check_degradation_labeling(trace)),
@@ -655,6 +715,49 @@ fn check_bounded_verify_commands(trace: &Trace) -> Result<(), String> {
             return Err(
                 "bounded_verify_commands: verify timeout required human interruption".to_string(),
             );
+        }
+    }
+    Ok(())
+}
+
+fn check_bounded_child_processes(trace: &Trace) -> Result<(), String> {
+    for event in events_named(&trace.events, "dependency_build_lifecycle") {
+        if string_field(event, "setup_status") != Some("timed_out") {
+            continue;
+        }
+        if string_field(event, "setup_timeout_classification") != Some("dependency_setup_timeout") {
+            return Err(format!(
+                "bounded_child_processes: dependency setup timeout lacks dependency_setup_timeout classification in {event}"
+            ));
+        }
+        if u64_field(event, "setup_duration_ms").unwrap_or_default() == 0 {
+            return Err(format!(
+                "bounded_child_processes: dependency setup timeout lacks duration telemetry in {event}"
+            ));
+        }
+        if u64_field(event, "setup_timeout_ms").unwrap_or_default() == 0 {
+            return Err(format!(
+                "bounded_child_processes: dependency setup timeout lacks timeout telemetry in {event}"
+            ));
+        }
+    }
+    for event in events_named(&trace.events, "tool_validation_error") {
+        if string_field(event, "name") != Some("Bash")
+            || string_field(event, "error_kind") != Some("command_timeout")
+        {
+            continue;
+        }
+        if u64_field(event, "duration_ms").unwrap_or_default() == 0 {
+            return Err(format!(
+                "bounded_child_processes: Bash command_timeout lacks duration telemetry in {event}"
+            ));
+        }
+    }
+    for stop in events_named(&trace.events, "tui_command_stop") {
+        if string_field(stop, "status") == Some("interrupted") {
+            return Err(format!(
+                "bounded_child_processes: hanging child pathway required human interruption in {stop}"
+            ));
         }
     }
     Ok(())
@@ -1471,6 +1574,24 @@ fn read_events(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+fn terminal_stop(status: &str) -> Value {
+    json!({
+        "event": "tui_command_stop",
+        "status": status,
+        "build_commit": anvilminimal::build_info::COMMIT,
+        "build_timestamp": anvilminimal::build_info::TIMESTAMP,
+        "effective_profile": "generic",
+        "contract_origin": "synthetic_conformance",
+    })
+}
+
+fn terminal_summary(status: &str) -> String {
+    format!(
+        "{}\nStatus: {status}\n",
+        anvilminimal::build_info::summary_line()
+    )
+}
+
 fn events_named<'a>(events: &'a [Value], name: &str) -> Vec<&'a Value> {
     events
         .iter()
@@ -1509,6 +1630,10 @@ fn string_field<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
 
 fn bool_field(event: &Value, key: &str) -> Option<bool> {
     event.get(key).and_then(Value::as_bool)
+}
+
+fn u64_field(event: &Value, key: &str) -> Option<u64> {
+    event.get(key).and_then(Value::as_u64)
 }
 
 fn string_array(event: &Value, key: &str) -> Vec<String> {
