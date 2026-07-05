@@ -232,6 +232,7 @@ pub fn run_session<C: MinimalChatClient>(
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy,
+            required_paths: requested_artifact_paths.clone(),
         };
 
         for call in tool_calls {

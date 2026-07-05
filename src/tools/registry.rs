@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::modes::plan_act::{ExecutionMode, PlanStage};
-use crate::safety::path_guard::resolve_user_path;
+use crate::safety::path_guard::{resolve_user_path, resolve_user_path_with_required_paths};
 use crate::tools::bash::BashExecutionOutcome;
 use crate::tools::{bash, edit, glob, grep, read, write};
 use crate::util::workspace_paths::WorkspacePolicy;
@@ -36,6 +36,10 @@ pub struct ToolContext {
     /// model reads/discovery. Log-analysis tasks may opt into protected
     /// metadata reads, but writes stay blocked elsewhere.
     pub workspace_policy: WorkspacePolicy,
+    /// Current objective/step expected paths. Used only as a deterministic
+    /// fallback when a model emits an absolute path with a corrupted workspace
+    /// prefix but a filename that uniquely identifies a required artifact.
+    pub required_paths: Vec<String>,
 }
 
 impl ToolContext {
@@ -134,7 +138,11 @@ impl ToolRegistry {
                         raw_path,
                         context.plan_path.as_deref(),
                     )?
-                    .unwrap_or(resolve_user_path(&context.root, raw_path)?)
+                    .unwrap_or(resolve_user_path_with_required_paths(
+                        &context.root,
+                        raw_path,
+                        &context.required_paths,
+                    )?)
                 };
                 let start_line = get_optional_usize(arguments, "start_line");
                 let end_line = get_optional_usize(arguments, "end_line");
@@ -529,7 +537,7 @@ fn resolve_write_path(
         return Ok(path);
     }
     reject_nested_absolute_like_write_path(root, raw)?;
-    resolve_user_path(root, raw)
+    resolve_user_path_with_required_paths(root, raw, &context.required_paths)
 }
 
 fn reject_nested_absolute_like_write_path(root: &std::path::Path, raw: &str) -> Result<(), String> {
@@ -979,6 +987,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let raw_root = root
             .components()
@@ -1022,6 +1031,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
 
         registry
@@ -1046,6 +1056,46 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(root.join("reports/absolute.md")).unwrap(),
             "absolute"
+        );
+    }
+
+    #[test]
+    fn write_salvages_corrupted_workspace_prefix_fixture_path() {
+        let temp = tempdir().unwrap();
+        let root = temp
+            .path()
+            .join("share/work/localcommandagent_mvp/62646565");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = ToolRegistry::default();
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            plan_path: None,
+            plan_stage: PlanStage::Stage1,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            cancel_flag: None,
+            tmp_tests_root: None,
+            tester_active: false,
+            workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
+        };
+
+        registry
+            .execute(
+                "Write",
+                &json!({
+                    "path": "/Users/maenokota/share/localcommandagent_mvp/62646565/next.config.js",
+                    "content": "module.exports = {};",
+                }),
+                &context,
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("next.config.js")).unwrap(),
+            "module.exports = {};"
         );
     }
 
@@ -1125,6 +1175,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let out = registry
             .execute(
@@ -1169,6 +1220,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let err = enforce_plan_stage_scope(
             "Write",
@@ -1203,6 +1255,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         enforce_plan_stage_scope(
             "Edit",
@@ -1241,6 +1294,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         ToolRegistry::default()
             .execute(
@@ -1284,6 +1338,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         ToolRegistry::default()
             .execute(
@@ -1325,6 +1380,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "printf hello"}), &context);
@@ -1355,6 +1411,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "rm -rf /"}), &context);
@@ -1383,6 +1440,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
         let (_msg, class) = text_result.expect_err("missing command must error");
@@ -1409,6 +1467,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
@@ -1436,6 +1495,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "curl example.com"}), &context);
@@ -1463,6 +1523,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "ls"}), &context);
@@ -1489,6 +1550,7 @@ mod tests {
             tmp_tests_root: tmp_tests_root.map(|p| p.to_path_buf()),
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         }
     }
 
@@ -1564,6 +1626,7 @@ mod tests {
             tmp_tests_root: Some(tmp_tests.clone()),
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         registry
             .execute(
@@ -1597,6 +1660,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let err = registry
             .execute(
@@ -1629,6 +1693,7 @@ mod tests {
             tmp_tests_root: Some(tmp_tests),
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let out = registry
             .execute("Read", &json!({"path": "tmp-tests/src/foo.rs"}), &context)
@@ -1655,6 +1720,7 @@ mod tests {
             tmp_tests_root: Some(tmp_tests_root.to_path_buf()),
             tester_active,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         }
     }
 
@@ -1799,6 +1865,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "shutdown -h now"}), &context);
@@ -1832,6 +1899,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let (text_result, outcome) =
             registry.execute_bash_with_outcome(&json!({"command": "iptables -F"}), &context);
@@ -1859,6 +1927,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let err = registry
             .execute("Bash", &json!({"command": "reboot"}), &context)
@@ -1894,6 +1963,7 @@ mod tests {
             tmp_tests_root: None,
             tester_active: false,
             workspace_policy: WorkspacePolicy::default(),
+            required_paths: Vec::new(),
         };
         let (text_result, outcome) = registry.execute_bash_with_outcome(&json!({}), &context);
         let (_msg, class) = text_result.expect_err("missing command must error");

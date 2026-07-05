@@ -22,6 +22,7 @@ fn read_write_edit_glob_and_grep_work() {
         tmp_tests_root: None,
         tester_active: false,
         workspace_policy: WorkspacePolicy::default(),
+        required_paths: Vec::new(),
     };
 
     registry
@@ -91,6 +92,7 @@ fn protected_workspace_metadata_is_hidden_from_normal_discovery() {
         tmp_tests_root: None,
         tester_active: false,
         workspace_policy: WorkspacePolicy::default(),
+        required_paths: Vec::new(),
     };
 
     let listing = registry
@@ -141,6 +143,7 @@ fn normal_task_rejects_v0430_style_first_reads_of_prompt_and_cmd() {
         tmp_tests_root: None,
         tester_active: false,
         workspace_policy: WorkspacePolicy::default(),
+        required_paths: Vec::new(),
     };
 
     for path in ["prompt.md", "cmd.txt"] {
@@ -171,6 +174,7 @@ fn explicit_log_analysis_policy_can_read_protected_metadata() {
         tmp_tests_root: None,
         tester_active: false,
         workspace_policy: WorkspacePolicy::allow_protected_metadata_reads(),
+        required_paths: Vec::new(),
     };
 
     let read = registry
@@ -200,6 +204,7 @@ fn edit_tool_salvages_token_anchor_drift() {
         tmp_tests_root: None,
         tester_active: false,
         workspace_policy: WorkspacePolicy::default(),
+        required_paths: Vec::new(),
     };
 
     registry
@@ -246,6 +251,7 @@ fn plan_mode_only_allows_plan_file_writes() {
         tmp_tests_root: None,
         tester_active: false,
         workspace_policy: WorkspacePolicy::default(),
+        required_paths: Vec::new(),
     };
 
     registry
@@ -287,6 +293,7 @@ fn plan_mode_allows_plan_file_outside_workspace() {
         tmp_tests_root: None,
         tester_active: false,
         workspace_policy: WorkspacePolicy::default(),
+        required_paths: Vec::new(),
     };
 
     registry
@@ -325,6 +332,7 @@ fn offline_mode_blocks_network_bash_commands() {
         tmp_tests_root: None,
         tester_active: false,
         workspace_policy: WorkspacePolicy::default(),
+        required_paths: Vec::new(),
     };
 
     let err = registry
@@ -353,6 +361,7 @@ fn offline_mode_allows_build_test_bash_commands() {
         tmp_tests_root: None,
         tester_active: false,
         workspace_policy: WorkspacePolicy::default(),
+        required_paths: Vec::new(),
     };
 
     let result = registry

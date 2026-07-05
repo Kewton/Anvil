@@ -228,6 +228,15 @@ fn tool_context(
             .as_deref()
             .map(crate::util::workspace_paths::WorkspacePolicy::for_task_request)
             .unwrap_or_default(),
+        required_paths: super::task_classification::task_contract_authority(agent)
+            .map(|contract| {
+                contract
+                    .required_artifact_identities
+                    .iter()
+                    .map(|obligation| obligation.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 

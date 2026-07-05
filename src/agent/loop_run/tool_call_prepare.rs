@@ -27,7 +27,7 @@ use super::Agent;
 use super::tool_history::focused_read_target_for_directory;
 use crate::ollama::xml_fallback::ToolCall;
 use crate::ollama::xml_fallback::normalize_tool_call_arguments;
-use crate::safety::path_guard::resolve_user_path;
+use crate::safety::path_guard::resolve_user_path_with_required_paths;
 use std::path::Path;
 
 pub(super) fn prepare_tool_call(agent: &Agent, mut tool_call: ToolCall) -> ToolCall {
@@ -35,7 +35,11 @@ pub(super) fn prepare_tool_call(agent: &Agent, mut tool_call: ToolCall) -> ToolC
     if matches!(tool_call.name.as_str(), "Read" | "Write" | "Edit")
         && let Some(arguments) = tool_call.arguments.as_object_mut()
         && let Some(raw_path) = arguments.get("path").and_then(serde_json::Value::as_str)
-        && let Ok(resolved) = resolve_user_path(&agent.work_root, raw_path)
+        && let Ok(resolved) = resolve_user_path_with_required_paths(
+            &agent.work_root,
+            raw_path,
+            &required_tool_paths_for_turn(agent),
+        )
     {
         let resolved = if tool_call.name == "Read" {
             super::effective_tool_policy_flow::effective_tool_policy(agent)
@@ -54,6 +58,18 @@ pub(super) fn prepare_tool_call(agent: &Agent, mut tool_call: ToolCall) -> ToolC
         );
     }
     tool_call
+}
+
+fn required_tool_paths_for_turn(agent: &Agent) -> Vec<String> {
+    super::task_classification::task_contract_authority(agent)
+        .map(|contract| {
+            contract
+                .required_artifact_identities
+                .iter()
+                .map(|obligation| obligation.path.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn model_visible_tool_path(work_root: &Path, resolved: &Path) -> String {

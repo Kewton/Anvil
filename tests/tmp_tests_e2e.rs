@@ -110,6 +110,7 @@ fn tool_context_for(fixture: &SessionFixture) -> ToolContext {
         tmp_tests_root: Some(fixture.tmp_tests_root.clone()),
         tester_active: false,
         workspace_policy: WorkspacePolicy::default(),
+        required_paths: Vec::new(),
     }
 }
 
@@ -303,6 +304,7 @@ fn tmp_tests_prefix_with_none_root_is_rejected() {
         tmp_tests_root: None,
         tester_active: false,
         workspace_policy: WorkspacePolicy::default(),
+        required_paths: Vec::new(),
     };
 
     let err = registry
