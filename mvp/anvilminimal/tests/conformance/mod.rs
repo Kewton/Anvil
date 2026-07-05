@@ -61,7 +61,7 @@ impl MatrixScenario {
                 ],
             },
             Self::PythonCli => UltraPlan {
-                goal: "Build a Python CLI that reads a CSV file path argument and prints sum, average, max, and min for numeric columns.".to_string(),
+                goal: "CSVファイルを読み込み、数値列の合計・平均・最大・最小を集計して表形式で標準出力するCLIツールをPythonで開発してください。".to_string(),
                 profile: "python-cli".to_string(),
                 style: "default".to_string(),
                 intent: "create".to_string(),
@@ -287,6 +287,10 @@ fn assert_conformance_contracts(trace: &Trace) {
         ("authority_symmetry", check_authority_symmetry(trace)),
         ("detect_repair_pairing", check_detect_repair_pairing(trace)),
         ("honest_terminal", check_honest_terminal(trace)),
+        (
+            "known_profile_contract_bound",
+            check_known_profile_contract_bound(trace),
+        ),
         ("oracle_tristate", check_oracle_tristate(trace)),
         ("degradation_labeling", check_degradation_labeling(trace)),
     ] {
@@ -550,6 +554,36 @@ fn check_honest_terminal(trace: &Trace) -> Result<(), String> {
     Ok(())
 }
 
+fn check_known_profile_contract_bound(trace: &Trace) -> Result<(), String> {
+    if !matches!(
+        trace.scenario,
+        MatrixScenario::Nextjs | MatrixScenario::PythonCli
+    ) {
+        return Ok(());
+    }
+    let expected_profile = trace.scenario.configured_profile();
+    let Some(contract) = trace.events.iter().find(|event| {
+        string_field(event, "event") == Some("completion_contract_bound")
+            && bool_field(event, "completion_contract_generated") == Some(true)
+    }) else {
+        return Err(format!(
+            "known_profile_contract_bound: explicit known profile {expected_profile} did not bind a generated completion contract"
+        ));
+    };
+    let required_capabilities = string_array(contract, "required_capabilities");
+    let required_evidence = string_array(contract, "required_evidence");
+    let required_obligations = string_array(contract, "required_obligations");
+    if required_capabilities.is_empty()
+        && required_evidence.is_empty()
+        && required_obligations.is_empty()
+    {
+        return Err(format!(
+            "known_profile_contract_bound: explicit known profile {expected_profile} bound an empty completion contract"
+        ));
+    }
+    Ok(())
+}
+
 fn check_oracle_tristate(trace: &Trace) -> Result<(), String> {
     for event in &trace.events {
         let text = event.to_string();
@@ -688,7 +722,7 @@ fn scenario_planner_replies(scenario: MatrixScenario) -> Vec<AssistantReply> {
                 "implement",
                 vec![
                     "pyproject.toml".to_string(),
-                    "src/csv_stats/main.py".to_string(),
+                    "src/anvil_app/main.py".to_string(),
                 ],
                 vec!["python -m compileall -q src".to_string()],
             )),
@@ -697,7 +731,7 @@ fn scenario_planner_replies(scenario: MatrixScenario) -> Vec<AssistantReply> {
                 "implement",
                 vec![
                     "pyproject.toml".to_string(),
-                    "src/csv_stats/main.py".to_string(),
+                    "src/anvil_app/main.py".to_string(),
                 ],
                 vec!["python -m compileall -q src".to_string()],
             )),
@@ -768,7 +802,7 @@ fn scenario_execution_replies(scenario: MatrixScenario) -> Vec<AssistantReply> {
                     ),
                     ToolCall::new(
                         "Write",
-                        json!({"path":"src/csv_stats/main.py","content":python_cli_main()}),
+                        json!({"path":"src/anvil_app/main.py","content":python_cli_main()}),
                     ),
                 ],
                 prompt_tokens: None,
@@ -783,7 +817,7 @@ fn scenario_execution_replies(scenario: MatrixScenario) -> Vec<AssistantReply> {
                     ),
                     ToolCall::new(
                         "Write",
-                        json!({"path":"src/csv_stats/main.py","content":python_cli_main()}),
+                        json!({"path":"src/anvil_app/main.py","content":python_cli_main()}),
                     ),
                 ],
                 prompt_tokens: None,
@@ -1130,11 +1164,11 @@ export default function Memo(){
 
 fn python_cli_pyproject() -> &'static str {
     r#"[project]
-name = "csv-stats"
+name = "anvil-app"
 version = "0.1.0"
 
 [project.scripts]
-csv-stats = "csv_stats.main:main"
+csv-stats = "anvil_app.main:main"
 "#
 }
 

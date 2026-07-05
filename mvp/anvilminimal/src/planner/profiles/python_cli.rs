@@ -166,8 +166,10 @@ impl DomainProfile for PythonCliProfile {
         vec!["implementation".to_string()]
     }
 
-    fn completion_contract_required(&self, _goal: &str, _required_capabilities: &[String]) -> bool {
-        false
+    fn completion_contract_required(&self, _goal: &str, required_capabilities: &[String]) -> bool {
+        required_capabilities
+            .iter()
+            .any(|capability| capability == "input_output_contract")
     }
 
     fn behavior_probe(
