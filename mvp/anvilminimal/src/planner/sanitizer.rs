@@ -13,6 +13,7 @@ use crate::tools::path_guard::validate_workspace_relative;
 const BROWSER_READINESS_NOTE: &str =
     "Browser readiness is verified by the runtime at final acceptance.";
 const STEP_PLAN_GOAL_LINT_LIMIT_CHARS: usize = 4_000;
+const STEP_PLAN_INSTRUCTION_LINT_LIMIT_CHARS: usize = 2_500;
 const SANITIZED_GOAL_MAX_CHARS: usize = 600;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -23,8 +24,10 @@ pub struct SanitizerReport {
     pub removed_commands: Vec<SanitizedCommandRecord>,
     pub substituted_commands: Vec<SanitizedSubstitutionRecord>,
     pub moved_commands: Vec<SanitizedMoveRecord>,
+    pub setup_verify_relocations: Vec<SanitizedMoveRecord>,
     pub dropped_commands: Vec<SanitizedCommandRecord>,
     pub retyped_steps: Vec<SanitizedRetypeRecord>,
+    pub instruction_truncations: Vec<SanitizedInstructionTruncationRecord>,
     pub instruction_notes: Vec<SanitizedInstructionNote>,
 }
 
@@ -83,6 +86,14 @@ pub struct SanitizedRetypeRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedInstructionTruncationRecord {
+    pub kind: String,
+    pub step_id: String,
+    pub original_len: usize,
+    pub new_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizedInstructionNote {
     pub step_id: String,
     pub note: String,
@@ -96,8 +107,10 @@ impl SanitizerReport {
             && self.removed_commands.is_empty()
             && self.substituted_commands.is_empty()
             && self.moved_commands.is_empty()
+            && self.setup_verify_relocations.is_empty()
             && self.dropped_commands.is_empty()
             && self.retyped_steps.is_empty()
+            && self.instruction_truncations.is_empty()
             && self.instruction_notes.is_empty()
     }
 }
@@ -110,6 +123,7 @@ pub fn sanitize_step_plan_against_policy(
     normalize_oversized_goal(plan, &mut report);
     normalize_repairable_verify_commands(plan, &mut report);
     sanitize_shell_control_verify_commands(plan, &mut report);
+    relocate_setup_verify_commands(plan, &mut report);
     remove_setup_or_dev_server_verify_commands(plan, &mut report);
     let should_retype_manifest_step = !report.removed_commands.is_empty()
         || !diagnose_step_plan_dependency_order(plan, workspace_root).is_empty();
@@ -118,6 +132,7 @@ pub fn sanitize_step_plan_against_policy(
     }
     move_dependency_order_commands(plan, workspace_root, &mut report);
     normalize_empty_verify_steps(plan, &mut report);
+    truncate_oversized_step_instructions(plan, &mut report);
     dedupe_verify_commands(plan);
     report
 }
@@ -449,11 +464,17 @@ fn truncate_at_sentence_or_line_boundary(text: &str, max_chars: usize) -> String
             return candidate.to_string();
         }
     }
-    text.chars()
-        .take(max_chars)
-        .collect::<String>()
+    let byte_limit = byte_index_after_chars(text, max_chars);
+    crate::util::truncate_at_char_boundary(text, byte_limit)
         .trim()
         .to_string()
+}
+
+fn byte_index_after_chars(text: &str, max_chars: usize) -> usize {
+    text.char_indices()
+        .nth(max_chars)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
 }
 
 fn remove_setup_or_dev_server_verify_commands(plan: &mut StepPlan, report: &mut SanitizerReport) {
@@ -579,6 +600,72 @@ fn move_dependency_order_commands(
     }
 }
 
+fn relocate_setup_verify_commands(plan: &mut StepPlan, report: &mut SanitizerReport) {
+    let Some(target_index) = plan
+        .steps
+        .iter()
+        .rposition(|step| step.step_kind() != StepKind::Setup)
+    else {
+        return;
+    };
+    let target_step_id = plan.steps[target_index].id.clone();
+    let mut relocations = Vec::new();
+    for source_index in 0..plan.steps.len() {
+        if source_index == target_index || plan.steps[source_index].step_kind() != StepKind::Setup {
+            continue;
+        }
+        let source_step_id = plan.steps[source_index].id.clone();
+        let original_verify = std::mem::take(&mut plan.steps[source_index].verify);
+        for command in original_verify {
+            if setup_step_verify_command_should_relocate(&command) {
+                relocations.push(SanitizedMoveRecord {
+                    from_step_id: source_step_id.clone(),
+                    to_step_id: target_step_id.clone(),
+                    command,
+                    reason: "setup_verify_relocated".to_string(),
+                });
+            } else {
+                plan.steps[source_index].verify.push(command);
+            }
+        }
+    }
+    for relocation in relocations {
+        let command = relocation.command.clone();
+        if append_verify_command(&mut plan.steps[target_index], command.clone()) {
+            report.setup_verify_relocations.push(relocation);
+        } else {
+            report.dropped_commands.push(SanitizedCommandRecord {
+                step_id: relocation.from_step_id,
+                command,
+                reason: "setup verify command already exists on relocation target".to_string(),
+            });
+        }
+    }
+}
+
+fn setup_step_verify_command_should_relocate(command: &str) -> bool {
+    if diagnose_verify_command(command).violation.is_some() {
+        return false;
+    }
+    let lower = command.trim().to_ascii_lowercase();
+    lower == "cargo test"
+        || lower.starts_with("cargo test ")
+        || lower == "npm test"
+        || lower == "npm run test"
+        || lower == "npm run build"
+        || lower == "pnpm test"
+        || lower == "pnpm build"
+        || lower == "yarn test"
+        || lower == "yarn build"
+        || lower.starts_with("python -m unittest")
+        || lower.starts_with("python3 -m unittest")
+        || lower.starts_with("python -m compileall")
+        || lower.starts_with("python3 -m compileall")
+        || lower == "pytest"
+        || lower.starts_with("pytest ")
+        || lower.contains(" build")
+}
+
 fn remove_verify_command_at(
     plan: &mut StepPlan,
     step_index: usize,
@@ -683,6 +770,28 @@ fn normalize_empty_verify_steps(plan: &mut StepPlan, report: &mut SanitizerRepor
                     .to_string(),
             });
         }
+    }
+}
+
+fn truncate_oversized_step_instructions(plan: &mut StepPlan, report: &mut SanitizerReport) {
+    for step in &mut plan.steps {
+        let original_len = step.instruction.chars().count();
+        if original_len <= STEP_PLAN_INSTRUCTION_LINT_LIMIT_CHARS {
+            continue;
+        }
+        step.instruction = truncate_at_sentence_or_line_boundary(
+            &step.instruction,
+            STEP_PLAN_INSTRUCTION_LINT_LIMIT_CHARS,
+        );
+        let new_len = step.instruction.chars().count();
+        report
+            .instruction_truncations
+            .push(SanitizedInstructionTruncationRecord {
+                kind: "instruction_truncated".to_string(),
+                step_id: step.id.clone(),
+                original_len,
+                new_len,
+            });
     }
 }
 
@@ -1071,6 +1180,92 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
             lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
             "{plan:?}"
         );
+    }
+
+    #[test]
+    fn sanitizer_relocates_build_verify_from_setup_to_last_non_setup_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Create a Rust helper".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "setup-project".to_string(),
+                    kind: "setup".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create Cargo.toml for the helper crate".to_string(),
+                    expected_paths: vec!["Cargo.toml".to_string()],
+                    verify: vec!["cargo test".to_string()],
+                },
+                PlanStep {
+                    id: "create-helper".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create src/lib.rs with the helper implementation".to_string(),
+                    expected_paths: vec!["src/lib.rs".to_string()],
+                    verify: Vec::new(),
+                },
+            ],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.setup_verify_relocations.len(), 1);
+        assert_eq!(
+            report.setup_verify_relocations[0].reason,
+            "setup_verify_relocated"
+        );
+        assert!(plan.steps[0].verify.is_empty());
+        assert_eq!(plan.steps[1].verify, vec!["cargo test"]);
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+        let once = plan.clone();
+        let second = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+        assert!(second.is_empty(), "{second:?}");
+        assert_eq!(plan, once);
+    }
+
+    #[test]
+    fn sanitizer_truncates_overlong_instruction_at_multibyte_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_instruction = format!("Create README.md. {}", "日本語".repeat(1_000));
+        let mut plan = StepPlan {
+            goal: "Create README".to_string(),
+            steps: vec![PlanStep {
+                id: "create-readme".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: long_instruction,
+                expected_paths: vec!["README.md".to_string()],
+                verify: vec!["test -f README.md".to_string()],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.instruction_truncations.len(), 1);
+        assert_eq!(
+            report.instruction_truncations[0].kind,
+            "instruction_truncated"
+        );
+        assert!(
+            plan.steps[0].instruction.chars().count() <= STEP_PLAN_INSTRUCTION_LINT_LIMIT_CHARS
+        );
+        assert!(
+            plan.steps[0]
+                .instruction
+                .is_char_boundary(plan.steps[0].instruction.len())
+        );
+        assert_eq!(plan.steps[0].instruction, "Create README.md.");
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+        let once = plan.clone();
+        let second = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+        assert!(second.is_empty(), "{second:?}");
+        assert_eq!(plan, once);
     }
 
     #[test]

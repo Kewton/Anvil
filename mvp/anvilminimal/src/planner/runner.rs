@@ -10080,6 +10080,16 @@ fn emit_planner_plan_sanitized(
                 "original_command": eval_events::body_snippet(&record.original_command),
                 "fragments": record.fragments.iter().map(|fragment| eval_events::body_snippet(fragment)).collect::<Vec<_>>(),
                 "dropped_fallback": record.dropped_fallback.as_deref().map(eval_events::body_snippet),
+            }))).chain(report.setup_verify_relocations.iter().map(|record| json!({
+                "kind": "setup_verify_relocated",
+                "from_step_id": &record.from_step_id,
+                "to_step_id": &record.to_step_id,
+                "command": eval_events::body_snippet(&record.command),
+            }))).chain(report.instruction_truncations.iter().map(|record| json!({
+                "kind": &record.kind,
+                "step_id": &record.step_id,
+                "original_len": record.original_len,
+                "new_len": record.new_len,
             }))).collect::<Vec<_>>(),
             "goal_truncations": report.goal_truncations.iter().map(|record| json!({
                 "kind": &record.kind,
@@ -10115,6 +10125,12 @@ fn emit_planner_plan_sanitized(
                 "command": eval_events::body_snippet(&record.command),
                 "reason": eval_events::body_snippet(&record.reason),
             })).collect::<Vec<_>>(),
+            "setup_verify_relocations": report.setup_verify_relocations.iter().map(|record| json!({
+                "from_step_id": &record.from_step_id,
+                "to_step_id": &record.to_step_id,
+                "command": eval_events::body_snippet(&record.command),
+                "reason": eval_events::body_snippet(&record.reason),
+            })).collect::<Vec<_>>(),
             "dropped_commands": report.dropped_commands.iter().map(|record| json!({
                 "step_id": &record.step_id,
                 "command": eval_events::body_snippet(&record.command),
@@ -10125,6 +10141,12 @@ fn emit_planner_plan_sanitized(
                 "from_kind": &record.from_kind,
                 "to_kind": &record.to_kind,
                 "reason": eval_events::body_snippet(&record.reason),
+            })).collect::<Vec<_>>(),
+            "instruction_truncations": report.instruction_truncations.iter().map(|record| json!({
+                "kind": &record.kind,
+                "step_id": &record.step_id,
+                "original_len": record.original_len,
+                "new_len": record.new_len,
             })).collect::<Vec<_>>(),
             "instruction_notes": report.instruction_notes.iter().map(|record| json!({
                 "step_id": &record.step_id,
@@ -12747,6 +12769,53 @@ mod tests {
         );
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"event\":\"planner_plan_sanitized\""));
+        assert!(!event_text.contains("\"event\":\"planner_error\""));
+    }
+
+    #[test]
+    fn sanitizer_emits_qwen_lint_shape_repairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let plan_json = serde_json::to_string(&StepPlan {
+            goal: "Create a Rust helper".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "setup-project".to_string(),
+                    kind: "setup".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create Cargo.toml for the helper crate".to_string(),
+                    expected_paths: vec!["Cargo.toml".to_string()],
+                    verify: vec!["cargo test".to_string()],
+                },
+                PlanStep {
+                    id: "create-helper".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: format!("Create src/lib.rs. {}", "日本語".repeat(1_000)),
+                    expected_paths: vec!["src/lib.rs".to_string()],
+                    verify: Vec::new(),
+                },
+            ],
+        })
+        .unwrap();
+        let mut planner = FakeClient::new(vec![AssistantReply::text(plan_json)]);
+
+        let plan = generate_step_plan(&mut planner, "Create a Rust helper", &cfg).unwrap();
+
+        assert_eq!(planner.messages.len(), 1);
+        assert!(plan.steps[0].verify.is_empty());
+        assert_eq!(plan.steps[1].verify, vec!["cargo test"]);
+        assert_eq!(plan.steps[1].instruction, "Create src/lib.rs.");
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"planner_plan_sanitized\""));
+        assert!(event_text.contains("\"kind\":\"setup_verify_relocated\""));
+        assert!(event_text.contains("\"kind\":\"instruction_truncated\""));
         assert!(!event_text.contains("\"event\":\"planner_error\""));
     }
 
