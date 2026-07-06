@@ -253,6 +253,7 @@ pub fn handle_command(
     let panic_diagnostic = Arc::new(Mutex::new(None));
     let panic_hook_guard = PanicHookGuard::install(Arc::clone(&panic_diagnostic));
     let command_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        crate::preflight::run_for_slash_command(&config, &parsed.command, &parsed.goal)?;
         match parsed.command.as_str() {
             "/plan-steps" => {
                 let plan =

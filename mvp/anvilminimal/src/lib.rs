@@ -8,6 +8,7 @@ pub mod eval_events;
 pub mod minimal_loop;
 pub mod mode;
 pub mod planner;
+pub mod preflight;
 pub mod provider_call;
 pub mod providers;
 pub mod repl;
@@ -40,6 +41,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     emit_run_start(&config);
     let direct_command_guard = DirectCommandCompletionGuard::start(&config);
     let result = (|| -> anyhow::Result<()> {
+        preflight::run_for_action(&config)?;
         match config.action.clone() {
             Action::Repl => repl::run_repl(config.clone()),
             Action::Prompt(prompt) => {

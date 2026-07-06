@@ -99,6 +99,9 @@ pub fn render_startup_banner(config: &Config, style: BannerStyle) -> String {
             sanitize_banner_text(&path.display().to_string())
         ));
     }
+    if crate::build_info::dirty() {
+        out.push_str("warning: build stamp is dirty; rebuild cleanly before measurement runs\n");
+    }
     out
 }
 
