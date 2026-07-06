@@ -1516,24 +1516,45 @@ function setPersistenceNotEvaluatedReason(reason) {
   }
 }
 
+function observedMutationDimensions() {
+  return Array.from(new Set(state_dimensions_changed || []))
+    .filter(Boolean)
+    .sort();
+}
+
+function contractPersistenceMutationKeys(beforeReloadText) {
+  const retained = retainedChangedStateKeys(input_before_marker, input_after_marker, beforeReloadText);
+  return retained.length > 0 ? retained : observedMutationDimensions();
+}
+
 function evaluatePersistenceAfterReload(mode, beforeReloadText, afterReloadText) {
   if (mode === "contract") {
-    const retained = retainedChangedStateKeys(input_before_marker, input_after_marker, beforeReloadText);
-    persistence_changed_dimensions = retained;
-    if (retained.length === 0) {
+    const changed = contractPersistenceMutationKeys(beforeReloadText);
+    persistence_changed_dimensions = changed;
+    if (changed.length === 0) {
       setPersistenceNotEvaluatedReason("no_mutation_observed");
       return "not_evaluated";
     }
-    return changedStateKeysPreservedAfterReload(retained, beforeReloadText, afterReloadText)
+    return changedStateKeysPreservedAfterReload(changed, beforeReloadText, afterReloadText)
       ? "preserved"
       : "reset";
   }
   if (!input_before_marker || !input_after_marker || input_before_marker === input_after_marker) {
+    const changed = observedMutationDimensions();
+    if (changed.length > 0) {
+      persistence_changed_dimensions = changed;
+      return beforeReloadText === afterReloadText ? "preserved" : "reset";
+    }
     persistence_changed_dimensions = [];
     setPersistenceNotEvaluatedReason("no_mutation_observed");
     return "not_evaluated";
   }
   if (beforeReloadText !== input_after_marker) {
+    const changed = observedMutationDimensions();
+    if (changed.length > 0) {
+      persistence_changed_dimensions = changed;
+      return beforeReloadText === afterReloadText ? "preserved" : "reset";
+    }
     persistence_changed_dimensions = [];
     setPersistenceNotEvaluatedReason("no_mutation_observed");
     return "not_evaluated";
@@ -1544,15 +1565,17 @@ function evaluatePersistenceAfterReload(mode, beforeReloadText, afterReloadText)
 
 function persistenceMarkerLooksPreserved(mode, beforeReloadText, afterReloadText) {
   if (mode === "contract") {
-    const retained = retainedChangedStateKeys(input_before_marker, input_after_marker, beforeReloadText);
-    return retained.length > 0
-      && changedStateKeysPreservedAfterReload(retained, beforeReloadText, afterReloadText);
+    const changed = contractPersistenceMutationKeys(beforeReloadText);
+    return changed.length > 0
+      && changedStateKeysPreservedAfterReload(changed, beforeReloadText, afterReloadText);
   }
   if (!input_before_marker || !input_after_marker || input_before_marker === input_after_marker) {
-    return false;
+    const changed = observedMutationDimensions();
+    return changed.length > 0 && beforeReloadText === afterReloadText;
   }
   if (beforeReloadText !== input_after_marker) {
-    return false;
+    const changed = observedMutationDimensions();
+    return changed.length > 0 && beforeReloadText === afterReloadText;
   }
   return beforeReloadText === afterReloadText;
 }
@@ -2786,15 +2809,33 @@ fn observation_from_value(
     let candidate_table = interaction_candidate_table(&value);
     let input_dispatches = string_array_field(&value, "input_dispatches");
     let state_dimensions_changed = string_array_field(&value, "state_dimensions_changed");
-    let persistence_after_reload = value
+    let mut persistence_after_reload = value
         .get("persistence_after_reload")
         .and_then(Value::as_str)
         .unwrap_or("not_evaluated")
         .to_string();
-    let persistence_after_reload_reason =
+    let mut persistence_after_reload_reason =
         persistence_after_reload_reason_from_value(&value, &steps, &persistence_after_reload);
-    let persistence_changed_dimensions =
+    let mut persistence_changed_dimensions =
         string_array_field(&value, "persistence_changed_dimensions");
+    let persistence_before_reload_marker = value
+        .get("persistence_before_reload_marker")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let persistence_after_reload_marker = value
+        .get("persistence_after_reload_marker")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    reconcile_observed_mutation_persistence(
+        &state_dimensions_changed,
+        &persistence_before_reload_marker,
+        &persistence_after_reload_marker,
+        &mut persistence_after_reload,
+        &mut persistence_after_reload_reason,
+        &mut persistence_changed_dimensions,
+    );
     let action_hooks = string_array_field(&value, "action_hooks")
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>()
@@ -2858,16 +2899,8 @@ fn observation_from_value(
         persistence_after_reload,
         persistence_after_reload_reason,
         persistence_changed_dimensions,
-        persistence_before_reload_marker: value
-            .get("persistence_before_reload_marker")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        persistence_after_reload_marker: value
-            .get("persistence_after_reload_marker")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
+        persistence_before_reload_marker,
+        persistence_after_reload_marker,
         action_hooks,
         text_entry,
         text_entry_target,
@@ -2997,6 +3030,40 @@ fn persistence_after_reload_reason_from_value(
         return "no_text_entry_surface".to_string();
     }
     "no_mutation_observed".to_string()
+}
+
+fn reconcile_observed_mutation_persistence(
+    state_dimensions_changed: &[String],
+    before_reload_marker: &str,
+    after_reload_marker: &str,
+    persistence_after_reload: &mut String,
+    persistence_after_reload_reason: &mut String,
+    persistence_changed_dimensions: &mut Vec<String>,
+) {
+    if persistence_after_reload != "not_evaluated"
+        || persistence_after_reload_reason != "no_mutation_observed"
+        || state_dimensions_changed.is_empty()
+        || before_reload_marker.trim().is_empty()
+        || after_reload_marker.trim().is_empty()
+    {
+        return;
+    }
+    *persistence_changed_dimensions = state_dimensions_changed
+        .iter()
+        .filter(|dimension| !dimension.trim().is_empty())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if persistence_changed_dimensions.is_empty() {
+        return;
+    }
+    *persistence_after_reload = if before_reload_marker == after_reload_marker {
+        "preserved".to_string()
+    } else {
+        "reset".to_string()
+    };
+    persistence_after_reload_reason.clear();
 }
 
 fn normalized_persistence_not_evaluated_reason(reason: &str) -> Option<&'static str> {
@@ -3260,6 +3327,9 @@ fn normalized_interaction_failure_kind(
     {
         return "app_route_unresponsive".to_string();
     }
+    if raw_failure_kind == "probe_script_error" {
+        return "probe_infrastructure_failed:probe_script_error".to_string();
+    }
     if probe_stage_before_observation(stage)
         || matches!(
             raw_failure_kind,
@@ -3317,7 +3387,9 @@ fn playwright_browser_binaries_missing(text: &str) -> bool {
 fn interaction_failure_remediation(failure_kind: &str) -> String {
     if failure_kind == "probe_dependency_missing:browser_binaries_missing" {
         PLAYWRIGHT_BROWSER_BINARIES_REMEDIATION.to_string()
-    } else if failure_kind == "probe_dependency_missing:playwright_module_missing" {
+    } else if failure_kind == "probe_dependency_missing:playwright_module_missing"
+        || failure_kind.starts_with("probe_infrastructure_failed")
+    {
         INTERACTION_PROBE_SETUP_REMEDIATION.to_string()
     } else {
         String::new()
@@ -3836,6 +3908,73 @@ mod tests {
                 .get("persistence_after_reload_reason")
                 .and_then(Value::as_str),
             Some("no_mutation_observed")
+        );
+    }
+
+    #[test]
+    fn probe_script_error_uses_infrastructure_taxonomy_with_error_and_remediation() {
+        let observation = observe_probe_value(json!({
+            "ok": false,
+            "status": "failed",
+            "stage": "observing",
+            "failure_kind": "probe_script_error",
+            "error": "locator.click: Timeout 5000ms exceeded",
+            "steps": ["surface_visible"],
+            "server_http_status": 200,
+            "server_check": {"ok": true, "status": 200, "error": ""}
+        }));
+
+        assert!(!observation.ok, "{observation:?}");
+        assert_eq!(
+            observation.failure_kind,
+            "probe_infrastructure_failed:probe_script_error"
+        );
+        let projected = interaction_observation_json(&observation);
+        assert_eq!(
+            projected.get("failure_category").and_then(Value::as_str),
+            Some("infrastructure")
+        );
+        assert!(
+            observation.error.contains("locator.click"),
+            "{observation:?}"
+        );
+        assert!(
+            observation.remediation.contains("setup-interaction-probe"),
+            "{observation:?}"
+        );
+    }
+
+    #[test]
+    fn observed_state_dimensions_make_persistence_reload_evaluated() {
+        let marker = r#"{"states":[{"index":0,"state":{"notesCount":0,"activeNoteId":null}}]}"#;
+        let observation = observe_probe_value(json!({
+            "ok": true,
+            "status": "passed",
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
+            "input_state_change": true,
+            "state_changed": true,
+            "visible_state_changed": true,
+            "text_entry": "entered",
+            "text_entry_target": "textarea:data-anvil-action=input",
+            "state_dimensions_changed": ["notesCount", "activeNoteId"],
+            "persistence_before_reload_marker": marker,
+            "persistence_after_reload_marker": marker,
+            "persistence_after_reload": "not_evaluated",
+            "persistence_after_reload_reason": "no_mutation_observed",
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "input_state_change",
+                "persistence_reload:not_evaluated"
+            ]
+        }));
+
+        assert_eq!(observation.persistence_after_reload, "preserved");
+        assert_eq!(observation.persistence_after_reload_reason, "");
+        assert_eq!(
+            observation.persistence_changed_dimensions,
+            vec!["activeNoteId".to_string(), "notesCount".to_string()]
         );
     }
 
