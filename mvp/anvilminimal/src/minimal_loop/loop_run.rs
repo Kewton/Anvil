@@ -9,7 +9,9 @@ use crate::config::Config;
 use crate::eval_events;
 use crate::mode::ExecutionMode;
 use crate::planner::profile::{profile_complete_scaffold, profile_setup_scaffold_paths};
-use crate::planner::verify::{diagnose_verify_command, normalize_verify_command_for_oracle_repair};
+use crate::planner::verify::{
+    diagnose_verify_command, normalize_verify_command_for_oracle_repair_with_root,
+};
 use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::ChatClient;
 use crate::state::{ConversationMessage, SessionSnapshot};
@@ -408,20 +410,13 @@ impl RuntimeBashPolicyDecision {
         let mut normalized_command = None;
         let mut normalization_kind = "";
         let mut normalization_reason = String::new();
-        if let Some(repair) = normalize_verify_command_for_oracle_repair(command)
-            && repair.kind == "output_pipe_stripped"
+        if let Some(repair) = normalize_verify_command_for_oracle_repair_with_root(command, root)
             && repair.normalized != command
         {
             normalization_kind = repair.kind;
             normalization_reason = repair.reason;
             effective_command = repair.normalized.clone();
             normalized_command = Some(repair.normalized);
-            if let Some(repaired_cd) =
-                normalize_runtime_absolute_cd_verify_command(&effective_command, root)
-            {
-                effective_command = repaired_cd.clone();
-                normalized_command = Some(repaired_cd);
-            }
         }
         let diagnosis = diagnose_verify_command(&effective_command);
         if let Some(violation) = diagnosis.violation {
@@ -444,7 +439,7 @@ impl RuntimeBashPolicyDecision {
             };
         }
         let reason = if normalized_command.is_some() {
-            "runtime Bash admitted as deterministic verifier evidence after stripping output-limiting pipe"
+            "runtime Bash admitted as deterministic verifier evidence after mechanical normalization"
         } else {
             "runtime Bash admitted as deterministic verifier evidence"
         };
@@ -480,36 +475,6 @@ fn runtime_bash_policy_decision(
     Some(RuntimeBashPolicyDecision::for_step(
         step_kind, command, root,
     ))
-}
-
-fn normalize_runtime_absolute_cd_verify_command(command: &str, root: &Path) -> Option<String> {
-    let (cd_part, verify_part) = command.split_once("&&")?;
-    if verify_part.contains("&&") {
-        return None;
-    }
-    let cd_tokens = cd_part.split_whitespace().collect::<Vec<_>>();
-    if cd_tokens.len() != 2 || cd_tokens[0] != "cd" {
-        return None;
-    }
-    let cd_path = Path::new(cd_tokens[1]);
-    if !cd_path.is_absolute() {
-        return None;
-    }
-    let root = root.canonicalize().ok()?;
-    let cd_path = cd_path.canonicalize().ok()?;
-    let relative = cd_path.strip_prefix(&root).ok()?;
-    let verify = verify_part.trim();
-    if verify.is_empty() {
-        return None;
-    }
-    if relative.as_os_str().is_empty() {
-        return Some(verify.to_string());
-    }
-    let relative = relative.to_string_lossy().replace('\\', "/");
-    if relative.chars().any(char::is_whitespace) {
-        return None;
-    }
-    Some(format!("cd {relative} && {verify}"))
 }
 
 fn recovered_bash_command(tool_name: &str, arguments: &Value) -> Option<String> {
@@ -3825,6 +3790,12 @@ fn looks_like_action_prompt(content: &str) -> bool {
 }
 
 fn recoverable_tool_feedback(name: &str, err: &anyhow::Error) -> String {
+    let err_text = err.to_string();
+    if err_text.contains("verify_command_policy_error") {
+        return format!(
+            "Tool call `{name}` was rejected by deterministic verify policy: {err_text}. Allowed alternatives: use one bounded verifier command such as `npm run build`, `cargo test`, `python -m compileall -q src`, or `test -f relative/path`; move dependency installation or dev-server startup to setup/runtime phases, not verify."
+        );
+    }
     format!(
         "Tool call `{name}` was rejected with a recoverable validation error: {err}. Retry with the same tool or another available tool using a valid JSON object that matches the tool schema."
     )
@@ -4639,7 +4610,7 @@ export default function Page(){
             .unwrap();
         assert_eq!(
             policy.get("normalization_kind").and_then(Value::as_str),
-            Some("output_pipe_stripped")
+            Some("workspace_cd_normalized")
         );
         assert_eq!(policy.get("blocked").and_then(Value::as_bool), Some(false));
         let normalization = events.iter().find(|event| {
@@ -4648,7 +4619,7 @@ export default function Page(){
         });
         assert_eq!(
             normalization.and_then(|event| event.get("kind")),
-            Some(&json!("output_pipe_stripped"))
+            Some(&json!("workspace_cd_normalized"))
         );
         assert!(
             normalization
@@ -4656,6 +4627,14 @@ export default function Page(){
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .contains("mask the base command exit status"),
+            "{events:?}"
+        );
+        assert!(
+            normalization
+                .and_then(|event| event.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("workspace cd"),
             "{events:?}"
         );
     }

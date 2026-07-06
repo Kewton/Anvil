@@ -53,6 +53,13 @@ pub struct VerifyCommandRuntimeNormalization {
 }
 
 pub const OUTPUT_PIPE_STRIPPED_REASON: &str = "output_pipe_stripped: verifier output is already captured and excerpted; trailing head/tail pipes mask the base command exit status";
+const STDERR_MERGE_STRIPPED_REASON: &str =
+    "stderr_merge_stripped: verifier output already captures stderr; trailing 2>&1 is redundant";
+const EXIT_CODE_ECHO_STRIPPED_REASON: &str = "exit_code_echo_stripped: trailing exit-code echo masks the base command exit status; verifier already records status";
+const FALLBACK_TRUE_STRIPPED_REASON: &str =
+    "fallback_true_stripped: trailing `|| true` masks the base command exit status";
+const WORKSPACE_CD_NORMALIZED_REASON: &str =
+    "workspace_cd_normalized: absolute workspace cd rewritten to workspace-relative verifier form";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyCommandViolationKind {
@@ -64,6 +71,10 @@ pub enum VerifyCommandViolationKind {
     GrepDashPattern,
     PackageJsonScriptGrep,
     OutputPipeStripped,
+    StderrMergeStripped,
+    ExitCodeEchoStripped,
+    FallbackTrueStripped,
+    WorkspaceCdNormalized,
 }
 
 impl VerifyCommandViolationKind {
@@ -77,6 +88,10 @@ impl VerifyCommandViolationKind {
             Self::GrepDashPattern => "grep_dash_pattern",
             Self::PackageJsonScriptGrep => "package_json_script_grep",
             Self::OutputPipeStripped => "output_pipe_stripped",
+            Self::StderrMergeStripped => "stderr_merge_stripped",
+            Self::ExitCodeEchoStripped => "exit_code_echo_stripped",
+            Self::FallbackTrueStripped => "fallback_true_stripped",
+            Self::WorkspaceCdNormalized => "workspace_cd_normalized",
         }
     }
 
@@ -84,14 +99,26 @@ impl VerifyCommandViolationKind {
         match self {
             Self::Empty => "verify command is empty",
             Self::Blocked => "verify command is blocked",
-            Self::ShellControlSyntax => "verify command may not use shell control syntax",
-            Self::SetupOrDevServer => "verify command may not perform setup or start a dev server",
-            Self::WorkspaceEscape => "verify command manifest path escapes workspace",
+            Self::ShellControlSyntax => {
+                "verify command may not use shell control syntax; allowed alternatives: use one deterministic command such as `npm run build`, `cargo test`, `python -m compileall -q src`, or `test -f relative/path`; split multiple checks into separate verify commands"
+            }
+            Self::SetupOrDevServer => {
+                "verify command may not perform setup or start a dev server; allowed alternatives: put dependency setup in a setup step, then verify with `npm run build` or `test -f relative/path`"
+            }
+            Self::WorkspaceEscape => {
+                "verify command manifest path escapes workspace; allowed alternative: use workspace-relative paths such as `test -f src/app/page.tsx` or `cd app && npm run build`"
+            }
             Self::GrepDashPattern => "grep pattern begins with '-' but command lacks `--` or `-e`",
             Self::PackageJsonScriptGrep => {
                 "grep package.json script assertion should use JSON parser"
             }
             Self::OutputPipeStripped => "verify command output-limiting pipe should be stripped",
+            Self::StderrMergeStripped => "verify command stderr merge should be stripped",
+            Self::ExitCodeEchoStripped => "verify command exit-code echo should be stripped",
+            Self::FallbackTrueStripped => "verify command fallback true should be stripped",
+            Self::WorkspaceCdNormalized => {
+                "verify command absolute workspace cd should be normalized"
+            }
         }
     }
 }
@@ -984,6 +1011,10 @@ pub fn normalize_verify_command(command: &str) -> anyhow::Result<String> {
             VerifyCommandViolationKind::GrepDashPattern
                 | VerifyCommandViolationKind::PackageJsonScriptGrep
                 | VerifyCommandViolationKind::OutputPipeStripped
+                | VerifyCommandViolationKind::StderrMergeStripped
+                | VerifyCommandViolationKind::ExitCodeEchoStripped
+                | VerifyCommandViolationKind::FallbackTrueStripped
+                | VerifyCommandViolationKind::WorkspaceCdNormalized
         ) {
             return Ok(diagnosis.normalized);
         }
@@ -1020,6 +1051,10 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
         let violation = match repair.kind {
             "package_json_script_assertion" => VerifyCommandViolationKind::PackageJsonScriptGrep,
             "output_pipe_stripped" => VerifyCommandViolationKind::OutputPipeStripped,
+            "stderr_merge_stripped" => VerifyCommandViolationKind::StderrMergeStripped,
+            "exit_code_echo_stripped" => VerifyCommandViolationKind::ExitCodeEchoStripped,
+            "fallback_true_stripped" => VerifyCommandViolationKind::FallbackTrueStripped,
+            "workspace_cd_normalized" => VerifyCommandViolationKind::WorkspaceCdNormalized,
             _ => VerifyCommandViolationKind::GrepDashPattern,
         };
         return verify_command_violation(repair.normalized, violation, Some(repair.reason));
@@ -1082,6 +1117,27 @@ pub fn normalize_verify_command_for_oracle_repair(
             kind: "output_pipe_stripped",
         });
     }
+    if let Some(stripped) = strip_exit_code_echo(command) {
+        return Some(VerifyCommandOracleRepair {
+            normalized: stripped,
+            reason: EXIT_CODE_ECHO_STRIPPED_REASON.to_string(),
+            kind: "exit_code_echo_stripped",
+        });
+    }
+    if let Some(stripped) = strip_fallback_true(command) {
+        return Some(VerifyCommandOracleRepair {
+            normalized: stripped,
+            reason: FALLBACK_TRUE_STRIPPED_REASON.to_string(),
+            kind: "fallback_true_stripped",
+        });
+    }
+    if let Some(stripped) = strip_redundant_stderr_merge(command) {
+        return Some(VerifyCommandOracleRepair {
+            normalized: stripped,
+            reason: STDERR_MERGE_STRIPPED_REASON.to_string(),
+            kind: "stderr_merge_stripped",
+        });
+    }
     let tokens = shell_words_with_spans(command)?;
     if let Some(script_check) = package_json_script_grep_check_command(&tokens) {
         return Some(VerifyCommandOracleRepair {
@@ -1099,6 +1155,89 @@ pub fn normalize_verify_command_for_oracle_repair(
     })
 }
 
+pub fn normalize_verify_command_for_oracle_repair_with_root(
+    command: &str,
+    root: &Path,
+) -> Option<VerifyCommandOracleRepair> {
+    let mut current = command.trim().to_string();
+    if current.is_empty() {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    let mut kinds = Vec::new();
+    for _ in 0..8 {
+        if let Some(repair) = normalize_verify_command_for_oracle_repair(&current)
+            && repair.normalized != current
+        {
+            current = repair.normalized;
+            reasons.push(repair.reason);
+            kinds.push(repair.kind);
+            continue;
+        }
+        if let Some(repair) = normalize_workspace_cd_verify_command(&current, root)
+            && repair.normalized != current
+        {
+            current = repair.normalized;
+            reasons.push(repair.reason);
+            kinds.push(repair.kind);
+            continue;
+        }
+        break;
+    }
+    if current == command.trim() {
+        return None;
+    }
+    let kind = kinds
+        .last()
+        .copied()
+        .unwrap_or("mechanical_verify_normalized");
+    Some(VerifyCommandOracleRepair {
+        normalized: current,
+        reason: reasons.join("; "),
+        kind,
+    })
+}
+
+pub fn normalize_workspace_cd_verify_command(
+    command: &str,
+    root: &Path,
+) -> Option<VerifyCommandOracleRepair> {
+    let trimmed = command.trim();
+    let (cd_part, verify_part) = split_once_outside_quotes_sequence(trimmed, "&&")?;
+    if find_outside_quotes_sequence(verify_part, "&&").is_some() {
+        return None;
+    }
+    let cd_tokens = shell_words_with_spans(cd_part.trim())?;
+    if cd_tokens.len() != 2 || cd_tokens[0].value != "cd" {
+        return None;
+    }
+    let cd_path = Path::new(&cd_tokens[1].value);
+    if !cd_path.is_absolute() {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let cd_path = cd_path.canonicalize().ok()?;
+    let relative = cd_path.strip_prefix(&root).ok()?;
+    let verify = verify_part.trim();
+    if verify.is_empty() {
+        return None;
+    }
+    let normalized = if relative.as_os_str().is_empty() {
+        verify.to_string()
+    } else {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative.chars().any(char::is_whitespace) {
+            return None;
+        }
+        format!("cd {relative} && {verify}")
+    };
+    Some(VerifyCommandOracleRepair {
+        normalized: normalized.split_whitespace().collect::<Vec<_>>().join(" "),
+        reason: WORKSPACE_CD_NORMALIZED_REASON.to_string(),
+        kind: "workspace_cd_normalized",
+    })
+}
+
 pub fn strip_output_truncation_pipe(command: &str) -> Option<String> {
     let trimmed = command.trim();
     let pipe_index = single_unquoted_pipe_index(trimmed)?;
@@ -1112,6 +1251,54 @@ pub fn strip_output_truncation_pipe(command: &str) -> Option<String> {
         return None;
     }
     Some(stripped.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn strip_exit_code_echo(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let (base, suffix) = split_last_outside_quotes(trimmed, ';')?;
+    if !is_exit_code_echo(suffix.trim()) {
+        return None;
+    }
+    let stripped = strip_trailing_stderr_merge(base.trim()).trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    Some(stripped.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn strip_fallback_true(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let (base, suffix) = split_once_outside_quotes_sequence(trimmed, "||")?;
+    if suffix.trim() != "true" {
+        return None;
+    }
+    let stripped = strip_trailing_stderr_merge(base.trim()).trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    Some(stripped.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn strip_redundant_stderr_merge(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let stripped = strip_trailing_stderr_merge(trimmed).trim();
+    if stripped == trimmed || stripped.is_empty() {
+        return None;
+    }
+    Some(stripped.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn is_exit_code_echo(command: &str) -> bool {
+    let Some(tokens) = shell_words_with_spans(command) else {
+        return false;
+    };
+    if tokens.len() != 2 || tokens[0].value != "echo" {
+        return false;
+    }
+    matches!(
+        tokens[1].value.as_str(),
+        "EXIT_CODE=$?" | "exit_code=$?" | "status=$?" | "STATUS=$?"
+    )
 }
 
 fn single_unquoted_pipe_index(command: &str) -> Option<usize> {
@@ -1132,6 +1319,58 @@ fn single_unquoted_pipe_index(command: &str) -> Option<usize> {
         }
     }
     if single || double { None } else { found }
+}
+
+fn split_last_outside_quotes(text: &str, needle: char) -> Option<(&str, &str)> {
+    let mut found = None;
+    let mut single = false;
+    let mut double = false;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            _ if ch == needle && !single && !double => found = Some(index),
+            _ => {}
+        }
+    }
+    let index = found?;
+    Some((&text[..index], &text[index + needle.len_utf8()..]))
+}
+
+fn split_once_outside_quotes_sequence<'a>(
+    text: &'a str,
+    needle: &str,
+) -> Option<(&'a str, &'a str)> {
+    let index = find_outside_quotes_sequence(text, needle)?;
+    Some((&text[..index], &text[index + needle.len()..]))
+}
+
+fn find_outside_quotes_sequence(text: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let mut single = false;
+    let mut double = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' if !double => {
+                single = !single;
+                index += 1;
+            }
+            b'"' if !single => {
+                double = !double;
+                index += 1;
+            }
+            _ if !single && !double && bytes[index..].starts_with(needle_bytes) => {
+                return Some(index);
+            }
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn strip_trailing_stderr_merge(base: &str) -> &str {
@@ -1808,9 +2047,14 @@ mod tests {
             diagnosis.violation,
             Some(VerifyCommandViolationKind::ShellControlSyntax)
         );
-        assert_eq!(
-            diagnosis.reason.as_deref(),
-            Some("verify command may not use shell control syntax")
+        let reason = diagnosis.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.starts_with("verify command may not use shell control syntax"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("split multiple checks into separate verify commands"),
+            "{reason}"
         );
     }
 
@@ -1821,9 +2065,14 @@ mod tests {
             diagnosis.violation,
             Some(VerifyCommandViolationKind::SetupOrDevServer)
         );
-        assert_eq!(
-            diagnosis.reason.as_deref(),
-            Some("verify command may not perform setup or start a dev server")
+        let reason = diagnosis.reason.as_deref().unwrap_or_default();
+        assert!(
+            reason.starts_with("verify command may not perform setup or start a dev server"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("put dependency setup in a setup step"),
+            "{reason}"
         );
     }
 
@@ -1898,6 +2147,79 @@ mod tests {
                 .unwrap_or_default()
                 .contains("mask the base command exit status"),
             "{diagnosis:?}"
+        );
+    }
+
+    #[test]
+    fn verify_command_normalizes_stderr_exit_and_true_wrappers() {
+        let stderr = diagnose_verify_command("npm run build 2>&1");
+        assert_eq!(
+            stderr.violation,
+            Some(VerifyCommandViolationKind::StderrMergeStripped)
+        );
+        assert_eq!(stderr.normalized, "npm run build");
+
+        let exit_echo =
+            diagnose_verify_command(r#"python -m compileall -q src 2>&1; echo "EXIT_CODE=$?""#);
+        assert_eq!(
+            exit_echo.violation,
+            Some(VerifyCommandViolationKind::ExitCodeEchoStripped)
+        );
+        assert_eq!(exit_echo.normalized, "python -m compileall -q src");
+
+        let fallback = diagnose_verify_command(r#"python3 -c "print(min(10, None))" 2>&1 || true"#);
+        assert_eq!(
+            fallback.violation,
+            Some(VerifyCommandViolationKind::FallbackTrueStripped)
+        );
+        assert_eq!(fallback.normalized, r#"python3 -c "print(min(10, None))""#);
+    }
+
+    #[test]
+    fn verify_command_normalizes_absolute_workspace_cd_with_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let repair = normalize_verify_command_for_oracle_repair_with_root(
+            &format!(
+                "cd {} && npm run build 2>&1; echo \"EXIT_CODE=$?\"",
+                dir.path().display()
+            ),
+            dir.path(),
+        )
+        .expect("root-aware repair");
+
+        assert_eq!(repair.normalized, "npm run build");
+        assert_eq!(repair.kind, "workspace_cd_normalized");
+        assert!(repair.reason.contains("exit-code echo"), "{repair:?}");
+        assert!(repair.reason.contains("workspace cd"), "{repair:?}");
+    }
+
+    #[test]
+    fn verify_command_rejection_feedback_names_allowed_alternative() {
+        let setup = diagnose_verify_command("npm install");
+        assert_eq!(
+            setup.violation,
+            Some(VerifyCommandViolationKind::SetupOrDevServer)
+        );
+        assert!(
+            setup
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("allowed alternatives"),
+            "{setup:?}"
+        );
+
+        let pipe = diagnose_verify_command("npm run build | grep error");
+        assert_eq!(
+            pipe.violation,
+            Some(VerifyCommandViolationKind::ShellControlSyntax)
+        );
+        assert!(
+            pipe.reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("split multiple checks into separate verify commands"),
+            "{pipe:?}"
         );
     }
 

@@ -6,7 +6,9 @@ use crate::planner::lint::{
 };
 use crate::planner::step_plan::{PlanStep, StepKind, StepPlan};
 use crate::planner::verify::{
-    VerifyCommandViolationKind, diagnose_verify_command, normalize_verify_command_for_oracle_repair,
+    VerifyCommandViolationKind, diagnose_verify_command,
+    normalize_verify_command_for_oracle_repair,
+    normalize_verify_command_for_oracle_repair_with_root,
 };
 use crate::tools::path_guard::validate_workspace_relative;
 
@@ -122,7 +124,7 @@ pub fn sanitize_step_plan_against_policy(
 ) -> SanitizerReport {
     let mut report = SanitizerReport::default();
     normalize_oversized_goal(plan, &mut report);
-    normalize_repairable_verify_commands(plan, &mut report);
+    normalize_repairable_verify_commands(plan, workspace_root, &mut report);
     sanitize_shell_control_verify_commands(plan, &mut report);
     relocate_setup_verify_commands(plan, &mut report);
     remove_setup_or_dev_server_verify_commands(plan, &mut report);
@@ -299,10 +301,19 @@ fn find_outside_quotes(text: &str, needle: &str) -> Option<usize> {
     None
 }
 
-fn normalize_repairable_verify_commands(plan: &mut StepPlan, report: &mut SanitizerReport) {
+fn normalize_repairable_verify_commands(
+    plan: &mut StepPlan,
+    workspace_root: Option<&Path>,
+    report: &mut SanitizerReport,
+) {
     for step in &mut plan.steps {
         for command in &mut step.verify {
-            let Some(repair) = normalize_verify_command_for_oracle_repair(command) else {
+            let repair = workspace_root
+                .and_then(|root| {
+                    normalize_verify_command_for_oracle_repair_with_root(command, root)
+                })
+                .or_else(|| normalize_verify_command_for_oracle_repair(command));
+            let Some(repair) = repair else {
                 continue;
             };
             if repair.normalized == *command {
@@ -1023,6 +1034,37 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
         assert!(lint.is_pass(), "{lint:?}");
         let second = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
         assert!(second.is_empty(), "{second:?}");
+    }
+
+    #[test]
+    fn sanitizer_normalizes_absolute_cd_stderr_and_exit_code_echo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let mut plan = StepPlan {
+            goal: "Verify local app".to_string(),
+            steps: vec![PlanStep {
+                id: "verify-build".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify the app build".to_string(),
+                expected_paths: vec!["package.json".to_string()],
+                verify: vec![format!(
+                    "cd {} && test -f package.json 2>&1; echo \"EXIT_CODE=$?\"",
+                    dir.path().display()
+                )],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.normalized_commands.len(), 1);
+        assert_eq!(
+            report.normalized_commands[0].kind,
+            "workspace_cd_normalized"
+        );
+        assert_eq!(plan.steps[0].verify, vec!["test -f package.json"]);
+        let lint = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+        assert!(lint.is_pass(), "{lint:?}");
     }
 
     #[test]
