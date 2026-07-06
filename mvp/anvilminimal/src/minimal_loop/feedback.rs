@@ -1,6 +1,7 @@
 pub fn missing_artifacts(paths: &[String]) -> String {
+    let remaining = paths.join(", ");
     format!(
-        "Required artifacts are still missing. Create these exact workspace-relative paths before final response:\n{}",
+        "Required artifacts are still missing. remaining: {remaining}\nCreate these exact workspace-relative paths before final response:\n{}",
         paths
             .iter()
             .map(|p| format!("- {p}"))
@@ -94,4 +95,24 @@ pub fn verify_repair_edit_required(
     format!(
         "Deterministic verification is still failing with the same signature: {signature}. Do not rerun verification and do not answer in prose. Make a concrete Write or Edit change to the failing implementation, test, or setup file before verification is retried. verify_repair_edit_attempt={attempt}/{attempt_limit}"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_artifacts_feedback_names_remaining_paths_inline() {
+        let feedback = missing_artifacts(&[
+            "postcss.config.js".to_string(),
+            "tailwind.config.ts".to_string(),
+        ]);
+
+        assert!(
+            feedback.contains("remaining: postcss.config.js, tailwind.config.ts"),
+            "{feedback}"
+        );
+        assert!(feedback.contains("- postcss.config.js"), "{feedback}");
+        assert!(feedback.contains("- tailwind.config.ts"), "{feedback}");
+    }
 }
