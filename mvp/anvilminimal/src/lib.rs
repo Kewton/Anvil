@@ -26,6 +26,7 @@ use serde_json::json;
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 use tui::OutputRenderer;
+use tui::TerminalUi;
 use tui::markdown::PlainRenderer;
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
@@ -37,6 +38,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Action::Repl => repl::run_repl(config.clone()),
             Action::Prompt(prompt) => {
                 let mut client = providers::client_from_config(&config, false)?;
+                let ui = DirectActionUi::new(&config);
                 let resume = if config.fresh_session {
                     None
                 } else {
@@ -44,66 +46,103 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 };
                 let mut session =
                     state::SessionStore::new(config.state_dir.clone()).load_or_create(resume)?;
-                let reply =
-                    minimal_loop::run_session(&mut *client, &mut session, &prompt, &config)?;
+                let reply = minimal_loop::loop_run::run_session_with_required_paths_with_ui(
+                    &mut *client,
+                    &mut session,
+                    &prompt,
+                    &[],
+                    &config,
+                    ui.as_interaction(),
+                )?;
                 state::SessionStore::new(config.state_dir.clone()).save(&session)?;
+                drop(ui);
                 PlainRenderer.render_assistant(&reply)?;
                 Ok(())
             }
             Action::PlanSteps(goal) => {
                 let mut planner = providers::client_from_config(&config, true)?;
-                let plan = planner::generate_step_plan(&mut *planner, &goal, &config)
-                    .context("failed to generate step plan")?;
+                let ui = DirectActionUi::new(&config);
+                let plan = planner::generate_step_plan_with_ui(
+                    &mut *planner,
+                    &goal,
+                    &config,
+                    ui.as_interaction(),
+                )
+                .context("failed to generate step plan")?;
                 let path = planner::save_step_plan(&config.workspace_root, &plan)?;
+                drop(ui);
                 println!("{}", path.display());
                 Ok(())
             }
             Action::PlanRun(goal) => {
                 let mut execution = providers::client_from_config(&config, false)?;
                 let mut planner_client = providers::client_from_config(&config, true)?;
-                let report = planner::generate_and_run_step_plan(
+                let ui = DirectActionUi::new(&config);
+                let report = planner::generate_and_run_step_plan_with_ui(
                     &mut *planner_client,
                     &mut *execution,
                     &goal,
                     &config,
+                    ui.as_interaction(),
                 )?;
+                drop(ui);
                 println!("{report}");
                 Ok(())
             }
             Action::RunPlan(path) => {
                 let mut execution = providers::client_from_config(&config, false)?;
-                let report = planner::run_plan_file(&mut *execution, &path, &config)?;
+                let ui = DirectActionUi::new(&config);
+                let report = planner::run_plan_file_with_ui(
+                    &mut *execution,
+                    &path,
+                    &config,
+                    ui.as_interaction(),
+                )?;
+                drop(ui);
                 println!("{report}");
                 Ok(())
             }
             Action::UltraPlan(goal) => {
                 let mut planner_client = providers::client_from_config(&config, true)?;
-                let plan = planner::generate_ultra_plan(&mut *planner_client, &goal, &config)?;
+                let ui = DirectActionUi::new(&config);
+                let plan = planner::generate_ultra_plan_with_ui(
+                    &mut *planner_client,
+                    &goal,
+                    &config,
+                    ui.as_interaction(),
+                )?;
                 let path = planner::save_ultra_plan(&config.workspace_root, &plan)?;
+                drop(ui);
                 println!("{}", path.display());
                 Ok(())
             }
             Action::UltraPlanRun(goal) => {
                 let mut execution = providers::client_from_config(&config, false)?;
                 let mut planner_client = providers::client_from_config(&config, true)?;
-                let report = planner::generate_and_run_ultra_plan(
+                let ui = DirectActionUi::new(&config);
+                let report = planner::generate_and_run_ultra_plan_with_ui(
                     &mut *planner_client,
                     &mut *execution,
                     &goal,
                     &config,
+                    ui.as_interaction(),
                 )?;
+                drop(ui);
                 println!("{report}");
                 Ok(())
             }
             Action::RunUltraPlan(path) => {
                 let mut execution = providers::client_from_config(&config, false)?;
                 let mut planner_client = providers::client_from_config(&config, true)?;
-                let report = planner::run_ultra_plan_file(
+                let ui = DirectActionUi::new(&config);
+                let report = planner::run_ultra_plan_file_with_ui(
                     &mut *planner_client,
                     &mut *execution,
                     &path,
                     &config,
+                    ui.as_interaction(),
                 )?;
+                drop(ui);
                 println!("{report}");
                 Ok(())
             }
@@ -123,6 +162,28 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     }
     emit_run_stop(&config, &result);
     result
+}
+
+enum DirectActionUi {
+    Terminal(TerminalUi),
+    Noop,
+}
+
+impl DirectActionUi {
+    fn new(config: &Config) -> Self {
+        if tui::footer::FooterEnv::detect(config).enabled {
+            Self::Terminal(TerminalUi::new(config))
+        } else {
+            Self::Noop
+        }
+    }
+
+    fn as_interaction(&self) -> &dyn tui::InteractionUi {
+        match self {
+            Self::Terminal(ui) => ui,
+            Self::Noop => &tui::NOOP_UI,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

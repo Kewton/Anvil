@@ -6,15 +6,19 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::tui::status::UiStatus;
+use crate::tui::status_bus::{
+    self, GlobalStatusBusGuard, RuntimeStatus, StatusPublisher, StatusSubscriber, StatusTime,
+};
 
-const TICK: Duration = Duration::from_millis(200);
+const TICK: Duration = Duration::from_millis(250);
+const NARROW_FOOTER_COLS: u16 = 100;
 
 pub mod ansi {
-    pub fn build_decstbm(rows: u16) -> Option<String> {
-        if rows < 2 {
+    pub fn build_decstbm(rows: u16, footer_rows: u16) -> Option<String> {
+        if footer_rows == 0 || rows <= footer_rows {
             None
         } else {
-            Some(format!("\x1b[1;{}r", rows - 1))
+            Some(format!("\x1b[1;{}r", rows - footer_rows))
         }
     }
 
@@ -87,8 +91,11 @@ pub struct Footer {
 
 struct Active {
     state: Arc<FooterState>,
+    _publisher: StatusPublisher,
+    _global_guard: GlobalStatusBusGuard,
     handle: Option<JoinHandle<()>>,
     rows: u16,
+    footer_rows: u16,
 }
 
 impl Footer {
@@ -97,13 +104,14 @@ impl Footer {
         if !env.enabled {
             return Self { inner: None };
         }
-        let Ok((_cols, rows)) = crossterm::terminal::size() else {
+        let Ok((cols, rows)) = crossterm::terminal::size() else {
             return Self { inner: None };
         };
-        if rows < 2 {
+        let footer_rows = footer_rows_for_cols(cols);
+        if rows <= footer_rows {
             return Self { inner: None };
         }
-        let Some(decstbm) = ansi::build_decstbm(rows) else {
+        let Some(decstbm) = ansi::build_decstbm(rows, footer_rows) else {
             return Self { inner: None };
         };
         {
@@ -120,17 +128,22 @@ impl Footer {
             stop: AtomicBool::new(false),
             wake: (Mutex::new(()), Condvar::new()),
         });
+        let (publisher, subscriber) = status_bus::channel();
+        let global_guard = status_bus::install_global(publisher.clone());
         let thread_state = state.clone();
         let handle = thread::Builder::new()
             .name("anvilminimal-footer".to_string())
-            .spawn(move || render_loop(thread_state, rows, env))
+            .spawn(move || render_loop(thread_state, subscriber, cols, rows, footer_rows, env))
             .ok();
         match handle {
             Some(handle) => Self {
                 inner: Some(Active {
                     state,
+                    _publisher: publisher,
+                    _global_guard: global_guard,
                     handle: Some(handle),
                     rows,
+                    footer_rows,
                 }),
             },
             None => {
@@ -178,9 +191,8 @@ impl Drop for Footer {
             let _ = handle.join();
         }
         let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(ansi::reset_decstbm().as_bytes());
-        let _ = stdout.write_all(ansi::move_to(active.rows, 1).as_bytes());
-        let _ = stdout.write_all(ansi::clear_line().as_bytes());
+        let _ = stdout
+            .write_all(clear_footer_region_sequence(active.rows, active.footer_rows).as_bytes());
         let _ = stdout.flush();
     }
 }
@@ -220,6 +232,116 @@ pub fn build_footer_line(status: &UiStatus, use_color: bool) -> String {
     }
 }
 
+pub fn build_live_footer_lines(
+    status: &UiStatus,
+    runtime: &RuntimeStatus,
+    now: StatusTime,
+    cols: u16,
+    use_color: bool,
+) -> Vec<String> {
+    if runtime.phase.is_none()
+        && runtime.step.is_none()
+        && runtime.provider.is_none()
+        && runtime.command.is_none()
+        && runtime.repair.is_none()
+        && runtime.stage.is_none()
+        && runtime.last_event.is_none()
+        && !runtime.interrupt_requested
+    {
+        let line = fit_to_width(&build_footer_line(status, false), cols);
+        return vec![if use_color {
+            format!("\x1b[2m{line}\x1b[0m")
+        } else {
+            line
+        }];
+    }
+
+    let mut primary = Vec::new();
+    if let Some(phase) = &runtime.phase {
+        let progress = if phase.total == 0 {
+            format!("Phase {}", phase.index)
+        } else {
+            format!("Phase {}/{}", phase.index, phase.total)
+        };
+        if phase.id.is_empty() {
+            primary.push(progress);
+        } else {
+            primary.push(format!("{progress} {}", phase.id));
+        }
+    }
+    if let Some(step) = &runtime.step {
+        let label = if step.kind.is_empty() {
+            step.id.clone()
+        } else {
+            step.kind.clone()
+        };
+        if !label.is_empty() {
+            primary.push(label);
+        }
+    }
+
+    let mut secondary = Vec::new();
+    if let Some(command) = &runtime.command {
+        let elapsed = now.elapsed_secs_since(command.started_at);
+        secondary.push(format!(
+            "cmd {} {}s/{}s",
+            command.excerpt, elapsed, command.cap_secs
+        ));
+    } else if let Some(provider) = &runtime.provider {
+        let elapsed = now.elapsed_secs_since(provider.started_at);
+        secondary.push(format!(
+            "provider {}s/{}s ({})",
+            elapsed, provider.deadline_secs, provider.scope
+        ));
+    } else if let Some(stage) = &runtime.stage {
+        secondary.push(stage.clone());
+    } else {
+        secondary.push(format!(
+            "provider:{} model:{}",
+            status.provider, status.model
+        ));
+    }
+    if let Some(repair) = &runtime.repair {
+        if repair.max == 0 {
+            secondary.push(format!("repair {}", repair.attempt));
+        } else {
+            secondary.push(format!("repair {}/{}", repair.attempt, repair.max));
+        }
+    }
+    if let Some(last) = &runtime.last_event {
+        secondary.push(format!("last: {last}"));
+    }
+
+    let prefix = if runtime.interrupt_requested {
+        "[interrupt: finishing current turn — Ctrl-C again to finalize] "
+    } else {
+        ""
+    };
+    let joined_primary = primary.join(" · ");
+    let joined_secondary = secondary.join(" · ");
+    let raw_lines = if cols < NARROW_FOOTER_COLS && !joined_primary.is_empty() {
+        vec![format!("{prefix}{joined_primary}"), joined_secondary]
+    } else {
+        let body = [joined_primary, joined_secondary]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        vec![format!("{prefix}{body}")]
+    };
+    raw_lines
+        .into_iter()
+        .map(|line| {
+            let line = fit_to_width(&line, cols);
+            if use_color {
+                format!("\x1b[2m{line}\x1b[0m")
+            } else {
+                line
+            }
+        })
+        .collect()
+}
+
 fn format_token_count(value: u64) -> String {
     if value < 1_000 {
         value.to_string()
@@ -230,7 +352,15 @@ fn format_token_count(value: u64) -> String {
     }
 }
 
-fn render_loop(state: Arc<FooterState>, rows: u16, env: FooterEnv) {
+fn render_loop(
+    state: Arc<FooterState>,
+    subscriber: StatusSubscriber,
+    cols: u16,
+    rows: u16,
+    footer_rows: u16,
+    env: FooterEnv,
+) {
+    let mut generation = 0;
     loop {
         if state.stop.load(Ordering::SeqCst) {
             break;
@@ -240,18 +370,102 @@ fn render_loop(state: Arc<FooterState>, rows: u16, env: FooterEnv) {
                 Ok(status) => status.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             };
-            let line = build_footer_line(&status, env.use_color);
+            let runtime = subscriber.snapshot();
+            generation = runtime.generation;
+            let lines =
+                build_live_footer_lines(&status, &runtime, status_bus::now(), cols, env.use_color);
             let mut stdout = io::stdout().lock();
             let _ = stdout.write_all(ansi::save_cursor().as_bytes());
-            let _ = stdout.write_all(ansi::move_to(rows, 1).as_bytes());
-            let _ = stdout.write_all(ansi::clear_line().as_bytes());
-            let _ = stdout.write_all(line.as_bytes());
+            let first_footer_row = rows.saturating_sub(footer_rows).saturating_add(1);
+            for index in 0..footer_rows {
+                let row = first_footer_row + index;
+                let _ = stdout.write_all(ansi::move_to(row, 1).as_bytes());
+                let _ = stdout.write_all(ansi::clear_line().as_bytes());
+                if let Some(line) = lines.get(index as usize) {
+                    let _ = stdout.write_all(line.as_bytes());
+                }
+            }
             let _ = stdout.write_all(ansi::restore_cursor().as_bytes());
             let _ = stdout.flush();
         }
+        let _ = subscriber.wait_for_change(generation, TICK);
         if let Ok(guard) = state.wake.0.lock() {
-            let _ = state.wake.1.wait_timeout(guard, TICK);
+            let _ = state.wake.1.wait_timeout(guard, Duration::from_millis(1));
         }
+    }
+}
+
+fn footer_rows_for_cols(cols: u16) -> u16 {
+    if cols < NARROW_FOOTER_COLS { 2 } else { 1 }
+}
+
+pub fn clear_footer_region_sequence(rows: u16, footer_rows: u16) -> String {
+    let mut out = String::from(ansi::reset_decstbm());
+    if footer_rows == 0 || rows == 0 {
+        return out;
+    }
+    let first_footer_row = rows.saturating_sub(footer_rows).saturating_add(1);
+    for row in first_footer_row..=rows {
+        out.push_str(&ansi::move_to(row, 1));
+        out.push_str(ansi::clear_line());
+    }
+    out
+}
+
+pub fn fit_to_width(value: &str, cols: u16) -> String {
+    let max_width = cols as usize;
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(value) <= max_width {
+        return value.to_string();
+    }
+    let marker = "...";
+    let marker_width = display_width(marker);
+    if max_width <= marker_width {
+        return crate::util::truncate_at_char_boundary(value, max_width).to_string();
+    }
+    let target = max_width - marker_width;
+    let mut width = 0usize;
+    let mut end = 0usize;
+    for (index, ch) in value.char_indices() {
+        let next = width + char_display_width(ch);
+        if next > target {
+            break;
+        }
+        width = next;
+        end = index + ch.len_utf8();
+    }
+    let mut out = crate::util::truncate_at_char_boundary(value, end)
+        .trim_end()
+        .to_string();
+    out.push_str(marker);
+    out
+}
+
+fn display_width(value: &str) -> usize {
+    value.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(ch: char) -> usize {
+    let cp = ch as u32;
+    if cp < 0x20 || (0x7f..=0x9f).contains(&cp) {
+        0
+    } else if matches!(
+        cp,
+        0x1100..=0x115f
+            | 0x2329..=0x232a
+            | 0x2e80..=0xa4cf
+            | 0xac00..=0xd7a3
+            | 0xf900..=0xfaff
+            | 0xfe10..=0xfe19
+            | 0xfe30..=0xfe6f
+            | 0xff00..=0xff60
+            | 0xffe0..=0xffe6
+    ) {
+        2
+    } else {
+        1
     }
 }
 
@@ -293,8 +507,18 @@ mod tests {
 
     #[test]
     fn footer_decstbm_rows_under_two_self_disable() {
-        assert_eq!(ansi::build_decstbm(1), None);
-        assert_eq!(ansi::build_decstbm(2).as_deref(), Some("\x1b[1;1r"));
+        assert_eq!(ansi::build_decstbm(1, 1), None);
+        assert_eq!(ansi::build_decstbm(2, 1).as_deref(), Some("\x1b[1;1r"));
+        assert_eq!(ansi::build_decstbm(4, 2).as_deref(), Some("\x1b[1;2r"));
+    }
+
+    #[test]
+    fn footer_restore_sequence_clears_reserved_rows_after_panic_unwind() {
+        let sequence = clear_footer_region_sequence(24, 2);
+
+        assert!(sequence.starts_with(ansi::reset_decstbm()));
+        assert!(sequence.contains("\x1b[23;1H\r\x1b[2K"));
+        assert!(sequence.contains("\x1b[24;1H\r\x1b[2K"));
     }
 
     #[test]
@@ -307,5 +531,112 @@ mod tests {
     fn footer_known_tokens_are_formatted() {
         let line = build_footer_line(&status(Some(1500)), false);
         assert!(line.contains("tokens:1.5k"));
+    }
+
+    #[test]
+    fn live_footer_long_planner_turn_snapshot() {
+        let runtime = RuntimeStatus {
+            phase: Some(status_bus::PhaseStatus {
+                index: 2,
+                total: 5,
+                id: "core-logic".to_string(),
+            }),
+            step: Some(status_bus::StepStatus {
+                id: "write".to_string(),
+                kind: "implement".to_string(),
+            }),
+            provider: Some(status_bus::ProviderTurnStatus {
+                scope: "planner_step".to_string(),
+                deadline_secs: 600,
+                started_at: StatusTime::from_secs(10),
+            }),
+            ..RuntimeStatus::default()
+        };
+
+        let lines = build_live_footer_lines(
+            &status(None),
+            &runtime,
+            StatusTime::from_secs(57),
+            140,
+            false,
+        );
+
+        assert_eq!(
+            lines,
+            vec!["Phase 2/5 core-logic · implement · provider 47s/600s (planner_step)".to_string()]
+        );
+    }
+
+    #[test]
+    fn live_footer_command_execution_replaces_provider_segment() {
+        let runtime = RuntimeStatus {
+            provider: Some(status_bus::ProviderTurnStatus {
+                scope: "executor".to_string(),
+                deadline_secs: 600,
+                started_at: StatusTime::ZERO,
+            }),
+            command: Some(status_bus::CommandStatus {
+                excerpt: "\"npm\" \"run\" \"build\"".to_string(),
+                cap_secs: 30,
+                started_at: StatusTime::from_secs(5),
+            }),
+            ..RuntimeStatus::default()
+        };
+
+        let lines = build_live_footer_lines(
+            &status(None),
+            &runtime,
+            StatusTime::from_secs(12),
+            140,
+            false,
+        );
+
+        assert_eq!(lines, vec!["cmd \"npm\" \"run\" \"build\" 7s/30s"]);
+    }
+
+    #[test]
+    fn live_footer_repair_and_interrupt_prefix_snapshot() {
+        let runtime = RuntimeStatus {
+            phase: Some(status_bus::PhaseStatus {
+                index: 1,
+                total: 2,
+                id: "検証".to_string(),
+            }),
+            step: Some(status_bus::StepStatus {
+                id: "修復".to_string(),
+                kind: "verify".to_string(),
+            }),
+            repair: Some(status_bus::RepairStatus {
+                attempt: 1,
+                max: 2,
+                kind: "final_acceptance".to_string(),
+            }),
+            last_event: Some("tool_args_path_normalized".to_string()),
+            interrupt_requested: true,
+            ..RuntimeStatus::default()
+        };
+
+        let lines =
+            build_live_footer_lines(&status(None), &runtime, StatusTime::from_secs(0), 80, false);
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with(
+            "[interrupt: finishing current turn — Ctrl-C again to finalize] Phase 1/2"
+        ));
+        assert!(lines[1].contains("repair 1/2"));
+        assert!(lines[1].contains("last: tool_args_path_normalized"));
+    }
+
+    #[test]
+    fn live_footer_fitting_is_multibyte_safe_for_japanese_paths() {
+        let long = format!(
+            "Phase 1/3 実装 · cmd .anvil/repairs/{} 123s/600s",
+            "日本語ディレクトリ/".repeat(24)
+        );
+        for cols in 1..120 {
+            let fitted = fit_to_width(&long, cols);
+            assert!(fitted.is_char_boundary(fitted.len()));
+            assert!(display_width(&fitted) <= cols as usize || cols <= 3);
+        }
     }
 }

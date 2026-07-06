@@ -101,11 +101,11 @@ impl TerminalUi {
 
 impl InteractionUi for TerminalUi {
     fn before_model_call(&self, label: &str) -> UiGuard {
-        UiGuard::active(self.footer.freeze(), Spinner::start(label))
+        UiGuard::active(None, Spinner::start(label))
     }
 
     fn before_tool_call(&self, name: &str) -> UiGuard {
-        UiGuard::active(self.footer.freeze(), Spinner::start(format!("tool {name}")))
+        UiGuard::active(None, Spinner::start(format!("tool {name}")))
     }
 
     fn publish_status(&self, status: UiStatus) {
