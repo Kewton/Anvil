@@ -46,6 +46,10 @@ impl ChatClient for OpenAiClient {
         "openai"
     }
 
+    fn boxed_clone(&self) -> Option<Box<dyn ChatClient>> {
+        Some(Box::new(self.clone()))
+    }
+
     fn supports_native_tools(&self, _model: &str) -> bool {
         true
     }

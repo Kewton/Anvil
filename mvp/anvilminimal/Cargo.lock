@@ -76,6 +76,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "thiserror",
  "uuid",

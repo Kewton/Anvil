@@ -8,6 +8,7 @@ pub mod eval_events;
 pub mod minimal_loop;
 pub mod mode;
 pub mod planner;
+pub mod provider_call;
 pub mod providers;
 pub mod repl;
 pub mod state;
@@ -15,16 +16,22 @@ pub mod tools;
 pub mod tui;
 pub mod util;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::Context;
 use cli::Cli;
 use config::{Action, Config};
 use serde_json::json;
+use signal_hook::consts::SIGINT;
+use signal_hook::iterator::{Handle as SignalHandle, Signals};
 use tui::OutputRenderer;
 use tui::markdown::PlainRenderer;
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     let config = Config::from_cli(cli)?;
     emit_run_start(&config);
+    let direct_command_guard = DirectCommandCompletionGuard::start(&config);
     let result = match config.action.clone() {
         Action::Repl => repl::run_repl(config.clone()),
         Action::Prompt(prompt) => {
@@ -107,8 +114,264 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             Ok(())
         }
     };
+    if let Some(guard) = direct_command_guard.as_ref() {
+        guard.finalize(&result);
+    }
     emit_run_stop(&config, &result);
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectCommandStatus {
+    Completed,
+    Partial,
+    Failed,
+    Interrupted,
+}
+
+impl DirectCommandStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    fn ok(self) -> bool {
+        matches!(self, Self::Completed | Self::Partial)
+    }
+
+    fn failure_kind(self) -> &'static str {
+        match self {
+            Self::Completed | Self::Partial => "",
+            Self::Failed => "direct_cli_command_failed",
+            Self::Interrupted => "direct_cli_command_interrupted",
+        }
+    }
+}
+
+struct DirectCommandCompletionGuard {
+    config: Config,
+    command: String,
+    finalized: Arc<AtomicBool>,
+    signal_handle: Option<SignalHandle>,
+    _signal_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DirectCommandCompletionGuard {
+    fn start(config: &Config) -> Option<Self> {
+        let command = direct_command_for_action(&config.action)?.to_string();
+        let finalized = Arc::new(AtomicBool::new(false));
+        let mut signal_handle = None;
+        let mut signal_thread = None;
+
+        match Signals::new([SIGINT]) {
+            Ok(mut signals) => {
+                let handle = signals.handle();
+                let signal_config = config.clone();
+                let signal_command = command.clone();
+                let signal_finalized = finalized.clone();
+                signal_thread = Some(std::thread::spawn(move || {
+                    if signals.forever().next().is_some() {
+                        if !signal_finalized.swap(true, Ordering::AcqRel) {
+                            let result: anyhow::Result<()> =
+                                Err(anyhow::anyhow!("interrupted by user"));
+                            emit_direct_command_stop_with_status(
+                                &signal_config,
+                                &signal_command,
+                                &result,
+                                DirectCommandStatus::Interrupted,
+                            );
+                        }
+                        std::process::exit(130);
+                    }
+                }));
+                signal_handle = Some(handle);
+            }
+            Err(err) => {
+                eprintln!("warning: failed to install direct CLI SIGINT finalizer: {err}");
+            }
+        }
+
+        Some(Self {
+            config: config.clone(),
+            command,
+            finalized,
+            signal_handle,
+            _signal_thread: signal_thread,
+        })
+    }
+
+    fn finalize(&self, result: &anyhow::Result<()>) {
+        let status = match result {
+            Ok(()) => DirectCommandStatus::Completed,
+            Err(err) if error_is_interrupted(err) => DirectCommandStatus::Interrupted,
+            Err(_) => DirectCommandStatus::Failed,
+        };
+        self.finalize_with_status(result, status);
+    }
+
+    fn finalize_with_status(&self, result: &anyhow::Result<()>, status: DirectCommandStatus) {
+        if self.finalized.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        emit_direct_command_stop_with_status(&self.config, &self.command, result, status);
+    }
+}
+
+impl Drop for DirectCommandCompletionGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.signal_handle.take() {
+            handle.close();
+        }
+        if self.finalized.load(Ordering::Acquire) {
+            return;
+        }
+        let result: anyhow::Result<()> = Err(anyhow::anyhow!(
+            "direct CLI command exited before completion finalizer"
+        ));
+        self.finalize_with_status(&result, DirectCommandStatus::Failed);
+    }
+}
+
+fn direct_command_for_action(action: &Action) -> Option<&'static str> {
+    match action {
+        Action::Repl => None,
+        Action::Prompt(_) => Some("--prompt"),
+        Action::PlanSteps(_) => Some("--plan-steps"),
+        Action::PlanRun(_) => Some("--plan-run"),
+        Action::RunPlan(_) => Some("--run-plan"),
+        Action::UltraPlan(_) => Some("--ultra-plan"),
+        Action::UltraPlanRun(_) => Some("--ultra-plan-run"),
+        Action::RunUltraPlan(_) => Some("--run-ultra-plan"),
+        Action::SetupInteractionProbe => Some("--setup-interaction-probe"),
+    }
+}
+
+fn emit_direct_command_stop_with_status(
+    config: &Config,
+    command: &str,
+    result: &anyhow::Result<()>,
+    requested_status: DirectCommandStatus,
+) -> eval_events::CompletionProjection {
+    let requested_ok = requested_status.ok();
+    let mut completion_snapshot =
+        eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
+    apply_config_completion_metadata(config, &mut completion_snapshot);
+    let completion = eval_events::project_completion(requested_ok, &completion_snapshot);
+    let terminal_status = effective_direct_status(requested_status, &completion);
+    let ok = terminal_status.ok();
+    let failure_kind = terminal_status.failure_kind();
+    let stop_reason = direct_stop_reason_for_result(result, terminal_status);
+    let event_projection = direct_event_projection_for_status(&completion, terminal_status);
+
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "tui_command_stop",
+            "lifecycle_stage": "direct_cli_command",
+            "command": command,
+            "ok": ok,
+            "status": terminal_status.as_str(),
+            "build_commit": build_info::COMMIT,
+            "build_dirty": build_info::dirty(),
+            "build_timestamp": build_info::TIMESTAMP,
+            "failure_kind": failure_kind,
+            "stop_reason": stop_reason,
+            "completion_status": &completion.status,
+            "task_status": &event_projection.task_status,
+            "profile": &completion.profile,
+            "effective_profile": &completion.effective_profile,
+            "contract_origin": &completion.contract_origin,
+            "assurance_level": &completion.assurance_level,
+            "assurance_reason": &completion.assurance_reason,
+            "profile_inferred": &completion.profile_inferred,
+            "profile_inference_source": &completion.profile_inference_source,
+            "session_status": "process_exited",
+            "repl_status": "not_applicable",
+            "command_completion_state": &event_projection.command_completion,
+            "runtime_acceptance_status": &completion.runtime_acceptance,
+            "final_acceptance_status": &completion.final_acceptance,
+            "release_gate_status": &completion.release_gate,
+            "next_action": &event_projection.next_action,
+            "recovery_next_action": &event_projection.next_action,
+            "recovery_prompt_path": &completion.recovery_prompt_path,
+            "recovery_ultra_plan_path": &completion.recovery_ultra_plan_path,
+            "suggested_recovery_command": &completion.suggested_recovery_command,
+            "suggested_recovery_yaml_command": &completion.suggested_recovery_yaml_command,
+        }),
+    );
+    eval_events::write_tui_command_completion_summary(
+        config.eval_events_path.as_deref(),
+        command,
+        &stop_reason,
+        failure_kind,
+        terminal_status.as_str(),
+        &completion,
+    );
+    event_projection
+}
+
+fn direct_stop_reason_for_result(
+    result: &anyhow::Result<()>,
+    terminal_status: DirectCommandStatus,
+) -> String {
+    match result {
+        Ok(()) => "completed".to_string(),
+        Err(err) => {
+            let reason = eval_events::render_stop_reason_text(&err.to_string());
+            if terminal_status == DirectCommandStatus::Interrupted && reason.trim().is_empty() {
+                "interrupted by user".to_string()
+            } else {
+                reason
+            }
+        }
+    }
+}
+
+fn effective_direct_status(
+    requested: DirectCommandStatus,
+    completion: &eval_events::CompletionProjection,
+) -> DirectCommandStatus {
+    if requested == DirectCommandStatus::Completed
+        && completion.release_gate == "partial"
+        && completion
+            .release_gate_reasons
+            .iter()
+            .any(|reason| reason.contains("interaction_unverified:probe_unavailable"))
+    {
+        DirectCommandStatus::Partial
+    } else {
+        requested
+    }
+}
+
+fn direct_event_projection_for_status(
+    completion: &eval_events::CompletionProjection,
+    terminal_status: DirectCommandStatus,
+) -> eval_events::CompletionProjection {
+    let mut projection = completion.clone();
+    if matches!(
+        terminal_status,
+        DirectCommandStatus::Completed | DirectCommandStatus::Partial
+    ) {
+        return projection;
+    }
+    projection.status = terminal_status.as_str().to_string();
+    projection.command_completion = terminal_status.as_str().to_string();
+    projection.task_status = terminal_status.as_str().to_string();
+    projection.next_action = match terminal_status {
+        DirectCommandStatus::Interrupted => "resume_or_rerun_command".to_string(),
+        DirectCommandStatus::Failed => "fix_command_failure".to_string(),
+        DirectCommandStatus::Completed | DirectCommandStatus::Partial => projection.next_action,
+    };
+    projection
+}
+
+fn error_is_interrupted(err: &anyhow::Error) -> bool {
+    err.to_string().contains("interrupted by user")
 }
 
 fn emit_run_start(config: &Config) {
@@ -384,6 +647,35 @@ mod tests {
         assert!(summary.contains("Session/REPL status: process_exited"));
         assert!(summary.contains("Final acceptance: not_checked"));
         assert!(summary.contains("Stop reason: completed"));
+    }
+
+    #[test]
+    fn direct_cli_ultra_plan_run_finalizer_rewrites_interrupted_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir
+            .path()
+            .join(".anvil/runs/direct-ultra-plan-run/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.action = Action::UltraPlanRun("Create a smoke app".to_string());
+        cfg.eval_events_path = Some(events.clone());
+
+        emit_run_start(&cfg);
+        let guard = DirectCommandCompletionGuard::start(&cfg).expect("direct command guard");
+        let result: anyhow::Result<()> = Err(anyhow::anyhow!("interrupted by user"));
+        guard.finalize_with_status(&result, DirectCommandStatus::Interrupted);
+        drop(guard);
+
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"event\":\"tui_command_stop\""));
+        assert!(event_text.contains("\"lifecycle_stage\":\"direct_cli_command\""));
+        assert!(event_text.contains("\"command\":\"--ultra-plan-run\""));
+        assert!(event_text.contains("\"status\":\"interrupted\""));
+        assert!(event_text.contains("\"failure_kind\":\"direct_cli_command_interrupted\""));
+
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains("Status: interrupted"), "{summary}");
+        assert!(summary.contains("Command status: interrupted"), "{summary}");
+        assert!(!summary.contains("Status: running"), "{summary}");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use reqwest::blocking::Client;
 use serde_json::json;
@@ -19,7 +20,7 @@ pub struct GeminiClient {
     max_predict: usize,
     retries: usize,
     eval_events_path: Option<PathBuf>,
-    previous_interaction_id: Option<String>,
+    previous_interaction_id: Arc<Mutex<Option<String>>>,
 }
 
 impl GeminiClient {
@@ -35,7 +36,7 @@ impl GeminiClient {
             max_predict: config.num_predict,
             retries: config.chat_retries,
             eval_events_path: config.eval_events_path.clone(),
-            previous_interaction_id: None,
+            previous_interaction_id: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -43,6 +44,10 @@ impl GeminiClient {
 impl ChatClient for GeminiClient {
     fn label(&self) -> &str {
         "gemini"
+    }
+
+    fn boxed_clone(&self) -> Option<Box<dyn ChatClient>> {
+        Some(Box::new(self.clone()))
     }
 
     fn supports_native_tools(&self, _model: &str) -> bool {
@@ -64,7 +69,10 @@ impl ChatClient for GeminiClient {
             .iter()
             .any(|message| matches!(message.role.as_str(), "assistant" | "tool"));
         let previous_interaction_id = if continues_existing_interaction {
-            self.previous_interaction_id.as_deref()
+            self.previous_interaction_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         } else {
             None
         };
@@ -73,7 +81,7 @@ impl ChatClient for GeminiClient {
             messages,
             tools,
             self.max_predict,
-            previous_interaction_id,
+            previous_interaction_id.as_deref(),
         );
         eval_events::emit(
             self.eval_events_path.as_deref(),
@@ -101,7 +109,10 @@ impl ChatClient for GeminiClient {
                         Ok(reply) => {
                             if let Some(id) = super::gemini_function_calling::interaction_id(&body)
                             {
-                                self.previous_interaction_id = Some(id);
+                                *self
+                                    .previous_interaction_id
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(id);
                             }
                             eval_events::emit(
                                 self.eval_events_path.as_deref(),

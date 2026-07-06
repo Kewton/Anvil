@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::bail;
 use serde_json::{Value, json};
@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::eval_events;
 use crate::mode::ExecutionMode;
 use crate::planner::verify::diagnose_verify_command;
+use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::ChatClient;
 use crate::state::{ConversationMessage, SessionSnapshot};
 use crate::tools::args_recovery::recover_tool_arguments;
@@ -286,6 +287,18 @@ impl RunSessionOptions {
 
     fn contract_enforcement_label(&self) -> &'static str {
         self.contract_enforcement.as_str()
+    }
+}
+
+fn provider_call_scope_for_options(
+    options: &RunSessionOptions,
+    pending_feedback: Option<&str>,
+) -> ProviderCallScope {
+    if pending_feedback.is_some() {
+        return ProviderCallScope::Repair;
+    }
+    match options.scope {
+        RunSessionScope::MinimalLoop | RunSessionScope::PlanRunStep => ProviderCallScope::Executor,
     }
 }
 
@@ -737,30 +750,23 @@ pub(crate) fn run_session_with_outcome_with_options(
             )
         };
         let label = format!("{} {}", client.label(), config.model);
-        let provider_turn_started = Instant::now();
-        let chat_result = {
+        let call_scope = provider_call_scope_for_options(&options, pending_feedback.as_deref());
+        let chat_outcome = {
             let _guard = ui.before_model_call(&label);
-            client.chat(
+            provider_call::chat(
+                client,
+                config,
+                call_scope,
                 &config.model,
                 &request_messages,
                 &request_tools,
                 native_tools_enabled,
             )
         };
-        let provider_turn_elapsed = provider_turn_started.elapsed();
-        let provider_turn_timed_out =
-            provider_turn_elapsed >= Duration::from_secs(config.chat_timeout_secs);
-        emit_provider_turn_duration(
-            config,
-            &options,
-            client.label(),
-            request_tools.len(),
-            native_tools_enabled,
-            provider_turn_elapsed,
-            provider_turn_timed_out,
-            chat_result.is_ok(),
-            provider_turn_timeouts + 1,
-        );
+        let provider_turn_elapsed = chat_outcome.elapsed;
+        let provider_turn_timed_out = chat_outcome.timed_out
+            || provider_turn_elapsed >= Duration::from_secs(config.chat_timeout_secs);
+        let chat_result = chat_outcome.result;
         if provider_turn_timed_out {
             provider_turn_timeouts += 1;
             let terminal = provider_turn_timeouts > 1;
@@ -2319,39 +2325,6 @@ fn extract_elapsed_ms(message: &str) -> Option<u64> {
         let value = line.trim().strip_prefix("elapsed_ms:")?.trim();
         value.parse::<u64>().ok()
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_provider_turn_duration(
-    config: &Config,
-    options: &RunSessionOptions,
-    provider: &str,
-    tool_count: usize,
-    native_tools_enabled: bool,
-    elapsed: Duration,
-    timed_out: bool,
-    ok: bool,
-    attempt: usize,
-) {
-    eval_events::emit(
-        config.eval_events_path.as_deref(),
-        json!({
-            "event": "provider_turn_duration",
-            "provider": provider,
-            "model": &config.model,
-            "elapsed_ms": elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
-            "timeout_ms": Duration::from_secs(config.chat_timeout_secs).as_millis().min(u128::from(u64::MAX)) as u64,
-            "timeout_secs": config.chat_timeout_secs,
-            "timed_out": timed_out,
-            "ok": ok,
-            "attempt": attempt,
-            "tools": tool_count,
-            "native_tools_enabled": native_tools_enabled,
-            "session_scope": options.scope.as_str(),
-            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
-            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
-        }),
-    );
 }
 
 fn emit_provider_turn_timeout(

@@ -223,6 +223,38 @@ fn conformance_negative_earned_assurance_catches_disconnected_gate() {
 }
 
 #[test]
+fn conformance_negative_bounded_provider_turns_catches_silent_phase_context_window() {
+    let trace = Trace {
+        scenario: MatrixScenario::GenericStatic,
+        events: vec![
+            json!({
+                "event": "provider_turn_duration",
+                "caller_scope": "planner_ultra",
+                "duration_ms": 10,
+                "timed_out": false,
+            }),
+            json!({
+                "event": "ultra_phase_context_attached",
+                "phase_id": "scaffold",
+            }),
+            json!({
+                "event": "ultra_phase_failed",
+                "phase_id": "scaffold",
+                "failure_kind": "phase_step_planner_timeout",
+            }),
+            terminal_stop("failed"),
+        ],
+        summary: terminal_summary("failed"),
+        output: String::new(),
+    };
+
+    assert_contract_fails(
+        "bounded_provider_turns",
+        check_bounded_provider_turns(&trace),
+    );
+}
+
+#[test]
 fn conformance_honest_terminal_covers_simulated_panic_exit() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -659,6 +691,28 @@ fn check_bounded_provider_turns(trace: &Trace) -> Result<(), String> {
             "bounded_provider_turns: no provider turn duration telemetry emitted".to_string(),
         );
     }
+    for (index, event) in trace.events.iter().enumerate() {
+        if string_field(event, "event") != Some("ultra_phase_context_attached") {
+            continue;
+        }
+        let mut saw_duration = false;
+        for next in trace.events.iter().skip(index + 1) {
+            match string_field(next, "event") {
+                Some("provider_turn_duration") => {
+                    saw_duration = true;
+                    break;
+                }
+                Some(name) if is_phase_boundary_event(name) => break,
+                _ => {}
+            }
+        }
+        if !saw_duration {
+            return Err(
+                "bounded_provider_turns: ultra phase context attach was followed by a silent provider window"
+                    .to_string(),
+            );
+        }
+    }
     for stop in events_named(&trace.events, "tui_command_stop") {
         if string_field(stop, "status") == Some("interrupted")
             || string_field(stop, "command_completion_state") == Some("interrupted")
@@ -688,6 +742,22 @@ fn check_bounded_provider_turns(trace: &Trace) -> Result<(), String> {
         return Err("bounded_provider_turns: provider timeout lacks honest loop_stop".to_string());
     }
     Ok(())
+}
+
+fn is_phase_boundary_event(name: &str) -> bool {
+    matches!(
+        name,
+        "ultra_phase_start"
+            | "ultra_phase_failed"
+            | "ultra_phase_scaffold_complete"
+            | "ultra_phase_plan_validated"
+            | "ultra_phase_execute_complete"
+            | "ultra_phase_profile_check"
+            | "ultra_phase_complete"
+            | "ultra_plan_complete"
+            | "loop_stop"
+            | "tui_command_stop"
+    )
 }
 
 fn check_bounded_verify_commands(trace: &Trace) -> Result<(), String> {

@@ -79,6 +79,7 @@ use crate::planner::verify::{
     verify_step_with_profile_setup_observed_with_offline,
     verify_step_with_profile_setup_observed_with_offline_and_events,
 };
+use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::{AssistantReply, ChatClient, model_for};
 use crate::state::SessionSnapshot;
 use crate::tools::path_guard::resolve_existing;
@@ -321,6 +322,8 @@ pub fn generate_step_plan(
 
 fn planner_chat_with_request_retry(
     client: &mut dyn ChatClient,
+    config: &Config,
+    scope: ProviderCallScope,
     model: &str,
     messages: &[crate::state::ConversationMessage],
     ui: &dyn InteractionUi,
@@ -329,7 +332,7 @@ fn planner_chat_with_request_retry(
     for request_attempt in 1..=PLANNER_PROVIDER_REQUEST_ATTEMPTS {
         let result = {
             let _guard = ui.before_model_call(&format!("planner {} {model}", client.label()));
-            client.chat(model, messages, &[], false)
+            provider_call::chat(client, config, scope, model, messages, &[], false).result
         };
         match result {
             Ok(reply) => return Ok(reply),
@@ -341,10 +344,14 @@ fn planner_chat_with_request_retry(
             }
         }
     }
+    let last_error = last_error.unwrap_or_else(|| "unknown provider error".to_string());
+    if provider_call::is_scoped_timeout(scope, &last_error) {
+        anyhow::bail!("{last_error}");
+    }
     anyhow::bail!(
         "provider request failed after {} attempts: {}",
         PLANNER_PROVIDER_REQUEST_ATTEMPTS,
-        last_error.unwrap_or_else(|| "unknown provider error".to_string())
+        last_error
     )
 }
 
@@ -371,7 +378,14 @@ pub fn generate_step_plan_with_ui(
     let mut lint_categories_seen = BTreeSet::new();
     for attempt in 1..=3 {
         let messages = step_plan_messages(&prompt);
-        let reply = planner_chat_with_request_retry(client, model, &messages, ui)?;
+        let reply = planner_chat_with_request_retry(
+            client,
+            config,
+            ProviderCallScope::PlannerStep,
+            model,
+            &messages,
+            ui,
+        )?;
         ui.publish_status(UiStatus::for_model_reply(
             config,
             model,
@@ -3523,7 +3537,14 @@ pub fn generate_ultra_plan_with_ui(
             &config.style,
             intent,
         );
-        let reply = planner_chat_with_request_retry(client, model, &messages, ui)?;
+        let reply = planner_chat_with_request_retry(
+            client,
+            config,
+            ProviderCallScope::PlannerUltra,
+            model,
+            &messages,
+            ui,
+        )?;
         ui.publish_status(UiStatus::for_model_reply(
             config,
             model,
