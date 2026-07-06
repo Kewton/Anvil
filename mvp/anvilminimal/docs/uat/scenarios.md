@@ -78,6 +78,20 @@ compatibility measurement.
    corpus case or be explicitly recorded as out of scope before changing probe,
    evidence, or profile logic.
 
+## Presentation Acceptance
+
+Every presentation-layer change must be checked by a human with:
+
+```sh
+anvilminimal --ux-demo
+```
+
+The reviewer requires explicit confirmation that the demo was run and that the
+banner, plan card, phase header, activity narration, live footer interruption
+hint, and terminal summary card were visible and ordered correctly. This demo is
+offline and does not replace the scenario suite; it is the permanent acceptance
+vehicle for TUI/scrollback/footer presentation changes.
+
 ## Scenarios
 
 ### GAME

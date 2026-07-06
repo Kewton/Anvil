@@ -24,3 +24,10 @@ fn ultra_plan_run_cli_shape() {
     assert!(matches!(config.action, Action::UltraPlanRun(_)));
     assert_eq!(config.profile, "nextjs");
 }
+
+#[test]
+fn ux_demo_cli_shape() {
+    let cli = Cli::parse_from(["anvilminimal", "--ux-demo"]);
+    let config = Config::from_cli(cli).unwrap();
+    assert!(matches!(config.action, Action::UxDemo));
+}

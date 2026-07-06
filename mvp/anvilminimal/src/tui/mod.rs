@@ -9,6 +9,7 @@ pub mod spinner;
 pub mod status;
 pub mod status_bus;
 pub mod terminal;
+pub mod ux_demo;
 
 use std::sync::{Arc, Mutex};
 

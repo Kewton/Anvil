@@ -163,6 +163,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 Ok(())
             }
+            Action::UxDemo => tui::ux_demo::run(&config),
             Action::Runs => Ok(()),
         }
     })();
@@ -312,7 +313,7 @@ impl Drop for DirectCommandCompletionGuard {
 
 fn direct_command_for_action(action: &Action) -> Option<&'static str> {
     match action {
-        Action::Repl | Action::Runs => None,
+        Action::Repl | Action::Runs | Action::UxDemo => None,
         Action::Prompt(_) => Some("--prompt"),
         Action::PlanSteps(_) => Some("--plan-steps"),
         Action::PlanRun(_) => Some("--plan-run"),

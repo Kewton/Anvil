@@ -114,7 +114,8 @@ pub fn project_event(event: &Value) {
         update_progress_from_event(event, None);
         return;
     };
-    update_progress_from_event(event, Some(line.clone()));
+    let activity = event_updates_current_activity(event).then_some(line.clone());
+    update_progress_from_event(event, activity);
     emit_markdown(&line);
 }
 
@@ -287,6 +288,20 @@ pub fn render_activity_line(event: &Value) -> Option<String> {
             let phase = text(event, "phase_id").unwrap_or_else(|| "unknown".to_string());
             Some(format!("── Phase {index}/{total}: {} ──", fit(&phase, 72)))
         }
+        "ultra_phase_complete" => Some(phase_status_label(event, "✓ Phase")),
+        "ultra_phase_failed" => {
+            let mut line = phase_status_label(event, "✗ Phase");
+            if let Some(reason) = text(event, "reason") {
+                line.push(' ');
+                line.push_str(&fit(&reason, 80));
+            }
+            Some(line)
+        }
+        "step_prompt_contract" => {
+            let id = text(event, "step_id").unwrap_or_else(|| "step".to_string());
+            let kind = text(event, "step_kind").unwrap_or_else(|| "step".to_string());
+            Some(format!("→ step {} [{}]", fit(&id, 72), fit(&kind, 24)))
+        }
         "tool_call_raw" => Some(format!("→ {}", tool_start_label(event))),
         "tool_execute" => {
             let name = text(event, "name").unwrap_or_else(|| "tool".to_string());
@@ -368,9 +383,114 @@ pub fn render_activity_line(event: &Value) -> Option<String> {
                 Some(format!("✗ probe: {}", fit(&kind, 96)))
             }
         }
+        "phase_verification_result" => {
+            let phase = text(event, "phase_id").unwrap_or_else(|| "phase".to_string());
+            let mode = text(event, "phase_verification_mode")
+                .unwrap_or_else(|| "verification".to_string());
+            if event.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                Some(format!("✓ verify {} ({mode})", fit(&phase, 72)))
+            } else {
+                let reason = text(event, "reason").unwrap_or_else(|| "failed".to_string());
+                Some(format!(
+                    "✗ verify {} ({mode}): {}",
+                    fit(&phase, 56),
+                    fit(&reason, 72)
+                ))
+            }
+        }
+        "ultra_final_acceptance" => {
+            let status =
+                text(event, "final_acceptance_status").unwrap_or_else(|| "unknown".to_string());
+            if status == "pass" {
+                Some("✓ final acceptance pass".to_string())
+            } else {
+                Some(format!("✗ final acceptance {}", fit(&status, 72)))
+            }
+        }
+        "ultra_plan_complete" => {
+            let total = event
+                .get("total_phases")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Some(format!("✓ ultra plan complete {total} phases"))
+        }
+        "planner_error" => {
+            let kind = text(event, "kind")
+                .or_else(|| text(event, "error_kind"))
+                .unwrap_or_else(|| "planner_error".to_string());
+            let message = text(event, "message")
+                .or_else(|| text(event, "reason"))
+                .unwrap_or_default();
+            if message.is_empty() {
+                Some(format!("✗ planner {kind}"))
+            } else {
+                Some(format!("✗ planner {kind}: {}", fit(&message, 96)))
+            }
+        }
+        "provider_turn_aborted_by_user" => Some("✗ provider aborted by user".to_string()),
         "dependency_build_lifecycle" => {
             let status = text(event, "status").unwrap_or_else(|| "dependency".to_string());
             Some(format!("→ npm install {status}"))
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityProjectionStatus {
+    Rendered,
+    Ignored,
+    Unclassified,
+}
+
+pub fn activity_projection_status(event: &Value) -> ActivityProjectionStatus {
+    if render_activity_line(event).is_some() {
+        return ActivityProjectionStatus::Rendered;
+    }
+    let Some(name) = event.get("event").and_then(Value::as_str) else {
+        return ActivityProjectionStatus::Unclassified;
+    };
+    if documented_activity_ignore_reason(name).is_some() {
+        ActivityProjectionStatus::Ignored
+    } else {
+        ActivityProjectionStatus::Unclassified
+    }
+}
+
+pub fn documented_activity_ignore_reason(name: &str) -> Option<&'static str> {
+    match name {
+        // Process and command lifecycle records are summarized by the terminal card.
+        "run_start" | "run_stop" | "tui_command_start" | "tui_command_stop" => {
+            Some("lifecycle summarized by terminal summary card")
+        }
+        // Planner bookkeeping is noisy in scrollback; visible plan cards cover the accepted result.
+        "ultra_plan_generation_attempt"
+        | "ultra_plan_raw_output_shape"
+        | "ultra_plan_generation_succeeded"
+        | "ultra_plan_generation_retry"
+        | "ultra_plan_generation_metadata_normalized"
+        | "planner_quality_warning"
+        | "planner_quality_issue" => Some("planner bookkeeping covered by plan cards"),
+        // Context/progress records update projections and footer state without adding useful text.
+        "ultra_context_initialized"
+        | "ultra_phase_context_attached"
+        | "ultra_phase_scaffold_complete"
+        | "ultra_phase_execute_complete"
+        | "ultra_phase_plan_validated"
+        | "ultra_phase_profile_check"
+        | "profile_inferred"
+        | "profile_reinferred"
+        | "generic_contract_bound" => Some("projection state update"),
+        // Provider and loop metrics are better inspected in events.jsonl than narrated line by line.
+        "provider_turn_duration"
+        | "loop_stop"
+        | "runtime_bash_policy"
+        | "tool_args_recovered"
+        | "empty_response_recovered"
+        | "provider_turn_timeout_recovered" => Some("low-value runtime metric"),
+        // Recovery artifacts are surfaced by the summary card and resume hints.
+        "recovery_prompt_saved" | "recovery_ultra_plan_saved" | "summary_written" => {
+            Some("recovery artifact summarized")
         }
         _ => None,
     }
@@ -439,6 +559,19 @@ fn update_progress_from_event(event: &Value, activity: Option<String>) {
         }
         _ => {}
     }
+}
+
+fn event_updates_current_activity(event: &Value) -> bool {
+    let name = event.get("event").and_then(Value::as_str).unwrap_or("");
+    !matches!(
+        name,
+        "ultra_phase_complete"
+            | "ultra_phase_execute_complete"
+            | "ultra_phase_scaffold_complete"
+            | "phase_verification_result"
+            | "ultra_final_acceptance"
+            | "ultra_plan_complete"
+    )
 }
 
 fn render_step_projection_block(plan: &StepPlanProjection, progress: &PlanProgress) -> String {
@@ -602,6 +735,23 @@ fn tool_start_label(event: &Value) -> String {
     }
 }
 
+fn phase_status_label(event: &Value, prefix: &str) -> String {
+    let index = event
+        .get("phase_index")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = event
+        .get("total_phases")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let phase = text(event, "phase_id").unwrap_or_else(|| "unknown".to_string());
+    if index == 0 && total == 0 {
+        format!("{prefix}: {}", fit(&phase, 72))
+    } else {
+        format!("{prefix} {index}/{total}: {}", fit(&phase, 72))
+    }
+}
+
 fn argument_preview(summary: &Value, key: &str) -> Option<String> {
     summary
         .get("argument_summaries")
@@ -742,6 +892,7 @@ mod tests {
     #[test]
     fn activity_narration_scripted_sequence_snapshot() {
         let events = vec![
+            json!({"event": "step_prompt_contract", "step_id": "write-page", "step_kind": "implement"}),
             json!({
                 "event": "tool_call_raw",
                 "name": "Write",
@@ -755,6 +906,7 @@ mod tests {
             json!({"event": "step_verify_failure", "primary_reason": "missing path package.json"}),
             json!({"event": "step_verify_repair", "repair_attempt": 1, "max_repair_turns": 2, "repair_target": "missing_artifact"}),
             json!({"event": "browser_probe", "ok": true, "http_status": 200, "status": "pass"}),
+            json!({"event": "phase_verification_result", "phase_id": "implement", "phase_verification_mode": "final_acceptance", "ok": true}),
         ];
         let lines = events
             .iter()
@@ -764,12 +916,52 @@ mod tests {
         assert_eq!(
             lines,
             vec![
+                "→ step write-page [implement]",
                 "→ Write src/app/page.tsx",
                 "✓ Write ok",
                 "✗ verify missing path package.json",
                 "↻ repair 1/2: missing_artifact",
                 "✓ probe: HTTP 200",
+                "✓ verify implement (final_acceptance)",
             ]
+        );
+    }
+
+    #[test]
+    fn activity_projection_audits_standard_ultra_event_fixture() {
+        let fixture = include_str!("../../tests/fixtures/standard-ultra-events.jsonl");
+        let mut total = 0usize;
+        let mut classified = 0usize;
+        let mut kinds = std::collections::BTreeSet::new();
+        let mut unclassified = Vec::new();
+
+        for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
+            let event = serde_json::from_str::<serde_json::Value>(line).unwrap();
+            let kind = event
+                .get("event")
+                .and_then(serde_json::Value::as_str)
+                .unwrap()
+                .to_string();
+            kinds.insert(kind.clone());
+            total += 1;
+            match activity_projection_status(&event) {
+                ActivityProjectionStatus::Rendered | ActivityProjectionStatus::Ignored => {
+                    classified += 1;
+                }
+                ActivityProjectionStatus::Unclassified => unclassified.push(kind),
+            }
+        }
+
+        assert!(kinds.contains("tool_call_raw"));
+        assert!(kinds.contains("phase_verification_result"));
+        assert!(kinds.contains("browser_interaction_probe"));
+        assert!(
+            classified * 100 >= total * 90,
+            "classified {classified}/{total}; unclassified={unclassified:?}; kinds={kinds:?}"
+        );
+        assert!(
+            unclassified.is_empty(),
+            "fixture should document every ignored event explicitly: {unclassified:?}"
         );
     }
 

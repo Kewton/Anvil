@@ -80,9 +80,15 @@ Release/manual TTY smoke:
 
 ```bash
 ANVIL_PTY_TESTS=1 cargo test tui_pty_smoke -- --ignored
+anvilminimal --ux-demo
 anvilminimal --help
 anvilminimal --yes --context-budget 65536 --model qwen3.6:27b-coding-nvfp4 --planner-model gemini-3.5-flash --planner-provider gemini --provider ollama
 ```
+
+`anvilminimal --ux-demo` is an offline presentation walkthrough for human
+review. It exercises the banner, plan card, phase header, activity narration,
+live footer interrupt hint, and terminal summary card without contacting a
+provider.
 
 ## UAT
 

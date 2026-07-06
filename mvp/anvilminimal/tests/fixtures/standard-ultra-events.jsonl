@@ -1,0 +1,32 @@
+{"event":"run_start","action":"UltraPlanRun(\"build app\")","profile":"generic"}
+{"event":"tui_command_start","command":"/ultra-plan-run","profile":"generic"}
+{"event":"ultra_plan_generation_attempt","attempt":1,"profile":"generic"}
+{"event":"provider_turn_duration","scope":"planner_ultra","duration_secs":2}
+{"event":"ultra_plan_generation_succeeded","attempt":1,"phase_count":2}
+{"event":"ultra_context_initialized","total_phases":2,"shared_execution_session":true}
+{"event":"ultra_phase_start","phase_id":"scaffold","phase_index":1,"total_phases":2,"stage":"start"}
+{"event":"ultra_phase_context_attached","phase_id":"scaffold","phase_index":1,"total_phases":2}
+{"event":"step_prompt_contract","step_id":"create-package","step_kind":"setup","has_expected_paths":true}
+{"event":"tool_call_raw","name":"Write","arguments":{"argument_summaries":{"path":{"preview":"package.json"}}}}
+{"event":"tool_execute","name":"Write","status":"ok"}
+{"event":"loop_stop","reason":"completion_contract_satisfied"}
+{"event":"dependency_build_lifecycle","status":"setup_passed","step_id":"create-package"}
+{"event":"phase_verification_result","phase_id":"scaffold","phase_index":1,"total_phases":2,"phase_verification_mode":"intermediate_invariant","ok":true}
+{"event":"ultra_phase_execute_complete","phase_id":"scaffold","phase_index":1,"total_phases":2}
+{"event":"ultra_phase_complete","phase_id":"scaffold","phase_index":1,"total_phases":2}
+{"event":"ultra_phase_start","phase_id":"implement","phase_index":2,"total_phases":2,"stage":"start"}
+{"event":"step_prompt_contract","step_id":"write-page","step_kind":"implement","has_expected_paths":true}
+{"event":"tool_call_raw","name":"Write","arguments":{"argument_summaries":{"path":{"preview":"src/app/page.tsx"}}}}
+{"event":"tool_execute","name":"Write","status":"ok"}
+{"event":"step_verify_failure","step_id":"write-page","repair_target":"missing_artifact","primary_reason":"missing path src/app/page.tsx"}
+{"event":"step_verify_repair","repair_attempt":1,"max_repair_turns":2,"repair_target":"missing_artifact"}
+{"event":"tool_call_raw","name":"Bash","arguments":{"argument_summaries":{"command":{"preview":"npm run build"}}}}
+{"event":"tool_execute","name":"Bash","status":"ok"}
+{"event":"browser_probe","status":"pass","ok":true,"http_status":200}
+{"event":"browser_interaction_probe","status":"passed","ok":true}
+{"event":"phase_verification_result","phase_id":"implement","phase_index":2,"total_phases":2,"phase_verification_mode":"final_acceptance","ok":true}
+{"event":"ultra_phase_complete","phase_id":"implement","phase_index":2,"total_phases":2}
+{"event":"ultra_final_acceptance","final_acceptance_status":"pass","release_gate_status":"pass"}
+{"event":"ultra_plan_complete","total_phases":2,"ok":true}
+{"event":"tui_command_stop","command":"/ultra-plan-run","ok":true,"status":"completed","assurance_level":"full"}
+{"event":"run_stop","ok":true,"stop_reason":"completed"}

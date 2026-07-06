@@ -42,6 +42,7 @@ pub enum Action {
     RunUltraPlan(PathBuf),
     SetupInteractionProbe,
     Runs,
+    UxDemo,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -650,7 +651,8 @@ pub fn action_goal(action: &Action) -> Option<&str> {
         | Action::RunPlan(_)
         | Action::RunUltraPlan(_)
         | Action::SetupInteractionProbe
-        | Action::Runs => None,
+        | Action::Runs
+        | Action::UxDemo => None,
     }
 }
 
@@ -665,6 +667,7 @@ fn action_from_cli(cli: &Cli) -> anyhow::Result<Action> {
     count += cli.run_ultra_plan.is_some() as usize;
     count += cli.setup_interaction_probe as usize;
     count += cli.runs as usize;
+    count += cli.ux_demo as usize;
     if count > 1 {
         bail!("only one action selector can be used at a time");
     }
@@ -698,6 +701,9 @@ fn action_from_cli(cli: &Cli) -> anyhow::Result<Action> {
     }
     if cli.runs {
         return Ok(Action::Runs);
+    }
+    if cli.ux_demo {
+        return Ok(Action::UxDemo);
     }
     Ok(Action::Repl)
 }

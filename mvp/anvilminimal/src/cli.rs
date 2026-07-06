@@ -46,6 +46,8 @@ pub struct Cli {
     pub setup_interaction_probe: bool,
     #[arg(long, action = ArgAction::SetTrue, help = "List recent runs for the current workspace")]
     pub runs: bool,
+    #[arg(long, action = ArgAction::SetTrue, help = "Run the offline presentation UX demo")]
+    pub ux_demo: bool,
     #[arg(long)]
     pub profile: Option<String>,
     #[arg(long, default_value = "default")]
@@ -109,6 +111,12 @@ mod tests {
     fn help_includes_runs() {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--runs"));
+    }
+
+    #[test]
+    fn help_includes_ux_demo() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--ux-demo"));
     }
 
     #[test]
