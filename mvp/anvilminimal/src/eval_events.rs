@@ -946,6 +946,9 @@ pub fn render_terminal_summary_card(
             phase_count_display(completed, total)
         ),
     ];
+    if let Some(resumed_from) = latest_event_field(&events, &["resumed_from"]) {
+        lines.push(format!("- Resumed from: {resumed_from}"));
+    }
     if let Some(telemetry) = terminal_card_telemetry(projection) {
         lines.push(format!("- Telemetry: {telemetry}"));
     }
@@ -960,6 +963,9 @@ pub fn render_terminal_summary_card(
             "- Recovery UltraPlan: {}",
             projection.recovery_ultra_plan_path
         ));
+        if let Some(command) = resume_command_for_run(path) {
+            lines.push(format!("- resume: {command}"));
+        }
     }
     if !projection.suggested_recovery_command.is_empty() {
         lines.push(format!(
@@ -976,6 +982,24 @@ pub fn render_terminal_summary_card(
     lines.push(format!("- Next action: {}", projection.next_action));
     lines.truncate(25);
     lines.join("\n")
+}
+
+fn resume_command_for_run(path: Option<&Path>) -> Option<String> {
+    let run_dir = path.and_then(Path::parent)?;
+    let is_run_dir = run_dir
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value == "runs");
+    if !is_run_dir {
+        return None;
+    }
+    let run_id = run_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())?;
+    let short = crate::util::truncate_at_char_boundary(run_id, 8);
+    Some(format!("/resume {short}"))
 }
 
 fn assurance_display(projection: &CompletionProjection) -> String {
@@ -3249,8 +3273,15 @@ mod tests {
     #[test]
     fn terminal_summary_card_snapshot_partial_failed_and_interrupted_projections() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("events.jsonl");
+        let path = dir.path().join(".anvil/runs/018f7777-summary/events.jsonl");
         let recovery = ".anvil/plans/recovery-ultra-plan-日本語ディレクトリ-final-acceptance.yaml";
+        emit(
+            Some(&path),
+            json!({
+                "event": "resume_start",
+                "resumed_from": "018f6666",
+            }),
+        );
         emit(
             Some(&path),
             json!({
@@ -3325,6 +3356,14 @@ mod tests {
             "{partial_card}"
         );
         assert!(partial_card.contains(recovery), "{partial_card}");
+        assert!(
+            partial_card.contains("- resume: /resume 018f7777"),
+            "{partial_card}"
+        );
+        assert!(
+            partial_card.contains("- Resumed from: 018f6666"),
+            "{partial_card}"
+        );
         assert!(
             !partial_card.contains("recovery-ultra-plan-日本語ディレクトリ-final-acceptance.ya\n")
         );

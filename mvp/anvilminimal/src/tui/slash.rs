@@ -204,6 +204,9 @@ pub fn handle_command(
     ui: &dyn crate::tui::InteractionUi,
 ) -> anyhow::Result<String> {
     let parsed = parse_slash(line, config)?;
+    if parsed.command == "/help" {
+        return Ok(render_help());
+    }
     if parsed.command == "/runs" {
         return Ok(crate::runs::render_runs_table(&config.workspace_root));
     }
@@ -361,6 +364,24 @@ pub fn handle_command(
             card
         )
     })
+}
+
+fn render_help() -> String {
+    [
+        "Commands:",
+        "/help - show this command list",
+        "/runs - list recent runs and recovery availability",
+        "/resume [run-id|yaml-path] - resume from a recovery UltraPlan",
+        "/plan-steps <goal> - write a step plan",
+        "/plan-run <goal> - generate and run a step plan",
+        "/run-plan <path> - run an existing step plan",
+        "/ultra-plan <goal> - write an UltraPlan",
+        "/ultra-plan-run <goal> - generate and run an UltraPlan",
+        "/run-ultra-plan <path> - run an existing UltraPlan",
+        "/setup-interaction-probe - install the interaction readiness probe",
+        "/exit or /quit - leave the TUI",
+    ]
+    .join("\n")
 }
 
 fn confirm_resume(config: &Config, resume: &crate::runs::ResumePlan) -> anyhow::Result<()> {

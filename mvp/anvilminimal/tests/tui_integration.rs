@@ -1043,6 +1043,32 @@ fn tui_runs_lists_recent_runs_without_emitting_command_events() {
 }
 
 #[test]
+fn tui_help_lists_recovery_commands_without_emitting_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/current/events.jsonl");
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    let mut planner = FakeClient::new("planner", Vec::new());
+    let mut execution = FakeClient::new("exec", Vec::new());
+    let ui = FakeUi::default();
+
+    let output =
+        anvilminimal::tui::slash::handle_command("/help", &cfg, &mut planner, &mut execution, &ui)
+            .unwrap();
+
+    assert!(output.contains("/runs - list recent runs"), "{output}");
+    assert!(
+        output.contains("/resume [run-id|yaml-path] - resume from a recovery UltraPlan"),
+        "{output}"
+    );
+    assert!(output.contains("/exit or /quit"), "{output}");
+    assert!(
+        !events_path.exists(),
+        "/help should not emit command events"
+    );
+}
+
+#[test]
 fn tui_resume_runs_recovery_plan_remaining_phases_and_records_lineage() {
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/current/events.jsonl");
@@ -1146,6 +1172,7 @@ phases:
         output.contains("completed phases skipped: scaffold"),
         "{output}"
     );
+    assert!(output.contains("- Resumed from: 018f6666"), "{output}");
     assert!(
         output.contains("phases to run: repair-phase, verify-recovery"),
         "{output}"
