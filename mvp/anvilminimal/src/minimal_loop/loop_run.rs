@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::config::Config;
 use crate::eval_events;
 use crate::mode::ExecutionMode;
+use crate::planner::profile::{profile_complete_scaffold, profile_setup_scaffold_paths};
 use crate::planner::verify::diagnose_verify_command;
 use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::ChatClient;
@@ -132,6 +133,7 @@ const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 1;
 const RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT: usize = 2;
 const MALFORMED_NATIVE_TOOL_RETRY_LIMIT: usize = 2;
 const EMPTY_RESPONSE_RECOVERY_EXTRA_ITERATIONS: usize = 3;
+const SETUP_SCAFFOLD_COMPLETION_REMAINING_THRESHOLD: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptArtifactExtraction {
@@ -177,6 +179,21 @@ pub(crate) enum RunSessionStepKind {
     Verify,
     Report,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupScaffoldCompletionTrigger {
+    BudgetLow,
+    Exhausted,
+}
+
+impl SetupScaffoldCompletionTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BudgetLow => "budget_low",
+            Self::Exhausted => "exhausted",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -697,6 +714,8 @@ pub(crate) fn run_session_with_outcome_with_options(
     let profile_guidance = crate::planner::profile::profile_guidance(&config.profile, user_prompt);
 
     for iteration in 0..iteration_limit {
+        let iterations_used = iteration + 1;
+        let remaining_iterations = iteration_limit.saturating_sub(iterations_used);
         if ui.interrupted() {
             bail!("interrupted by user");
         }
@@ -920,8 +939,34 @@ pub(crate) fn run_session_with_outcome_with_options(
             tool_calls.clone(),
         ));
         if tool_calls.is_empty() {
-            let missing = missing_paths(&config.workspace_root, &required_paths);
+            let mut missing = missing_paths(&config.workspace_root, &required_paths);
             if !missing.is_empty() {
+                if remaining_iterations <= SETUP_SCAFFOLD_COMPLETION_REMAINING_THRESHOLD {
+                    maybe_complete_setup_scaffold(
+                        config,
+                        &options,
+                        user_prompt,
+                        &missing,
+                        SetupScaffoldCompletionTrigger::BudgetLow,
+                        &mut changed_paths,
+                    )?;
+                    missing = missing_paths(&config.workspace_root, &required_paths);
+                    if missing.is_empty() {
+                        session.messages.pop();
+                        return Ok(stop_for_required_artifacts_satisfied(
+                            config,
+                            &required_paths,
+                            RequiredArtifactsStop {
+                                changed_paths,
+                                iterations: iterations_used,
+                                tool_calls: tool_call_count,
+                                verify_attempts,
+                                last_blocking_reason,
+                                last_provider_error,
+                            },
+                        ));
+                    }
+                }
                 session.messages.pop();
                 artifact_non_edit_streak =
                     artifact_non_edit_streak.saturating_add(ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD);
@@ -1563,7 +1608,34 @@ pub(crate) fn run_session_with_outcome_with_options(
                 last_provider_error,
             });
         }
-        let missing = missing_after_batch;
+        let mut missing = missing_after_batch;
+        if !missing.is_empty()
+            && remaining_iterations <= SETUP_SCAFFOLD_COMPLETION_REMAINING_THRESHOLD
+        {
+            maybe_complete_setup_scaffold(
+                config,
+                &options,
+                user_prompt,
+                &missing,
+                SetupScaffoldCompletionTrigger::BudgetLow,
+                &mut changed_paths,
+            )?;
+            missing = missing_paths(&config.workspace_root, &required_paths);
+            if missing.is_empty() {
+                return Ok(stop_for_required_artifacts_satisfied(
+                    config,
+                    &required_paths,
+                    RequiredArtifactsStop {
+                        changed_paths,
+                        iterations: iterations_used,
+                        tool_calls: tool_call_count,
+                        verify_attempts,
+                        last_blocking_reason,
+                        last_provider_error,
+                    },
+                ));
+            }
+        }
         if let Some(feedback) = maybe_artifact_recovery_feedback(
             &mut artifact_recovery_state,
             &mut artifact_non_edit_streak,
@@ -1583,7 +1655,32 @@ pub(crate) fn run_session_with_outcome_with_options(
             continue;
         }
     }
-    let missing = missing_paths(&config.workspace_root, &required_paths);
+    let mut missing = missing_paths(&config.workspace_root, &required_paths);
+    if !missing.is_empty() {
+        maybe_complete_setup_scaffold(
+            config,
+            &options,
+            user_prompt,
+            &missing,
+            SetupScaffoldCompletionTrigger::Exhausted,
+            &mut changed_paths,
+        )?;
+        missing = missing_paths(&config.workspace_root, &required_paths);
+        if missing.is_empty() {
+            return Ok(stop_for_required_artifacts_satisfied(
+                config,
+                &required_paths,
+                RequiredArtifactsStop {
+                    changed_paths,
+                    iterations: iteration_limit,
+                    tool_calls: tool_call_count,
+                    verify_attempts,
+                    last_blocking_reason,
+                    last_provider_error,
+                },
+            ));
+        }
+    }
     let reason = if missing.is_empty() {
         "max_iterations"
     } else {
@@ -1610,6 +1707,147 @@ fn missing_paths(root: &std::path::Path, required_paths: &[String]) -> Vec<Strin
         .filter(|path| resolve_existing(root, path).is_err())
         .cloned()
         .collect()
+}
+
+fn maybe_complete_setup_scaffold(
+    config: &Config,
+    options: &RunSessionOptions,
+    user_prompt: &str,
+    missing_paths: &[String],
+    trigger: SetupScaffoldCompletionTrigger,
+    changed_paths: &mut Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+    if !setup_scaffold_completion_applicable(config, options, user_prompt, missing_paths) {
+        return Ok(Vec::new());
+    }
+    let created =
+        profile_complete_scaffold(&config.workspace_root, &config.profile, missing_paths)?;
+    if created.is_empty() {
+        return Ok(created);
+    }
+    for path in &created {
+        if !changed_paths.contains(path) {
+            changed_paths.push(path.clone());
+        }
+    }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "setup_scaffold_completed",
+            "paths": created,
+            "trigger": trigger.as_str(),
+            "profile": config.profile,
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+        }),
+    );
+    Ok(created)
+}
+
+fn setup_scaffold_completion_applicable(
+    config: &Config,
+    options: &RunSessionOptions,
+    user_prompt: &str,
+    missing_paths: &[String],
+) -> bool {
+    if missing_paths.is_empty() || !setup_step_or_phase(options, user_prompt) {
+        return false;
+    }
+    let scaffold_paths = profile_setup_scaffold_paths(&config.workspace_root, &config.profile)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if scaffold_paths.is_empty() {
+        return false;
+    }
+    missing_paths.iter().all(|path| {
+        scaffold_paths.contains(path) || python_cli_entrypoint_scaffold_path(config, path)
+    })
+}
+
+fn setup_step_or_phase(options: &RunSessionOptions, user_prompt: &str) -> bool {
+    if options.step_kind == Some(RunSessionStepKind::Setup) {
+        return true;
+    }
+    if options.step_kind != Some(RunSessionStepKind::Implement) {
+        return false;
+    }
+    let lower = format!(
+        "{}\n{}",
+        options.phase_scope.as_deref().unwrap_or(""),
+        user_prompt
+    )
+    .to_ascii_lowercase();
+    [
+        "setup",
+        "set up",
+        "scaffold",
+        "initialize",
+        "initialise",
+        "init",
+    ]
+    .iter()
+    .any(|token| lower.contains(token))
+}
+
+fn python_cli_entrypoint_scaffold_path(config: &Config, path: &str) -> bool {
+    if crate::planner::profile::canonical_profile_name(&config.profile) != "python-cli" {
+        return false;
+    }
+    let normalized = path.replace('\\', "/");
+    normalized.starts_with("src/")
+        && normalized.ends_with("/main.py")
+        && normalized
+            .strip_prefix("src/")
+            .and_then(|tail| tail.strip_suffix("/main.py"))
+            .is_some_and(|package| {
+                !package.is_empty()
+                    && !package.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+                    && package
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            })
+}
+
+struct RequiredArtifactsStop {
+    changed_paths: Vec<String>,
+    iterations: usize,
+    tool_calls: usize,
+    verify_attempts: usize,
+    last_blocking_reason: Option<String>,
+    last_provider_error: Option<String>,
+}
+
+fn stop_for_required_artifacts_satisfied(
+    config: &Config,
+    required_paths: &[String],
+    stop: RequiredArtifactsStop,
+) -> RunSessionOutcome {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "loop_stop",
+            "reason": "required_artifacts_satisfied_after_tool",
+            "required_paths": required_paths,
+        }),
+    );
+    RunSessionOutcome {
+        final_text: format!(
+            "required artifacts satisfied: {}",
+            required_paths.join(", ")
+        ),
+        stop_reason: RunStopReason::RequiredArtifactsSatisfiedAfterTool,
+        changed_paths: stop.changed_paths,
+        iterations: stop.iterations,
+        tool_calls: stop.tool_calls,
+        missing_required_paths: Vec::new(),
+        missing_capabilities: Vec::new(),
+        missing_evidence: Vec::new(),
+        missing_obligations: Vec::new(),
+        verify_attempts: stop.verify_attempts,
+        last_blocking_reason: stop.last_blocking_reason,
+        last_provider_error: stop.last_provider_error,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4397,6 +4635,159 @@ export default function Page(){
         );
         assert!(err.contains(".yaml"), "{err}");
         assert!(dir.path().join("package.json").is_file());
+    }
+
+    #[test]
+    fn setup_scaffold_completion_finishes_missing_nextjs_configs_at_budget_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 1;
+        let required_paths = crate::planner::profiles::nextjs::setup_scaffold_paths(dir.path());
+        let page = "export default function Page(){return <main>ready</main>;}\n";
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![
+                        ToolCall::new("Write", json!({"path":"package.json","content":"{}"})),
+                        ToolCall::new("Write", json!({"path":"tsconfig.json","content":"{}"})),
+                        ToolCall::new(
+                            "Write",
+                            json!({"path":"src/app/layout.tsx","content":"import './globals.css';\nexport default function RootLayout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>}\n"}),
+                        ),
+                        ToolCall::new("Write", json!({"path":"src/app/page.tsx","content":page})),
+                        ToolCall::new(
+                            "Write",
+                            json!({"path":"src/app/globals.css","content":"@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"}),
+                        ),
+                        ToolCall::new(
+                            "Write",
+                            json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";\n"}),
+                        ),
+                    ],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(empty_reply()),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Scaffold the Next.js setup files.",
+            &required_paths,
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
+            page
+        );
+        let postcss = std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap();
+        assert!(postcss.contains("tailwindcss"), "{postcss}");
+        assert!(postcss.contains("autoprefixer"), "{postcss}");
+        assert!(dir.path().join("tailwind.config.ts").is_file());
+        assert!(
+            outcome
+                .changed_paths
+                .contains(&"postcss.config.js".to_string())
+        );
+        assert!(
+            outcome
+                .changed_paths
+                .contains(&"tailwind.config.ts".to_string())
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"setup_scaffold_completed\""));
+        assert!(event_text.contains("\"trigger\":\"budget_low\""));
+        assert!(event_text.contains("postcss.config.js"));
+        assert!(event_text.contains("tailwind.config.ts"));
+    }
+
+    #[test]
+    fn setup_scaffold_completion_does_not_author_nextjs_application_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 1;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(empty_reply()),
+                Ok(empty_reply()),
+                Ok(empty_reply()),
+                Ok(empty_reply()),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+
+        let err = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Scaffold the Next.js setup files.",
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("artifact recovery exhausted"), "{err}");
+        assert!(!dir.path().join("src/app/page.tsx").exists());
+        let event_text = std::fs::read_to_string(events).unwrap_or_default();
+        assert!(!event_text.contains("\"event\":\"setup_scaffold_completed\""));
+    }
+
+    #[test]
+    fn setup_scaffold_completion_finishes_python_cli_scaffold() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "python-cli".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 1;
+        let mut fake = Fake {
+            replies: vec![Ok(empty_reply()), Ok(empty_reply())],
+        };
+        let mut session = SessionSnapshot::new();
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Scaffold the Python CLI setup files.",
+            &[
+                "pyproject.toml".to_string(),
+                "src/csv_stats/main.py".to_string(),
+            ],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert!(dir.path().join("pyproject.toml").is_file());
+        assert!(dir.path().join("src/csv_stats/main.py").is_file());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"setup_scaffold_completed\""));
+        assert!(event_text.contains("src/csv_stats/main.py"));
     }
 
     #[test]
