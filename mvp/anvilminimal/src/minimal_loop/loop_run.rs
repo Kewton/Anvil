@@ -489,6 +489,24 @@ fn recovered_bash_command(tool_name: &str, arguments: &Value) -> Option<String> 
         .map(ToOwned::to_owned)
 }
 
+fn set_bash_command(arguments: &mut Value, command: String) {
+    if let Some(object) = arguments.as_object_mut() {
+        object.insert("command".to_string(), json!(command));
+    } else {
+        *arguments = json!({ "command": command });
+    }
+}
+
+fn deterministic_verify_substitute(root: &Path, required_paths: &[String]) -> Option<String> {
+    let path = required_paths
+        .iter()
+        .find(|path| resolve_existing(root, path).is_err())
+        .or_else(|| required_paths.first())?;
+    crate::tools::path_guard::validate_workspace_relative(path).ok()?;
+    let command = format!("test -f {path}");
+    (diagnose_verify_command(&command).violation.is_none()).then_some(command)
+}
+
 fn emit_runtime_bash_policy(
     path: Option<&Path>,
     decision: &RuntimeBashPolicyDecision,
@@ -1311,39 +1329,72 @@ pub(crate) fn run_session_with_outcome_with_options(
                             "repeat_count": repeats,
                         }),
                     );
-                    eval_events::emit(
-                        config.eval_events_path.as_deref(),
-                        json!({
-                            "event": "tool_validation_error",
-                            "name": call.name.as_str(),
-                            "error_kind": decision.policy_error_kind,
-                            "missing_arg": null,
-                            "repeat_count": repeats,
-                        }),
-                    );
-                    if repeats > RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT {
+                    if decision.policy_error_kind == "verify_command_policy_error"
+                        && repeats >= RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT
+                        && let Some(substitute) =
+                            deterministic_verify_substitute(&config.workspace_root, &required_paths)
+                    {
                         eval_events::emit(
                             config.eval_events_path.as_deref(),
                             json!({
-                                "event": "loop_stop",
-                                "reason": "recoverable_tool_error_repeated",
-                                "name": call.name.as_str(),
-                                "error_kind": decision.policy_error_kind,
-                                "repeat_count": repeats - 1,
+                                "event": "verify_command_substituted",
+                                "original": eval_events::body_snippet(&command),
+                                "substitute": &substitute,
+                                "reason": "policy_repetition",
+                                "repeat_count": repeats,
+                                "step_kind": decision.step_kind,
+                                "oracle_tier": "degraded",
+                                "degradation": "deterministic_expected_path_substitution",
                             }),
                         );
-                        bail!(
-                            "recoverable tool error repeated: {}",
-                            decision.policy_error_kind
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "step_oracle_tier_degraded",
+                                "reason": "policy_repetition",
+                                "oracle_tier": "degraded",
+                                "original": eval_events::body_snippet(&command),
+                                "substitute": &substitute,
+                                "step_kind": decision.step_kind,
+                            }),
                         );
+                        set_bash_command(&mut call.arguments, substitute);
+                        recoverable_tool_error_state.reset();
+                    } else {
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "tool_validation_error",
+                                "name": call.name.as_str(),
+                                "error_kind": decision.policy_error_kind,
+                                "missing_arg": null,
+                                "repeat_count": repeats,
+                            }),
+                        );
+                        if repeats > RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT {
+                            eval_events::emit(
+                                config.eval_events_path.as_deref(),
+                                json!({
+                                    "event": "loop_stop",
+                                    "reason": "recoverable_tool_error_repeated",
+                                    "name": call.name.as_str(),
+                                    "error_kind": decision.policy_error_kind,
+                                    "repeat_count": repeats - 1,
+                                }),
+                            );
+                            bail!(
+                                "recoverable tool error repeated: {}",
+                                decision.policy_error_kind
+                            );
+                        }
+                        let feedback = recoverable_tool_feedback(&call.name, &policy_error);
+                        session.messages.push(ConversationMessage::tool_result(
+                            call.name,
+                            Some(call.id),
+                            feedback,
+                        ));
+                        continue;
                     }
-                    let feedback = recoverable_tool_feedback(&call.name, &policy_error);
-                    session.messages.push(ConversationMessage::tool_result(
-                        call.name,
-                        Some(call.id),
-                        feedback,
-                    ));
-                    continue;
                 }
                 if let Some(normalized_command) = decision.normalized_command.clone() {
                     eval_events::emit(
@@ -1358,11 +1409,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                             "reason": eval_events::body_snippet(&decision.normalization_reason),
                         }),
                     );
-                    if let Some(object) = call.arguments.as_object_mut() {
-                        object.insert("command".to_string(), json!(normalized_command));
-                    } else {
-                        call.arguments = json!({ "command": normalized_command });
-                    }
+                    set_bash_command(&mut call.arguments, normalized_command);
                 }
             }
             let result = {
@@ -6187,6 +6234,88 @@ Required final artifacts:
             .unwrap_err()
             .to_string();
         assert!(err.contains("recoverable tool error repeated"));
+    }
+
+    #[test]
+    fn repeated_verify_policy_error_substitutes_expected_path_check() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path.clone());
+        cfg.max_iterations = 5;
+        let rejected = "npm run build | grep error";
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Bash", json!({"command": rejected}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new("Bash", json!({"command": rejected}))],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Verify the current step.",
+            &["package.json".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.final_text, "done");
+        let bash_result = session
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool" && message.name.as_deref() == Some("Bash"))
+            .next_back()
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        assert!(bash_result.contains("outcome: Success"), "{bash_result}");
+        let events = event_values(&events_path);
+        let substitution = events
+            .iter()
+            .find(|event| {
+                event.get("event").and_then(Value::as_str) == Some("verify_command_substituted")
+            })
+            .expect("substitution event");
+        assert_eq!(
+            substitution.get("reason").and_then(Value::as_str),
+            Some("policy_repetition")
+        );
+        assert_eq!(
+            substitution.get("oracle_tier").and_then(Value::as_str),
+            Some("degraded")
+        );
+        assert_eq!(
+            substitution.get("substitute").and_then(Value::as_str),
+            Some("test -f package.json")
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.get("event").and_then(Value::as_str) == Some("step_oracle_tier_degraded")
+            }),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                event.get("event").and_then(Value::as_str) == Some("loop_stop")
+                    && event.get("reason").and_then(Value::as_str)
+                        == Some("recoverable_tool_error_repeated")
+            }),
+            "{events:?}"
+        );
     }
 
     #[test]
