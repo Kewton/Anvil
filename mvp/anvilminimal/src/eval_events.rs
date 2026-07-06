@@ -127,6 +127,7 @@ pub fn is_eval_events_override() -> bool {
 }
 
 pub fn emit(path: Option<&Path>, mut event: Value) {
+    crate::tui::status_bus::publish_eval_projection(&event);
     let Some(path) = path else {
         return;
     };

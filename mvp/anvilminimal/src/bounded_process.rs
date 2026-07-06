@@ -48,8 +48,17 @@ pub fn run_with_timeout_and_cancel<F>(
 where
     F: Fn() -> bool,
 {
-    let child = spawn_child(command)?;
-    wait_with_timeout_and_cancel(child, timeout, is_cancelled)
+    crate::tui::status_bus::publish_command_started(command, timeout);
+    let child = match spawn_child(command) {
+        Ok(child) => child,
+        Err(err) => {
+            crate::tui::status_bus::publish_command_finished();
+            return Err(err);
+        }
+    };
+    let output = wait_with_timeout_and_cancel(child, timeout, is_cancelled);
+    crate::tui::status_bus::publish_command_finished();
+    output
 }
 
 pub fn wait_with_timeout(child: Child, timeout: Duration) -> io::Result<BoundedProcessOutput> {

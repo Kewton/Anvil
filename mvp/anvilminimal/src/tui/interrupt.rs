@@ -222,6 +222,9 @@ fn monitor_loop(flag: Arc<AtomicBool>, state: Arc<(Mutex<MonitorState>, Condvar)
                 Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
                     emit_interrupt_feedback();
                     flag.store(true, Ordering::SeqCst);
+                    crate::tui::status_bus::publish_global(
+                        crate::tui::status_bus::StatusEvent::InterruptRequested,
+                    );
                 }
                 Ok(_) => {}
                 Err(_) => break,

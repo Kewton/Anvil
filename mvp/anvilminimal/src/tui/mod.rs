@@ -6,6 +6,7 @@ pub mod repl;
 pub mod slash;
 pub mod spinner;
 pub mod status;
+pub mod status_bus;
 pub mod terminal;
 
 use std::sync::{Arc, Mutex};

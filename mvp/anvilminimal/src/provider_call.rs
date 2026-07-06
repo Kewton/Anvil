@@ -69,11 +69,13 @@ pub fn chat(
 ) -> ProviderCallOutcome {
     let provider = client.label().to_string();
     let timeout = Duration::from_secs(config.chat_timeout_secs);
+    crate::tui::status_bus::publish_provider_started(scope.as_str(), config.chat_timeout_secs);
     let started = Instant::now();
 
     let Some(mut worker_client) = client.boxed_clone() else {
         let result = client.chat(model, messages, tools, native_tools_enabled);
         let elapsed = started.elapsed();
+        crate::tui::status_bus::publish_provider_finished(elapsed);
         emit_provider_turn_duration(
             config,
             ProviderTurnTelemetry {
@@ -108,6 +110,7 @@ pub fn chat(
     match rx.recv_timeout(timeout) {
         Ok(result) => {
             let elapsed = started.elapsed();
+            crate::tui::status_bus::publish_provider_finished(elapsed);
             emit_provider_turn_duration(
                 config,
                 ProviderTurnTelemetry {
@@ -129,6 +132,7 @@ pub fn chat(
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let elapsed = started.elapsed();
+            crate::tui::status_bus::publish_provider_finished(elapsed);
             emit_provider_turn_duration(
                 config,
                 ProviderTurnTelemetry {
@@ -157,6 +161,7 @@ pub fn chat(
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             let elapsed = started.elapsed();
+            crate::tui::status_bus::publish_provider_finished(elapsed);
             emit_provider_turn_duration(
                 config,
                 ProviderTurnTelemetry {
