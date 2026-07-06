@@ -1043,6 +1043,145 @@ fn tui_runs_lists_recent_runs_without_emitting_command_events() {
 }
 
 #[test]
+fn tui_resume_runs_recovery_plan_remaining_phases_and_records_lineage() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/current/events.jsonl");
+    std::fs::create_dir_all(dir.path().join(".anvil/plans")).unwrap();
+    std::fs::write(dir.path().join("setup.txt"), "done").unwrap();
+    std::fs::write(
+        dir.path()
+            .join(".anvil/plans/recovery-ultra-plan-test.yaml"),
+        r#"
+recovery_schema_version: "1"
+recovery_original_goal: "build app"
+recovery_failure_kind: "interrupted"
+recovery_profile: "generic"
+recovery_expected_completed_artifacts:
+  - "setup.txt"
+goal: "build app"
+profile: "generic"
+style: "recovery"
+intent: "recover"
+phases:
+  - id: "repair-phase"
+    prompt: "repair the remaining implementation"
+  - id: "verify-recovery"
+    prompt: "verify the recovered implementation"
+"#
+        .trim_start(),
+    )
+    .unwrap();
+    let previous_run = dir.path().join(".anvil/runs/018f6666-resumable");
+    std::fs::create_dir_all(&previous_run).unwrap();
+    std::fs::write(
+        previous_run.join("events.jsonl"),
+        format!(
+            "{}\n{}\n",
+            json!({
+                "event": "ultra_partial_artifact_summary",
+                "completed_phase_ids": ["scaffold"],
+                "failed_phase_id": "repair-phase",
+                "pending_phase_ids": ["verify"],
+                "recovery_ultra_plan_path": ".anvil/plans/recovery-ultra-plan-test.yaml"
+            }),
+            json!({
+                "event": "tui_command_stop",
+                "ok": false,
+                "status": "interrupted",
+                "assurance_level": "partial",
+                "failure_kind": "tui_command_interrupted",
+                "effective_profile": "generic",
+                "requested_port": "",
+                "recovery_ultra_plan_path": ".anvil/plans/recovery-ultra-plan-test.yaml"
+            })
+        ),
+    )
+    .unwrap();
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    let step_json = implement_step_plan_json();
+    let mut planner = FakeClient::new(
+        "planner",
+        vec![
+            AssistantReply::text(step_json.clone()),
+            AssistantReply::text(step_json),
+        ],
+    );
+    let mut execution = FakeClient::new(
+        "exec",
+        vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"app.jsx","content":interactive_app_source("repaired")}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"app.jsx","content":interactive_app_source("verified")}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ],
+    );
+    let ui = FakeUi::default();
+
+    let output = anvilminimal::tui::slash::handle_command(
+        "/resume 018f6666",
+        &cfg,
+        &mut planner,
+        &mut execution,
+        &ui,
+    )
+    .unwrap();
+
+    assert!(output.contains("### Resume recovery run"), "{output}");
+    assert!(
+        output.contains("completed phases skipped: scaffold"),
+        "{output}"
+    );
+    assert!(
+        output.contains("phases to run: repair-phase, verify-recovery"),
+        "{output}"
+    );
+    assert!(
+        output.contains("ultra-plan-run complete: 2 phases"),
+        "{output}"
+    );
+    assert_eq!(planner.requests.len(), 2);
+    assert_eq!(execution.requests.len(), 2);
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    assert!(events.contains("\"event\":\"resume_start\""), "{events}");
+    assert!(events.contains("\"resumed_from\":\"018f6666\""), "{events}");
+    let phase_starts = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event.get("event").and_then(|value| value.as_str()) == Some("ultra_phase_start")
+        })
+        .map(|event| {
+            event
+                .get("phase_id")
+                .and_then(|value| value.as_str())
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(phase_starts, vec!["repair-phase", "verify-recovery"]);
+    let stop = tui_command_stop_events(&events).pop().unwrap();
+    assert_eq!(
+        stop.get("resumed_from").and_then(|value| value.as_str()),
+        Some("018f6666")
+    );
+}
+
+#[test]
 fn tui_slash_failure_records_run_events_and_failure_stage() {
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");

@@ -213,7 +213,7 @@ pub fn save_recovery_ultra_plan(
     handoff: &RecoveryHandoff,
 ) -> anyhow::Result<std::path::PathBuf> {
     let plan = build_recovery_ultra_plan(handoff);
-    let rendered = render_ultra_plan(&plan);
+    let rendered = render_recovery_ultra_plan(handoff, &plan);
     let parsed = parse_ultra_plan(&rendered)?;
     if parsed != plan {
         anyhow::bail!("recovery UltraPlan failed render/parse roundtrip");
@@ -226,6 +226,35 @@ pub fn save_recovery_ultra_plan(
     ));
     std::fs::write(&path, rendered)?;
     Ok(path)
+}
+
+fn render_recovery_ultra_plan(handoff: &RecoveryHandoff, plan: &UltraPlan) -> String {
+    let mut out = String::new();
+    out.push_str("# anvil-recovery-ultra-plan\n");
+    out.push_str("recovery_schema_version: \"1\"\n");
+    out.push_str(&format!(
+        "recovery_original_goal: {:?}\n",
+        handoff.original_goal
+    ));
+    out.push_str(&format!(
+        "recovery_failure_kind: {:?}\n",
+        handoff.failure_kind
+    ));
+    out.push_str(&format!("recovery_profile: {:?}\n", handoff.profile));
+    if let Some(failed_phase) = &handoff.failed_phase {
+        out.push_str(&format!("recovery_failed_phase: {:?}\n", failed_phase));
+    }
+    if let Some(failed_step) = &handoff.failed_step {
+        out.push_str(&format!("recovery_failed_step: {:?}\n", failed_step));
+    }
+    if !handoff.changed_paths.is_empty() {
+        out.push_str("recovery_expected_completed_artifacts:\n");
+        for path in &handoff.changed_paths {
+            out.push_str(&format!("  - {:?}\n", path));
+        }
+    }
+    out.push_str(&render_ultra_plan(plan));
+    out
 }
 
 pub fn suggested_ultra_recovery_command(path: &Path, profile: &str) -> String {
@@ -595,7 +624,7 @@ mod tests {
             missing_paths: vec!["src/app/page.tsx".to_string()],
             missing_capabilities: vec!["interactive_ui".to_string()],
             verify_commands: vec!["npm run build".to_string()],
-            changed_paths: Vec::new(),
+            changed_paths: vec!["src/app/page.tsx".to_string()],
             repair_targets: vec!["phase_scaffold".to_string()],
         };
         let path = save_recovery_ultra_plan(dir.path(), "phase-web-audio", &handoff).unwrap();
@@ -607,6 +636,10 @@ mod tests {
                 .starts_with("recovery-ultra-plan-phase-web-audio-")
         );
         let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# anvil-recovery-ultra-plan"));
+        assert!(text.contains("recovery_schema_version"));
+        assert!(text.contains("recovery_failure_kind: \"phase_scaffold_error\""));
+        assert!(text.contains("recovery_expected_completed_artifacts"));
         assert!(text.contains("Build an interactive web game"));
         assert!(text.contains("web-audio-synth-and-ui"));
         assert!(text.contains("interactive_ui"));

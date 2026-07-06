@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::io::{self, IsTerminal, Write};
 use std::panic::{AssertUnwindSafe, PanicHookInfo};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -290,6 +291,22 @@ pub fn handle_command(
                 &config,
                 ui,
             ),
+            "/resume" => {
+                let resume = crate::runs::prepare_resume(&config.workspace_root, &parsed.goal)?;
+                if let Some(error) = resume.workspace_drift_error() {
+                    bail!("{error}");
+                }
+                confirm_resume(&config, &resume)?;
+                crate::runs::emit_resume_start(&config, &resume);
+                let output = crate::planner::run_ultra_plan_with_ui(
+                    planner,
+                    execution,
+                    &resume.plan,
+                    &config,
+                    ui,
+                )?;
+                Ok(format!("{}\n\n{}", resume.confirmation_card(), output))
+            }
             "/setup-interaction-probe" => {
                 let report =
                 crate::minimal_loop::interaction_probe::setup_interaction_probe_with_stdout_progress()?;
@@ -344,6 +361,27 @@ pub fn handle_command(
             card
         )
     })
+}
+
+fn confirm_resume(config: &Config, resume: &crate::runs::ResumePlan) -> anyhow::Result<()> {
+    let card = resume.confirmation_card();
+    if config.yes {
+        eprintln!("{card}");
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        bail!("{card}\n\nconfirmation required; rerun with --yes");
+    }
+    eprintln!("{card}");
+    eprint!("Resume recovery plan? [y/N] ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes") {
+        Ok(())
+    } else {
+        bail!("resume cancelled by user")
+    }
 }
 
 fn emit_panic_caught(config: &Config, command: &str, diagnostic: &PanicDiagnostic) {
@@ -411,6 +449,7 @@ fn emit_tui_command_stop_with_status(
             "build_timestamp": crate::build_info::TIMESTAMP,
             "failure_kind": failure_kind,
             "stop_reason": stop_reason,
+            "resumed_from": crate::runs::latest_resumed_from(config.eval_events_path.as_deref()).unwrap_or_default(),
             "completion_status": &completion.status,
             "task_status": &event_projection.task_status,
             "profile": &completion.profile,
