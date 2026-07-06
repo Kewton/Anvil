@@ -1,7 +1,8 @@
 use std::io::{self, IsTerminal, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 
@@ -187,11 +188,15 @@ impl PortControl for SystemPortControl {
 
 fn lsof_owner(port: u16) -> Option<PortOwner> {
     let port_spec = format!("-iTCP:{port}");
-    let output = Command::new("lsof")
+    let mut command = Command::new("lsof");
+    command
         .args(["-nP", &port_spec, "-sTCP:LISTEN", "-F", "pc"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output =
+        crate::bounded_process::run_with_timeout(&mut command, Duration::from_secs(2)).ok()?;
+    if !output.success() {
         return None;
     }
     parse_lsof_owner(&String::from_utf8(output.stdout).ok()?)
