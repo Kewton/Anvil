@@ -203,6 +203,9 @@ pub fn handle_command(
     ui: &dyn crate::tui::InteractionUi,
 ) -> anyhow::Result<String> {
     let parsed = parse_slash(line, config)?;
+    if parsed.command == "/runs" {
+        return Ok(crate::runs::render_runs_table(&config.workspace_root));
+    }
     let mut config = config.clone();
     config.profile = parsed.profile;
     config.profile_explicit = parsed.profile_explicit;

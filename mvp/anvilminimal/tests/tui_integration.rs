@@ -993,6 +993,56 @@ fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
 }
 
 #[test]
+fn tui_runs_lists_recent_runs_without_emitting_command_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/current/events.jsonl");
+    let previous_run = dir.path().join(".anvil/runs/018f2222-bbbb");
+    std::fs::create_dir_all(&previous_run).unwrap();
+    std::fs::write(
+        previous_run.join("events.jsonl"),
+        serde_json::json!({
+            "event": "tui_command_stop",
+            "ok": false,
+            "status": "failed",
+            "task_status": "failed",
+            "assurance_level": "full",
+            "runtime_acceptance_status": "pass",
+            "final_acceptance_status": "failed",
+            "release_gate_status": "failed",
+            "stop_reason": "failed because recovery is available",
+            "recovery_ultra_plan_path": ".anvil/plans/recovery-ultra-plan-test.yaml"
+        })
+        .to_string()
+            + "\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join(".anvil/plans")).unwrap();
+    std::fs::write(
+        dir.path()
+            .join(".anvil/plans/recovery-ultra-plan-test.yaml"),
+        "goal: \"g\"\nphases:\n  - id: \"p\"\n    prompt: \"p\"\n",
+    )
+    .unwrap();
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    let mut planner = FakeClient::new("planner", Vec::new());
+    let mut execution = FakeClient::new("exec", Vec::new());
+    let ui = FakeUi::default();
+
+    let output =
+        anvilminimal::tui::slash::handle_command("/runs", &cfg, &mut planner, &mut execution, &ui)
+            .unwrap();
+
+    assert!(output.contains("018f2222"), "{output}");
+    assert!(output.contains("failed/partial"), "{output}");
+    assert!(output.contains("yaml"), "{output}");
+    assert!(
+        !events_path.exists(),
+        "/runs should not emit command events"
+    );
+}
+
+#[test]
 fn tui_slash_failure_records_run_events_and_failure_stage() {
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");

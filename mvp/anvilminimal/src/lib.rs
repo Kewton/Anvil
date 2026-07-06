@@ -11,6 +11,7 @@ pub mod planner;
 pub mod provider_call;
 pub mod providers;
 pub mod repl;
+pub mod runs;
 pub mod state;
 pub mod tools;
 pub mod tui;
@@ -31,6 +32,10 @@ use tui::markdown::{PlainRenderer, TerminalMarkdownRenderer};
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     let config = Config::from_cli(cli)?;
+    if matches!(config.action, Action::Runs) {
+        println!("{}", runs::render_runs_table(&config.workspace_root));
+        return Ok(());
+    }
     emit_run_start(&config);
     let direct_command_guard = DirectCommandCompletionGuard::start(&config);
     let result = (|| -> anyhow::Result<()> {
@@ -155,6 +160,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 }
                 Ok(())
             }
+            Action::Runs => Ok(()),
         }
     })();
     if let Some(guard) = direct_command_guard.as_ref() {
@@ -303,7 +309,7 @@ impl Drop for DirectCommandCompletionGuard {
 
 fn direct_command_for_action(action: &Action) -> Option<&'static str> {
     match action {
-        Action::Repl => None,
+        Action::Repl | Action::Runs => None,
         Action::Prompt(_) => Some("--prompt"),
         Action::PlanSteps(_) => Some("--plan-steps"),
         Action::PlanRun(_) => Some("--plan-run"),

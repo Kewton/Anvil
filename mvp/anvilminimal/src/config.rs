@@ -39,6 +39,7 @@ pub enum Action {
     UltraPlanRun(String),
     RunUltraPlan(PathBuf),
     SetupInteractionProbe,
+    Runs,
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +165,8 @@ pub fn action_goal(action: &Action) -> Option<&str> {
         Action::Repl
         | Action::RunPlan(_)
         | Action::RunUltraPlan(_)
-        | Action::SetupInteractionProbe => None,
+        | Action::SetupInteractionProbe
+        | Action::Runs => None,
     }
 }
 
@@ -178,6 +180,7 @@ fn action_from_cli(cli: &Cli) -> anyhow::Result<Action> {
     count += cli.ultra_plan_run as usize;
     count += cli.run_ultra_plan.is_some() as usize;
     count += cli.setup_interaction_probe as usize;
+    count += cli.runs as usize;
     if count > 1 {
         bail!("only one action selector can be used at a time");
     }
@@ -208,6 +211,9 @@ fn action_from_cli(cli: &Cli) -> anyhow::Result<Action> {
     }
     if cli.setup_interaction_probe {
         return Ok(Action::SetupInteractionProbe);
+    }
+    if cli.runs {
+        return Ok(Action::Runs);
     }
     Ok(Action::Repl)
 }
@@ -295,6 +301,21 @@ mod tests {
         let cli = Cli::parse_from(["anvilminimal", "--provider", "ollama", "--model", "m"]);
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.planner_model, "m");
+    }
+
+    #[test]
+    fn runs_action_is_read_only_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            dir.path().to_str().unwrap(),
+            "--runs",
+        ]);
+        let config = Config::from_cli(cli).unwrap();
+
+        assert!(matches!(config.action, Action::Runs));
+        assert!(action_goal(&config.action).is_none());
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub struct Cli {
     pub run_ultra_plan: Option<PathBuf>,
     #[arg(long, action = ArgAction::SetTrue)]
     pub setup_interaction_probe: bool,
+    #[arg(long, action = ArgAction::SetTrue, help = "List recent runs for the current workspace")]
+    pub runs: bool,
     #[arg(long)]
     pub profile: Option<String>,
     #[arg(long, default_value = "default")]
@@ -97,6 +99,12 @@ mod tests {
     fn help_includes_no_footer() {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--no-footer"));
+    }
+
+    #[test]
+    fn help_includes_runs() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--runs"));
     }
 
     #[test]
