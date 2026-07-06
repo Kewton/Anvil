@@ -1062,6 +1062,10 @@ fn tui_help_lists_recovery_commands_without_emitting_events() {
         output.contains("/resume [run-id|yaml-path] - resume from a recovery UltraPlan"),
         "{output}"
     );
+    assert!(
+        output.contains("/plan - show the active plan and current activity"),
+        "{output}"
+    );
     assert!(output.contains("/exit or /quit"), "{output}");
     assert!(
         !events_path.exists(),
@@ -1206,6 +1210,17 @@ phases:
     assert_eq!(
         stop.get("resumed_from").and_then(|value| value.as_str()),
         Some("018f6666")
+    );
+
+    let plan_output =
+        anvilminimal::tui::slash::handle_command("/plan", &cfg, &mut planner, &mut execution, &ui)
+            .unwrap();
+    assert!(plan_output.contains("### Plan"), "{plan_output}");
+    assert!(plan_output.contains("repair-phase"), "{plan_output}");
+    assert!(plan_output.contains("verify-recovery"), "{plan_output}");
+    assert!(
+        plan_output.contains("Current activity: ✓ Write ok"),
+        "{plan_output}"
     );
 }
 

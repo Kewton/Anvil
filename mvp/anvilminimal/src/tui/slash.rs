@@ -207,6 +207,9 @@ pub fn handle_command(
     if parsed.command == "/help" {
         return Ok(render_help());
     }
+    if parsed.command == "/plan" {
+        return Ok(crate::tui::presentation::render_current_plan());
+    }
     if parsed.command == "/runs" {
         return Ok(crate::runs::render_runs_table(&config.workspace_root));
     }
@@ -385,6 +388,7 @@ fn render_help() -> String {
         "/help - show this command list",
         "/runs - list recent runs and recovery availability",
         "/resume [run-id|yaml-path] - resume from a recovery UltraPlan",
+        "/plan - show the active plan and current activity",
         "/plan-steps <goal> - write a step plan",
         "/plan-run <goal> - generate and run a step plan",
         "/run-plan <path> - run an existing step plan",
