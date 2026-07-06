@@ -39,6 +39,17 @@ Ollama host, run scenarios serially and avoid concurrent planner/executor UAT
 loads; timeout telemetry records whether the local default or an override was
 used.
 
+Local-tier expectation setting: the final local compatibility measurement
+`test0704-999-Q1-62646566676869707172_001` used a co-resident
+`qwen3.6:27b-coding-nvfp4` planner and `ornith:35b` executor on the local
+Ollama host. It reached 8/8 honest terminal states and 2/8 full passes: CLI
+1/2, web 1/6, with CONTENT b as the complete web full pass including browser
+readiness, interaction evidence, persistence, release-gate pass, and full
+earned assurance. Treat this pair as moderately viable for CLI and below the
+recommended tier for reliable web delivery. For release-quality web UAT, keep
+using the recommended `gemini-3.5-flash`-class tier unless the goal is a local
+compatibility measurement.
+
 ## Preflight Runbook
 
 1. Version check: `anvilminimal --version` must exactly match the intended

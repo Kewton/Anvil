@@ -229,6 +229,9 @@ Optional backlog after Q1:
 
 | optional track | trigger |
 |---|---|
+| `tsconfig` paths alias deterministic invariant repair | Start on recurrence of a route-bound `@/*` import gap or `tsconfig baseUrl/paths missing @/* alias` terminal reason, using [local-q1-final-tool-b-tsconfig-alias-gap](../tests/corpus/apps/local-q1-final-tool-b-tsconfig-alias-gap/expectations.toml) as the fixture. |
+| Dangerous-command rejection feedback categories | Start after recurrence analysis shows repeated local-model failures at the same policy category instead of isolated blocked-command attempts. |
+| CONTENT a dependency lifecycle variance | Start on recurrence of dependency setup lifecycle failure; first check offline/network/package-registry state before treating it as an Anvil behavior defect. |
 | Second web profile / web-family layer | Start when a non-Next.js web stack needs first-class promotion, shared web obligations, or release-gate parity. Until then, unknown manifests remain generic/static by design. |
 | Linux run | Start before claiming Linux host parity, adding Linux-specific release support, or treating Darwin UAT results as portable. |
 | English-goal run | Start before claiming English prompt-distribution parity or using English-goal quality as release/marketing evidence. |
