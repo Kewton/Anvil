@@ -364,6 +364,7 @@ fn render_loop(
     env: FooterEnv,
 ) {
     let mut generation = 0;
+    let mut last_rendered: Option<Vec<String>> = None;
     loop {
         if state.stop.load(Ordering::SeqCst) {
             break;
@@ -377,25 +378,45 @@ fn render_loop(
             generation = runtime.generation;
             let lines =
                 build_live_footer_lines(&status, &runtime, status_bus::now(), cols, env.use_color);
-            let mut stdout = io::stdout().lock();
-            let _ = stdout.write_all(ansi::save_cursor().as_bytes());
-            let first_footer_row = rows.saturating_sub(footer_rows).saturating_add(1);
-            for index in 0..footer_rows {
-                let row = first_footer_row + index;
-                let _ = stdout.write_all(ansi::move_to(row, 1).as_bytes());
-                let _ = stdout.write_all(ansi::clear_line().as_bytes());
-                if let Some(line) = lines.get(index as usize) {
-                    let _ = stdout.write_all(line.as_bytes());
-                }
+            if footer_lines_changed(&mut last_rendered, &lines) {
+                let frame = render_footer_frame_sequence(&lines, cols, rows, footer_rows);
+                let mut stdout = io::stdout().lock();
+                let _ = stdout.write_all(frame.as_bytes());
+                let _ = stdout.flush();
             }
-            let _ = stdout.write_all(ansi::restore_cursor().as_bytes());
-            let _ = stdout.flush();
         }
         let _ = subscriber.wait_for_change(generation, TICK);
         if let Ok(guard) = state.wake.0.lock() {
             let _ = state.wake.1.wait_timeout(guard, Duration::from_millis(1));
         }
     }
+}
+
+fn footer_lines_changed(last_rendered: &mut Option<Vec<String>>, lines: &[String]) -> bool {
+    if last_rendered.as_deref() == Some(lines) {
+        return false;
+    }
+    *last_rendered = Some(lines.to_vec());
+    true
+}
+
+fn render_footer_frame_sequence(
+    lines: &[String],
+    cols: u16,
+    rows: u16,
+    footer_rows: u16,
+) -> String {
+    let mut out = String::new();
+    out.push_str(ansi::save_cursor());
+    let first_footer_row = rows.saturating_sub(footer_rows).saturating_add(1);
+    for index in 0..footer_rows {
+        let row = first_footer_row + index;
+        out.push_str(&ansi::move_to(row, 1));
+        let line = lines.get(index as usize).map(String::as_str).unwrap_or("");
+        out.push_str(&pad_to_width(line, cols));
+    }
+    out.push_str(ansi::restore_cursor());
+    out
 }
 
 fn footer_rows_for_cols(cols: u16) -> u16 {
@@ -448,6 +469,33 @@ pub fn fit_to_width(value: &str, cols: u16) -> String {
 
 fn display_width(value: &str) -> usize {
     value.chars().map(char_display_width).sum()
+}
+
+fn pad_to_width(value: &str, cols: u16) -> String {
+    let width = display_width_ansi(value);
+    let mut out = value.to_string();
+    if width < cols as usize {
+        out.push_str(&" ".repeat(cols as usize - width));
+    }
+    out
+}
+
+fn display_width_ansi(value: &str) -> usize {
+    let mut width = 0usize;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += char_display_width(ch);
+    }
+    width
 }
 
 fn char_display_width(ch: char) -> usize {
@@ -666,5 +714,67 @@ mod tests {
             assert!(fitted.is_char_boundary(fitted.len()));
             assert!(display_width(&fitted) <= cols as usize || cols <= 3);
         }
+    }
+
+    #[test]
+    fn footer_skips_render_until_composed_line_changes() {
+        let runtime = RuntimeStatus {
+            provider: Some(status_bus::ProviderTurnStatus {
+                scope: "planner_step".to_string(),
+                deadline_secs: 600,
+                started_at: StatusTime::ZERO,
+            }),
+            ..RuntimeStatus::default()
+        };
+        let mut last = None;
+        let first = build_live_footer_lines(
+            &status(None),
+            &runtime,
+            StatusTime::from_millis(0),
+            120,
+            false,
+        );
+        let same = build_live_footer_lines(
+            &status(None),
+            &runtime,
+            StatusTime::from_millis(250),
+            120,
+            false,
+        );
+        let next_second = build_live_footer_lines(
+            &status(None),
+            &runtime,
+            StatusTime::from_millis(1_000),
+            120,
+            false,
+        );
+
+        assert!(footer_lines_changed(&mut last, &first));
+        assert!(!footer_lines_changed(&mut last, &same));
+        assert!(footer_lines_changed(&mut last, &next_second));
+    }
+
+    #[test]
+    fn footer_frame_overwrites_without_clear_line_between_frames() {
+        let frame = render_footer_frame_sequence(&["short".to_string()], 12, 24, 1);
+
+        assert!(!frame.contains(ansi::clear_line()), "{frame:?}");
+        assert!(frame.contains("\x1b[24;1Hshort       "), "{frame:?}");
+    }
+
+    #[test]
+    fn footer_frame_pads_empty_rows_to_clear_stale_tails() {
+        let frame = render_footer_frame_sequence(&["p1".to_string()], 10, 24, 2);
+
+        assert!(frame.contains("\x1b[23;1Hp1        "), "{frame:?}");
+        assert!(frame.contains("\x1b[24;1H          "), "{frame:?}");
+    }
+
+    #[test]
+    fn footer_padding_ignores_sgr_width() {
+        let padded = pad_to_width("\x1b[2mabc\x1b[0m", 5);
+
+        assert_eq!(display_width_ansi(&padded), 5);
+        assert!(padded.ends_with("  "));
     }
 }
