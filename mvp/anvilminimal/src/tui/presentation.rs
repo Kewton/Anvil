@@ -559,7 +559,7 @@ fn phase_mark(id: &str, progress: &PlanProgress) -> &'static str {
 }
 
 fn status_port(config: &Config) -> String {
-    if crate::planner::profile::canonical_profile_name(&config.profile) != "nextjs" {
+    if !crate::planner::profile::is_nextjs_profile(&config.profile) {
         return "not applicable".to_string();
     }
     let goal = crate::config::action_goal(&config.action).unwrap_or("");

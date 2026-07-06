@@ -786,6 +786,10 @@ pub fn canonical_profile_name(profile: &str) -> String {
     }
 }
 
+pub fn is_nextjs_profile(profile: &str) -> bool {
+    NEXTJS_PROFILE.matches(profile)
+}
+
 pub fn verify_profile(root: &Path, profile: &str, goal: &str) -> VerificationReport {
     verify_profile_final(root, profile, goal)
 }

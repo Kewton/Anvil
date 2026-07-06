@@ -76,7 +76,7 @@ fn run_for_goal_with(
     ports: &dyn PortControl,
     probes: &dyn ProbeCheck,
 ) -> anyhow::Result<()> {
-    if crate::planner::profile::canonical_profile_name(&config.profile) != "nextjs" {
+    if !crate::planner::profile::is_nextjs_profile(&config.profile) {
         return Ok(());
     }
     let port = crate::planner::profiles::nextjs::requested_or_default_port(goal);
