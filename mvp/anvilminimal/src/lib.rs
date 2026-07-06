@@ -32,88 +32,92 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     let config = Config::from_cli(cli)?;
     emit_run_start(&config);
     let direct_command_guard = DirectCommandCompletionGuard::start(&config);
-    let result = match config.action.clone() {
-        Action::Repl => repl::run_repl(config.clone()),
-        Action::Prompt(prompt) => {
-            let mut client = providers::client_from_config(&config, false)?;
-            let resume = if config.fresh_session {
-                None
-            } else {
-                config.resume.as_deref()
-            };
-            let mut session =
-                state::SessionStore::new(config.state_dir.clone()).load_or_create(resume)?;
-            let reply = minimal_loop::run_session(&mut *client, &mut session, &prompt, &config)?;
-            state::SessionStore::new(config.state_dir.clone()).save(&session)?;
-            PlainRenderer.render_assistant(&reply)?;
-            Ok(())
-        }
-        Action::PlanSteps(goal) => {
-            let mut planner = providers::client_from_config(&config, true)?;
-            let plan = planner::generate_step_plan(&mut *planner, &goal, &config)
-                .context("failed to generate step plan")?;
-            let path = planner::save_step_plan(&config.workspace_root, &plan)?;
-            println!("{}", path.display());
-            Ok(())
-        }
-        Action::PlanRun(goal) => {
-            let mut execution = providers::client_from_config(&config, false)?;
-            let mut planner_client = providers::client_from_config(&config, true)?;
-            let report = planner::generate_and_run_step_plan(
-                &mut *planner_client,
-                &mut *execution,
-                &goal,
-                &config,
-            )?;
-            println!("{report}");
-            Ok(())
-        }
-        Action::RunPlan(path) => {
-            let mut execution = providers::client_from_config(&config, false)?;
-            let report = planner::run_plan_file(&mut *execution, &path, &config)?;
-            println!("{report}");
-            Ok(())
-        }
-        Action::UltraPlan(goal) => {
-            let mut planner_client = providers::client_from_config(&config, true)?;
-            let plan = planner::generate_ultra_plan(&mut *planner_client, &goal, &config)?;
-            let path = planner::save_ultra_plan(&config.workspace_root, &plan)?;
-            println!("{}", path.display());
-            Ok(())
-        }
-        Action::UltraPlanRun(goal) => {
-            let mut execution = providers::client_from_config(&config, false)?;
-            let mut planner_client = providers::client_from_config(&config, true)?;
-            let report = planner::generate_and_run_ultra_plan(
-                &mut *planner_client,
-                &mut *execution,
-                &goal,
-                &config,
-            )?;
-            println!("{report}");
-            Ok(())
-        }
-        Action::RunUltraPlan(path) => {
-            let mut execution = providers::client_from_config(&config, false)?;
-            let mut planner_client = providers::client_from_config(&config, true)?;
-            let report = planner::run_ultra_plan_file(
-                &mut *planner_client,
-                &mut *execution,
-                &path,
-                &config,
-            )?;
-            println!("{report}");
-            Ok(())
-        }
-        Action::SetupInteractionProbe => {
-            let report =
-                minimal_loop::interaction_probe::setup_interaction_probe_with_stdout_progress()?;
-            for line in report.summary_lines() {
-                println!("{line}");
+    let result = (|| -> anyhow::Result<()> {
+        match config.action.clone() {
+            Action::Repl => repl::run_repl(config.clone()),
+            Action::Prompt(prompt) => {
+                let mut client = providers::client_from_config(&config, false)?;
+                let resume = if config.fresh_session {
+                    None
+                } else {
+                    config.resume.as_deref()
+                };
+                let mut session =
+                    state::SessionStore::new(config.state_dir.clone()).load_or_create(resume)?;
+                let reply =
+                    minimal_loop::run_session(&mut *client, &mut session, &prompt, &config)?;
+                state::SessionStore::new(config.state_dir.clone()).save(&session)?;
+                PlainRenderer.render_assistant(&reply)?;
+                Ok(())
             }
-            Ok(())
+            Action::PlanSteps(goal) => {
+                let mut planner = providers::client_from_config(&config, true)?;
+                let plan = planner::generate_step_plan(&mut *planner, &goal, &config)
+                    .context("failed to generate step plan")?;
+                let path = planner::save_step_plan(&config.workspace_root, &plan)?;
+                println!("{}", path.display());
+                Ok(())
+            }
+            Action::PlanRun(goal) => {
+                let mut execution = providers::client_from_config(&config, false)?;
+                let mut planner_client = providers::client_from_config(&config, true)?;
+                let report = planner::generate_and_run_step_plan(
+                    &mut *planner_client,
+                    &mut *execution,
+                    &goal,
+                    &config,
+                )?;
+                println!("{report}");
+                Ok(())
+            }
+            Action::RunPlan(path) => {
+                let mut execution = providers::client_from_config(&config, false)?;
+                let report = planner::run_plan_file(&mut *execution, &path, &config)?;
+                println!("{report}");
+                Ok(())
+            }
+            Action::UltraPlan(goal) => {
+                let mut planner_client = providers::client_from_config(&config, true)?;
+                let plan = planner::generate_ultra_plan(&mut *planner_client, &goal, &config)?;
+                let path = planner::save_ultra_plan(&config.workspace_root, &plan)?;
+                println!("{}", path.display());
+                Ok(())
+            }
+            Action::UltraPlanRun(goal) => {
+                let mut execution = providers::client_from_config(&config, false)?;
+                let mut planner_client = providers::client_from_config(&config, true)?;
+                let report = planner::generate_and_run_ultra_plan(
+                    &mut *planner_client,
+                    &mut *execution,
+                    &goal,
+                    &config,
+                )?;
+                println!("{report}");
+                Ok(())
+            }
+            Action::RunUltraPlan(path) => {
+                let mut execution = providers::client_from_config(&config, false)?;
+                let mut planner_client = providers::client_from_config(&config, true)?;
+                let report = planner::run_ultra_plan_file(
+                    &mut *planner_client,
+                    &mut *execution,
+                    &path,
+                    &config,
+                )?;
+                println!("{report}");
+                Ok(())
+            }
+            Action::SetupInteractionProbe => {
+                let report =
+                    minimal_loop::interaction_probe::setup_interaction_probe_with_stdout_progress(
+                    )?;
+                for line in report.summary_lines() {
+                    println!("{line}");
+                }
+                Ok(())
+            }
         }
-    };
+    })();
     if let Some(guard) = direct_command_guard.as_ref() {
         guard.finalize(&result);
     }
@@ -563,6 +567,7 @@ mod tests {
 
     use super::*;
     use crate::config::{Action, Provider};
+    use clap::Parser;
     use serde_json::json;
 
     fn config(root: PathBuf) -> Config {
@@ -679,6 +684,51 @@ mod tests {
         assert!(summary.contains("Status: interrupted"), "{summary}");
         assert!(summary.contains("Command status: interrupted"), "{summary}");
         assert!(!summary.contains("Status: running"), "{summary}");
+    }
+
+    #[test]
+    fn direct_cli_error_finalizes_before_run_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let cli = Cli::parse_from([
+            "anvilminimal".to_string(),
+            "--cwd".to_string(),
+            dir.path().display().to_string(),
+            "--state-dir".to_string(),
+            state_dir.display().to_string(),
+            "--run-plan".to_string(),
+            "missing-plan.yaml".to_string(),
+            "--model".to_string(),
+            "m".to_string(),
+            "--yes".to_string(),
+        ]);
+
+        let err = run(cli).expect_err("missing run plan should fail");
+
+        assert!(
+            err.to_string().contains("missing-plan.yaml")
+                || err.to_string().contains("No such file")
+                || err.to_string().contains("failed to"),
+            "{err:?}"
+        );
+        let runs_dir = dir.path().join(".anvil/runs");
+        let events_path = std::fs::read_dir(&runs_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path().join("events.jsonl"))
+            .find(|path| path.is_file())
+            .expect("events path");
+        let event_text = std::fs::read_to_string(events_path).unwrap();
+        assert!(
+            !event_text.contains("direct CLI command exited before completion finalizer"),
+            "{event_text}"
+        );
+        let command_stop = event_text.find("\"event\":\"tui_command_stop\"").unwrap();
+        let run_stop = event_text.find("\"event\":\"run_stop\"").unwrap();
+        assert!(command_stop < run_stop, "{event_text}");
+        assert!(event_text.contains("\"command\":\"--run-plan\""));
+        assert!(event_text.contains("\"status\":\"failed\""));
+        assert!(event_text.contains("\"failure_kind\":\"direct_cli_command_failed\""));
     }
 
     #[test]

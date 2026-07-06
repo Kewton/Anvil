@@ -223,6 +223,26 @@ fn conformance_negative_earned_assurance_catches_disconnected_gate() {
 }
 
 #[test]
+fn conformance_negative_earned_assurance_catches_failed_python_probe_pass_fields() {
+    let trace = Trace {
+        scenario: MatrixScenario::PythonCli,
+        events: vec![json!({
+            "event": "ultra_final_acceptance",
+            "assurance_level": "full",
+            "runtime_acceptance_status": "pass",
+            "final_acceptance_status": "full_success",
+            "release_gate_status": "pass",
+            "profile_behavior_probe_status": "failed",
+            "profile_behavior_probe_reasons": ["python_cli_behavior_probe_failed:stdout_not_changed_by_input"]
+        })],
+        summary: terminal_summary("completed"),
+        output: String::new(),
+    };
+
+    assert_contract_fails("earned_assurance", check_earned_assurance(&trace));
+}
+
+#[test]
 fn conformance_negative_bounded_provider_turns_catches_silent_phase_context_window() {
     let trace = Trace {
         scenario: MatrixScenario::GenericStatic,
@@ -407,10 +427,28 @@ fn assert_contract_fails(name: &str, result: Result<(), String>) {
 
 fn check_earned_assurance(trace: &Trace) -> Result<(), String> {
     for event in completion_events(trace) {
+        let event_name = string_field(event, "event").unwrap_or("<unknown>");
+        if string_field(event, "profile_behavior_probe_status") == Some("failed") {
+            for key in [
+                "runtime_acceptance_status",
+                "final_acceptance_status",
+                "release_gate_status",
+                "assurance_level",
+            ] {
+                if matches!(
+                    string_field(event, key),
+                    Some("pass" | "full_success" | "full")
+                ) {
+                    return Err(format!(
+                        "earned_assurance: {event_name} reported {key}={} despite failed profile behavior probe",
+                        string_field(event, key).unwrap_or("")
+                    ));
+                }
+            }
+        }
         if string_field(event, "assurance_level") != Some("full") {
             continue;
         }
-        let event_name = string_field(event, "event").unwrap_or("<unknown>");
         if let Some(status) = string_field(event, "final_acceptance_status")
             && !matches!(status, "full_success" | "pass")
         {

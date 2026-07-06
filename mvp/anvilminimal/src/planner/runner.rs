@@ -5621,8 +5621,15 @@ fn ultra_final_acceptance_report_inner(
         &profile_report,
     );
     let profile_behavior_failed = profile_behavior_probe.status == "failed";
+    if profile_behavior_failed {
+        mark_release_gate_profile_behavior_failed(&mut release_gate, &profile_behavior_probe);
+    }
     let final_acceptance_status = release_gate_final_acceptance_status(&release_gate);
-    let runtime_acceptance_status = runtime_acceptance_status(acceptance.passed, Some(&acceptance));
+    let runtime_acceptance_status = if profile_behavior_failed {
+        "failed"
+    } else {
+        runtime_acceptance_status(acceptance.passed, Some(&acceptance))
+    };
     let (assurance_level, assurance_reason) = earned_assurance_for_completion(
         &effective_profile,
         &required_capabilities,
@@ -5736,7 +5743,7 @@ fn ultra_final_acceptance_report_inner(
             "required_capabilities": required_capabilities.clone(),
             "required_evidence": required_evidence.clone(),
             "required_obligations": required_obligations.clone(),
-            "runtime_acceptance_passed": acceptance.passed,
+            "runtime_acceptance_passed": acceptance.passed && !profile_behavior_failed,
             "runtime_acceptance_status": runtime_acceptance_status,
             "runtime_acceptance_inconclusive": acceptance.inconclusive,
             "compile_errors": compile_errors.clone(),
@@ -6672,6 +6679,28 @@ fn acceptance_gates_disconnected_reason(
     }
     (!disconnected.is_empty())
         .then(|| format!("acceptance_gates_disconnected:{}", disconnected.join(",")))
+}
+
+fn mark_release_gate_profile_behavior_failed(
+    release_gate: &mut ReleaseGateSummary,
+    profile_behavior_probe: &ProfileBehaviorProbeReport,
+) {
+    let mut reasons = release_gate.reasons.clone();
+    if profile_behavior_probe.reasons.is_empty() {
+        reasons.push("profile_behavior_probe_failed".to_string());
+    } else {
+        reasons.extend(
+            profile_behavior_probe
+                .reasons
+                .iter()
+                .map(|reason| format!("profile_behavior_probe_failed:{reason}")),
+        );
+    }
+    if let Some(path) = &profile_behavior_probe.evidence_path {
+        reasons.push(format!("profile_behavior_probe_evidence:{path}"));
+    }
+    release_gate.status = "failed".to_string();
+    release_gate.reasons = dedup_strings(reasons);
 }
 
 fn runtime_acceptance_unverified_release_reasons(
@@ -16739,6 +16768,133 @@ if __name__ == "__main__":
             dir.path()
                 .join(".anvil/evidence/python-cli-fixtures/input-b.csv")
                 .is_file()
+        );
+    }
+
+    #[test]
+    fn python_cli_failed_behavior_probe_forces_failed_gate_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "python-cli".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        std::fs::create_dir_all(dir.path().join("src/anvil_app")).unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            r#"[project]
+name = "anvil-app"
+version = "0.1.0"
+
+[project.scripts]
+csv-stats = "anvil_app.main:main"
+"#,
+        )
+        .unwrap();
+        let entrypoint = dir.path().join("src/anvil_app/main.py");
+        std::fs::write(
+            &entrypoint,
+            r#"#!/usr/bin/env python3
+import sys
+
+def main() -> None:
+    _path = sys.argv[1] if len(sys.argv) > 1 else ""
+    print("csv processed")
+
+if __name__ == "__main__":
+    main()
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = std::fs::metadata(&entrypoint).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+            std::fs::set_permissions(&entrypoint, permissions).unwrap();
+        }
+        let plan = UltraPlan {
+            goal: "Build a Python CLI that reads a CSV file path argument and prints sum, average, max, and min for numeric columns.".to_string(),
+            profile: "python-cli".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![crate::planner::ultra_plan::UltraPhase {
+                id: "final".to_string(),
+                prompt: "Final acceptance".to_string(),
+            }],
+        };
+
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(!report.is_pass(), "{report:?}");
+        assert!(
+            report
+                .primary_reason()
+                .contains("python_cli_behavior_probe_failed"),
+            "{report:?}"
+        );
+        let final_acceptance = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            final_acceptance
+                .get("profile_behavior_probe_status")
+                .and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("runtime_acceptance_passed")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            final_acceptance
+                .get("runtime_acceptance_status")
+                .and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("release_gate_status")
+                .and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            final_acceptance
+                .get("final_acceptance_status")
+                .and_then(Value::as_str),
+            Some("incomplete")
+        );
+        assert_ne!(
+            final_acceptance
+                .get("assurance_level")
+                .and_then(Value::as_str),
+            Some("full")
+        );
+        let release_gate_reasons = final_acceptance
+            .get("release_gate_reasons")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            release_gate_reasons.iter().any(|reason| {
+                reason
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("profile_behavior_probe_failed"))
+            }),
+            "{release_gate_reasons:?}"
+        );
+        assert!(
+            release_gate_reasons.iter().any(|reason| {
+                reason.as_str().is_some_and(|reason| {
+                    reason.contains(
+                        "profile_behavior_probe_evidence:.anvil/evidence/python-cli-behavior.json",
+                    )
+                })
+            }),
+            "{release_gate_reasons:?}"
+        );
+        let behavior_probe = latest_event(&events, "profile_behavior_probe");
+        assert_eq!(
+            behavior_probe.get("status").and_then(Value::as_str),
+            Some("failed")
         );
     }
 
