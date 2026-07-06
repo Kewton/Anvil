@@ -207,6 +207,9 @@ pub fn handle_command(
     if parsed.command == "/help" {
         return Ok(render_help());
     }
+    if parsed.command == "/status" {
+        return Ok(crate::tui::presentation::render_status_card(config));
+    }
     if parsed.command == "/plan" {
         return Ok(crate::tui::presentation::render_current_plan());
     }
@@ -332,7 +335,7 @@ pub fn handle_command(
                 crate::minimal_loop::interaction_probe::setup_interaction_probe_with_stdout_progress()?;
                 Ok(report.summary_lines().join("\n"))
             }
-            other => bail!("unknown slash command: {other}"),
+            other => bail!("unknown slash command: {other}; type /help for commands"),
         }
     }));
     drop(panic_hook_guard);
@@ -387,6 +390,7 @@ fn render_help() -> String {
     [
         "Commands:",
         "/help - show this command list",
+        "/status - show effective configuration and readiness",
         "/runs - list recent runs and recovery availability",
         "/resume [run-id|yaml-path] - resume from a recovery UltraPlan",
         "/plan - show the active plan and current activity",
@@ -398,6 +402,7 @@ fn render_help() -> String {
         "/run-ultra-plan <path> - run an existing UltraPlan",
         "/setup-interaction-probe - install the interaction readiness probe",
         "/exit or /quit - leave the TUI",
+        "Interrupt: Esc/Ctrl-C once = prompt abort; twice = force finalize.",
     ]
     .join("\n")
 }
@@ -770,6 +775,27 @@ pub fn parse_words(input: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::{AssistantReply, ChatClient};
+    use crate::state::ConversationMessage;
+    use crate::tools::registry::ToolSpec;
+
+    struct DummyClient;
+
+    impl ChatClient for DummyClient {
+        fn label(&self) -> &str {
+            "dummy"
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            _messages: &[ConversationMessage],
+            _tools: &[ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            Ok(AssistantReply::text("unused"))
+        }
+    }
 
     fn config() -> Config {
         Config {
@@ -852,6 +878,42 @@ mod tests {
         assert_eq!(parsed.profile, "generic");
         assert!(parsed.profile_explicit);
         assert!(parsed.profile_inference.is_none());
+    }
+
+    #[test]
+    fn help_lists_discovery_commands_and_interrupt_semantics() {
+        let help = render_help();
+        for expected in [
+            "/ultra-plan-run <goal> - generate and run an UltraPlan",
+            "/plan-run <goal> - generate and run a step plan",
+            "/plan - show the active plan and current activity",
+            "/runs - list recent runs and recovery availability",
+            "/resume [run-id|yaml-path] - resume from a recovery UltraPlan",
+            "/status - show effective configuration and readiness",
+            "/setup-interaction-probe - install the interaction readiness probe",
+            "/exit or /quit - leave the TUI",
+            "Interrupt: Esc/Ctrl-C once = prompt abort; twice = force finalize.",
+        ] {
+            assert!(help.contains(expected), "{help}");
+        }
+    }
+
+    #[test]
+    fn unknown_slash_command_suggests_help() {
+        let mut planner = DummyClient;
+        let mut execution = DummyClient;
+        let err = handle_command(
+            "/bogus",
+            &config(),
+            &mut planner,
+            &mut execution,
+            &crate::tui::NOOP_UI,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("unknown slash command: /bogus"), "{err}");
+        assert!(err.contains("/help"), "{err}");
     }
 
     #[test]
