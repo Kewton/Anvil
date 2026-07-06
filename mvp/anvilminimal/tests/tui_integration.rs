@@ -362,6 +362,16 @@ fn assert_exactly_one_tui_stop(text: &str, status: &str) {
     );
 }
 
+fn assert_in_order(text: &str, needles: &[&str]) {
+    let mut offset = 0usize;
+    for needle in needles {
+        let Some(index) = text[offset..].find(needle) else {
+            panic!("missing {needle:?} after byte {offset} in:\n{text}");
+        };
+        offset += index + needle.len();
+    }
+}
+
 fn assert_terminal_summary(summary: &str, status: &str) {
     assert!(
         summary.starts_with(&format!("{}\n", anvilminimal::build_info::summary_line())),
@@ -642,6 +652,72 @@ fn planner_uses_ui_for_planner_model_call() {
         ui.events()
             .iter()
             .any(|event| event == "model:planner planner pm")
+    );
+}
+
+#[test]
+fn primary_ultra_plan_run_renders_plan_then_activity_then_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path);
+    let plan_text = anvilminimal::planner::ultra_plan::render_ultra_plan(&two_phase_ultra_plan());
+    let step_json = implement_step_plan_json();
+    let mut planner = FakeClient::new(
+        "planner",
+        vec![
+            AssistantReply::text(plan_text),
+            AssistantReply::text(step_json.clone()),
+            AssistantReply::text(step_json),
+        ],
+    );
+    let mut execution = FakeClient::new(
+        "exec",
+        vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"app.jsx","content":interactive_app_source("phase1")}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"app.jsx","content":interactive_app_source("phase2")}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ],
+    );
+    let ui = FakeUi::default();
+    let _presentation = anvilminimal::tui::presentation::install(&cfg);
+    let capture = anvilminimal::tui::markdown::capture::start();
+
+    let output = anvilminimal::tui::slash::handle_command(
+        "/ultra-plan-run build app",
+        &cfg,
+        &mut planner,
+        &mut execution,
+        &ui,
+    )
+    .unwrap();
+    let rendered = format!("{}\n{output}", capture.output());
+
+    assert_in_order(
+        &rendered,
+        &[
+            "### Plan",
+            "── Phase 1/2: p1 ──",
+            "#### Phase: p1",
+            "→ Write app.jsx",
+            "✓ Write ok",
+            "### Terminal summary",
+        ],
     );
 }
 

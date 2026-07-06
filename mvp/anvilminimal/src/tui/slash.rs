@@ -680,7 +680,7 @@ fn render_terminal_summary_card_to_stdout(
     stop_reason: &str,
     projection: &crate::eval_events::CompletionProjection,
 ) {
-    if !crate::tui::terminal::stdout_is_tty() {
+    if !crate::tui::terminal::stdout_is_tty() && !crate::tui::markdown::capture::is_active() {
         return;
     }
     let card = crate::eval_events::render_terminal_summary_card(

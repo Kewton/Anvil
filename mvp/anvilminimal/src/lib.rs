@@ -617,7 +617,7 @@ fn render_terminal_summary_card_to_stdout(
     stop_reason: &str,
     projection: &eval_events::CompletionProjection,
 ) {
-    if !tui::terminal::stdout_is_tty() {
+    if !tui::terminal::stdout_is_tty() && !tui::markdown::capture::is_active() {
         return;
     }
     let card = eval_events::render_terminal_summary_card(path, stop_reason, projection);

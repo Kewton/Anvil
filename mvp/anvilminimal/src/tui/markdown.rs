@@ -1,6 +1,75 @@
 use std::io::{self, IsTerminal, Write};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::tui::OutputRenderer;
+
+pub mod capture {
+    use super::*;
+
+    static CAPTURE_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+    static CAPTURED: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+    fn serial() -> &'static Mutex<()> {
+        CAPTURE_SERIAL.get_or_init(|| Mutex::new(()))
+    }
+
+    fn captured() -> &'static Mutex<Option<String>> {
+        CAPTURED.get_or_init(|| Mutex::new(None))
+    }
+
+    pub struct Guard {
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    impl Guard {
+        pub fn output(&self) -> String {
+            captured()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .unwrap_or_default()
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *captured()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+    }
+
+    pub fn start() -> Guard {
+        let serial = serial()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *captured()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(String::new());
+        Guard { _serial: serial }
+    }
+
+    pub fn is_active() -> bool {
+        captured()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    pub(super) fn record(raw_text: &str) -> bool {
+        let mut guard = captured()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(buffer) = guard.as_mut() else {
+            return false;
+        };
+        buffer.push_str(raw_text);
+        if !raw_text.ends_with('\n') {
+            buffer.push('\n');
+        }
+        true
+    }
+}
 
 const MD_CODE_FENCE_COLOR: &str = "\x1b[32m";
 const MD_INLINE_CODE_COLOR: &str = "\x1b[36m";
@@ -290,6 +359,9 @@ impl TerminalMarkdownRenderer {
 
 impl OutputRenderer for TerminalMarkdownRenderer {
     fn render_assistant(&self, raw_text: &str) -> anyhow::Result<()> {
+        if capture::record(raw_text) {
+            return Ok(());
+        }
         let rendered = self.render_to_string(raw_text);
         let mut stdout = io::stdout().lock();
         stdout.write_all(rendered.as_bytes())?;
@@ -306,6 +378,9 @@ pub struct PlainRenderer;
 
 impl OutputRenderer for PlainRenderer {
     fn render_assistant(&self, raw_text: &str) -> anyhow::Result<()> {
+        if capture::record(raw_text) {
+            return Ok(());
+        }
         println!("{raw_text}");
         Ok(())
     }
