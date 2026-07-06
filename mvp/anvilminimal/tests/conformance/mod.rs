@@ -243,6 +243,25 @@ fn conformance_negative_earned_assurance_catches_failed_python_probe_pass_fields
 }
 
 #[test]
+fn conformance_negative_precise_exhaustion_rejects_bare_iteration_reason() {
+    let trace = Trace {
+        scenario: MatrixScenario::Nextjs,
+        events: vec![
+            json!({
+                "event": "loop_stop",
+                "reason": "max_iterations",
+                "missing_paths": ["src/app/page.tsx"]
+            }),
+            terminal_stop("partial"),
+        ],
+        summary: terminal_summary("partial"),
+        output: String::new(),
+    };
+
+    assert_contract_fails("precise_exhaustion", check_precise_exhaustion(&trace));
+}
+
+#[test]
 fn conformance_negative_bounded_provider_turns_catches_silent_phase_context_window() {
     let trace = Trace {
         scenario: MatrixScenario::GenericStatic,
@@ -411,6 +430,7 @@ fn assert_conformance_contracts(trace: &Trace) {
             "bounded_child_processes",
             check_bounded_child_processes(trace),
         ),
+        ("precise_exhaustion", check_precise_exhaustion(trace)),
         ("oracle_tristate", check_oracle_tristate(trace)),
         ("degradation_labeling", check_degradation_labeling(trace)),
     ] {
@@ -869,6 +889,42 @@ fn check_bounded_child_processes(trace: &Trace) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn check_precise_exhaustion(trace: &Trace) -> Result<(), String> {
+    for event in trace.events.iter().filter(|event| {
+        matches!(
+            string_field(event, "event"),
+            Some("loop_stop" | "tui_command_stop")
+        )
+    }) {
+        for key in [
+            "reason",
+            "primary_reason",
+            "stop_reason",
+            "failure_reason",
+            "task_reason",
+        ] {
+            let Some(value) = string_field(event, key) else {
+                continue;
+            };
+            if stranded_budget_label(value) {
+                return Err(format!(
+                    "precise_exhaustion: terminal {key} stranded at budget label {value:?} in {event}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stranded_budget_label(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("max_iterations")
+        || lower.contains("iteration limit")
+        || lower.contains("iteration_limit")
+        || lower == "budget_exhausted"
+        || lower == "exhausted_budget"
 }
 
 fn check_oracle_tristate(trace: &Trace) -> Result<(), String> {

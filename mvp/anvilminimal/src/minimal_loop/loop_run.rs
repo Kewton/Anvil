@@ -1788,30 +1788,61 @@ pub(crate) fn run_session_with_outcome_with_options(
             ));
         }
     }
-    let reason = if missing.is_empty() {
-        "max_iterations"
+    let non_scaffold_missing = non_scaffold_missing_paths(config, &missing);
+    let artifact_stagnation_feedback_count = artifact_recovery_state.target_attempts;
+    let reason = if !non_scaffold_missing.is_empty() {
+        "artifact_follow_through_exhausted"
+    } else if missing.is_empty() {
+        "loop_progress_exhausted"
     } else {
-        "required_artifacts_missing"
+        "scaffold_artifact_follow_through_exhausted"
     };
     let loop_stop_event = json!({
             "event": "loop_stop",
             "reason": reason,
             "missing_paths": missing,
+            "non_scaffold_missing_paths": non_scaffold_missing.clone(),
+            "artifact_stagnation_feedback_count": artifact_stagnation_feedback_count,
             "verify_attempts": verify_attempts,
             "last_blocking_reason": last_blocking_reason,
             "last_provider_error": last_provider_error.as_deref().map(eval_events::body_snippet),
     });
     eval_events::emit(config.eval_events_path.as_deref(), loop_stop_event);
-    bail!(
-        "minimal loop reached max_iterations ({})",
-        config.max_iterations
-    )
+    if !non_scaffold_missing.is_empty() {
+        bail!(
+            "artifact_follow_through_exhausted: missing expected paths: {}; artifact_stagnation_feedback_count: {}",
+            non_scaffold_missing.join(", "),
+            artifact_stagnation_feedback_count
+        );
+    }
+    let blocker = if missing.is_empty() {
+        last_blocking_reason
+            .as_deref()
+            .unwrap_or("no concrete blocker recorded")
+            .to_string()
+    } else {
+        format!("missing scaffold paths: {}", missing.join(", "))
+    };
+    bail!("{reason}: {blocker}")
 }
 
 fn missing_paths(root: &std::path::Path, required_paths: &[String]) -> Vec<String> {
     required_paths
         .iter()
         .filter(|path| resolve_existing(root, path).is_err())
+        .cloned()
+        .collect()
+}
+
+fn non_scaffold_missing_paths(config: &Config, missing_paths: &[String]) -> Vec<String> {
+    let scaffold_paths = profile_setup_scaffold_paths(&config.workspace_root, &config.profile)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    missing_paths
+        .iter()
+        .filter(|path| {
+            !scaffold_paths.contains(*path) && !python_cli_entrypoint_scaffold_path(config, path)
+        })
         .cloned()
         .collect()
 }

@@ -111,7 +111,10 @@ has two parts:
 - **Mandatory stranding elimination**: every sampled run must terminate
   honestly with a closed terminal state, concrete status/reason fields, and a
   recovery handoff when the run is not full. Max-iteration, human-interrupt,
-  absent terminal status, and false-full exits disqualify the round.
+  absent terminal status, and false-full exits disqualify the round. A run is
+  stranded when its primary termination reason is an iteration or budget label
+  instead of the concrete blocker, such as missing artifacts, policy rejection,
+  compile failure, probe infrastructure failure, or failed behavioral evidence.
 - **Distribution over samples**: after the mandatory condition passes, quality
   is judged by the distribution over at least two samples per scenario.
 

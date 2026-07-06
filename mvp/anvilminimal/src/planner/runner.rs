@@ -20586,7 +20586,8 @@ export default function Page() {
         let err = run_step_plan(&mut fake, &plan, &cfg)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("max_iterations (8)"), "{err}");
+        assert!(err.contains("artifact_follow_through_exhausted"), "{err}");
+        assert!(err.contains("missing.txt"), "{err}");
     }
 
     #[test]
