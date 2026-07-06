@@ -2,6 +2,7 @@ use crate::gemini::GeminiClient;
 use crate::ollama::client::OllamaClient;
 use crate::ollama::parsing::AssistantReply;
 use crate::openai::OpenAiClient;
+use crate::provider_call::{self, ProviderCallScope};
 use crate::session::store::ConversationMessage;
 use crate::tools::registry::ToolSpec;
 
@@ -30,17 +31,39 @@ impl MinimalChatClient for MinimalLlmClient {
         tools: &[ToolSpec],
         native_tools_enabled: bool,
     ) -> Result<AssistantReply, String> {
+        self.chat_scoped(
+            ProviderCallScope::Executor,
+            model,
+            messages,
+            tools,
+            native_tools_enabled,
+        )
+    }
+
+    fn chat_scoped(
+        &mut self,
+        scope: ProviderCallScope,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+        native_tools_enabled: bool,
+    ) -> Result<AssistantReply, String> {
         match self {
-            Self::Ollama(client) => {
-                MinimalChatClient::chat(client, model, messages, tools, native_tools_enabled)
-            }
+            Self::Ollama(client) => provider_call::chat_ollama_with_mode(
+                scope,
+                client,
+                model,
+                messages,
+                tools,
+                native_tools_enabled,
+            ),
             Self::Gemini(client) => {
                 let _ = native_tools_enabled;
-                client.chat(model, messages, tools)
+                provider_call::chat_gemini(scope, client, model, messages, tools)
             }
             Self::Openai(client) => {
                 let _ = native_tools_enabled;
-                client.chat(model, messages, tools)
+                provider_call::chat_openai(scope, client, model, messages, tools)
             }
         }
     }

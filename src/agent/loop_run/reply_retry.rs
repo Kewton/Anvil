@@ -53,6 +53,7 @@ use crate::agent::recovery;
 use crate::model_capabilities::model_capabilities;
 use crate::modes::plan_act::ExecutionMode;
 use crate::ollama::client::AssistantReply;
+use crate::provider_call::{self, ProviderCallScope};
 use crate::session::store::ConversationMessage;
 use crate::tools::registry::ToolSpec;
 
@@ -399,7 +400,9 @@ fn request_streaming_assistant_reply(
 ) -> Result<AssistantReply, String> {
     let assistant_model = super::agent_misc::current_assistant_model(agent);
     let mut render_state = super::streaming_reply::StreamingReplyRenderState::new();
-    let reply = agent.client.chat_streaming_with_mode(
+    let reply = provider_call::chat_ollama_streaming_with_mode(
+        ProviderCallScope::Executor,
+        &agent.client,
         assistant_model.as_str(),
         messages,
         tool_specs,

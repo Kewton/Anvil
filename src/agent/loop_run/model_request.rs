@@ -1,9 +1,8 @@
 use std::path::Path;
-use std::time::{Duration, Instant};
 
-use crate::logging;
 use crate::model_capabilities::model_capabilities;
 use crate::ollama::client::{AssistantReply, OllamaClient};
+use crate::provider_call::{self, ProviderCallScope};
 use crate::session::store::ConversationMessage;
 use crate::tools::registry::ToolSpec;
 
@@ -148,49 +147,9 @@ pub(super) fn request_non_streaming_assistant_reply(
     let model = model.to_string();
     let tool_specs = tool_specs.to_vec();
     let owned_messages = messages.to_vec();
-    let timeout = Duration::from_secs(timeout_secs);
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let started = Instant::now();
-
-    std::thread::spawn(move || {
-        let result =
-            client.chat_with_mode(&model, &owned_messages, &tool_specs, native_tools_enabled);
-        let _ = tx.send(result);
-    });
-
-    match rx.recv_timeout(timeout) {
-        Ok(result) => {
-            logging::log_llm_event(
-                "provider.turn.elapsed",
-                serde_json::json!({
-                    "transport": "worker",
-                    "timeout_secs": timeout_secs,
-                    "elapsed_ms": started.elapsed().as_millis() as u64,
-                    "outcome": if result.is_ok() { "ok" } else { "error" },
-                }),
-            );
-            result
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            logging::log_llm_event(
-                "provider.turn.elapsed",
-                serde_json::json!({
-                    "transport": "worker",
-                    "timeout_secs": timeout_secs,
-                    "elapsed_ms": started.elapsed().as_millis() as u64,
-                    "outcome": "provider_turn_timeout",
-                }),
-            );
-            Err(provider_turn_timeout_error(timeout_secs))
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err("assistant reply worker disconnected".to_string())
-        }
-    }
-}
-
-pub(super) fn provider_turn_timeout_error(timeout_secs: u64) -> String {
-    format!("provider_turn_timeout: assistant reply timed out after {timeout_secs}s")
+    provider_call::run_bounded_provider_call(ProviderCallScope::Executor, timeout_secs, move || {
+        client.chat_with_mode(&model, &owned_messages, &tool_specs, native_tools_enabled)
+    })
 }
 
 #[cfg(test)]
@@ -200,6 +159,7 @@ mod tests {
     use std::io::Read;
     use std::net::TcpListener;
     use std::path::Path;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn streaming_transport_requires_streaming_capable_model_and_demand() {

@@ -10,6 +10,7 @@ pub mod modes;
 pub mod ollama;
 pub mod openai;
 pub mod photon;
+pub mod provider_call;
 pub(crate) mod provider_timeout;
 pub mod repo_graph;
 pub mod safety;

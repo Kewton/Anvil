@@ -46,7 +46,28 @@ impl OpenAiClient {
         })
     }
 
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+
     pub fn chat(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+    ) -> Result<AssistantReply, String> {
+        self.chat_impl(model, messages, tools)
+    }
+
+    pub fn chat_text(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<AssistantReply, String> {
+        self.chat_impl(model, messages, &[])
+    }
+
+    fn chat_impl(
         &self,
         model: &str,
         messages: &[ConversationMessage],
@@ -118,14 +139,6 @@ impl OpenAiClient {
             }),
         );
         parse_openai_response(&body, &tool_names_vec)
-    }
-
-    pub fn chat_text(
-        &self,
-        model: &str,
-        messages: &[ConversationMessage],
-    ) -> Result<AssistantReply, String> {
-        self.chat(model, messages, &[])
     }
 
     fn map_transport_error(&self, operation: &str, err: reqwest::Error) -> String {

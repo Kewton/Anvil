@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::model_registry::RuntimeModels;
+use crate::provider_call::ProviderCallScope;
 use crate::session::store::{SessionSnapshot, SessionStore};
 
 use super::minimal_llm::MinimalLlmClient;
@@ -330,6 +331,28 @@ pub(crate) fn run_turn_with_early_success_paths<C: MinimalChatClient>(
     prompt: &str,
     early_success_paths: Vec<String>,
 ) -> Result<String, String> {
+    run_turn_with_provider_scope(
+        config,
+        model,
+        client,
+        session_store,
+        session,
+        prompt,
+        early_success_paths,
+        ProviderCallScope::Executor,
+    )
+}
+
+pub(crate) fn run_turn_with_provider_scope<C: MinimalChatClient>(
+    config: &Config,
+    model: &str,
+    client: &mut C,
+    session_store: &SessionStore,
+    session: &mut SessionSnapshot,
+    prompt: &str,
+    early_success_paths: Vec<String>,
+    provider_scope: ProviderCallScope,
+) -> Result<String, String> {
     let work_root = session
         .active_root
         .clone()
@@ -342,6 +365,7 @@ pub(crate) fn run_turn_with_early_success_paths<C: MinimalChatClient>(
         auto_approve: config.yes_mode,
         offline: config.offline,
         cancel_flag: None,
+        provider_scope,
         completion_without_write_feedback: !completion_without_write_feedback_disabled_from_env(),
         requested_artifact_feedback: !requested_artifact_feedback_disabled_from_env(),
         early_success_paths,

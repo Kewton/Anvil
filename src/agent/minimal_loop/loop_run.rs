@@ -8,6 +8,7 @@ use regex::Regex;
 use crate::modes::plan_act::ExecutionMode;
 use crate::ollama::client::{AssistantReply, OllamaClient, should_use_native_tool_calls};
 use crate::ollama::xml_fallback::ToolCall;
+use crate::provider_call::{self, ProviderCallScope};
 use crate::session::store::{ConversationMessage, SessionSnapshot};
 use crate::tools::registry::{ToolContext, ToolRegistry, ToolSpec};
 use crate::util::workspace_paths::WorkspacePolicy;
@@ -35,6 +36,18 @@ pub trait MinimalChatClient {
         tools: &[ToolSpec],
         native_tools_enabled: bool,
     ) -> Result<AssistantReply, String>;
+
+    fn chat_scoped(
+        &mut self,
+        scope: ProviderCallScope,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+        native_tools_enabled: bool,
+    ) -> Result<AssistantReply, String> {
+        let _ = scope;
+        MinimalChatClient::chat(self, model, messages, tools, native_tools_enabled)
+    }
 }
 
 impl MinimalChatClient for OllamaClient {
@@ -49,7 +62,31 @@ impl MinimalChatClient for OllamaClient {
         tools: &[ToolSpec],
         native_tools_enabled: bool,
     ) -> Result<AssistantReply, String> {
-        self.chat_with_mode(model, messages, tools, native_tools_enabled)
+        self.chat_scoped(
+            ProviderCallScope::Executor,
+            model,
+            messages,
+            tools,
+            native_tools_enabled,
+        )
+    }
+
+    fn chat_scoped(
+        &mut self,
+        scope: ProviderCallScope,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+        native_tools_enabled: bool,
+    ) -> Result<AssistantReply, String> {
+        provider_call::chat_ollama_with_mode(
+            scope,
+            self,
+            model,
+            messages,
+            tools,
+            native_tools_enabled,
+        )
     }
 }
 
@@ -62,6 +99,7 @@ pub struct MinimalLoopConfig {
     pub auto_approve: bool,
     pub offline: bool,
     pub cancel_flag: Option<Arc<AtomicBool>>,
+    pub provider_scope: ProviderCallScope,
     pub completion_without_write_feedback: bool,
     pub requested_artifact_feedback: bool,
     pub early_success_paths: Vec<String>,
@@ -112,7 +150,8 @@ pub fn run_session<C: MinimalChatClient>(
             prompt_tool_mode(native_tools_enabled),
             pending_feedback.as_deref(),
         );
-        let reply = match client.chat(
+        let reply = match client.chat_scoped(
+            config.provider_scope,
             model,
             &request_messages,
             &request_tools,
@@ -840,6 +879,7 @@ mod tests {
             auto_approve: true,
             offline: false,
             cancel_flag: None,
+            provider_scope: ProviderCallScope::Executor,
             completion_without_write_feedback: true,
             requested_artifact_feedback: true,
             early_success_paths: Vec::new(),

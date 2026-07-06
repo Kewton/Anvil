@@ -9,12 +9,13 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::logging::log_llm_event;
+use crate::provider_call::{self, ProviderCallScope};
 use crate::session::store::{ConversationMessage, SessionSnapshot, SessionStore};
 #[cfg(test)]
 use crate::tools::registry::ToolSpec;
 
 use super::minimal_loop::MinimalChatClient;
-use super::minimal_repl::run_turn_with_early_success_paths;
+use super::minimal_repl::{run_turn_with_early_success_paths, run_turn_with_provider_scope};
 use super::planner_llm::PlannerLlm;
 use super::text_tokens;
 
@@ -60,6 +61,7 @@ const STEP_REPAIR_MAX_FILE_CHANGES: usize = 2;
 const STEP_REPAIR_MAX_TURNS: usize = 4;
 const MAX_ULTRA_PHASES: usize = 8;
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
+const PLANNER_TIMEOUT_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepPlan {
@@ -511,7 +513,8 @@ pub fn generate_step_plan<P: PlannerLlm + ?Sized>(
     ];
     let mut last_error = String::new();
     for attempt in 0..PLAN_GENERATION_ATTEMPTS {
-        let reply = planner.chat_plan(&messages)?;
+        let reply =
+            chat_plan_with_timeout_retry(planner, ProviderCallScope::PlannerStep, &messages)?;
         if !reply.tool_calls.is_empty() {
             last_error = "plan generation must not emit tool calls".to_string();
         } else {
@@ -617,7 +620,7 @@ pub fn run_plan<C: MinimalChatClient>(
             );
             let repair_start = session.messages.len();
             let early_success_paths = early_success_paths_for_step(&config.cwd, step);
-            let repair_result = run_turn_with_early_success_paths(
+            let repair_result = run_turn_with_provider_scope(
                 &repair_config,
                 model,
                 client,
@@ -625,6 +628,7 @@ pub fn run_plan<C: MinimalChatClient>(
                 session,
                 &repair_prompt,
                 early_success_paths,
+                ProviderCallScope::Repair,
             );
             repair_error = match repair_result {
                 Ok(reply) => {
@@ -731,7 +735,8 @@ pub fn generate_ultra_plan<P: PlannerLlm + ?Sized>(
     ];
     let mut last_error = String::new();
     for attempt in 0..ULTRA_PLAN_GENERATION_ATTEMPTS {
-        let reply = planner.chat_plan(&messages)?;
+        let reply =
+            chat_plan_with_timeout_retry(planner, ProviderCallScope::PlannerUltra, &messages)?;
         if !reply.tool_calls.is_empty() {
             last_error = "ultra plan generation must not emit tool calls".to_string();
         } else {
@@ -874,6 +879,38 @@ pub fn generate_and_run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>
         &plan_path,
     )?;
     Ok(UltraPlanRunSummary { plan_path, phases })
+}
+
+fn chat_plan_with_timeout_retry<P: PlannerLlm + ?Sized>(
+    planner: &mut P,
+    scope: ProviderCallScope,
+    messages: &[ConversationMessage],
+) -> Result<crate::ollama::client::AssistantReply, String> {
+    let mut last_timeout: Option<String> = None;
+    for attempt in 1..=PLANNER_TIMEOUT_ATTEMPTS {
+        match planner.chat_plan(scope, messages) {
+            Ok(reply) => return Ok(reply),
+            Err(err) if provider_call::is_scoped_planner_timeout(scope, &err) => {
+                log_llm_event(
+                    "agent.minimal.planner_timeout",
+                    json!({
+                        "caller_scope": scope.as_str(),
+                        "attempt": attempt,
+                        "max_attempts": PLANNER_TIMEOUT_ATTEMPTS,
+                        "timeout_kind": scope.planner_timeout_kind(),
+                        "retrying": attempt < PLANNER_TIMEOUT_ATTEMPTS,
+                        "error": err,
+                    }),
+                );
+                if attempt == PLANNER_TIMEOUT_ATTEMPTS {
+                    return Err(err);
+                }
+                last_timeout = Some(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_timeout.unwrap_or_else(|| "planner failed".to_string()))
 }
 
 fn plan_generation_system_prompt() -> String {
@@ -1671,6 +1708,7 @@ mod tests {
     impl PlannerLlm for MockClient {
         fn chat_plan(
             &mut self,
+            _scope: ProviderCallScope,
             _messages: &[ConversationMessage],
         ) -> Result<AssistantReply, String> {
             self.replies
@@ -1713,6 +1751,26 @@ mod tests {
         }
     }
 
+    struct TimeoutPlanner {
+        attempts: usize,
+        error: &'static str,
+    }
+
+    impl PlannerLlm for TimeoutPlanner {
+        fn chat_plan(
+            &mut self,
+            _scope: ProviderCallScope,
+            _messages: &[ConversationMessage],
+        ) -> Result<AssistantReply, String> {
+            self.attempts += 1;
+            Err(self.error.to_string())
+        }
+
+        fn label(&self) -> String {
+            "timeout-planner".to_string()
+        }
+    }
+
     #[test]
     fn plan_json_is_saved_as_valid_yaml() {
         let temp = tempfile::tempdir().unwrap();
@@ -1727,6 +1785,42 @@ mod tests {
         let loaded = parse_plan_yaml(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(loaded.goal, "Build app");
         assert_eq!(loaded.steps[0].id, "scaffold");
+    }
+
+    #[test]
+    fn step_planner_timeout_uses_two_attempts_then_fails_with_kind() {
+        let mut planner = TimeoutPlanner {
+            attempts: 0,
+            error: "phase_step_planner_timeout: provider call timed out after 1s",
+        };
+
+        let err = chat_plan_with_timeout_retry(
+            &mut planner,
+            ProviderCallScope::PlannerStep,
+            &[ConversationMessage::user("plan".to_string())],
+        )
+        .unwrap_err();
+
+        assert_eq!(planner.attempts, PLANNER_TIMEOUT_ATTEMPTS);
+        assert!(err.starts_with("phase_step_planner_timeout:"), "{err}");
+    }
+
+    #[test]
+    fn ultra_planner_timeout_uses_ultra_kind() {
+        let mut planner = TimeoutPlanner {
+            attempts: 0,
+            error: "planner_ultra_timeout: provider call timed out after 1s",
+        };
+
+        let err = chat_plan_with_timeout_retry(
+            &mut planner,
+            ProviderCallScope::PlannerUltra,
+            &[ConversationMessage::user("plan".to_string())],
+        )
+        .unwrap_err();
+
+        assert_eq!(planner.attempts, PLANNER_TIMEOUT_ATTEMPTS);
+        assert!(err.starts_with("planner_ultra_timeout:"), "{err}");
     }
 
     #[test]

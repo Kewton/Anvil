@@ -6,6 +6,7 @@ use clap::ValueEnum;
 use crate::gemini::GeminiClient;
 use crate::ollama::client::{AssistantReply, OllamaClient};
 use crate::openai::OpenAiClient;
+use crate::provider_call::{self, ProviderCallScope};
 use crate::session::store::ConversationMessage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -43,7 +44,11 @@ impl FromStr for PlannerProvider {
 }
 
 pub trait PlannerLlm {
-    fn chat_plan(&mut self, messages: &[ConversationMessage]) -> Result<AssistantReply, String>;
+    fn chat_plan(
+        &mut self,
+        scope: ProviderCallScope,
+        messages: &[ConversationMessage],
+    ) -> Result<AssistantReply, String>;
     fn label(&self) -> String;
 }
 
@@ -59,9 +64,12 @@ impl OllamaPlannerLlm {
 }
 
 impl PlannerLlm for OllamaPlannerLlm {
-    fn chat_plan(&mut self, messages: &[ConversationMessage]) -> Result<AssistantReply, String> {
-        self.client
-            .chat_with_mode(&self.model, messages, &[], false)
+    fn chat_plan(
+        &mut self,
+        scope: ProviderCallScope,
+        messages: &[ConversationMessage],
+    ) -> Result<AssistantReply, String> {
+        provider_call::chat_ollama_with_mode(scope, &self.client, &self.model, messages, &[], false)
     }
 
     fn label(&self) -> String {
@@ -81,8 +89,12 @@ impl GeminiPlannerLlm {
 }
 
 impl PlannerLlm for GeminiPlannerLlm {
-    fn chat_plan(&mut self, messages: &[ConversationMessage]) -> Result<AssistantReply, String> {
-        self.client.chat_text(&self.model, messages)
+    fn chat_plan(
+        &mut self,
+        scope: ProviderCallScope,
+        messages: &[ConversationMessage],
+    ) -> Result<AssistantReply, String> {
+        provider_call::chat_gemini(scope, &self.client, &self.model, messages, &[])
     }
 
     fn label(&self) -> String {
@@ -102,8 +114,12 @@ impl OpenAiPlannerLlm {
 }
 
 impl PlannerLlm for OpenAiPlannerLlm {
-    fn chat_plan(&mut self, messages: &[ConversationMessage]) -> Result<AssistantReply, String> {
-        self.client.chat_text(&self.model, messages)
+    fn chat_plan(
+        &mut self,
+        scope: ProviderCallScope,
+        messages: &[ConversationMessage],
+    ) -> Result<AssistantReply, String> {
+        provider_call::chat_openai(scope, &self.client, &self.model, messages, &[])
     }
 
     fn label(&self) -> String {
