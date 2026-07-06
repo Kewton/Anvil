@@ -1,0 +1,12 @@
+{
+  "shape": "tsconfig_alias_baseurl_gap",
+  "source_round": "test0704-999-Q1-62646566676869707172_001",
+  "scenario": "tool_b",
+  "primary_reason": "tsconfig baseUrl/paths missing @/* alias",
+  "observed_import": "@/hooks/useTodos",
+  "tsconfig_has_paths_alias": true,
+  "tsconfig_has_baseUrl": false,
+  "expected_invariant": "compilerOptions.baseUrl plus compilerOptions.paths @/* -> ./src/*",
+  "expected_backlog": "deterministic tsconfig paths alias invariant repair",
+  "trigger": "recurrence"
+}

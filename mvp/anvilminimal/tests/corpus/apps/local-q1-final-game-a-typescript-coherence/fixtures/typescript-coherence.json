@@ -1,0 +1,12 @@
+{
+  "shape": "multi_file_typescript_coherence",
+  "source_round": "test0704-999-Q1-62646566676869707172_001",
+  "scenario": "game_a",
+  "compile_error": "Property 'startWave' does not exist on type 'GameEngine'.",
+  "caller": "src/components/GameUI.tsx",
+  "callee": "src/lib/game-engine.ts",
+  "missing_api": "GameEngine.startWave",
+  "observed_api": "GameEngine.start",
+  "failure_kind": "bounded_repair_exhausted",
+  "terminal_reason": "implementation_compile_error: src/components/GameUI.tsx:71:24 Type error: Property 'startWave' does not exist on type 'GameEngine'."
+}

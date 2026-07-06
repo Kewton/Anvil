@@ -1,0 +1,30 @@
+{
+  "dependencies": {
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "autoprefixer": "latest",
+    "next": "^14.2.0",
+    "postcss": "latest",
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0",
+    "tailwindcss": "latest",
+    "typescript": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.5.15",
+    "tailwindcss": "^3.4.19",
+    "typescript": "^5.5.0"
+  },
+  "name": "todo-app",
+  "private": true,
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev -p 3011",
+    "start": "next start -p 3011"
+  },
+  "version": "0.1.0"
+}

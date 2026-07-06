@@ -1,0 +1,30 @@
+{
+  "dev_server": {
+    "child_reaped": true,
+    "child_spawned": true,
+    "command": "npm run start",
+    "elapsed_ms": 15106,
+    "has_canvas": false,
+    "interactive_control_count": 0,
+    "output_excerpt": "> markdown-note-app@0.1.0 start > next start -p 3011 ▲ Next.js 14.2.35 - Local: http://localhost:3011 ✓ Starting... ✓ Ready in 135ms",
+    "port": 3011,
+    "profile": "nextjs",
+    "route": "/",
+    "ssr_has_canvas": false,
+    "ssr_interactive_control_count": 0,
+    "title_text_excerpt": ""
+  },
+  "has_canvas": false,
+  "http_status": 200,
+  "interactive_control_count": 0,
+  "ok": true,
+  "output_excerpt": "> markdown-note-app@0.1.0 start > next start -p 3011 ▲ Next.js 14.2.35 - Local: http://localhost:3011 ✓ Starting... ✓ Ready in 135ms",
+  "route": "/",
+  "route_rendered": true,
+  "route_rendered_quality": "rendered_without_expected_surface",
+  "ssr_has_canvas": false,
+  "ssr_interactive_control_count": 0,
+  "status": "ready",
+  "surface_marker_authority": "ssr",
+  "title_text_excerpt": ""
+}

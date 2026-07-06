@@ -1,0 +1,43 @@
+case_id = "local-q1-final-content-b-web-full-pass"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-999-Q1-62646566676869707172_001/content_b"
+required_paths = ["package.json", "src/app/page.tsx"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "user_input_or_action", "visible_state_change", "persistence", "nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "build_command_or_dependency_missing_boundary", "implementation_artifact", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence", "interactive_ui_source_evidence", "non_static_screen_evidence", "persistence_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["markdown", "note", "localStorage"]
+
+[route_closure]
+include = ["src/app/page.tsx"]
+exclude = []
+
+[evidence]
+build_command_or_dependency_missing_boundary = "Strong"
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+persistence_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_passed"
+
+[json_fields]
+fixtures/browser-readiness.json:ok = "true"
+fixtures/browser-readiness.json:status = "ready"
+fixtures/browser-readiness.json:http_status = "200"
+fixtures/browser-interaction.json:ok = "true"
+fixtures/browser-interaction.json:interaction_success = "true"
+fixtures/browser-interaction.json:persistence_after_reload = "preserved"
+fixtures/browser-interaction.json:text_entry = "entered"
+fixtures/browser-interaction.json:text_input_state_change = "true"
