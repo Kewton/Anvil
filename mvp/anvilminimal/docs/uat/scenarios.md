@@ -31,6 +31,14 @@ scenarios or the `AMBIGUOUS` scenario in parallel because web-gated runs use
 port 3011. The CLI scenario uses `--profile python-cli`, does not bind a port,
 and must not be treated as a web or browser-interaction run.
 
+Local provider timeout calibration: `ollama`/local provider runs default each
+provider turn to 600 seconds; remote-only provider runs default to 180 seconds.
+Use `--chat-timeout-secs <seconds>` only when intentionally overriding that
+calibrated default. When planner and executor are co-resident on the same local
+Ollama host, run scenarios serially and avoid concurrent planner/executor UAT
+loads; timeout telemetry records whether the local default or an override was
+used.
+
 ## Preflight Runbook
 
 1. Version check: `anvilminimal --version` must exactly match the intended

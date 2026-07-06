@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::eval_events;
 use crate::mode::ExecutionMode;
 use crate::planner::profile::{profile_complete_scaffold, profile_setup_scaffold_paths};
-use crate::planner::verify::diagnose_verify_command;
+use crate::planner::verify::{diagnose_verify_command, normalize_verify_command_for_oracle_repair};
 use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::ChatClient;
 use crate::state::{ConversationMessage, SessionSnapshot};
@@ -380,10 +380,13 @@ struct RuntimeBashPolicyDecision {
     policy_error_kind: &'static str,
     violation_kind: &'static str,
     reason: String,
+    normalized_command: Option<String>,
+    normalization_kind: &'static str,
+    normalization_reason: String,
 }
 
 impl RuntimeBashPolicyDecision {
-    fn for_step(step_kind: RunSessionStepKind, command: &str) -> Self {
+    fn for_step(step_kind: RunSessionStepKind, command: &str, root: &Path) -> Self {
         let verifier_policy_checked = step_kind.requires_verifier_bash_policy();
         if !verifier_policy_checked {
             return Self {
@@ -396,9 +399,31 @@ impl RuntimeBashPolicyDecision {
                 policy_error_kind: "",
                 violation_kind: "",
                 reason: "runtime Bash is not deterministic verifier evidence".to_string(),
+                normalized_command: None,
+                normalization_kind: "",
+                normalization_reason: String::new(),
             };
         }
-        let diagnosis = diagnose_verify_command(command);
+        let mut effective_command = command.to_string();
+        let mut normalized_command = None;
+        let mut normalization_kind = "";
+        let mut normalization_reason = String::new();
+        if let Some(repair) = normalize_verify_command_for_oracle_repair(command)
+            && repair.kind == "output_pipe_stripped"
+            && repair.normalized != command
+        {
+            normalization_kind = repair.kind;
+            normalization_reason = repair.reason;
+            effective_command = repair.normalized.clone();
+            normalized_command = Some(repair.normalized);
+            if let Some(repaired_cd) =
+                normalize_runtime_absolute_cd_verify_command(&effective_command, root)
+            {
+                effective_command = repaired_cd.clone();
+                normalized_command = Some(repaired_cd);
+            }
+        }
+        let diagnosis = diagnose_verify_command(&effective_command);
         if let Some(violation) = diagnosis.violation {
             let reason = diagnosis
                 .reason
@@ -413,8 +438,16 @@ impl RuntimeBashPolicyDecision {
                 policy_error_kind: "verify_command_policy_error",
                 violation_kind: violation.as_str(),
                 reason,
+                normalized_command,
+                normalization_kind,
+                normalization_reason,
             };
         }
+        let reason = if normalized_command.is_some() {
+            "runtime Bash admitted as deterministic verifier evidence after stripping output-limiting pipe"
+        } else {
+            "runtime Bash admitted as deterministic verifier evidence"
+        };
         Self {
             step_kind: step_kind.as_str(),
             bash_policy_purpose: step_kind.bash_policy_purpose(),
@@ -424,7 +457,10 @@ impl RuntimeBashPolicyDecision {
             blocked: false,
             policy_error_kind: "",
             violation_kind: "",
-            reason: "runtime Bash admitted as deterministic verifier evidence".to_string(),
+            reason: reason.to_string(),
+            normalized_command,
+            normalization_kind,
+            normalization_reason,
         }
     }
 }
@@ -433,6 +469,7 @@ fn runtime_bash_policy_decision(
     options: &RunSessionOptions,
     tool_name: &str,
     arguments: &Value,
+    root: &Path,
 ) -> Option<RuntimeBashPolicyDecision> {
     if tool_name != "Bash" {
         return None;
@@ -440,7 +477,39 @@ fn runtime_bash_policy_decision(
     let recovered = recover_tool_arguments(tool_name, arguments.clone());
     let command = recovered.arguments.get("command").and_then(Value::as_str)?;
     let step_kind = options.step_kind.unwrap_or(RunSessionStepKind::Unknown);
-    Some(RuntimeBashPolicyDecision::for_step(step_kind, command))
+    Some(RuntimeBashPolicyDecision::for_step(
+        step_kind, command, root,
+    ))
+}
+
+fn normalize_runtime_absolute_cd_verify_command(command: &str, root: &Path) -> Option<String> {
+    let (cd_part, verify_part) = command.split_once("&&")?;
+    if verify_part.contains("&&") {
+        return None;
+    }
+    let cd_tokens = cd_part.split_whitespace().collect::<Vec<_>>();
+    if cd_tokens.len() != 2 || cd_tokens[0] != "cd" {
+        return None;
+    }
+    let cd_path = Path::new(cd_tokens[1]);
+    if !cd_path.is_absolute() {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let cd_path = cd_path.canonicalize().ok()?;
+    let relative = cd_path.strip_prefix(&root).ok()?;
+    let verify = verify_part.trim();
+    if verify.is_empty() {
+        return None;
+    }
+    if relative.as_os_str().is_empty() {
+        return Some(verify.to_string());
+    }
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    if relative.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(format!("cd {relative} && {verify}"))
 }
 
 fn recovered_bash_command(tool_name: &str, arguments: &Value) -> Option<String> {
@@ -473,6 +542,8 @@ fn emit_runtime_bash_policy(
             "blocked": decision.blocked,
             "policy_error_kind": decision.policy_error_kind,
             "verify_command_violation_kind": decision.violation_kind,
+            "normalization_kind": decision.normalization_kind,
+            "normalized_command_summary": decision.normalized_command.as_deref().map(eval_events::body_snippet).unwrap_or_default(),
             "reason": eval_events::body_snippet(&decision.reason),
             "command_summary": eval_events::body_snippet(command),
         }),
@@ -1234,7 +1305,7 @@ pub(crate) fn run_session_with_outcome_with_options(
         let mut batch_non_edit_tools = 0usize;
         let mut batch_had_recoverable_tool_error = false;
         let missing_before_batch = missing_paths(&config.workspace_root, &required_paths);
-        for call in tool_calls {
+        for mut call in tool_calls {
             if ui.interrupted() {
                 bail!("interrupted by user");
             }
@@ -1249,7 +1320,12 @@ pub(crate) fn run_session_with_outcome_with_options(
             }
             if let (Some(command), Some(decision)) = (
                 recovered_bash_command(&call.name, &call.arguments),
-                runtime_bash_policy_decision(&options, &call.name, &call.arguments),
+                runtime_bash_policy_decision(
+                    &options,
+                    &call.name,
+                    &call.arguments,
+                    &config.workspace_root,
+                ),
             ) {
                 emit_runtime_bash_policy(config.eval_events_path.as_deref(), &decision, &command);
                 if decision.blocked {
@@ -1303,6 +1379,25 @@ pub(crate) fn run_session_with_outcome_with_options(
                         feedback,
                     ));
                     continue;
+                }
+                if let Some(normalized_command) = decision.normalized_command.clone() {
+                    eval_events::emit(
+                        config.eval_events_path.as_deref(),
+                        json!({
+                            "event": "verify_command_normalized_at_runtime",
+                            "classification": "deterministic_verify_policy",
+                            "kind": decision.normalization_kind,
+                            "normalization_source": decision.normalization_kind,
+                            "original": eval_events::body_snippet(&command),
+                            "repaired": eval_events::body_snippet(&normalized_command),
+                            "reason": eval_events::body_snippet(&decision.normalization_reason),
+                        }),
+                    );
+                    if let Some(object) = call.arguments.as_object_mut() {
+                        object.insert("command".to_string(), json!(normalized_command));
+                    } else {
+                        call.arguments = json!({ "command": normalized_command });
+                    }
                 }
             }
             let result = {
@@ -3844,6 +3939,7 @@ mod tests {
             num_predict: 100,
             max_iterations: 4,
             chat_timeout_secs: 1,
+            chat_timeout_source: "override:test".to_string(),
             chat_retries: 1,
             eval_events_path: None,
             completion_contract_path: None,
@@ -4488,6 +4584,80 @@ export default function Page(){
             })
             .count();
         assert_eq!(successful_bash_execs, 1);
+    }
+
+    #[test]
+    fn verify_step_runtime_strips_output_truncation_pipe_before_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path.clone());
+        let command = format!(
+            "cd {} && test -f missing-marker.txt 2>&1 | tail -80",
+            dir.path().display()
+        );
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command": command}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create app. Verify the current step.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert_eq!(outcome.final_text, "step tool observation completed");
+        let bash_result = session
+            .messages
+            .iter()
+            .find(|message| message.role == "tool" && message.name.as_deref() == Some("Bash"))
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        assert!(
+            bash_result.contains("outcome: CommandFailed"),
+            "{bash_result}"
+        );
+        assert!(
+            bash_result.contains("command did not succeed: test -f missing-marker.txt"),
+            "{bash_result}"
+        );
+        assert!(!bash_result.contains("tail -80"), "{bash_result}");
+        let events = event_values(&events_path);
+        let policy = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("runtime_bash_policy"))
+            .unwrap();
+        assert_eq!(
+            policy.get("normalization_kind").and_then(Value::as_str),
+            Some("output_pipe_stripped")
+        );
+        assert_eq!(policy.get("blocked").and_then(Value::as_bool), Some(false));
+        let normalization = events.iter().find(|event| {
+            event.get("event").and_then(Value::as_str)
+                == Some("verify_command_normalized_at_runtime")
+        });
+        assert_eq!(
+            normalization.and_then(|event| event.get("kind")),
+            Some(&json!("output_pipe_stripped"))
+        );
+        assert!(
+            normalization
+                .and_then(|event| event.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("mask the base command exit status"),
+            "{events:?}"
+        );
     }
 
     #[test]

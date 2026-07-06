@@ -52,6 +52,8 @@ pub struct VerifyCommandRuntimeNormalization {
     pub repaired: String,
 }
 
+pub const OUTPUT_PIPE_STRIPPED_REASON: &str = "output_pipe_stripped: verifier output is already captured and excerpted; trailing head/tail pipes mask the base command exit status";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyCommandViolationKind {
     Empty,
@@ -61,6 +63,7 @@ pub enum VerifyCommandViolationKind {
     WorkspaceEscape,
     GrepDashPattern,
     PackageJsonScriptGrep,
+    OutputPipeStripped,
 }
 
 impl VerifyCommandViolationKind {
@@ -73,6 +76,7 @@ impl VerifyCommandViolationKind {
             Self::WorkspaceEscape => "workspace_escape",
             Self::GrepDashPattern => "grep_dash_pattern",
             Self::PackageJsonScriptGrep => "package_json_script_grep",
+            Self::OutputPipeStripped => "output_pipe_stripped",
         }
     }
 
@@ -87,6 +91,7 @@ impl VerifyCommandViolationKind {
             Self::PackageJsonScriptGrep => {
                 "grep package.json script assertion should use JSON parser"
             }
+            Self::OutputPipeStripped => "verify command output-limiting pipe should be stripped",
         }
     }
 }
@@ -978,6 +983,7 @@ pub fn normalize_verify_command(command: &str) -> anyhow::Result<String> {
             violation,
             VerifyCommandViolationKind::GrepDashPattern
                 | VerifyCommandViolationKind::PackageJsonScriptGrep
+                | VerifyCommandViolationKind::OutputPipeStripped
         ) {
             return Ok(diagnosis.normalized);
         }
@@ -1013,6 +1019,7 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
     if let Some(repair) = normalize_verify_command_for_oracle_repair(&normalized) {
         let violation = match repair.kind {
             "package_json_script_assertion" => VerifyCommandViolationKind::PackageJsonScriptGrep,
+            "output_pipe_stripped" => VerifyCommandViolationKind::OutputPipeStripped,
             _ => VerifyCommandViolationKind::GrepDashPattern,
         };
         return verify_command_violation(repair.normalized, violation, Some(repair.reason));
@@ -1026,10 +1033,20 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
         );
     }
     if contains_shell_control_syntax(&normalized) {
+        if let Some(diagnosis) = diagnose_leading_cd_verify_command(&normalized) {
+            return diagnosis;
+        }
         return verify_command_violation(
             normalized,
             VerifyCommandViolationKind::ShellControlSyntax,
             None,
+        );
+    }
+    if is_lone_cd_command(&normalized) {
+        return verify_command_violation(
+            normalized,
+            VerifyCommandViolationKind::ShellControlSyntax,
+            Some("verify command may not be a standalone directory change".to_string()),
         );
     }
     if let Some(path) = manifest_path_arg(&normalized)
@@ -1058,6 +1075,13 @@ pub struct VerifyCommandOracleRepair {
 pub fn normalize_verify_command_for_oracle_repair(
     command: &str,
 ) -> Option<VerifyCommandOracleRepair> {
+    if let Some(stripped) = strip_output_truncation_pipe(command) {
+        return Some(VerifyCommandOracleRepair {
+            normalized: stripped,
+            reason: OUTPUT_PIPE_STRIPPED_REASON.to_string(),
+            kind: "output_pipe_stripped",
+        });
+    }
     let tokens = shell_words_with_spans(command)?;
     if let Some(script_check) = package_json_script_grep_check_command(&tokens) {
         return Some(VerifyCommandOracleRepair {
@@ -1073,6 +1097,81 @@ pub fn normalize_verify_command_for_oracle_repair(
         reason: "grep pattern begins with '-' but command lacks `--` or `-e`".to_string(),
         kind: "grep_dash_pattern_separator",
     })
+}
+
+pub fn strip_output_truncation_pipe(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let pipe_index = single_unquoted_pipe_index(trimmed)?;
+    let base = trimmed[..pipe_index].trim_end();
+    let limiter = trimmed[(pipe_index + 1)..].trim();
+    if base.is_empty() || !is_output_limiter_command(limiter) {
+        return None;
+    }
+    let stripped = strip_trailing_stderr_merge(base).trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    Some(stripped.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn single_unquoted_pipe_index(command: &str) -> Option<usize> {
+    let mut found = None;
+    let mut single = false;
+    let mut double = false;
+    for (index, ch) in command.char_indices() {
+        match ch {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '|' if !single && !double => {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(index);
+            }
+            _ => {}
+        }
+    }
+    if single || double { None } else { found }
+}
+
+fn strip_trailing_stderr_merge(base: &str) -> &str {
+    let trimmed = base.trim_end();
+    let Some(prefix) = trimmed.strip_suffix("2>&1") else {
+        return trimmed;
+    };
+    if prefix
+        .chars()
+        .next_back()
+        .is_some_and(|ch| !ch.is_whitespace())
+    {
+        return trimmed;
+    }
+    prefix.trim_end()
+}
+
+fn is_output_limiter_command(command: &str) -> bool {
+    let Some(tokens) = shell_words_with_spans(command) else {
+        return false;
+    };
+    match tokens.as_slice() {
+        [program, count] => is_head_or_tail(&program.value) && is_line_count(&count.value),
+        [program, flag, count] => {
+            is_head_or_tail(&program.value) && flag.value == "-n" && is_line_count(&count.value)
+        }
+        _ => false,
+    }
+}
+
+fn is_head_or_tail(program: &str) -> bool {
+    matches!(program, "head" | "tail")
+}
+
+fn is_line_count(value: &str) -> bool {
+    let digits = value
+        .strip_prefix('-')
+        .or_else(|| value.strip_prefix('+'))
+        .unwrap_or(value);
+    !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1526,6 +1625,92 @@ fn verify_command_violation(
     }
 }
 
+fn diagnose_leading_cd_verify_command(command: &str) -> Option<VerifyCommandDiagnosis> {
+    let (cd_part, verify_part) = split_once_outside_quotes(command, "&&")?;
+    if find_outside_quotes(verify_part, "&&").is_some() {
+        return None;
+    }
+    let cd_tokens = shell_words_with_spans(cd_part.trim())?;
+    if cd_tokens.len() != 2 || cd_tokens[0].value != "cd" {
+        return None;
+    }
+    let cd_path = cd_tokens[1].value.as_str();
+    if let Err(err) = validate_workspace_relative(cd_path) {
+        return Some(verify_command_violation(
+            command.to_string(),
+            VerifyCommandViolationKind::WorkspaceEscape,
+            Some(err.to_string()),
+        ));
+    }
+    if cd_path.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let verify = verify_part.trim();
+    if verify.is_empty() {
+        return Some(verify_command_violation(
+            command.to_string(),
+            VerifyCommandViolationKind::Empty,
+            None,
+        ));
+    }
+    let verify_diagnosis = diagnose_verify_command(verify);
+    if verify_diagnosis.violation.is_some() {
+        return Some(verify_diagnosis);
+    }
+    if !is_safe_split_verify_fragment(&verify_diagnosis.normalized) {
+        return Some(verify_command_violation(
+            command.to_string(),
+            VerifyCommandViolationKind::ShellControlSyntax,
+            Some(format!(
+                "verify command shell split contains unsupported fragment: {}",
+                verify_diagnosis.normalized
+            )),
+        ));
+    }
+    Some(VerifyCommandDiagnosis {
+        normalized: format!("cd {cd_path} && {}", verify_diagnosis.normalized),
+        violation: None,
+        reason: None,
+    })
+}
+
+fn is_lone_cd_command(command: &str) -> bool {
+    let Some(tokens) = shell_words_with_spans(command) else {
+        return false;
+    };
+    matches!(tokens.as_slice(), [program, _path] if program.value == "cd")
+}
+
+fn split_once_outside_quotes<'a>(text: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    let index = find_outside_quotes(text, needle)?;
+    Some((&text[..index], &text[(index + needle.len())..]))
+}
+
+fn find_outside_quotes(text: &str, needle: &str) -> Option<usize> {
+    let needle_bytes = needle.as_bytes();
+    let bytes = text.as_bytes();
+    let mut single = false;
+    let mut double = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' if !double => {
+                single = !single;
+                index += 1;
+            }
+            b'"' if !single => {
+                double = !double;
+                index += 1;
+            }
+            _ if !single && !double && bytes[index..].starts_with(needle_bytes) => {
+                return Some(index);
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 fn contains_shell_control_syntax(command: &str) -> bool {
     command.bytes().any(|byte| {
         matches!(
@@ -1687,6 +1872,55 @@ mod tests {
             diagnosis.normalized,
             r#"node -p "String(require('./package.json').scripts.dev).includes('next dev -p 3011') ? true : process.exit(1)""#
         );
+    }
+
+    #[test]
+    fn verify_command_normalizes_output_truncation_pipe() {
+        let diagnosis = diagnose_verify_command("npm run build 2>&1 | tail -80");
+
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::OutputPipeStripped)
+        );
+        assert_eq!(diagnosis.normalized, "npm run build");
+        assert_eq!(
+            normalize_verify_command("npm run build | head -n 20").unwrap(),
+            "npm run build"
+        );
+        assert_eq!(
+            normalize_verify_command("npm run build | tail 80").unwrap(),
+            "npm run build"
+        );
+        assert!(
+            diagnosis
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("mask the base command exit status"),
+            "{diagnosis:?}"
+        );
+    }
+
+    #[test]
+    fn verify_command_rejects_non_output_truncation_pipe() {
+        let diagnosis = diagnose_verify_command("npm run build | grep error");
+
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::ShellControlSyntax)
+        );
+        assert!(validate_verify_command("npm run build | grep error").is_err());
+    }
+
+    #[test]
+    fn verify_command_accepts_narrow_leading_cd_for_safe_verify() {
+        assert!(validate_verify_command("cd app && npm run build").is_ok());
+        assert_eq!(
+            diagnose_verify_command("cd app && npm run build").normalized,
+            "cd app && npm run build"
+        );
+        assert!(validate_verify_command("cd ../app && npm run build").is_err());
+        assert!(validate_verify_command("cd app && echo ok").is_err());
     }
 
     #[test]

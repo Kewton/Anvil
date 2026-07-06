@@ -194,6 +194,7 @@ fn emit_provider_turn_duration(config: &Config, telemetry: ProviderTurnTelemetry
             "duration_ms": telemetry.elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
             "timeout_ms": Duration::from_secs(config.chat_timeout_secs).as_millis().min(u128::from(u64::MAX)) as u64,
             "timeout_secs": config.chat_timeout_secs,
+            "timeout_source": config.chat_timeout_source,
             "timed_out": telemetry.timed_out,
             "ok": telemetry.ok,
             "tools": telemetry.tool_count,
@@ -219,6 +220,7 @@ fn emit_provider_turn_timeout(
             "classification": scope.timeout_kind(),
             "duration_ms": elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
             "timeout_secs": config.chat_timeout_secs,
+            "timeout_source": config.chat_timeout_source,
         }),
     );
 }
@@ -285,6 +287,7 @@ mod tests {
             num_predict: 100,
             max_iterations: 1,
             chat_timeout_secs: 1,
+            chat_timeout_source: "override:test".to_string(),
             chat_retries: 1,
             eval_events_path: Some(events_path.clone()),
             completion_contract_path: None,
@@ -322,6 +325,7 @@ mod tests {
         let events = std::fs::read_to_string(events_path).expect("events");
         assert!(events.contains("\"event\":\"provider_turn_duration\""));
         assert!(events.contains("\"caller_scope\":\"planner_step\""));
+        assert!(events.contains("\"timeout_source\":\"override:test\""));
         assert!(events.contains("\"classification\":\"phase_step_planner_timeout\""));
     }
 }

@@ -385,6 +385,8 @@ fn emit_run_start(config: &Config) {
             "model": eval_events::body_snippet(&config.model),
             "planner_provider": format!("{:?}", config.planner_provider).to_ascii_lowercase(),
             "planner_model": eval_events::body_snippet(&config.planner_model),
+            "chat_timeout_secs": config.chat_timeout_secs,
+            "chat_timeout_source": config.chat_timeout_source,
             "profile": config.profile,
             "profile_inferred": config
                 .profile_inference
@@ -580,6 +582,7 @@ mod tests {
             num_predict: 100,
             max_iterations: 4,
             chat_timeout_secs: 1,
+            chat_timeout_source: "override:test".to_string(),
             chat_retries: 1,
             resume: None,
             fresh_session: false,

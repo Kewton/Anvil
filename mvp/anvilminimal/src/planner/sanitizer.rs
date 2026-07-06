@@ -47,6 +47,7 @@ pub struct SanitizedCommandRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizedCommandNormalizationRecord {
+    pub kind: String,
     pub step_id: String,
     pub original_command: String,
     pub normalized_command: String,
@@ -172,6 +173,7 @@ fn split_sanitizable_shell_control_verify_command(command: &str) -> Option<Shell
     if trimmed.is_empty() {
         return None;
     }
+    diagnose_verify_command(trimmed).violation?;
     let (main, dropped_fallback) = split_once_outside_quotes(trimmed, "||")
         .map(|(main, fallback)| {
             (
@@ -310,6 +312,7 @@ fn normalize_repairable_verify_commands(plan: &mut StepPlan, report: &mut Saniti
             report
                 .normalized_commands
                 .push(SanitizedCommandNormalizationRecord {
+                    kind: repair.kind.to_string(),
                     step_id: step.id.clone(),
                     original_command: original,
                     normalized_command: repair.normalized,
@@ -993,6 +996,36 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
     }
 
     #[test]
+    fn sanitizer_strips_output_truncation_pipe_after_leading_cd() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Verify content scaffold artifacts".to_string(),
+            steps: vec![PlanStep {
+                id: "verify-content-app".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify the nested app build".to_string(),
+                expected_paths: vec!["app/package.json".to_string()],
+                verify: vec!["cd app && npm run build 2>&1 | tail -80".to_string()],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.normalized_commands.len(), 1);
+        assert_eq!(report.normalized_commands[0].kind, "output_pipe_stripped");
+        assert_eq!(
+            report.normalized_commands[0].reason,
+            crate::planner::verify::OUTPUT_PIPE_STRIPPED_REASON
+        );
+        assert_eq!(plan.steps[0].verify, vec!["cd app && npm run build"]);
+        let lint = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+        assert!(lint.is_pass(), "{lint:?}");
+        let second = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+        assert!(second.is_empty(), "{second:?}");
+    }
+
+    #[test]
     fn sanitizer_splits_shell_control_verify_commands_and_drops_fallback_tail() {
         let dir = tempfile::tempdir().unwrap();
         let mut plan = StepPlan {
@@ -1062,7 +1095,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
     }
 
     #[test]
-    fn sanitizer_leaves_pipes_for_existing_lint_retry_path() {
+    fn sanitizer_rejects_non_output_limiter_pipes() {
         let dir = tempfile::tempdir().unwrap();
         let mut plan = StepPlan {
             goal: "Verify content scaffold artifacts".to_string(),
@@ -1072,15 +1105,16 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
                 expected_result: "pass".to_string(),
                 instruction: "Verify build and route artifacts".to_string(),
                 expected_paths: vec!["src/app/page.tsx".to_string()],
-                verify: vec!["npm run build | cat".to_string()],
+                verify: vec!["npm run build | grep error".to_string()],
             }],
         };
 
         let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
         let lint = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
 
+        assert!(report.normalized_commands.is_empty(), "{report:?}");
         assert!(report.shell_control_splits.is_empty(), "{report:?}");
-        assert_eq!(plan.steps[0].verify, vec!["npm run build | cat"]);
+        assert_eq!(plan.steps[0].verify, vec!["npm run build | grep error"]);
         assert!(
             lint.errors.iter().any(|err| {
                 err.category == "verify_policy"

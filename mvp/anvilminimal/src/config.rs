@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::cli::{Cli, ProviderArg};
 use crate::planner::profile::{ProfileInference, infer_profile};
 
+pub const LOCAL_PROVIDER_CHAT_TIMEOUT_SECS: u64 = 600;
+pub const REMOTE_PROVIDER_CHAT_TIMEOUT_SECS: u64 = 180;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
@@ -55,6 +58,7 @@ pub struct Config {
     pub num_predict: usize,
     pub max_iterations: usize,
     pub chat_timeout_secs: u64,
+    pub chat_timeout_source: String,
     pub chat_retries: usize,
     pub resume: Option<String>,
     pub fresh_session: bool,
@@ -70,6 +74,8 @@ impl Config {
     pub fn from_cli(cli: Cli) -> anyhow::Result<Self> {
         let provider = Provider::from(cli.provider);
         let planner_provider = cli.planner_provider.map(Provider::from).unwrap_or(provider);
+        let (chat_timeout_secs, chat_timeout_source) =
+            resolve_chat_timeout(cli.chat_timeout_secs, provider, planner_provider);
         let planner_model = match cli.planner_model.clone() {
             Some(model) => model,
             None if planner_provider == provider => cli.model.clone(),
@@ -112,7 +118,8 @@ impl Config {
             ollama_host: cli.ollama_host,
             num_predict: cli.num_predict,
             max_iterations: cli.max_iterations,
-            chat_timeout_secs: cli.chat_timeout_secs,
+            chat_timeout_secs,
+            chat_timeout_source,
             chat_retries: cli.chat_retries,
             resume: cli.resume,
             fresh_session: cli.fresh_session,
@@ -123,6 +130,27 @@ impl Config {
             style: cli.style,
             action,
         })
+    }
+}
+
+fn resolve_chat_timeout(
+    override_secs: Option<u64>,
+    provider: Provider,
+    planner_provider: Provider,
+) -> (u64, String) {
+    if let Some(secs) = override_secs {
+        return (secs, "override:cli".to_string());
+    }
+    if matches!(provider, Provider::Ollama) || matches!(planner_provider, Provider::Ollama) {
+        (
+            LOCAL_PROVIDER_CHAT_TIMEOUT_SECS,
+            "default:local_provider".to_string(),
+        )
+    } else {
+        (
+            REMOTE_PROVIDER_CHAT_TIMEOUT_SECS,
+            "default:remote_provider".to_string(),
+        )
     }
 }
 
@@ -267,6 +295,42 @@ mod tests {
         let cli = Cli::parse_from(["anvilminimal", "--provider", "ollama", "--model", "m"]);
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.planner_model, "m");
+    }
+
+    #[test]
+    fn ollama_chat_timeout_defaults_to_local_provider_budget() {
+        let cli = Cli::parse_from(["anvilminimal", "--provider", "ollama"]);
+        let config = Config::from_cli(cli).unwrap();
+        assert_eq!(config.chat_timeout_secs, LOCAL_PROVIDER_CHAT_TIMEOUT_SECS);
+        assert_eq!(config.chat_timeout_source, "default:local_provider");
+    }
+
+    #[test]
+    fn remote_chat_timeout_defaults_to_remote_provider_budget() {
+        let cli = Cli::parse_from([
+            "anvilminimal",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-test",
+        ]);
+        let config = Config::from_cli(cli).unwrap();
+        assert_eq!(config.chat_timeout_secs, REMOTE_PROVIDER_CHAT_TIMEOUT_SECS);
+        assert_eq!(config.chat_timeout_source, "default:remote_provider");
+    }
+
+    #[test]
+    fn explicit_chat_timeout_wins_for_local_provider() {
+        let cli = Cli::parse_from([
+            "anvilminimal",
+            "--provider",
+            "ollama",
+            "--chat-timeout-secs",
+            "42",
+        ]);
+        let config = Config::from_cli(cli).unwrap();
+        assert_eq!(config.chat_timeout_secs, 42);
+        assert_eq!(config.chat_timeout_source, "override:cli");
     }
 
     #[test]

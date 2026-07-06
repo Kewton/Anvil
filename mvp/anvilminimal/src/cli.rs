@@ -56,8 +56,8 @@ pub struct Cli {
     pub num_predict: usize,
     #[arg(long, default_value_t = 12)]
     pub max_iterations: usize,
-    #[arg(long, default_value_t = 180)]
-    pub chat_timeout_secs: u64,
+    #[arg(long)]
+    pub chat_timeout_secs: Option<u64>,
     #[arg(long, default_value_t = 1)]
     pub chat_retries: usize,
     #[arg(long)]
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn chat_timeout_defaults_to_source_config() {
         let cli = Cli::parse_from(["anvilminimal"]);
-        assert_eq!(cli.chat_timeout_secs, 180);
+        assert_eq!(cli.chat_timeout_secs, None);
     }
 
     #[test]
