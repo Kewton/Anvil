@@ -435,68 +435,77 @@ fn run_minimal_engine(
 ) -> Result<(), String> {
     let selected_planner_model = planner_model.unwrap_or_else(|| models.main.clone());
     if let Some(prompt) = resume_prompt {
-        return run_minimal_prompt(
-            &config,
-            &models.main,
-            &mut client,
-            &session_store,
-            &mut session,
-            &prompt,
-        );
+        return signal_interrupt::run_direct_cli_command("resume", || {
+            run_minimal_prompt(
+                &config,
+                &models.main,
+                &mut client,
+                &session_store,
+                &mut session,
+                &prompt,
+            )
+        });
     }
 
     if let Some(goal) = &plan_steps {
-        let mut planner = build_planner_llm(
-            planner_provider,
-            planner_ollama_client.as_ref(),
-            planner_gemini_client.as_ref(),
-            planner_openai_client.as_ref(),
-            selected_planner_model.clone(),
-        )?;
-        let path = agent::minimal_step_runner::generate_step_plan(&config, planner.as_mut(), goal)?;
-        println!("created step plan: {}", path.display());
-        return Ok(());
+        return signal_interrupt::run_direct_cli_command("plan_steps", || {
+            let mut planner = build_planner_llm(
+                planner_provider,
+                planner_ollama_client.as_ref(),
+                planner_gemini_client.as_ref(),
+                planner_openai_client.as_ref(),
+                selected_planner_model.clone(),
+            )?;
+            let path =
+                agent::minimal_step_runner::generate_step_plan(&config, planner.as_mut(), goal)?;
+            println!("created step plan: {}", path.display());
+            Ok(())
+        });
     }
 
     if let Some(goal) = &plan_run {
-        let mut planner = build_planner_llm(
-            planner_provider,
-            planner_ollama_client.as_ref(),
-            planner_gemini_client.as_ref(),
-            planner_openai_client.as_ref(),
-            selected_planner_model.clone(),
-        )?;
-        let summary = agent::minimal_step_runner::generate_and_run_step_plan(
-            &config,
-            planner.as_mut(),
-            &models.main,
-            &mut client,
-            &session_store,
-            &mut session,
-            goal,
-        )?;
-        println!("created step plan: {}", summary.plan_path.display());
-        println!(
-            "completed {}/{} plan steps",
-            summary.steps.completed, summary.steps.total
-        );
-        return Ok(());
+        return signal_interrupt::run_direct_cli_command("plan_run", || {
+            let mut planner = build_planner_llm(
+                planner_provider,
+                planner_ollama_client.as_ref(),
+                planner_gemini_client.as_ref(),
+                planner_openai_client.as_ref(),
+                selected_planner_model.clone(),
+            )?;
+            let summary = agent::minimal_step_runner::generate_and_run_step_plan(
+                &config,
+                planner.as_mut(),
+                &models.main,
+                &mut client,
+                &session_store,
+                &mut session,
+                goal,
+            )?;
+            println!("created step plan: {}", summary.plan_path.display());
+            println!(
+                "completed {}/{} plan steps",
+                summary.steps.completed, summary.steps.total
+            );
+            Ok(())
+        });
     }
 
     if let Some(plan_path) = run_plan_path {
-        let summary = agent::minimal_step_runner::run_plan(
-            &config,
-            &models.main,
-            &mut client,
-            &session_store,
-            &mut session,
-            &plan_path,
-        )?;
-        println!(
-            "completed {}/{} plan steps",
-            summary.completed, summary.total
-        );
-        return Ok(());
+        return signal_interrupt::run_direct_cli_command("run_plan", || {
+            let summary = agent::minimal_step_runner::run_plan(
+                &config,
+                &models.main,
+                &mut client,
+                &session_store,
+                &mut session,
+                &plan_path,
+            )?;
+            println!(
+                "completed {}/{} plan steps",
+                summary.completed, summary.total
+            );
+            Ok(())
+        });
     }
 
     let ultra_style = match ultra_style {
@@ -512,111 +521,121 @@ fn run_minimal_engine(
     };
 
     if let Some(goal) = &ultra_plan {
-        let mut planner = build_planner_llm(
-            planner_provider,
-            planner_ollama_client.as_ref(),
-            planner_gemini_client.as_ref(),
-            planner_openai_client.as_ref(),
-            selected_planner_model.clone(),
-        )?;
-        let path = agent::minimal_step_runner::generate_ultra_plan(
-            &config,
-            planner.as_mut(),
-            goal,
-            ultra_profile,
-            ultra_style,
-        )?;
-        println!("created ultra plan: {}", path.display());
-        if let Some(line) = &ultra_profile_line {
-            println!("{line}");
-        }
-        return Ok(());
+        return signal_interrupt::run_direct_cli_command("ultra_plan", || {
+            let mut planner = build_planner_llm(
+                planner_provider,
+                planner_ollama_client.as_ref(),
+                planner_gemini_client.as_ref(),
+                planner_openai_client.as_ref(),
+                selected_planner_model.clone(),
+            )?;
+            let path = agent::minimal_step_runner::generate_ultra_plan(
+                &config,
+                planner.as_mut(),
+                goal,
+                ultra_profile,
+                ultra_style,
+            )?;
+            println!("created ultra plan: {}", path.display());
+            if let Some(line) = &ultra_profile_line {
+                println!("{line}");
+            }
+            Ok(())
+        });
     }
 
     if let Some(goal) = &ultra_plan_run {
-        let mut planner = build_planner_llm(
-            planner_provider,
-            planner_ollama_client.as_ref(),
-            planner_gemini_client.as_ref(),
-            planner_openai_client.as_ref(),
-            selected_planner_model.clone(),
-        )?;
-        let summary = agent::minimal_step_runner::generate_and_run_ultra_plan(
-            &config,
-            planner.as_mut(),
-            &models.main,
-            &mut client,
-            &session_store,
-            &mut session,
-            goal,
-            ultra_profile,
-            ultra_style,
-        )?;
-        println!("created ultra plan: {}", summary.plan_path.display());
-        if let Some(line) = &ultra_profile_line {
-            println!("{line}");
-        }
-        println!(
-            "{} {}/{} ultra phases",
-            summary.phases.status_label(),
-            summary.phases.completed,
-            summary.phases.total
-        );
-        if let Some(line) = summary.phases.assurance_summary_line() {
-            println!("{line}");
-        }
-        return Ok(());
+        return signal_interrupt::run_direct_cli_command("ultra_plan_run", || {
+            let mut planner = build_planner_llm(
+                planner_provider,
+                planner_ollama_client.as_ref(),
+                planner_gemini_client.as_ref(),
+                planner_openai_client.as_ref(),
+                selected_planner_model.clone(),
+            )?;
+            let summary = agent::minimal_step_runner::generate_and_run_ultra_plan(
+                &config,
+                planner.as_mut(),
+                &models.main,
+                &mut client,
+                &session_store,
+                &mut session,
+                goal,
+                ultra_profile,
+                ultra_style,
+            )?;
+            println!("created ultra plan: {}", summary.plan_path.display());
+            if let Some(line) = &ultra_profile_line {
+                println!("{line}");
+            }
+            println!(
+                "{} {}/{} ultra phases",
+                summary.phases.status_label(),
+                summary.phases.completed,
+                summary.phases.total
+            );
+            if let Some(line) = summary.phases.assurance_summary_line() {
+                println!("{line}");
+            }
+            Ok(())
+        });
     }
 
     if let Some(plan_path) = run_ultra_plan_path {
-        let mut planner = build_planner_llm(
-            planner_provider,
-            planner_ollama_client.as_ref(),
-            planner_gemini_client.as_ref(),
-            planner_openai_client.as_ref(),
-            selected_planner_model.clone(),
-        )?;
-        let summary = agent::minimal_step_runner::run_ultra_plan(
-            &config,
-            planner.as_mut(),
-            &models.main,
-            &mut client,
-            &session_store,
-            &mut session,
-            &plan_path,
-        )?;
-        println!(
-            "{} {}/{} ultra phases",
-            summary.status_label(),
-            summary.completed,
-            summary.total
-        );
-        if let Some(line) = summary.assurance_summary_line() {
-            println!("{line}");
-        }
-        return Ok(());
+        return signal_interrupt::run_direct_cli_command("run_ultra_plan", || {
+            let mut planner = build_planner_llm(
+                planner_provider,
+                planner_ollama_client.as_ref(),
+                planner_gemini_client.as_ref(),
+                planner_openai_client.as_ref(),
+                selected_planner_model.clone(),
+            )?;
+            let summary = agent::minimal_step_runner::run_ultra_plan(
+                &config,
+                planner.as_mut(),
+                &models.main,
+                &mut client,
+                &session_store,
+                &mut session,
+                &plan_path,
+            )?;
+            println!(
+                "{} {}/{} ultra phases",
+                summary.status_label(),
+                summary.completed,
+                summary.total
+            );
+            if let Some(line) = summary.assurance_summary_line() {
+                println!("{line}");
+            }
+            Ok(())
+        });
     }
 
     if let Some(prompt) = &config.prompt {
-        return run_minimal_prompt(
-            &config,
-            &models.main,
-            &mut client,
-            &session_store,
-            &mut session,
-            prompt,
-        );
+        return signal_interrupt::run_direct_cli_command("prompt", || {
+            run_minimal_prompt(
+                &config,
+                &models.main,
+                &mut client,
+                &session_store,
+                &mut session,
+                prompt,
+            )
+        });
     }
 
     if let Some(prompt) = stdin_prompt()? {
-        return run_minimal_prompt(
-            &config,
-            &models.main,
-            &mut client,
-            &session_store,
-            &mut session,
-            &prompt,
-        );
+        return signal_interrupt::run_direct_cli_command("stdin_prompt", || {
+            run_minimal_prompt(
+                &config,
+                &models.main,
+                &mut client,
+                &session_store,
+                &mut session,
+                &prompt,
+            )
+        });
     }
 
     if io::stdin().is_terminal() {
