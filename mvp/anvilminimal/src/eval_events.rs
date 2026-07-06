@@ -227,6 +227,8 @@ pub struct CompletionSnapshot {
     pub typed_token: String,
     pub token_echoed: String,
     pub text_input_state_change: String,
+    pub persistence_after_reload: String,
+    pub persistence_after_reload_reason: String,
     pub evidence_arbitration_summary: String,
     pub recovery_prompt_path: String,
     pub recovery_ultra_plan_path: String,
@@ -240,6 +242,9 @@ pub struct CompletionSnapshot {
     pub planner_quality_issue_count: usize,
     pub planner_repaired: bool,
     pub planner_release_risk: bool,
+    pub display_normalization_count: usize,
+    pub display_salvaged_count: usize,
+    pub display_substituted_count: usize,
     pub compile_rollback_summaries: Vec<String>,
 }
 
@@ -279,6 +284,8 @@ impl CompletionSnapshot {
             typed_token: String::new(),
             token_echoed: String::new(),
             text_input_state_change: String::new(),
+            persistence_after_reload: "not_applicable".to_string(),
+            persistence_after_reload_reason: String::new(),
             evidence_arbitration_summary: String::new(),
             recovery_prompt_path: String::new(),
             recovery_ultra_plan_path: String::new(),
@@ -292,6 +299,9 @@ impl CompletionSnapshot {
             planner_quality_issue_count: 0,
             planner_repaired: false,
             planner_release_risk: false,
+            display_normalization_count: 0,
+            display_salvaged_count: 0,
+            display_substituted_count: 0,
             compile_rollback_summaries: Vec::new(),
         }
     }
@@ -343,6 +353,8 @@ pub struct CompletionProjection {
     pub typed_token: String,
     pub token_echoed: String,
     pub text_input_state_change: String,
+    pub persistence_after_reload: String,
+    pub persistence_after_reload_reason: String,
     pub evidence_arbitration_summary: String,
     pub release_quality_completion: String,
     pub next_action: String,
@@ -358,12 +370,18 @@ pub struct CompletionProjection {
     pub planner_quality_issue_count: usize,
     pub planner_repaired: bool,
     pub planner_release_risk: bool,
+    pub display_normalization_count: usize,
+    pub display_salvaged_count: usize,
+    pub display_substituted_count: usize,
     pub compile_rollback_summaries: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct PlannerDiagnostics {
     verify_normalization_count: usize,
+    display_normalization_count: usize,
+    display_salvaged_count: usize,
+    display_substituted_count: usize,
     retry_count: usize,
     quality_warning_count: usize,
     quality_issue_count: usize,
@@ -392,6 +410,7 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
         .collect::<Vec<_>>();
     let diagnostics = planner_diagnostics_from_events(&events);
     let recovery_fields = latest_recovery_fields(&events);
+    let persistence_fields = latest_persistence_fields(&events);
     let mut snapshot = CompletionSnapshot::empty();
     let mut latest_completion_index = None;
     for (index, event) in events.iter().enumerate() {
@@ -414,8 +433,12 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
     snapshot.planner_quality_issue_count = diagnostics.quality_issue_count;
     snapshot.planner_repaired = diagnostics.repaired();
     snapshot.planner_release_risk = diagnostics.release_risk();
+    snapshot.display_normalization_count = diagnostics.display_normalization_count;
+    snapshot.display_salvaged_count = diagnostics.display_salvaged_count;
+    snapshot.display_substituted_count = diagnostics.display_substituted_count;
     snapshot.compile_rollback_summaries = compile_rollback_summaries_from_events(&events);
     recovery_fields.apply_to(&mut snapshot);
+    persistence_fields.apply_to(&mut snapshot);
     snapshot
 }
 
@@ -496,6 +519,8 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         typed_token: snapshot.typed_token.clone(),
         token_echoed: snapshot.token_echoed.clone(),
         text_input_state_change: snapshot.text_input_state_change.clone(),
+        persistence_after_reload: snapshot.persistence_after_reload.clone(),
+        persistence_after_reload_reason: snapshot.persistence_after_reload_reason.clone(),
         evidence_arbitration_summary: snapshot.evidence_arbitration_summary.clone(),
         release_quality_completion,
         next_action,
@@ -511,6 +536,9 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         planner_quality_issue_count: snapshot.planner_quality_issue_count,
         planner_repaired: snapshot.planner_repaired,
         planner_release_risk: snapshot.planner_release_risk,
+        display_normalization_count: snapshot.display_normalization_count,
+        display_salvaged_count: snapshot.display_salvaged_count,
+        display_substituted_count: snapshot.display_substituted_count,
         compile_rollback_summaries: snapshot.compile_rollback_summaries.clone(),
     }
 }
@@ -628,6 +656,18 @@ fn planner_diagnostics_from_events(events: &[Value]) -> PlannerDiagnostics {
         match event.get("event").and_then(Value::as_str).unwrap_or("") {
             "planner_verify_command_normalized" => {
                 diagnostics.verify_normalization_count += 1;
+                diagnostics.display_normalization_count += 1;
+            }
+            "tool_args_path_normalized"
+            | "verify_command_normalized_at_runtime"
+            | "ultra_plan_generation_metadata_normalized" => {
+                diagnostics.display_normalization_count += 1;
+            }
+            "tool_args_path_salvaged" => {
+                diagnostics.display_salvaged_count += 1;
+            }
+            "verify_command_substituted" => {
+                diagnostics.display_substituted_count += 1;
             }
             "planner_quality_retry"
             | "planner_quality_retry_degraded"
@@ -673,6 +713,45 @@ impl RecoveryFields {
             snapshot.suggested_recovery_yaml_command = self.suggested_recovery_yaml_command.clone();
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PersistenceFields {
+    persistence_after_reload: String,
+    persistence_after_reload_reason: String,
+}
+
+impl PersistenceFields {
+    fn apply_to(&self, snapshot: &mut CompletionSnapshot) {
+        if !self.persistence_after_reload.is_empty() {
+            snapshot.persistence_after_reload = self.persistence_after_reload.clone();
+        }
+        if !self.persistence_after_reload_reason.is_empty() {
+            snapshot.persistence_after_reload_reason = self.persistence_after_reload_reason.clone();
+        }
+    }
+}
+
+fn latest_persistence_fields(events: &[Value]) -> PersistenceFields {
+    let mut fields = PersistenceFields::default();
+    for event in events.iter().rev() {
+        if fields.persistence_after_reload.is_empty()
+            && let Some(value) = non_empty_event_field(event, "persistence_after_reload")
+        {
+            fields.persistence_after_reload = value.to_string();
+        }
+        if fields.persistence_after_reload_reason.is_empty()
+            && let Some(value) = non_empty_event_field(event, "persistence_after_reload_reason")
+        {
+            fields.persistence_after_reload_reason = value.to_string();
+        }
+        if !fields.persistence_after_reload.is_empty()
+            && !fields.persistence_after_reload_reason.is_empty()
+        {
+            break;
+        }
+    }
+    fields
 }
 
 fn latest_recovery_fields(events: &[Value]) -> RecoveryFields {
@@ -819,6 +898,153 @@ pub fn render_tui_completion_output(output: &str, projection: &CompletionProject
         }
     }
     output
+}
+
+pub fn render_terminal_summary_card(
+    path: Option<&Path>,
+    primary_stop_reason: &str,
+    projection: &CompletionProjection,
+) -> String {
+    let events = read_event_values(path);
+    let summary_text = read_run_summary(path).unwrap_or_default();
+    let (completed, total) = phase_counts_from_events(&events)
+        .or_else(|| phase_counts_from_summary(&summary_text))
+        .unwrap_or((None, None));
+    let mut lines = vec![
+        "### Terminal summary".to_string(),
+        format!(
+            "- Status: {} · Assurance: {}",
+            projection.status,
+            assurance_display(projection)
+        ),
+        "| Gate | Recorded value |".to_string(),
+        "| --- | --- |".to_string(),
+        format!("| task_status | {} |", projection.task_status),
+        format!("| release_gate_status | {} |", projection.release_gate),
+        format!(
+            "| final_acceptance_status | {} |",
+            projection.final_acceptance
+        ),
+        format!(
+            "| browser_readiness_status | execution={} status={} |",
+            projection.browser_readiness_execution_status, projection.browser_readiness
+        ),
+        format!(
+            "| interaction_evidence_status | execution={} status={} |",
+            projection.interaction_evidence_execution_status, projection.interaction_evidence
+        ),
+        format!(
+            "| persistence_after_reload | {} |",
+            persistence_display(projection)
+        ),
+        format!(
+            "- Primary stop reason: {}",
+            terminal_card_stop_reason(primary_stop_reason)
+        ),
+        format!(
+            "- Phases completed: {}",
+            phase_count_display(completed, total)
+        ),
+    ];
+    if let Some(telemetry) = terminal_card_telemetry(projection) {
+        lines.push(format!("- Telemetry: {telemetry}"));
+    }
+    if !projection.recovery_prompt_path.is_empty() {
+        lines.push(format!(
+            "- Recovery prompt: {}",
+            projection.recovery_prompt_path
+        ));
+    }
+    if !projection.recovery_ultra_plan_path.is_empty() {
+        lines.push(format!(
+            "- Recovery UltraPlan: {}",
+            projection.recovery_ultra_plan_path
+        ));
+    }
+    if !projection.suggested_recovery_command.is_empty() {
+        lines.push(format!(
+            "- Suggested command: {}",
+            projection.suggested_recovery_command
+        ));
+    }
+    if !projection.suggested_recovery_yaml_command.is_empty() {
+        lines.push(format!(
+            "- Suggested YAML command: {}",
+            projection.suggested_recovery_yaml_command
+        ));
+    }
+    lines.push(format!("- Next action: {}", projection.next_action));
+    lines.truncate(25);
+    lines.join("\n")
+}
+
+fn assurance_display(projection: &CompletionProjection) -> String {
+    if projection.assurance_level.is_empty() {
+        return "missing".to_string();
+    }
+    if projection.assurance_reason.is_empty() {
+        projection.assurance_level.clone()
+    } else {
+        format!(
+            "{} ({})",
+            projection.assurance_level, projection.assurance_reason
+        )
+    }
+}
+
+fn persistence_display(projection: &CompletionProjection) -> String {
+    if projection.persistence_after_reload.is_empty() {
+        return "not_applicable".to_string();
+    }
+    if projection.persistence_after_reload_reason.is_empty() {
+        projection.persistence_after_reload.clone()
+    } else {
+        format!(
+            "{} ({})",
+            projection.persistence_after_reload, projection.persistence_after_reload_reason
+        )
+    }
+}
+
+fn terminal_card_stop_reason(value: &str) -> String {
+    let rendered = render_stop_reason_text(value);
+    let first_line = rendered.lines().next().unwrap_or("unknown");
+    body_snippet_whole_tokens(first_line)
+}
+
+fn phase_count_display(completed: Option<usize>, total: Option<usize>) -> String {
+    match (completed, total) {
+        (Some(completed), Some(total)) => format!("{completed}/{total}"),
+        (Some(completed), None) => format!("{completed}/unknown"),
+        (None, Some(total)) => format!("unknown/{total}"),
+        (None, None) => "unknown".to_string(),
+    }
+}
+
+fn terminal_card_telemetry(projection: &CompletionProjection) -> Option<String> {
+    let mut parts = Vec::new();
+    if projection.display_normalization_count > 0 {
+        parts.push(format!(
+            "normalized={}",
+            projection.display_normalization_count
+        ));
+    }
+    if projection.display_salvaged_count > 0 {
+        parts.push(format!("salvaged={}", projection.display_salvaged_count));
+    }
+    if projection.display_substituted_count > 0 {
+        parts.push(format!(
+            "substituted={}",
+            projection.display_substituted_count
+        ));
+    }
+    if !projection.compile_rollback_summaries.is_empty() {
+        parts.push(format!(
+            "rollbacks={}",
+            projection.compile_rollback_summaries.len()
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 pub fn render_tui_command_failure_block(
@@ -1582,6 +1808,16 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .to_string(),
         token_echoed: event_bool_or_string(event, "token_echoed"),
         text_input_state_change: event_bool_or_string(event, "text_input_state_change"),
+        persistence_after_reload: event
+            .get("persistence_after_reload")
+            .and_then(Value::as_str)
+            .unwrap_or("not_applicable")
+            .to_string(),
+        persistence_after_reload_reason: event
+            .get("persistence_after_reload_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         evidence_arbitration_summary: event
             .get("evidence_arbitration_summary")
             .and_then(Value::as_str)
@@ -1633,6 +1869,9 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .get("planner_release_risk")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        display_normalization_count: 0,
+        display_salvaged_count: 0,
+        display_substituted_count: 0,
         compile_rollback_summaries: Vec::new(),
     })
 }
@@ -2933,6 +3172,198 @@ mod tests {
             ),
             "{summary}"
         );
+    }
+
+    #[test]
+    fn terminal_summary_card_snapshot_full_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_phase_start",
+                "phase_id": "final",
+                "phase_index": 2,
+                "total_phases": 2,
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "browser_interaction_probe",
+                "persistence_after_reload": "preserved",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "profile": "nextjs",
+                "effective_profile": "nextjs",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "full_success",
+                "release_gate_status": "pass",
+                "assurance_level": "full",
+                "completion_contract_verification_enabled": true,
+                "external_contract_checked": true,
+                "external_contract_ok": true,
+                "browser_readiness_execution_status": "performed",
+                "browser_readiness_status": "pass",
+                "interaction_evidence_execution_status": "performed",
+                "interaction_evidence_status": "pass",
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(true, &snapshot);
+        let card = render_terminal_summary_card(Some(&path), "completed", &projection);
+
+        assert!(card.contains("### Terminal summary"), "{card}");
+        assert!(
+            card.contains("- Status: complete · Assurance: full"),
+            "{card}"
+        );
+        assert!(card.contains("| task_status | complete |"), "{card}");
+        assert!(card.contains("| release_gate_status | pass |"), "{card}");
+        assert!(
+            card.contains("| final_acceptance_status | full_success |"),
+            "{card}"
+        );
+        assert!(
+            card.contains("| browser_readiness_status | execution=performed status=pass |"),
+            "{card}"
+        );
+        assert!(
+            card.contains("| interaction_evidence_status | execution=performed status=pass |"),
+            "{card}"
+        );
+        assert!(
+            card.contains("| persistence_after_reload | preserved |"),
+            "{card}"
+        );
+        assert!(card.contains("- Phases completed: 1/2"), "{card}");
+        assert!(card.contains("- Next action: none"), "{card}");
+        assert!(card.lines().count() <= 25, "{card}");
+    }
+
+    #[test]
+    fn terminal_summary_card_snapshot_partial_failed_and_interrupted_projections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let recovery = ".anvil/plans/recovery-ultra-plan-日本語ディレクトリ-final-acceptance.yaml";
+        emit(
+            Some(&path),
+            json!({
+                "event": "planner_verify_command_normalized",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "tool_args_path_salvaged",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "verify_command_substituted",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "compile_rollback_applied",
+                "paths": ["src/app/page.tsx"],
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_partial_artifact_summary",
+                "completed_phase_ids": ["setup"],
+                "failed_phase_id": "acceptance",
+                "pending_phase_ids": ["release"],
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "partial",
+                "release_gate_status": "partial",
+                "release_gate_reasons": ["interaction_unverified:probe_unavailable"],
+                "browser_readiness_execution_status": "performed",
+                "browser_readiness_status": "pass",
+                "interaction_evidence_execution_status": "disconnected",
+                "interaction_evidence_status": "not_applicable",
+                "persistence_after_reload": "not_evaluated",
+                "persistence_after_reload_reason": "no_mutation_observed",
+                "recovery_ultra_plan_path": recovery,
+                "suggested_recovery_yaml_command": format!("/run-ultra-plan {recovery}"),
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let partial = project_completion(true, &snapshot);
+        let partial_card = render_terminal_summary_card(Some(&path), "partial gate", &partial);
+        assert!(
+            partial_card.contains("| release_gate_status | partial |"),
+            "{partial_card}"
+        );
+        assert!(
+            partial_card.contains("| final_acceptance_status | partial |"),
+            "{partial_card}"
+        );
+        assert!(
+            partial_card
+                .contains("| persistence_after_reload | not_evaluated (no_mutation_observed) |"),
+            "{partial_card}"
+        );
+        assert!(
+            partial_card.contains("Telemetry: normalized=1 salvaged=1 substituted=1 rollbacks=1"),
+            "{partial_card}"
+        );
+        assert!(partial_card.contains(recovery), "{partial_card}");
+        assert!(
+            !partial_card.contains("recovery-ultra-plan-日本語ディレクトリ-final-acceptance.ya\n")
+        );
+
+        let failed = project_completion(false, &snapshot);
+        let failed_card = render_terminal_summary_card(Some(&path), "failed release", &failed);
+        assert!(
+            failed_card.contains("- Status: incomplete"),
+            "{failed_card}"
+        );
+        assert!(
+            failed_card.contains("| task_status | failed |"),
+            "{failed_card}"
+        );
+        assert!(
+            failed_card.contains("- Next action: fix_command_failure"),
+            "{failed_card}"
+        );
+
+        let mut interrupted = failed.clone();
+        interrupted.status = "interrupted".to_string();
+        interrupted.command_completion = "interrupted".to_string();
+        interrupted.task_status = "interrupted".to_string();
+        interrupted.next_action = "resume_or_rerun_command".to_string();
+        let interrupted_card =
+            render_terminal_summary_card(Some(&path), "interrupted by user", &interrupted);
+        assert!(
+            interrupted_card.contains("- Status: interrupted"),
+            "{interrupted_card}"
+        );
+        assert!(
+            interrupted_card.contains("| task_status | interrupted |"),
+            "{interrupted_card}"
+        );
+        assert!(
+            interrupted_card.contains("- Next action: resume_or_rerun_command"),
+            "{interrupted_card}"
+        );
+        assert!(interrupted_card.lines().count() <= 25, "{interrupted_card}");
     }
 
     #[test]

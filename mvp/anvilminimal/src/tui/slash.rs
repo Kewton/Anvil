@@ -311,6 +311,7 @@ pub fn handle_command(
         }
     };
     let terminal_status = terminal_status_for_result(&result, ui);
+    let stop_reason = stop_reason_for_result(&result, terminal_status);
     let completion = completion_guard.finalize(&result, terminal_status);
     if let Err(err) = &result {
         eprintln!(
@@ -321,13 +322,25 @@ pub fn handle_command(
                 &completion,
             )
         );
+        render_terminal_summary_card_to_stdout(&config, &stop_reason, &completion);
     } else if let Some(notice) = crate::eval_events::render_tui_command_incomplete_notice(
         config.eval_events_path.as_deref(),
         &completion,
     ) {
         eprintln!("{notice}");
     }
-    result.map(|output| crate::eval_events::render_tui_completion_output(&output, &completion))
+    let card = crate::eval_events::render_terminal_summary_card(
+        config.eval_events_path.as_deref(),
+        &stop_reason,
+        &completion,
+    );
+    result.map(|output| {
+        format!(
+            "{}\n\n{}",
+            crate::eval_events::render_tui_completion_output(&output, &completion),
+            card
+        )
+    })
 }
 
 fn emit_panic_caught(config: &Config, command: &str, diagnostic: &PanicDiagnostic) {
@@ -574,6 +587,23 @@ fn event_projection_for_terminal_status(
         TuiTerminalStatus::Completed | TuiTerminalStatus::Partial => projection.next_action,
     };
     projection
+}
+
+fn render_terminal_summary_card_to_stdout(
+    config: &Config,
+    stop_reason: &str,
+    projection: &crate::eval_events::CompletionProjection,
+) {
+    if !crate::tui::terminal::stdout_is_tty() {
+        return;
+    }
+    let card = crate::eval_events::render_terminal_summary_card(
+        config.eval_events_path.as_deref(),
+        stop_reason,
+        projection,
+    );
+    let renderer = crate::tui::markdown::TerminalMarkdownRenderer::for_stdout();
+    let _ = crate::tui::OutputRenderer::render_assistant(&renderer, &card);
 }
 
 pub fn parse_profile_style(args: &[String], config: &Config) -> (String, String, Vec<String>) {

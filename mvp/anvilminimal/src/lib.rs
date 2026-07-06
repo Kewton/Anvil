@@ -27,7 +27,7 @@ use signal_hook::consts::SIGINT;
 use signal_hook::iterator::{Handle as SignalHandle, Signals};
 use tui::OutputRenderer;
 use tui::TerminalUi;
-use tui::markdown::PlainRenderer;
+use tui::markdown::{PlainRenderer, TerminalMarkdownRenderer};
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     let config = Config::from_cli(cli)?;
@@ -376,6 +376,11 @@ fn emit_direct_command_stop_with_status(
         terminal_status.as_str(),
         &completion,
     );
+    render_terminal_summary_card_to_stdout(
+        config.eval_events_path.as_deref(),
+        &stop_reason,
+        &event_projection,
+    );
     event_projection
 }
 
@@ -596,6 +601,19 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
         failure_kind,
         &completion,
     );
+}
+
+fn render_terminal_summary_card_to_stdout(
+    path: Option<&std::path::Path>,
+    stop_reason: &str,
+    projection: &eval_events::CompletionProjection,
+) {
+    if !tui::terminal::stdout_is_tty() {
+        return;
+    }
+    let card = eval_events::render_terminal_summary_card(path, stop_reason, projection);
+    let renderer = TerminalMarkdownRenderer::for_stdout();
+    let _ = renderer.render_assistant(&card);
 }
 
 fn apply_config_completion_metadata(
