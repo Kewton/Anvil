@@ -629,6 +629,7 @@ struct StepPlanRunOutcome {
     command_failures: Vec<String>,
     repair_attempts: usize,
     repair_changed_paths: Vec<String>,
+    compile_rollbacks: Vec<CompileRollbackOutcome>,
     stop_reason: Option<String>,
     partial: bool,
 }
@@ -736,6 +737,14 @@ impl UltraRunContext {
             ULTRA_CONTEXT_MAX_MESSAGES,
             &mut self.truncated,
         );
+        for rollback in &outcome.compile_rollbacks {
+            push_context_items_capped(
+                &mut self.carry_forward_guidance,
+                &rollback.carry_forward_guidance,
+                ULTRA_CONTEXT_MAX_MESSAGES,
+                &mut self.truncated,
+            );
+        }
     }
 
     fn merge_observed_contract_debt(&mut self, outcome: &StepPlanRunOutcome) {
@@ -811,6 +820,14 @@ impl UltraRunContext {
             ULTRA_CONTEXT_MAX_MESSAGES,
             &mut self.truncated,
         );
+        for rollback in &outcome.compile_rollbacks {
+            push_context_items_capped(
+                &mut self.carry_forward_guidance,
+                &rollback.carry_forward_guidance,
+                ULTRA_CONTEXT_MAX_MESSAGES,
+                &mut self.truncated,
+            );
+        }
     }
 
     fn update_after_profile_failure(
@@ -1236,6 +1253,8 @@ impl StepPlanRunOutcome {
         merge_unique_strings(&mut self.repair_targets, &step.repair_targets);
         merge_unique_strings(&mut self.command_failures, &step.command_failures);
         merge_unique_strings(&mut self.repair_changed_paths, &step.repair_changed_paths);
+        self.compile_rollbacks
+            .extend(step.compile_rollbacks.iter().cloned());
         self.repair_attempts += step.repair_attempts;
         if let Some(primary) = &step.primary_failure {
             self.primary_failure = Some(primary.clone());
@@ -1274,6 +1293,7 @@ struct StepRunOutcome {
     command_failures: Vec<String>,
     repair_attempts: usize,
     repair_changed_paths: Vec<String>,
+    compile_rollbacks: Vec<CompileRollbackOutcome>,
     stop_reason: Option<String>,
     partial: bool,
 }
@@ -2134,6 +2154,33 @@ fn run_step(
         terminal_repair_failure_kind.unwrap_or_else(|| "bounded_repair_exhausted".to_string());
     context.repair_stop_reason = Some(final_failure_kind.to_string());
     let final_repair_target = classify_repair_target(&current_report);
+    if !current_report.compile_errors.is_empty() {
+        match try_compile_rollback_after_repair_exhaustion(
+            config,
+            &config.profile,
+            overall_goal,
+            phase_scope.unwrap_or(&step.id),
+            &step.instruction,
+            &current_report,
+            &final_failure_kind,
+        ) {
+            Ok(Some(rollback)) => {
+                outcome.primary_failure = None;
+                outcome.stop_reason = Some("compile_rollback_applied".to_string());
+                outcome.partial = true;
+                outcome.compile_rollbacks.push(rollback);
+                return Ok(outcome);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let message = err.to_string();
+                outcome.primary_failure = Some(message.clone());
+                outcome.stop_reason = Some("compile_rollback_error".to_string());
+                outcome.partial = true;
+                return Err(StepRunError { message, outcome });
+            }
+        }
+    }
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -3923,6 +3970,9 @@ pub fn run_ultra_plan_with_ui(
             &step_outcome,
             missing_final_artifacts(&config.workspace_root, &final_expected_paths),
         );
+        for rollback in &step_outcome.compile_rollbacks {
+            emit_compile_rollback_context_carried(config, rollback);
+        }
         let acceptance = ultra_contract_runtime_acceptance_report(plan, config)?;
         ultra_context.refresh_pending_capability_evidence(&acceptance);
         emit_ultra_phase_context_updated(
@@ -3967,6 +4017,34 @@ pub fn run_ultra_plan_with_ui(
                 invariant_report,
                 &mut setup_authority_state,
             )?;
+        }
+        if !final_phase
+            && !invariant_report.is_pass()
+            && !invariant_report.compile_errors.is_empty()
+        {
+            if let Some(rollback) = try_compile_rollback_after_repair_exhaustion(
+                config,
+                &plan.profile,
+                &plan.goal,
+                &phase.id,
+                &phase.prompt,
+                &invariant_report,
+                "profile_invariant_repair_exhausted",
+            )? {
+                push_context_items_capped(
+                    &mut ultra_context.carry_forward_guidance,
+                    &rollback.carry_forward_guidance,
+                    ULTRA_CONTEXT_MAX_MESSAGES,
+                    &mut ultra_context.truncated,
+                );
+                emit_compile_rollback_context_carried(config, &rollback);
+                invariant_report = verify_profile_invariant(
+                    &config.workspace_root,
+                    &plan.profile,
+                    &plan.goal,
+                    &profile_snapshot,
+                );
+            }
         }
         if !invariant_report.is_pass() {
             let fresh_evidence = fresh_profile_invariant_failure_evidence(
@@ -4473,8 +4551,10 @@ pub fn run_ultra_plan_with_ui(
             && !acceptance_report.compile_errors.is_empty()
             && let Some(rollback) = try_compile_rollback_after_repair_exhaustion(
                 config,
-                plan,
-                &fallback_phase,
+                &plan.profile,
+                &plan.goal,
+                &fallback_phase.id,
+                &fallback_phase.prompt,
                 &acceptance_report,
                 &exhausted_reason,
             )?
@@ -4485,15 +4565,7 @@ pub fn run_ultra_plan_with_ui(
                 ULTRA_CONTEXT_MAX_MESSAGES,
                 &mut ultra_context.truncated,
             );
-            eval_events::emit(
-                config.eval_events_path.as_deref(),
-                json!({
-                    "event": "compile_rollback_context_carried",
-                    "paths": rollback.paths,
-                    "snapshot_origins": rollback.snapshot_origins,
-                    "carry_forward_guidance": rollback.carry_forward_guidance,
-                }),
-            );
+            emit_compile_rollback_context_carried(config, &rollback);
             exhausted_reason = "compile_rollback_applied".to_string();
             acceptance_report = ultra_final_acceptance_report_with_cycle(
                 plan,
@@ -11349,8 +11421,10 @@ struct CompileRollbackOutcome {
 
 fn try_compile_rollback_after_repair_exhaustion(
     config: &Config,
-    plan: &UltraPlan,
-    phase: &UltraPhase,
+    profile: &str,
+    goal: &str,
+    phase_id: &str,
+    phase_prompt: &str,
     report: &VerificationReport,
     exhausted_reason: &str,
 ) -> anyhow::Result<Option<CompileRollbackOutcome>> {
@@ -11401,13 +11475,13 @@ fn try_compile_rollback_after_repair_exhaustion(
         restored_paths.push(rel.clone());
         origins.push(workspace_relative_handoff_path(snapshot));
     }
-    let rebuild_report = verify_profile_final(&config.workspace_root, &plan.profile, &plan.goal);
+    let rebuild_report = verify_profile_final(&config.workspace_root, profile, goal);
     if report_has_production_build_failure(&rebuild_report) {
         eval_events::emit(
             config.eval_events_path.as_deref(),
             json!({
                 "event": "compile_rollback_failed",
-                "phase_id": phase.id,
+                "phase_id": phase_id,
                 "paths": restored_paths,
                 "snapshot_origins": origins,
                 "exhausted_reason": exhausted_reason,
@@ -11416,13 +11490,13 @@ fn try_compile_rollback_after_repair_exhaustion(
         );
         return Ok(None);
     }
-    let phase_goal = phase_goal_one_liner(&phase.prompt);
+    let phase_goal = phase_goal_one_liner(phase_prompt);
     let carry_forward_guidance = restored_paths
         .iter()
         .map(|path| {
             format!(
                 "phase {} changes to {} were rolled back; re-apply: {}",
-                phase.id, path, phase_goal
+                phase_id, path, phase_goal
             )
         })
         .collect::<Vec<_>>();
@@ -11430,7 +11504,7 @@ fn try_compile_rollback_after_repair_exhaustion(
         config.eval_events_path.as_deref(),
         json!({
             "event": "compile_rollback_applied",
-            "phase_id": phase.id,
+            "phase_id": phase_id,
             "paths": restored_paths.clone(),
             "snapshot_origins": origins.clone(),
             "exhausted_reason": exhausted_reason,
@@ -11451,6 +11525,18 @@ fn try_compile_rollback_after_repair_exhaustion(
         snapshot_origins: origins,
         carry_forward_guidance,
     }))
+}
+
+fn emit_compile_rollback_context_carried(config: &Config, rollback: &CompileRollbackOutcome) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "compile_rollback_context_carried",
+            "paths": &rollback.paths,
+            "snapshot_origins": &rollback.snapshot_origins,
+            "carry_forward_guidance": &rollback.carry_forward_guidance,
+        }),
+    );
 }
 
 fn emit_compile_rollback_skipped(
@@ -21668,6 +21754,26 @@ exit 2\n",
         .unwrap()
     }
 
+    #[cfg(unix)]
+    fn static_breaking_build_step_plan() -> StepPlan {
+        StepPlan {
+            goal: "Create a static Next.js page".to_string(),
+            steps: vec![PlanStep {
+                id: "break-then-verify-build".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Update src/app/page.tsx and verify the build.".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: vec!["npm run build".to_string()],
+            }],
+        }
+    }
+
+    #[cfg(unix)]
+    fn static_breaking_build_step_plan_json() -> String {
+        serde_json::to_string(&static_breaking_build_step_plan()).unwrap()
+    }
+
     fn write_static_page_reply(content: &str) -> AssistantReply {
         AssistantReply {
             content: String::new(),
@@ -21686,6 +21792,19 @@ exit 2\n",
             tool_calls: vec![crate::state::ToolCall::new(
                 "Read",
                 serde_json::json!({"path":"src/app/page.tsx"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn bash_true_reply() -> AssistantReply {
+        AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Bash",
+                serde_json::json!({"command":"true"}),
             )],
             prompt_tokens: None,
             completion_tokens: None,
@@ -21960,6 +22079,158 @@ exit 2\n",
         assert_eq!(
             std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
             static_broken_page_source()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn step_verify_compile_repair_exhaustion_rolls_back_snapshot_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/step-rollback/events.jsonl");
+        write_static_compile_repair_workspace(dir.path(), static_good_page_source());
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_static_build_contract(dir.path()));
+        let plan = UltraPlan {
+            goal: "Create a static Next.js page".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "phase-one".to_string(),
+                    prompt: "Confirm the current build is good.".to_string(),
+                },
+                UltraPhase {
+                    id: "phase-two".to_string(),
+                    prompt: "Apply a risky page update and verify the build.".to_string(),
+                },
+                UltraPhase {
+                    id: "phase-three".to_string(),
+                    prompt: "Continue after rollback with the recovered page.".to_string(),
+                },
+            ],
+        };
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(static_phase_step_plan_json(true)),
+            AssistantReply::text(static_breaking_build_step_plan_json()),
+            AssistantReply::text(static_phase_step_plan_json(false)),
+        ]);
+        let mut execution = FakeClient::new(vec![
+            read_static_page_reply(),
+            write_static_page_reply(static_broken_page_source()),
+            bash_true_reply(),
+            AssistantReply::text("The compile error is unchanged."),
+            bash_true_reply(),
+            AssistantReply::text("The compile error is still unchanged."),
+            bash_true_reply(),
+            AssistantReply::text("The compile error remains unchanged."),
+            bash_true_reply(),
+            AssistantReply::text("The compile error remains unchanged again."),
+            bash_true_reply(),
+            AssistantReply::text("Continue after rollback."),
+            write_static_page_reply(static_good_page_source()),
+            read_static_page_reply(),
+            AssistantReply::text("phase three complete"),
+        ]);
+
+        let result =
+            run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap_or_else(|err| {
+                let event_text = std::fs::read_to_string(&events).unwrap_or_default();
+                panic!("{err}\nEvents:\n{event_text}");
+            });
+
+        assert!(result.contains("ultra-plan-run complete"), "{result}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
+            static_good_page_source()
+        );
+        assert_eq!(planner.messages.len(), 3);
+        let phase_three_prompt = planner_request_text(&planner, 2);
+        assert!(
+            phase_three_prompt.contains("Carry-forward guidance"),
+            "{phase_three_prompt}"
+        );
+        assert!(
+            phase_three_prompt
+                .contains("phase phase-two changes to src/app/page.tsx were rolled back"),
+            "{phase_three_prompt}"
+        );
+        assert!(
+            phase_three_prompt.contains("Update src/app/page.tsx and verify the build."),
+            "{phase_three_prompt}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"event\":\"compile_snapshot_saved\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"event\":\"compile_rollback_applied\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"event\":\"compile_rollback_context_carried\""),
+            "{event_text}"
+        );
+        assert!(
+            !event_text.contains("\"event\":\"recovery_prompt_saved\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"phase_id\":\"phase-two\""),
+            "{event_text}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn step_verify_compile_repair_exhaustion_without_snapshot_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/step-no-snapshot/events.jsonl");
+        write_static_compile_repair_workspace(dir.path(), static_good_page_source());
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let mut execution = FakeClient::new(vec![
+            write_static_page_reply(static_broken_page_source()),
+            bash_true_reply(),
+            AssistantReply::text("The compile error is unchanged."),
+            bash_true_reply(),
+            AssistantReply::text("The compile error is still unchanged."),
+            bash_true_reply(),
+            AssistantReply::text("The compile error remains unchanged."),
+            bash_true_reply(),
+            AssistantReply::text("The compile error remains unchanged again."),
+        ]);
+
+        let err = run_step_plan(&mut execution, &static_breaking_build_step_plan(), &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("repair prompt saved"), "{err}");
+        assert!(err.contains("implementation_compile_error"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
+            static_broken_page_source()
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"event\":\"compile_rollback_skipped\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("snapshot_missing:src/app/page.tsx"),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"event\":\"recovery_prompt_saved\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"failure_kind\":\"verify_repair_progress_unchanged\""),
+            "{event_text}"
         );
     }
 
