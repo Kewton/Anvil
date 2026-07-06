@@ -1422,7 +1422,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     &call.arguments,
                     &context,
                     || ui.interrupted(),
-                    || false,
+                    || ui.force_interrupted(),
                 )
             };
             let result = match result {

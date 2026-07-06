@@ -230,6 +230,8 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
         "dangerous_command"
     } else if message.contains("command_timeout") {
         "command_timeout"
+    } else if message.contains("command_aborted_by_user") {
+        "command_aborted_by_user"
     } else if message.contains("verify_command_policy_error") {
         "verify_command_policy_error"
     } else if message.contains("edit_anchor_not_found") {

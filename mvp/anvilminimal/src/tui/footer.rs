@@ -247,6 +247,7 @@ pub fn build_live_footer_lines(
         && runtime.stage.is_none()
         && runtime.last_event.is_none()
         && !runtime.interrupt_requested
+        && !runtime.force_finalize_requested
     {
         let line = fit_to_width(&build_footer_line(status, false), cols);
         return vec![if use_color {
@@ -312,8 +313,10 @@ pub fn build_live_footer_lines(
         secondary.push(format!("last: {last}"));
     }
 
-    let prefix = if runtime.interrupt_requested {
-        "[interrupt: finishing current turn — Ctrl-C again to finalize] "
+    let prefix = if runtime.force_finalize_requested {
+        "[stopping: force-finalizing…] "
+    } else if runtime.interrupt_requested {
+        "[stopping: aborting current operation…] "
     } else {
         ""
     };
@@ -620,11 +623,36 @@ mod tests {
             build_live_footer_lines(&status(None), &runtime, StatusTime::from_secs(0), 80, false);
 
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with(
-            "[interrupt: finishing current turn — Ctrl-C again to finalize] Phase 1/2"
-        ));
+        assert!(lines[0].starts_with("[stopping: aborting current operation…] Phase 1/2"));
         assert!(lines[1].contains("repair 1/2"));
         assert!(lines[1].contains("last: tool_args_path_normalized"));
+    }
+
+    #[test]
+    fn live_footer_force_finalize_prefix_snapshot() {
+        let runtime = RuntimeStatus {
+            command: Some(status_bus::CommandStatus {
+                excerpt: "sleep 600".to_string(),
+                cap_secs: 600,
+                started_at: StatusTime::from_secs(10),
+            }),
+            interrupt_requested: true,
+            force_finalize_requested: true,
+            ..RuntimeStatus::default()
+        };
+
+        let lines = build_live_footer_lines(
+            &status(None),
+            &runtime,
+            StatusTime::from_secs(12),
+            120,
+            false,
+        );
+
+        assert_eq!(
+            lines,
+            vec!["[stopping: force-finalizing…] cmd sleep 600 2s/600s"]
+        );
     }
 
     #[test]

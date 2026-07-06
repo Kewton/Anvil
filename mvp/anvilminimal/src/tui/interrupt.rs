@@ -3,12 +3,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::Write;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const INTERRUPT_NOTICE: &str = "interrupt requested; stopping after current operation";
+const INTERRUPT_NOTICE: &str = "interrupt requested; aborting current operation";
+const FORCE_INTERRUPT_NOTICE: &str = "interrupt requested again; force-finalizing immediately";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterruptEnv {
@@ -41,6 +42,7 @@ struct MonitorState {
 
 struct Active {
     flag: Arc<AtomicBool>,
+    force_flag: Arc<AtomicBool>,
     state: Arc<(Mutex<MonitorState>, Condvar)>,
     handle: Option<JoinHandle<()>>,
     raw_mode_active: bool,
@@ -49,6 +51,7 @@ struct Active {
 pub struct InterruptMonitor {
     inner: Option<Active>,
     dummy_flag: Arc<AtomicBool>,
+    dummy_force_flag: Arc<AtomicBool>,
 }
 
 impl InterruptMonitor {
@@ -58,13 +61,16 @@ impl InterruptMonitor {
 
     pub fn start_with_env(env: InterruptEnv) -> Self {
         let dummy_flag = Arc::new(AtomicBool::new(false));
+        let dummy_force_flag = Arc::new(AtomicBool::new(false));
         if !env.enabled || enable_raw_mode().is_err() {
             return Self {
                 inner: None,
                 dummy_flag,
+                dummy_force_flag,
             };
         }
         let flag = Arc::new(AtomicBool::new(false));
+        let force_flag = Arc::new(AtomicBool::new(false));
         let state = Arc::new((
             Mutex::new(MonitorState {
                 stop_requested: false,
@@ -74,26 +80,30 @@ impl InterruptMonitor {
             Condvar::new(),
         ));
         let thread_flag = flag.clone();
+        let thread_force_flag = force_flag.clone();
         let thread_state = state.clone();
         let handle = thread::Builder::new()
             .name("anvilminimal-interrupt".to_string())
-            .spawn(move || monitor_loop(thread_flag, thread_state))
+            .spawn(move || monitor_loop(thread_flag, thread_force_flag, thread_state))
             .ok();
         match handle {
             Some(handle) => Self {
                 inner: Some(Active {
                     flag,
+                    force_flag,
                     state,
                     handle: Some(handle),
                     raw_mode_active: true,
                 }),
                 dummy_flag,
+                dummy_force_flag,
             },
             None => {
                 let _ = disable_raw_mode();
                 Self {
                     inner: None,
                     dummy_flag,
+                    dummy_force_flag,
                 }
             }
         }
@@ -103,6 +113,7 @@ impl InterruptMonitor {
         Self {
             inner: None,
             dummy_flag: Arc::new(AtomicBool::new(value)),
+            dummy_force_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -113,10 +124,23 @@ impl InterruptMonitor {
         }
     }
 
+    pub fn force_interrupted(&self) -> bool {
+        match &self.inner {
+            Some(active) => active.force_flag.load(Ordering::SeqCst),
+            None => self.dummy_force_flag.load(Ordering::SeqCst),
+        }
+    }
+
     pub fn reset(&self) {
         match &self.inner {
-            Some(active) => active.flag.store(false, Ordering::SeqCst),
-            None => self.dummy_flag.store(false, Ordering::SeqCst),
+            Some(active) => {
+                active.flag.store(false, Ordering::SeqCst);
+                active.force_flag.store(false, Ordering::SeqCst);
+            }
+            None => {
+                self.dummy_flag.store(false, Ordering::SeqCst);
+                self.dummy_force_flag.store(false, Ordering::SeqCst);
+            }
         }
     }
 
@@ -199,7 +223,11 @@ impl Drop for PauseGuard {
     }
 }
 
-fn monitor_loop(flag: Arc<AtomicBool>, state: Arc<(Mutex<MonitorState>, Condvar)>) {
+fn monitor_loop(
+    flag: Arc<AtomicBool>,
+    force_flag: Arc<AtomicBool>,
+    state: Arc<(Mutex<MonitorState>, Condvar)>,
+) {
     let (lock, cvar) = &*state;
     loop {
         {
@@ -219,12 +247,17 @@ fn monitor_loop(flag: Arc<AtomicBool>, state: Arc<(Mutex<MonitorState>, Condvar)
         }
         match event::poll(POLL_INTERVAL) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(key)) if key.code == KeyCode::Esc => {
-                    emit_interrupt_feedback();
-                    flag.store(true, Ordering::SeqCst);
-                    crate::tui::status_bus::publish_global(
-                        crate::tui::status_bus::StatusEvent::InterruptRequested,
-                    );
+                Ok(Event::Key(key)) if is_interrupt_key(key.code, key.modifiers) => {
+                    match register_interrupt_press(&flag, &force_flag) {
+                        InterruptPress::First => {
+                            emit_interrupt_feedback(INTERRUPT_NOTICE);
+                            crate::tui::status_bus::publish_interrupt_requested();
+                        }
+                        InterruptPress::Force => {
+                            emit_interrupt_feedback(FORCE_INTERRUPT_NOTICE);
+                            crate::tui::status_bus::publish_force_finalize_requested();
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(_) => break,
@@ -235,10 +268,30 @@ fn monitor_loop(flag: Arc<AtomicBool>, state: Arc<(Mutex<MonitorState>, Condvar)
     }
 }
 
-fn emit_interrupt_feedback() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptPress {
+    First,
+    Force,
+}
+
+fn is_interrupt_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    code == KeyCode::Esc
+        || (code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL))
+}
+
+fn register_interrupt_press(flag: &AtomicBool, force_flag: &AtomicBool) -> InterruptPress {
+    if flag.swap(true, Ordering::SeqCst) {
+        force_flag.store(true, Ordering::SeqCst);
+        InterruptPress::Force
+    } else {
+        InterruptPress::First
+    }
+}
+
+fn emit_interrupt_feedback(message: &str) {
     let mut err = std::io::stderr().lock();
     let _ = err.write_all(b"\r\x1b[2K\r\n");
-    let _ = err.write_all(INTERRUPT_NOTICE.as_bytes());
+    let _ = err.write_all(message.as_bytes());
     let _ = err.write_all(b"\r\n");
     let _ = err.flush();
 }
@@ -265,7 +318,34 @@ mod tests {
     fn interrupt_preset_flag() {
         let monitor = InterruptMonitor::new_preset(true);
         assert!(monitor.interrupted());
+        assert!(!monitor.force_interrupted());
         monitor.reset();
         assert!(!monitor.interrupted());
+        assert!(!monitor.force_interrupted());
+    }
+
+    #[test]
+    fn interrupt_press_escalates_to_force() {
+        let flag = AtomicBool::new(false);
+        let force_flag = AtomicBool::new(false);
+
+        assert_eq!(
+            register_interrupt_press(&flag, &force_flag),
+            InterruptPress::First
+        );
+        assert!(flag.load(Ordering::SeqCst));
+        assert!(!force_flag.load(Ordering::SeqCst));
+        assert_eq!(
+            register_interrupt_press(&flag, &force_flag),
+            InterruptPress::Force
+        );
+        assert!(force_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn ctrl_c_key_is_interrupt_key() {
+        assert!(is_interrupt_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(is_interrupt_key(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(!is_interrupt_key(KeyCode::Char('c'), KeyModifiers::empty()));
     }
 }

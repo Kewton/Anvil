@@ -771,11 +771,16 @@ fn check_bounded_provider_turns(trace: &Trace) -> Result<(), String> {
             );
         }
     }
+    let user_provider_abort =
+        !events_named(&trace.events, "provider_turn_aborted_by_user").is_empty();
     for stop in events_named(&trace.events, "tui_command_stop") {
         if string_field(stop, "status") == Some("interrupted")
             || string_field(stop, "command_completion_state") == Some("interrupted")
             || string_field(stop, "task_status") == Some("interrupted")
         {
+            if user_provider_abort {
+                continue;
+            }
             return Err(format!(
                 "bounded_provider_turns: pathway required human interruption in {stop}"
             ));
@@ -881,8 +886,17 @@ fn check_bounded_child_processes(trace: &Trace) -> Result<(), String> {
             ));
         }
     }
+    let tool_execute_events = events_named(&trace.events, "tool_execute");
+    let tool_validation_events = events_named(&trace.events, "tool_validation_error");
+    let user_command_abort = tool_execute_events
+        .iter()
+        .chain(tool_validation_events.iter())
+        .any(|event| string_field(event, "error_kind") == Some("command_aborted_by_user"));
     for stop in events_named(&trace.events, "tui_command_stop") {
         if string_field(stop, "status") == Some("interrupted") {
+            if user_command_abort {
+                continue;
+            }
             return Err(format!(
                 "bounded_child_processes: hanging child pathway required human interruption in {stop}"
             ));

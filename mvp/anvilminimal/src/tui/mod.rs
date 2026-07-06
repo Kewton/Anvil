@@ -23,6 +23,9 @@ pub trait InteractionUi {
     fn before_tool_call(&self, name: &str) -> UiGuard;
     fn publish_status(&self, status: UiStatus);
     fn interrupted(&self) -> bool;
+    fn force_interrupted(&self) -> bool {
+        false
+    }
 }
 
 pub trait OutputRenderer {
@@ -116,6 +119,13 @@ impl InteractionUi for TerminalUi {
         self.interrupt
             .lock()
             .map(|monitor| monitor.interrupted())
+            .unwrap_or(false)
+    }
+
+    fn force_interrupted(&self) -> bool {
+        self.interrupt
+            .lock()
+            .map(|monitor| monitor.force_interrupted())
             .unwrap_or(false)
     }
 }

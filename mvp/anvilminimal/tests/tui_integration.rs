@@ -1,6 +1,7 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anvilminimal::config::{Action, Config, Provider};
 use anvilminimal::minimal_loop::loop_run::run_session_with_required_paths_with_ui;
@@ -190,6 +191,153 @@ impl InteractionUi for InterruptAfterUi {
     }
 }
 
+#[derive(Clone)]
+struct SleepingCloneClient {
+    label: &'static str,
+    sleep: Duration,
+    calls: Arc<AtomicUsize>,
+}
+
+impl SleepingCloneClient {
+    fn new(label: &'static str, sleep: Duration) -> Self {
+        Self {
+            label,
+            sleep,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl ChatClient for SleepingCloneClient {
+    fn label(&self) -> &str {
+        self.label
+    }
+
+    fn supports_native_tools(&self, _model: &str) -> bool {
+        true
+    }
+
+    fn boxed_clone(&self) -> Option<Box<dyn ChatClient>> {
+        Some(Box::new(self.clone()))
+    }
+
+    fn chat(
+        &mut self,
+        _model: &str,
+        _messages: &[ConversationMessage],
+        _tools: &[ToolSpec],
+        _native_tools_enabled: bool,
+    ) -> anyhow::Result<AssistantReply> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.sleep);
+        Ok(AssistantReply::text("late"))
+    }
+}
+
+struct TimedInterruptUi {
+    events: Mutex<Vec<String>>,
+    interrupt_at: Instant,
+    force_at: Option<Instant>,
+}
+
+impl TimedInterruptUi {
+    fn new(interrupt_after: Duration) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            interrupt_at: Instant::now() + interrupt_after,
+            force_at: None,
+        }
+    }
+}
+
+impl InteractionUi for TimedInterruptUi {
+    fn before_model_call(&self, label: &str) -> UiGuard {
+        self.events.lock().unwrap().push(format!("model:{label}"));
+        UiGuard::noop()
+    }
+
+    fn before_tool_call(&self, name: &str) -> UiGuard {
+        self.events.lock().unwrap().push(format!("tool:{name}"));
+        UiGuard::noop()
+    }
+
+    fn publish_status(&self, status: UiStatus) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("status:{}:{}", status.provider, status.model));
+    }
+
+    fn interrupted(&self) -> bool {
+        Instant::now() >= self.interrupt_at
+    }
+
+    fn force_interrupted(&self) -> bool {
+        self.force_at
+            .is_some_and(|force_at| Instant::now() >= force_at)
+    }
+}
+
+struct ToolTimedInterruptUi {
+    events: Mutex<Vec<String>>,
+    tool_started_at: Mutex<Option<Instant>>,
+    interrupt_after: Duration,
+    force_after: Duration,
+}
+
+impl ToolTimedInterruptUi {
+    fn new(interrupt_after: Duration, force_after: Duration) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            tool_started_at: Mutex::new(None),
+            interrupt_after,
+            force_after,
+        }
+    }
+
+    fn elapsed_since_tool_start(&self) -> Option<Duration> {
+        let started = *self.tool_started_at.lock().unwrap();
+        started.map(|started| started.elapsed())
+    }
+}
+
+impl InteractionUi for ToolTimedInterruptUi {
+    fn before_model_call(&self, label: &str) -> UiGuard {
+        self.events.lock().unwrap().push(format!("model:{label}"));
+        UiGuard::noop()
+    }
+
+    fn before_tool_call(&self, name: &str) -> UiGuard {
+        self.events.lock().unwrap().push(format!("tool:{name}"));
+        let mut started = self.tool_started_at.lock().unwrap();
+        if started.is_none() {
+            *started = Some(Instant::now());
+        }
+        UiGuard::noop()
+    }
+
+    fn publish_status(&self, status: UiStatus) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("status:{}:{}", status.provider, status.model));
+    }
+
+    fn interrupted(&self) -> bool {
+        self.elapsed_since_tool_start()
+            .is_some_and(|elapsed| elapsed >= self.interrupt_after)
+    }
+
+    fn force_interrupted(&self) -> bool {
+        self.elapsed_since_tool_start()
+            .is_some_and(|elapsed| elapsed >= self.force_after)
+    }
+}
+
 fn tui_command_stop_events(text: &str) -> Vec<serde_json::Value> {
     text.lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -224,6 +372,31 @@ fn assert_terminal_summary(summary: &str, status: &str) {
         "{summary}"
     );
     assert!(!summary.contains("Status: running"), "{summary}");
+}
+
+fn assert_recovery_artifacts_exist(root: &std::path::Path, events: &str) {
+    let recovery_event = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| {
+            event
+                .get("event")
+                .and_then(|value| value.as_str())
+                .is_some_and(|name| name == "recovery_prompt_saved")
+        })
+        .unwrap_or_else(|| panic!("missing recovery_prompt_saved event:\n{events}"));
+    let prompt_path = recovery_event
+        .get("recovery_prompt_path")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .expect("recovery prompt path");
+    let plan_path = recovery_event
+        .get("recovery_ultra_plan_path")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .expect("recovery ultra plan path");
+    assert!(root.join(prompt_path).is_file(), "{prompt_path}");
+    assert!(root.join(plan_path).is_file(), "{plan_path}");
 }
 
 fn two_phase_ultra_plan() -> anvilminimal::planner::ultra_plan::UltraPlan {
@@ -468,6 +641,92 @@ fn planner_uses_ui_for_planner_model_call() {
             .iter()
             .any(|event| event == "model:planner planner pm")
     );
+}
+
+#[test]
+fn in_flight_provider_interrupt_finishes_before_sleep_and_writes_terminal_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+    let plan_path = write_ultra_plan(dir.path());
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    cfg.chat_timeout_secs = 30;
+    let mut planner = SleepingCloneClient::new("planner", Duration::from_secs(30));
+    let mut execution = FakeClient::new("exec", Vec::new());
+    let ui = TimedInterruptUi::new(Duration::from_secs(1));
+
+    let started = Instant::now();
+    let err = anvilminimal::tui::slash::handle_command(
+        &format!("/run-ultra-plan {plan_path}"),
+        &cfg,
+        &mut planner,
+        &mut execution,
+        &ui,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("interrupted by user"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(planner.calls(), 1, "provider abort must not retry");
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    assert!(events.contains("\"event\":\"provider_turn_aborted_by_user\""));
+    assert!(events.contains("\"classification\":\"aborted_by_user\""));
+    assert!(!events.contains("\"event\":\"provider_turn_timeout\""));
+    assert_exactly_one_tui_stop(&events, "interrupted");
+    assert!(events.contains("\"failure_kind\":\"tui_command_interrupted\""));
+    assert_recovery_artifacts_exist(dir.path(), &events);
+    let summary =
+        std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
+    assert_terminal_summary(&summary, "interrupted");
+    assert!(summary.contains("Command status: interrupted"));
+}
+
+#[test]
+fn in_flight_bash_interrupt_force_finalizes_without_waiting_for_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+    let plan_path = write_ultra_plan(dir.path());
+    let mut cfg = config(dir.path().to_path_buf());
+    cfg.eval_events_path = Some(events_path.clone());
+    let step_json = implement_step_plan_json();
+    let mut planner = FakeClient::new("planner", vec![AssistantReply::text(step_json)]);
+    let mut execution = FakeClient::new(
+        "exec",
+        vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Bash",
+                json!({"command": "trap '' TERM; while :; do :; done"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }],
+    );
+    let ui = ToolTimedInterruptUi::new(Duration::from_millis(100), Duration::from_millis(300));
+
+    let started = Instant::now();
+    let err = anvilminimal::tui::slash::handle_command(
+        &format!("/run-ultra-plan {plan_path}"),
+        &cfg,
+        &mut planner,
+        &mut execution,
+        &ui,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("command_aborted_by_user"), "{err}");
+    assert!(err.contains("interrupted by user"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    assert!(events.contains("\"error_kind\":\"command_aborted_by_user\""));
+    assert_exactly_one_tui_stop(&events, "interrupted");
+    assert!(events.contains("\"failure_kind\":\"tui_command_interrupted\""));
+    let summary =
+        std::fs::read_to_string(events_path.parent().unwrap().join("summary.md")).unwrap();
+    assert_terminal_summary(&summary, "interrupted");
+    assert!(summary.contains("Command status: interrupted"));
 }
 
 #[test]
@@ -1004,6 +1263,7 @@ fn tui_slash_completion_guard_records_interrupted_mid_phase() {
     assert!(summary.contains("Command status: interrupted"));
     assert!(summary.contains("Failed phases:\n- p1 (interrupted)"));
     assert!(summary.contains("Pending phases:\n- p2 (pending)"));
+    assert_recovery_artifacts_exist(dir.path(), &events);
 }
 
 #[test]

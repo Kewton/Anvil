@@ -71,6 +71,7 @@ pub struct RuntimeStatus {
     pub stage: Option<String>,
     pub last_event: Option<String>,
     pub interrupt_requested: bool,
+    pub force_finalize_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +116,7 @@ pub enum StatusEvent {
         label: String,
     },
     InterruptRequested,
+    ForceFinalizeRequested,
 }
 
 #[derive(Debug)]
@@ -267,6 +269,10 @@ fn apply_event(status: &mut RuntimeStatus, event: StatusEvent) {
         StatusEvent::InterruptRequested => {
             status.interrupt_requested = true;
         }
+        StatusEvent::ForceFinalizeRequested => {
+            status.interrupt_requested = true;
+            status.force_finalize_requested = true;
+        }
     }
 }
 
@@ -337,6 +343,14 @@ pub fn publish_command_started(command: &std::process::Command, cap: Duration) -
 
 pub fn publish_command_finished() -> bool {
     publish_global(StatusEvent::CommandFinished)
+}
+
+pub fn publish_interrupt_requested() -> bool {
+    publish_global(StatusEvent::InterruptRequested)
+}
+
+pub fn publish_force_finalize_requested() -> bool {
+    publish_global(StatusEvent::ForceFinalizeRequested)
 }
 
 pub fn publish_eval_projection(event: &Value) -> bool {
@@ -473,6 +487,17 @@ mod tests {
         assert_eq!(snapshot.step.as_ref().unwrap().kind, "implement");
         assert_eq!(snapshot.provider.as_ref().unwrap().scope, "planner_step");
         assert!(snapshot.generation >= 3);
+    }
+
+    #[test]
+    fn bus_projects_force_finalize_interrupt() {
+        let (publisher, subscriber) = channel();
+
+        assert!(publisher.publish(StatusEvent::ForceFinalizeRequested));
+        let snapshot = subscriber.snapshot();
+
+        assert!(snapshot.interrupt_requested);
+        assert!(snapshot.force_finalize_requested);
     }
 
     #[test]

@@ -35,7 +35,7 @@ anvilminimal --provider ollama --model qwen3.6:27b-coding-nvfp4 \
 ## TUI
 
 Interactive TTY mode uses the same `anvil>` prompt and slash commands, plus
-terminal-only markdown rendering, spinner, ESC boundary interrupt, and a fixed
+terminal-only markdown rendering, spinner, Esc/Ctrl-C prompt interrupt, and a fixed
 footer. Disable paths:
 
 ```bash
