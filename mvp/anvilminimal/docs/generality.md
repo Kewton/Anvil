@@ -94,14 +94,31 @@ Measured evidence:
 - Q1-final used `gemini-3.5-flash` as the implementation and planner model on
   build `0604a76b` and produced 8/8 honest terminal states: 6 full, 1 reasoned
   partial, and 1 behavioral failed.
-- Local full round `test0704-999-Q1-6264656667686970_001` used a local
-  27b/35b Ollama pair and produced 8/8 honest terminal states but only 1/8
-  full. The local pair is CLI-viable, with full-pass evidence on the
-  `python-cli` scenario, but remains below the recommended tier for web
-  scenarios on this distribution. Planner/executor co-residency on the same
-  local host should use the local 600s provider-turn default and serial UAT
-  execution; override with `--chat-timeout-secs` only when recording a deliberate
-  calibration change.
+- Final local-model compatibility round
+  `test0704-999-Q1-62646566676869707172_001` used
+  `qwen3.6:27b-coding-nvfp4` as the local planner and `ornith:35b` as the
+  local executor. It produced 8/8 honest terminal states and 2/8 full passes:
+  CLI 1/2, web 1/6. The web full pass was CONTENT b, including browser
+  readiness, interaction evidence, persistence, release-gate pass, and full
+  earned assurance. The other 6/8 runs failed with concrete terminal reasons:
+  CLI b failed the Python behavior smoke probe, TOOL a hit a dangerous-command
+  policy boundary, TOOL b hit the `tsconfig` alias/baseUrl route-closure gap,
+  CONTENT a failed dependency setup lifecycle, GAME a failed multi-file
+  TypeScript coherence, and GAME b failed compile repair follow-through.
+  Verdict: the 27b/35b local pair is below the recommended tier for reliable
+  web delivery. CLI is moderately viable; web full-pass delivery is possible
+  but low-probability on this distribution. The recommended implementation tier
+  remains the `gemini-3.5-flash` class or above.
+- The local-model compatibility track left permanent, model-agnostic assets:
+  tool-argument path normalization and corrupted-prefix salvage; verifier
+  command transforms for shell-control splitting, `cd`/cwd normalization, and
+  output-pipe stripping; deterministic substitution after repeated verifier
+  policy rejection; deterministic scaffold completion; per-provider timeout
+  calibration; planner-call chokepoint instrumentation; and precise
+  exhaustion classification. The honest scope limit is that dialect coverage
+  was measured against this 27b/35b model pair. New model families may require a
+  new dialect-absorption round; that is expected bounded cost, not a portability
+  claim for unseen output dialects.
 
 ## Q1 Final Quality Baseline
 

@@ -39,6 +39,16 @@ Status: Q1 concluded on 2026-07-05.
 | Q1 residual corpus harvest | complete | 2026-07-05 | [generality.md#clause-evidence](generality.md#clause-evidence) |
 | Q1 boundedness closure | complete | 2026-07-05 | [boundedness-guarantees](#boundedness-guarantees) |
 
+## Local-Model Compatibility Track Cross-Reference
+
+Status: complete on 2026-07-06.
+
+| milestone | status | date | reference |
+|---|---|---|---|
+| Instructions 64-72 | complete | 2026-07-06 | Final local-tier verdict in [generality.md#recommended-model-tier](generality.md#recommended-model-tier); final distribution `test0704-999-Q1-62646566676869707172_001`. |
+| Corpus closure | complete | 2026-07-06 | Local residual and golden fixtures in [generality.md#clause-evidence](generality.md#clause-evidence). |
+| Runbook closure | complete | 2026-07-06 | Local-provider timeout and co-residency notes in [uat/scenarios.md#command-shape](uat/scenarios.md#command-shape). |
+
 ## Promotion-Path Incident Chain
 
 | incident | committed evidence | fix | permanent guard |
@@ -46,6 +56,29 @@ Status: Q1 concluded on 2026-07-05.
 | False-full promoted run: final acceptance reported `full_success` / `assurance_level=full` while browser readiness and interaction evidence were `not_applicable`. | `../../../workspace/management/runs/uat-test0704-40304445424346474848149505153545556-000/uat-report.md` | Instruction 57 introduced the earned-assurance invariant: full assurance is derived from executed gate statuses, and disconnected promoted-web gates fail loudly. | `acceptance_gates_disconnected` is added to release-gate reasons; `earned_assurance_for_completion` reduces assurance when gate telemetry and release-gate status disagree. |
 | UTF-8 boundary panic during promoted evidence scanning: substring extraction sliced inside a Japanese character and aborted before final acceptance. | `../../../workspace/management/runs/uat-test0704-403044454243464748481495051535455-000/uat-report.md` | Instruction 56 routed truncation through char-boundary helpers, including `floor_char_boundary` / `truncate_at_char_boundary`, and wrapped TUI slash-command execution with a terminal panic guard. | Multibyte truncation tests cover the helper path; `panic_caught` events distinguish a Rust panic from user abort or model failure. |
 | Dependency setup authority required after promotion: package state declared `autoprefixer`, but later verify/build lacked authority to reconcile missing installed dependencies. | `../../../workspace/management/runs/uat-test0704-4030444542434647484814950515354555657-000/uat-report.md` | Instruction 58 added run-level setup authority after promotion/manifest repair and boundary reconciliation for declared Node dependencies. | Later verify/contract steps inherit sanctioned setup authority when the run created the dependency need; absent authority still ends as `dependency_setup_authority_required`. |
+
+## Local-Model Compatibility Incident Chain
+
+| instruction | incident | fix | permanent guard |
+|---|---|---|---|
+| 64 | Local model tool calls emitted absolute workspace paths and corrupted path prefixes that were semantically workspace-relative but failed tool validation. | Tool-argument path normalization and corrupted-prefix salvage admit the mechanical dialect while preserving path confinement. | `tool_args_path_normalized` telemetry plus path-guard tests ensure repaired paths remain workspace-relative. |
+| 65 | Local planner verifier commands used shell-control variants and cwd wrappers that obscured a deterministic base check. | Plan-time verifier normalization splits safe shell-control forms and rewrites absolute workspace `cd` wrappers to cwd-relative verifier commands. | Planner sanitizer tests require normalized verifier commands to pass the same deterministic policy as authored commands. |
+| 66 | Scaffold/setup completion could strand after the model created only framework support files or omitted deterministic setup artifacts. | Deterministic scaffold completion materializes known setup members and reports remaining missing paths explicitly. | Setup-scaffold unit coverage and loop telemetry distinguish scaffold members from task artifacts. |
+| 67 | Runtime verifier execution did not fully match planner normalization, and local models added `2>&1 | tail/head -N` output pipes that masked base-command exit status. | The runtime boundary applies the same verifier normalization and strips output-limiting head/tail pipes while preserving the base command. | Runtime tests assert parity with plan-time normalization and emit `output_pipe_stripped` / normalization telemetry. |
+| 68 | Local provider turns and planner-call chokepoints were tuned for remote latency, causing honest local work to hit provider deadlines too early. | Per-provider defaults set local/Ollama provider turns to 600 seconds and remote API turns to 180 seconds, with explicit `--chat-timeout-secs` override. | Provider-call chokepoint telemetry records effective timeout source; conformance keeps bounded provider turns mandatory. |
+| 69 | Direct CLI runs could exit before completion finalization, and release/final fields could ignore a failed Python behavior probe. | The direct CLI entry now finalizes before exit, and earned-assurance fields consume `python-cli` behavior-probe results. | Python-CLI conformance rejects failed behavior probes that leave `full_success`, release pass, or runtime pass fields. |
+| 70 | Repeated verifier policy errors caused local-model phase death even when an expected-path deterministic substitute existed. | On the second identical verifier policy rejection within a step, the runner substitutes `test -f <expected_path>`, emits `verify_command_substituted`, and marks the oracle tier degraded. | Substitution tests assert continuation without hiding degradation; final acceptance gates remain unchanged. |
+| 71 | Iteration exhaustion could be reported as a bare budget label instead of the concrete artifact blocker. | Exhaustion now classifies non-scaffold missing artifacts as `artifact_follow_through_exhausted` with missing paths and stagnation-feedback count. | Conformance rejects terminal `loop_stop` / `tui_command_stop` reasons that strand at `max_iterations` or bare budget labels. |
+| 72 | Deep local web runs exposed two probe accounting gaps: `probe_script_error` was app-labeled, and observed state mutation could still leave persistence `not_evaluated:no_mutation_observed`. | Probe script errors use infrastructure taxonomy with setup remediation, and persistence evaluation reconciles observed state dimensions as the pre-reload mutation. | Interaction-probe tests cover infrastructure taxonomy, error propagation, remediation, and observed-mutation persistence evaluation. |
+
+Reviewer-process lessons:
+
+- Gate-status fields outrank labels. Reviews must quote the executed gate
+  fields that earned a status; `full_success`, `pass`, or `full` labels alone
+  are not evidence.
+- Landing conditions must be pre-committed before final rounds. The expected
+  terminal distribution, corpus harvest duty, and no-false-full criteria must
+  be written down before calling a measurement round final.
 
 ## Boundedness Guarantees
 
