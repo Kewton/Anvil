@@ -808,6 +808,16 @@ pub fn run_ultra_plan<P: PlannerLlm + ?Sized, C: MinimalChatClient>(
             }),
         );
         let phase_prompt = build_profiled_phase_prompt(&ultra_plan, phase, &snapshot, intent);
+        log_llm_event(
+            "ultra_phase_context_attached",
+            json!({
+                "phase_id": phase.id,
+                "profile": ultra_plan.profile.inference_id(),
+                "requested_port": requested_port,
+                "probe_port": snapshot.probe_port,
+                "prompt_chars": phase_prompt.chars().count(),
+            }),
+        );
         let summary = generate_and_run_step_plan(
             config,
             planner,

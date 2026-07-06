@@ -170,6 +170,7 @@ fn ultra_plan_run_step_planner_timeout_rewrites_terminal_summary() {
         }),
         "{log}"
     );
+    assert_provider_duration_after_phase_context(&log);
 }
 
 fn read_single_llm_log(state_root: &std::path::Path) -> String {
@@ -181,4 +182,32 @@ fn read_single_llm_log(state_root: &std::path::Path) -> String {
         .unwrap()
         .path();
     std::fs::read_to_string(session_dir.join("logs").join("llm-io.jsonl")).unwrap()
+}
+
+fn assert_provider_duration_after_phase_context(log: &str) {
+    let records = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let attach_index = records
+        .iter()
+        .position(|record| record["event"] == "ultra_phase_context_attached")
+        .expect("ultra_phase_context_attached event");
+    let end_index = records
+        .iter()
+        .enumerate()
+        .skip(attach_index + 1)
+        .find_map(|(index, record)| {
+            let event = record["event"].as_str().unwrap_or_default();
+            (event == "tui_command_stop" || event == "agent.minimal.ultra_phase.start")
+                .then_some(index)
+        })
+        .unwrap_or(records.len());
+
+    assert!(
+        records[attach_index + 1..end_index]
+            .iter()
+            .any(|record| record["event"] == "provider_turn_duration"),
+        "provider_turn_duration missing after ultra_phase_context_attached: {log}"
+    );
 }
