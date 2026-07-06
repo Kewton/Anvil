@@ -549,12 +549,6 @@ fn lock_state() -> MutexGuard<'static, PresentationState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-impl Default for NarrationMode {
-    fn default() -> Self {
-        Self::Normal
-    }
-}
-
 #[allow(dead_code)]
 fn _path_exists(path: &Path) -> bool {
     path.exists()

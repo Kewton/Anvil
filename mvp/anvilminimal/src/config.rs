@@ -42,8 +42,9 @@ pub enum Action {
     Runs,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum NarrationMode {
+    #[default]
     Normal,
     Quiet,
 }
