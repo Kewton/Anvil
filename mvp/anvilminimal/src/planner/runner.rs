@@ -332,12 +332,30 @@ fn planner_chat_with_request_retry(
     for request_attempt in 1..=PLANNER_PROVIDER_REQUEST_ATTEMPTS {
         let result = {
             let _guard = ui.before_model_call(&format!("planner {} {model}", client.label()));
-            provider_call::chat(client, config, scope, model, messages, &[], false).result
+            provider_call::chat_with_cancel(
+                client,
+                config,
+                provider_call::ProviderChatRequest {
+                    scope,
+                    model,
+                    messages,
+                    tools: &[],
+                    native_tools_enabled: false,
+                },
+                || ui.interrupted(),
+            )
+            .result
         };
         match result {
             Ok(reply) => return Ok(reply),
             Err(err) => {
                 last_error = Some(err.to_string());
+                if last_error
+                    .as_deref()
+                    .is_some_and(provider_call::is_aborted_by_user)
+                {
+                    break;
+                }
                 if request_attempt < PLANNER_PROVIDER_REQUEST_ATTEMPTS {
                     std::thread::sleep(PLANNER_PROVIDER_REQUEST_RETRY_DELAY);
                 }
@@ -345,6 +363,9 @@ fn planner_chat_with_request_retry(
         }
     }
     let last_error = last_error.unwrap_or_else(|| "unknown provider error".to_string());
+    if provider_call::is_aborted_by_user(&last_error) {
+        anyhow::bail!("{last_error}");
+    }
     if provider_call::is_scoped_timeout(scope, &last_error) {
         anyhow::bail!("{last_error}");
     }

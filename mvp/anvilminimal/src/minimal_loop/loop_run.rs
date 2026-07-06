@@ -826,14 +826,17 @@ pub(crate) fn run_session_with_outcome_with_options(
         let call_scope = provider_call_scope_for_options(&options, pending_feedback.as_deref());
         let chat_outcome = {
             let _guard = ui.before_model_call(&label);
-            provider_call::chat(
+            provider_call::chat_with_cancel(
                 client,
                 config,
-                call_scope,
-                &config.model,
-                &request_messages,
-                &request_tools,
-                native_tools_enabled,
+                provider_call::ProviderChatRequest {
+                    scope: call_scope,
+                    model: &config.model,
+                    messages: &request_messages,
+                    tools: &request_tools,
+                    native_tools_enabled,
+                },
+                || ui.interrupted(),
             )
         };
         let provider_turn_elapsed = chat_outcome.elapsed;
