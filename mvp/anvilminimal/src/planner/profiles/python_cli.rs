@@ -44,6 +44,14 @@ impl DomainProfile for PythonCliProfile {
         scaffold_paths(root)
     }
 
+    fn complete_scaffold(
+        &self,
+        root: &Path,
+        missing_paths: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        complete_scaffold(root, missing_paths)
+    }
+
     fn verify_final(&self, root: &Path, _goal: &str) -> VerificationReport {
         let invariant = verify_invariant_contract(root);
         if !invariant.is_pass() {
@@ -382,6 +390,88 @@ fn scaffold_paths(root: &Path) -> Vec<String> {
         "pyproject.toml".to_string(),
         format!("src/{}/main.py", package_name(root)),
     ]
+}
+
+pub fn complete_scaffold(root: &Path, missing_paths: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut created = Vec::new();
+    let entrypoint_rel = missing_paths
+        .iter()
+        .find(|path| python_entrypoint_rel(path))
+        .cloned()
+        .unwrap_or_else(|| format!("src/{}/main.py", package_name(root)));
+    let package = entrypoint_rel
+        .strip_prefix("src/")
+        .and_then(|tail| tail.strip_suffix("/main.py"))
+        .filter(|name| safe_python_package_name(name))
+        .unwrap_or(DEFAULT_PACKAGE);
+
+    for rel in missing_paths {
+        if rel == "pyproject.toml" {
+            if write_absent(&root.join(rel), &canonical_pyproject(package))? {
+                created.push(rel.clone());
+            }
+            continue;
+        }
+        if python_entrypoint_rel(rel) && write_absent(&root.join(rel), canonical_main_py())? {
+            make_entrypoint_executable(root)?;
+            created.push(rel.clone());
+        }
+    }
+    Ok(created)
+}
+
+fn python_entrypoint_rel(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized.starts_with("src/")
+        && normalized.ends_with("/main.py")
+        && normalized
+            .strip_prefix("src/")
+            .and_then(|tail| tail.strip_suffix("/main.py"))
+            .is_some_and(safe_python_package_name)
+}
+
+fn safe_python_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && !name.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+}
+
+fn write_absent(path: &Path, content: &str) -> anyhow::Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, content)?;
+    Ok(true)
+}
+
+fn canonical_pyproject(package: &str) -> String {
+    let script = package.replace('_', "-");
+    format!(
+        "[project]\nname = \"{script}\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = []\n\n[project.scripts]\n{script} = \"{package}.main:main\"\n"
+    )
+}
+
+fn canonical_main_py() -> &'static str {
+    r#"#!/usr/bin/env python3
+import sys
+
+
+def main() -> int:
+    data = " ".join(sys.argv[1:]).strip() or sys.stdin.read().strip()
+    if not data:
+        data = "ready"
+    print(f"anvil_app: {data}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"#
 }
 
 fn verify_invariant_contract(root: &Path) -> VerificationReport {
@@ -745,5 +835,65 @@ SyntaxError: invalid syntax
     fn package_name_normalizes_project_name() {
         assert_eq!(python_package_from_project_name("hello-cli"), "hello_cli");
         assert_eq!(python_package_from_project_name("7-tool"), "_7_tool");
+    }
+
+    #[test]
+    fn complete_scaffold_creates_python_cli_pyproject_and_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let created = complete_scaffold(
+            dir.path(),
+            &[
+                "pyproject.toml".to_string(),
+                "src/csv_stats/main.py".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            created,
+            vec![
+                "pyproject.toml".to_string(),
+                "src/csv_stats/main.py".to_string()
+            ]
+        );
+        let pyproject = std::fs::read_to_string(dir.path().join("pyproject.toml")).unwrap();
+        assert!(pyproject.contains("name = \"csv-stats\""), "{pyproject}");
+        assert!(
+            pyproject.contains("csv-stats = \"csv_stats.main:main\""),
+            "{pyproject}"
+        );
+        let main = std::fs::read_to_string(dir.path().join("src/csv_stats/main.py")).unwrap();
+        assert!(main.contains("def main()"), "{main}");
+        assert!(verify_invariant_contract(dir.path()).is_pass());
+    }
+
+    #[test]
+    fn complete_scaffold_never_overwrites_python_cli_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/anvil_app")).unwrap();
+        let pyproject = "[project]\nname = \"custom-app\"\nversion = \"9.9.9\"\n";
+        let main = "print('custom')\n";
+        std::fs::write(dir.path().join("pyproject.toml"), pyproject).unwrap();
+        std::fs::write(dir.path().join("src/anvil_app/main.py"), main).unwrap();
+
+        let created = complete_scaffold(
+            dir.path(),
+            &[
+                "pyproject.toml".to_string(),
+                "src/anvil_app/main.py".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert!(created.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("pyproject.toml")).unwrap(),
+            pyproject
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/anvil_app/main.py")).unwrap(),
+            main
+        );
     }
 }

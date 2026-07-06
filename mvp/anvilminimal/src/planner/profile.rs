@@ -69,6 +69,14 @@ pub trait DomainProfile: Sync {
         Vec::new()
     }
 
+    fn complete_scaffold(
+        &self,
+        _root: &Path,
+        _missing_paths: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     fn verify_final(&self, _root: &Path, _goal: &str) -> VerificationReport {
         VerificationReport::pass()
     }
@@ -307,6 +315,14 @@ impl DomainProfile for NextjsProfile {
 
     fn setup_scaffold_paths(&self, root: &Path) -> Vec<String> {
         crate::planner::profiles::nextjs::setup_scaffold_paths(root)
+    }
+
+    fn complete_scaffold(
+        &self,
+        root: &Path,
+        missing_paths: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        crate::planner::profiles::nextjs::complete_scaffold(root, missing_paths)
     }
 
     fn verify_final(&self, root: &Path, goal: &str) -> VerificationReport {
@@ -844,6 +860,14 @@ pub fn profile_expected_paths(root: &Path, profile: &str, goal: &str) -> Vec<Str
 
 pub fn profile_setup_scaffold_paths(root: &Path, profile: &str) -> Vec<String> {
     domain_profile(profile).setup_scaffold_paths(root)
+}
+
+pub fn profile_complete_scaffold(
+    root: &Path,
+    profile: &str,
+    missing_paths: &[String],
+) -> anyhow::Result<Vec<String>> {
+    domain_profile(profile).complete_scaffold(root, missing_paths)
 }
 
 pub fn profile_quality_expectations(
