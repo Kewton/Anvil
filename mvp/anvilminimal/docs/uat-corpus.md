@@ -50,6 +50,28 @@ surface wait selected a hidden leading `data-anvil-state` node before later
 visible controls. This is a known probe calibration limit and must remain an
 honest failed fixture until the probe selection is changed deliberately.
 
+The local-tier Q1 round harvests are:
+
+```sh
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-999-Q1-6264656667686970_001/game_b \
+  local-q1-game-b-artifact-stagnation
+
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-999-Q1-6264656667686970_001/tool_b \
+  local-q1-tool-b-output-pipe-verify
+```
+
+`local-q1-game-b-artifact-stagnation` records the missing-component recovery
+shape where `src/components/GameBoard.tsx` and `src/hooks/useGame.ts` were
+requested but artifact recovery exhausted before a complete route-bound game
+surface existed.
+
+`local-q1-tool-b-output-pipe-verify` records the Todo app source state from the
+run whose runtime verifier attempted `npm run build 2>&1 | tail -80`; that
+shape must be normalized to the base build command rather than rejected or
+allowed to mask the build exit status.
+
 The script copies `src/**`, `package.json`, and common Next.js/TypeScript/
 Tailwind/PostCSS config files. It intentionally does not copy `node_modules`,
 `.next`, `.anvil`, lockfiles, logs, screenshots, or other generated artifacts.

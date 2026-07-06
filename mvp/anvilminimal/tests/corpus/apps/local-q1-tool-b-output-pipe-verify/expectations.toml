@@ -1,0 +1,39 @@
+case_id = "local-q1-tool-b-output-pipe-verify"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-999-Q1-6264656667686970_001/tool_b"
+required_paths = ["package.json", "src/app/page.tsx"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "user_input_or_action", "visible_state_change", "persistence", "nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "build_command_or_dependency_missing_boundary", "implementation_artifact", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence", "interactive_ui_source_evidence", "non_static_screen_evidence", "persistence_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["todo", "localStorage"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/lib/todo-storage.ts"]
+exclude = []
+
+[evidence]
+build_command_or_dependency_missing_boundary = "Strong"
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+persistence_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_passed"
+
+[json_fields]
+fixtures/output-pipe-verify.json:shape = "output_pipe_verify"
+fixtures/output-pipe-verify.json:original_suffix = "2>&1 | tail -80"
+fixtures/output-pipe-verify.json:expected_runtime_kind = "output_pipe_stripped"
+fixtures/output-pipe-verify.json:base_command = "npm run build"

@@ -1,0 +1,8 @@
+{
+  "shape": "output_pipe_verify",
+  "source_round": "test0704-999-Q1-6264656667686970_001",
+  "scenario": "TOOL b",
+  "original_suffix": "2>&1 | tail -80",
+  "expected_runtime_kind": "output_pipe_stripped",
+  "base_command": "npm run build"
+}

@@ -94,6 +94,14 @@ Measured evidence:
 - Q1-final used `gemini-3.5-flash` as the implementation and planner model on
   build `0604a76b` and produced 8/8 honest terminal states: 6 full, 1 reasoned
   partial, and 1 behavioral failed.
+- Local full round `test0704-999-Q1-6264656667686970_001` used a local
+  27b/35b Ollama pair and produced 8/8 honest terminal states but only 1/8
+  full. The local pair is CLI-viable, with full-pass evidence on the
+  `python-cli` scenario, but remains below the recommended tier for web
+  scenarios on this distribution. Planner/executor co-residency on the same
+  local host should use the local 600s provider-turn default and serial UAT
+  execution; override with `--chat-timeout-secs` only when recording a deliberate
+  calibration change.
 
 ## Q1 Final Quality Baseline
 
@@ -137,6 +145,7 @@ behavioral failed distribution.
 | App evidence detectors and interaction probe selection are fixture-backed. | M5 Round A four runs | [test0702_008](../tests/corpus/apps/test0702_008/expectations.toml), [test0703_002](../tests/corpus/apps/test0703_002/expectations.toml), [test0703_005_4](../tests/corpus/apps/test0703_005_4/expectations.toml), [test0704_001](../tests/corpus/apps/test0704_001/expectations.toml) |
 | The second corpus round confirms the same detectors over a new harvested app snapshot. | M5 Round B | [test0704_003](../tests/corpus/apps/test0704_003/expectations.toml) |
 | Q1-final residuals are corpus-backed: persistence `not_evaluated` must render a reason, and the GAME b HTTP-200 hidden-first surface failure is recorded as a probe calibration limit. | Q1-final: `test0704-999-Q1-62_001` TOOL a and GAME b | [q1-final-tool-a-persistence-not-evaluated](../tests/corpus/apps/q1-final-tool-a-persistence-not-evaluated/expectations.toml), [q1-final-game-b-rendered-hidden-probe-limit](../tests/corpus/apps/q1-final-game-b-rendered-hidden-probe-limit/expectations.toml) |
+| Local-tier residuals are corpus-backed: GAME b records the artifact-stagnation/missing-component shape, and TOOL b records the output-pipe verify shape that must normalize instead of blocking. | Local full round: `test0704-999-Q1-6264656667686970_001` GAME b and TOOL b | [local-q1-game-b-artifact-stagnation](../tests/corpus/apps/local-q1-game-b-artifact-stagnation/expectations.toml), [local-q1-tool-b-output-pipe-verify](../tests/corpus/apps/local-q1-tool-b-output-pipe-verify/expectations.toml) |
 | Guardrails are permanent and cheap enough to run in CI. | M6 docs and tests | `cargo test --test corpus_regression`, `cargo test --test generality_guardrails`, `cargo test --test conformance`, plus the scenario contract golden tests named below. |
 
 ## Required Gates

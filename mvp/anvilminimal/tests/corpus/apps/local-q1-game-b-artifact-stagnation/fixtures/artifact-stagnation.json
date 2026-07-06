@@ -1,0 +1,8 @@
+{
+  "shape": "artifact_stagnation",
+  "source_round": "test0704-999-Q1-6264656667686970_001",
+  "scenario": "GAME b",
+  "missing_component": "src/components/GameBoard.tsx",
+  "missing_hook": "src/hooks/useGame.ts",
+  "terminal_reason": "artifact_recovery_exhausted"
+}

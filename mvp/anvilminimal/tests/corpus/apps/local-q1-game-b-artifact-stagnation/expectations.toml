@@ -1,0 +1,42 @@
+case_id = "local-q1-game-b-artifact-stagnation"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0704-999-Q1-6264656667686970_001/game_b"
+required_paths = ["package.json", "src/app/page.tsx", "src/components/GameBoard.tsx", "src/hooks/useGame.ts"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule", "nextjs_route"]
+required_evidence = ["nextjs_route_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["invader", "laser", "score"]
+
+[route_closure]
+include = []
+exclude = []
+
+[evidence]
+build_command_or_dependency_missing_boundary = "Strong"
+implementation_artifact = "Absent"
+interactive_ui_source_evidence = "Absent"
+non_static_screen_evidence = "Absent"
+visible_interactive_surface_evidence = "Absent"
+user_input_handler_evidence = "Absent"
+stateful_update_evidence = "Absent"
+challenge_or_adversary_evidence = "Absent"
+score_or_progression_evidence = "Absent"
+failure_or_collision_evidence = "Absent"
+restart_or_recoverable_state_evidence = "Absent"
+nextjs_route_evidence = "Absent"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[json_fields]
+fixtures/artifact-stagnation.json:shape = "artifact_stagnation"
+fixtures/artifact-stagnation.json:missing_component = "src/components/GameBoard.tsx"
+fixtures/artifact-stagnation.json:missing_hook = "src/hooks/useGame.ts"
+fixtures/artifact-stagnation.json:terminal_reason = "artifact_recovery_exhausted"
