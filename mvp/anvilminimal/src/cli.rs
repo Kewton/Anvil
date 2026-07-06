@@ -52,6 +52,8 @@ pub struct Cli {
     pub resume: Option<String>,
     #[arg(long, action = ArgAction::SetTrue)]
     pub offline: bool,
+    #[arg(long, action = ArgAction::SetTrue, help = "Keep presentation narration quiet")]
+    pub quiet: bool,
     #[arg(long, default_value = "http://localhost:11434")]
     pub ollama_host: String,
     #[arg(long, default_value_t = 8_192)]
@@ -105,6 +107,12 @@ mod tests {
     fn help_includes_runs() {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--runs"));
+    }
+
+    #[test]
+    fn help_includes_quiet() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--quiet"));
     }
 
     #[test]

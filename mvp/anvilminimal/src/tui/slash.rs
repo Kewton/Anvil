@@ -300,6 +300,14 @@ pub fn handle_command(
                     bail!("{error}");
                 }
                 confirm_resume(&config, &resume)?;
+                let progress = crate::tui::presentation::PlanProgress {
+                    completed_phases: resume.completed_phase_ids.clone(),
+                    current_phase: None,
+                    current_step: None,
+                };
+                crate::tui::presentation::emit_ultra_plan_card(&resume.plan, &progress);
+                let plan_card =
+                    crate::tui::presentation::render_ultra_plan_card(&resume.plan, &progress);
                 crate::runs::emit_resume_start(&config, &resume);
                 let output = crate::planner::run_ultra_plan_with_ui(
                     planner,
@@ -308,7 +316,12 @@ pub fn handle_command(
                     &config,
                     ui,
                 )?;
-                Ok(format!("{}\n\n{}", resume.confirmation_card(), output))
+                Ok(format!(
+                    "{}\n\n{}\n\n{}",
+                    resume.confirmation_card(),
+                    plan_card,
+                    output
+                ))
             }
             "/setup-interaction-probe" => {
                 let report =
@@ -775,6 +788,7 @@ mod tests {
             resume: None,
             fresh_session: false,
             no_footer: false,
+            narration: crate::config::NarrationMode::Normal,
             profile: "generic".to_string(),
             profile_explicit: false,
             profile_inference: None,

@@ -1,0 +1,742 @@
+use std::collections::BTreeMap;
+use std::io::IsTerminal;
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use serde_json::Value;
+
+use crate::config::{Config, NarrationMode};
+use crate::planner::sanitizer::SanitizerReport;
+use crate::planner::step_plan::StepPlan;
+use crate::planner::ultra_plan::UltraPlan;
+use crate::tui::OutputRenderer;
+
+const GOAL_WIDTH: usize = 120;
+const PHASE_WIDTH: usize = 96;
+const STEP_WIDTH: usize = 96;
+const ACTIVITY_WIDTH: usize = 140;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanProgress {
+    pub completed_phases: Vec<String>,
+    pub current_phase: Option<String>,
+    pub current_step: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PhaseProjection {
+    id: String,
+    prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StepProjection {
+    id: String,
+    kind: String,
+    instruction: String,
+    verify_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UltraPlanProjection {
+    goal: String,
+    profile: String,
+    phases: Vec<PhaseProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StepPlanProjection {
+    phase: String,
+    steps: Vec<StepProjection>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PresentationState {
+    enabled: bool,
+    mode: NarrationMode,
+    ultra_plan: Option<UltraPlanProjection>,
+    current_step_plan: Option<StepPlanProjection>,
+    progress: PlanProgress,
+    current_activity: Option<String>,
+}
+
+static PRESENTATION: OnceLock<Mutex<PresentationState>> = OnceLock::new();
+
+fn global() -> &'static Mutex<PresentationState> {
+    PRESENTATION.get_or_init(|| {
+        Mutex::new(PresentationState {
+            mode: NarrationMode::Quiet,
+            ..PresentationState::default()
+        })
+    })
+}
+
+pub struct PresentationGuard {
+    previous: PresentationState,
+}
+
+impl Drop for PresentationGuard {
+    fn drop(&mut self) {
+        *lock_state() = self.previous.clone();
+    }
+}
+
+pub fn install(config: &Config) -> PresentationGuard {
+    let mut state = lock_state();
+    let previous = state.clone();
+    state.enabled = !config.narration.is_quiet();
+    state.mode = config.narration;
+    PresentationGuard { previous }
+}
+
+pub fn installed_quiet() -> bool {
+    let state = lock_state();
+    !state.enabled || state.mode.is_quiet()
+}
+
+pub fn emit_ultra_plan_card(plan: &UltraPlan, progress: &PlanProgress) {
+    update_ultra_plan(plan);
+    update_progress(progress);
+    emit_markdown(&render_ultra_plan_card(plan, progress));
+}
+
+pub fn emit_step_plan_block(
+    phase_name: &str,
+    plan: &StepPlan,
+    sanitizer_report: Option<&SanitizerReport>,
+) {
+    update_step_plan(phase_name, plan);
+    emit_markdown(&render_step_plan_block(phase_name, plan, sanitizer_report));
+}
+
+pub fn project_event(event: &Value) {
+    let Some(line) = render_activity_line(event) else {
+        update_progress_from_event(event, None);
+        return;
+    };
+    update_progress_from_event(event, Some(line.clone()));
+    emit_markdown(&line);
+}
+
+pub fn render_current_plan() -> String {
+    let state = lock_state().clone();
+    let Some(plan) = state.ultra_plan else {
+        return "No active plan projection is available.".to_string();
+    };
+    let plan = UltraPlan {
+        goal: plan.goal,
+        profile: plan.profile,
+        style: "projection".to_string(),
+        intent: "current".to_string(),
+        phases: plan
+            .phases
+            .into_iter()
+            .map(|phase| crate::planner::ultra_plan::UltraPhase {
+                id: phase.id,
+                prompt: phase.prompt,
+            })
+            .collect(),
+    };
+    let mut out = render_ultra_plan_card(&plan, &state.progress);
+    if let Some(step_plan) = state.current_step_plan {
+        out.push_str("\n\n");
+        out.push_str(&render_step_projection_block(&step_plan, &state.progress));
+    }
+    if let Some(activity) = state.current_activity {
+        out.push_str("\n\n");
+        out.push_str("Current activity: ");
+        out.push_str(&fit(&activity, ACTIVITY_WIDTH));
+    }
+    out
+}
+
+pub fn render_ultra_plan_card(plan: &UltraPlan, progress: &PlanProgress) -> String {
+    let port = crate::planner::signals::requested_port_from_text(&plan.goal)
+        .map(|port| port.to_string())
+        .unwrap_or_else(|| "not specified".to_string());
+    let assurance = if plan.profile == "generic" {
+        "earned after final acceptance; static until gates run"
+    } else {
+        "earned after final acceptance re-verifies all gates"
+    };
+    let mut lines = vec![
+        "### Plan".to_string(),
+        format!("- Goal: {}", fit(&plan.goal, GOAL_WIDTH)),
+        format!("- Profile: {}", plan.profile),
+        format!("- Port: {port}"),
+        format!("- Assurance expectation: {assurance}"),
+        "- Phases:".to_string(),
+    ];
+    for (index, phase) in plan.phases.iter().enumerate() {
+        let mark = phase_mark(&phase.id, progress);
+        lines.push(format!(
+            "{}. {} {} - {}",
+            index + 1,
+            mark,
+            phase.id,
+            fit(&phase.prompt, PHASE_WIDTH)
+        ));
+    }
+    let skipped = progress
+        .completed_phases
+        .iter()
+        .filter(|id| !plan.phases.iter().any(|phase| &phase.id == *id))
+        .map(|id| format!("✓ {id}"))
+        .collect::<Vec<_>>();
+    if !skipped.is_empty() {
+        lines.push(format!(
+            "- Completed before this plan: {}",
+            skipped.join(", ")
+        ));
+    }
+    lines.join("\n")
+}
+
+pub fn render_step_plan_block(
+    phase_name: &str,
+    plan: &StepPlan,
+    sanitizer_report: Option<&SanitizerReport>,
+) -> String {
+    let projection = step_projection(phase_name, plan);
+    let mut out = render_step_projection_block(&projection, &PlanProgress::default());
+    if let Some(summary) = sanitizer_report.and_then(sanitizer_summary) {
+        out.push('\n');
+        out.push_str("plan normalized: ");
+        out.push_str(&summary);
+    }
+    out
+}
+
+pub fn render_activity_line(event: &Value) -> Option<String> {
+    let name = event.get("event").and_then(Value::as_str)?;
+    match name {
+        "ultra_phase_start" => {
+            let index = event
+                .get("phase_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let total = event
+                .get("total_phases")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let phase = text(event, "phase_id").unwrap_or_else(|| "unknown".to_string());
+            Some(format!("── Phase {index}/{total}: {} ──", fit(&phase, 72)))
+        }
+        "tool_call_raw" => Some(format!("→ {}", tool_start_label(event))),
+        "tool_execute" => {
+            let name = text(event, "name").unwrap_or_else(|| "tool".to_string());
+            let status = text(event, "status").unwrap_or_default();
+            if status == "ok" {
+                Some(format!("✓ {name} ok"))
+            } else {
+                let kind = text(event, "error_kind").unwrap_or_else(|| "error".to_string());
+                Some(format!("✗ {name} {kind}"))
+            }
+        }
+        "tool_validation_error" | "tool_policy_error" => {
+            let name = text(event, "name").unwrap_or_else(|| "tool".to_string());
+            let kind = text(event, "error_kind")
+                .or_else(|| text(event, "policy_error_kind"))
+                .unwrap_or_else(|| "validation_error".to_string());
+            Some(format!("✗ {name} {kind}"))
+        }
+        "step_verify_failure" => {
+            let reason =
+                text(event, "primary_reason").unwrap_or_else(|| "verify failed".to_string());
+            Some(format!("✗ verify {}", fit(&reason, 100)))
+        }
+        "step_verify_repair" | "verify_repair_turn" | "verify_repair_progress" => {
+            let attempt = event
+                .get("repair_attempt")
+                .or_else(|| event.get("attempt"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let max = event
+                .get("max_repair_turns")
+                .or_else(|| event.get("max"))
+                .and_then(Value::as_u64)
+                .unwrap_or(2);
+            let target = text(event, "repair_target")
+                .or_else(|| text(event, "target"))
+                .unwrap_or_else(|| "repair".to_string());
+            Some(format!("↻ repair {attempt}/{max}: {}", fit(&target, 96)))
+        }
+        "final_acceptance_repair_start" => {
+            let attempt = event
+                .get("repair_attempt")
+                .or_else(|| event.get("attempt"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            let max = event
+                .get("max_repair_turns")
+                .or_else(|| event.get("max"))
+                .and_then(Value::as_u64)
+                .unwrap_or(2);
+            let target = text(event, "repair_target")
+                .or_else(|| text(event, "target"))
+                .unwrap_or_else(|| "final acceptance".to_string());
+            Some(format!("↻ repair {attempt}/{max}: {}", fit(&target, 96)))
+        }
+        "browser_probe" => {
+            let status = text(event, "status").unwrap_or_default();
+            if event.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                let code = event
+                    .get("http_status")
+                    .and_then(Value::as_u64)
+                    .map(|code| format!("HTTP {code}"))
+                    .unwrap_or_else(|| "ok".to_string());
+                Some(format!("✓ probe: {code}"))
+            } else if status.is_empty() {
+                Some("→ probe: navigating".to_string())
+            } else {
+                let kind = text(event, "failure_kind").unwrap_or(status);
+                Some(format!("✗ probe: {}", fit(&kind, 96)))
+            }
+        }
+        "browser_interaction_probe" => {
+            if event.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                Some("✓ probe: interaction ok".to_string())
+            } else {
+                let kind = text(event, "failure_kind")
+                    .or_else(|| text(event, "status"))
+                    .unwrap_or_else(|| "interaction failed".to_string());
+                Some(format!("✗ probe: {}", fit(&kind, 96)))
+            }
+        }
+        "dependency_build_lifecycle" => {
+            let status = text(event, "status").unwrap_or_else(|| "dependency".to_string());
+            Some(format!("→ npm install {status}"))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+pub fn reset_for_test() {
+    *lock_state() = PresentationState {
+        enabled: false,
+        mode: NarrationMode::Normal,
+        ..PresentationState::default()
+    };
+}
+
+#[cfg(test)]
+pub fn set_plan_for_test(plan: &UltraPlan, progress: PlanProgress, activity: Option<String>) {
+    update_ultra_plan(plan);
+    update_progress(&progress);
+    lock_state().current_activity = activity;
+}
+
+fn update_ultra_plan(plan: &UltraPlan) {
+    let mut state = lock_state();
+    state.ultra_plan = Some(UltraPlanProjection {
+        goal: plan.goal.clone(),
+        profile: plan.profile.clone(),
+        phases: plan
+            .phases
+            .iter()
+            .map(|phase| PhaseProjection {
+                id: phase.id.clone(),
+                prompt: phase.prompt.clone(),
+            })
+            .collect(),
+    });
+}
+
+fn update_step_plan(phase_name: &str, plan: &StepPlan) {
+    lock_state().current_step_plan = Some(step_projection(phase_name, plan));
+}
+
+fn update_progress(progress: &PlanProgress) {
+    lock_state().progress = progress.clone();
+}
+
+fn update_progress_from_event(event: &Value, activity: Option<String>) {
+    let mut state = lock_state();
+    if let Some(activity) = activity {
+        state.current_activity = Some(activity);
+    }
+    let name = event.get("event").and_then(Value::as_str).unwrap_or("");
+    match name {
+        "ultra_phase_start" => {
+            state.progress.current_phase = text(event, "phase_id");
+            state.progress.current_step = None;
+        }
+        "ultra_phase_complete" | "ultra_phase_execute_complete" => {
+            if let Some(phase) = text(event, "phase_id")
+                && !state.progress.completed_phases.contains(&phase)
+            {
+                state.progress.completed_phases.push(phase);
+            }
+        }
+        "step_prompt_contract" => {
+            state.progress.current_step = text(event, "step_id");
+        }
+        _ => {}
+    }
+}
+
+fn render_step_projection_block(plan: &StepPlanProjection, progress: &PlanProgress) -> String {
+    let mut lines = vec![format!("#### Phase: {}", fit(&plan.phase, PHASE_WIDTH))];
+    for (index, step) in plan.steps.iter().enumerate() {
+        let mark = if progress.current_step.as_deref() == Some(step.id.as_str()) {
+            "▶"
+        } else {
+            "○"
+        };
+        let verify = if step.verify_count == 0 {
+            "verify 0".to_string()
+        } else {
+            format!("verify {}", step.verify_count)
+        };
+        lines.push(format!(
+            "{}. {} [{}] {} ({verify})",
+            index + 1,
+            mark,
+            step.kind,
+            fit(&step.instruction, STEP_WIDTH)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn step_projection(phase_name: &str, plan: &StepPlan) -> StepPlanProjection {
+    StepPlanProjection {
+        phase: phase_name.to_string(),
+        steps: plan
+            .steps
+            .iter()
+            .map(|step| StepProjection {
+                id: step.id.clone(),
+                kind: step.kind.clone(),
+                instruction: step.instruction.clone(),
+                verify_count: step.verify.len(),
+            })
+            .collect(),
+    }
+}
+
+fn sanitizer_summary(report: &SanitizerReport) -> Option<String> {
+    if report.is_empty() {
+        return None;
+    }
+    let mut counts = BTreeMap::<String, usize>::new();
+    add_count(&mut counts, "goal_truncated", report.goal_truncations.len());
+    add_count(
+        &mut counts,
+        "verify_command_normalized",
+        report.normalized_commands.len(),
+    );
+    add_count(
+        &mut counts,
+        "shell_control_split",
+        report.shell_control_splits.len(),
+    );
+    add_count(
+        &mut counts,
+        "command_removed",
+        report.removed_commands.len(),
+    );
+    add_count(
+        &mut counts,
+        "verify_command_substituted",
+        report.substituted_commands.len(),
+    );
+    add_count(&mut counts, "command_moved", report.moved_commands.len());
+    add_count(
+        &mut counts,
+        "setup_verify_relocated",
+        report.setup_verify_relocations.len(),
+    );
+    add_count(
+        &mut counts,
+        "command_dropped",
+        report.dropped_commands.len(),
+    );
+    add_count(&mut counts, "step_retyped", report.retyped_steps.len());
+    add_count(
+        &mut counts,
+        "instruction_truncated",
+        report.instruction_truncations.len(),
+    );
+    add_count(
+        &mut counts,
+        "instruction_note",
+        report.instruction_notes.len(),
+    );
+    let parts = counts
+        .into_iter()
+        .map(|(kind, count)| {
+            if count == 1 {
+                kind
+            } else {
+                format!("{kind} x{count}")
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(parts.join(", "))
+}
+
+fn add_count(counts: &mut BTreeMap<String, usize>, key: &str, count: usize) {
+    if count > 0 {
+        counts.insert(key.to_string(), count);
+    }
+}
+
+fn phase_mark(id: &str, progress: &PlanProgress) -> &'static str {
+    if progress.completed_phases.iter().any(|phase| phase == id) {
+        "✓"
+    } else if progress.current_phase.as_deref() == Some(id) {
+        "▶"
+    } else {
+        "○"
+    }
+}
+
+fn tool_start_label(event: &Value) -> String {
+    let name = text(event, "name").unwrap_or_else(|| "tool".to_string());
+    let Some(summary) = event.get("arguments") else {
+        return name;
+    };
+    let preview = argument_preview(summary, "path")
+        .or_else(|| argument_preview(summary, "command"))
+        .or_else(|| argument_preview(summary, "pattern"));
+    match preview {
+        Some(preview) => format!("{name} {}", fit(&preview, 96)),
+        None => name,
+    }
+}
+
+fn argument_preview(summary: &Value, key: &str) -> Option<String> {
+    summary
+        .get("argument_summaries")
+        .and_then(|value| value.get(key))
+        .and_then(|value| value.get("preview"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn text(event: &Value, key: &str) -> Option<String> {
+    event
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn emit_markdown(text: &str) {
+    let state = lock_state();
+    if !state.enabled || state.mode.is_quiet() {
+        return;
+    }
+    drop(state);
+    if std::io::stdout().is_terminal() {
+        let renderer = crate::tui::markdown::TerminalMarkdownRenderer::for_stdout();
+        let _ = renderer.render_assistant(text);
+    } else {
+        let _ = crate::tui::markdown::PlainRenderer.render_assistant(text);
+    }
+}
+
+fn fit(value: &str, max: usize) -> String {
+    crate::util::excerpt_with_marker(&value.replace(['\n', '\r'], " "), max, "...")
+}
+
+fn lock_state() -> MutexGuard<'static, PresentationState> {
+    global()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Default for NarrationMode {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[allow(dead_code)]
+fn _path_exists(path: &Path) -> bool {
+    path.exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planner::sanitizer::{
+        SanitizedGoalTruncationRecord, SanitizedShellControlSplitRecord,
+    };
+    use crate::planner::step_plan::{PlanStep, StepPlan};
+    use crate::planner::ultra_plan::{UltraPhase, UltraPlan};
+    use serde_json::json;
+
+    #[test]
+    fn plan_card_and_step_block_snapshot_handle_japanese_goal() {
+        let plan = UltraPlan {
+            goal: "日本語のメモアプリを4000番ポートで作ってください".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "setup".to_string(),
+                    prompt: "package.json と Next.js の土台を作る".to_string(),
+                },
+                UltraPhase {
+                    id: "implement".to_string(),
+                    prompt: "メモ追加と永続化の UI を実装する".to_string(),
+                },
+            ],
+        };
+        let progress = PlanProgress {
+            completed_phases: vec!["setup".to_string()],
+            current_phase: Some("implement".to_string()),
+            current_step: None,
+        };
+        let card = render_ultra_plan_card(&plan, &progress);
+
+        assert!(card.contains("- Goal: 日本語のメモアプリ"), "{card}");
+        assert!(card.contains("- Profile: nextjs"), "{card}");
+        assert!(card.contains("- Port: 4000"), "{card}");
+        assert!(card.contains("1. ✓ setup"), "{card}");
+        assert!(card.contains("2. ▶ implement"), "{card}");
+
+        let step_plan = StepPlan {
+            goal: "実装".to_string(),
+            steps: vec![PlanStep {
+                id: "write-page".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "src/app/page.tsx にメモ UI を作る".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: vec!["test -f src/app/page.tsx".to_string()],
+            }],
+        };
+        let sanitizer = SanitizerReport {
+            goal_truncations: vec![SanitizedGoalTruncationRecord {
+                kind: "goal_truncated".to_string(),
+                original_len: 900,
+                new_len: 600,
+            }],
+            shell_control_splits: vec![
+                SanitizedShellControlSplitRecord {
+                    kind: "shell_control_split".to_string(),
+                    step_id: "write-page".to_string(),
+                    original_command: "test -f a && test -f b".to_string(),
+                    fragments: vec!["test -f a".to_string(), "test -f b".to_string()],
+                    dropped_fallback: None,
+                },
+                SanitizedShellControlSplitRecord {
+                    kind: "shell_control_split".to_string(),
+                    step_id: "write-page".to_string(),
+                    original_command: "test -f c && test -f d".to_string(),
+                    fragments: vec!["test -f c".to_string(), "test -f d".to_string()],
+                    dropped_fallback: None,
+                },
+            ],
+            ..SanitizerReport::default()
+        };
+        let block = render_step_plan_block("implement", &step_plan, Some(&sanitizer));
+
+        assert!(block.contains("#### Phase: implement"), "{block}");
+        assert!(
+            block.contains("1. ○ [implement] src/app/page.tsx にメモ UI を作る (verify 1)"),
+            "{block}"
+        );
+        assert!(
+            block.contains("plan normalized: goal_truncated, shell_control_split x2"),
+            "{block}"
+        );
+    }
+
+    #[test]
+    fn activity_narration_scripted_sequence_snapshot() {
+        let events = vec![
+            json!({
+                "event": "tool_call_raw",
+                "name": "Write",
+                "arguments": {
+                    "argument_summaries": {
+                        "path": {"preview": "src/app/page.tsx"}
+                    }
+                }
+            }),
+            json!({"event": "tool_execute", "name": "Write", "status": "ok"}),
+            json!({"event": "step_verify_failure", "primary_reason": "missing path package.json"}),
+            json!({"event": "step_verify_repair", "repair_attempt": 1, "max_repair_turns": 2, "repair_target": "missing_artifact"}),
+            json!({"event": "browser_probe", "ok": true, "http_status": 200, "status": "pass"}),
+        ];
+        let lines = events
+            .iter()
+            .filter_map(render_activity_line)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            lines,
+            vec![
+                "→ Write src/app/page.tsx",
+                "✓ Write ok",
+                "✗ verify missing path package.json",
+                "↻ repair 1/2: missing_artifact",
+                "✓ probe: HTTP 200",
+            ]
+        );
+    }
+
+    #[test]
+    fn current_plan_projection_marks_mid_run_and_post_run() {
+        reset_for_test();
+        let plan = UltraPlan {
+            goal: "Build app".to_string(),
+            profile: "generic".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "setup".to_string(),
+                    prompt: "setup".to_string(),
+                },
+                UltraPhase {
+                    id: "implement".to_string(),
+                    prompt: "implement".to_string(),
+                },
+            ],
+        };
+        set_plan_for_test(
+            &plan,
+            PlanProgress {
+                completed_phases: vec!["setup".to_string()],
+                current_phase: Some("implement".to_string()),
+                current_step: Some("write-page".to_string()),
+            },
+            Some("→ Write src/app/page.tsx".to_string()),
+        );
+        update_step_plan(
+            "implement",
+            &StepPlan {
+                goal: "implement".to_string(),
+                steps: vec![PlanStep {
+                    id: "write-page".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Write page".to_string(),
+                    expected_paths: vec![],
+                    verify: vec![],
+                }],
+            },
+        );
+
+        let mid = render_current_plan();
+        assert!(mid.contains("1. ✓ setup"), "{mid}");
+        assert!(mid.contains("2. ▶ implement"), "{mid}");
+        assert!(mid.contains("1. ▶ [implement] Write page"), "{mid}");
+        assert!(
+            mid.contains("Current activity: → Write src/app/page.tsx"),
+            "{mid}"
+        );
+
+        project_event(&json!({"event": "ultra_phase_complete", "phase_id": "implement"}));
+        let post = render_current_plan();
+        assert!(post.contains("2. ✓ implement"), "{post}");
+    }
+}

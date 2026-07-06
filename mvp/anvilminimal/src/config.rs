@@ -42,6 +42,26 @@ pub enum Action {
     Runs,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NarrationMode {
+    Normal,
+    Quiet,
+}
+
+impl NarrationMode {
+    pub fn is_quiet(self) -> bool {
+        matches!(self, Self::Quiet)
+    }
+
+    fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim() {
+            "normal" => Some(Self::Normal),
+            "quiet" => Some(Self::Quiet),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub workspace_root: PathBuf,
@@ -64,6 +84,7 @@ pub struct Config {
     pub resume: Option<String>,
     pub fresh_session: bool,
     pub no_footer: bool,
+    pub narration: NarrationMode,
     pub profile: String,
     pub profile_explicit: bool,
     pub profile_inference: Option<ProfileInference>,
@@ -93,6 +114,11 @@ impl Config {
         let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
         let action = action_from_cli(&cli)?;
         let eval_events_path = crate::eval_events::path_from_env_or_default(&workspace_root);
+        let narration = if cli.quiet {
+            NarrationMode::Quiet
+        } else {
+            config_file_narration(&workspace_root).unwrap_or(NarrationMode::Normal)
+        };
         let profile_explicit = cli.profile.is_some();
         let profile_inference = if profile_explicit {
             None
@@ -125,6 +151,7 @@ impl Config {
             resume: cli.resume,
             fresh_session: cli.fresh_session,
             no_footer: cli.no_footer,
+            narration,
             profile,
             profile_explicit,
             profile_inference,
@@ -132,6 +159,17 @@ impl Config {
             action,
         })
     }
+}
+
+fn config_file_narration(root: &std::path::Path) -> Option<NarrationMode> {
+    let text = std::fs::read_to_string(root.join(".anvil").join("config")).ok()?;
+    text.lines().find_map(|line| {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let value = line.strip_prefix("narration")?.trim();
+        let value = value.strip_prefix('=')?.trim();
+        let value = value.trim_matches('"').trim_matches('\'');
+        NarrationMode::from_config_value(value)
+    })
 }
 
 fn resolve_chat_timeout(
@@ -316,6 +354,21 @@ mod tests {
 
         assert!(matches!(config.action, Action::Runs));
         assert!(action_goal(&config.action).is_none());
+    }
+
+    #[test]
+    fn narration_quiet_is_read_from_cli_or_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+        std::fs::write(dir.path().join(".anvil/config"), "narration = \"quiet\"\n").unwrap();
+        let config = Config::from_cli(Cli::parse_from(["anvilminimal", "--cwd", &cwd])).unwrap();
+        assert_eq!(config.narration, NarrationMode::Quiet);
+
+        std::fs::write(dir.path().join(".anvil/config"), "narration = \"normal\"\n").unwrap();
+        let config =
+            Config::from_cli(Cli::parse_from(["anvilminimal", "--cwd", &cwd, "--quiet"])).unwrap();
+        assert_eq!(config.narration, NarrationMode::Quiet);
     }
 
     #[test]

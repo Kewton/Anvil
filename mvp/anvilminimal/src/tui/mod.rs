@@ -2,6 +2,7 @@ pub mod banner;
 pub mod footer;
 pub mod interrupt;
 pub mod markdown;
+pub mod presentation;
 pub mod repl;
 pub mod slash;
 pub mod spinner;

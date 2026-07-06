@@ -36,6 +36,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         println!("{}", runs::render_runs_table(&config.workspace_root));
         return Ok(());
     }
+    let _presentation_guard = tui::presentation::install(&config);
     emit_run_start(&config);
     let direct_command_guard = DirectCommandCompletionGuard::start(&config);
     let result = (|| -> anyhow::Result<()> {
@@ -677,6 +678,7 @@ mod tests {
             resume: None,
             fresh_session: false,
             no_footer: false,
+            narration: crate::config::NarrationMode::Normal,
             profile: "generic".to_string(),
             profile_explicit: false,
             profile_inference: None,

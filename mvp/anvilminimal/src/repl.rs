@@ -42,6 +42,7 @@ mod tests {
             resume: None,
             fresh_session: false,
             no_footer: false,
+            narration: crate::config::NarrationMode::Normal,
             profile: "generic".to_string(),
             profile_explicit: false,
             profile_inference: None,

@@ -382,6 +382,16 @@ pub fn generate_step_plan_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<StepPlan> {
+    generate_step_plan_with_ui_for_phase(client, goal, config, ui, None)
+}
+
+fn generate_step_plan_with_ui_for_phase(
+    client: &mut dyn ChatClient,
+    goal: &str,
+    config: &Config,
+    ui: &dyn InteractionUi,
+    phase_label: Option<&str>,
+) -> anyhow::Result<StepPlan> {
     if ui.interrupted() {
         anyhow::bail!("interrupted by user");
     }
@@ -473,6 +483,7 @@ pub fn generate_step_plan_with_ui(
                             &quality_report,
                         );
                     }
+                    emit_step_plan_presentation(phase_label, &plan, Some(&sanitizer_report));
                     return Ok(plan);
                 }
                 if let Some(plan) = last_valid_plan.clone() {
@@ -485,6 +496,7 @@ pub fn generate_step_plan_with_ui(
                         &lint_report.primary_message(),
                     );
                     if attempt >= 3 {
+                        emit_step_plan_presentation(phase_label, &plan, None);
                         return Ok(plan);
                     }
                     let message = lint_report.primary_message();
@@ -537,6 +549,7 @@ pub fn generate_step_plan_with_ui(
         }
     }
     if let Some(plan) = last_valid_plan {
+        emit_step_plan_presentation(phase_label, &plan, None);
         return Ok(plan);
     }
     if let Some(plan) = fallback_step_plan_for_setup_phase(goal, config) {
@@ -548,12 +561,22 @@ pub fn generate_step_plan_with_ui(
             &plan,
             last_error.as_deref().unwrap_or("unknown parse error"),
         );
+        emit_step_plan_presentation(phase_label, &plan, None);
         return Ok(plan);
     }
     anyhow::bail!(
         "invalid StepPlan after corrective retries: {}",
         last_error.unwrap_or_else(|| "unknown parse error".to_string())
     )
+}
+
+fn emit_step_plan_presentation(
+    phase_label: Option<&str>,
+    plan: &StepPlan,
+    sanitizer_report: Option<&SanitizerReport>,
+) {
+    let phase = phase_label.unwrap_or(&plan.goal);
+    crate::tui::presentation::emit_step_plan_block(phase, plan, sanitizer_report);
 }
 
 pub fn save_step_plan(root: &Path, plan: &StepPlan) -> anyhow::Result<PathBuf> {
@@ -3682,6 +3705,10 @@ pub fn generate_ultra_plan_with_ui(
                         attempt,
                         plan.phases.len(),
                     );
+                    crate::tui::presentation::emit_ultra_plan_card(
+                        &plan,
+                        &crate::tui::presentation::PlanProgress::default(),
+                    );
                     return Ok(plan);
                 } else {
                     emit_planner_error_for_lint(config, client.label(), model, &report, attempt);
@@ -3852,52 +3879,55 @@ pub fn run_ultra_plan_with_ui(
             ultra_session.messages.len(),
         );
         let phase_prompt = ultra_phase_prompt(plan, phase, config, &ultra_context);
-        let step_plan =
-            generate_step_plan_with_ui(planner, &phase_prompt, config, ui).map_err(|err| {
-                let message = err.to_string();
-                emit_ultra_phase_event(
-                    config,
-                    "ultra_phase_failed",
-                    plan,
-                    phase,
-                    index,
-                    "scaffold",
-                    Some(false),
-                    Some(&message),
-                    None,
-                );
-                emit_planner_error(
-                    config,
-                    planner.label(),
-                    &config.planner_model,
-                    "scaffold",
-                    "phase_scaffold_error",
-                    &format!("phase scaffold failed: {}", message),
-                    index + 1,
-                );
-                let handoff = save_ultra_phase_recovery_handoff(
-                    config,
-                    plan,
-                    phase,
-                    UltraPhaseRecoveryRequest {
-                        failure_kind: "phase_scaffold_error",
-                        reason: &message,
-                        missing_paths: &missing_final_artifacts(
-                            &config.workspace_root,
-                            &final_expected_paths,
-                        ),
-                        missing_signals: &[],
-                        repair_targets: &["phase_scaffold".to_string()],
-                    },
-                );
-                anyhow::anyhow!(
-                    "{}",
-                    render_failure_stop_reason(
-                        format!("phase scaffold failed: {message}"),
-                        handoff,
-                    )
-                )
-            })?;
+        let step_plan = generate_step_plan_with_ui_for_phase(
+            planner,
+            &phase_prompt,
+            config,
+            ui,
+            Some(&phase.id),
+        )
+        .map_err(|err| {
+            let message = err.to_string();
+            emit_ultra_phase_event(
+                config,
+                "ultra_phase_failed",
+                plan,
+                phase,
+                index,
+                "scaffold",
+                Some(false),
+                Some(&message),
+                None,
+            );
+            emit_planner_error(
+                config,
+                planner.label(),
+                &config.planner_model,
+                "scaffold",
+                "phase_scaffold_error",
+                &format!("phase scaffold failed: {}", message),
+                index + 1,
+            );
+            let handoff = save_ultra_phase_recovery_handoff(
+                config,
+                plan,
+                phase,
+                UltraPhaseRecoveryRequest {
+                    failure_kind: "phase_scaffold_error",
+                    reason: &message,
+                    missing_paths: &missing_final_artifacts(
+                        &config.workspace_root,
+                        &final_expected_paths,
+                    ),
+                    missing_signals: &[],
+                    repair_targets: &["phase_scaffold".to_string()],
+                },
+            );
+            anyhow::anyhow!(
+                "{}",
+                render_failure_stop_reason(format!("phase scaffold failed: {message}"), handoff,)
+            )
+        })?;
         emit_ultra_phase_event(
             config,
             "ultra_phase_scaffold_complete",
@@ -22728,6 +22758,7 @@ exit 2\n",
             resume: None,
             fresh_session: false,
             no_footer: false,
+            narration: crate::config::NarrationMode::Normal,
             profile: "generic".to_string(),
             profile_explicit: false,
             profile_inference: None,

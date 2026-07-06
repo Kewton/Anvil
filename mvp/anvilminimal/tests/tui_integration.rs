@@ -36,6 +36,7 @@ fn config(root: PathBuf) -> Config {
         resume: None,
         fresh_session: false,
         no_footer: false,
+        narration: anvilminimal::config::NarrationMode::Normal,
         profile: "generic".to_string(),
         profile_explicit: false,
         profile_inference: None,
