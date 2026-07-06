@@ -38,6 +38,40 @@ pub fn run(command: &str, root: &Path, offline: bool) -> anyhow::Result<String> 
     run_with_timeout(command, root, offline, DEFAULT_TIMEOUT)
 }
 
+pub fn run_with_cancel_and_force<F, G>(
+    command: &str,
+    root: &Path,
+    offline: bool,
+    is_cancelled: F,
+    is_force_cancelled: G,
+) -> anyhow::Result<String>
+where
+    F: Fn() -> bool,
+    G: Fn() -> bool,
+{
+    let outcome = run_structured_cancel_and_force(
+        command,
+        root,
+        offline,
+        DEFAULT_TIMEOUT,
+        is_cancelled,
+        is_force_cancelled,
+    )?;
+    if outcome.kind == BashOutcomeKind::Blocked {
+        bail!("{}", outcome.summary);
+    }
+    if outcome.kind == BashOutcomeKind::Timeout {
+        bail!("command_timeout: {command}\n{}", format_outcome(&outcome));
+    }
+    if outcome.kind == BashOutcomeKind::Cancelled {
+        bail!(
+            "command_aborted_by_user: interrupted by user: {command}\n{}",
+            format_outcome(&outcome)
+        );
+    }
+    Ok(format_outcome(&outcome))
+}
+
 fn run_with_timeout(
     command: &str,
     root: &Path,
@@ -73,6 +107,21 @@ pub fn run_structured<F>(
 where
     F: Fn() -> bool,
 {
+    run_structured_cancel_and_force(command, root, offline, timeout, is_cancelled, || false)
+}
+
+pub fn run_structured_cancel_and_force<F, G>(
+    command: &str,
+    root: &Path,
+    offline: bool,
+    timeout: Duration,
+    is_cancelled: F,
+    is_force_cancelled: G,
+) -> anyhow::Result<BashOutcome>
+where
+    F: Fn() -> bool,
+    G: Fn() -> bool,
+{
     let started = Instant::now();
     if let Some(reason) = blocked_reason(command, offline) {
         return Ok(BashOutcome {
@@ -88,8 +137,13 @@ where
     let mut process = Command::new("sh");
     process.arg("-c").arg(command).current_dir(root);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let output = bounded_process::run_with_timeout_and_cancel(&mut process, timeout, is_cancelled)
-        .with_context(|| format!("failed to spawn command: {command}"))?;
+    let output = bounded_process::run_with_timeout_cancel_and_force(
+        &mut process,
+        timeout,
+        is_cancelled,
+        is_force_cancelled,
+    )
+    .with_context(|| format!("failed to spawn command: {command}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -112,14 +166,21 @@ where
                 summary: build_summary(command, kind, &stdout, &stderr),
             })
         }
-        BoundedProcessOutcomeKind::Cancelled => Ok(BashOutcome {
-            kind: BashOutcomeKind::Cancelled,
-            status: None,
-            stdout: truncate_stream(&stdout),
-            stderr: truncate_stream(&stderr),
-            elapsed_ms: output.elapsed.as_millis(),
-            summary: "command cancelled".to_string(),
-        }),
+        BoundedProcessOutcomeKind::Cancelled | BoundedProcessOutcomeKind::CommandAbortedByUser => {
+            let summary = if output.kind == BoundedProcessOutcomeKind::CommandAbortedByUser {
+                "command_aborted_by_user"
+            } else {
+                "command cancelled"
+            };
+            Ok(BashOutcome {
+                kind: BashOutcomeKind::Cancelled,
+                status: None,
+                stdout: truncate_stream(&stdout),
+                stderr: truncate_stream(&stderr),
+                elapsed_ms: output.elapsed.as_millis(),
+                summary: summary.to_string(),
+            })
+        }
         BoundedProcessOutcomeKind::TimedOut => Ok(BashOutcome {
             kind: BashOutcomeKind::Timeout,
             status: None,

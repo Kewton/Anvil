@@ -63,6 +63,21 @@ impl ToolRegistry {
         arguments: &Value,
         context: &ToolContext,
     ) -> anyhow::Result<String> {
+        self.execute_with_cancel(name, arguments, context, || false, || false)
+    }
+
+    pub fn execute_with_cancel<F, G>(
+        &self,
+        name: &str,
+        arguments: &Value,
+        context: &ToolContext,
+        is_cancelled: F,
+        is_force_cancelled: G,
+    ) -> anyhow::Result<String>
+    where
+        F: Fn() -> bool,
+        G: Fn() -> bool,
+    {
         enforce_mode(name, context.mode)?;
         if is_mutating(name) && !context.auto_approve && !context.interactive_approval {
             bail!("approval required for {name}; rerun with --yes or use interactive approval");
@@ -72,7 +87,13 @@ impl ToolRegistry {
         match name {
             "Bash" => {
                 let command = required_string(arguments, "command")?;
-                crate::tools::bash::run(command, &context.root, context.offline)
+                crate::tools::bash::run_with_cancel_and_force(
+                    command,
+                    &context.root,
+                    context.offline,
+                    is_cancelled,
+                    is_force_cancelled,
+                )
             }
             "Read" => {
                 let raw = required_string(arguments, "path")?;

@@ -718,9 +718,9 @@ fn run_node_dependency_setup_with_program_timeout_and_offline(
         BoundedProcessOutcomeKind::Exited if status_success && required_ready => {
             NodeDependencySetupStatus::Passed
         }
-        BoundedProcessOutcomeKind::Exited | BoundedProcessOutcomeKind::Cancelled => {
-            NodeDependencySetupStatus::Failed
-        }
+        BoundedProcessOutcomeKind::Exited
+        | BoundedProcessOutcomeKind::Cancelled
+        | BoundedProcessOutcomeKind::CommandAbortedByUser => NodeDependencySetupStatus::Failed,
     };
     NodeDependencySetupObservation {
         status: status_kind,
@@ -735,6 +735,9 @@ fn run_node_dependency_setup_with_program_timeout_and_offline(
                 timeout.as_millis()
             ),
             BoundedProcessOutcomeKind::Cancelled => "dependency setup cancelled".to_string(),
+            BoundedProcessOutcomeKind::CommandAbortedByUser => {
+                "dependency setup command_aborted_by_user".to_string()
+            }
             BoundedProcessOutcomeKind::Exited if status_success && required_ready => {
                 "dependency setup passed".to_string()
             }
@@ -861,9 +864,9 @@ fn run_python_cli_dependency_setup(
         BoundedProcessOutcomeKind::Exited if status_success && ready => {
             NodeDependencySetupStatus::Passed
         }
-        BoundedProcessOutcomeKind::Exited | BoundedProcessOutcomeKind::Cancelled => {
-            NodeDependencySetupStatus::Failed
-        }
+        BoundedProcessOutcomeKind::Exited
+        | BoundedProcessOutcomeKind::Cancelled
+        | BoundedProcessOutcomeKind::CommandAbortedByUser => NodeDependencySetupStatus::Failed,
     };
     NodeDependencySetupObservation {
         status: status_kind,
@@ -879,6 +882,9 @@ fn run_python_cli_dependency_setup(
             ),
             BoundedProcessOutcomeKind::Cancelled => {
                 "Python CLI dependency setup cancelled".to_string()
+            }
+            BoundedProcessOutcomeKind::CommandAbortedByUser => {
+                "Python CLI dependency setup command_aborted_by_user".to_string()
             }
             BoundedProcessOutcomeKind::Exited if status_success && ready => {
                 "Python CLI dependency setup passed".to_string()

@@ -266,14 +266,21 @@ fn run_structured(
             elapsed_ms: output.elapsed.as_millis(),
             summary: format!("command timed out after {} ms", timeout.as_millis()),
         }),
-        BoundedProcessOutcomeKind::Cancelled => Ok(BashOutcome {
-            kind: BashOutcomeKind::Timeout,
-            status: None,
-            stdout: truncate_stream(&stdout),
-            stderr: truncate_stream(&stderr),
-            elapsed_ms: output.elapsed.as_millis(),
-            summary: "command cancelled".to_string(),
-        }),
+        BoundedProcessOutcomeKind::Cancelled | BoundedProcessOutcomeKind::CommandAbortedByUser => {
+            let summary = if output.kind == BoundedProcessOutcomeKind::CommandAbortedByUser {
+                "command_aborted_by_user"
+            } else {
+                "command cancelled"
+            };
+            Ok(BashOutcome {
+                kind: BashOutcomeKind::Timeout,
+                status: None,
+                stdout: truncate_stream(&stdout),
+                stderr: truncate_stream(&stderr),
+                elapsed_ms: output.elapsed.as_millis(),
+                summary: summary.to_string(),
+            })
+        }
     }
 }
 

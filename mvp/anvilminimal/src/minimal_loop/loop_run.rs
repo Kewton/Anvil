@@ -1417,7 +1417,13 @@ pub(crate) fn run_session_with_outcome_with_options(
             }
             let result = {
                 let _guard = ui.before_tool_call(&call.name);
-                registry.execute(&call.name, &call.arguments, &context)
+                registry.execute_with_cancel(
+                    &call.name,
+                    &call.arguments,
+                    &context,
+                    || ui.interrupted(),
+                    || false,
+                )
             };
             let result = match result {
                 Ok(result) => {
