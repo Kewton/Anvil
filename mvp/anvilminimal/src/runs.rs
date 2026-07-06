@@ -112,7 +112,7 @@ pub fn prepare_resume(root: &Path, target: &str) -> anyhow::Result<ResumePlan> {
     let source = if target.is_empty() {
         let run = newest_run_with_recovery(root)
             .ok_or_else(|| anyhow::anyhow!("no recovery UltraPlan found; run /runs"))?;
-        ResumeSource::Run(run)
+        ResumeSource::Run(Box::new(run))
     } else if resume_target_looks_like_path(target) {
         ResumeSource::Yaml(
             resolve_resume_yaml_path(root, Path::new(target)).with_context(|| {
@@ -120,7 +120,7 @@ pub fn prepare_resume(root: &Path, target: &str) -> anyhow::Result<ResumePlan> {
             })?,
         )
     } else if let Some(run) = find_run(root, target) {
-        ResumeSource::Run(run)
+        ResumeSource::Run(Box::new(run))
     } else {
         bail!("run `{target}` not found; run /runs");
     };
@@ -206,7 +206,7 @@ impl ResumePlan {
 }
 
 enum ResumeSource {
-    Run(RunInventoryItem),
+    Run(Box<RunInventoryItem>),
     Yaml(PathBuf),
 }
 
@@ -221,7 +221,7 @@ fn resume_plan_from_source(root: &Path, source: ResumeSource) -> anyhow::Result<
                             run.short_id
                         )
                     })?;
-            (Some(run), yaml_path)
+            (Some(*run), yaml_path)
         }
         ResumeSource::Yaml(path) => {
             let source_run = find_run_by_recovery_yaml(root, &path);
