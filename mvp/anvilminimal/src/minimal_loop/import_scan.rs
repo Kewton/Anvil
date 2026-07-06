@@ -9,6 +9,15 @@ pub struct MissingImport {
     pub specifier: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedDefinitionExcerpt {
+    pub local_name: String,
+    pub imported_name: String,
+    pub specifier: String,
+    pub definition_path: String,
+    pub excerpt: String,
+}
+
 pub fn scan_relative_imports(root: &Path, paths: &[String]) -> anyhow::Result<Vec<MissingImport>> {
     let mut missing = Vec::new();
     for path in paths {
@@ -37,6 +46,37 @@ pub fn scan_relative_imports(root: &Path, paths: &[String]) -> anyhow::Result<Ve
         }
     }
     Ok(missing)
+}
+
+pub fn imported_symbol_definition_excerpt(
+    root: &Path,
+    source: &str,
+    local_name: &str,
+) -> Option<ImportedDefinitionExcerpt> {
+    let source_path = root.join(source);
+    if !source_path.is_file() || !is_source_path(source) {
+        return None;
+    }
+    let content = std::fs::read_to_string(&source_path).ok()?;
+    let import = find_imported_symbol(&content, local_name)?;
+    let definition_path = resolve_import_for_source(root, &source_path, &import.specifier)
+        .into_iter()
+        .find(|path| path.is_file())?;
+    let definition_content = std::fs::read_to_string(&definition_path).ok()?;
+    let excerpt = exported_definition_excerpt(&definition_content, &import.imported_name)?;
+    let definition_rel = definition_path
+        .strip_prefix(root)
+        .ok()
+        .map(normalize_pathbuf)?
+        .display()
+        .to_string();
+    Some(ImportedDefinitionExcerpt {
+        local_name: local_name.to_string(),
+        imported_name: import.imported_name,
+        specifier: import.specifier,
+        definition_path: definition_rel,
+        excerpt,
+    })
 }
 
 pub fn route_bound_closure(root: &Path, profile: &str) -> BTreeSet<PathBuf> {
@@ -94,6 +134,151 @@ pub fn route_bound_closure(root: &Path, profile: &str) -> BTreeSet<PathBuf> {
     } else {
         closure
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportedSymbol {
+    imported_name: String,
+    specifier: String,
+}
+
+fn find_imported_symbol(content: &str, local_name: &str) -> Option<ImportedSymbol> {
+    for statement in import_statements(content) {
+        let Some(specifier) = import_statement_specifier(&statement) else {
+            continue;
+        };
+        let Some(head) = statement.split_once(" from ").map(|(head, _)| head) else {
+            continue;
+        };
+        if let Some((named, _)) = head
+            .split_once('{')
+            .and_then(|(_, rest)| rest.split_once('}'))
+        {
+            for item in named.split(',') {
+                let trimmed = item.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let (imported, local) = trimmed
+                    .split_once(" as ")
+                    .map(|(imported, local)| (imported.trim(), local.trim()))
+                    .unwrap_or((trimmed, trimmed));
+                if local == local_name {
+                    return Some(ImportedSymbol {
+                        imported_name: imported.to_string(),
+                        specifier,
+                    });
+                }
+            }
+        } else {
+            let default_name = head
+                .trim_start_matches("import")
+                .trim()
+                .split(',')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            if !default_name.is_empty() && default_name == local_name {
+                return Some(ImportedSymbol {
+                    imported_name: "default".to_string(),
+                    specifier,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn import_statements(content: &str) -> Vec<String> {
+    content
+        .split(';')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            (trimmed.starts_with("import ") && trimmed.contains(" from "))
+                .then(|| trimmed.to_string())
+        })
+        .collect()
+}
+
+fn import_statement_specifier(statement: &str) -> Option<String> {
+    let (_, rest) = statement.rsplit_once(" from ")?;
+    let trimmed = rest.trim();
+    let quote = trimmed.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let rest = &trimmed[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+fn resolve_import_for_source(root: &Path, source_path: &Path, specifier: &str) -> Vec<PathBuf> {
+    let Some(parent) = source_path.parent() else {
+        return Vec::new();
+    };
+    if is_relative_specifier(specifier) {
+        return resolve_route_import(parent, specifier);
+    }
+    if let Some(alias_path) = specifier.strip_prefix("@/")
+        && let Some((project_root, _)) = nextjs_project_root(root)
+    {
+        return resolve_workspace_alias_import(&project_root, alias_path);
+    }
+    Vec::new()
+}
+
+fn exported_definition_excerpt(content: &str, symbol: &str) -> Option<String> {
+    let lines = content.lines().collect::<Vec<_>>();
+    let start = find_exported_definition_start(&lines, symbol)?;
+    let end = bounded_definition_end(&lines, start);
+    Some(lines[start..end].join("\n"))
+}
+
+fn find_exported_definition_start(lines: &[&str], symbol: &str) -> Option<usize> {
+    lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        let function = format!("export function {symbol}");
+        let async_function = format!("export async function {symbol}");
+        let const_export = format!("export const {symbol}");
+        let interface_export = format!("export interface {symbol}");
+        let type_export = format!("export type {symbol}");
+        let named_default = if symbol == "default" {
+            trimmed.starts_with("export default function")
+                || trimmed.starts_with("export default async function")
+        } else {
+            false
+        };
+        trimmed.starts_with(&function)
+            || trimmed.starts_with(&async_function)
+            || trimmed.starts_with(&const_export)
+            || trimmed.starts_with(&interface_export)
+            || trimmed.starts_with(&type_export)
+            || named_default
+    })
+}
+
+fn bounded_definition_end(lines: &[&str], start: usize) -> usize {
+    let max_end = (start + 25).min(lines.len());
+    let mut brace_depth = 0isize;
+    let mut seen_open_brace = false;
+    for (offset, line) in lines[start..max_end].iter().enumerate() {
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    brace_depth += 1;
+                    seen_open_brace = true;
+                }
+                '}' => {
+                    brace_depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        if seen_open_brace && brace_depth <= 0 {
+            return start + offset + 1;
+        }
+    }
+    max_end
 }
 
 fn extract_import_specifiers(content: &str) -> Vec<String> {

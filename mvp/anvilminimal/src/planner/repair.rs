@@ -1,8 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::eval_events;
 use crate::minimal_loop::completion::{
-    CompileRepairPromptProtection, compile_repair_prompt_section,
+    CompileRepairPromptProtection, compile_repair_prompt_section_with_root,
 };
 use crate::minimal_loop::repair_target::classify_repair_target;
 use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
@@ -27,6 +27,7 @@ pub struct RepairContext {
     pub progress_warning: Option<String>,
     pub compile_reanchored_retry: bool,
     pub compile_narrow_no_snapshot_retry: bool,
+    pub workspace_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -88,7 +89,8 @@ Make the smallest bounded change, then stop.",
     }
     if !report.compile_errors.is_empty() {
         prompt.push_str("\n\nCompile errors:\n");
-        prompt.push_str(&compile_repair_prompt_section(
+        prompt.push_str(&compile_repair_prompt_section_with_root(
+            context.workspace_root.as_deref(),
             &report.compile_errors,
             CompileRepairPromptProtection {
                 reanchored_retry: context.compile_reanchored_retry,
@@ -418,7 +420,8 @@ Suggested command:\n\
                 .map(|failure| format!("{}: {}", failure.command, failure.reason))
                 .collect::<Vec<_>>()
         ),
-        compile_repair_prompt_section(
+        compile_repair_prompt_section_with_root(
+            context.workspace_root.as_deref(),
             &report.compile_errors,
             CompileRepairPromptProtection {
                 reanchored_retry: context.compile_reanchored_retry,

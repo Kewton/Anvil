@@ -11,6 +11,9 @@ use crate::minimal_loop::build_verifier::{
 };
 use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
 use crate::minimal_loop::evidence::{RuntimeAcceptanceReport, required_evidence_for_capability};
+use crate::minimal_loop::import_scan::{
+    ImportedDefinitionExcerpt, imported_symbol_definition_excerpt,
+};
 use crate::minimal_loop::repair_target::{RepairTarget, classify_repair_target};
 use crate::planner::verify::{VerificationReport, validate_verify_command};
 use crate::tools::path_guard::{
@@ -763,6 +766,13 @@ pub(crate) fn target_implementation_files(
 }
 
 pub(crate) fn compile_error_repair_guidance(errors: &[CompileError]) -> Vec<String> {
+    compile_error_repair_guidance_with_root(None, errors)
+}
+
+pub(crate) fn compile_error_repair_guidance_with_root(
+    root: Option<&Path>,
+    errors: &[CompileError],
+) -> Vec<String> {
     errors
         .iter()
         .flat_map(|error| {
@@ -777,6 +787,9 @@ pub(crate) fn compile_error_repair_guidance(errors: &[CompileError]) -> Vec<Stri
                     error.location(),
                     error.excerpt.trim()
                 ));
+            }
+            if let Some(suggestion) = compiler_suggestion(&error.message) {
+                lines.push(format!("Compiler suggestion: {suggestion}"));
             }
             lines.push(format!(
                 "You MUST modify {} using the edit tool; a reply without file edits fails this repair.",
@@ -793,9 +806,187 @@ pub(crate) fn compile_error_repair_guidance(errors: &[CompileError]) -> Vec<Stri
                     error.location()
                 ));
             }
+            if let Some(root) = root {
+                lines.extend(type_script_cross_file_definition_guidance(root, error));
+            }
             lines
         })
         .collect()
+}
+
+fn type_script_cross_file_definition_guidance(root: &Path, error: &CompileError) -> Vec<String> {
+    let mut contexts = Vec::new();
+    if let Some(symbol) = error.symbol.as_deref()
+        && let Some(context) = imported_symbol_definition_excerpt(root, &error.path, symbol)
+    {
+        contexts.push(context);
+    }
+    if let Some(suggestion) = compiler_suggested_symbol(&error.message)
+        && let Some(imported_call) = local_receiver_imported_call(root, &error.path, &suggestion)
+        && let Some(context) = imported_symbol_definition_excerpt(root, &error.path, &imported_call)
+    {
+        contexts.push(context);
+    }
+    if let Some(property) = property_missing_name(&error.message)
+        && let Some(receiver) = property_receiver_identifier(root, error, &property)
+    {
+        if let Some(imported_call) = local_receiver_imported_call(root, &error.path, &receiver)
+            && let Some(context) =
+                imported_symbol_definition_excerpt(root, &error.path, &imported_call)
+        {
+            contexts.push(context);
+        } else if let Some(context) =
+            imported_symbol_definition_excerpt(root, &error.path, &receiver)
+        {
+            contexts.push(context);
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let mut lines = Vec::new();
+    for context in contexts {
+        let key = format!("{}:{}", context.definition_path, context.imported_name);
+        if !seen.insert(key) {
+            continue;
+        }
+        lines.extend(render_imported_definition_context(&context));
+    }
+    lines
+}
+
+fn render_imported_definition_context(context: &ImportedDefinitionExcerpt) -> Vec<String> {
+    vec![
+        format!(
+            "Imported definition context for `{}` from {}:",
+            context.local_name, context.definition_path
+        ),
+        context.excerpt.clone(),
+        "TypeScript member repair menu: use an exported member, export the missing one, or remove the call."
+            .to_string(),
+    ]
+}
+
+fn compiler_suggestion(message: &str) -> Option<String> {
+    let start = message.find("Did you mean")?;
+    Some(message[start..].trim().to_string())
+}
+
+fn compiler_suggested_symbol(message: &str) -> Option<String> {
+    let suggestion = compiler_suggestion(message)?;
+    extract_first_quoted_symbol(&suggestion)
+}
+
+fn property_missing_name(message: &str) -> Option<String> {
+    message
+        .contains("Property ")
+        .then(|| extract_first_quoted_symbol(message))
+        .flatten()
+}
+
+fn extract_first_quoted_symbol(message: &str) -> Option<String> {
+    for quote in ['\'', '"', '`'] {
+        let Some(start) = message.find(quote) else {
+            continue;
+        };
+        let rest = &message[start + quote.len_utf8()..];
+        let Some(end) = rest.find(quote) else {
+            continue;
+        };
+        let symbol = rest[..end].trim();
+        if !symbol.is_empty() {
+            return Some(symbol.to_string());
+        }
+    }
+    None
+}
+
+fn local_receiver_imported_call(root: &Path, source: &str, receiver: &str) -> Option<String> {
+    let content = std::fs::read_to_string(root.join(source)).ok()?;
+    let assignment = find_local_assignment_expression(&content, receiver)?;
+    let callee = leading_call_identifier(&assignment)?;
+    imported_symbol_definition_excerpt(root, source, &callee).map(|_| callee)
+}
+
+fn find_local_assignment_expression(content: &str, receiver: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        for prefix in [
+            format!("const {receiver} ="),
+            format!("let {receiver} ="),
+            format!("var {receiver} ="),
+        ] {
+            if let Some(rest) = trimmed.strip_prefix(&prefix) {
+                return Some(rest.trim().trim_end_matches(';').to_string());
+            }
+        }
+    }
+    None
+}
+
+fn leading_call_identifier(expression: &str) -> Option<String> {
+    let trimmed = expression.trim();
+    let open = trimmed.find('(')?;
+    let ident = trimmed[..open]
+        .trim()
+        .trim_start_matches("await ")
+        .trim()
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    is_identifier(ident).then(|| ident.to_string())
+}
+
+fn property_receiver_identifier(
+    root: &Path,
+    error: &CompileError,
+    property: &str,
+) -> Option<String> {
+    let line = source_line(root, &error.path, error.line)
+        .or_else(|| compile_excerpt_source_line(&error.excerpt))?;
+    receiver_before_property(&line, property)
+}
+
+fn source_line(root: &Path, path: &str, line: usize) -> Option<String> {
+    if line == 0 {
+        return None;
+    }
+    std::fs::read_to_string(root.join(path))
+        .ok()?
+        .lines()
+        .nth(line.saturating_sub(1))
+        .map(str::to_string)
+}
+
+fn compile_excerpt_source_line(excerpt: &str) -> Option<String> {
+    excerpt.lines().find_map(|line| {
+        line.split_once('|')
+            .map(|(_, rest)| rest.trim().to_string())
+            .filter(|rest| !rest.is_empty() && !rest.starts_with('^'))
+    })
+}
+
+fn receiver_before_property(line: &str, property: &str) -> Option<String> {
+    let needle = format!(".{property}");
+    let index = line.find(&needle)?;
+    let before = &line[..index];
+    let receiver = before
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '$')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    is_identifier(&receiver).then_some(receiver)
+}
+
+fn is_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -808,10 +999,18 @@ pub(crate) fn compile_repair_prompt_section(
     errors: &[CompileError],
     protection: CompileRepairPromptProtection,
 ) -> String {
+    compile_repair_prompt_section_with_root(None, errors, protection)
+}
+
+pub(crate) fn compile_repair_prompt_section_with_root(
+    root: Option<&Path>,
+    errors: &[CompileError],
+    protection: CompileRepairPromptProtection,
+) -> String {
     if errors.is_empty() {
         return "- none".to_string();
     }
-    let mut lines = compile_error_repair_guidance(errors);
+    let mut lines = compile_error_repair_guidance_with_root(root, errors);
     let paths = errors
         .iter()
         .map(|error| error.path.clone())
@@ -1351,6 +1550,121 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).unwrap();
         }
+    }
+
+    #[test]
+    fn compile_repair_prompt_includes_imported_hook_context_for_ts_suggestion() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/hooks")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "import { useTodos } from \"../hooks/useTodos\";\n\
+export default function Page() {\n\
+  const todos = useTodos();\n\
+  return <button onClick={() => setTodos([...todos.items])}>Save</button>;\n\
+}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/hooks/useTodos.ts"),
+            "export function useTodos() {\n\
+  const items = [] as string[];\n\
+  const addTodo = (value: string) => items.push(value);\n\
+  return {\n\
+    items,\n\
+    addTodo,\n\
+  };\n\
+}\n",
+        )
+        .unwrap();
+        let prompt = compile_repair_prompt_section_with_root(
+            Some(dir.path()),
+            &[CompileError {
+                path: "src/app/page.tsx".to_string(),
+                line: 4,
+                column: 33,
+                message: "Cannot find name 'setTodos'. Did you mean 'todos'?".to_string(),
+                excerpt: "4 |   return <button onClick={() => setTodos([...todos.items])}>Save</button>;\n  |                                 ^".to_string(),
+                symbol: Some("setTodos".to_string()),
+                route_bound: Some(true),
+            }],
+            CompileRepairPromptProtection::default(),
+        );
+
+        assert!(
+            prompt.contains("Compiler suggestion: Did you mean 'todos'?"),
+            "{prompt}"
+        );
+        assert!(
+            prompt
+                .contains("Imported definition context for `useTodos` from src/hooks/useTodos.ts:"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("export function useTodos()"), "{prompt}");
+        assert!(prompt.contains("return {\nitems,\naddTodo,"), "{prompt}");
+        assert!(
+            prompt.contains(
+                "TypeScript member repair menu: use an exported member, export the missing one, or remove the call."
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn compile_repair_prompt_includes_imported_hook_context_for_missing_property() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/hooks")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "import { useTodos } from \"../hooks/useTodos\";\n\
+export default function Page() {\n\
+  const todos = useTodos();\n\
+  todos.setTodos([]);\n\
+  return <main>{todos.items.length}</main>;\n\
+}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/hooks/useTodos.ts"),
+            "export function useTodos() {\n\
+  const items = [] as string[];\n\
+  const addTodo = (value: string) => items.push(value);\n\
+  return {\n\
+    items,\n\
+    addTodo,\n\
+  };\n\
+}\n",
+        )
+        .unwrap();
+        let prompt = compile_repair_prompt_section_with_root(
+            Some(dir.path()),
+            &[CompileError {
+                path: "src/app/page.tsx".to_string(),
+                line: 4,
+                column: 9,
+                message: "Property 'setTodos' does not exist on type '{ items: string[]; addTodo: (value: string) => number; }'."
+                    .to_string(),
+                excerpt: "4 |   todos.setTodos([]);\n  |         ^".to_string(),
+                symbol: None,
+                route_bound: Some(true),
+            }],
+            CompileRepairPromptProtection::default(),
+        );
+
+        assert!(
+            prompt
+                .contains("Imported definition context for `useTodos` from src/hooks/useTodos.ts:"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("return {\nitems,\naddTodo,"), "{prompt}");
+        assert!(
+            prompt.contains(
+                "TypeScript member repair menu: use an exported member, export the missing one, or remove the call."
+            ),
+            "{prompt}"
+        );
     }
 
     #[test]

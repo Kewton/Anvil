@@ -20,7 +20,7 @@ use crate::minimal_loop::build_verifier::{
 };
 use crate::minimal_loop::completion::{
     CompileRepairPromptProtection, CompletionContract, compile_error_repair_guidance,
-    compile_repair_prompt_section, evidence_hint_tokens_for_goal,
+    compile_repair_prompt_section_with_root, evidence_hint_tokens_for_goal,
 };
 use crate::minimal_loop::dependency_setup::{
     self, NodeDependencySetupAuthority, NodeDependencySetupRequirement, NodeDependencySetupStatus,
@@ -1892,6 +1892,7 @@ fn run_step(
         missing_paths: report.missing_paths.clone(),
         changed_files: initial.changed_paths.clone(),
         initial_stop_reason: Some(format!("{:?}", initial.stop_reason)),
+        workspace_root: Some(config.workspace_root.clone()),
         ..RepairContext::default()
     };
     let mut current_report = report;
@@ -4021,8 +4022,7 @@ pub fn run_ultra_plan_with_ui(
         if !final_phase
             && !invariant_report.is_pass()
             && !invariant_report.compile_errors.is_empty()
-        {
-            if let Some(rollback) = try_compile_rollback_after_repair_exhaustion(
+            && let Some(rollback) = try_compile_rollback_after_repair_exhaustion(
                 config,
                 &plan.profile,
                 &plan.goal,
@@ -4030,21 +4030,21 @@ pub fn run_ultra_plan_with_ui(
                 &phase.prompt,
                 &invariant_report,
                 "profile_invariant_repair_exhausted",
-            )? {
-                push_context_items_capped(
-                    &mut ultra_context.carry_forward_guidance,
-                    &rollback.carry_forward_guidance,
-                    ULTRA_CONTEXT_MAX_MESSAGES,
-                    &mut ultra_context.truncated,
-                );
-                emit_compile_rollback_context_carried(config, &rollback);
-                invariant_report = verify_profile_invariant(
-                    &config.workspace_root,
-                    &plan.profile,
-                    &plan.goal,
-                    &profile_snapshot,
-                );
-            }
+            )?
+        {
+            push_context_items_capped(
+                &mut ultra_context.carry_forward_guidance,
+                &rollback.carry_forward_guidance,
+                ULTRA_CONTEXT_MAX_MESSAGES,
+                &mut ultra_context.truncated,
+            );
+            emit_compile_rollback_context_carried(config, &rollback);
+            invariant_report = verify_profile_invariant(
+                &config.workspace_root,
+                &plan.profile,
+                &plan.goal,
+                &profile_snapshot,
+            );
         }
         if !invariant_report.is_pass() {
             let fresh_evidence = fresh_profile_invariant_failure_evidence(
@@ -4291,6 +4291,7 @@ pub fn run_ultra_plan_with_ui(
                 &[],
             );
             let repair_prompt = final_acceptance_repair_prompt(
+                &config.workspace_root,
                 plan,
                 &acceptance_report,
                 &ultra_context,
@@ -11630,6 +11631,7 @@ fn obligation_repair_target_paths(report: &VerificationReport) -> Vec<String> {
 
 #[allow(clippy::too_many_arguments)]
 fn final_acceptance_repair_prompt(
+    root: &Path,
     plan: &UltraPlan,
     report: &VerificationReport,
     context: &UltraRunContext,
@@ -11652,7 +11654,8 @@ fn final_acceptance_repair_prompt(
         final_acceptance_behavioral_probe_context(report, expected_paths);
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
-    let compile_errors = compile_repair_prompt_section(
+    let compile_errors = compile_repair_prompt_section_with_root(
+        Some(root),
         &report.compile_errors,
         CompileRepairPromptProtection {
             reanchored_retry: compile_reanchored_retry,
@@ -18011,6 +18014,7 @@ if __name__ == "__main__":
             phases: Vec::new(),
         };
         let prompt = final_acceptance_repair_prompt(
+            Path::new("."),
             &plan,
             &report,
             &UltraRunContext::default(),
@@ -18408,6 +18412,7 @@ if __name__ == "__main__":
         let expected_paths =
             final_acceptance_repair_expected_paths(&plan, &cfg, &initial_report).unwrap();
         let repair_prompt = final_acceptance_repair_prompt(
+            &cfg.workspace_root,
             &plan,
             &initial_report,
             &UltraRunContext::default(),
@@ -18508,6 +18513,7 @@ if __name__ == "__main__":
             let expected_paths =
                 final_acceptance_repair_expected_paths(&plan, &cfg, &report).unwrap();
             let prompt = final_acceptance_repair_prompt(
+                &cfg.workspace_root,
                 &plan,
                 &report,
                 &UltraRunContext::default(),
@@ -19024,6 +19030,7 @@ if __name__ == "__main__":
         };
 
         let prompt = final_acceptance_repair_prompt(
+            Path::new("."),
             &plan,
             &report,
             &UltraRunContext::default(),
@@ -21905,6 +21912,7 @@ exit 2\n",
         let expected_paths = final_acceptance_repair_expected_paths(&plan, &cfg, &initial_report)
             .expect("expected paths");
         let repair_prompt = final_acceptance_repair_prompt(
+            &cfg.workspace_root,
             &plan,
             &initial_report,
             &UltraRunContext::default(),
