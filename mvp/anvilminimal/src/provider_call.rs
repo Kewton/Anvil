@@ -429,6 +429,7 @@ mod tests {
             max_iterations: 1,
             chat_timeout_secs,
             chat_timeout_source: "override:test".to_string(),
+            field_sources: crate::config::ConfigFieldSources::default(),
             chat_retries: 1,
             eval_events_path: Some(events_path),
             completion_contract_path: None,

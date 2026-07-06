@@ -32,6 +32,35 @@ anvilminimal --provider ollama --model qwen3.6:27b-coding-nvfp4 \
   "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。"
 ```
 
+Named presets can live in `.anvil/config.toml` or `~/.anvil/config.toml`.
+These are examples only; Anvil does not auto-create them:
+
+```toml
+# [preset.gemini-tier]
+# provider = "gemini"
+# model = "gemini-3.5-flash"
+# planner_provider = "gemini"
+# planner_model = "gemini-3.5-flash"
+# context_budget = 65536
+# chat_timeout_secs = 180
+# profile = "nextjs"
+# narration = "normal"
+#
+# [preset.local]
+# provider = "ollama"
+# model = "qwen3.6:27b-coding-nvfp4"
+# planner_provider = "ollama"
+# planner_model = "qwen3.6:27b-coding-nvfp4"
+# context_budget = 65536
+# chat_timeout_secs = 600
+# profile = "generic"
+# narration = "normal"
+```
+
+```bash
+anvilminimal --preset local --ultra-plan-run "Build a small CLI tool"
+```
+
 ## TUI
 
 Interactive TTY mode uses the same `anvil>` prompt and slash commands, plus

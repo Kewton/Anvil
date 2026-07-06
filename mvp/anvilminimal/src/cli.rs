@@ -16,12 +16,14 @@ pub enum ProviderArg {
 pub struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     pub yes: bool,
-    #[arg(long, default_value_t = 65_536)]
-    pub context_budget: usize,
-    #[arg(long, default_value = "qwen3.6:27b-coding-nvfp4")]
-    pub model: String,
-    #[arg(long, value_enum, default_value_t = ProviderArg::Ollama)]
-    pub provider: ProviderArg,
+    #[arg(long)]
+    pub preset: Option<String>,
+    #[arg(long)]
+    pub context_budget: Option<usize>,
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long, value_enum)]
+    pub provider: Option<ProviderArg>,
     #[arg(long)]
     pub planner_model: Option<String>,
     #[arg(long, value_enum)]
@@ -142,6 +144,14 @@ mod tests {
     fn num_predict_defaults_to_source_minimal_budget() {
         let cli = Cli::parse_from(["anvilminimal"]);
         assert_eq!(cli.num_predict, 8_192);
+    }
+
+    #[test]
+    fn config_preset_fields_are_absent_until_resolved() {
+        let cli = Cli::parse_from(["anvilminimal"]);
+        assert_eq!(cli.model, None);
+        assert_eq!(cli.provider, None);
+        assert_eq!(cli.context_budget, None);
     }
 
     #[test]

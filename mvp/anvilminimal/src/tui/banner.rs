@@ -67,19 +67,31 @@ pub fn render_startup_banner(config: &Config, style: BannerStyle) -> String {
     out.push_str(&crate::build_info::commit_with_dirty());
     out.push('\n');
     out.push_str(&format!(
-        "model={} provider={} planner={} planner_provider={}\n",
+        "model={} ({}) provider={} ({}) planner={} ({}) planner_provider={} ({})\n",
         sanitize_banner_text(&config.model),
+        sanitize_banner_text(&config.field_sources.model),
         provider_label(config.provider),
+        sanitize_banner_text(&config.field_sources.provider),
         sanitize_banner_text(&config.planner_model),
+        sanitize_banner_text(&config.field_sources.planner_model),
         provider_label(config.planner_provider),
+        sanitize_banner_text(&config.field_sources.planner_provider),
     ));
     out.push_str(&format!(
         "mode=Act cwd={}\n",
         sanitize_banner_text(&config.workspace_root.display().to_string())
     ));
     out.push_str(&format!(
-        "context_budget={} yes={}\n",
-        config.context_budget, config.yes
+        "context_budget={} ({}) timeout={}s ({}) profile={} ({}) narration={} ({}) yes={}\n",
+        config.context_budget,
+        sanitize_banner_text(&config.field_sources.context_budget),
+        config.chat_timeout_secs,
+        sanitize_banner_text(&config.field_sources.chat_timeout_secs),
+        sanitize_banner_text(&config.profile),
+        sanitize_banner_text(&config.field_sources.profile),
+        narration_label(config.narration),
+        sanitize_banner_text(&config.field_sources.narration),
+        config.yes
     ));
     if let Some(path) = &config.eval_events_path {
         out.push_str(&format!(
@@ -95,6 +107,13 @@ fn provider_label(provider: Provider) -> &'static str {
         Provider::Ollama => "ollama",
         Provider::Openai => "openai",
         Provider::Gemini => "gemini",
+    }
+}
+
+fn narration_label(mode: crate::config::NarrationMode) -> &'static str {
+    match mode {
+        crate::config::NarrationMode::Normal => "normal",
+        crate::config::NarrationMode::Quiet => "quiet",
     }
 }
 
@@ -133,6 +152,7 @@ mod tests {
             max_iterations: 4,
             chat_timeout_secs: 1,
             chat_timeout_source: "override:test".to_string(),
+            field_sources: crate::config::ConfigFieldSources::default(),
             chat_retries: 1,
             resume: None,
             fresh_session: false,
@@ -184,7 +204,8 @@ mod tests {
         let out = render_startup_banner(&config(), BannerStyle::Legacy4Line);
         assert!(out.contains("anvilminimal"));
         assert!(out.contains(&crate::build_info::commit_with_dirty()));
-        assert!(out.contains("context_budget=65536 yes=true"));
+        assert!(out.contains("context_budget=65536 (default)"));
+        assert!(out.contains("yes=true"));
         assert!(!out.contains("╔═╗"));
     }
 }

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,8 @@ use crate::planner::profile::{ProfileInference, infer_profile};
 
 pub const LOCAL_PROVIDER_CHAT_TIMEOUT_SECS: u64 = 600;
 pub const REMOTE_PROVIDER_CHAT_TIMEOUT_SECS: u64 = 180;
+pub const DEFAULT_CONTEXT_BUDGET: usize = 65_536;
+pub const DEFAULT_MODEL: &str = "qwen3.6:27b-coding-nvfp4";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -81,6 +83,7 @@ pub struct Config {
     pub max_iterations: usize,
     pub chat_timeout_secs: u64,
     pub chat_timeout_source: String,
+    pub field_sources: ConfigFieldSources,
     pub chat_retries: usize,
     pub resume: Option<String>,
     pub fresh_session: bool,
@@ -93,34 +96,144 @@ pub struct Config {
     pub action: Action,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFieldSources {
+    pub model: String,
+    pub provider: String,
+    pub planner_model: String,
+    pub planner_provider: String,
+    pub context_budget: String,
+    pub chat_timeout_secs: String,
+    pub profile: String,
+    pub narration: String,
+}
+
+impl Default for ConfigFieldSources {
+    fn default() -> Self {
+        Self {
+            model: "default".to_string(),
+            provider: "default".to_string(),
+            planner_model: "default".to_string(),
+            planner_provider: "default".to_string(),
+            context_budget: "default".to_string(),
+            chat_timeout_secs: "default".to_string(),
+            profile: "default".to_string(),
+            narration: "default".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Sourced<T> {
+    value: T,
+    source: String,
+}
+
+fn sourced<T>(value: T, source: impl Into<String>) -> Sourced<T> {
+    Sourced {
+        value,
+        source: source.into(),
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PresetConfig {
+    model: Option<Sourced<String>>,
+    provider: Option<Sourced<Provider>>,
+    planner_model: Option<Sourced<String>>,
+    planner_provider: Option<Sourced<Provider>>,
+    context_budget: Option<Sourced<usize>>,
+    chat_timeout_secs: Option<Sourced<u64>>,
+    profile: Option<Sourced<String>>,
+    narration: Option<Sourced<NarrationMode>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConfigFile {
+    presets: HashMap<String, PresetConfig>,
+    narration: Option<Sourced<NarrationMode>>,
+}
+
 impl Config {
     pub fn from_cli(cli: Cli) -> anyhow::Result<Self> {
-        let provider = Provider::from(cli.provider);
-        let planner_provider = cli.planner_provider.map(Provider::from).unwrap_or(provider);
-        let (chat_timeout_secs, chat_timeout_source) =
-            resolve_chat_timeout(cli.chat_timeout_secs, provider, planner_provider);
-        let planner_model = match cli.planner_model.clone() {
-            Some(model) => model,
-            None if planner_provider == provider => cli.model.clone(),
-            None => {
-                bail!("--planner-model is required when --planner-provider differs from --provider")
-            }
-        };
         let workspace_root = cli
             .cwd
             .clone()
             .unwrap_or(std::env::current_dir().context("failed to read current directory")?)
             .canonicalize()
             .context("failed to canonicalize workspace root")?;
+        let preset = load_named_preset(&workspace_root, cli.preset.as_deref())?;
+        let model = cli
+            .model
+            .clone()
+            .map(|value| sourced(value, "flag"))
+            .or_else(|| preset.as_ref().and_then(|preset| preset.model.clone()))
+            .unwrap_or_else(|| sourced(DEFAULT_MODEL.to_string(), "default"));
+        let provider = cli
+            .provider
+            .map(|value| sourced(Provider::from(value), "flag"))
+            .or_else(|| preset.as_ref().and_then(|preset| preset.provider.clone()))
+            .unwrap_or_else(|| sourced(Provider::Ollama, "default"));
+        let planner_provider = cli
+            .planner_provider
+            .map(|value| sourced(Provider::from(value), "flag"))
+            .or_else(|| {
+                preset
+                    .as_ref()
+                    .and_then(|preset| preset.planner_provider.clone())
+            })
+            .unwrap_or_else(|| sourced(provider.value, "default"));
+        let planner_model = cli
+            .planner_model
+            .clone()
+            .map(|value| sourced(value, "flag"))
+            .or_else(|| {
+                preset
+                    .as_ref()
+                    .and_then(|preset| preset.planner_model.clone())
+            })
+            .or_else(|| {
+                (planner_provider.value == provider.value)
+                    .then(|| sourced(model.value.clone(), "default"))
+            });
+        let Some(planner_model) = planner_model else {
+            bail!("--planner-model is required when --planner-provider differs from --provider");
+        };
+        let context_budget = cli
+            .context_budget
+            .map(|value| sourced(value, "flag"))
+            .or_else(|| {
+                preset
+                    .as_ref()
+                    .and_then(|preset| preset.context_budget.clone())
+            })
+            .unwrap_or_else(|| sourced(DEFAULT_CONTEXT_BUDGET, "default"));
+        let chat_timeout = cli
+            .chat_timeout_secs
+            .map(|value| sourced(value, "flag"))
+            .or_else(|| {
+                preset
+                    .as_ref()
+                    .and_then(|preset| preset.chat_timeout_secs.clone())
+            });
+        let (chat_timeout_secs, chat_timeout_source) = match chat_timeout {
+            Some(value) => (value.value, value.source),
+            None => resolve_chat_timeout(None, provider.value, planner_provider.value),
+        };
         let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
         let action = action_from_cli(&cli)?;
         let eval_events_path = crate::eval_events::path_from_env_or_default(&workspace_root);
         let narration = if cli.quiet {
-            NarrationMode::Quiet
+            sourced(NarrationMode::Quiet, "flag")
         } else {
-            config_file_narration(&workspace_root).unwrap_or(NarrationMode::Normal)
+            preset
+                .as_ref()
+                .and_then(|preset| preset.narration.clone())
+                .or_else(|| config_file_narration(&workspace_root))
+                .unwrap_or_else(|| sourced(NarrationMode::Normal, "default"))
         };
-        let profile_explicit = cli.profile.is_some();
+        let profile_from_preset = preset.as_ref().and_then(|preset| preset.profile.clone());
+        let profile_explicit = cli.profile.is_some() || profile_from_preset.is_some();
         let profile_inference = if profile_explicit {
             None
         } else {
@@ -129,8 +242,23 @@ impl Config {
         let profile = cli
             .profile
             .clone()
-            .or_else(|| profile_inference.map(|inference| inference.profile.to_string()))
-            .unwrap_or_else(|| "generic".to_string());
+            .map(|value| sourced(value, "flag"))
+            .or(profile_from_preset.clone())
+            .or_else(|| {
+                profile_inference
+                    .map(|inference| sourced(inference.profile.to_string(), "default:inferred"))
+            })
+            .unwrap_or_else(|| sourced("generic".to_string(), "default"));
+        let field_sources = ConfigFieldSources {
+            model: model.source.clone(),
+            provider: provider.source.clone(),
+            planner_model: planner_model.source.clone(),
+            planner_provider: planner_provider.source.clone(),
+            context_budget: context_budget.source.clone(),
+            chat_timeout_secs: chat_timeout_source.clone(),
+            profile: profile.source.clone(),
+            narration: narration.source.clone(),
+        };
         Ok(Self {
             workspace_root,
             state_dir,
@@ -138,22 +266,23 @@ impl Config {
             completion_contract_path: cli.completion_contract_json,
             yes: cli.yes,
             offline: cli.offline,
-            context_budget: cli.context_budget,
-            model: cli.model,
-            provider,
-            planner_model,
-            planner_provider,
+            context_budget: context_budget.value,
+            model: model.value,
+            provider: provider.value,
+            planner_model: planner_model.value,
+            planner_provider: planner_provider.value,
             ollama_host: cli.ollama_host,
             num_predict: cli.num_predict,
             max_iterations: cli.max_iterations,
             chat_timeout_secs,
             chat_timeout_source,
+            field_sources,
             chat_retries: cli.chat_retries,
             resume: cli.resume,
             fresh_session: cli.fresh_session,
             no_footer: cli.no_footer,
-            narration,
-            profile,
+            narration: narration.value,
+            profile: profile.value,
             profile_explicit,
             profile_inference,
             style: cli.style,
@@ -162,15 +291,331 @@ impl Config {
     }
 }
 
-fn config_file_narration(root: &std::path::Path) -> Option<NarrationMode> {
-    let text = std::fs::read_to_string(root.join(".anvil").join("config")).ok()?;
+fn load_named_preset(root: &Path, name: Option<&str>) -> anyhow::Result<Option<PresetConfig>> {
+    let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok(None);
+    };
+    let mut found = false;
+    let mut merged = PresetConfig::default();
+    for path in config_paths(root) {
+        let Some(file) = parse_config_file_if_present(&path)? else {
+            continue;
+        };
+        let Some(preset) = file.presets.get(name) else {
+            continue;
+        };
+        found = true;
+        merge_preset_field(&mut merged.model, &preset.model);
+        merge_preset_field(&mut merged.provider, &preset.provider);
+        merge_preset_field(&mut merged.planner_model, &preset.planner_model);
+        merge_preset_field(&mut merged.planner_provider, &preset.planner_provider);
+        merge_preset_field(&mut merged.context_budget, &preset.context_budget);
+        merge_preset_field(&mut merged.chat_timeout_secs, &preset.chat_timeout_secs);
+        merge_preset_field(&mut merged.profile, &preset.profile);
+        merge_preset_field(&mut merged.narration, &preset.narration);
+        if preset_complete(&merged) {
+            break;
+        }
+    }
+    if !found {
+        let paths = config_paths(root)
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("preset '{name}' not found in {paths} (key: preset.{name})");
+    }
+    Ok(Some(merged))
+}
+
+fn preset_complete(preset: &PresetConfig) -> bool {
+    preset.model.is_some()
+        && preset.provider.is_some()
+        && preset.planner_model.is_some()
+        && preset.planner_provider.is_some()
+        && preset.context_budget.is_some()
+        && preset.chat_timeout_secs.is_some()
+        && preset.profile.is_some()
+        && preset.narration.is_some()
+}
+
+fn merge_preset_field<T: Clone>(target: &mut Option<Sourced<T>>, source: &Option<Sourced<T>>) {
+    if target.is_none() {
+        *target = source.clone();
+    }
+}
+
+fn config_file_narration(root: &Path) -> Option<Sourced<NarrationMode>> {
+    for path in config_paths(root) {
+        if let Ok(Some(file)) = parse_config_file_if_present(&path)
+            && let Some(narration) = file.narration
+        {
+            return Some(narration);
+        }
+    }
+    legacy_config_file_narration(root)
+}
+
+fn legacy_config_file_narration(root: &Path) -> Option<Sourced<NarrationMode>> {
+    let path = root.join(".anvil").join("config");
+    let text = std::fs::read_to_string(&path).ok()?;
     text.lines().find_map(|line| {
         let line = line.split('#').next().unwrap_or("").trim();
         let value = line.strip_prefix("narration")?.trim();
         let value = value.strip_prefix('=')?.trim();
         let value = value.trim_matches('"').trim_matches('\'');
-        NarrationMode::from_config_value(value)
+        NarrationMode::from_config_value(value).map(|mode| {
+            sourced(
+                mode,
+                format!(
+                    "config:{}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            )
+        })
     })
+}
+
+fn config_paths(root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![root.join(".anvil").join("config.toml")];
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".anvil").join("config.toml"));
+    }
+    paths
+}
+
+fn parse_config_file_if_present(path: &Path) -> anyhow::Result<Option<ConfigFile>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_config_file(path, &text).map(Some),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+fn parse_config_file(path: &Path, text: &str) -> anyhow::Result<ConfigFile> {
+    let mut file = ConfigFile::default();
+    let mut section = ConfigSection::Top;
+    for (index, raw_line) in text.lines().enumerate() {
+        let line_no = index + 1;
+        let line = strip_toml_comment(raw_line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(section_name) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            section = if let Some(name) = section_name.trim().strip_prefix("preset.") {
+                let name = name.trim();
+                if name.is_empty() {
+                    bail!(
+                        "{}:{} invalid empty preset section name",
+                        path.display(),
+                        line_no
+                    );
+                }
+                ConfigSection::Preset(name.to_string())
+            } else {
+                ConfigSection::Other
+            };
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            bail!("{}:{} invalid config line", path.display(), line_no);
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match &section {
+            ConfigSection::Top => parse_top_level_key(path, line_no, key, value, &mut file)?,
+            ConfigSection::Preset(name) => {
+                let source = format!("preset:{name}");
+                let preset = file.presets.entry(name.clone()).or_default();
+                parse_preset_key(path, line_no, name, key, value, &source, preset)?;
+            }
+            ConfigSection::Other => {}
+        }
+    }
+    Ok(file)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigSection {
+    Top,
+    Preset(String),
+    Other,
+}
+
+fn parse_top_level_key(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: &str,
+    file: &mut ConfigFile,
+) -> anyhow::Result<()> {
+    match key {
+        "narration" => {
+            file.narration = Some(sourced(
+                parse_narration_value(path, line_no, key, value)?,
+                format!(
+                    "config:{}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            ));
+            Ok(())
+        }
+        _ => bail!("{}:{} unknown config key '{key}'", path.display(), line_no),
+    }
+}
+
+fn parse_preset_key(
+    path: &Path,
+    line_no: usize,
+    name: &str,
+    key: &str,
+    value: &str,
+    source: &str,
+    preset: &mut PresetConfig,
+) -> anyhow::Result<()> {
+    let full_key = format!("preset.{name}.{key}");
+    match key {
+        "model" => {
+            preset.model = Some(sourced(
+                parse_string_value(path, line_no, &full_key, value)?,
+                source,
+            ))
+        }
+        "provider" => {
+            preset.provider = Some(sourced(
+                parse_provider_value(path, line_no, &full_key, value)?,
+                source,
+            ))
+        }
+        "planner_model" => {
+            preset.planner_model = Some(sourced(
+                parse_string_value(path, line_no, &full_key, value)?,
+                source,
+            ))
+        }
+        "planner_provider" => {
+            preset.planner_provider = Some(sourced(
+                parse_provider_value(path, line_no, &full_key, value)?,
+                source,
+            ))
+        }
+        "context_budget" => {
+            preset.context_budget = Some(sourced(
+                parse_usize_value(path, line_no, &full_key, value)?,
+                source,
+            ))
+        }
+        "chat_timeout_secs" => {
+            preset.chat_timeout_secs = Some(sourced(
+                parse_u64_value(path, line_no, &full_key, value)?,
+                source,
+            ))
+        }
+        "profile" => {
+            preset.profile = Some(sourced(
+                parse_string_value(path, line_no, &full_key, value)?,
+                source,
+            ))
+        }
+        "narration" => {
+            preset.narration = Some(sourced(
+                parse_narration_value(path, line_no, &full_key, value)?,
+                source,
+            ))
+        }
+        _ => bail!(
+            "{}:{} unknown config key '{full_key}'",
+            path.display(),
+            line_no
+        ),
+    }
+    Ok(())
+}
+
+fn strip_toml_comment(line: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '#' if !quoted => return &line[..index],
+            _ => {}
+        }
+    }
+    line
+}
+
+fn parse_string_value(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<String> {
+    let Some(value) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        bail!(
+            "{}:{} {key} expects a quoted string",
+            path.display(),
+            line_no
+        );
+    };
+    Ok(value.replace("\\\"", "\"").replace("\\\\", "\\"))
+}
+
+fn parse_provider_value(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<Provider> {
+    match parse_string_value(path, line_no, key, value)?.as_str() {
+        "ollama" => Ok(Provider::Ollama),
+        "openai" => Ok(Provider::Openai),
+        "gemini" => Ok(Provider::Gemini),
+        _ => bail!(
+            "{}:{} {key} expects provider ollama|openai|gemini",
+            path.display(),
+            line_no
+        ),
+    }
+}
+
+fn parse_narration_value(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<NarrationMode> {
+    let value = parse_string_value(path, line_no, key, value)?;
+    NarrationMode::from_config_value(&value).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}:{} {key} expects narration normal|quiet",
+            path.display(),
+            line_no
+        )
+    })
+}
+
+fn parse_usize_value(path: &Path, line_no: usize, key: &str, value: &str) -> anyhow::Result<usize> {
+    value
+        .parse::<usize>()
+        .with_context(|| format!("{}:{} {key} expects an integer", path.display(), line_no))
+}
+
+fn parse_u64_value(path: &Path, line_no: usize, key: &str, value: &str) -> anyhow::Result<u64> {
+    value
+        .parse::<u64>()
+        .with_context(|| format!("{}:{} {key} expects an integer", path.display(), line_no))
 }
 
 fn resolve_chat_timeout(
@@ -405,7 +850,114 @@ mod tests {
         ]);
         let config = Config::from_cli(cli).unwrap();
         assert_eq!(config.chat_timeout_secs, 42);
-        assert_eq!(config.chat_timeout_source, "override:cli");
+        assert_eq!(config.chat_timeout_source, "flag");
+    }
+
+    #[test]
+    fn preset_resolution_uses_flag_preset_default_precedence_and_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+        std::fs::write(
+            dir.path().join(".anvil/config.toml"),
+            r#"
+[preset.local]
+model = "preset-model"
+provider = "ollama"
+planner_model = "preset-planner"
+planner_provider = "gemini"
+context_budget = 12345
+chat_timeout_secs = 77
+profile = "nextjs"
+narration = "quiet"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--preset",
+            "local",
+            "--model",
+            "flag-model",
+            "--context-budget",
+            "999",
+            "--ultra-plan-run",
+            "Web app",
+        ]))
+        .unwrap();
+
+        assert_eq!(config.model, "flag-model");
+        assert_eq!(config.field_sources.model, "flag");
+        assert_eq!(config.context_budget, 999);
+        assert_eq!(config.field_sources.context_budget, "flag");
+        assert_eq!(config.provider, Provider::Ollama);
+        assert_eq!(config.field_sources.provider, "preset:local");
+        assert_eq!(config.planner_provider, Provider::Gemini);
+        assert_eq!(config.field_sources.planner_provider, "preset:local");
+        assert_eq!(config.planner_model, "preset-planner");
+        assert_eq!(config.field_sources.planner_model, "preset:local");
+        assert_eq!(config.chat_timeout_secs, 77);
+        assert_eq!(config.field_sources.chat_timeout_secs, "preset:local");
+        assert_eq!(config.profile, "nextjs");
+        assert_eq!(config.field_sources.profile, "preset:local");
+        assert!(config.profile_explicit);
+        assert!(config.profile_inference.is_none());
+        assert_eq!(config.narration, NarrationMode::Quiet);
+        assert_eq!(config.field_sources.narration, "preset:local");
+    }
+
+    #[test]
+    fn missing_preset_error_names_file_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+        std::fs::write(dir.path().join(".anvil/config.toml"), "# no preset\n").unwrap();
+
+        let err = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--preset",
+            "missing-pre-ux-final",
+        ]))
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("preset 'missing-pre-ux-final' not found"),
+            "{err}"
+        );
+        assert!(err.contains(".anvil/config.toml"), "{err}");
+        assert!(err.contains("preset.missing-pre-ux-final"), "{err}");
+    }
+
+    #[test]
+    fn invalid_preset_value_error_names_file_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+        std::fs::write(
+            dir.path().join(".anvil/config.toml"),
+            "[preset.bad]\nprovider = \"bogus\"\n",
+        )
+        .unwrap();
+
+        let err = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--preset",
+            "bad",
+        ]))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains(".anvil/config.toml"), "{err}");
+        assert!(err.contains("preset.bad.provider"), "{err}");
+        assert!(err.contains("ollama|openai|gemini"), "{err}");
     }
 
     #[test]

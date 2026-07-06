@@ -25,6 +25,7 @@ fn config(root: PathBuf) -> Config {
         max_iterations: 4,
         chat_timeout_secs: 1,
         chat_timeout_source: "override:test".to_string(),
+        field_sources: anvilminimal::config::ConfigFieldSources::default(),
         chat_retries: 1,
         resume: None,
         fresh_session: false,
