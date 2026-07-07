@@ -135,6 +135,23 @@ const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 15] = [
     "canvas_unavailable",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannerSessionMode {
+    Standard,
+    CompactRetry,
+    FreshCompact,
+}
+
+impl PlannerSessionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::CompactRetry => "compact_retry",
+            Self::FreshCompact => "fresh_compact",
+        }
+    }
+}
+
 const GENERIC_INTERACTIVE_EVIDENCE_KEYS: [&str; 3] = [
     "user_input_handler_evidence",
     "stateful_update_evidence",
@@ -427,6 +444,36 @@ fn planner_chat_with_request_retry(
     )
 }
 
+fn planner_chat_for_step_plan_attempt(
+    client: &mut dyn ChatClient,
+    config: &Config,
+    model: &str,
+    messages: &[crate::state::ConversationMessage],
+    ui: &dyn InteractionUi,
+    session_mode: PlannerSessionMode,
+) -> anyhow::Result<AssistantReply> {
+    if session_mode == PlannerSessionMode::FreshCompact
+        && let Some(mut fresh_client) = client.boxed_clone()
+    {
+        return planner_chat_with_request_retry(
+            fresh_client.as_mut(),
+            config,
+            ProviderCallScope::PlannerStep,
+            model,
+            messages,
+            ui,
+        );
+    }
+    planner_chat_with_request_retry(
+        client,
+        config,
+        ProviderCallScope::PlannerStep,
+        model,
+        messages,
+        ui,
+    )
+}
+
 pub fn generate_step_plan_with_ui(
     client: &mut dyn ChatClient,
     goal: &str,
@@ -458,16 +505,12 @@ fn generate_step_plan_with_ui_for_phase(
     let mut last_error = None;
     let mut last_valid_plan: Option<StepPlan> = None;
     let mut lint_categories_seen = BTreeSet::new();
+    let mut empty_response_count = 0usize;
+    let mut session_mode = PlannerSessionMode::Standard;
     for attempt in 1..=3 {
         let messages = step_plan_messages(&prompt);
-        let reply = planner_chat_with_request_retry(
-            client,
-            config,
-            ProviderCallScope::PlannerStep,
-            model,
-            &messages,
-            ui,
-        )?;
+        let reply =
+            planner_chat_for_step_plan_attempt(client, config, model, &messages, ui, session_mode)?;
         ui.publish_status(UiStatus::for_model_reply(
             config,
             model,
@@ -475,7 +518,39 @@ fn generate_step_plan_with_ui_for_phase(
             reply.prompt_tokens,
             reply.completion_tokens,
         ));
-        emit_planner_raw_output_shape(config, client.label(), model, attempt, &reply.content);
+        emit_planner_raw_output_shape(
+            config,
+            client.label(),
+            model,
+            attempt,
+            &reply.content,
+            session_mode,
+        );
+        if reply.content.trim().is_empty() {
+            empty_response_count += 1;
+            let message = format!(
+                "planner_empty_response: planner returned empty content on attempt {attempt}/3"
+            );
+            last_error = Some(message.clone());
+            emit_planner_error(
+                config,
+                client.label(),
+                model,
+                "empty_response",
+                "planner_empty_response",
+                &message,
+                attempt,
+            );
+            if attempt < 3 {
+                prompt = build_empty_step_plan_compact_prompt(goal, attempt);
+                session_mode = if empty_response_count >= 2 {
+                    PlannerSessionMode::FreshCompact
+                } else {
+                    PlannerSessionMode::CompactRetry
+                };
+            }
+            continue;
+        }
         match parse_generated_step_plan_json(&reply.content, goal) {
             Ok(mut plan) => {
                 let verify_before_repair = collect_step_verify_commands(&plan);
@@ -524,6 +599,7 @@ fn generate_step_plan_with_ui_for_phase(
                                 &quality_report,
                             );
                             prompt = build_quality_retry_prompt(goal, &quality_report, attempt);
+                            session_mode = PlannerSessionMode::Standard;
                             continue;
                         }
                         emit_planner_quality_retry_exhausted(
@@ -557,6 +633,7 @@ fn generate_step_plan_with_ui_for_phase(
                     }
                     prompt =
                         build_lint_retry_prompt(goal, &lint_report, attempt, &lint_categories_seen);
+                    session_mode = PlannerSessionMode::Standard;
                     continue;
                 }
                 let message = lint_report.primary_message();
@@ -567,6 +644,7 @@ fn generate_step_plan_with_ui_for_phase(
                 }
                 prompt =
                     build_lint_retry_prompt(goal, &lint_report, attempt, &lint_categories_seen);
+                session_mode = PlannerSessionMode::Standard;
             }
             Err(err) => {
                 if let Some(plan) = last_valid_plan.clone() {
@@ -583,6 +661,7 @@ fn generate_step_plan_with_ui_for_phase(
                     }
                     last_error = Some(err.to_string());
                     prompt = build_schema_retry_prompt(goal, &err.to_string(), attempt);
+                    session_mode = PlannerSessionMode::Standard;
                     continue;
                 }
                 last_error = Some(err.to_string());
@@ -596,12 +675,18 @@ fn generate_step_plan_with_ui_for_phase(
                     attempt,
                 );
                 prompt = build_schema_retry_prompt(goal, &err.to_string(), attempt);
+                session_mode = PlannerSessionMode::Standard;
             }
         }
     }
     if let Some(plan) = last_valid_plan {
         emit_step_plan_presentation(phase_label, &plan, None);
         return Ok(plan);
+    }
+    if empty_response_count == 3 {
+        anyhow::bail!(
+            "invalid StepPlan after corrective retries: planner_empty_response: planner returned empty content on all attempts"
+        );
     }
     if let Some(plan) = fallback_step_plan_for_setup_phase(goal, config) {
         emit_planner_fallback_plan(
@@ -10498,6 +10583,7 @@ fn emit_planner_raw_output_shape(
     model: &str,
     attempt: usize,
     content: &str,
+    session_mode: PlannerSessionMode,
 ) {
     let json_extract_status = match extract_json_object(content) {
         Ok(_) => "ok",
@@ -10510,6 +10596,7 @@ fn emit_planner_raw_output_shape(
             "planner_provider": provider,
             "planner_model": model,
             "attempt": attempt,
+            "planner_session_mode": session_mode.as_str(),
             "content_len": content.chars().count(),
             "has_json_object": json_extract_status == "ok",
             "has_yaml_fence": content.contains("```yaml") || content.contains("```yml"),
@@ -11126,6 +11213,28 @@ fn schema_retry_issue_hints(error: &str) -> Vec<&'static str> {
         hints.push("Return the canonical StepPlan JSON object with goal and steps.");
     }
     hints
+}
+
+fn build_empty_step_plan_compact_prompt(goal: &str, attempt: usize) -> String {
+    let minimal_context = phase_id_and_task_text(goal).unwrap_or_else(|| {
+        compact_single_line(goal)
+            .chars()
+            .take(600)
+            .collect::<String>()
+    });
+    format!(
+        "Compact StepPlan recovery after empty planner output on attempt {attempt}/3.\n\
+Do not use prior chat history. Return only one JSON object and no markdown fences.\n\n\
+Required JSON shape:\n\
+{{\n  \"goal\": \"short phase goal\",\n  \"steps\": [\n    {{\n      \"id\": \"kebab-id\",\n      \"kind\": \"implement\",\n      \"expected_result\": \"pass\",\n      \"instruction\": \"Create the required files for the phase.\",\n      \"expected_paths\": [\"relative/path\"],\n      \"verify\": [\"command\"]\n    }}\n  ]\n}}\n\n\
+Rules:\n\
+- Include top-level goal and non-empty steps.\n\
+- Step kind is required and must be inspect, setup, implement, verify, or report.\n\
+- expected_paths and verify are semantic contracts; include arrays, even if empty.\n\
+- expected_result is descriptive and may be pass or fail.\n\
+- Keep paths workspace-relative and verify commands deterministic.\n\n\
+Minimal phase context:\n{minimal_context}"
+    )
 }
 
 fn build_lint_retry_prompt(
@@ -13132,6 +13241,70 @@ mod tests {
             generate_step_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
         assert_eq!(plan.goal, "goal");
         assert_eq!(plan.steps.len(), 1);
+    }
+
+    #[test]
+    fn empty_planner_output_uses_compact_ladder_then_accepts_valid_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let valid = generated_step_plan_json("goal");
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(""),
+            AssistantReply::text(""),
+            AssistantReply::text(valid),
+        ]);
+
+        let plan = generate_step_plan(&mut planner, "goal", &cfg).unwrap();
+
+        assert_eq!(plan.goal, "goal");
+        assert_eq!(planner.messages.len(), 3);
+        let compact_prompt = planner.messages[1]
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(compact_prompt.contains("Compact StepPlan recovery"));
+        assert!(compact_prompt.contains("Required JSON shape"));
+        assert!(compact_prompt.contains("Minimal phase context"));
+        let fresh_prompt = planner.messages[2]
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(fresh_prompt.contains("Compact StepPlan recovery"));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"planner_session_mode\":\"standard\""));
+        assert!(event_text.contains("\"planner_session_mode\":\"compact_retry\""));
+        assert!(event_text.contains("\"planner_session_mode\":\"fresh_compact\""));
+        assert!(event_text.contains("\"content_len\":0"));
+        assert!(event_text.contains("\"planner_error_kind\":\"planner_empty_response\""));
+    }
+
+    #[test]
+    fn all_empty_planner_output_reports_precise_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(""),
+            AssistantReply::text(""),
+            AssistantReply::text(""),
+        ]);
+
+        let err = generate_step_plan(&mut planner, "goal", &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("planner_empty_response"), "{err}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"planner_error_kind\":\"planner_empty_response\""));
+        assert!(
+            !event_text.contains("\"planner_error_kind\":\"planner_schema_error\""),
+            "{event_text}"
+        );
     }
 
     #[test]
