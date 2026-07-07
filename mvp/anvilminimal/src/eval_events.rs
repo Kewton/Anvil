@@ -669,6 +669,7 @@ fn planner_diagnostics_from_events(events: &[Value]) -> PlannerDiagnostics {
             }
             "tool_args_path_normalized"
             | "verify_command_normalized_at_runtime"
+            | "side_effect_path_dropped"
             | "ultra_plan_generation_metadata_normalized" => {
                 diagnostics.display_normalization_count += 1;
             }

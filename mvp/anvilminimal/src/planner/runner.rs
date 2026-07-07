@@ -10411,7 +10411,14 @@ fn emit_planner_plan_sanitized(
                 "kind": &record.kind,
                 "original_len": record.original_len,
                 "new_len": record.new_len,
-            })).chain(report.shell_control_splits.iter().map(|record| json!({
+            })).chain(report.dropped_expected_paths.iter().map(|record| json!({
+                "kind": "side_effect_path_dropped",
+                "step_id": &record.step_id,
+                "path": &record.path,
+                "tier": &record.tier,
+                "side_effect_token": &record.token,
+                "reason": eval_events::body_snippet(&record.reason),
+            }))).chain(report.shell_control_splits.iter().map(|record| json!({
                 "kind": &record.kind,
                 "step_id": &record.step_id,
                 "original_command": eval_events::body_snippet(&record.original_command),
@@ -10469,6 +10476,13 @@ fn emit_planner_plan_sanitized(
                 "command": eval_events::body_snippet(&record.command),
                 "reason": eval_events::body_snippet(&record.reason),
             })).collect::<Vec<_>>(),
+            "dropped_expected_paths": report.dropped_expected_paths.iter().map(|record| json!({
+                "step_id": &record.step_id,
+                "path": &record.path,
+                "tier": &record.tier,
+                "side_effect_token": &record.token,
+                "reason": eval_events::body_snippet(&record.reason),
+            })).collect::<Vec<_>>(),
             "dropped_commands": report.dropped_commands.iter().map(|record| json!({
                 "step_id": &record.step_id,
                 "command": eval_events::body_snippet(&record.command),
@@ -10492,6 +10506,23 @@ fn emit_planner_plan_sanitized(
             })).collect::<Vec<_>>(),
         }),
     );
+    for record in &report.dropped_expected_paths {
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "side_effect_path_dropped",
+                "planner_stage": "sanitize",
+                "planner_provider": provider,
+                "planner_model": model,
+                "repair_attempt": attempt,
+                "step_id": &record.step_id,
+                "path": &record.path,
+                "tier": &record.tier,
+                "side_effect_token": &record.token,
+                "reason": eval_events::body_snippet(&record.reason),
+            }),
+        );
+    }
 }
 
 fn emit_planner_fallback_plan(
@@ -11030,6 +11061,9 @@ fn lint_retry_hard_constraints(
         out.push("- Put package manifest and dependency setup before npm/pnpm/yarn build or test verification.");
         out.push("- Python stdlib unittest does not require dependency setup by itself.");
     }
+    if categories.contains("side_effect_expected_path") {
+        out.push("- Do not put dependency/build side-effect directories such as node_modules, .next, __pycache__, .venv, venv, dist, build, target, coverage, or out in expected_paths unless the user goal explicitly asks for that artifact path.");
+    }
     if categories.contains("contract") {
         out.push("- Implement steps must declare concrete workspace-relative expected_paths.");
         out.push("- Inspect and report steps must not declare expected_paths or verify commands.");
@@ -11228,6 +11262,7 @@ fn plan_generation_system_prompt() -> String {
         "Use report only for explicit blockers such as dependency_missing, unavailable external service, required user input, or unfixable local blocker. Report is not success.",
         "Normal success plans must end with a verify step or an artifact-owning setup/implement step, not a final summary report.",
         "Expected paths must be workspace-relative, exact, and owned by one implement/setup step.",
+        "Do not put dependency/build side-effect directories such as node_modules, .next, __pycache__, .venv, venv, dist, build, target, coverage, or out in expected_paths unless the user goal explicitly asks for that artifact path.",
         "Prefer tests, builds, smoke checks, or content assertions over file existence checks.",
         "Use file existence checks only as a fallback when no stronger deterministic verification fits.",
         "Implement/setup instructions should say what each expected artifact will contain.",
@@ -13368,6 +13403,44 @@ mod tests {
         assert!(event_text.contains("\"event\":\"planner_plan_sanitized\""));
         assert!(event_text.contains("\"kind\":\"setup_verify_relocated\""));
         assert!(event_text.contains("\"kind\":\"instruction_truncated\""));
+        assert!(!event_text.contains("\"event\":\"planner_error\""));
+    }
+
+    #[test]
+    fn generated_step_plan_drops_side_effect_expected_paths_before_lint() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan_json = serde_json::to_string(&StepPlan {
+            goal: "Set up the Next.js app dependencies".to_string(),
+            steps: vec![PlanStep {
+                id: "setup".to_string(),
+                kind: "setup".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create package.json and install dependencies.".to_string(),
+                expected_paths: vec!["package.json".to_string(), "node_modules".to_string()],
+                verify: vec!["test -d node_modules/next".to_string()],
+            }],
+        })
+        .unwrap();
+        let mut planner = FakeClient::new(vec![AssistantReply::text(plan_json)]);
+
+        let plan = generate_step_plan(&mut planner, "Set up the Next.js app", &cfg).unwrap();
+
+        assert_eq!(
+            plan.steps[0].expected_paths,
+            vec!["package.json".to_string()]
+        );
+        assert_eq!(
+            plan.steps[0].verify,
+            vec!["test -d node_modules/next".to_string()]
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"side_effect_path_dropped\""));
+        assert!(event_text.contains("\"tier\":\"unambiguous\""));
+        assert!(event_text.contains("\"path\":\"node_modules\""));
         assert!(!event_text.contains("\"event\":\"planner_error\""));
     }
 

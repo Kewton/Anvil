@@ -778,6 +778,11 @@ fn sanitizer_summary(report: &SanitizerReport) -> Option<String> {
     );
     add_count(
         &mut counts,
+        "side_effect_path_dropped",
+        report.dropped_expected_paths.len(),
+    );
+    add_count(
+        &mut counts,
         "command_dropped",
         report.dropped_commands.len(),
     );

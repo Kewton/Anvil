@@ -117,6 +117,10 @@ pub fn plan_adherence_stopword(token: &str) -> bool {
     STOPWORDS.contains(&token)
 }
 
+pub fn contains_bilingual_token(text: &str, token: &str) -> bool {
+    matched_any(text, &[token]).is_some()
+}
+
 fn contains_any(text: &str, tokens: &[&str]) -> bool {
     matched_any(text, tokens).is_some()
 }

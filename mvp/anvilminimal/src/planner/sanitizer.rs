@@ -4,6 +4,7 @@ use std::path::Path;
 use crate::planner::lint::{
     VerifyDependencyOrderViolationKind, diagnose_step_plan_dependency_order,
 };
+use crate::planner::side_effect_paths::{SideEffectPathTier, diagnose_expected_path};
 use crate::planner::step_plan::{PlanStep, StepKind, StepPlan};
 use crate::planner::verify::{
     VerifyCommandViolationKind, diagnose_verify_command,
@@ -27,6 +28,7 @@ pub struct SanitizerReport {
     pub substituted_commands: Vec<SanitizedSubstitutionRecord>,
     pub moved_commands: Vec<SanitizedMoveRecord>,
     pub setup_verify_relocations: Vec<SanitizedMoveRecord>,
+    pub dropped_expected_paths: Vec<SanitizedExpectedPathDropRecord>,
     pub dropped_commands: Vec<SanitizedCommandRecord>,
     pub retyped_steps: Vec<SanitizedRetypeRecord>,
     pub instruction_truncations: Vec<SanitizedInstructionTruncationRecord>,
@@ -81,6 +83,15 @@ pub struct SanitizedMoveRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedExpectedPathDropRecord {
+    pub step_id: String,
+    pub path: String,
+    pub tier: String,
+    pub token: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizedRetypeRecord {
     pub step_id: String,
     pub from_kind: String,
@@ -111,6 +122,7 @@ impl SanitizerReport {
             && self.substituted_commands.is_empty()
             && self.moved_commands.is_empty()
             && self.setup_verify_relocations.is_empty()
+            && self.dropped_expected_paths.is_empty()
             && self.dropped_commands.is_empty()
             && self.retyped_steps.is_empty()
             && self.instruction_truncations.is_empty()
@@ -124,6 +136,7 @@ pub fn sanitize_step_plan_against_policy(
 ) -> SanitizerReport {
     let mut report = SanitizerReport::default();
     normalize_oversized_goal(plan, &mut report);
+    drop_side_effect_expected_paths(plan, &mut report);
     normalize_repairable_verify_commands(plan, workspace_root, &mut report);
     sanitize_shell_control_verify_commands(plan, &mut report);
     relocate_setup_verify_commands(plan, &mut report);
@@ -138,6 +151,42 @@ pub fn sanitize_step_plan_against_policy(
     truncate_oversized_step_instructions(plan, &mut report);
     dedupe_verify_commands(plan);
     report
+}
+
+fn drop_side_effect_expected_paths(plan: &mut StepPlan, report: &mut SanitizerReport) {
+    let goal_or_plan_text = plan.goal.clone();
+    for step in &mut plan.steps {
+        let original = std::mem::take(&mut step.expected_paths);
+        let mut sanitized = Vec::with_capacity(original.len());
+        for path in original {
+            let Some(diagnosis) = diagnose_expected_path(&path, &goal_or_plan_text) else {
+                sanitized.push(path);
+                continue;
+            };
+            if !diagnosis.should_drop() {
+                sanitized.push(path);
+                continue;
+            }
+            let reason = match diagnosis.tier {
+                SideEffectPathTier::Unambiguous => {
+                    "unambiguous dependency/build side effect; dependency lifecycle owns this path"
+                }
+                SideEffectPathTier::Ambiguous => {
+                    "ambiguous dependency/build side effect absent from goal/ultra-plan text; dependency lifecycle owns this path"
+                }
+            };
+            report
+                .dropped_expected_paths
+                .push(SanitizedExpectedPathDropRecord {
+                    step_id: step.id.clone(),
+                    path,
+                    tier: diagnosis.tier.as_str().to_string(),
+                    token: diagnosis.token,
+                    reason: reason.to_string(),
+                });
+        }
+        step.expected_paths = sanitized;
+    }
 }
 
 fn sanitize_shell_control_verify_commands(plan: &mut StepPlan, report: &mut SanitizerReport) {
@@ -928,6 +977,148 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
 
         assert!(report.is_empty());
         assert_eq!(serde_json::to_string(&plan).unwrap(), before);
+    }
+
+    #[test]
+    fn sanitizer_drops_unambiguous_side_effect_expected_paths_before_lint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Set up a Next.js app".to_string(),
+            steps: vec![PlanStep {
+                id: "setup".to_string(),
+                kind: "setup".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the manifest and prepare dependencies.".to_string(),
+                expected_paths: vec!["package.json".to_string(), "node_modules".to_string()],
+                verify: vec![
+                    "test -f package.json".to_string(),
+                    "test -d node_modules/next".to_string(),
+                ],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(
+            plan.steps[0].expected_paths,
+            vec!["package.json".to_string()]
+        );
+        assert_eq!(
+            plan.steps[0].verify,
+            vec![
+                "test -f package.json".to_string(),
+                "test -d node_modules/next".to_string()
+            ]
+        );
+        assert_eq!(report.dropped_expected_paths.len(), 1);
+        assert_eq!(report.dropped_expected_paths[0].path, "node_modules");
+        assert_eq!(report.dropped_expected_paths[0].tier, "unambiguous");
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn side_effect_expected_path_sanitization_is_idempotent_and_keeps_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Set up a Next.js app".to_string(),
+            steps: vec![PlanStep {
+                id: "setup".to_string(),
+                kind: "setup".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create package-lock.json and install dependencies.".to_string(),
+                expected_paths: vec!["package-lock.json".to_string(), "node_modules".to_string()],
+                verify: vec!["test -d node_modules/next".to_string()],
+            }],
+        };
+
+        let first = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+        let after_first = plan.clone();
+        let second = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(first.dropped_expected_paths.len(), 1);
+        assert!(second.is_empty());
+        assert_eq!(plan, after_first);
+        assert_eq!(
+            plan.steps[0].expected_paths,
+            vec!["package-lock.json".to_string()]
+        );
+        assert_eq!(
+            plan.steps[0].verify,
+            vec!["test -d node_modules/next".to_string()]
+        );
+    }
+
+    #[test]
+    fn sanitizer_drops_ambiguous_side_effect_only_when_goal_omits_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut absent = StepPlan {
+            goal: "Create a web app".to_string(),
+            steps: vec![PlanStep {
+                id: "bundle".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the generated bundle directory.".to_string(),
+                expected_paths: vec!["dist".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let mut present = StepPlan {
+            goal: "Create the dist artifact requested by the user".to_string(),
+            steps: vec![PlanStep {
+                id: "dist".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create dist.".to_string(),
+                expected_paths: vec!["dist".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+
+        let absent_report = sanitize_step_plan_against_policy(&mut absent, Some(dir.path()));
+        let present_report = sanitize_step_plan_against_policy(&mut present, Some(dir.path()));
+
+        assert!(absent.steps[0].expected_paths.is_empty());
+        assert_eq!(absent_report.dropped_expected_paths[0].tier, "ambiguous");
+        assert_eq!(present.steps[0].expected_paths, vec!["dist".to_string()]);
+        assert!(present_report.is_empty());
+    }
+
+    #[test]
+    fn sanitizer_drops_python_side_effect_expected_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Create a Python CLI".to_string(),
+            steps: vec![PlanStep {
+                id: "python-cli".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the Python CLI package.".to_string(),
+                expected_paths: vec![
+                    "pyproject.toml".to_string(),
+                    "__pycache__".to_string(),
+                    ".venv".to_string(),
+                ],
+                verify: vec!["python -m compileall -q .".to_string()],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(
+            plan.steps[0].expected_paths,
+            vec!["pyproject.toml".to_string()]
+        );
+        assert_eq!(
+            report
+                .dropped_expected_paths
+                .iter()
+                .map(|record| record.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["__pycache__", ".venv"]
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::planner::side_effect_paths::diagnose_expected_path;
 use crate::planner::step_plan::{ExpectedResult, StepKind, StepPlan};
 use crate::planner::ultra_plan::UltraPlan;
 use crate::tools::path_guard::validate_workspace_relative;
@@ -225,6 +226,11 @@ pub fn lint_step_plan_report_with_workspace(
                         step.id
                     ),
                 );
+            }
+            if let Some(diagnosis) = diagnose_expected_path(path, &plan.goal)
+                && let Some(message) = diagnosis.lint_message()
+            {
+                report.push("side_effect_expected_path", message);
             }
         }
         for command in &step.verify {
@@ -1173,6 +1179,82 @@ mod tests {
             }],
         };
         assert!(lint_step_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn lint_reports_unsanitized_side_effect_expected_path_precisely() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = StepPlan {
+            goal: "Set up a Next.js app".to_string(),
+            steps: vec![PlanStep {
+                id: "setup".to_string(),
+                kind: "setup".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create package.json and install dependencies".to_string(),
+                expected_paths: vec!["package.json".to_string(), "node_modules".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+
+        let report = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+
+        assert!(report.has_category("side_effect_expected_path"));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|err| err.message.contains("expected path 'node_modules'")
+                    && err.message.contains("unambiguous")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn lint_reports_ambiguous_goal_contract_conflict_precisely() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = StepPlan {
+            goal: "Create the target output requested by the user".to_string(),
+            steps: vec![PlanStep {
+                id: "target-output".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create target.".to_string(),
+                expected_paths: vec!["target".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+
+        let report = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+
+        assert!(report.has_category("side_effect_expected_path"));
+        assert!(
+            report.errors.iter().any(|err| err.message
+                == "goal requests 'target' but it is a blocked contract path: target"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn lint_allows_ambiguous_path_when_goal_mentions_it_and_contract_allows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = StepPlan {
+            goal: "Create the dist artifact requested by the user".to_string(),
+            steps: vec![PlanStep {
+                id: "dist".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create dist.".to_string(),
+                expected_paths: vec!["dist".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+
+        let report = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
+
+        assert!(
+            !report.has_category("side_effect_expected_path"),
+            "{report:?}"
+        );
     }
 
     #[test]
