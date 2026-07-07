@@ -612,6 +612,9 @@ pub fn parse_compile_errors(output: &str) -> Vec<CompileError> {
     if errors.is_empty() {
         parse_failed_to_compile_module_error(&lines, &mut errors);
     }
+    if errors.is_empty() {
+        parse_swc_source_frame_errors(&lines, &mut errors);
+    }
     errors
 }
 
@@ -859,6 +862,35 @@ fn parse_failed_to_compile_module_error(lines: &[&str], errors: &mut Vec<Compile
     );
 }
 
+fn parse_swc_source_frame_errors(lines: &[&str], errors: &mut Vec<CompileError>) {
+    for (message_index, raw) in lines.iter().enumerate() {
+        let line = trim_compile_line(raw);
+        let matched = !line.is_empty()
+            && (line.starts_with("Error:")
+                || line.contains("Syntax Error")
+                || line.contains("Syntax error:"));
+        if !matched {
+            continue;
+        }
+        let details = compile_error_details_from_message_line(lines, message_index);
+        let Some((path, line, column)) = details.locator.as_ref().cloned() else {
+            continue;
+        };
+        push_compile_error(
+            errors,
+            CompileError {
+                path,
+                line,
+                column,
+                excerpt: details.excerpt.clone(),
+                symbol: cannot_find_name_symbol(&details.message),
+                message: details.message,
+                route_bound: None,
+            },
+        );
+    }
+}
+
 fn normalize_compile_error_path(raw: &str) -> Option<String> {
     let trimmed = raw
         .trim()
@@ -1078,6 +1110,40 @@ Error:
         assert_eq!(errors[0].message, "Expected ';', '}' or <eof>");
         assert!(errors[0].excerpt.contains("12 |"), "{errors:?}");
         assert!(errors[0].excerpt.contains("|     ^"), "{errors:?}");
+    }
+
+    #[test]
+    fn parse_swc_path_header_frame_without_failed_compile_banner() {
+        let output = r#"
+outcome: CommandFailed
+status: exit status: 1
+summary: command failed
+stdout:
+./src/app/game.ts
+Error:
+  x Expected ',', got '}'
+
+   ,-[./src/app/game.ts:631:1]
+628 |   const asteroids = [
+629 |     { x: 10, y: 20 },
+630 |     { x: 30, y: 40 }
+631 |   }
+    |   ^
+632 |   return asteroids
+   `----
+> Build failed because of webpack errors
+stderr:
+"#;
+
+        let errors = parse_compile_errors(output);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "src/app/game.ts");
+        assert_eq!(errors[0].line, 631);
+        assert_eq!(errors[0].column, 1);
+        assert_eq!(errors[0].message, "Expected ',', got '}'");
+        assert!(errors[0].excerpt.contains("631 |   }"), "{errors:?}");
+        assert!(errors[0].excerpt.contains("|   ^"), "{errors:?}");
     }
 
     #[test]

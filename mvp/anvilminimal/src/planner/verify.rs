@@ -2523,6 +2523,77 @@ mod tests {
     }
 
     #[test]
+    fn nextjs_swc_lifecycle_frame_is_compile_error_not_dependency_lifecycle_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        write_fake_next_build_workspace(
+            dir.path(),
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"run\" ] && [ \"$2\" = \"build\" ]; then\n\
+               cat >&2 <<'EOF'\n\
+./src/app/game.ts\n\
+Error:\n\
+  x Expected ',', got '}'\n\
+\n\
+   ,-[./src/app/game.ts:631:1]\n\
+628 |   const asteroids = [\n\
+629 |     { x: 10, y: 20 },\n\
+630 |     { x: 30, y: 40 }\n\
+631 |   }\n\
+    |   ^\n\
+632 |   return asteroids\n\
+   `----\n\
+> Build failed because of webpack errors\n\
+EOF\n\
+               exit 1\n\
+             fi\n\
+             exit 2\n",
+        );
+        std::fs::write(
+            dir.path().join("src/app/game.ts"),
+            "export const asteroids = [];\n",
+        )
+        .unwrap();
+        let step = PlanStep {
+            id: "build".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Run production build".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["npm run build".to_string()],
+        };
+
+        let (report, lifecycles) =
+            verify_step_with_setup_observed(dir.path(), &step, NodeDependencySetupAuthority::None);
+
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::Implementation
+        );
+        assert!(
+            report
+                .command_failures
+                .iter()
+                .all(|failure| !failure.reason.contains("dependency_setup_lifecycle_failed")),
+            "{report:?}"
+        );
+        assert!(report.dependency_missing.is_empty(), "{report:?}");
+        assert_eq!(report.compile_errors.len(), 1, "{report:?}");
+        assert_eq!(report.compile_errors[0].path, "src/app/game.ts");
+        assert_eq!(report.compile_errors[0].line, 631);
+        assert_eq!(report.compile_errors[0].message, "Expected ',', got '}'");
+        assert!(report.compile_errors[0].excerpt.contains("631 |   }"));
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].final_status, BuildVerifierStatus::Failed);
+        assert_eq!(lifecycles[0].final_observation().compile_errors.len(), 1);
+        assert!(
+            !report
+                .primary_reason()
+                .contains("dependency_setup_lifecycle_failed"),
+            "{report:?}"
+        );
+    }
+
+    #[test]
     fn nextjs_cannot_find_module_build_failure_stays_dependency_missing() {
         let dir = tempfile::tempdir().unwrap();
         write_fake_next_build_workspace(

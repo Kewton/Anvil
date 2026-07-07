@@ -637,6 +637,44 @@ mod tests {
     }
 
     #[test]
+    fn compact_compile_repair_prompt_preserves_swc_frame_excerpt() {
+        let mut report = VerificationReport::pass();
+        report.push_compile_errors(
+            "npm run build",
+            vec![CompileError {
+                path: "src/app/game.ts".to_string(),
+                line: 631,
+                column: 1,
+                message: "Expected ',', got '}'".to_string(),
+                excerpt:
+                    "628 |   const asteroids = [\n629 |     { x: 10, y: 20 },\n630 |     { x: 30, y: 40 }\n631 |   }\n|   ^\n632 |   return asteroids"
+                        .to_string(),
+                symbol: None,
+                route_bound: Some(true),
+            }],
+        );
+
+        let prompt = build_compact_compile_repair_prompt_with_context(
+            "verify-nextjs-build",
+            &report,
+            &RepairContext::default(),
+        );
+
+        assert!(prompt.contains("Repair session mode: compact"), "{prompt}");
+        assert!(
+            prompt.contains("Compile error: src/app/game.ts:631:1 Expected ',', got '}'"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Compile error excerpt for src/app/game.ts:631:1"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("631 |   }"), "{prompt}");
+        assert!(prompt.contains("|   ^"), "{prompt}");
+        assert!(prompt.contains("Tool schema reminder"), "{prompt}");
+    }
+
+    #[test]
     fn recovery_ultra_plan_roundtrips_and_contains_recovery_contract() {
         let dir = tempfile::tempdir().unwrap();
         let handoff = RecoveryHandoff {
