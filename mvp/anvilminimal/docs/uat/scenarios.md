@@ -92,6 +92,11 @@ hint, and terminal summary card were visible and ordered correctly. This demo is
 offline and does not replace the scenario suite; it is the permanent acceptance
 vehicle for TUI/scrollback/footer presentation changes.
 
+For footer-specific changes, the reviewer also checks `anvilminimal --ux-demo`
+and one real local run for zero blinking, readable long-turn breadcrumbs, and a
+stable footer. If a terminal shows cursor-region artifacts, rerun with
+`--footer off`; the fixed footer is disabled and scrollback breadcrumbs remain.
+
 ## Scenarios
 
 ### GAME

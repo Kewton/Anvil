@@ -294,6 +294,11 @@ pub fn render_status_card(config: &Config) -> String {
             narration_label(config.narration),
             config.field_sources.narration
         ),
+        format!(
+            "- Footer: {} ({})",
+            footer_label(config.no_footer),
+            config.field_sources.footer
+        ),
     ]
     .join("\n")
 }
@@ -846,6 +851,10 @@ fn narration_label(mode: NarrationMode) -> &'static str {
     }
 }
 
+fn footer_label(no_footer: bool) -> &'static str {
+    if no_footer { "off" } else { "on" }
+}
+
 fn tool_start_label(event: &Value) -> String {
     let name = text(event, "name").unwrap_or_else(|| "tool".to_string());
     let Some(summary) = event.get("arguments") else {
@@ -1191,6 +1200,7 @@ mod tests {
         sources.context_budget = "flag".to_string();
         sources.profile = "preset:local".to_string();
         sources.narration = "preset:local".to_string();
+        sources.footer = "preset:local".to_string();
         let config = Config {
             workspace_root: std::path::PathBuf::from("."),
             state_dir: std::path::PathBuf::from("state"),
@@ -1212,7 +1222,7 @@ mod tests {
             chat_retries: 1,
             resume: None,
             fresh_session: false,
-            no_footer: false,
+            no_footer: true,
             narration: crate::config::NarrationMode::Quiet,
             profile: "nextjs".to_string(),
             profile_explicit: true,
@@ -1233,6 +1243,7 @@ mod tests {
         assert!(card.contains("- Timeout: 77s (preset:local)"), "{card}");
         assert!(card.contains("- Context budget: 999 (flag)"), "{card}");
         assert!(card.contains("- Profile: nextjs (preset:local)"), "{card}");
+        assert!(card.contains("- Footer: off (preset:local)"), "{card}");
         assert!(card.contains("- Inference: explicit"), "{card}");
         assert!(card.contains("- Port: 4000 (goal)"), "{card}");
         assert!(

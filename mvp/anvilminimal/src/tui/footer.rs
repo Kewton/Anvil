@@ -520,6 +520,7 @@ fn char_display_width(ch: char) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn status(tokens: Option<u64>) -> UiStatus {
         UiStatus {
@@ -536,6 +537,24 @@ mod tests {
     #[test]
     fn footer_env_disable_by_flag() {
         assert!(!FooterEnv::detect_with(|_| None, true, true).enabled);
+    }
+
+    #[test]
+    fn footer_env_disable_by_footer_off_cli_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let config = crate::config::Config::from_cli(crate::cli::Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--footer",
+            "off",
+        ]))
+        .unwrap();
+
+        assert!(config.no_footer);
+        assert_eq!(config.field_sources.footer, "flag");
+        assert!(!FooterEnv::detect_with(|_| None, true, config.no_footer).enabled);
     }
 
     #[test]

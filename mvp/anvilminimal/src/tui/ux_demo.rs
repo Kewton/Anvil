@@ -60,9 +60,17 @@ pub fn run(config: &Config) -> anyhow::Result<()> {
     let total_secs = if fast { 2 } else { 20 };
     let interrupt_at = if fast { 1 } else { 10 };
     status_bus::publish_provider_started("planner_step", 600);
+    crate::tui::presentation::emit_provider_turn_started(
+        "planner_step",
+        &demo_config.planner_model,
+        600,
+    );
     for second in 0..=total_secs {
         if second == interrupt_at {
             status_bus::publish_interrupt_requested();
+        }
+        if second == 2 {
+            crate::tui::presentation::emit_provider_turn_progress(60, 600);
         }
         if (0..=2).contains(&second) || second == interrupt_at {
             render_demo_markdown(&footer_snapshot(
@@ -119,6 +127,25 @@ pub fn render_scripted_demo_text(config: &Config) -> String {
             out.push('\n');
         }
     }
+    let context = crate::tui::presentation::ProviderBreadcrumbContext {
+        phase: Some(crate::tui::presentation::ProviderBreadcrumbPhase {
+            index: 1,
+            total: 2,
+            id: "scaffold".to_string(),
+        }),
+        repair_target: None,
+    };
+    out.push_str(&crate::tui::presentation::render_provider_turn_started(
+        "planner_step",
+        &config.planner_model,
+        600,
+        &context,
+    ));
+    out.push('\n');
+    out.push_str(&crate::tui::presentation::render_provider_turn_progress(
+        60, 600,
+    ));
+    out.push('\n');
     out.push_str(&footer_snapshot(config, 2, false));
     out.push('\n');
     out.push_str(&footer_snapshot(config, 10, true));
@@ -268,7 +295,9 @@ mod tests {
             "✓ Write ok",
             "✗ verify missing path browser-readiness.json",
             "↻ repair 1/2: browser evidence",
-            "provider 2s/600s (planner_step)",
+            "→ planning steps for phase 1/2 scaffold (pm, up to 600s)",
+            "… still waiting (60s/600s)",
+            "planning steps 2s/600s",
             "[stopping: aborting current operation…]",
             "### Terminal summary",
             "- Status: interrupted",

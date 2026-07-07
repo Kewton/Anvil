@@ -82,7 +82,7 @@ pub fn render_startup_banner(config: &Config, style: BannerStyle) -> String {
         sanitize_banner_text(&config.workspace_root.display().to_string())
     ));
     out.push_str(&format!(
-        "context_budget={} ({}) timeout={}s ({}) profile={} ({}) narration={} ({}) yes={}\n",
+        "context_budget={} ({}) timeout={}s ({}) profile={} ({}) narration={} ({}) footer={} ({}) yes={}\n",
         config.context_budget,
         sanitize_banner_text(&config.field_sources.context_budget),
         config.chat_timeout_secs,
@@ -91,6 +91,8 @@ pub fn render_startup_banner(config: &Config, style: BannerStyle) -> String {
         sanitize_banner_text(&config.field_sources.profile),
         narration_label(config.narration),
         sanitize_banner_text(&config.field_sources.narration),
+        footer_label(config.no_footer),
+        sanitize_banner_text(&config.field_sources.footer),
         config.yes
     ));
     if let Some(path) = &config.eval_events_path {
@@ -118,6 +120,10 @@ fn narration_label(mode: crate::config::NarrationMode) -> &'static str {
         crate::config::NarrationMode::Normal => "normal",
         crate::config::NarrationMode::Quiet => "quiet",
     }
+}
+
+fn footer_label(no_footer: bool) -> &'static str {
+    if no_footer { "off" } else { "on" }
 }
 
 fn sanitize_banner_text(input: &str) -> String {
@@ -208,6 +214,7 @@ mod tests {
         assert!(out.contains("anvilminimal"));
         assert!(out.contains(&crate::build_info::commit_with_dirty()));
         assert!(out.contains("context_budget=65536 (default)"));
+        assert!(out.contains("footer=on (default)"));
         assert!(out.contains("yes=true"));
         assert!(!out.contains("╔═╗"));
     }

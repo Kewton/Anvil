@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{Cli, ProviderArg};
+use crate::cli::{Cli, FooterArg, ProviderArg};
 use crate::planner::profile::{ProfileInference, infer_profile};
 
 pub const LOCAL_PROVIDER_CHAT_TIMEOUT_SECS: u64 = 600;
@@ -26,6 +26,36 @@ impl From<ProviderArg> for Provider {
             ProviderArg::Ollama => Self::Ollama,
             ProviderArg::Openai => Self::Openai,
             ProviderArg::Gemini => Self::Gemini,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FooterMode {
+    #[default]
+    On,
+    Off,
+}
+
+impl FooterMode {
+    pub fn is_off(self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim() {
+            "on" => Some(Self::On),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+impl From<FooterArg> for FooterMode {
+    fn from(value: FooterArg) -> Self {
+        match value {
+            FooterArg::On => Self::On,
+            FooterArg::Off => Self::Off,
         }
     }
 }
@@ -107,6 +137,7 @@ pub struct ConfigFieldSources {
     pub chat_timeout_secs: String,
     pub profile: String,
     pub narration: String,
+    pub footer: String,
 }
 
 impl Default for ConfigFieldSources {
@@ -120,6 +151,7 @@ impl Default for ConfigFieldSources {
             chat_timeout_secs: "default".to_string(),
             profile: "default".to_string(),
             narration: "default".to_string(),
+            footer: "default".to_string(),
         }
     }
 }
@@ -147,12 +179,14 @@ struct PresetConfig {
     chat_timeout_secs: Option<Sourced<u64>>,
     profile: Option<Sourced<String>>,
     narration: Option<Sourced<NarrationMode>>,
+    footer: Option<Sourced<FooterMode>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ConfigFile {
     presets: HashMap<String, PresetConfig>,
     narration: Option<Sourced<NarrationMode>>,
+    footer: Option<Sourced<FooterMode>>,
 }
 
 impl Config {
@@ -233,6 +267,17 @@ impl Config {
                 .or_else(|| config_file_narration(&workspace_root))
                 .unwrap_or_else(|| sourced(NarrationMode::Normal, "default"))
         };
+        let footer = if cli.no_footer {
+            sourced(FooterMode::Off, "flag")
+        } else if let Some(footer) = cli.footer {
+            sourced(FooterMode::from(footer), "flag")
+        } else {
+            preset
+                .as_ref()
+                .and_then(|preset| preset.footer.clone())
+                .or_else(|| config_file_footer(&workspace_root))
+                .unwrap_or_else(|| sourced(FooterMode::On, "default"))
+        };
         let profile_from_preset = preset.as_ref().and_then(|preset| preset.profile.clone());
         let profile_explicit = cli.profile.is_some() || profile_from_preset.is_some();
         let profile_inference = if profile_explicit {
@@ -259,6 +304,7 @@ impl Config {
             chat_timeout_secs: chat_timeout_source.clone(),
             profile: profile.source.clone(),
             narration: narration.source.clone(),
+            footer: footer.source.clone(),
         };
         Ok(Self {
             workspace_root,
@@ -281,7 +327,7 @@ impl Config {
             chat_retries: cli.chat_retries,
             resume: cli.resume,
             fresh_session: cli.fresh_session,
-            no_footer: cli.no_footer,
+            no_footer: footer.value.is_off(),
             narration: narration.value,
             profile: profile.value,
             profile_explicit,
@@ -314,6 +360,7 @@ fn load_named_preset(root: &Path, name: Option<&str>) -> anyhow::Result<Option<P
         merge_preset_field(&mut merged.chat_timeout_secs, &preset.chat_timeout_secs);
         merge_preset_field(&mut merged.profile, &preset.profile);
         merge_preset_field(&mut merged.narration, &preset.narration);
+        merge_preset_field(&mut merged.footer, &preset.footer);
         if preset_complete(&merged) {
             break;
         }
@@ -338,6 +385,7 @@ fn preset_complete(preset: &PresetConfig) -> bool {
         && preset.chat_timeout_secs.is_some()
         && preset.profile.is_some()
         && preset.narration.is_some()
+        && preset.footer.is_some()
 }
 
 fn merge_preset_field<T: Clone>(target: &mut Option<Sourced<T>>, source: &Option<Sourced<T>>) {
@@ -357,15 +405,38 @@ fn config_file_narration(root: &Path) -> Option<Sourced<NarrationMode>> {
     legacy_config_file_narration(root)
 }
 
+fn config_file_footer(root: &Path) -> Option<Sourced<FooterMode>> {
+    for path in config_paths(root) {
+        if let Ok(Some(file)) = parse_config_file_if_present(&path)
+            && let Some(footer) = file.footer
+        {
+            return Some(footer);
+        }
+    }
+    legacy_config_file_footer(root)
+}
+
 fn legacy_config_file_narration(root: &Path) -> Option<Sourced<NarrationMode>> {
+    legacy_config_file_value(root, "narration", NarrationMode::from_config_value)
+}
+
+fn legacy_config_file_footer(root: &Path) -> Option<Sourced<FooterMode>> {
+    legacy_config_file_value(root, "footer", FooterMode::from_config_value)
+}
+
+fn legacy_config_file_value<T>(
+    root: &Path,
+    key: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Option<Sourced<T>> {
     let path = root.join(".anvil").join("config");
     let text = std::fs::read_to_string(&path).ok()?;
     text.lines().find_map(|line| {
         let line = line.split('#').next().unwrap_or("").trim();
-        let value = line.strip_prefix("narration")?.trim();
+        let value = line.strip_prefix(key)?.trim();
         let value = value.strip_prefix('=')?.trim();
         let value = value.trim_matches('"').trim_matches('\'');
-        NarrationMode::from_config_value(value).map(|mode| {
+        parse(value).map(|mode| {
             sourced(
                 mode,
                 format!(
@@ -464,6 +535,16 @@ fn parse_top_level_key(
             ));
             Ok(())
         }
+        "footer" => {
+            file.footer = Some(sourced(
+                parse_footer_value(path, line_no, key, value)?,
+                format!(
+                    "config:{}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            ));
+            Ok(())
+        }
         _ => bail!("{}:{} unknown config key '{key}'", path.display(), line_no),
     }
 }
@@ -524,6 +605,12 @@ fn parse_preset_key(
         "narration" => {
             preset.narration = Some(sourced(
                 parse_narration_value(path, line_no, &full_key, value)?,
+                source,
+            ))
+        }
+        "footer" => {
+            preset.footer = Some(sourced(
+                parse_footer_value(path, line_no, &full_key, value)?,
                 source,
             ))
         }
@@ -604,6 +691,18 @@ fn parse_narration_value(
             path.display(),
             line_no
         )
+    })
+}
+
+fn parse_footer_value(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<FooterMode> {
+    let value = parse_string_value(path, line_no, key, value)?;
+    FooterMode::from_config_value(&value).ok_or_else(|| {
+        anyhow::anyhow!("{}:{} {key} expects footer on|off", path.display(), line_no)
     })
 }
 
@@ -821,6 +920,71 @@ mod tests {
         let config =
             Config::from_cli(Cli::parse_from(["anvilminimal", "--cwd", &cwd, "--quiet"])).unwrap();
         assert_eq!(config.narration, NarrationMode::Quiet);
+    }
+
+    #[test]
+    fn footer_mode_is_read_from_cli_preset_or_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+        std::fs::write(dir.path().join(".anvil/config.toml"), "footer = \"off\"\n").unwrap();
+
+        let config = Config::from_cli(Cli::parse_from(["anvilminimal", "--cwd", &cwd])).unwrap();
+        assert!(config.no_footer);
+        assert_eq!(config.field_sources.footer, "config:config.toml");
+
+        let config = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--footer",
+            "on",
+        ]))
+        .unwrap();
+        assert!(!config.no_footer);
+        assert_eq!(config.field_sources.footer, "flag");
+
+        std::fs::write(
+            dir.path().join(".anvil/config.toml"),
+            "[preset.local]\nfooter = \"off\"\n",
+        )
+        .unwrap();
+        let config = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--preset",
+            "local",
+        ]))
+        .unwrap();
+        assert!(config.no_footer);
+        assert_eq!(config.field_sources.footer, "preset:local");
+    }
+
+    #[test]
+    fn invalid_footer_value_error_names_file_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+        std::fs::write(
+            dir.path().join(".anvil/config.toml"),
+            "[preset.bad]\nfooter = \"blink\"\n",
+        )
+        .unwrap();
+
+        let err = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--preset",
+            "bad",
+        ]))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains(".anvil/config.toml"), "{err}");
+        assert!(err.contains("preset.bad.footer"), "{err}");
+        assert!(err.contains("on|off"), "{err}");
     }
 
     #[test]

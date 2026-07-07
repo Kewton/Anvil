@@ -45,6 +45,7 @@ These are examples only; Anvil does not auto-create them:
 # chat_timeout_secs = 180
 # profile = "nextjs"
 # narration = "normal"
+# footer = "on"
 #
 # [preset.local]
 # provider = "ollama"
@@ -55,6 +56,7 @@ These are examples only; Anvil does not auto-create them:
 # chat_timeout_secs = 600
 # profile = "generic"
 # narration = "normal"
+# footer = "on"
 ```
 
 ```bash
@@ -74,6 +76,7 @@ ANVIL_NO_INTERRUPT=1 anvilminimal --yes
 ANVIL_NO_MARKDOWN=1 anvilminimal --yes
 NO_COLOR=1 anvilminimal --yes
 anvilminimal --yes --no-footer
+anvilminimal --yes --footer off
 ```
 
 Release/manual TTY smoke:
@@ -88,7 +91,8 @@ anvilminimal --yes --context-budget 65536 --model qwen3.6:27b-coding-nvfp4 --pla
 `anvilminimal --ux-demo` is an offline presentation walkthrough for human
 review. It exercises the banner, plan card, phase header, activity narration,
 live footer interrupt hint, and terminal summary card without contacting a
-provider.
+provider. If a terminal still shows cursor-region artifacts, rerun with
+`--footer off`; scrollback breadcrumbs stay enabled without the DECSTBM footer.
 
 ## UAT
 

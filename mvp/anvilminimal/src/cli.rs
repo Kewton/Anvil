@@ -9,6 +9,12 @@ pub enum ProviderArg {
     Gemini,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum FooterArg {
+    On,
+    Off,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "anvilminimal")]
 #[command(about = "Minimal loop + YAML plan runner MVP")]
@@ -74,7 +80,19 @@ pub struct Cli {
     pub cwd: Option<PathBuf>,
     #[arg(long, action = ArgAction::SetTrue)]
     pub fresh_session: bool,
-    #[arg(long, action = ArgAction::SetTrue, help = "Disable the fixed TUI footer")]
+    #[arg(
+        long,
+        value_enum,
+        value_name = "on|off",
+        help = "Control the fixed TUI footer; off keeps scrollback breadcrumbs only"
+    )]
+    pub footer: Option<FooterArg>,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        conflicts_with = "footer",
+        help = "Disable the fixed TUI footer"
+    )]
     pub no_footer: bool,
     #[arg(long, hide = true)]
     pub completion_contract_json: Option<PathBuf>,
@@ -105,6 +123,13 @@ mod tests {
     fn help_includes_no_footer() {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--no-footer"));
+    }
+
+    #[test]
+    fn help_includes_footer_mode() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--footer"));
+        assert!(help.contains("on|off"));
     }
 
     #[test]

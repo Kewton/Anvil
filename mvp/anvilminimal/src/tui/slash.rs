@@ -402,6 +402,7 @@ fn render_help() -> String {
         "/run-ultra-plan <path> - run an existing UltraPlan",
         "/setup-interaction-probe - install the interaction readiness probe",
         "/exit or /quit - leave the TUI",
+        "Footer: use --footer off to disable the fixed footer; breadcrumbs remain in scrollback.",
         "Interrupt: Esc/Ctrl-C once = prompt abort; twice = force finalize.",
     ]
     .join("\n")
@@ -892,6 +893,7 @@ mod tests {
             "/status - show effective configuration and readiness",
             "/setup-interaction-probe - install the interaction readiness probe",
             "/exit or /quit - leave the TUI",
+            "Footer: use --footer off to disable the fixed footer; breadcrumbs remain in scrollback.",
             "Interrupt: Esc/Ctrl-C once = prompt abort; twice = force finalize.",
         ] {
             assert!(help.contains(expected), "{help}");
