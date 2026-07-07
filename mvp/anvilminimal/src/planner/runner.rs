@@ -63,10 +63,10 @@ use crate::planner::profile::{
     verify_profile_invariant,
 };
 use crate::planner::repair::{
-    RecoveryHandoff, RepairContext, build_repair_prompt_with_context, save_recovery_ultra_plan,
-    save_repair_report_with_context, save_ultra_recovery_prompt,
-    suggested_recovery_ultra_plan_command, suggested_ultra_recovery_command,
-    workspace_relative_handoff_path,
+    RecoveryHandoff, RepairContext, build_compact_compile_repair_prompt_with_context,
+    build_repair_prompt_with_context, save_recovery_ultra_plan, save_repair_report_with_context,
+    save_ultra_recovery_prompt, suggested_recovery_ultra_plan_command,
+    suggested_ultra_recovery_command, workspace_relative_handoff_path,
 };
 use crate::planner::sanitizer::{SanitizerReport, sanitize_step_plan_against_policy};
 use crate::planner::signals;
@@ -140,6 +140,21 @@ const GENERIC_INTERACTIVE_EVIDENCE_KEYS: [&str; 3] = [
     "stateful_update_evidence",
     "visible_interactive_surface_evidence",
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairSessionMode {
+    Appended,
+    Compact,
+}
+
+impl RepairSessionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Appended => "appended",
+            Self::Compact => "compact",
+        }
+    }
+}
 
 thread_local! {
     static FINAL_ACCEPTANCE_CYCLE_INDEX: Cell<usize> = const { Cell::new(0) };
@@ -1970,22 +1985,48 @@ fn run_step(
     }
     if current_reachability.reachable {
         for attempt in 1..=STEP_REPAIR_MAX_TURNS {
+            let repair_session_mode =
+                if no_change_repairs > 0 && !current_report.compile_errors.is_empty() {
+                    RepairSessionMode::Compact
+                } else {
+                    RepairSessionMode::Appended
+                };
             context.repair_attempt = Some(attempt);
-            context.compile_reanchored_retry =
-                no_change_repairs > 0 && !current_report.compile_errors.is_empty();
+            context.compile_reanchored_retry = repair_session_mode == RepairSessionMode::Compact;
             context.compile_narrow_no_snapshot_retry = false;
-            let repair_prompt =
-                build_repair_prompt_with_context(&step.id, &current_report, &context);
-            let repair = run_session_with_outcome_with_options(
-                client,
-                session,
-                &repair_prompt,
-                &step.expected_paths,
-                &repair_config,
-                ui,
-                step_options.clone(),
-            )
-            .map_err(|err| {
+            let repair_prompt = if repair_session_mode == RepairSessionMode::Compact {
+                build_compact_compile_repair_prompt_with_context(
+                    &step.id,
+                    &current_report,
+                    &context,
+                )
+            } else {
+                build_repair_prompt_with_context(&step.id, &current_report, &context)
+            };
+            let repair_result = match repair_session_mode {
+                RepairSessionMode::Appended => run_session_with_outcome_with_options(
+                    client,
+                    session,
+                    &repair_prompt,
+                    &step.expected_paths,
+                    &repair_config,
+                    ui,
+                    step_options.clone(),
+                ),
+                RepairSessionMode::Compact => {
+                    let mut compact_session = SessionSnapshot::new();
+                    run_session_with_outcome_with_options(
+                        client,
+                        &mut compact_session,
+                        &repair_prompt,
+                        &step.expected_paths,
+                        &repair_config,
+                        ui,
+                        step_options.clone(),
+                    )
+                }
+            };
+            let repair = repair_result.map_err(|err| {
                 let message = err.to_string();
                 apply_session_error_observations(&mut outcome, &err, &message);
                 outcome.primary_failure = Some(message.clone());
@@ -2146,6 +2187,7 @@ fn run_step(
                     "report_signature_unchanged": report_signature_unchanged,
                     "allowed_action": previous_target.allowed_action(),
                     "repair_stop_reason": repair_stop_reason.clone().unwrap_or_default(),
+                    "repair_session_mode": repair_session_mode.as_str(),
                     "compile_reanchored_retry": context.compile_reanchored_retry,
                     "compile_repair_no_source_change": compile_repair_no_change,
                     "dependency_setup_authority": setup_authority.as_str(),
@@ -21462,6 +21504,63 @@ export default function Page() {
         }
     }
 
+    struct CompactAwareCompileRepairClient {
+        messages: Vec<Vec<ConversationMessage>>,
+        initial_done: bool,
+        appended_repair_calls: usize,
+        compact_repair_calls: usize,
+    }
+
+    impl CompactAwareCompileRepairClient {
+        fn new() -> Self {
+            Self {
+                messages: Vec::new(),
+                initial_done: false,
+                appended_repair_calls: 0,
+                compact_repair_calls: 0,
+            }
+        }
+    }
+
+    impl ChatClient for CompactAwareCompileRepairClient {
+        fn label(&self) -> &str {
+            "compact-aware"
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            messages: &[ConversationMessage],
+            _tools: &[ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            self.messages.push(messages.to_vec());
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !self.initial_done {
+                self.initial_done = true;
+                return Ok(api_mismatch_initial_reply(3011));
+            }
+            if prompt.contains("Repair session mode: compact") {
+                self.compact_repair_calls += 1;
+                return Ok(api_mismatch_poll_fix_reply());
+            }
+            if prompt.contains("Property 'onStateChange'") {
+                self.appended_repair_calls += 1;
+                if self.appended_repair_calls == 1 {
+                    return Ok(api_mismatch_read_only_reply());
+                }
+                return Ok(AssistantReply::text(
+                    "The failing call is engine.onStateChange, but no edit is needed.",
+                ));
+            }
+            anyhow::bail!("compact-aware fake client received unexpected prompt")
+        }
+    }
+
     struct FlakyClient {
         replies: Vec<AssistantReply>,
         messages: Vec<Vec<ConversationMessage>>,
@@ -23361,6 +23460,68 @@ exit 2\n",
         );
         let event_text = std::fs::read_to_string(&events).unwrap();
         assert!(event_text.contains("\"event\":\"step_verify_repair\""));
+        assert!(event_text.contains("\"repair_session_mode\":\"appended\""));
+        assert!(event_text.contains("\"ok\":true"), "{event_text}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn step_verify_compile_repair_recovers_in_compact_session_after_appended_no_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir
+            .path()
+            .join(".anvil/runs/api-mismatch-compact/events.jsonl");
+        write_api_mismatch_build_shim(dir.path());
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let mut execution = CompactAwareCompileRepairClient::new();
+
+        let result =
+            run_step_plan(&mut execution, &api_mismatch_step_plan(), &cfg).unwrap_or_else(|err| {
+                let event_text = std::fs::read_to_string(&events).unwrap_or_default();
+                panic!("{err}\nEvents:\n{event_text}");
+            });
+
+        assert!(result.contains("plan-run complete"), "{result}");
+        assert_eq!(execution.compact_repair_calls, 1);
+        assert!(execution.appended_repair_calls >= 2);
+        let prompts = execution
+            .messages
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>();
+        let compact_prompt = prompts
+            .iter()
+            .find(|prompt| prompt.contains("Repair session mode: compact"))
+            .expect("compact repair prompt");
+        assert!(
+            compact_prompt.contains("Compile error frames and remedies"),
+            "{compact_prompt}"
+        );
+        assert!(
+            compact_prompt.contains("Tool schema reminder"),
+            "{compact_prompt}"
+        );
+        assert!(
+            !compact_prompt.contains("Overall goal:"),
+            "{compact_prompt}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"repair_session_mode\":\"appended\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"repair_session_mode\":\"compact\""),
+            "{event_text}"
+        );
         assert!(event_text.contains("\"ok\":true"), "{event_text}");
     }
 
@@ -23405,9 +23566,23 @@ exit 2\n",
                 .any(|prompt| prompt.contains("Compile repair re-anchor")),
             "{prompts:#?}"
         );
+        assert!(
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("Repair session mode: compact")),
+            "{prompts:#?}"
+        );
         let event_text = std::fs::read_to_string(&events).unwrap();
         assert!(
             event_text.contains("\"failure_kind\":\"compile_repair_no_source_change\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"repair_session_mode\":\"appended\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"repair_session_mode\":\"compact\""),
             "{event_text}"
         );
         assert!(

@@ -134,6 +134,31 @@ Make the smallest bounded change, then stop.",
     prompt
 }
 
+pub fn build_compact_compile_repair_prompt_with_context(
+    step_id: &str,
+    report: &VerificationReport,
+    context: &RepairContext,
+) -> String {
+    let compile_errors = compile_repair_prompt_section_with_root(
+        context.workspace_root.as_deref(),
+        &report.compile_errors,
+        CompileRepairPromptProtection {
+            reanchored_retry: true,
+            narrow_no_snapshot_retry: context.compile_narrow_no_snapshot_retry,
+        },
+    );
+    format!(
+        "Repair session mode: compact.\n\
+Compile-error repair for step `{step_id}`.\n\n\
+Compile error frames and remedies:\n\
+{compile_errors}\n\n\
+Tool schema reminder:\n\
+- Use Write or Edit tool calls to modify the failing source file.\n\
+- Do not answer in prose only; a response without a source edit fails this compile repair.\n\
+- Keep the change bounded to the compile frame above, then stop."
+    )
+}
+
 pub fn save_repair_report(
     root: &Path,
     step_id: &str,
