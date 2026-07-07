@@ -30,7 +30,8 @@ use crate::minimal_loop::evidence::{
     verify_runtime_acceptance_with_browser_dirs_and_hints,
 };
 use crate::minimal_loop::import_scan::{
-    MissingImport, format_missing_import_findings, missing_import_target_rel, route_bound_closure,
+    MissingImport, UnattachedRefDiagnostic, format_missing_import_findings,
+    missing_import_target_rel, route_bound_closure, route_bound_unattached_ref_diagnostics,
     scan_relative_imports,
 };
 use crate::minimal_loop::interaction_probe::{
@@ -113,7 +114,8 @@ const PERSISTENCE_RELOAD_REPAIR_REQUIREMENT: &str = "load persisted state on mou
 const TEXT_ECHO_REPAIR_REQUIREMENT: &str = "token never rendered; render the input's content reactively (no manual rebuild) - the typed text must appear in the preview/list";
 const TEXT_ECHO_AFTER_RELOAD_REPAIR_REQUIREMENT: &str =
     "preview renders only after reload - make it reactive to input";
-const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 14] = [
+const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 15] = [
+    "canvas_blank",
     "interaction_state_change_missing",
     "input_state_change_missing_after_start",
     "input_state_change_not_evaluated_after_start",
@@ -6224,6 +6226,8 @@ fn emit_browser_probe_event(
 }
 
 fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionProbeOutcome) {
+    let source_diagnostics = interaction_source_diagnostics(config);
+    let source_diagnostic_labels = unattached_ref_diagnostic_labels(&source_diagnostics);
     match outcome {
         InteractionProbeOutcome::Unavailable(reason) => {
             eval_events::emit(
@@ -6235,12 +6239,26 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "ok": false,
                     "failure_kind": reason,
                     "evidence_path": "",
+                    "source_diagnostics": &source_diagnostic_labels,
+                    "unattached_ref_diagnostics": &source_diagnostics,
                     "playwright_resolution_location": "",
                     "playwright_version": "",
                 }),
             );
         }
         InteractionProbeOutcome::Observation(observation) => {
+            annotate_interaction_evidence_with_source_diagnostics(
+                &observation.evidence_path,
+                &source_diagnostics,
+            );
+            let workspace_evidence =
+                interaction_probe::browser_interaction_evidence_path(&config.workspace_root);
+            if workspace_evidence != observation.evidence_path {
+                annotate_interaction_evidence_with_source_diagnostics(
+                    &workspace_evidence,
+                    &source_diagnostics,
+                );
+            }
             let resolution = observation.playwright_resolution.as_ref();
             eval_events::emit(
                 config.eval_events_path.as_deref(),
@@ -6274,6 +6292,12 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "contract_hook_status": observation.contract_hook_status.as_str(),
                     "candidate_table": &observation.candidate_table,
                     "input_dispatches": &observation.input_dispatches,
+                    "canvas_snapshots": &observation.canvas_snapshots,
+                    "canvas_blank_before_start": observation.canvas_blank_before_start,
+                    "canvas_blank_after_start": observation.canvas_blank_after_start,
+                    "canvas_blank_after_inputs": observation.canvas_blank_after_inputs,
+                    "source_diagnostics": &source_diagnostic_labels,
+                    "unattached_ref_diagnostics": &source_diagnostics,
                     "state_dimensions_changed": &observation.state_dimensions_changed,
                     "persistence_after_reload": observation.persistence_after_reload.as_str(),
                     "persistence_after_reload_reason": observation.persistence_after_reload_reason.as_str(),
@@ -6311,6 +6335,44 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                 }),
             );
         }
+    }
+}
+
+fn interaction_source_diagnostics(config: &Config) -> Vec<UnattachedRefDiagnostic> {
+    let profile = config
+        .profile_inference
+        .map(|inference| inference.profile.to_string())
+        .unwrap_or_else(|| config.profile.clone());
+    route_bound_unattached_ref_diagnostics(&config.workspace_root, &profile)
+}
+
+fn unattached_ref_diagnostic_labels(diagnostics: &[UnattachedRefDiagnostic]) -> Vec<String> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.diagnostic.clone())
+        .collect()
+}
+
+fn annotate_interaction_evidence_with_source_diagnostics(
+    path: &Path,
+    diagnostics: &[UnattachedRefDiagnostic],
+) {
+    if diagnostics.is_empty() || !path.is_file() {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    if !value.is_object() {
+        return;
+    }
+    value["source_diagnostics"] = json!(unattached_ref_diagnostic_labels(diagnostics));
+    value["unattached_ref_diagnostics"] = json!(diagnostics);
+    if let Ok(text) = serde_json::to_string_pretty(&value) {
+        let _ = std::fs::write(path, format!("{text}\n"));
     }
 }
 

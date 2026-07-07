@@ -89,6 +89,15 @@ pub struct InteractionProbeCandidateEvidence {
     pub changed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CanvasSnapshotEvidence {
+    pub name: String,
+    pub canvas_count: usize,
+    pub canvas_blank: Option<bool>,
+    pub blank_canvas_count: usize,
+    pub pixel_hashes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 pub struct BrowserInteractionProbeOptions {
     pub persistence_required: bool,
@@ -116,6 +125,10 @@ pub struct BrowserInteractionObservation {
     pub contract_hook_status: String,
     pub candidate_table: Vec<InteractionProbeCandidateEvidence>,
     pub input_dispatches: Vec<String>,
+    pub canvas_snapshots: Vec<CanvasSnapshotEvidence>,
+    pub canvas_blank_before_start: Option<bool>,
+    pub canvas_blank_after_start: Option<bool>,
+    pub canvas_blank_after_inputs: Option<bool>,
     pub state_dimensions_changed: Vec<String>,
     pub persistence_after_reload: String,
     pub persistence_after_reload_reason: String,
@@ -1159,6 +1172,7 @@ let start_control_found = true;
 let input_state_evaluated_after_start = false;
 let candidate_table = [];
 let input_dispatches = [];
+let canvas_snapshots = [];
 let state_dimensions_changed = [];
 let persistence_after_reload = "not_evaluated";
 let persistence_after_reload_reason = "";
@@ -1276,6 +1290,114 @@ async function surfaceSnapshot(page) {
       title_text_excerpt: title.slice(0, 120)
     };
   });
+}
+
+async function recordCanvasSnapshot(page, name) {
+  try {
+    const snapshot = await page.evaluate((snapshotName) => {
+      const hashBytes = (bytes) => {
+        let hash = 2166136261 >>> 0;
+        for (let index = 0; index < bytes.length; index += 1) {
+          hash ^= bytes[index];
+          hash = Math.imul(hash, 16777619) >>> 0;
+        }
+        return hash.toString(16).padStart(8, "0");
+      };
+      const emptyCanvasHash = (width, height) => {
+        const empty = document.createElement("canvas");
+        empty.width = width;
+        empty.height = height;
+        const ctx = empty.getContext("2d");
+        if (!ctx) return "";
+        return hashBytes(ctx.getImageData(0, 0, width, height).data);
+      };
+      const canvases = Array.from(document.querySelectorAll("canvas"))
+        .slice(0, 3)
+        .map((canvas, index) => {
+          const width = Math.max(1, canvas.width || Math.round(canvas.getBoundingClientRect().width) || 1);
+          const height = Math.max(1, canvas.height || Math.round(canvas.getBoundingClientRect().height) || 1);
+          try {
+            const ctx = canvas.getContext("2d");
+            if (!ctx) {
+              return { index, width, height, readable: false, canvas_blank: null, pixel_hash: "", empty_hash: "" };
+            }
+            const data = ctx.getImageData(0, 0, width, height).data;
+            let allZero = true;
+            let allAlphaZero = true;
+            for (let offset = 0; offset < data.length; offset += 4) {
+              if (data[offset] !== 0 || data[offset + 1] !== 0 || data[offset + 2] !== 0 || data[offset + 3] !== 0) {
+                allZero = false;
+              }
+              if (data[offset + 3] !== 0) {
+                allAlphaZero = false;
+              }
+              if (!allZero && !allAlphaZero) break;
+            }
+            const pixelHash = hashBytes(data);
+            const emptyHash = emptyCanvasHash(width, height);
+            const canvasBlank = allZero || allAlphaZero || (!!emptyHash && pixelHash === emptyHash);
+            return {
+              index,
+              width,
+              height,
+              readable: true,
+              canvas_blank: canvasBlank,
+              all_zero_pixels: allZero,
+              all_alpha_zero: allAlphaZero,
+              pixel_hash: pixelHash,
+              empty_hash: emptyHash
+            };
+          } catch (err) {
+            return {
+              index,
+              width,
+              height,
+              readable: false,
+              canvas_blank: null,
+              pixel_hash: "",
+              empty_hash: "",
+              error: err && err.message ? err.message : String(err)
+            };
+          }
+        });
+      const readable = canvases.filter((canvas) => canvas.readable);
+      const blankCanvasCount = readable.filter((canvas) => canvas.canvas_blank === true).length;
+      return {
+        name: snapshotName,
+        canvas_count: canvases.length,
+        readable_canvas_count: readable.length,
+        blank_canvas_count: blankCanvasCount,
+        canvas_blank: readable.length > 0 ? blankCanvasCount === readable.length : null,
+        canvases,
+        pixel_hashes: readable.map((canvas) => canvas.pixel_hash).filter(Boolean)
+      };
+    }, name);
+    const existing = canvas_snapshots.findIndex((item) => item.name === name);
+    if (existing >= 0) {
+      canvas_snapshots[existing] = snapshot;
+    } else {
+      canvas_snapshots.push(snapshot);
+    }
+    return snapshot;
+  } catch (err) {
+    const snapshot = {
+      name,
+      canvas_count: 0,
+      readable_canvas_count: 0,
+      blank_canvas_count: 0,
+      canvas_blank: null,
+      canvases: [],
+      pixel_hashes: [],
+      error: err && err.message ? err.message : String(err)
+    };
+    canvas_snapshots.push(snapshot);
+    return snapshot;
+  }
+}
+
+function canvasBlankForSnapshot(name) {
+  const snapshot = canvas_snapshots.find((item) => item.name === name);
+  return snapshot ? snapshot.canvas_blank : null;
 }
 
 function navigationFailureDetail(err) {
@@ -2228,6 +2350,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
     action_hooks = contract_hooks.action_hooks || [];
     probe_mode = contract_hooks.usable ? "contract" : "heuristic";
     before_marker = await activeMarker(page, probe_mode);
+    await recordCanvasSnapshot(page, "before_start");
 
     let initial_start_text = "";
     let transitionObserved = false;
@@ -2267,6 +2390,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
         primary_transition_observed = false;
       }
     }
+    await recordCanvasSnapshot(page, "after_start");
 
     const textEntryObserved = await attemptTextEntry(page, probe_mode);
 
@@ -2280,6 +2404,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
         await dispatchStartlessTextInput(page, probe_mode);
       }
     }
+    await recordCanvasSnapshot(page, "after_inputs");
 
     if (transitionObserved && probe_mode === "contract") {
       await attemptContractRecoveryTransition(page, after_marker);
@@ -2294,6 +2419,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
         await dispatchPostTransitionInputs(page, probe_mode);
       }
     }
+    await recordCanvasSnapshot(page, "after_inputs");
 
     await evaluatePersistenceReload(page, probe_mode);
 
@@ -2307,11 +2433,19 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
     const textInputObserved = text_entry === "entered" && text_input_state_change;
     const inputEvaluated = input_state_evaluated_after_start || textInputObserved;
     const startlessInputObserved = (!start_control_found && inputStateChanged) || textInputObserved;
+    const canvasBlankBeforeStart = canvasBlankForSnapshot("before_start");
+    const canvasBlankAfterStart = canvasBlankForSnapshot("after_start");
+    const canvasBlankAfterInputs = canvasBlankForSnapshot("after_inputs");
+    const canvasBlankFailure = !!(post_js_surface && post_js_surface.has_canvas)
+      && transitionObserved
+      && canvasBlankAfterStart === true
+      && canvasBlankAfterInputs === true;
     const ok = steps.includes("surface_visible")
       && inputStateChanged
       && ((transitionObserved && inputEvaluated) || startlessInputObserved)
       && (!tokenEchoRequired || token_echoed)
-      && (!persistenceRequired || persistence_after_reload !== "reset");
+      && (!persistenceRequired || persistence_after_reload !== "reset")
+      && !canvasBlankFailure;
     const recoveryObserved = steps.includes("recovery_transition");
     const failureKind = persistenceRequired && persistence_after_reload === "reset"
       ? "persistence_after_reload_reset"
@@ -2321,6 +2455,8 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
         ? "text_entry_missing"
       : textEntryRequired && !text_input_state_change
         ? "text_input_state_change_missing"
+      : canvasBlankFailure
+        ? "canvas_blank"
       : interactionFailureKind(
       transitionObserved || startlessInputObserved,
       inputEvaluated || startlessInputObserved,
@@ -2347,6 +2483,10 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       contract_hooks,
       candidate_table,
       input_dispatches,
+      canvas_snapshots,
+      canvas_blank_before_start: canvasBlankBeforeStart,
+      canvas_blank_after_start: canvasBlankAfterStart,
+      canvas_blank_after_inputs: canvasBlankAfterInputs,
       state_dimensions_changed,
       persistence_after_reload,
       persistence_after_reload_reason,
@@ -2418,6 +2558,10 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       contract_hooks,
       candidate_table,
       input_dispatches,
+      canvas_snapshots,
+      canvas_blank_before_start: canvasBlankForSnapshot("before_start"),
+      canvas_blank_after_start: canvasBlankForSnapshot("after_start"),
+      canvas_blank_after_inputs: canvasBlankForSnapshot("after_inputs"),
       state_dimensions_changed,
       persistence_after_reload,
       persistence_after_reload_reason,
@@ -2532,6 +2676,10 @@ fn merge_script_stdout_failure_value(mut value: Value, logs: &InteractionStdio) 
             "contract_hooks",
             "candidate_table",
             "input_dispatches",
+            "canvas_snapshots",
+            "canvas_blank_before_start",
+            "canvas_blank_after_start",
+            "canvas_blank_after_inputs",
             "state_dimensions_changed",
             "persistence_after_reload",
             "persistence_changed_dimensions",
@@ -2808,6 +2956,13 @@ fn observation_from_value(
         .to_string();
     let candidate_table = interaction_candidate_table(&value);
     let input_dispatches = string_array_field(&value, "input_dispatches");
+    let canvas_snapshots = canvas_snapshots_from_value(&value);
+    let canvas_blank_before_start =
+        canvas_blank_snapshot_value(&value, &canvas_snapshots, "before_start");
+    let canvas_blank_after_start =
+        canvas_blank_snapshot_value(&value, &canvas_snapshots, "after_start");
+    let canvas_blank_after_inputs =
+        canvas_blank_snapshot_value(&value, &canvas_snapshots, "after_inputs");
     let state_dimensions_changed = string_array_field(&value, "state_dimensions_changed");
     let mut persistence_after_reload = value
         .get("persistence_after_reload")
@@ -2895,6 +3050,10 @@ fn observation_from_value(
         contract_hook_status,
         candidate_table,
         input_dispatches,
+        canvas_snapshots,
+        canvas_blank_before_start,
+        canvas_blank_after_start,
+        canvas_blank_after_inputs,
         state_dimensions_changed,
         persistence_after_reload,
         persistence_after_reload_reason,
@@ -3105,6 +3264,62 @@ fn interaction_candidate_table(value: &Value) -> Vec<InteractionProbeCandidateEv
         .collect()
 }
 
+fn canvas_snapshots_from_value(value: &Value) -> Vec<CanvasSnapshotEvidence> {
+    value
+        .get("canvas_snapshots")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|snapshot| {
+            let name = snapshot.get("name").and_then(Value::as_str)?.to_string();
+            Some(CanvasSnapshotEvidence {
+                name,
+                canvas_count: snapshot
+                    .get("canvas_count")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0),
+                canvas_blank: snapshot.get("canvas_blank").and_then(Value::as_bool),
+                blank_canvas_count: snapshot
+                    .get("blank_canvas_count")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(0),
+                pixel_hashes: snapshot
+                    .get("pixel_hashes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn canvas_blank_snapshot_value(
+    value: &Value,
+    snapshots: &[CanvasSnapshotEvidence],
+    name: &str,
+) -> Option<bool> {
+    let field = match name {
+        "before_start" => "canvas_blank_before_start",
+        "after_start" => "canvas_blank_after_start",
+        "after_inputs" => "canvas_blank_after_inputs",
+        _ => "",
+    };
+    if !field.is_empty()
+        && let Some(value) = value.get(field).and_then(Value::as_bool)
+    {
+        return Some(value);
+    }
+    snapshots
+        .iter()
+        .find(|snapshot| snapshot.name == name)
+        .and_then(|snapshot| snapshot.canvas_blank)
+}
+
 fn interaction_taxonomy_failure_kind(
     transition_observed: bool,
     input_evaluated_after_start: bool,
@@ -3216,6 +3431,10 @@ fn failure_observation(
         contract_hook_status: "unknown".to_string(),
         candidate_table: Vec::new(),
         input_dispatches: Vec::new(),
+        canvas_snapshots: Vec::new(),
+        canvas_blank_before_start: None,
+        canvas_blank_after_start: None,
+        canvas_blank_after_inputs: None,
         state_dimensions_changed: Vec::new(),
         persistence_after_reload: "not_evaluated".to_string(),
         persistence_after_reload_reason: "reload_failed".to_string(),
@@ -3428,6 +3647,10 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "contract_hook_status": observation.contract_hook_status.as_str(),
         "candidate_table": &observation.candidate_table,
         "input_dispatches": &observation.input_dispatches,
+        "canvas_snapshots": &observation.canvas_snapshots,
+        "canvas_blank_before_start": observation.canvas_blank_before_start,
+        "canvas_blank_after_start": observation.canvas_blank_after_start,
+        "canvas_blank_after_inputs": observation.canvas_blank_after_inputs,
         "state_dimensions_changed": &observation.state_dimensions_changed,
         "persistence_after_reload": observation.persistence_after_reload,
         "persistence_after_reload_reason": observation.persistence_after_reload_reason,
@@ -4670,6 +4893,67 @@ module.exports = {
         assert_eq!(
             observation.failure_kind,
             "input_state_change_missing_after_start"
+        );
+    }
+
+    #[test]
+    fn canvas_blank_snapshots_are_preserved_as_app_failure() {
+        let observation = observe_probe_value(json!({
+            "ok": false,
+            "status": "failed",
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
+            "input_state_change": true,
+            "state_changed": true,
+            "has_canvas": true,
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "control_input_dispatched",
+                "input_state_evaluated_after_start",
+                "input_state_change"
+            ],
+            "canvas_snapshots": [
+                {
+                    "name": "before_start",
+                    "canvas_count": 1,
+                    "blank_canvas_count": 1,
+                    "canvas_blank": true,
+                    "pixel_hashes": ["811c9dc5"]
+                },
+                {
+                    "name": "after_start",
+                    "canvas_count": 1,
+                    "blank_canvas_count": 1,
+                    "canvas_blank": true,
+                    "pixel_hashes": ["811c9dc5"]
+                },
+                {
+                    "name": "after_inputs",
+                    "canvas_count": 1,
+                    "blank_canvas_count": 1,
+                    "canvas_blank": true,
+                    "pixel_hashes": ["811c9dc5"]
+                }
+            ],
+            "canvas_blank_before_start": true,
+            "canvas_blank_after_start": true,
+            "canvas_blank_after_inputs": true,
+            "failure_kind": "canvas_blank"
+        }));
+
+        assert!(!observation.ok);
+        assert_eq!(observation.failure_kind, "canvas_blank");
+        assert_eq!(observation.canvas_blank_before_start, Some(true));
+        assert_eq!(observation.canvas_blank_after_start, Some(true));
+        assert_eq!(observation.canvas_blank_after_inputs, Some(true));
+        assert_eq!(observation.canvas_snapshots.len(), 3);
+        let value = interaction_observation_json(&observation);
+        assert_eq!(
+            value
+                .get("canvas_blank_after_start")
+                .and_then(Value::as_bool),
+            Some(true)
         );
     }
 

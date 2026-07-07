@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::minimal_loop::import_scan::route_bound_closure;
+use crate::minimal_loop::import_scan::{
+    route_bound_closure, route_bound_unattached_ref_diagnostics,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeAcceptanceReport {
@@ -1136,6 +1138,11 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
             &mut diagnostics,
         );
     }
+    diagnostics.extend(
+        route_bound_unattached_ref_diagnostics(root, "nextjs")
+            .into_iter()
+            .map(|diagnostic| diagnostic.diagnostic),
+    );
 
     collect_weak_verify_evidence(verify_commands, &workspace, &mut weak_evidence);
     if !generic_interactive_contract {
@@ -1166,6 +1173,8 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
         &workspace,
         &missing_obligations,
     );
+    diagnostics.sort();
+    diagnostics.dedup();
     let inconclusive = !inconclusive_reasons.is_empty();
     let weak_evidence_blocks_completion = !weak_evidence.is_empty()
         && source_first_completion_authority_required(

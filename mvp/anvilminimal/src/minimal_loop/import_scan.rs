@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
+use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingImport {
@@ -16,6 +17,23 @@ pub struct ImportedDefinitionExcerpt {
     pub specifier: String,
     pub definition_path: String,
     pub excerpt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnattachedRefCandidateElement {
+    pub source: String,
+    pub line: usize,
+    pub tag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnattachedRefDiagnostic {
+    pub diagnostic: String,
+    pub name: String,
+    pub source: String,
+    pub declaration_line: usize,
+    pub candidate_elements: Vec<UnattachedRefCandidateElement>,
+    pub guidance: String,
 }
 
 pub fn scan_relative_imports(root: &Path, paths: &[String]) -> anyhow::Result<Vec<MissingImport>> {
@@ -136,6 +154,37 @@ pub fn route_bound_closure(root: &Path, profile: &str) -> BTreeSet<PathBuf> {
     }
 }
 
+pub fn route_bound_unattached_ref_diagnostics(
+    root: &Path,
+    profile: &str,
+) -> Vec<UnattachedRefDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for rel in route_bound_closure(root, profile) {
+        let rel_text = rel.to_string_lossy().replace('\\', "/");
+        if !is_source_path(&rel_text) {
+            continue;
+        }
+        let path = root.join(&rel);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        diagnostics.extend(unattached_ref_diagnostics_for_source(&rel_text, &content));
+    }
+    diagnostics.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then_with(|| a.declaration_line.cmp(&b.declaration_line))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    diagnostics.dedup_by(|a, b| {
+        a.source == b.source
+            && a.declaration_line == b.declaration_line
+            && a.name == b.name
+            && a.candidate_elements == b.candidate_elements
+    });
+    diagnostics
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImportedSymbol {
     imported_name: String,
@@ -187,6 +236,141 @@ fn find_imported_symbol(content: &str, local_name: &str) -> Option<ImportedSymbo
         }
     }
     None
+}
+
+fn unattached_ref_diagnostics_for_source(
+    source: &str,
+    content: &str,
+) -> Vec<UnattachedRefDiagnostic> {
+    let declarations = use_ref_declarations(content);
+    if declarations.is_empty() {
+        return Vec::new();
+    }
+    let candidate_elements = jsx_ref_candidate_elements(source, content);
+    if candidate_elements.is_empty() {
+        return Vec::new();
+    }
+    declarations
+        .into_iter()
+        .filter(|decl| ref_passed_across_boundary(content, &decl.name))
+        .filter(|decl| !jsx_ref_attached(content, &decl.name))
+        .map(|decl| {
+            let first = candidate_elements
+                .first()
+                .expect("candidate_elements checked non-empty");
+            let guidance = format!(
+                "attach ref={{{}}} to the <{}> at {}:{}",
+                decl.name,
+                first.tag,
+                display_basename(&first.source),
+                first.line
+            );
+            UnattachedRefDiagnostic {
+                diagnostic: format!("unattached_ref:{}", decl.name),
+                name: decl.name,
+                source: source.to_string(),
+                declaration_line: decl.line,
+                candidate_elements: candidate_elements.clone(),
+                guidance,
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UseRefDeclaration {
+    name: String,
+    line: usize,
+}
+
+fn use_ref_declarations(content: &str) -> Vec<UseRefDeclaration> {
+    let re = Regex::new(
+        r#"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:React\.)?useRef(?:\s*<[^;\n=]+>)?\s*\("#,
+    )
+    .expect("valid useRef declaration regex");
+    re.captures_iter(content)
+        .filter_map(|captures| {
+            let whole = captures.get(0)?;
+            let name = captures.get(1)?.as_str().to_string();
+            Some(UseRefDeclaration {
+                name,
+                line: line_number_at(content, whole.start()),
+            })
+        })
+        .collect()
+}
+
+fn ref_passed_across_boundary(content: &str, name: &str) -> bool {
+    let escaped = regex::escape(name);
+    let call = Regex::new(&format!(
+        r#"\b(?:use[A-Za-z0-9_$]*|[A-Z][A-Za-z0-9_$]*)\s*\([^;\n{{}})]*\b{escaped}\b[^;\n{{}})]*\)"#
+    ))
+    .expect("valid ref call regex");
+    if call.is_match(content) {
+        return true;
+    }
+    let component_prop = Regex::new(&format!(
+        r#"(?is)<[A-Z][A-Za-z0-9_.$]*\b[^>]*\b[A-Za-z_$][A-Za-z0-9_$-]*\s*=\s*\{{\s*{escaped}\s*\}}"#
+    ))
+    .expect("valid component prop regex");
+    component_prop.is_match(content)
+}
+
+fn jsx_ref_attached(content: &str, name: &str) -> bool {
+    let escaped = regex::escape(name);
+    Regex::new(&format!(r#"\bref\s*=\s*\{{\s*{escaped}\s*\}}"#))
+        .expect("valid jsx ref regex")
+        .is_match(content)
+}
+
+fn jsx_ref_candidate_elements(source: &str, content: &str) -> Vec<UnattachedRefCandidateElement> {
+    let re = Regex::new(r#"(?is)<(canvas|video|input)\b([^>]*)>"#)
+        .expect("valid JSX ref candidate regex");
+    let ref_re = Regex::new(r#"(?i)\bref\s*="#).expect("valid JSX ref attribute regex");
+    let mut candidates = re
+        .captures_iter(content)
+        .filter_map(|captures| {
+            let whole = captures.get(0)?;
+            let tag = captures.get(1)?.as_str().to_ascii_lowercase();
+            let attrs = captures.get(2).map_or("", |m| m.as_str());
+            (!ref_re.is_match(attrs)).then(|| UnattachedRefCandidateElement {
+                source: source.to_string(),
+                line: line_number_at(content, whole.start()),
+                tag,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        element_priority(&a.tag)
+            .cmp(&element_priority(&b.tag))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+    candidates
+}
+
+fn element_priority(tag: &str) -> usize {
+    match tag {
+        "canvas" => 0,
+        "video" => 1,
+        "input" => 2,
+        _ => 3,
+    }
+}
+
+fn line_number_at(content: &str, byte_offset: usize) -> usize {
+    content[..byte_offset.min(content.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+fn display_basename(source: &str) -> String {
+    Path::new(source)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(source)
+        .to_string()
 }
 
 fn import_statements(content: &str) -> Vec<String> {
@@ -604,6 +788,78 @@ mod tests {
         .unwrap();
         let missing = scan_relative_imports(dir.path(), &["src/page.tsx".to_string()]).unwrap();
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn route_bound_unattached_ref_finds_hook_argument_canvas_missing_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useRef } from "react";
+import { useGame } from "./useGame";
+
+export default function Page() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  useGame(canvasRef);
+  return (
+    <main>
+      <button>Start</button>
+      <canvas width={800} height={600} />
+    </main>
+  );
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/useGame.ts"),
+            "export function useGame(_: unknown) {}\n",
+        )
+        .unwrap();
+
+        let diagnostics = route_bound_unattached_ref_diagnostics(dir.path(), "nextjs");
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.diagnostic, "unattached_ref:canvasRef");
+        assert_eq!(diagnostic.source, "src/app/page.tsx");
+        assert_eq!(diagnostic.declaration_line, 6);
+        assert_eq!(diagnostic.candidate_elements[0].tag, "canvas");
+        assert_eq!(diagnostic.candidate_elements[0].line, 11);
+        assert_eq!(
+            diagnostic.guidance,
+            "attach ref={canvasRef} to the <canvas> at page.tsx:11"
+        );
+    }
+
+    #[test]
+    fn route_bound_unattached_ref_ignores_attached_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useRef } from "react";
+import { useGame } from "./useGame";
+export default function Page() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  useGame(canvasRef);
+  return <canvas ref={canvasRef} width={800} height={600} />;
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/useGame.ts"),
+            "export function useGame(_: unknown) {}\n",
+        )
+        .unwrap();
+
+        assert!(route_bound_unattached_ref_diagnostics(dir.path(), "nextjs").is_empty());
     }
 
     #[test]
