@@ -835,10 +835,10 @@ mod tests {
         emit_run_stop(&cfg, &result);
 
         let event_text = std::fs::read_to_string(&events).unwrap();
-        assert!(event_text.contains("\"assurance_level\":\"reduced\""));
+        assert!(event_text.contains("\"assurance_level\":\"partial\""));
         assert!(!event_text.contains("\"assurance_level\":\"full\""));
         let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
-        assert!(summary.contains("Assurance: reduced"));
+        assert!(summary.contains("Assurance: partial"));
         assert!(!summary.contains("Assurance: full"));
         assert!(summary.contains("Task status: complete"));
         assert!(!summary.contains("completed (full assurance)"));

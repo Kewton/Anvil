@@ -1,0 +1,63 @@
+{
+  "ok": false,
+  "status": "failed",
+  "browser_failure_kind": "input_state_change_missing_after_start",
+  "failure_kind": "input_state_change_missing_after_start",
+  "stage": "input_state",
+  "steps": [
+    "surface_visible",
+    "start_transition",
+    "control_input_dispatched",
+    "input_state_evaluated_after_start"
+  ],
+  "start_transition": true,
+  "input_state_evaluated_after_start": true,
+  "input_state_change": false,
+  "state_changed": false,
+  "visible_state_changed": false,
+  "has_canvas": true,
+  "canvas_count": 1,
+  "canvas_blank_before_start": true,
+  "canvas_blank_after_start": true,
+  "canvas_blank_after_inputs": true,
+  "canvas_snapshots": [
+    {
+      "name": "before_start",
+      "canvas_count": 1,
+      "canvas_blank": true,
+      "blank_canvas_count": 1,
+      "pixel_hashes": ["811c9dc5"]
+    },
+    {
+      "name": "after_start",
+      "canvas_count": 1,
+      "canvas_blank": true,
+      "blank_canvas_count": 1,
+      "pixel_hashes": ["811c9dc5"]
+    },
+    {
+      "name": "after_inputs",
+      "canvas_count": 1,
+      "canvas_blank": true,
+      "blank_canvas_count": 1,
+      "pixel_hashes": ["811c9dc5"]
+    }
+  ],
+  "source_diagnostics": ["unattached_ref:canvasRef"],
+  "unattached_ref_diagnostics": [
+    {
+      "diagnostic": "unattached_ref:canvasRef",
+      "name": "canvasRef",
+      "source": "src/app/page.tsx",
+      "declaration_line": 7,
+      "guidance": "attach ref={canvasRef} to the <canvas> at page.tsx:39",
+      "candidate_elements": [
+        {
+          "source": "src/app/page.tsx",
+          "line": 39,
+          "tag": "canvas"
+        }
+      ]
+    }
+  ]
+}

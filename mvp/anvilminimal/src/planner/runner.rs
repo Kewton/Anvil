@@ -9088,7 +9088,7 @@ fn earned_assurance_for_completion(
     }
     if final_acceptance_status != "full_success" || release_gate.status == "failed" {
         return (
-            "reduced".to_string(),
+            "partial".to_string(),
             release_gate
                 .reasons
                 .first()
@@ -14360,7 +14360,7 @@ export default function Memo() {
         );
 
         assert_eq!(final_acceptance_status, "incomplete");
-        assert_eq!(assurance_level, "reduced");
+        assert_eq!(assurance_level, "partial");
         assert!(reason.contains("acceptance_gates_disconnected"));
         assert!(reason.contains("browser_readiness_status=not_applicable"));
         assert!(reason.contains("interaction_evidence_status=skipped"));

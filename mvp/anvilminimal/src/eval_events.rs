@@ -580,7 +580,7 @@ fn projected_assurance_from_snapshot(
         );
     }
     if final_acceptance != "full_success" || release_gate == "failed" {
-        level = "reduced".to_string();
+        level = "partial".to_string();
         reason = snapshot
             .release_gate_reasons
             .first()
@@ -2873,6 +2873,53 @@ mod tests {
             projection.assurance_reason,
             "browser_readiness_not_performed:disconnected"
         );
+    }
+
+    #[test]
+    fn explicit_known_profile_failed_projection_is_partial_not_reduced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "profile": "nextjs",
+                "effective_profile": "nextjs",
+                "runtime_acceptance_status": "failed",
+                "final_acceptance_status": "failed",
+                "release_gate_status": "failed",
+                "release_gate_reasons": ["browser_interaction_failed:canvas_blank"],
+                "assurance_level": "full",
+                "completion_contract_verification_enabled": true,
+                "external_contract_checked": true,
+                "external_contract_ok": false,
+                "browser_readiness_applicable": true,
+                "browser_readiness_execution_status": "performed",
+                "browser_readiness_status": "passed",
+                "interaction_evidence_applicable": true,
+                "interaction_evidence_execution_status": "performed_failed",
+                "interaction_evidence_status": "failed:canvas_blank",
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(false, &snapshot);
+        let summary = render_completion_summary(
+            "process",
+            Some("UltraPlanRun"),
+            None,
+            "failed",
+            "direct_cli_command_failed",
+            &projection,
+        );
+
+        assert_eq!(projection.effective_profile, "nextjs");
+        assert_eq!(projection.status, "incomplete");
+        assert_eq!(projection.task_status, "failed");
+        assert_eq!(projection.assurance_level, "partial");
+        assert!(!summary.contains("Assurance: reduced"), "{summary}");
+        assert!(summary.contains("Task status: failed"), "{summary}");
+        assert!(summary.contains("Final acceptance: failed"), "{summary}");
     }
 
     #[test]
