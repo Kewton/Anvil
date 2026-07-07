@@ -1774,6 +1774,7 @@ fn dependency_reconciliation_lifecycle(
         status: BuildVerifierStatus::DependencyMissing,
         primary_reason: requirement.reason.clone(),
         output_snippet: String::new(),
+        output_path: String::new(),
         compile_errors: Vec::new(),
         foreign_toolchain: None,
     };
@@ -1799,6 +1800,7 @@ fn dependency_reconciliation_lifecycle(
         status: BuildVerifierStatus::Passed,
         primary_reason: "dependency setup reconciliation passed".to_string(),
         output_snippet: String::new(),
+        output_path: String::new(),
         compile_errors: Vec::new(),
         foreign_toolchain: None,
     });
@@ -9982,6 +9984,7 @@ fn compile_errors_from_release_evidence_path(path: &str) -> Vec<CompileError> {
     if path.trim().is_empty() {
         return Vec::new();
     }
+    let evidence_path = Path::new(path);
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -9989,7 +9992,7 @@ fn compile_errors_from_release_evidence_path(path: &str) -> Vec<CompileError> {
         return build_verifier::parse_compile_errors(&text);
     };
     let mut errors = Vec::new();
-    for output in release_evidence_compile_output_fields(&value) {
+    for output in release_evidence_compile_output_fields(&value, evidence_path) {
         for error in build_verifier::parse_compile_errors(&output) {
             if !errors.contains(&error) {
                 errors.push(error);
@@ -9999,7 +10002,45 @@ fn compile_errors_from_release_evidence_path(path: &str) -> Vec<CompileError> {
     errors
 }
 
-fn release_evidence_compile_output_fields(value: &Value) -> Vec<String> {
+fn release_evidence_compile_output_fields(value: &Value, evidence_path: &Path) -> Vec<String> {
+    let full_outputs = release_evidence_compile_output_path_fields(value, evidence_path);
+    if !full_outputs.is_empty() {
+        return full_outputs;
+    }
+    release_evidence_compile_excerpt_fields(value)
+}
+
+fn release_evidence_compile_output_path_fields(value: &Value, evidence_path: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let base_dir = evidence_path.parent().unwrap_or_else(|| Path::new("."));
+    for scope in raw_value_scopes(value) {
+        for key in [
+            "build_output_path",
+            "full_output_path",
+            "output_path",
+            "stdout_path",
+            "stderr_path",
+        ] {
+            if let Some(raw_path) = scope.get(key).and_then(Value::as_str) {
+                let path = Path::new(raw_path);
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    base_dir.join(path)
+                };
+                if let Ok(text) = std::fs::read_to_string(path)
+                    && !text.trim().is_empty()
+                    && !out.iter().any(|existing| existing == &text)
+                {
+                    out.push(text);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn release_evidence_compile_excerpt_fields(value: &Value) -> Vec<String> {
     let mut out = Vec::new();
     for scope in raw_value_scopes(value) {
         for key in [
@@ -24918,6 +24959,103 @@ export default function Page() {\n\
             prompt.contains(
                 "remove the extra argument, or extend the signature -- keep call sites consistent"
             ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn readiness_compile_repair_parses_full_build_output_not_truncated_excerpt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        let mut page = String::new();
+        for _ in 0..438 {
+            page.push('\n');
+        }
+        page.push_str("const PLAYER_W = 12;\n");
+        page.push_str("export default function Page(){ return <main>{player}</main>; }\n");
+        std::fs::write(dir.path().join("src/app/page.tsx"), page).unwrap();
+        let full_output_path = dir.path().join("full-build-output.log");
+        std::fs::write(
+            &full_output_path,
+            "Failed to compile.\n\n\
+./src/app/page.tsx:440:25\n\
+Type error: Cannot find name 'player'. Did you mean 'PLAYER_W'?\n\n\
+  438 |\n\
+  439 |\n\
+> 440 | export default function Page(){ return <main>{player}</main>; }\n\
+      |                         ^\n",
+        )
+        .unwrap();
+        let readiness = dir.path().join("browser-readiness.json");
+        std::fs::write(
+            &readiness,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "failed",
+                "ok": false,
+                "failure_kind": "build_verifier_failed",
+                "output_excerpt": "command failed: npm run build summary: Failed to compile. Type error: Cannot find name 'player'. Did you mean 'PLAYER_W'?",
+                "build_output_path": "full-build-output.log"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            build_verifier::parse_compile_errors(
+                "command failed: npm run build summary: Failed to compile. Type error: Cannot find name 'player'. Did you mean 'PLAYER_W'?"
+            )
+            .is_empty(),
+            "the display excerpt intentionally lacks the source anchor"
+        );
+        let errors = compile_errors_from_release_evidence_path(&readiness.display().to_string());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "src/app/page.tsx");
+        assert_eq!(errors[0].line, 440);
+        assert_eq!(errors[0].column, 25);
+        assert_eq!(errors[0].symbol.as_deref(), Some("player"));
+
+        let gate = ReleaseGateSummary {
+            status: "failed".to_string(),
+            reasons: vec!["browser_readiness_failed:build_verifier_failed".to_string()],
+            browser_readiness_status: "failed:build_verifier_failed".to_string(),
+            browser_readiness_evidence_path: readiness.display().to_string(),
+            interaction_evidence_status: "not_exercised:build_verifier_failed".to_string(),
+            interaction_evidence_path: String::new(),
+        };
+        assert_eq!(
+            release_recovery_repair_targets(&gate, None),
+            vec![
+                "fix_compile_error".to_string(),
+                "implementation".to_string()
+            ]
+        );
+        let mut report = VerificationReport::pass();
+        append_release_gate_observation_failures(&mut report, &gate);
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::Implementation
+        );
+        let prompt = final_acceptance_repair_prompt(
+            dir.path(),
+            &static_compile_repair_plan(),
+            &report,
+            &UltraRunContext::default(),
+            RepairTarget::Implementation.as_str(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            (1, 2),
+            false,
+            false,
+        );
+        assert!(
+            prompt.contains("Compile error: src/app/page.tsx:440:25"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Compiler suggestion: Did you mean 'PLAYER_W'?"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Cannot-find-name repair for `player`"),
             "{prompt}"
         );
     }

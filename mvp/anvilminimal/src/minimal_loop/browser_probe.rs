@@ -35,6 +35,8 @@ pub struct BrowserReadinessObservation {
     pub evidence_path: PathBuf,
     pub elapsed_ms: u128,
     pub output_excerpt: String,
+    pub build_output_path: String,
+    pub compile_errors: Vec<build_verifier::CompileError>,
     pub child_spawned: bool,
     pub child_reaped: bool,
     pub has_canvas: bool,
@@ -209,7 +211,7 @@ fn probe_browser_readiness_with_options(
     if options.require_build {
         let build = observe_nextjs_build(root, options.offline);
         if build.final_status != BuildVerifierStatus::Passed {
-            return finish_without_spawn(
+            let mut observation = finish_without_spawn(
                 root,
                 started,
                 &evidence_path,
@@ -219,6 +221,11 @@ fn probe_browser_readiness_with_options(
                 "build_verifier_failed",
                 &build.final_reason,
             );
+            let final_observation = build.final_observation();
+            observation.build_output_path = final_observation.output_path.clone();
+            observation.compile_errors = final_observation.compile_errors.clone();
+            write_browser_readiness_evidence(root, &observation);
+            return observation;
         }
     }
     if localhost_port_accepts_connection(spec.port) {
@@ -540,6 +547,8 @@ fn finish_without_spawn(
         evidence_path: evidence_path.to_path_buf(),
         elapsed_ms: started.elapsed().as_millis(),
         output_excerpt: eval_events::body_snippet(output_excerpt),
+        build_output_path: String::new(),
+        compile_errors: Vec::new(),
         child_spawned: false,
         child_reaped: false,
         has_canvas: false,
@@ -581,6 +590,8 @@ fn finish_with_cleanup(
         evidence_path: evidence_path.to_path_buf(),
         elapsed_ms: started.elapsed().as_millis(),
         output_excerpt: eval_events::body_snippet(&adjusted_output_excerpt),
+        build_output_path: String::new(),
+        compile_errors: Vec::new(),
         child_spawned,
         child_reaped,
         has_canvas: surface_markers.has_canvas,
@@ -650,6 +661,14 @@ fn browser_readiness_evidence_json(observation: &BrowserReadinessObservation) ->
     }
     if !observation.output_excerpt.is_empty() {
         value["output_excerpt"] = json!(observation.output_excerpt);
+    }
+    if !observation.build_output_path.is_empty() {
+        value["build_output_path"] = json!(observation.build_output_path);
+        value["dev_server"]["build_output_path"] = json!(observation.build_output_path);
+    }
+    if !observation.compile_errors.is_empty() {
+        value["compile_errors"] = json!(observation.compile_errors);
+        value["dev_server"]["compile_errors"] = json!(observation.compile_errors);
     }
     value
 }
@@ -896,6 +915,8 @@ mod tests {
             evidence_path: browser_readiness_evidence_path(dir.path()),
             elapsed_ms: 1,
             output_excerpt: String::new(),
+            build_output_path: String::new(),
+            compile_errors: Vec::new(),
             child_spawned: false,
             child_reaped: false,
             has_canvas: markers.has_canvas,

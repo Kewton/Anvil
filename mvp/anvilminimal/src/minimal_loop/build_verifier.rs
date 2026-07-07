@@ -93,6 +93,8 @@ pub struct BuildVerifierObservation {
     pub status: BuildVerifierStatus,
     pub primary_reason: String,
     pub output_snippet: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub output_path: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compile_errors: Vec<CompileError>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -347,6 +349,7 @@ pub fn observe_requirement(
             status: BuildVerifierStatus::PolicyRejected,
             primary_reason: err.to_string(),
             output_snippet: String::new(),
+            output_path: String::new(),
             compile_errors: Vec::new(),
             foreign_toolchain: None,
         };
@@ -368,6 +371,7 @@ pub fn observe_requirement(
             status: BuildVerifierStatus::DependencyMissing,
             primary_reason,
             output_snippet: String::new(),
+            output_path: String::new(),
             compile_errors: Vec::new(),
             foreign_toolchain,
         };
@@ -384,11 +388,13 @@ pub fn observe_requirement(
             status: BuildVerifierStatus::Passed,
             primary_reason: "build verifier passed".to_string(),
             output_snippet: eval_events::body_snippet(&output),
+            output_path: String::new(),
             compile_errors: Vec::new(),
             foreign_toolchain: None,
         },
         Err(err) => {
             let reason = err.to_string();
+            let output_path = write_build_verifier_output(root, requirement, &reason);
             let mut compile_errors = parse_compile_errors_for_requirement(requirement, &reason);
             profile.annotate_compile_errors(root, &mut compile_errors);
             let status = if profile.dependency_missing_output(&reason) {
@@ -411,6 +417,7 @@ pub fn observe_requirement(
                 status,
                 primary_reason: eval_events::body_snippet(&reason),
                 output_snippet: eval_events::body_snippet(&reason),
+                output_path,
                 compile_errors,
                 foreign_toolchain: None,
             }
@@ -513,6 +520,7 @@ pub(crate) fn observe_dependency_missing_output_lifecycle_with_setup_program_and
         status: BuildVerifierStatus::DependencyMissing,
         primary_reason: snippet.clone(),
         output_snippet: snippet,
+        output_path: write_build_verifier_output(root, requirement, output),
         compile_errors: Vec::new(),
         foreign_toolchain: profile_for_build_requirement(requirement)
             .foreign_toolchain(root, requirement),
@@ -577,6 +585,48 @@ fn observe_requirement_lifecycle_from_before(
         after_setup,
         final_status,
         final_reason,
+    }
+}
+
+fn write_build_verifier_output(
+    root: &Path,
+    requirement: &BuildVerifierRequirement,
+    output: &str,
+) -> String {
+    if output.trim().is_empty() {
+        return String::new();
+    }
+    let dir = root.join(".anvil").join("evidence");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return String::new();
+    }
+    let path = dir.join(format!(
+        "build-verifier-{}.log",
+        command_slug(&requirement.command)
+    ));
+    if std::fs::write(&path, output).is_err() {
+        return String::new();
+    }
+    path.display().to_string()
+}
+
+fn command_slug(command: &str) -> String {
+    let mut slug = String::new();
+    for ch in command.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+        if slug.len() >= 80 {
+            break;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "command".to_string()
+    } else {
+        slug.to_string()
     }
 }
 

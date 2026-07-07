@@ -122,6 +122,7 @@ mod tests {
             status,
             primary_reason: "test".to_string(),
             output_snippet: String::new(),
+            output_path: String::new(),
             compile_errors: Vec::new(),
             foreign_toolchain: None,
         };
