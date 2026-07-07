@@ -1,0 +1,442 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* === CSS Variables === */
+:root {
+  --neon-green: #39ff14;
+  --neon-pink: #ff6ec7;
+  --neon-cyan: #00ffff;
+  --neon-yellow: #ffff00;
+  --neon-orange: #ff6600;
+  --space-dark: #0a0a1a;
+  --space-mid: #1a1a3a;
+  --space-light: #2a2a5a;
+}
+
+/* === Base Reset === */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  padding: 0;
+  margin: 0;
+}
+
+html,
+body {
+  max-width: 100vw;
+  overflow-x: hidden;
+  background: var(--space-dark);
+  color: var(--neon-green);
+  font-family: 'Courier New', monospace;
+}
+
+/* === Game Container === */
+.game-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem;
+  width: 100%;
+  max-width: 700px;
+  margin: 0 auto;
+}
+
+/* === Canvas Container with CRT Effect === */
+.canvas-container {
+  position: relative;
+  border: 2px solid var(--neon-green);
+  box-shadow:
+    0 0 10px var(--neon-green),
+    0 0 20px rgba(57, 255, 20, 0.5),
+    inset 0 0 30px rgba(57, 255, 20, 0.1);
+  border-radius: 8px;
+  overflow: hidden;
+  animation: neonPulse 3s ease-in-out infinite;
+}
+
+.canvas-container canvas {
+  display: block;
+  image-rendering: pixelated;
+  width: 100%;
+  height: auto;
+}
+
+/* CRT Scanline Overlay */
+.canvas-container::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 2px,
+    rgba(0, 0, 0, 0.15) 2px,
+    rgba(0, 0, 0, 0.15) 4px
+  );
+  pointer-events: none;
+  z-index: 10;
+}
+
+/* CRT Flicker */
+.canvas-container::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(18, 16, 16, 0);
+  pointer-events: none;
+  z-index: 11;
+  animation: crtFlicker 0.15s infinite;
+  opacity: 0.03;
+}
+
+/* === Scoreboard === */
+.scoreboard {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  max-width: 640px;
+  padding: 0.5rem 1rem;
+  background: rgba(26, 26, 58, 0.8);
+  border: 1px solid var(--neon-green);
+  border-radius: 4px;
+  font-size: 0.875rem;
+  color: var(--neon-green);
+  text-shadow: 0 0 5px var(--neon-green);
+}
+
+.scoreboard .score {
+  color: var(--neon-yellow);
+  text-shadow: 0 0 5px var(--neon-yellow);
+}
+
+.scoreboard .lives {
+  color: var(--neon-pink);
+  text-shadow: 0 0 5px var(--neon-pink);
+}
+
+.scoreboard .level {
+  color: var(--neon-cyan);
+  text-shadow: 0 0 5px var(--neon-cyan);
+}
+
+/* === Buttons === */
+.btn-game {
+  padding: 0.75rem 2rem;
+  font-size: 1.125rem;
+  font-weight: bold;
+  font-family: 'Courier New', monospace;
+  cursor: pointer;
+  border: 2px solid var(--neon-pink);
+  background: var(--space-mid);
+  color: var(--neon-pink);
+  text-shadow: 0 0 5px var(--neon-pink);
+  box-shadow: 0 0 10px var(--neon-pink), 0 0 20px rgba(255, 110, 199, 0.3);
+  border-radius: 4px;
+  transition: all 0.2s ease;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+}
+
+.btn-game:hover {
+  background: var(--neon-pink);
+  color: var(--space-dark);
+  box-shadow: 0 0 20px var(--neon-pink), 0 0 40px rgba(255, 110, 199, 0.5);
+  transform: scale(1.05);
+}
+
+.btn-game:active {
+  transform: scale(0.95);
+}
+
+.btn-pause {
+  padding: 0.75rem 2rem;
+  font-size: 1.125rem;
+  font-weight: bold;
+  font-family: 'Courier New', monospace;
+  cursor: pointer;
+  border: 2px solid var(--neon-yellow);
+  background: var(--space-mid);
+  color: var(--neon-yellow);
+  text-shadow: 0 0 5px var(--neon-yellow);
+  box-shadow: 0 0 10px var(--neon-yellow), 0 0 20px rgba(255, 255, 0, 0.3);
+  border-radius: 4px;
+  transition: all 0.2s ease;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+}
+
+.btn-pause:hover {
+  background: var(--neon-yellow);
+  color: var(--space-dark);
+  box-shadow: 0 0 20px var(--neon-yellow), 0 0 40px rgba(255, 255, 0, 0.5);
+  transform: scale(1.05);
+}
+
+.btn-pause:active {
+  transform: scale(0.95);
+}
+
+/* === Touch Controls === */
+.touch-controls {
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+  padding: 0.5rem;
+}
+
+.touch-btn {
+  width: 60px;
+  height: 60px;
+  border: 2px solid var(--neon-cyan);
+  background: rgba(26, 26, 58, 0.8);
+  color: var(--neon-cyan);
+  font-size: 1.5rem;
+  font-weight: bold;
+  border-radius: 8px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+  transition: all 0.1s ease;
+}
+
+.touch-btn:active {
+  background: var(--neon-cyan);
+  color: var(--space-dark);
+  transform: scale(0.9);
+}
+
+/* === Game Over Overlay === */
+.game-over-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1.5rem;
+  z-index: 20;
+  animation: fadeIn 0.5s ease;
+}
+
+.game-over-title {
+  font-size: 2.5rem;
+  font-weight: bold;
+  color: var(--neon-pink);
+  text-shadow: 0 0 10px var(--neon-pink), 0 0 20px var(--neon-pink);
+  animation: blink 1s step-end infinite;
+  text-transform: uppercase;
+  letter-spacing: 4px;
+}
+
+.game-over-score {
+  font-size: 1.25rem;
+  color: var(--neon-yellow);
+  text-shadow: 0 0 5px var(--neon-yellow);
+}
+
+/* === Menu Overlay === */
+.menu-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.75);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1.5rem;
+  z-index: 20;
+}
+
+.menu-title {
+  font-size: 2rem;
+  font-weight: bold;
+  color: var(--neon-green);
+  text-shadow: 0 0 10px var(--neon-green), 0 0 20px var(--neon-green);
+  animation: neonPulse 2s ease-in-out infinite;
+  text-transform: uppercase;
+  letter-spacing: 4px;
+}
+
+.menu-subtitle {
+  color: var(--neon-cyan);
+  font-size: 0.875rem;
+  text-align: center;
+  text-shadow: 0 0 5px var(--neon-cyan);
+  line-height: 1.6;
+}
+
+/* === Instructions === */
+.instructions {
+  color: var(--neon-cyan);
+  font-size: 0.75rem;
+  font-family: 'Courier New', monospace;
+  text-align: center;
+  text-shadow: 0 0 3px var(--neon-cyan);
+  opacity: 0.8;
+}
+
+/* === Keyframe Animations === */
+
+/* Starfield Parallax */
+@keyframes starfield {
+  0% { transform: translateY(0); }
+  100% { transform: translateY(100vh); }
+}
+
+/* Enemy March Sway */
+@keyframes enemySway {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(2px); }
+  75% { transform: translateX(-2px); }
+}
+
+/* Explosion Fade */
+@keyframes explosionFade {
+  0% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.8; transform: scale(1.5); }
+  100% { opacity: 0; transform: scale(2); }
+}
+
+/* Screen Shake */
+@keyframes screenShake {
+  0%, 100% { transform: translate(0, 0); }
+  10% { transform: translate(-4px, -2px); }
+  20% { transform: translate(4px, 2px); }
+  30% { transform: translate(-4px, 2px); }
+  40% { transform: translate(4px, -2px); }
+  50% { transform: translate(-2px, 4px); }
+  60% { transform: translate(2px, -4px); }
+  70% { transform: translate(-2px, -2px); }
+  80% { transform: translate(2px, 2px); }
+  90% { transform: translate(-1px, 1px); }
+}
+
+.shake {
+  animation: screenShake 0.3s ease;
+}
+
+/* Neon Pulse Glow */
+@keyframes neonPulse {
+  0%, 100% {
+    box-shadow:
+      0 0 5px var(--neon-green),
+      0 0 10px var(--neon-green),
+      0 0 20px rgba(57, 255, 20, 0.5),
+      inset 0 0 30px rgba(57, 255, 20, 0.1);
+  }
+  50% {
+    box-shadow:
+      0 0 10px var(--neon-green),
+      0 0 20px var(--neon-green),
+      0 0 40px rgba(57, 255, 20, 0.5),
+      0 0 60px rgba(57, 255, 20, 0.3),
+      inset 0 0 40px rgba(57, 255, 20, 0.15);
+  }
+}
+
+/* Blink Animation */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Fade In */
+@keyframes fadeIn {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+/* Float Animation */
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+/* Scan Line */
+@keyframes scanLine {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
+
+/* Score Popup */
+@keyframes scorePopup {
+  0% { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(-40px) scale(1.5); }
+}
+
+/* === Utility Classes === */
+.text-glow {
+  text-shadow: 0 0 5px currentColor, 0 0 10px currentColor;
+}
+
+.text-glow-strong {
+  text-shadow: 0 0 5px currentColor, 0 0 10px currentColor, 0 0 20px currentColor;
+}
+
+.box-glow {
+  box-shadow: 0 0 5px currentColor, 0 0 10px currentColor, inset 0 0 5px currentColor;
+}
+
+.crt-scanline {
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 2px,
+    rgba(0, 0, 0, 0.15) 2px,
+    rgba(0, 0, 0, 0.15) 4px
+  );
+}
+
+/* === Responsive === */
+@media (max-width: 640px) {
+  .game-wrapper {
+    padding: 0.5rem;
+    gap: 0.5rem;
+  }
+
+  .scoreboard {
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+  }
+
+  .btn-game,
+  .btn-pause {
+    padding: 0.5rem 1rem;
+    font-size: 0.875rem;
+  }
+
+  .game-over-title {
+    font-size: 1.5rem;
+  }
+
+  .menu-title {
+    font-size: 1.25rem;
+  }
+
+  .touch-btn {
+    width: 50px;
+    height: 50px;
+    font-size: 1.25rem;
+  }
+}

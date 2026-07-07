@@ -72,6 +72,20 @@ run whose runtime verifier attempted `npm run build 2>&1 | tail -80`; that
 shape must be normalized to the base build command rather than rejected or
 allowed to mask the build exit status.
 
+The local single-model GAME golden harvest is:
+
+```sh
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0707_009 \
+  local-single-qwen36-game-full-pass
+```
+
+`local-single-qwen36-game-full-pass` records the instruction 81-87 closure run
+for the single-model `qwen3.6:27b-coding-nvfp4` GAME track. It pins browser
+readiness, interaction pass, start transition, in-play recovery/restart
+transition, and score/enemy state mutation. Its `fits_viewport=false` browser
+fixture is informational presentation-quality evidence, not a release gate.
+
 The script copies `src/**`, `package.json`, and common Next.js/TypeScript/
 Tailwind/PostCSS config files. It intentionally does not copy `node_modules`,
 `.next`, `.anvil`, lockfiles, logs, screenshots, or other generated artifacts.

@@ -50,6 +50,19 @@ recommended tier for reliable web delivery. For release-quality web UAT, keep
 using the recommended `gemini-3.5-flash`-class tier unless the goal is a local
 compatibility measurement.
 
+Single-model local GAME expectation: the instruction 81-87 GAME quality track
+used `qwen3.6:27b-coding-nvfp4` as a single local model configuration across a
+six-run series. The frontier moved from phase 0, to phase 1, to final-gate
+failure, then to `test0707_009` full success with browser readiness,
+interaction evidence, score and enemy-state mutation, and an in-play
+recovery/restart transition. Treat this as a golden local single-model GAME
+reference, distinct from the broader 27b/35b mixed-pair distribution above. It
+does not make long local turns suspicious by itself: multi-minute provider
+turns and long wall-clock GAME runs are normal on local models when they stay
+inside the configured 600-second provider-turn bound and produce progress
+telemetry. Budget or timeout failures must still terminate with concrete
+bounded handoff reasons.
+
 ## Preflight Runbook
 
 1. Version check: `anvilminimal --version` must exactly match the intended

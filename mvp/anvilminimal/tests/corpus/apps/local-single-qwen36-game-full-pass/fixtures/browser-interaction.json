@@ -1,0 +1,150 @@
+{
+  "action_hooks": [
+    "primary"
+  ],
+  "after_marker": "{\"states\":[{\"index\":0,\"state\":{\"aliensRemaining\":55,\"gameOver\":false,\"highScore\":0,\"level\":1,\"lives\":3,\"phase\":\"playing\",\"score\":0}}]}",
+  "before_marker": "{\"states\":[{\"index\":0,\"state\":{\"aliensRemaining\":0,\"gameOver\":false,\"highScore\":0,\"level\":1,\"lives\":3,\"phase\":\"menu\",\"score\":0}}]}",
+  "candidate_table": [],
+  "canvas_blank_after_inputs": false,
+  "canvas_blank_after_start": false,
+  "canvas_blank_before_start": false,
+  "canvas_snapshots": [
+    {
+      "blank_canvas_count": 0,
+      "canvas_blank": false,
+      "canvas_count": 1,
+      "name": "before_start",
+      "pixel_hashes": [
+        "d4a5ea0b"
+      ]
+    },
+    {
+      "blank_canvas_count": 0,
+      "canvas_blank": false,
+      "canvas_count": 1,
+      "name": "after_start",
+      "pixel_hashes": [
+        "df6e8fc8"
+      ]
+    },
+    {
+      "blank_canvas_count": 0,
+      "canvas_blank": false,
+      "canvas_count": 1,
+      "name": "after_inputs",
+      "pixel_hashes": [
+        "3c2a09e8"
+      ]
+    }
+  ],
+  "cold_start_ms": 19,
+  "contract_hook_status": "usable",
+  "duration_ms": 1239,
+  "echo_latency_ms": null,
+  "failure_category": "",
+  "has_canvas": true,
+  "informational_failure_kinds": [],
+  "input_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"aliensRemaining\":54,\"gameOver\":false,\"highScore\":0,\"level\":1,\"lives\":3,\"phase\":\"playing\",\"score\":10}}]}",
+  "input_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"aliensRemaining\":55,\"gameOver\":false,\"highScore\":0,\"level\":1,\"lives\":3,\"phase\":\"playing\",\"score\":0}}]}",
+  "input_dispatches": [
+    "canvas/center click",
+    "ArrowLeft keydown",
+    "ArrowRight keydown",
+    "Space keydown"
+  ],
+  "input_event_observed": true,
+  "input_state_change": true,
+  "input_state_evaluated_after_start": true,
+  "interaction_performed": true,
+  "interaction_success": true,
+  "interactive_control_count": 1,
+  "measured_navigation_ms": 10,
+  "ok": true,
+  "output_excerpt": "{\"stage\":\"resolving\"} {\"stage\":\"launching\"} {\"stage\":\"server_check\"} {\"stage\":\"warmup_navigation\",\"attempt\":1,\"timeout_ms\":45000} {\"stage\":\"measured_navigation\",\"timeout_ms\":12000} {\"stage\":\"surface_wait\"} {\"stage\":\"observing\"}",
+  "persistence_after_reload": "not_evaluated",
+  "persistence_after_reload_marker": "",
+  "persistence_after_reload_reason": "no_text_entry_surface",
+  "persistence_before_reload_marker": "",
+  "persistence_changed_dimensions": [],
+  "playwright_resolution": {
+    "location": "managed_interaction_probe",
+    "module_dir": "/Users/maenokota/.anvil/tools/interaction-probe/node_modules/playwright",
+    "module_path": "/Users/maenokota/.anvil/tools/interaction-probe/node_modules/playwright/index.js",
+    "node_path": "/Users/maenokota/.anvil/tools/interaction-probe/node_modules",
+    "version": "1.61.1"
+  },
+  "playwright_resolution_location": "managed_interaction_probe",
+  "playwright_version": "1.61.1",
+  "post_js_has_canvas": true,
+  "post_js_interactive_control_count": 1,
+  "primary_start_transition": true,
+  "primary_start_transition_missing": false,
+  "probe": {
+    "child_reaped": true,
+    "child_spawned": true,
+    "cold_start_ms": 19,
+    "measured_navigation_ms": 10,
+    "output_excerpt": "{\"stage\":\"resolving\"} {\"stage\":\"launching\"} {\"stage\":\"server_check\"} {\"stage\":\"warmup_navigation\",\"attempt\":1,\"timeout_ms\":45000} {\"stage\":\"measured_navigation\",\"timeout_ms\":12000} {\"stage\":\"surface_wait\"} {\"stage\":\"observing\"}",
+    "playwright_resolution_location": "managed_interaction_probe",
+    "script_path": "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0707_009/.anvil/evidence/browser-interaction-probe.cjs",
+    "stage": "observing",
+    "stderr_excerpt": "{\"stage\":\"resolving\"} {\"stage\":\"launching\"} {\"stage\":\"server_check\"} {\"stage\":\"warmup_navigation\",\"attempt\":1,\"timeout_ms\":45000} {\"stage\":\"measured_navigation\",\"timeout_ms\":12000} {\"stage\":\"surface_wait\"} {\"stage\":\"observing\"}"
+  },
+  "probe_mode": "contract",
+  "recovery_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"aliensRemaining\":55,\"gameOver\":false,\"highScore\":0,\"level\":1,\"lives\":3,\"phase\":\"playing\",\"score\":0}}]}",
+  "recovery_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"aliensRemaining\":54,\"gameOver\":false,\"highScore\":0,\"level\":1,\"lives\":3,\"phase\":\"playing\",\"score\":10}}]}",
+  "recovery_transition": true,
+  "recovery_transition_status": "observed",
+  "remediation": "",
+  "restart_hook_count_after_start": 0,
+  "restart_hook_reachable_after_start": false,
+  "route_rendered_quality": "rendered",
+  "server_check": {
+    "error": "",
+    "ok": true,
+    "status": 200
+  },
+  "server_http_status": 200,
+  "stage": "observing",
+  "start_control_found": true,
+  "start_transition": true,
+  "state_changed": true,
+  "state_dimensions_changed": [
+    "aliensRemaining",
+    "score"
+  ],
+  "status": "passed",
+  "stderr_excerpt": "{\"stage\":\"resolving\"} {\"stage\":\"launching\"} {\"stage\":\"server_check\"} {\"stage\":\"warmup_navigation\",\"attempt\":1,\"timeout_ms\":45000} {\"stage\":\"measured_navigation\",\"timeout_ms\":12000} {\"stage\":\"surface_wait\"} {\"stage\":\"observing\"}",
+  "steps": [
+    "warmup_navigation",
+    "measured_navigation",
+    "surface_visible",
+    "start_transition",
+    "text_entry:not_applicable",
+    "control_input_dispatched",
+    "input_state_evaluated_after_start",
+    "input_state_change",
+    "recovery_transition"
+  ],
+  "surface_fit": {
+    "fits_viewport": false,
+    "overflow_bottom_px": 136,
+    "overflow_left_px": 0,
+    "overflow_right_px": 0,
+    "overflow_top_px": 0,
+    "rect_height_px": 724,
+    "rect_width_px": 644,
+    "surface": "canvas",
+    "viewport_height_px": 720,
+    "viewport_width_px": 1280
+  },
+  "text_entry": "not_applicable",
+  "text_entry_target": "",
+  "text_input_state_change": false,
+  "token_echo_after_reload_latency_ms": null,
+  "token_echoed": false,
+  "token_echoed_after_reload": false,
+  "typed_token": "anvil-hm3633",
+  "url": "http://127.0.0.1:3011/",
+  "visible_state_changed": true
+}
