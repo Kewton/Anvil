@@ -58,6 +58,7 @@ const STDERR_MERGE_STRIPPED_REASON: &str =
 const EXIT_CODE_ECHO_STRIPPED_REASON: &str = "exit_code_echo_stripped: trailing exit-code echo masks the base command exit status; verifier already records status";
 const FALLBACK_TRUE_STRIPPED_REASON: &str =
     "fallback_true_stripped: trailing `|| true` masks the base command exit status";
+const SUCCESS_FAILURE_ECHO_STRIPPED_REASON: &str = "success_failure_echo_stripped: verifier exit status already records pass/fail; trailing echo branches mask the base command";
 const WORKSPACE_CD_NORMALIZED_REASON: &str =
     "workspace_cd_normalized: absolute workspace cd rewritten to workspace-relative verifier form";
 
@@ -74,6 +75,7 @@ pub enum VerifyCommandViolationKind {
     StderrMergeStripped,
     ExitCodeEchoStripped,
     FallbackTrueStripped,
+    SuccessFailureEchoStripped,
     WorkspaceCdNormalized,
 }
 
@@ -91,6 +93,7 @@ impl VerifyCommandViolationKind {
             Self::StderrMergeStripped => "stderr_merge_stripped",
             Self::ExitCodeEchoStripped => "exit_code_echo_stripped",
             Self::FallbackTrueStripped => "fallback_true_stripped",
+            Self::SuccessFailureEchoStripped => "success_failure_echo_stripped",
             Self::WorkspaceCdNormalized => "workspace_cd_normalized",
         }
     }
@@ -116,6 +119,9 @@ impl VerifyCommandViolationKind {
             Self::StderrMergeStripped => "verify command stderr merge should be stripped",
             Self::ExitCodeEchoStripped => "verify command exit-code echo should be stripped",
             Self::FallbackTrueStripped => "verify command fallback true should be stripped",
+            Self::SuccessFailureEchoStripped => {
+                "verify command success/failure echo branches should be stripped"
+            }
             Self::WorkspaceCdNormalized => {
                 "verify command absolute workspace cd should be normalized"
             }
@@ -1014,6 +1020,7 @@ pub fn normalize_verify_command(command: &str) -> anyhow::Result<String> {
                 | VerifyCommandViolationKind::StderrMergeStripped
                 | VerifyCommandViolationKind::ExitCodeEchoStripped
                 | VerifyCommandViolationKind::FallbackTrueStripped
+                | VerifyCommandViolationKind::SuccessFailureEchoStripped
                 | VerifyCommandViolationKind::WorkspaceCdNormalized
         ) {
             return Ok(diagnosis.normalized);
@@ -1054,6 +1061,9 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
             "stderr_merge_stripped" => VerifyCommandViolationKind::StderrMergeStripped,
             "exit_code_echo_stripped" => VerifyCommandViolationKind::ExitCodeEchoStripped,
             "fallback_true_stripped" => VerifyCommandViolationKind::FallbackTrueStripped,
+            "success_failure_echo_stripped" => {
+                VerifyCommandViolationKind::SuccessFailureEchoStripped
+            }
             "workspace_cd_normalized" => VerifyCommandViolationKind::WorkspaceCdNormalized,
             _ => VerifyCommandViolationKind::GrepDashPattern,
         };
@@ -1129,6 +1139,13 @@ pub fn normalize_verify_command_for_oracle_repair(
             normalized: stripped,
             reason: FALLBACK_TRUE_STRIPPED_REASON.to_string(),
             kind: "fallback_true_stripped",
+        });
+    }
+    if let Some(stripped) = strip_success_failure_echo(command) {
+        return Some(VerifyCommandOracleRepair {
+            normalized: stripped,
+            reason: SUCCESS_FAILURE_ECHO_STRIPPED_REASON.to_string(),
+            kind: "success_failure_echo_stripped",
         });
     }
     if let Some(stripped) = strip_redundant_stderr_merge(command) {
@@ -1277,6 +1294,37 @@ fn strip_fallback_true(command: &str) -> Option<String> {
         return None;
     }
     Some(stripped.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn strip_success_failure_echo(command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    let (success_part, failure_part) = split_once_outside_quotes_sequence(trimmed, "||")?;
+    if !is_plain_status_echo(failure_part.trim(), &["fail", "failed", "false"]) {
+        return None;
+    }
+    let (base, success_echo) = split_once_outside_quotes_sequence(success_part.trim(), "&&")?;
+    if !is_plain_status_echo(
+        success_echo.trim(),
+        &["pass", "passed", "success", "ok", "true"],
+    ) {
+        return None;
+    }
+    let base = strip_trailing_stderr_merge(base.trim()).trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some(base.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn is_plain_status_echo(command: &str, allowed: &[&str]) -> bool {
+    let Some(tokens) = shell_words_with_spans(command) else {
+        return false;
+    };
+    if tokens.len() != 2 || tokens[0].value != "echo" {
+        return false;
+    }
+    let value = tokens[1].value.to_ascii_lowercase();
+    allowed.iter().any(|allowed| value == *allowed)
 }
 
 fn strip_redundant_stderr_merge(command: &str) -> Option<String> {
@@ -2173,6 +2221,14 @@ mod tests {
             Some(VerifyCommandViolationKind::FallbackTrueStripped)
         );
         assert_eq!(fallback.normalized, r#"python3 -c "print(min(10, None))""#);
+
+        let status_echo =
+            diagnose_verify_command(r#"test -f src/app/page.tsx && echo "pass" || echo "fail""#);
+        assert_eq!(
+            status_echo.violation,
+            Some(VerifyCommandViolationKind::SuccessFailureEchoStripped)
+        );
+        assert_eq!(status_echo.normalized, "test -f src/app/page.tsx");
     }
 
     #[test]

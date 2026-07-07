@@ -4729,6 +4729,107 @@ export default function Page(){
     }
 
     #[test]
+    fn verify_step_runtime_strips_status_echo_shell_control_before_policy_bail() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page() {}\n",
+        )
+        .unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path.clone());
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Bash",
+                    json!({"command":"test -f src/app/page.tsx && echo \"pass\" || echo \"fail\""}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create app. Verify the current step.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert_eq!(outcome.final_text, "step tool observation completed");
+        let bash_result = session
+            .messages
+            .iter()
+            .find(|message| message.role == "tool" && message.name.as_deref() == Some("Bash"))
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        assert!(bash_result.contains("outcome: Success"), "{bash_result}");
+        assert!(bash_result.contains("command succeeded"), "{bash_result}");
+        assert!(!bash_result.contains("echo \"pass\""), "{bash_result}");
+        let events = event_values(&events_path);
+        assert!(
+            !events.iter().any(
+                |event| event.get("event").and_then(Value::as_str) == Some("tool_policy_error")
+            ),
+            "{events:?}"
+        );
+        let policy = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("runtime_bash_policy"))
+            .unwrap();
+        assert_eq!(
+            policy.get("normalization_kind").and_then(Value::as_str),
+            Some("success_failure_echo_stripped")
+        );
+        assert_eq!(policy.get("blocked").and_then(Value::as_bool), Some(false));
+        let normalization = events.iter().find(|event| {
+            event.get("event").and_then(Value::as_str)
+                == Some("verify_command_normalized_at_runtime")
+        });
+        assert_eq!(
+            normalization.and_then(|event| event.get("repaired").and_then(Value::as_str)),
+            Some("test -f src/app/page.tsx")
+        );
+    }
+
+    #[test]
+    fn verify_command_tool_boundary_inventory_routes_through_shared_normalizer() {
+        let source = include_str!("loop_run.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let execute_sites = implementation
+            .match_indices("registry.execute_with_cancel(")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            execute_sites,
+            vec![
+                implementation
+                    .find("registry.execute_with_cancel(")
+                    .unwrap()
+            ],
+            "new tool execution boundaries must be allowlisted and routed through runtime_bash_policy_decision"
+        );
+        let execute_index = execute_sites[0];
+        let policy_call = implementation[..execute_index]
+            .rfind("runtime_bash_policy_decision(")
+            .expect("Bash policy decision before tool execution");
+        let normalized_set = implementation[policy_call..execute_index]
+            .find("set_bash_command(&mut call.arguments, normalized_command)")
+            .expect("normalized verifier command is written back before execution");
+        let substitute_set = implementation[policy_call..execute_index]
+            .find("set_bash_command(&mut call.arguments, substitute)")
+            .expect("repetition substitution is written back before repeated-error bail");
+        assert!(normalized_set > substitute_set || substitute_set > normalized_set);
+    }
+
+    #[test]
     fn setup_step_bash_shell_control_is_runtime_setup_not_verifier_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
