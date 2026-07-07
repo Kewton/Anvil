@@ -9381,6 +9381,13 @@ fn interaction_probe_failure_evidence_lines(path: &str) -> Vec<String> {
         return Vec::new();
     };
     let mut lines = Vec::new();
+    let failure_kind = raw_text_field_deep(&value, &["failure_kind", "browser_failure_kind"])
+        .map(|kind| format!("browser_interaction_failed:{kind}"))
+        .unwrap_or_default();
+    lines.extend(interaction_root_cause_repair_guidance(
+        &failure_kind,
+        Some(&value),
+    ));
     if let Some(cold_start_ms) = raw_u64_field_deep(&value, "cold_start_ms")
         && cold_start_ms > 10_000
     {
@@ -9548,6 +9555,7 @@ fn interaction_repair_targets_for_reason(reason: &str) -> Vec<String> {
     if lower.contains("input_state_change_missing_after_start")
         || lower.contains("input_state_change_not_evaluated_after_start")
         || lower.contains("interaction_state_change_missing")
+        || lower.contains("canvas_blank")
         || lower.contains("text_input_state_change_missing")
     {
         vec!["input_state_render_wiring".to_string()]
@@ -11846,6 +11854,74 @@ Bounded repair rules:\n\
     )
 }
 
+fn interaction_root_cause_repair_guidance(
+    failure_kind: &str,
+    evidence: Option<&Value>,
+) -> Vec<String> {
+    if !interaction_render_loop_failure(failure_kind) {
+        return Vec::new();
+    }
+    let mut lines = evidence
+        .map(unattached_ref_guidance_lines)
+        .unwrap_or_default();
+    lines.push(
+        "render-loop checklist: ref attached -> effect runs -> rAF loop starts -> draw calls"
+            .to_string(),
+    );
+    lines.push(format!(
+        "input-wiring checklist: {INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT}"
+    ));
+    dedup_strings(lines)
+}
+
+fn interaction_render_loop_failure(failure_kind: &str) -> bool {
+    let lower = failure_kind.to_ascii_lowercase();
+    lower.contains("input_state_change_missing_after_start") || lower.contains("canvas_blank")
+}
+
+fn unattached_ref_guidance_lines(value: &Value) -> Vec<String> {
+    raw_value_scopes(value)
+        .into_iter()
+        .find_map(|scope| {
+            scope
+                .get("unattached_ref_diagnostics")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(unattached_ref_guidance_line)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn unattached_ref_guidance_line(value: &Value) -> Option<String> {
+    if let Some(guidance) = value
+        .get("guidance")
+        .and_then(Value::as_str)
+        .filter(|guidance| !guidance.trim().is_empty())
+    {
+        return Some(guidance.trim().to_string());
+    }
+    let name = value.get("name").and_then(Value::as_str)?;
+    let candidate = value
+        .get("candidate_elements")
+        .and_then(Value::as_array)?
+        .first()?;
+    let tag = candidate.get("tag").and_then(Value::as_str)?;
+    let source = candidate.get("source").and_then(Value::as_str)?;
+    let line = candidate.get("line").and_then(Value::as_u64)?;
+    let file = Path::new(source)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(source);
+    Some(format!(
+        "attach ref={{{name}}} to the <{tag}> at {file}:{line}"
+    ))
+}
+
 fn final_acceptance_behavioral_probe_context(
     report: &VerificationReport,
     expected_paths: &[String],
@@ -11866,12 +11942,19 @@ fn final_acceptance_behavioral_probe_context(
                 "canvas/center click".to_string(),
             ]
         });
-    let mut lines = vec![
+    let mut lines = interaction_root_cause_repair_guidance(&failure_kind, evidence.as_ref());
+    lines.extend([
         "Interaction probe context:".to_string(),
         format!("- failure kind: {failure_kind}"),
         format!("- dispatched inputs: {}", dispatched_inputs.join(", ")),
-    ];
+    ]);
     if let Some(value) = evidence.as_ref() {
+        if let Some(blank) = raw_bool_field_deep(value, "canvas_blank_after_start") {
+            lines.push(format!("- canvas blank after start: {blank}"));
+        }
+        if let Some(blank) = raw_bool_field_deep(value, "canvas_blank_after_inputs") {
+            lines.push(format!("- canvas blank after inputs: {blank}"));
+        }
         if let Some(mode) =
             raw_text_field_deep(value, &["probe_mode"]).filter(|mode| !mode.is_empty())
         {
@@ -12068,10 +12151,14 @@ fn final_acceptance_recovery_failure_evidence(
     report: &VerificationReport,
     reason: &str,
 ) -> Vec<String> {
-    let mut evidence = compile_error_repair_guidance(&report.compile_errors)
-        .into_iter()
-        .map(|line| format!("fix_compile_error: {line}"))
-        .collect::<Vec<_>>();
+    let failure_kind = final_acceptance_app_behavior_failure_kind(report).unwrap_or_default();
+    let probe_json = interaction_probe_json_from_report(report);
+    let mut evidence = interaction_root_cause_repair_guidance(&failure_kind, probe_json.as_ref());
+    evidence.extend(
+        compile_error_repair_guidance(&report.compile_errors)
+            .into_iter()
+            .map(|line| format!("fix_compile_error: {line}")),
+    );
     if !reason.trim().is_empty() {
         evidence.push(reason.to_string());
     }
@@ -18404,6 +18491,130 @@ if __name__ == "__main__":
 
     #[test]
     #[cfg(unix)]
+    fn unattached_canvas_ref_guidance_leads_repair_and_reprobe_passes() {
+        let _probe_guard = dev_server_probe_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/unattached-ref/events.jsonl");
+        enable_dev_server_probe_test_override(dir.path());
+        write_probe_nextjs_workspace(dir.path(), port, unattached_canvas_ref_game_page_source());
+        std::fs::write(
+            dir.path().join("src/app/useGame.ts"),
+            canvas_ref_game_hook_source(),
+        )
+        .unwrap();
+        interaction_probe::write_test_availability_override(dir.path(), true);
+        interaction_probe::write_test_result_overrides(
+            dir.path(),
+            &[
+                interaction_state_missing_probe_result(),
+                interaction_state_changed_probe_result(),
+            ],
+        );
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: explicit_port_goal("Create an interactive browser game", port),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Final acceptance".to_string(),
+            }],
+        };
+
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(!report.is_pass(), "{report:?}");
+        let emitted_events = read_jsonl_events(&events);
+        let interaction_event = emitted_events
+            .iter()
+            .find(|event| {
+                event.get("event").and_then(Value::as_str) == Some("browser_interaction_probe")
+            })
+            .unwrap_or_else(|| panic!("{emitted_events:#?}"));
+        assert_eq!(
+            interaction_event
+                .get("source_diagnostics")
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(Value::as_str),
+            Some("unattached_ref:canvasRef"),
+            "{interaction_event:#?}"
+        );
+        let expected_paths = final_acceptance_repair_expected_paths(&plan, &cfg, &report).unwrap();
+        let prompt = final_acceptance_repair_prompt(
+            &cfg.workspace_root,
+            &plan,
+            &report,
+            &UltraRunContext::default(),
+            classify_repair_target(&report).as_str(),
+            &expected_paths,
+            &[],
+            (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+            false,
+            false,
+        );
+        let attach = interaction_source_diagnostics(&cfg)
+            .into_iter()
+            .find(|diagnostic| diagnostic.diagnostic == "unattached_ref:canvasRef")
+            .map(|diagnostic| diagnostic.guidance)
+            .expect("unattached ref guidance");
+        let attach_at = prompt.find(&attach).unwrap_or_else(|| panic!("{prompt}"));
+        let render_at = prompt
+            .find("render-loop checklist: ref attached -> effect runs -> rAF loop starts -> draw calls")
+            .unwrap_or_else(|| panic!("{prompt}"));
+        let input_at = prompt
+            .find("input-wiring checklist:")
+            .unwrap_or_else(|| panic!("{prompt}"));
+        assert!(attach_at < render_at && render_at < input_at, "{prompt}");
+        let failure_kind = final_acceptance_app_behavior_failure_kind(&report).unwrap();
+        let recovery_evidence = final_acceptance_recovery_failure_evidence(&report, &failure_kind);
+        assert_eq!(
+            recovery_evidence.first().map(String::as_str),
+            Some(attach.as_str()),
+            "{recovery_evidence:?}"
+        );
+        assert_eq!(
+            recovery_evidence.get(1).map(String::as_str),
+            Some(
+                "render-loop checklist: ref attached -> effect runs -> rAF loop starts -> draw calls"
+            ),
+            "{recovery_evidence:?}"
+        );
+
+        let mut fake = FakeClient::new(vec![probe_nextjs_scaffold_reply(
+            port,
+            attached_canvas_ref_game_page_source(),
+        )]);
+        let mut session = SessionSnapshot::new();
+        let outcome = run_final_acceptance_repair_with_ultra_session(
+            &mut fake,
+            &mut session,
+            &prompt,
+            &expected_paths,
+            &cfg,
+            &NOOP_UI,
+        )
+        .unwrap();
+        assert!(
+            outcome
+                .changed_paths
+                .iter()
+                .any(|path| path == "src/app/page.tsx"),
+            "{outcome:?}"
+        );
+        clear_final_acceptance_browser_probe_evidence(&cfg);
+
+        let repaired = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(repaired.is_pass(), "{repaired:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
     #[ignore = "covered by focused final-acceptance repair/reprobe tests without intermediate phase repair"]
     fn behavioral_interaction_failure_repairs_and_reprobes_to_success() {
         let _probe_guard = dev_server_probe_test_guard();
@@ -21617,6 +21828,98 @@ export default function Page(){
 "#
     }
 
+    fn unattached_canvas_ref_game_page_source() -> &'static str {
+        r#""use client";
+import { useEffect, useRef, useState } from "react";
+import { useGame } from "./useGame";
+
+export default function Page() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [score, setScore] = useState(0);
+  const [gameOver, setGameOver] = useState(false);
+  const [screen, setScreen] = useState("menu");
+  const [bullets, setBullets] = useState<{ x: number; y: number }[]>([]);
+  const [enemies, setEnemies] = useState([{ x: 10, y: 20 }]);
+  useGame(canvasRef);
+  const fireBullet = () => {
+    setScreen("playing");
+    setBullets((items) => [...items, { x: 10, y: 90 }]);
+    setScore((value) => value + 1);
+  };
+  const restart = () => {
+    setScreen("menu");
+    setGameOver(false);
+    setScore(0);
+    setBullets([]);
+    setEnemies([{ x: 10, y: 20 }]);
+  };
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft" || event.key === " ") {
+        fireBullet();
+      }
+    };
+    const frame = requestAnimationFrame(() => {
+      bullets.forEach((bullet) => {
+        enemies.forEach((enemy) => {
+          if (Math.abs(bullet.x - enemy.x) < 12 && Math.abs(bullet.y - enemy.y) < 12) {
+            setGameOver(true);
+            setScore((value) => value + 10);
+          }
+        });
+      });
+      setEnemies((items) => items.map((enemy) => ({ ...enemy, x: enemy.x + 1 })));
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [bullets, enemies]);
+  return (
+    <main data-anvil-state={JSON.stringify({ screen, score, gameOver, bullets, enemies })}>
+      <button data-anvil-action="primary" onClick={fireBullet}>Start</button>
+      <button data-anvil-action="restart" onClick={restart}>Restart</button>
+      <canvas width={800} height={600} />
+      <p>score {score} enemy collision {gameOver ? "game over" : screen}</p>
+    </main>
+  );
+}
+"#
+    }
+
+    fn attached_canvas_ref_game_page_source() -> String {
+        unattached_canvas_ref_game_page_source().replace(
+            "<canvas width={800} height={600} />",
+            "<canvas ref={canvasRef} width={800} height={600} />",
+        )
+    }
+
+    fn canvas_ref_game_hook_source() -> &'static str {
+        r##"import { useEffect, type RefObject } from "react";
+
+export function useGame(canvasRef: RefObject<HTMLCanvasElement | null>) {
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    let frame = 0;
+    const draw = () => {
+      frame += 1;
+      ctx.fillStyle = "#111827";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#22c55e";
+      ctx.fillRect(40 + frame, 500, 60, 20);
+      requestAnimationFrame(draw);
+    };
+    const id = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(id);
+  }, [canvasRef]);
+}
+"##
+    }
+
     fn interaction_state_missing_probe_result() -> Value {
         serde_json::json!({
             "ok": false,
@@ -22675,10 +22978,14 @@ exit 2\n",
             }
         }
         loop {
-            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let port = listener.local_addr().unwrap().port();
-            if port != NEXTJS_DEV_SERVER_DEFAULT_PORT {
-                return port;
+            match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+                Ok(listener) => {
+                    let port = listener.local_addr().unwrap().port();
+                    if port != NEXTJS_DEV_SERVER_DEFAULT_PORT {
+                        return port;
+                    }
+                }
+                Err(_) => return NEXTJS_DEV_SERVER_DEFAULT_PORT + 1,
             }
         }
     }
