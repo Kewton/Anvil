@@ -795,6 +795,9 @@ pub(crate) fn compile_error_repair_guidance_with_root(
             if let Some(guidance) = nullability_narrowing_repair_guidance(error) {
                 lines.push(guidance);
             }
+            if let Some(guidance) = call_arity_repair_guidance(root, error) {
+                lines.extend(guidance);
+            }
             lines.push(format!(
                 "You MUST modify {} using the edit tool; a reply without file edits fails this repair.",
                 error.path
@@ -837,6 +840,123 @@ fn typescript_nullability_message(message: &str) -> bool {
         || lower.contains("is possibly 'undefined'")
         || lower.contains("is possibly \"undefined\"")
         || lower.contains("is possibly `undefined`")
+}
+
+fn call_arity_repair_guidance(root: Option<&Path>, error: &CompileError) -> Option<Vec<String>> {
+    let (expected, got) = typescript_call_arity_message(&error.message)?;
+    let root = root?;
+    let content = std::fs::read_to_string(root.join(&error.path)).ok()?;
+    let line = source_line(root, &error.path, error.line)
+        .or_else(|| compile_excerpt_source_line(&error.excerpt))?;
+    let callee = call_callee_for_error_column(&line, error.column)?;
+    let signature = local_function_signature(&content, &callee)?;
+    Some(vec![
+        format!(
+            "TypeScript call-arity repair for `{callee}`: Expected {expected} arguments, but got {got}."
+        ),
+        format!("Actual same-file signature for `{callee}`: {signature}"),
+        format!(
+            "TypeScript call-arity remedy menu for `{callee}`: remove the extra argument, or extend the signature -- keep call sites consistent."
+        ),
+    ])
+}
+
+fn typescript_call_arity_message(message: &str) -> Option<(usize, usize)> {
+    let after_expected = message.split_once("Expected ")?.1;
+    let (expected, rest) = after_expected.split_once(" arguments")?;
+    let after_got = rest.split_once("but got ")?.1;
+    let got = after_got
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    Some((expected.trim().parse().ok()?, got.parse().ok()?))
+}
+
+fn call_callee_for_error_column(line: &str, column: usize) -> Option<String> {
+    let column_index = column.saturating_sub(1);
+    let mut best: Option<(usize, String)> = None;
+    for (open_index, _) in line.match_indices('(') {
+        let prefix = &line[..open_index];
+        let callee = prefix
+            .chars()
+            .rev()
+            .skip_while(|ch| ch.is_ascii_whitespace())
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '$' || *ch == '.')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        let callee = callee.rsplit('.').next().unwrap_or_default().trim();
+        if !is_identifier(callee) {
+            continue;
+        }
+        if open_index <= column_index {
+            best = Some((open_index, callee.to_string()));
+        } else if best.is_none() {
+            best = Some((open_index, callee.to_string()));
+            break;
+        }
+    }
+    best.map(|(_, callee)| callee)
+}
+
+fn local_function_signature(content: &str, callee: &str) -> Option<String> {
+    let lines = content.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if local_function_definition_starts(trimmed, callee)
+            || local_arrow_function_definition_starts(trimmed, callee)
+        {
+            return Some(clean_signature_lines(&lines[index..]));
+        }
+    }
+    None
+}
+
+fn local_function_definition_starts(line: &str, callee: &str) -> bool {
+    [
+        format!("function {callee}"),
+        format!("async function {callee}"),
+        format!("export function {callee}"),
+        format!("export async function {callee}"),
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn local_arrow_function_definition_starts(line: &str, callee: &str) -> bool {
+    [
+        format!("const {callee} ="),
+        format!("let {callee} ="),
+        format!("var {callee} ="),
+        format!("export const {callee} ="),
+        format!("export let {callee} ="),
+        format!("export var {callee} ="),
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn clean_signature_lines(lines: &[&str]) -> String {
+    let mut out = Vec::new();
+    for line in lines.iter().take(8) {
+        let mut trimmed = line.trim().to_string();
+        if let Some((head, _)) = trimmed.split_once('{') {
+            trimmed = format!("{} {{", head.trim_end());
+            out.push(trimmed);
+            break;
+        }
+        if let Some((head, _)) = trimmed.split_once("=>") {
+            trimmed = format!("{} =>", head.trim_end());
+            out.push(trimmed);
+            break;
+        }
+        out.push(trimmed);
+        if out.last().is_some_and(|line| line.ends_with(';')) {
+            break;
+        }
+    }
+    out.join("\n")
 }
 
 fn type_script_cross_file_definition_guidance(root: &Path, error: &CompileError) -> Vec<String> {
@@ -1619,6 +1739,56 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).unwrap();
         }
+    }
+
+    #[test]
+    fn compile_repair_prompt_includes_call_arity_signature_and_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "type Sprite = { x: number; y: number };\n\
+function renderSprite(ctx: CanvasRenderingContext2D, sprite: Sprite, scale: number) {\n\
+  ctx.fillRect(sprite.x, sprite.y, scale, scale);\n\
+}\n\
+export default function Page() {\n\
+  renderSprite(document.createElement('canvas').getContext('2d')!, { x: 1, y: 2 }, 12, 'debug');\n\
+  return <main />;\n\
+}\n",
+        )
+        .unwrap();
+        let prompt = compile_repair_prompt_section_with_root(
+            Some(dir.path()),
+            &[CompileError {
+                path: "src/app/page.tsx".to_string(),
+                line: 6,
+                column: 3,
+                message: "Type error: Expected 3 arguments, but got 4.".to_string(),
+                excerpt: "6 |   renderSprite(document.createElement('canvas').getContext('2d')!, { x: 1, y: 2 }, 12, 'debug');\n  |   ^".to_string(),
+                symbol: None,
+                route_bound: Some(true),
+            }],
+            CompileRepairPromptProtection::default(),
+        );
+
+        assert!(
+            prompt.contains(
+                "TypeScript call-arity repair for `renderSprite`: Expected 3 arguments, but got 4."
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "Actual same-file signature for `renderSprite`: function renderSprite(ctx: CanvasRenderingContext2D, sprite: Sprite, scale: number) {"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "remove the extra argument, or extend the signature -- keep call sites consistent"
+            ),
+            "{prompt}"
+        );
     }
 
     #[test]

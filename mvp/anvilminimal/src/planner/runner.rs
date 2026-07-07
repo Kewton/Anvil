@@ -15,7 +15,7 @@ use crate::minimal_loop::browser_probe::{
     probe_browser_readiness_with_offline_and_interaction_options,
 };
 use crate::minimal_loop::build_verifier::{
-    BuildVerifierLifecycleObservation, BuildVerifierObservation, BuildVerifierRequirement,
+    self, BuildVerifierLifecycleObservation, BuildVerifierObservation, BuildVerifierRequirement,
     BuildVerifierStatus, CompileError, emit_dependency_build_lifecycle,
 };
 use crate::minimal_loop::completion::{
@@ -6995,6 +6995,17 @@ fn append_release_gate_observation_failures(
             "browser readiness evidence: {}",
             release_gate.browser_readiness_evidence_path
         ));
+        if release_gate
+            .browser_readiness_status
+            .contains("build_verifier_failed")
+        {
+            report.push_compile_errors(
+                "browser readiness build verifier",
+                compile_errors_from_release_evidence_path(
+                    &release_gate.browser_readiness_evidence_path,
+                ),
+            );
+        }
     }
     if release_gate.interaction_evidence_status != "not_checked"
         && release_gate.interaction_evidence_status != "not_applicable"
@@ -9409,6 +9420,14 @@ fn release_recovery_failure_evidence(
             "browser readiness evidence: {}",
             release_gate.browser_readiness_evidence_path
         ));
+        evidence.extend(
+            compile_errors_from_release_evidence_path(
+                &release_gate.browser_readiness_evidence_path,
+            )
+            .into_iter()
+            .flat_map(|error| compile_error_repair_guidance(&[error]))
+            .map(|line| format!("fix_compile_error: {line}")),
+        );
     }
     evidence.push(format!(
         "interaction evidence: {}",
@@ -9563,6 +9582,17 @@ fn release_recovery_repair_targets(
         .any(|reason| reason.contains("interaction_unverified:terminal_state_not_reached"));
     let interaction_probe_infrastructure =
         release_gate_has_interaction_probe_infrastructure_failure(release_gate);
+    let build_verifier_compile_errors = release_gate
+        .browser_readiness_status
+        .contains("build_verifier_failed")
+        && !compile_errors_from_release_evidence_path(
+            &release_gate.browser_readiness_evidence_path,
+        )
+        .is_empty();
+    if build_verifier_compile_errors {
+        targets.push("fix_compile_error".to_string());
+        targets.push("implementation".to_string());
+    }
     if browser_status.contains("tailwind_dev_pipeline_failure")
         || browser_status.contains("css")
         || browser_status.contains("http_500")
@@ -9577,7 +9607,7 @@ fn release_recovery_repair_targets(
     {
         targets.push("required_evidence_missing".to_string());
     }
-    if browser_status.starts_with("failed:") {
+    if browser_status.starts_with("failed:") && !build_verifier_compile_errors {
         targets.push("test_or_evidence".to_string());
     }
     if interaction_status.starts_with("failed:") && !interaction_probe_infrastructure {
@@ -9605,6 +9635,49 @@ fn release_recovery_repair_targets(
         targets.push("release_acceptance".to_string());
     }
     dedup_strings(targets)
+}
+
+fn compile_errors_from_release_evidence_path(path: &str) -> Vec<CompileError> {
+    if path.trim().is_empty() {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return build_verifier::parse_compile_errors(&text);
+    };
+    let mut errors = Vec::new();
+    for output in release_evidence_compile_output_fields(&value) {
+        for error in build_verifier::parse_compile_errors(&output) {
+            if !errors.contains(&error) {
+                errors.push(error);
+            }
+        }
+    }
+    errors
+}
+
+fn release_evidence_compile_output_fields(value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for scope in raw_value_scopes(value) {
+        for key in [
+            "output_excerpt",
+            "stderr",
+            "stdout",
+            "build_output",
+            "error",
+            "message",
+        ] {
+            if let Some(text) = scope.get(key).and_then(Value::as_str)
+                && !text.trim().is_empty()
+                && !out.iter().any(|existing| existing == text)
+            {
+                out.push(text.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn release_recovery_verify_commands(
@@ -23957,6 +24030,92 @@ exit 2\n",
             .find("Repair targets:\n- fix_compile_error")
             .unwrap();
         assert!(evidence_index < target_index, "{repair_phase}");
+    }
+
+    #[test]
+    fn build_verifier_readiness_failure_targets_compile_repair_with_arity_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "type Sprite = { x: number; y: number };\n\
+function renderSprite(ctx: CanvasRenderingContext2D, sprite: Sprite, scale: number) {\n\
+  ctx.fillRect(sprite.x, sprite.y, scale, scale);\n\
+}\n\
+export default function Page() {\n\
+  renderSprite(document.createElement('canvas').getContext('2d')!, { x: 1, y: 2 }, 12, 'debug');\n\
+  return <main />;\n\
+}\n",
+        )
+        .unwrap();
+        let readiness = dir.path().join("browser-readiness.json");
+        std::fs::write(
+            &readiness,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "failed",
+                "ok": false,
+                "failure_kind": "build_verifier_failed",
+                "output_excerpt": "./src/app/page.tsx:6:3\nType error: Expected 3 arguments, but got 4.\n"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let gate = ReleaseGateSummary {
+            status: "failed".to_string(),
+            reasons: vec!["browser_readiness_failed:build_verifier_failed".to_string()],
+            browser_readiness_status: "failed:build_verifier_failed".to_string(),
+            browser_readiness_evidence_path: readiness.display().to_string(),
+            interaction_evidence_status: "not_exercised:build_verifier_failed".to_string(),
+            interaction_evidence_path: String::new(),
+        };
+
+        assert_eq!(
+            release_recovery_repair_targets(&gate, None),
+            vec![
+                "fix_compile_error".to_string(),
+                "implementation".to_string()
+            ]
+        );
+        let mut report = VerificationReport::pass();
+        append_release_gate_observation_failures(&mut report, &gate);
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::Implementation
+        );
+
+        let plan = static_compile_repair_plan();
+        let prompt = final_acceptance_repair_prompt(
+            dir.path(),
+            &plan,
+            &report,
+            &UltraRunContext::default(),
+            RepairTarget::Implementation.as_str(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            (1, 2),
+            false,
+            false,
+        );
+        assert!(
+            prompt.contains("Compile error: src/app/page.tsx:6:3"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "TypeScript call-arity repair for `renderSprite`: Expected 3 arguments, but got 4."
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Actual same-file signature for `renderSprite`: function renderSprite"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "remove the extra argument, or extend the signature -- keep call sites consistent"
+            ),
+            "{prompt}"
+        );
     }
 
     #[cfg(unix)]
