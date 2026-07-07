@@ -17,6 +17,26 @@ pub struct PlanStep {
     pub verify: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeneratedStepPlanSanitizationReport {
+    pub field_defaults: Vec<GeneratedStepPlanFieldDefault>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedStepPlanFieldDefault {
+    pub step_index: usize,
+    pub step_id: String,
+    pub field: String,
+    pub default_value: String,
+    pub source_excerpt: String,
+}
+
+impl GeneratedStepPlanSanitizationReport {
+    pub fn is_empty(&self) -> bool {
+        self.field_defaults.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepKind {
     Inspect,
@@ -96,6 +116,13 @@ impl StepPlan {
 }
 
 pub fn parse_generated_step_plan_json(raw: &str, original_goal: &str) -> anyhow::Result<StepPlan> {
+    parse_generated_step_plan_json_with_report(raw, original_goal).map(|(plan, _)| plan)
+}
+
+pub fn parse_generated_step_plan_json_with_report(
+    raw: &str,
+    original_goal: &str,
+) -> anyhow::Result<(StepPlan, GeneratedStepPlanSanitizationReport)> {
     let json_text = extract_json_object(raw)?;
     let value: Value = serde_json::from_str(json_text)
         .map_err(|err| anyhow::anyhow!("StepPlan invalid JSON: {}", err))?;
@@ -165,9 +192,10 @@ pub fn extract_json_object(raw: &str) -> anyhow::Result<&str> {
 fn normalize_generated_step_plan(
     generated: GeneratedStepPlan,
     original_goal: &str,
-) -> anyhow::Result<StepPlan> {
+) -> anyhow::Result<(StepPlan, GeneratedStepPlanSanitizationReport)> {
     let _provider_goal = generated.goal;
     let mut steps = Vec::new();
+    let mut report = GeneratedStepPlanSanitizationReport::default();
     for (index, step) in generated.steps.into_iter().enumerate() {
         let mut expected_paths = Vec::new();
         for path in normalize_string_list(&step.expected_paths, "expected_paths")? {
@@ -176,10 +204,18 @@ fn normalize_generated_step_plan(
             expected_paths.push(path);
         }
         let verify = normalize_string_list(&step.verify, "verify")?;
+        let step_id = normalize_step_id(&step.id, index);
+        let expected_result = normalize_generated_expected_result(
+            step.expected_result,
+            index,
+            &step.instruction,
+            &step_id,
+            &mut report,
+        );
         let normalized = PlanStep {
-            id: normalize_step_id(&step.id, index),
+            id: step_id,
             kind: normalize_step_kind(&step.kind),
-            expected_result: normalize_generated_expected_result(step.expected_result, index)?,
+            expected_result,
             instruction: step.instruction,
             expected_paths,
             verify,
@@ -189,10 +225,13 @@ fn normalize_generated_step_plan(
     if steps.is_empty() {
         anyhow::bail!("StepPlan has no steps");
     }
-    Ok(StepPlan {
-        goal: original_goal.to_string(),
-        steps,
-    })
+    Ok((
+        StepPlan {
+            goal: original_goal.to_string(),
+            steps,
+        },
+        report,
+    ))
 }
 
 fn normalize_string_list(value: &Value, field: &str) -> anyhow::Result<Vec<String>> {
@@ -242,14 +281,51 @@ fn normalize_step_kind(kind: &str) -> String {
 fn normalize_generated_expected_result(
     value: Option<String>,
     index: usize,
-) -> anyhow::Result<String> {
-    let Some(value) = value else {
-        anyhow::bail!("StepPlan missing expected_result in step {}", index + 1);
-    };
-    if value.trim().is_empty() {
-        anyhow::bail!("StepPlan missing expected_result in step {}", index + 1);
+    instruction: &str,
+    step_id: &str,
+    report: &mut GeneratedStepPlanSanitizationReport,
+) -> String {
+    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+        return normalize_expected_result(&value);
     }
-    Ok(normalize_expected_result(&value))
+    let default_value = default_expected_result_from_instruction(instruction);
+    report.field_defaults.push(GeneratedStepPlanFieldDefault {
+        step_index: index + 1,
+        step_id: step_id.to_string(),
+        field: "expected_result".to_string(),
+        default_value: default_value.clone(),
+        source_excerpt: char_boundary_excerpt(instruction, 96),
+    });
+    default_value
+}
+
+fn default_expected_result_from_instruction(instruction: &str) -> String {
+    let lower = instruction.to_ascii_lowercase();
+    if lower.contains("fail")
+        || lower.contains("red test")
+        || lower.contains("expected failure")
+        || lower.contains("failing test")
+    {
+        "fail".to_string()
+    } else {
+        "pass".to_string()
+    }
+}
+
+fn char_boundary_excerpt(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            truncated = true;
+            break;
+        }
+        out.push(ch);
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    out
 }
 
 fn normalize_expected_result(value: &str) -> String {
@@ -724,14 +800,21 @@ steps:
     }
 
     #[test]
-    fn generated_step_plan_rejects_missing_expected_result() {
-        let err = parse_generated_step_plan_json(
-            r#"{"goal":"g","steps":[{"id":"s1","instruction":"do it"}]}"#,
+    fn generated_step_plan_defaults_missing_expected_result() {
+        let (plan, report) = parse_generated_step_plan_json_with_report(
+            r#"{"goal":"g","steps":[{"id":"s1","instruction":"Add a red test for 日本語のゲーム behavior before implementation"}]}"#,
             "g",
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("StepPlan missing expected_result"));
+        .unwrap();
+        assert_eq!(plan.steps[0].expected_result, "fail");
+        assert_eq!(report.field_defaults.len(), 1);
+        assert_eq!(report.field_defaults[0].field, "expected_result");
+        assert_eq!(report.field_defaults[0].step_id, "s1");
+        assert!(
+            report.field_defaults[0]
+                .source_excerpt
+                .contains("日本語のゲーム")
+        );
     }
 
     #[test]

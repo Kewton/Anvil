@@ -70,9 +70,12 @@ use crate::planner::repair::{
 };
 use crate::planner::sanitizer::{SanitizerReport, sanitize_step_plan_against_policy};
 use crate::planner::signals;
+#[cfg(test)]
+use crate::planner::step_plan::parse_generated_step_plan_json;
 use crate::planner::step_plan::{
-    PlanStep, StepKind, StepPlan, extract_json_object, parse_generated_step_plan_json,
-    parse_step_plan, render_step_plan, repair_generated_step_plan_contract,
+    GeneratedStepPlanFieldDefault, PlanStep, StepKind, StepPlan, extract_json_object,
+    parse_generated_step_plan_json_with_report, parse_step_plan, render_step_plan,
+    repair_generated_step_plan_contract,
 };
 use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
 #[cfg(test)]
@@ -551,8 +554,15 @@ fn generate_step_plan_with_ui_for_phase(
             }
             continue;
         }
-        match parse_generated_step_plan_json(&reply.content, goal) {
-            Ok(mut plan) => {
+        match parse_generated_step_plan_json_with_report(&reply.content, goal) {
+            Ok((mut plan, generated_sanitization)) => {
+                emit_planner_schema_field_defaults(
+                    config,
+                    client.label(),
+                    model,
+                    attempt,
+                    &generated_sanitization.field_defaults,
+                );
                 let verify_before_repair = collect_step_verify_commands(&plan);
                 repair_generated_step_plan_contract(&mut plan);
                 emit_planner_verify_command_normalized(
@@ -567,7 +577,8 @@ fn generate_step_plan_with_ui_for_phase(
                 repair_generated_step_plan_contract(&mut plan);
                 let sanitizer_report =
                     sanitize_step_plan_against_policy(&mut plan, Some(&config.workspace_root));
-                let plan_was_sanitized = !sanitizer_report.is_empty();
+                let plan_was_sanitized =
+                    !generated_sanitization.is_empty() || !sanitizer_report.is_empty();
                 emit_planner_plan_sanitized(
                     config,
                     client.label(),
@@ -10608,6 +10619,43 @@ fn emit_planner_raw_output_shape(
     );
 }
 
+fn emit_planner_schema_field_defaults(
+    config: &Config,
+    provider: &str,
+    model: &str,
+    attempt: usize,
+    field_defaults: &[GeneratedStepPlanFieldDefault],
+) {
+    if field_defaults.is_empty() {
+        return;
+    }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "planner_plan_sanitized",
+            "planner_stage": "sanitize",
+            "planner_provider": provider,
+            "planner_model": model,
+            "repair_attempt": attempt,
+            "actions": field_defaults.iter().map(|record| json!({
+                "kind": "schema_field_defaulted",
+                "field": &record.field,
+                "step_index": record.step_index,
+                "step_id": &record.step_id,
+                "default_value": &record.default_value,
+                "source_excerpt": eval_events::body_snippet(&record.source_excerpt),
+            })).collect::<Vec<_>>(),
+            "schema_field_defaults": field_defaults.iter().map(|record| json!({
+                "field": &record.field,
+                "step_index": record.step_index,
+                "step_id": &record.step_id,
+                "default_value": &record.default_value,
+                "source_excerpt": eval_events::body_snippet(&record.source_excerpt),
+            })).collect::<Vec<_>>(),
+        }),
+    );
+}
+
 fn collect_step_verify_commands(plan: &StepPlan) -> Vec<String> {
     plan.steps
         .iter()
@@ -13322,6 +13370,36 @@ mod tests {
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("planner_error"));
         assert!(event_text.contains("planner_raw_output_shape"));
+    }
+
+    #[test]
+    fn missing_descriptive_expected_result_is_defaulted_and_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let generated = r#"{
+          "goal": "Implement the core Space Invaders game engine within app/page.tsx using an HTML5 canvas.",
+          "steps": [
+            {
+              "id": "implement-game-engine",
+              "kind": "implement",
+              "instruction": "Create `src/app/page.tsx` as a route-bound Space Invaders game engine with a canvas render loop, keyboard input, synchronized enemy grid, projectile firing, collision detection, score tracking, lives, and game-over state.",
+              "expected_paths": ["src/app/page.tsx"],
+              "verify": ["test -f src/app/page.tsx"]
+            }
+          ]
+        }"#;
+        let mut planner = FakeClient::new(vec![AssistantReply::text(generated)]);
+
+        let plan = generate_step_plan(&mut planner, "goal", &cfg).unwrap();
+
+        assert_eq!(plan.steps[0].expected_result, "pass");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"planner_plan_sanitized\""));
+        assert!(event_text.contains("\"kind\":\"schema_field_defaulted\""));
+        assert!(event_text.contains("\"field\":\"expected_result\""));
+        assert!(!event_text.contains("\"event\":\"planner_error\""));
     }
 
     #[test]
