@@ -394,7 +394,7 @@ pub fn verify_setup_dependency_state_with_setup_observed_with_offline(
 }
 
 #[cfg(test)]
-fn verify_setup_dependency_state_with_setup_observed_with_options(
+pub(crate) fn verify_setup_dependency_state_with_setup_observed_with_options(
     root: &Path,
     setup_authority: NodeDependencySetupAuthority,
     npm_program: &Path,
@@ -409,7 +409,7 @@ fn verify_setup_dependency_state_with_setup_observed_with_options(
 }
 
 #[cfg(not(test))]
-fn verify_setup_dependency_state_with_setup_observed_with_options(
+pub(crate) fn verify_setup_dependency_state_with_setup_observed_with_options(
     root: &Path,
     setup_authority: NodeDependencySetupAuthority,
     npm_program: &Path,

@@ -75,6 +75,8 @@ use crate::planner::step_plan::{
     parse_step_plan, render_step_plan, repair_generated_step_plan_contract,
 };
 use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
+#[cfg(test)]
+use crate::planner::verify::verify_setup_dependency_state_with_setup_observed_with_options;
 use crate::planner::verify::{
     VerificationReport, verify_setup_dependency_state_with_setup_observed_with_offline,
     verify_step_with_profile_setup_observed_with_offline,
@@ -14978,6 +14980,85 @@ if __name__ == "__main__":
         );
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(!event_text.contains("dependency_setup_authority_required"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn side_effect_expected_paths_are_sanitized_before_dependency_lifecycle_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let setup_plan = serde_json::to_string(&StepPlan {
+            goal: "Create package manifest and install dependencies".to_string(),
+            steps: vec![PlanStep {
+                id: "setup-nextjs".to_string(),
+                kind: "setup".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create package.json and install dependencies for the Next.js app."
+                    .to_string(),
+                expected_paths: vec!["package.json".to_string(), "node_modules".to_string()],
+                verify: Vec::new(),
+            }],
+        })
+        .unwrap();
+        let mut planner = FakeClient::new(vec![AssistantReply::text(setup_plan)]);
+        let generated = generate_step_plan(
+            &mut planner,
+            "Create package manifest and install dependencies",
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            generated.steps[0].expected_paths,
+            vec!["package.json".to_string()]
+        );
+        let drops = events_with_name(&events, "side_effect_path_dropped");
+        assert!(
+            drops.iter().any(|event| {
+                event.get("path").and_then(Value::as_str) == Some("node_modules")
+                    && event.get("tier").and_then(Value::as_str) == Some("unambiguous")
+            }),
+            "{drops:#?}"
+        );
+        std::fs::write(
+            dir.path().join("package.json"),
+            nextjs_complete_package_json(),
+        )
+        .unwrap();
+        let fake_npm = dir.path().join("fake-npm.sh");
+        std::fs::write(
+            &fake_npm,
+            "#!/bin/sh\nmkdir -p node_modules/next node_modules/react node_modules/react-dom\necho '{\"version\":\"14.2.0\"}' > node_modules/next/package.json\ntouch package-lock.json\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_npm).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&fake_npm, permissions).unwrap();
+        let (dependency_report, build_lifecycles) =
+            verify_setup_dependency_state_with_setup_observed_with_options(
+                dir.path(),
+                NodeDependencySetupAuthority::PlanSetupStep,
+                &fake_npm,
+                false,
+            );
+
+        assert!(dependency_report.is_pass(), "{dependency_report:?}");
+        assert!(dir.path().join("node_modules/next").is_dir());
+        assert!(dir.path().join("package-lock.json").is_file());
+        assert!(
+            build_lifecycles.iter().any(|event| {
+                event.setup_status() == "passed"
+                    && event.setup.as_ref().is_some_and(|setup| {
+                        setup
+                            .changed_paths
+                            .iter()
+                            .any(|path| path == "node_modules")
+                    })
+            }),
+            "{build_lifecycles:#?}"
+        );
     }
 
     #[test]

@@ -1,0 +1,1 @@
+{"goal":"Create package manifest and install dependencies","steps":[{"id":"setup-nextjs","kind":"setup","expected_result":"pass","instruction":"Create package.json and install dependencies for the Next.js app.","expected_paths":["package.json","node_modules"],"verify":[]}]}

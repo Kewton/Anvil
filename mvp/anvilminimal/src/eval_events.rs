@@ -3104,6 +3104,25 @@ mod tests {
     }
 
     #[test]
+    fn side_effect_path_drop_counts_as_display_normalization_metric() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "side_effect_path_dropped",
+                "path": "node_modules",
+                "tier": "unambiguous",
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+
+        assert_eq!(snapshot.display_normalization_count, 1);
+        assert_eq!(snapshot.display_salvaged_count, 0);
+    }
+
+    #[test]
     fn summary_keeps_recovery_command_lines_intact_with_long_failure_reason() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".anvil/runs/test/events.jsonl");
