@@ -1537,6 +1537,8 @@ impl UltraRunSetupAuthorityState {
 enum DependencyReconciliationTrigger {
     Promotion,
     ManifestRepair,
+    ManifestChanged,
+    DeclaredDependenciesNotReady,
 }
 
 impl DependencyReconciliationTrigger {
@@ -1544,6 +1546,8 @@ impl DependencyReconciliationTrigger {
         match self {
             Self::Promotion => "promotion",
             Self::ManifestRepair => "manifest_repair",
+            Self::ManifestChanged => "manifest_changed",
+            Self::DeclaredDependenciesNotReady => "declared_dependencies_not_ready",
         }
     }
 }
@@ -1627,14 +1631,50 @@ fn dependency_reconciliation_requirement(
     authority: NodeDependencySetupAuthority,
 ) -> Option<NodeDependencySetupRequirement> {
     let reason = format!("{} dependency reconciliation", trigger.as_str());
-    match canonical_profile_name(profile).as_str() {
+    let canonical_profile = canonical_profile_name(profile);
+    if trigger == DependencyReconciliationTrigger::ManifestChanged {
+        if canonical_profile == "nextjs"
+            && dependency_setup::package_json_declares_dependencies(root)
+        {
+            return if !dependency_setup::next_build_dependencies_ready(root) {
+                Some(dependency_setup::requirement_for_next_build(
+                    root,
+                    Some(canonical_profile.as_str()),
+                    &reason,
+                    authority,
+                ))
+            } else {
+                Some(
+                    dependency_setup::requirement_for_node_declared_dependencies(
+                        root,
+                        Some(canonical_profile.as_str()),
+                        &reason,
+                        authority,
+                    ),
+                )
+            };
+        }
+        return match canonical_profile.as_str() {
+            "python-cli" | "python_cli" => None,
+            _ if dependency_setup::package_json_declares_dependencies(root) => Some(
+                dependency_setup::requirement_for_node_declared_dependencies(
+                    root,
+                    Some(&canonical_profile),
+                    &reason,
+                    authority,
+                ),
+            ),
+            _ => None,
+        };
+    }
+    match canonical_profile.as_str() {
         "nextjs"
             if dependency_setup::package_json_declares_dependencies(root)
                 && !dependency_setup::next_build_dependencies_ready(root) =>
         {
             Some(dependency_setup::requirement_for_next_build(
                 root,
-                Some("nextjs"),
+                Some(canonical_profile.as_str()),
                 &reason,
                 authority,
             ))
@@ -1656,13 +1696,66 @@ fn dependency_reconciliation_requirement(
             Some(
                 dependency_setup::requirement_for_node_declared_dependencies(
                     root,
-                    Some(&canonical_profile_name(profile)),
+                    Some(&canonical_profile),
                     &reason,
                     authority,
                 ),
             )
         }
         _ => None,
+    }
+}
+
+fn reconcile_manifest_changed_dependencies_if_needed(
+    config: &Config,
+    profile: &str,
+    setup_authority: &mut UltraRunSetupAuthorityState,
+) -> anyhow::Result<Option<Vec<String>>> {
+    if !dependency_setup::node_dependency_declarations_fingerprint_mismatch(&config.workspace_root)
+    {
+        return Ok(None);
+    }
+    setup_authority.grant("manifest_changed");
+    reconcile_run_dependency_setup(
+        config,
+        profile,
+        DependencyReconciliationTrigger::ManifestChanged,
+        setup_authority,
+    )
+}
+
+fn acceptance_dependency_deterministic_reconcile_needed(
+    config: &Config,
+    report: &VerificationReport,
+) -> bool {
+    if !dependency_setup::package_json_declares_dependencies(&config.workspace_root) {
+        return false;
+    }
+    verification_report_mentions_dependency_setup_missing(report)
+}
+
+fn verification_report_mentions_dependency_setup_missing(report: &VerificationReport) -> bool {
+    report
+        .dependency_missing
+        .iter()
+        .chain(report.profile_failures.iter())
+        .any(|reason| text_mentions_dependency_setup_missing(reason))
+        || report
+            .command_failures
+            .iter()
+            .any(|failure| text_mentions_dependency_setup_missing(&failure.reason))
+}
+
+fn text_mentions_dependency_setup_missing(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("dependency setup missing")
+        || lower.contains("build dependency setup missing")
+        || lower.contains("node_modules missing")
+}
+
+fn push_unique_label(labels: &mut Vec<String>, label: &str) {
+    if !labels.iter().any(|existing| existing == label) {
+        labels.push(label.to_string());
     }
 }
 
@@ -1998,6 +2091,16 @@ fn run_step(
             });
         }
     }
+    if let Some(state) = run_setup_authority.as_deref_mut()
+        && let Err(err) =
+            reconcile_manifest_changed_dependencies_if_needed(config, &config.profile, state)
+    {
+        let message = err.to_string();
+        outcome.primary_failure = Some(message.clone());
+        outcome.stop_reason = Some("dependency_setup_reconciliation_failed".to_string());
+        outcome.partial = true;
+        return Err(StepRunError { message, outcome });
+    }
     let (mut report, mut build_lifecycles) =
         verify_step_with_profile_setup_observed_with_offline_and_events(
             &config.workspace_root,
@@ -2224,6 +2327,19 @@ fn run_step(
                         outcome,
                     });
                 }
+            }
+            if let Some(state) = run_setup_authority.as_deref_mut()
+                && let Err(err) = reconcile_manifest_changed_dependencies_if_needed(
+                    config,
+                    &config.profile,
+                    state,
+                )
+            {
+                let message = err.to_string();
+                outcome.primary_failure = Some(message.clone());
+                outcome.stop_reason = Some("dependency_setup_reconciliation_failed".to_string());
+                outcome.partial = true;
+                return Err(StepRunError { message, outcome });
             }
             let (retry, retry_lifecycles) =
                 verify_step_with_profile_setup_observed_with_offline_and_events(
@@ -4418,6 +4534,11 @@ pub fn run_ultra_plan_with_ui(
                 None,
                 None,
             );
+            reconcile_manifest_changed_dependencies_if_needed(
+                config,
+                &plan.profile,
+                &mut setup_authority_state,
+            )?;
             if try_promote_profile_at_phase_boundary(
                 config,
                 plan,
@@ -4472,6 +4593,11 @@ pub fn run_ultra_plan_with_ui(
             None,
             None,
         );
+        reconcile_manifest_changed_dependencies_if_needed(
+            config,
+            &plan.profile,
+            &mut setup_authority_state,
+        )?;
         if try_promote_profile_at_phase_boundary(
             config,
             plan,
@@ -4493,7 +4619,13 @@ pub fn run_ultra_plan_with_ui(
         }
     }
     let mut final_acceptance_cycle_deltas = Vec::new();
-    let mut acceptance_report = ultra_final_acceptance_report_with_cycle(plan, config, 0)?;
+    let (mut acceptance_report, mut deterministic_remedies_applied) =
+        ultra_final_acceptance_report_with_deterministic_remedies(
+            plan,
+            config,
+            0,
+            &mut setup_authority_state,
+        )?;
     if !acceptance_report.is_pass() {
         let initial_reason = acceptance_report.primary_reason();
         let initial_target = classify_repair_target(&acceptance_report);
@@ -4508,6 +4640,7 @@ pub fn run_ultra_plan_with_ui(
                 "missing_paths": acceptance_report.missing_paths.clone(),
                 "compile_errors": acceptance_report.compile_errors.clone(),
                 "profile_failures": acceptance_report.profile_failures.clone(),
+                "deterministic_remedies_applied": deterministic_remedies_applied.clone(),
                 "bounded_repair_available": true,
                 "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
             }),
@@ -4576,6 +4709,7 @@ pub fn run_ultra_plan_with_ui(
                     "missing_paths": acceptance_report.missing_paths.clone(),
                     "compile_errors": acceptance_report.compile_errors.clone(),
                     "profile_failures": acceptance_report.profile_failures.clone(),
+                    "deterministic_remedies_applied": deterministic_remedies_applied.clone(),
                     "selected_evidence_keys": before_missing_keys.clone(),
                     "selected_interaction_failure": final_acceptance_app_behavior_failure_kind(&acceptance_report)
                         .unwrap_or_default(),
@@ -4795,7 +4929,13 @@ pub fn run_ultra_plan_with_ui(
                 break;
             }
             clear_final_acceptance_browser_probe_evidence(config);
-            acceptance_report = ultra_final_acceptance_report_with_cycle(plan, config, attempt)?;
+            (acceptance_report, deterministic_remedies_applied) =
+                ultra_final_acceptance_report_with_deterministic_remedies(
+                    plan,
+                    config,
+                    attempt,
+                    &mut setup_authority_state,
+                )?;
             let remaining_keys = verification_missing_signals(&acceptance_report);
             let delta = FinalAcceptanceCycleDelta {
                 cycle_index: attempt,
@@ -4830,14 +4970,16 @@ pub fn run_ultra_plan_with_ui(
             );
             emit_compile_rollback_context_carried(config, &rollback);
             exhausted_reason = "compile_rollback_applied".to_string();
-            acceptance_report = ultra_final_acceptance_report_with_cycle(
-                plan,
-                config,
-                final_acceptance_cycle_deltas
-                    .last()
-                    .map(|delta| delta.cycle_index)
-                    .unwrap_or(0),
-            )?;
+            (acceptance_report, deterministic_remedies_applied) =
+                ultra_final_acceptance_report_with_deterministic_remedies(
+                    plan,
+                    config,
+                    final_acceptance_cycle_deltas
+                        .last()
+                        .map(|delta| delta.cycle_index)
+                        .unwrap_or(0),
+                    &mut setup_authority_state,
+                )?;
         }
         if !acceptance_report.is_pass() {
             let target = classify_repair_target(&acceptance_report);
@@ -4874,6 +5016,7 @@ pub fn run_ultra_plan_with_ui(
                     "missing_paths": acceptance_report.missing_paths.clone(),
                     "compile_errors": acceptance_report.compile_errors.clone(),
                     "profile_failures": acceptance_report.profile_failures.clone(),
+                    "deterministic_remedies_applied": deterministic_remedies_applied.clone(),
                     "bounded_repair_exhausted": true,
                     "exhausted_reason": exhausted_reason.clone(),
                 }),
@@ -5724,6 +5867,53 @@ fn ultra_final_acceptance_report_with_cycle(
     with_final_acceptance_cycle(cycle_index, || {
         ultra_final_acceptance_report_inner(plan, config, cycle_index)
     })
+}
+
+fn ultra_final_acceptance_report_with_deterministic_remedies(
+    plan: &UltraPlan,
+    config: &Config,
+    cycle_index: usize,
+    setup_authority: &mut UltraRunSetupAuthorityState,
+) -> anyhow::Result<(VerificationReport, Vec<String>)> {
+    let mut deterministic_remedies_applied = Vec::new();
+    if reconcile_manifest_changed_dependencies_if_needed(config, &plan.profile, setup_authority)?
+        .is_some()
+    {
+        push_unique_label(
+            &mut deterministic_remedies_applied,
+            "manifest_changed_dependency_reconciliation",
+        );
+        clear_final_acceptance_browser_probe_evidence(config);
+    }
+    let mut report = ultra_final_acceptance_report_with_cycle(plan, config, cycle_index)?;
+    if acceptance_dependency_deterministic_reconcile_needed(config, &report) {
+        setup_authority.grant("declared_dependencies_not_ready");
+        if reconcile_run_dependency_setup(
+            config,
+            &plan.profile,
+            DependencyReconciliationTrigger::DeclaredDependenciesNotReady,
+            setup_authority,
+        )?
+        .is_some()
+        {
+            push_unique_label(
+                &mut deterministic_remedies_applied,
+                "declared_dependencies_not_ready_install",
+            );
+            clear_final_acceptance_browser_probe_evidence(config);
+            report = ultra_final_acceptance_report_with_cycle(plan, config, cycle_index)?;
+        }
+    }
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "final_acceptance_deterministic_remedies",
+            "cycle_index": cycle_index,
+            "lifecycle_stage": "final_acceptance",
+            "deterministic_remedies_applied": deterministic_remedies_applied.clone(),
+        }),
+    );
+    Ok((report, deterministic_remedies_applied))
 }
 
 fn ultra_final_acceptance_report_inner(
@@ -14687,6 +14877,179 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
     }
 
     #[test]
+    #[cfg(unix)]
+    fn manifest_changed_reconciliation_installs_before_next_build_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        write_fake_npm_dependency_installer(dir.path());
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        )
+        .unwrap();
+        let mut setup_authority = UltraRunSetupAuthorityState::default();
+        setup_authority.grant("phase_setup_step");
+        reconcile_run_dependency_setup(
+            &cfg,
+            "nextjs",
+            DependencyReconciliationTrigger::DeclaredDependenciesNotReady,
+            &setup_authority,
+        )
+        .unwrap();
+        assert!(!dependency_setup::node_dependency_declarations_fingerprint_mismatch(dir.path()));
+
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}}"#,
+        )
+        .unwrap();
+        let changed =
+            reconcile_manifest_changed_dependencies_if_needed(&cfg, "nextjs", &mut setup_authority)
+                .unwrap();
+
+        assert!(changed.is_some());
+        assert!(
+            dir.path()
+                .join("node_modules/tailwindcss/package.json")
+                .is_file()
+        );
+        assert!(
+            dir.path()
+                .join("node_modules/postcss/package.json")
+                .is_file()
+        );
+        assert!(
+            dir.path()
+                .join("node_modules/autoprefixer/package.json")
+                .is_file()
+        );
+        assert!(!dependency_setup::node_dependency_declarations_fingerprint_mismatch(dir.path()));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""trigger":"manifest_changed""#));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scripts_only_manifest_edit_does_not_reconcile_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        write_fake_npm_dependency_installer(dir.path());
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        )
+        .unwrap();
+        let mut setup_authority = UltraRunSetupAuthorityState::default();
+        setup_authority.grant("phase_setup_step");
+        reconcile_run_dependency_setup(
+            &cfg,
+            "nextjs",
+            DependencyReconciliationTrigger::DeclaredDependenciesNotReady,
+            &setup_authority,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build --turbo"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        )
+        .unwrap();
+
+        let changed =
+            reconcile_manifest_changed_dependencies_if_needed(&cfg, "nextjs", &mut setup_authority)
+                .unwrap();
+
+        assert!(changed.is_none());
+    }
+
+    #[test]
+    fn python_cli_manifest_changed_reconciliation_is_noop_without_node_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "python-cli".to_string();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            r#"[project]
+name = "demo-cli"
+version = "0.1.0"
+dependencies = ["requests"]
+"#,
+        )
+        .unwrap();
+        let mut setup_authority = UltraRunSetupAuthorityState::default();
+        setup_authority.grant("phase_setup_step");
+
+        let changed = reconcile_manifest_changed_dependencies_if_needed(
+            &cfg,
+            "python-cli",
+            &mut setup_authority,
+        )
+        .unwrap();
+
+        assert!(changed.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn final_acceptance_applies_deterministic_dependency_repair_before_compile_targeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let contract_path = dir.path().join("completion-contract.json");
+        cfg.completion_contract_path = Some(contract_path.clone());
+        write_compile_error_fake_npm(dir.path());
+        write_nextjs_dual_blocker_workspace(dir.path());
+        std::fs::write(
+            &contract_path,
+            r#"{
+  "required_paths": ["src/app/page.tsx"],
+  "verify_commands": ["npm run build"],
+  "profile": "nextjs",
+  "goal": "Create a Next.js route",
+  "required_capabilities": [],
+  "required_evidence": [],
+  "required_obligations": []
+}
+"#,
+        )
+        .unwrap();
+        let plan =
+            UltraPlan::deterministic("Create a Next.js route", "nextjs", "default", "create");
+        let mut setup_authority = UltraRunSetupAuthorityState::default();
+
+        let (report, deterministic_remedies) =
+            ultra_final_acceptance_report_with_deterministic_remedies(
+                &plan,
+                &cfg,
+                0,
+                &mut setup_authority,
+            )
+            .unwrap();
+
+        assert!(
+            deterministic_remedies.contains(&"declared_dependencies_not_ready_install".to_string())
+        );
+        assert!(
+            report
+                .compile_errors
+                .iter()
+                .any(|error| error.message.contains("defined multiple times")),
+            "{report:?}"
+        );
+        assert_eq!(classify_repair_target(&report).as_str(), "implementation");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(
+            r#""deterministic_remedies_applied":["declared_dependencies_not_ready_install"]"#
+        ));
+        assert!(event_text.contains(r#""trigger":"declared_dependencies_not_ready""#));
+    }
+
+    #[test]
     fn ultra_final_acceptance_event_carries_generic_static_assurance() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -22809,6 +23172,98 @@ exit 2
         let mut permissions = std::fs::metadata(&path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
         std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_compile_error_fake_npm(root: &Path) {
+        let bin = root.join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = r#"#!/bin/sh
+set -eu
+install_pkg() {
+  name="$1"
+  if grep -q "\"$name\"" package.json 2>/dev/null; then
+    mkdir -p "node_modules/$name"
+    printf '{"name":"%s"}\n' "$name" > "node_modules/$name/package.json"
+  fi
+}
+if [ "$1" = "install" ]; then
+  mkdir -p node_modules/.bin
+  install_pkg next
+  install_pkg react
+  install_pkg react-dom
+  install_pkg typescript
+  install_pkg @types/node
+  install_pkg @types/react
+  install_pkg @types/react-dom
+  install_pkg tailwindcss
+  install_pkg postcss
+  install_pkg autoprefixer
+  if [ -d node_modules/next ]; then
+    printf '#!/bin/sh\nexit 0\n' > node_modules/.bin/next
+    chmod +x node_modules/.bin/next
+  fi
+  printf '{"lockfileVersion":3}\n' > package-lock.json
+  exit 0
+fi
+if [ "$1" = "run" ] && [ "$2" = "build" ]; then
+  cat >&2 <<'OUT'
+./src/app/page.tsx
+Error:
+  x the name `player` is defined multiple times
+
+   ,-[./src/app/page.tsx:479:1]
+359 |       const player = playerRef.current;
+    :             ------ previous definition of `player` here
+479 |       const player = playerRef.current;
+    :             ------ `player` redefined here
+   `----
+> Build failed because of webpack errors
+OUT
+  exit 1
+fi
+echo "unexpected fake npm args: $*" >&2
+exit 2
+"#;
+        let path = bin.join("npm");
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn write_nextjs_dual_blocker_workspace(root: &Path) {
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("tsconfig.json"), nextjs_tsconfig_json()).unwrap();
+        std::fs::write(root.join("postcss.config.js"), nextjs_postcss_config()).unwrap();
+        std::fs::write(root.join("tailwind.config.ts"), nextjs_tailwind_config_ts()).unwrap();
+        std::fs::write(root.join("src/app/layout.tsx"), nextjs_layout_source()).unwrap();
+        std::fs::write(root.join("src/app/globals.css"), nextjs_globals_css()).unwrap();
+        std::fs::write(
+            root.join("src/app/global.d.ts"),
+            "declare module \"*.css\";\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/app/page.tsx"),
+            r#""use client";
+export default function Page() {
+  if (true) {
+    const player = { lives: 3 };
+    const enemyBullets = [{ active: true }];
+    const player = { lives: 2 };
+    return <main><canvas data-anvil-primary-action />{enemyBullets.length}{player.lives}</main>;
+  }
+  return <main />;
+}
+"#,
+        )
+        .unwrap();
     }
 
     #[cfg(not(unix))]

@@ -9,6 +9,8 @@ use crate::eval_events;
 use crate::minimal_loop::verifier_env;
 
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(600);
+const NODE_DEPENDENCY_DECLARATIONS_FINGERPRINT: &str =
+    ".anvil/node-dependency-declarations.fingerprint";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -228,6 +230,71 @@ pub fn package_json_declares_dependencies(root: &Path) -> bool {
             .and_then(serde_json::Value::as_object)
             .is_some_and(|deps| !deps.is_empty())
     })
+}
+
+pub fn node_dependency_declarations_fingerprint(root: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(root.join("package.json")).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let object = value.as_object()?;
+    let mut entries = Vec::new();
+    for section in ["dependencies", "devDependencies"] {
+        let Some(deps) = object.get(section).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (name, version) in deps {
+            let encoded_version =
+                serde_json::to_string(version).unwrap_or_else(|_| "null".to_string());
+            entries.push((section.to_string(), name.clone(), encoded_version));
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort();
+    let mut canonical = String::new();
+    for (section, name, version) in entries {
+        canonical.push_str(&section);
+        canonical.push('\0');
+        canonical.push_str(&name);
+        canonical.push('\0');
+        canonical.push_str(&version);
+        canonical.push('\n');
+    }
+    Some(format!("{:016x}", stable_fnv1a64(canonical.as_bytes())))
+}
+
+pub fn record_node_dependency_declarations_fingerprint(
+    root: &Path,
+) -> std::io::Result<Option<String>> {
+    let Some(fingerprint) = node_dependency_declarations_fingerprint(root) else {
+        return Ok(None);
+    };
+    let path = root.join(NODE_DEPENDENCY_DECLARATIONS_FINGERPRINT);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{fingerprint}\n"))?;
+    Ok(Some(fingerprint))
+}
+
+pub fn node_dependency_declarations_fingerprint_mismatch(root: &Path) -> bool {
+    let Some(current) = node_dependency_declarations_fingerprint(root) else {
+        return false;
+    };
+    let Ok(stored) = std::fs::read_to_string(root.join(NODE_DEPENDENCY_DECLARATIONS_FINGERPRINT))
+    else {
+        return false;
+    };
+    stored.trim() != current
+}
+
+fn stable_fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 pub fn next_binary_ready(root: &Path) -> bool {
@@ -722,6 +789,15 @@ fn run_node_dependency_setup_with_program_timeout_and_offline(
         | BoundedProcessOutcomeKind::Cancelled
         | BoundedProcessOutcomeKind::CommandAbortedByUser => NodeDependencySetupStatus::Failed,
     };
+    if status_kind == NodeDependencySetupStatus::Passed
+        && matches!(
+            requirement.setup_kind,
+            NodeDependencySetupKind::NextBuildDependencies
+                | NodeDependencySetupKind::NodeDeclaredDependencies
+        )
+    {
+        let _ = record_node_dependency_declarations_fingerprint(root);
+    }
     NodeDependencySetupObservation {
         status: status_kind,
         setup_kind: requirement.setup_kind,
@@ -1192,6 +1268,56 @@ mod tests {
         );
         assert!(requirement.allowed);
         assert_eq!(requirement.package_manager, PackageManagerKind::Npm);
+    }
+
+    #[test]
+    fn dependency_declaration_fingerprint_only_tracks_dependencies_and_dev_dependencies() {
+        let dir = TempDir::new().unwrap();
+        write_package(
+            dir.path(),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0"},"devDependencies":{"typescript":"^5.5.0"},"metadata":{"note":"ignored"}}"#,
+        );
+        let initial = node_dependency_declarations_fingerprint(dir.path()).unwrap();
+        record_node_dependency_declarations_fingerprint(dir.path()).unwrap();
+
+        write_package(
+            dir.path(),
+            r#"{"scripts":{"build":"next build --turbo"},"dependencies":{"next":"^14.2.0"},"devDependencies":{"typescript":"^5.5.0"},"metadata":{"note":"changed"}}"#,
+        );
+        assert_eq!(
+            node_dependency_declarations_fingerprint(dir.path()).as_deref(),
+            Some(initial.as_str())
+        );
+        assert!(!node_dependency_declarations_fingerprint_mismatch(
+            dir.path()
+        ));
+
+        write_package(
+            dir.path(),
+            r#"{"scripts":{"build":"next build --turbo"},"dependencies":{"next":"^14.2.0"},"devDependencies":{"typescript":"^5.5.0","tailwindcss":"^3.4.19"}}"#,
+        );
+        assert!(node_dependency_declarations_fingerprint_mismatch(
+            dir.path()
+        ));
+    }
+
+    #[test]
+    fn missing_node_manifest_never_reports_dependency_fingerprint_mismatch() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("pyproject.toml"),
+            r#"[project]
+name = "demo-cli"
+version = "0.1.0"
+dependencies = ["requests"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(node_dependency_declarations_fingerprint(dir.path()), None);
+        assert!(!node_dependency_declarations_fingerprint_mismatch(
+            dir.path()
+        ));
     }
 
     #[test]
