@@ -2094,7 +2094,13 @@ fn run_step(
                     target_not_followed_repairs = 0;
                 }
             }
-            let repair_failure_kind = repair_follow_through.failure_kind().unwrap_or("");
+            let compile_repair_no_change = !current_report.compile_errors.is_empty()
+                && matches!(repair_follow_through, RepairFollowThrough::NoChange);
+            let repair_failure_kind = if compile_repair_no_change {
+                "compile_repair_no_source_change"
+            } else {
+                repair_follow_through.failure_kind().unwrap_or("")
+            };
             let retry_signature = verification_report_signature(&retry);
             let report_signature_unchanged = retry_signature == current_report_signature;
             if report_signature_unchanged && repair_turn_changed_paths.is_empty() {
@@ -2138,6 +2144,8 @@ fn run_step(
                     "report_signature_unchanged": report_signature_unchanged,
                     "allowed_action": previous_target.allowed_action(),
                     "repair_stop_reason": repair_stop_reason.clone().unwrap_or_default(),
+                    "compile_reanchored_retry": context.compile_reanchored_retry,
+                    "compile_repair_no_source_change": compile_repair_no_change,
                     "dependency_setup_authority": setup_authority.as_str(),
                     "repair_reachable": retry_reachability.reachable,
                     "reachable": retry_reachability.reachable,
@@ -2192,8 +2200,16 @@ fn run_step(
             previous_missing = next_missing;
             current_report = retry;
             current_report_signature = retry_signature;
+            if compile_repair_no_change && no_change_repairs >= 2 {
+                terminal_repair_failure_kind = Some("compile_repair_no_source_change".to_string());
+                break;
+            }
             if identical_no_change_repairs >= STEP_REPAIR_IDENTICAL_NO_CHANGE_LIMIT {
-                terminal_repair_failure_kind = Some("verify_repair_progress_unchanged".to_string());
+                terminal_repair_failure_kind = Some(if !current_report.compile_errors.is_empty() {
+                    "compile_repair_no_source_change".to_string()
+                } else {
+                    "verify_repair_progress_unchanged".to_string()
+                });
                 break;
             }
         }
@@ -22540,6 +22556,184 @@ exit 2\n"
         contract_path
     }
 
+    #[cfg(unix)]
+    fn write_api_mismatch_build_shim(root: &Path) {
+        std::fs::create_dir_all(root.join("node_modules/.bin")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/next")).unwrap();
+        let script = "#!/bin/sh\n\
+if [ \"$1\" = \"run\" ] && [ \"$2\" = \"build\" ]; then\n\
+  if grep -q 'onStateChange' src/app/SpaceInvadersGame.tsx 2>/dev/null; then\n\
+    echo './src/app/SpaceInvadersGame.tsx:30:12' >&2\n\
+    echo \"Type error: Property 'onStateChange' does not exist on type 'SpaceInvadersEngine'.\" >&2\n\
+    exit 1\n\
+  fi\n\
+  if ! grep -q 'getState' src/app/SpaceInvadersGame.tsx 2>/dev/null; then\n\
+    echo './src/app/SpaceInvadersGame.tsx:30:12' >&2\n\
+    echo \"Type error: expected poll-based getState repair.\" >&2\n\
+    exit 1\n\
+  fi\n\
+  echo 'fake build ok'\n\
+  exit 0\n\
+fi\n\
+echo \"unexpected fake npm args: $*\" >&2\n\
+exit 2\n";
+        let npm = root.join("node_modules/.bin/npm");
+        std::fs::write(&npm, script).unwrap();
+        let mut permissions = std::fs::metadata(&npm).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&npm, permissions).unwrap();
+        let next_path = root.join("node_modules/.bin/next");
+        std::fs::write(&next_path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&next_path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(next_path, permissions).unwrap();
+    }
+
+    fn api_mismatch_step_plan() -> StepPlan {
+        StepPlan {
+            goal: "Fix a Next.js TypeScript API mismatch on port 3011".to_string(),
+            steps: vec![PlanStep {
+                id: "verify-build".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create the route-bound game component and engine, then build."
+                    .to_string(),
+                expected_paths: vec![
+                    "src/app/page.tsx".to_string(),
+                    "src/app/SpaceInvadersGame.tsx".to_string(),
+                    "src/lib/game-engine.ts".to_string(),
+                    "package.json".to_string(),
+                ],
+                verify: vec!["npm run build".to_string()],
+            }],
+        }
+    }
+
+    fn api_mismatch_initial_reply(port: u16) -> AssistantReply {
+        AssistantReply {
+            content: String::new(),
+            tool_calls: vec![
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({
+                        "path": "package.json",
+                        "content": format!(
+                            r#"{{"scripts":{{"build":"next build","dev":"next dev -p {port}","start":"next start -p {port}"}},"dependencies":{{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}}}"#
+                        )
+                    }),
+                ),
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":"import SpaceInvadersGame from \"./SpaceInvadersGame\";\n\nexport default function Page() {\n  return <SpaceInvadersGame />;\n}\n"}),
+                ),
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/SpaceInvadersGame.tsx","content":api_mismatch_broken_game_source()}),
+                ),
+                crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/lib/game-engine.ts","content":api_mismatch_engine_source()}),
+                ),
+            ],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }
+    }
+
+    fn api_mismatch_poll_fix_reply() -> AssistantReply {
+        AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/SpaceInvadersGame.tsx","content":api_mismatch_poll_fixed_game_source()}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }
+    }
+
+    fn api_mismatch_read_only_reply() -> AssistantReply {
+        AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Read",
+                serde_json::json!({"path":"src/app/SpaceInvadersGame.tsx"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }
+    }
+
+    fn api_mismatch_broken_game_source() -> &'static str {
+        r#""use client";
+import { useEffect, useRef, useState } from "react";
+import { SpaceInvadersEngine, type GameState } from "../lib/game-engine";
+
+export default function SpaceInvadersGame() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [gameState, setGameState] = useState<GameState>({ score: 0, status: "ready" });
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const engine = new SpaceInvadersEngine(canvas);
+    engine.onStateChange((state) => {
+      setGameState({ ...state });
+    });
+    engine.start();
+    return () => engine.destroy();
+  }, []);
+  return <main data-anvil-state={JSON.stringify(gameState)}><canvas ref={canvasRef} /></main>;
+}
+"#
+    }
+
+    fn api_mismatch_poll_fixed_game_source() -> &'static str {
+        r#""use client";
+import { useEffect, useRef, useState } from "react";
+import { SpaceInvadersEngine, type GameState } from "../lib/game-engine";
+
+export default function SpaceInvadersGame() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [gameState, setGameState] = useState<GameState>({ score: 0, status: "ready" });
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const engine = new SpaceInvadersEngine(canvas);
+    let raf = 0;
+    const tick = () => {
+      setGameState({ ...engine.getState() });
+      raf = requestAnimationFrame(tick);
+    };
+    engine.start();
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      engine.destroy();
+    };
+  }, []);
+  return <main data-anvil-state={JSON.stringify(gameState)}><canvas ref={canvasRef} /></main>;
+}
+"#
+    }
+
+    fn api_mismatch_engine_source() -> &'static str {
+        r#"export interface GameState {
+  score: number;
+  status: string;
+}
+
+export class SpaceInvadersEngine {
+  private state: GameState = { score: 0, status: "ready" };
+  public start() { this.state = { ...this.state, status: "playing" }; }
+  public pause() { this.state = { ...this.state, status: "paused" }; }
+  public reset() { this.state = { score: 0, status: "ready" }; }
+  public setKey(key: string, pressed: boolean) { void key; void pressed; }
+  public getState(): GameState { return this.state; }
+  public destroy() { this.state = { ...this.state, status: "destroyed" }; }
+}
+"#
+    }
+
     fn generated_nextjs_artifact_plan_json_with_build_verify(goal: &str) -> String {
         let expected_paths = nextjs_scaffold_expected_paths();
         serde_json::to_string(&StepPlan {
@@ -22951,6 +23145,127 @@ exit 2\n",
 
     #[test]
     #[cfg(unix)]
+    fn step_verify_api_mismatch_prompt_and_poll_fix_passes_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = 3011;
+        let events = dir.path().join(".anvil/runs/api-mismatch/events.jsonl");
+        write_api_mismatch_build_shim(dir.path());
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let mut execution = FakeClient::new(vec![
+            api_mismatch_initial_reply(port),
+            api_mismatch_poll_fix_reply(),
+        ]);
+
+        let result =
+            run_step_plan(&mut execution, &api_mismatch_step_plan(), &cfg).unwrap_or_else(|err| {
+                let event_text = std::fs::read_to_string(&events).unwrap_or_default();
+                panic!("{err}\nEvents:\n{event_text}");
+            });
+
+        assert!(result.contains("plan-run complete"), "{result}");
+        let repair_prompt = execution
+            .messages
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .find(|text| text.contains("Property 'onStateChange'"))
+            .expect("repair prompt");
+        assert!(
+            repair_prompt.contains(
+                "Imported definition context for `SpaceInvadersEngine` from src/lib/game-engine.ts:"
+            ),
+            "{repair_prompt}"
+        );
+        assert!(
+            repair_prompt.contains("Public API surface for `SpaceInvadersEngine`"),
+            "{repair_prompt}"
+        );
+        assert!(repair_prompt.contains("public start();"), "{repair_prompt}");
+        assert!(repair_prompt.contains("public pause();"), "{repair_prompt}");
+        assert!(
+            repair_prompt.contains("public getState(): GameState;"),
+            "{repair_prompt}"
+        );
+        assert!(
+            repair_prompt.contains(
+                "call an existing member (e.g. poll getState() from the rAF loop), or add onStateChange to SpaceInvadersEngine's definition -- keep both files consistent"
+            ),
+            "{repair_prompt}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"event\":\"step_verify_repair\""));
+        assert!(event_text.contains("\"ok\":true"), "{event_text}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn step_verify_compile_zero_edit_reanchors_then_reports_no_source_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir
+            .path()
+            .join(".anvil/runs/api-mismatch-no-edit/events.jsonl");
+        write_api_mismatch_build_shim(dir.path());
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let mut execution = FakeClient::new(vec![
+            api_mismatch_initial_reply(3011),
+            api_mismatch_read_only_reply(),
+            AssistantReply::text("No source behavior changed."),
+            api_mismatch_read_only_reply(),
+            AssistantReply::text("Still no source behavior changed."),
+        ]);
+
+        let err = run_step_plan(&mut execution, &api_mismatch_step_plan(), &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("compile_repair_no_source_change"), "{err}");
+        let prompts = execution
+            .messages
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("Compile repair re-anchor")),
+            "{prompts:#?}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"failure_kind\":\"compile_repair_no_source_change\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"compile_reanchored_retry\":true"),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"reason\":\"compile_repair_no_source_change\""),
+            "{event_text}"
+        );
+        assert!(
+            !event_text.contains("\"reason\":\"verify_repair_no_change\""),
+            "{event_text}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn compile_repair_no_edit_reanchors_then_no_snapshot_gets_narrow_retry() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join(".anvil/runs/no-snapshot/events.jsonl");
@@ -23156,7 +23471,7 @@ exit 2\n",
             .to_string();
 
         assert!(err.contains("repair prompt saved"), "{err}");
-        assert!(err.contains("implementation_compile_error"), "{err}");
+        assert!(err.contains("compile_repair_no_source_change"), "{err}");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
             static_broken_page_source()
@@ -23175,7 +23490,7 @@ exit 2\n",
             "{event_text}"
         );
         assert!(
-            event_text.contains("\"failure_kind\":\"verify_repair_progress_unchanged\""),
+            event_text.contains("\"failure_kind\":\"compile_repair_no_source_change\""),
             "{event_text}"
         );
     }

@@ -413,6 +413,15 @@ fn resolve_import_for_source(root: &Path, source_path: &Path, specifier: &str) -
 
 fn exported_definition_excerpt(content: &str, symbol: &str) -> Option<String> {
     let lines = content.lines().collect::<Vec<_>>();
+    if let Some(excerpt) = exported_class_api_surface_excerpt(&lines, symbol) {
+        return Some(excerpt);
+    }
+    if let Some(excerpt) = exported_interface_api_surface_excerpt(&lines, symbol) {
+        return Some(excerpt);
+    }
+    if let Some(excerpt) = exported_object_literal_api_surface_excerpt(&lines, symbol) {
+        return Some(excerpt);
+    }
     let start = find_exported_definition_start(&lines, symbol)?;
     let end = bounded_definition_end(&lines, start);
     Some(lines[start..end].join("\n"))
@@ -424,6 +433,7 @@ fn find_exported_definition_start(lines: &[&str], symbol: &str) -> Option<usize>
         let function = format!("export function {symbol}");
         let async_function = format!("export async function {symbol}");
         let const_export = format!("export const {symbol}");
+        let class_export = format!("export class {symbol}");
         let interface_export = format!("export interface {symbol}");
         let type_export = format!("export type {symbol}");
         let named_default = if symbol == "default" {
@@ -435,10 +445,182 @@ fn find_exported_definition_start(lines: &[&str], symbol: &str) -> Option<usize>
         trimmed.starts_with(&function)
             || trimmed.starts_with(&async_function)
             || trimmed.starts_with(&const_export)
+            || trimmed.starts_with(&class_export)
             || trimmed.starts_with(&interface_export)
             || trimmed.starts_with(&type_export)
             || named_default
     })
+}
+
+fn exported_class_api_surface_excerpt(lines: &[&str], symbol: &str) -> Option<String> {
+    let start = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with(&format!("export class {symbol} "))
+            || trimmed.starts_with(&format!("export class {symbol}{{"))
+            || trimmed.starts_with(&format!("export class {symbol}<"))
+    })?;
+    let mut out = vec![format!("Public API surface for `{symbol}`:")];
+    out.push(lines[start].trim().trim_end_matches('{').trim().to_string() + " {");
+    let mut depth = 0isize;
+    let mut seen_open = false;
+    for line in lines.iter().skip(start) {
+        let trimmed = line.trim();
+        let member_depth = depth;
+        if seen_open
+            && member_depth == 1
+            && let Some(signature) = class_member_signature(trimmed)
+        {
+            out.push(format!("  {signature}"));
+            if out.len() >= 31 {
+                break;
+            }
+        }
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    seen_open = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if seen_open && depth <= 0 {
+            break;
+        }
+    }
+    if out.len() <= 2 {
+        return None;
+    }
+    out.push("}".to_string());
+    Some(out.join("\n"))
+}
+
+fn class_member_signature(line: &str) -> Option<String> {
+    if line.is_empty()
+        || line.starts_with("//")
+        || line.starts_with('*')
+        || line.starts_with("constructor")
+        || line.starts_with("private ")
+        || line.starts_with("protected ")
+        || line.starts_with('#')
+    {
+        return None;
+    }
+    let publicish = line.starts_with("public ")
+        || line.starts_with("async ")
+        || line.starts_with("static ")
+        || line.starts_with("readonly ")
+        || line
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == '$');
+    if !publicish {
+        return None;
+    }
+    let signature = line
+        .split_once('{')
+        .map(|(head, _)| head)
+        .unwrap_or(line)
+        .trim()
+        .trim_end_matches(';')
+        .trim_end_matches(',')
+        .trim();
+    (!signature.is_empty()
+        && (signature.contains('(') || signature.contains(':') || signature.contains('=')))
+    .then(|| format!("{signature};"))
+}
+
+fn exported_interface_api_surface_excerpt(lines: &[&str], symbol: &str) -> Option<String> {
+    let start = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with(&format!("export interface {symbol} "))
+            || trimmed.starts_with(&format!("export interface {symbol}{{"))
+            || trimmed.starts_with(&format!("export interface {symbol}<"))
+    })?;
+    let end = bounded_definition_end(lines, start);
+    let mut out = vec![format!("Public API surface for `{symbol}`:")];
+    for line in lines[start..end].iter().take(30) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        out.push(trimmed.to_string());
+        if out.len() >= 31 {
+            break;
+        }
+    }
+    (out.len() > 1).then(|| out.join("\n"))
+}
+
+fn exported_object_literal_api_surface_excerpt(lines: &[&str], symbol: &str) -> Option<String> {
+    let start = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with(&format!("export const {symbol} = {{"))
+            || trimmed.starts_with(&format!("export let {symbol} = {{"))
+            || trimmed.starts_with(&format!("export var {symbol} = {{"))
+    })?;
+    let mut out = vec![format!("Public API surface for `{symbol}`:")];
+    out.push(lines[start].trim().to_string());
+    let mut depth = 0isize;
+    let mut seen_open = false;
+    for line in lines.iter().skip(start + 1) {
+        let trimmed = line.trim();
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    seen_open = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if !seen_open {
+            depth = 1;
+            seen_open = true;
+        }
+        if depth <= 0 {
+            break;
+        }
+        if let Some(signature) = object_member_signature(trimmed) {
+            out.push(format!("  {signature}"));
+            if out.len() >= 31 {
+                break;
+            }
+        }
+    }
+    if out.len() <= 2 {
+        return None;
+    }
+    out.push("}".to_string());
+    Some(out.join("\n"))
+}
+
+fn object_member_signature(line: &str) -> Option<String> {
+    if line.is_empty() || line.starts_with("//") || line.starts_with("...") {
+        return None;
+    }
+    let signature = line
+        .split_once('{')
+        .map(|(head, _)| format!("{} {{ ... }}", head.trim()))
+        .unwrap_or_else(|| line.to_string())
+        .trim()
+        .trim_end_matches(',')
+        .trim()
+        .to_string();
+    (!signature.is_empty()
+        && (signature.contains('(') || signature.contains(':') || is_identifier_like(&signature)))
+    .then_some(signature)
+}
+
+fn is_identifier_like(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_' || first == '$')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
 }
 
 fn bounded_definition_end(lines: &[&str], start: usize) -> usize {

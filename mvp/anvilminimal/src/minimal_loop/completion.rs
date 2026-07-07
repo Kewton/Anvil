@@ -842,6 +842,13 @@ fn type_script_cross_file_definition_guidance(root: &Path, error: &CompileError)
             contexts.push(context);
         }
     }
+    let missing_property = property_missing_name(&error.message);
+    let missing_type = property_missing_type_name(&error.message);
+    if let Some(type_name) = missing_type.as_deref()
+        && let Some(context) = imported_symbol_definition_excerpt(root, &error.path, type_name)
+    {
+        contexts.push(context);
+    }
     let mut seen = BTreeSet::new();
     let mut lines = Vec::new();
     for context in contexts {
@@ -850,6 +857,13 @@ fn type_script_cross_file_definition_guidance(root: &Path, error: &CompileError)
             continue;
         }
         lines.extend(render_imported_definition_context(&context));
+        if let Some(property) = missing_property.as_deref() {
+            lines.push(missing_property_repair_menu(
+                property,
+                missing_type.as_deref(),
+                &context,
+            ));
+        }
     }
     lines
 }
@@ -881,6 +895,28 @@ fn property_missing_name(message: &str) -> Option<String> {
         .contains("Property ")
         .then(|| extract_first_quoted_symbol(message))
         .flatten()
+}
+
+fn property_missing_type_name(message: &str) -> Option<String> {
+    let (_, rest) = message.split_once(" on type ")?;
+    let raw = extract_first_quoted_symbol(rest)?;
+    is_identifier(&raw).then_some(raw)
+}
+
+fn missing_property_repair_menu(
+    property: &str,
+    type_name: Option<&str>,
+    context: &ImportedDefinitionExcerpt,
+) -> String {
+    let type_label = type_name.unwrap_or(context.local_name.as_str());
+    let existing_member_hint = if context.excerpt.contains("getState") {
+        "call an existing member (e.g. poll getState() from the rAF loop)"
+    } else {
+        "call an existing member"
+    };
+    format!(
+        "TypeScript member repair menu: {existing_member_hint}, or add {property} to {type_label}'s definition -- keep both files consistent."
+    )
 }
 
 fn extract_first_quoted_symbol(message: &str) -> Option<String> {
@@ -929,6 +965,7 @@ fn leading_call_identifier(expression: &str) -> Option<String> {
     let ident = trimmed[..open]
         .trim()
         .trim_start_matches("await ")
+        .trim_start_matches("new ")
         .trim()
         .rsplit('.')
         .next()
@@ -1670,6 +1707,76 @@ export default function Page() {\n\
         assert!(
             prompt.contains(
                 "TypeScript member repair menu: use an exported member, export the missing one, or remove the call."
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn compile_repair_prompt_includes_imported_class_public_api_for_missing_property() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/lib")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/SpaceInvadersGame.tsx"),
+            "import { SpaceInvadersEngine } from \"../lib/game-engine\";\n\
+export default function SpaceInvadersGame() {\n\
+  const canvas = document.createElement('canvas');\n\
+  const engine = new SpaceInvadersEngine(canvas);\n\
+  engine.onStateChange((state) => console.log(state));\n\
+  return <canvas />;\n\
+}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib/game-engine.ts"),
+            "export interface GameState { score: number; status: string; }\n\
+export class SpaceInvadersEngine {\n\
+  private running = false;\n\
+  public start() { this.running = true; }\n\
+  public pause() { this.running = false; }\n\
+  public reset() { this.running = false; }\n\
+  public setKey(key: string, pressed: boolean) { void key; void pressed; }\n\
+  public getState(): GameState { return { score: 0, status: 'ready' }; }\n\
+  public destroy() { this.running = false; }\n\
+}\n",
+        )
+        .unwrap();
+
+        let prompt = compile_repair_prompt_section_with_root(
+            Some(dir.path()),
+            &[CompileError {
+                path: "src/app/SpaceInvadersGame.tsx".to_string(),
+                line: 5,
+                column: 10,
+                message:
+                    "Type error: Property 'onStateChange' does not exist on type 'SpaceInvadersEngine'."
+                        .to_string(),
+                excerpt:
+                    "5 |   engine.onStateChange((state) => console.log(state));\n  |          ^"
+                        .to_string(),
+                symbol: None,
+                route_bound: Some(true),
+            }],
+            CompileRepairPromptProtection::default(),
+        );
+
+        assert!(
+            prompt.contains(
+                "Imported definition context for `SpaceInvadersEngine` from src/lib/game-engine.ts:"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Public API surface for `SpaceInvadersEngine`"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("public start();"), "{prompt}");
+        assert!(prompt.contains("public pause();"), "{prompt}");
+        assert!(prompt.contains("public getState(): GameState;"), "{prompt}");
+        assert!(
+            prompt.contains(
+                "call an existing member (e.g. poll getState() from the rAF loop), or add onStateChange to SpaceInvadersEngine's definition -- keep both files consistent"
             ),
             "{prompt}"
         );
