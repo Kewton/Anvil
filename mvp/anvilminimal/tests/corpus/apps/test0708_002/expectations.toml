@@ -1,0 +1,65 @@
+case_id = "test0708_002"
+source = "UAT uat-test0708-002"
+required_paths = ["package.json", "tsconfig.json", "postcss.config.js", "tailwind.config.ts", "src/app/layout.tsx", "src/app/page.tsx", "src/app/globals.css", "src/app/global.d.ts"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule", "nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "build_command_or_dependency_missing_boundary", "implementation_artifact", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence", "interactive_ui_source_evidence", "non_static_screen_evidence", "restart_or_recoverable_state_evidence", "challenge_or_adversary_evidence", "score_or_progression_evidence", "failure_or_collision_evidence"]
+required_obligations = ["implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "score", "restart", "collision"]
+acceptance_passed = true
+primary_reason = "pass"
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = ["src/app/global.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+restart_or_recoverable_state_evidence = "Strong"
+challenge_or_adversary_evidence = "Strong"
+score_or_progression_evidence = "Strong"
+failure_or_collision_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+build_command_or_dependency_missing_boundary = "Strong"
+
+[weak_evidence]
+contains = []
+absent = ["route_unbound:src/app/global.d.ts"]
+
+[diagnostics]
+contains = []
+absent = ["route_unbound:src/app/global.d.ts", "route_unbound_capability_artifact:src/app/global.d.ts"]
+
+[compile]
+expect = "build_passed"
+
+[json_fields]
+fixtures/browser-readiness.json:status = "ready"
+fixtures/browser-readiness.json:http_status = "200"
+fixtures/browser-interaction.json:status = "passed"
+fixtures/browser-interaction.json:interaction_success = "true"
+fixtures/browser-interaction.json:input_state_change = "true"
+fixtures/browser-interaction.json:recovery_transition_status = "not_observed"
+fixtures/browser-interaction.json:restart_hook_reachable_after_start = "false"
+fixtures/browser-interaction.json:surface_fit.fits_viewport = "true"
+fixtures/browser-interaction.json:surface_fit.overflow_bottom_px = "0"
+
+[fixture_contains]
+fixtures/browser-interaction.json = [
+  "score\\\":10",
+  "status\\\":\\\"PLAYING",
+  "\"fits_viewport\": true"
+]
+fixtures/events-release-gate.jsonl = [
+  "\"model\":\"gemma4:31b-cloud\"",
+  "weak_verification_evidence:route_unbound:src/app/global.d.ts",
+  "\"release_gate_status\":\"failed\"",
+  "\"runtime_acceptance_status\":\"partial\"",
+  "\"task_status\":\"failed\""
+]

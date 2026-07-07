@@ -21,11 +21,15 @@ struct CorpusCase {
     required_obligations: Vec<String>,
     deferred_verify_requirements: Vec<String>,
     evidence_hint_tokens: Vec<String>,
+    acceptance_passed: Option<bool>,
+    primary_reason: Option<String>,
     route_closure_include: Vec<String>,
     route_closure_exclude: Vec<String>,
     evidence_tiers: BTreeMap<String, String>,
     weak_evidence_contains: Vec<String>,
+    weak_evidence_absent: Vec<String>,
     diagnostics_contains: Vec<String>,
+    diagnostics_absent: Vec<String>,
     compile_expect: String,
     probe: Option<ProbeExpectation>,
     json_fields: BTreeMap<String, String>,
@@ -90,6 +94,18 @@ fn generated_app_corpus_matches_detector_and_probe_expectations() {
             &expectations.deferred_verify_requirements,
             &expectations.evidence_hint_tokens,
         );
+        if let Some(expected) = expectations.acceptance_passed {
+            assert_eq!(
+                report.passed, expected,
+                "{display}: acceptance outcome mismatch; report={report:?}"
+            );
+        }
+        if let Some(expected) = &expectations.primary_reason {
+            assert_eq!(
+                &report.primary_reason, expected,
+                "{display}: primary reason mismatch; report={report:?}"
+            );
+        }
         for (evidence, expected) in &expectations.evidence_tiers {
             let actual = report
                 .evidence_tiers
@@ -108,10 +124,27 @@ fn generated_app_corpus_matches_detector_and_probe_expectations() {
                 report.weak_evidence
             );
         }
+        for absent in &expectations.weak_evidence_absent {
+            assert!(
+                report
+                    .weak_evidence
+                    .iter()
+                    .all(|item| !item.contains(absent)),
+                "{display}: weak evidence unexpectedly contained {absent}; weak={:?}; report={report:?}",
+                report.weak_evidence
+            );
+        }
         for expected in &expectations.diagnostics_contains {
             assert!(
                 report.diagnostics.iter().any(|item| item == expected),
                 "{display}: diagnostic missing {expected}; diagnostics={:?}; report={report:?}",
+                report.diagnostics
+            );
+        }
+        for absent in &expectations.diagnostics_absent {
+            assert!(
+                report.diagnostics.iter().all(|item| !item.contains(absent)),
+                "{display}: diagnostic unexpectedly contained {absent}; diagnostics={:?}; report={report:?}",
                 report.diagnostics
             );
         }
@@ -287,6 +320,8 @@ fn parse_expectations(path: &Path) -> CorpusCase {
                     case.deferred_verify_requirements = parse_string_array(value);
                 }
                 "evidence_hint_tokens" => case.evidence_hint_tokens = parse_string_array(value),
+                "acceptance_passed" => case.acceptance_passed = Some(parse_bool(value)),
+                "primary_reason" => case.primary_reason = Some(parse_string(value)),
                 "source" => {
                     let _ = parse_string(value);
                 }
@@ -307,6 +342,7 @@ fn parse_expectations(path: &Path) -> CorpusCase {
             }
             "weak_evidence" => match key {
                 "contains" => case.weak_evidence_contains = parse_string_array(value),
+                "absent" => case.weak_evidence_absent = parse_string_array(value),
                 _ => panic!(
                     "{}:{}: unknown weak_evidence key {key}",
                     path.display(),
@@ -315,6 +351,7 @@ fn parse_expectations(path: &Path) -> CorpusCase {
             },
             "diagnostics" => match key {
                 "contains" => case.diagnostics_contains = parse_string_array(value),
+                "absent" => case.diagnostics_absent = parse_string_array(value),
                 _ => panic!(
                     "{}:{}: unknown diagnostics key {key}",
                     path.display(),
