@@ -1358,7 +1358,7 @@ export default function Page() {
                 .evidence_tiers
                 .get("restart_or_recoverable_state_evidence")
                 .map(String::as_str),
-            Some("weak"),
+            Some("absent"),
             "{report:?}"
         );
         let arbitration = arbitrate_final_acceptance(

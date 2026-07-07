@@ -224,6 +224,8 @@ pub struct CompletionSnapshot {
     pub interaction_evidence_path: String,
     pub state_dimensions_changed: Vec<String>,
     pub action_hooks: Vec<String>,
+    pub surface_fit_summary: String,
+    pub surface_fit_guidance: String,
     pub text_entry_target: String,
     pub typed_token: String,
     pub token_echoed: String,
@@ -281,6 +283,8 @@ impl CompletionSnapshot {
             interaction_evidence_path: String::new(),
             state_dimensions_changed: Vec::new(),
             action_hooks: Vec::new(),
+            surface_fit_summary: String::new(),
+            surface_fit_guidance: String::new(),
             text_entry_target: String::new(),
             typed_token: String::new(),
             token_echoed: String::new(),
@@ -350,6 +354,8 @@ pub struct CompletionProjection {
     pub interaction_evidence_path: String,
     pub state_dimensions_changed: Vec<String>,
     pub action_hooks: Vec<String>,
+    pub surface_fit_summary: String,
+    pub surface_fit_guidance: String,
     pub text_entry_target: String,
     pub typed_token: String,
     pub token_echoed: String,
@@ -516,6 +522,8 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         interaction_evidence_path: snapshot.interaction_evidence_path.clone(),
         state_dimensions_changed: snapshot.state_dimensions_changed.clone(),
         action_hooks: snapshot.action_hooks.clone(),
+        surface_fit_summary: snapshot.surface_fit_summary.clone(),
+        surface_fit_guidance: snapshot.surface_fit_guidance.clone(),
         text_entry_target: snapshot.text_entry_target.clone(),
         typed_token: snapshot.typed_token.clone(),
         token_echoed: snapshot.token_echoed.clone(),
@@ -1821,6 +1829,16 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .to_string(),
         state_dimensions_changed: event_string_array(event, "state_dimensions_changed"),
         action_hooks: event_string_array(event, "action_hooks"),
+        surface_fit_summary: event
+            .get("surface_fit_summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        surface_fit_guidance: event
+            .get("surface_fit_guidance")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         text_entry_target: event
             .get("text_entry_target")
             .and_then(Value::as_str)
@@ -2217,6 +2235,10 @@ fn render_completion_summary(
             }
         ),
         format!(
+            "Surface fit: {}",
+            missing_if_empty(&projection.surface_fit_summary)
+        ),
+        format!(
             "Text entry target: {}",
             missing_if_empty(&projection.text_entry_target)
         ),
@@ -2276,6 +2298,12 @@ fn render_completion_summary(
                     .to_string(),
             );
         }
+    }
+    if !projection.surface_fit_guidance.is_empty() {
+        lines.push(format!(
+            "Surface fit guidance: {}",
+            projection.surface_fit_guidance
+        ));
     }
     if interaction_unverified_probe_unavailable(
         &projection.release_gate,
@@ -3179,6 +3207,8 @@ mod tests {
                 "evidence_arbitration_summary": "behavioral (probe ok)",
                 "state_dimensions_changed": ["player", "score"],
                 "action_hooks": ["primary", "restart"],
+                "surface_fit_summary": "canvas overflows viewport (right: 22px)",
+                "surface_fit_guidance": "canvas overflows the viewport by 22px; consider responsive sizing",
                 "text_entry_target": "textarea:data-anvil-action=input",
                 "typed_token": "anvil-note",
                 "token_echoed": true,
@@ -3206,6 +3236,16 @@ mod tests {
         );
         assert!(
             summary.contains("Action hooks: primary, restart"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Surface fit: canvas overflows viewport (right: 22px)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(
+                "Surface fit guidance: canvas overflows the viewport by 22px; consider responsive sizing"
+            ),
             "{summary}"
         );
         assert!(

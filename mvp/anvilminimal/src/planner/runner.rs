@@ -2891,6 +2891,7 @@ fn verify_plan_final_contract(
     let state_dimensions_changed =
         interaction_state_dimensions_changed_from_path(&release_gate.interaction_evidence_path);
     let action_hooks = interaction_action_hooks_from_path(&release_gate.interaction_evidence_path);
+    let surface_fit = interaction_surface_fit_from_path(&release_gate.interaction_evidence_path);
     let text_telemetry =
         interaction_text_telemetry_from_path(&release_gate.interaction_evidence_path);
     let requested_port = effective_requested_port(&config.profile, &plan.goal, None);
@@ -3032,6 +3033,9 @@ fn verify_plan_final_contract(
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "state_dimensions_changed": state_dimensions_changed,
             "action_hooks": action_hooks,
+            "surface_fit": surface_fit.raw,
+            "surface_fit_summary": surface_fit.summary,
+            "surface_fit_guidance": surface_fit.guidance,
             "text_entry": text_telemetry.text_entry,
             "text_entry_target": text_telemetry.text_entry_target,
             "typed_token": text_telemetry.typed_token,
@@ -5698,6 +5702,7 @@ fn ultra_final_acceptance_report_inner(
     let state_dimensions_changed =
         interaction_state_dimensions_changed_from_path(&release_gate.interaction_evidence_path);
     let action_hooks = interaction_action_hooks_from_path(&release_gate.interaction_evidence_path);
+    let surface_fit = interaction_surface_fit_from_path(&release_gate.interaction_evidence_path);
     let text_telemetry =
         interaction_text_telemetry_from_path(&release_gate.interaction_evidence_path);
     let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
@@ -5834,6 +5839,9 @@ fn ultra_final_acceptance_report_inner(
             "interaction_evidence_path": release_gate.interaction_evidence_path.clone(),
             "state_dimensions_changed": state_dimensions_changed,
             "action_hooks": action_hooks,
+            "surface_fit": surface_fit.raw,
+            "surface_fit_summary": surface_fit.summary,
+            "surface_fit_guidance": surface_fit.guidance,
             "text_entry": text_telemetry.text_entry,
             "text_entry_target": text_telemetry.text_entry_target,
             "typed_token": text_telemetry.typed_token,
@@ -6300,6 +6308,7 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "source_diagnostics": &source_diagnostic_labels,
                     "unattached_ref_diagnostics": &source_diagnostics,
                     "state_dimensions_changed": &observation.state_dimensions_changed,
+                    "surface_fit": &observation.surface_fit,
                     "restart_hook_reachable_after_start": observation.restart_hook_reachable_after_start,
                     "restart_hook_count_after_start": observation.restart_hook_count_after_start,
                     "persistence_after_reload": observation.persistence_after_reload.as_str(),
@@ -9412,6 +9421,11 @@ fn interaction_probe_failure_evidence_lines(path: &str) -> Vec<String> {
             "Note: first page load took {seconds}s (cold start; excluded from assertions)"
         ));
     }
+    lines.extend(
+        surface_fit_guidance_lines_from_value(&value)
+            .into_iter()
+            .map(|line| format!("interaction surface fit: {line}")),
+    );
     if let Some(mode) = raw_text_field_deep(&value, &["probe_mode"]).filter(|mode| !mode.is_empty())
     {
         lines.push(format!("interaction probe mode: {mode}"));
@@ -12039,6 +12053,9 @@ fn final_acceptance_behavioral_probe_context(
         if let Some(changed) = raw_bool_field_deep(value, "text_input_state_change") {
             lines.push(format!("- text input state change: {changed}"));
         }
+        for line in surface_fit_guidance_lines_from_value(value) {
+            lines.push(format!("- surface fit guidance: {line}"));
+        }
         let state_dimensions = raw_string_array_field_deep(value, "state_dimensions_changed");
         if !state_dimensions.is_empty() {
             lines.push(format!(
@@ -12251,6 +12268,115 @@ fn interaction_action_hooks_from_path(path: &str) -> Vec<String> {
         .filter(Value::is_object)
         .map(|value| raw_string_array_field_deep(&value, "action_hooks"))
         .unwrap_or_default()
+}
+
+#[derive(Debug, Clone, Default)]
+struct InteractionSurfaceFitTelemetry {
+    raw: Option<Value>,
+    summary: String,
+    guidance: String,
+}
+
+fn interaction_surface_fit_from_path(path: &str) -> InteractionSurfaceFitTelemetry {
+    let Some(value) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(Value::is_object)
+    else {
+        return InteractionSurfaceFitTelemetry::default();
+    };
+    interaction_surface_fit_from_value(&value)
+}
+
+fn interaction_surface_fit_from_value(value: &Value) -> InteractionSurfaceFitTelemetry {
+    let Some(fit) = raw_surface_fit_value(value) else {
+        return InteractionSurfaceFitTelemetry::default();
+    };
+    let surface = fit
+        .get("surface")
+        .and_then(Value::as_str)
+        .filter(|surface| !surface.trim().is_empty())
+        .unwrap_or("surface");
+    let fits = fit
+        .get("fits_viewport")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let overflows = surface_fit_overflows(fit);
+    let raw = Some(fit.clone());
+    let summary = if fits {
+        format!("{surface} fits viewport")
+    } else {
+        format!(
+            "{surface} overflows viewport ({})",
+            surface_fit_edge_summary(&overflows)
+        )
+    };
+    let guidance = surface_fit_guidance(surface, fits, &overflows);
+    InteractionSurfaceFitTelemetry {
+        raw,
+        summary,
+        guidance,
+    }
+}
+
+fn raw_surface_fit_value(value: &Value) -> Option<&Value> {
+    raw_value_scopes(value)
+        .into_iter()
+        .find_map(|scope| scope.get("surface_fit").filter(|fit| fit.is_object()))
+}
+
+fn surface_fit_overflows(fit: &Value) -> BTreeMap<&'static str, i64> {
+    [
+        ("top", "overflow_top_px"),
+        ("right", "overflow_right_px"),
+        ("bottom", "overflow_bottom_px"),
+        ("left", "overflow_left_px"),
+    ]
+    .into_iter()
+    .map(|(edge, key)| (edge, raw_i64_field(fit, key).unwrap_or(0).max(0)))
+    .collect()
+}
+
+fn raw_i64_field(value: &Value, name: &str) -> Option<i64> {
+    value.get(name).and_then(Value::as_i64).or_else(|| {
+        value
+            .get(name)
+            .and_then(Value::as_f64)
+            .map(|value| value.round() as i64)
+    })
+}
+
+fn surface_fit_edge_summary(overflows: &BTreeMap<&'static str, i64>) -> String {
+    overflows
+        .iter()
+        .filter(|(_, px)| **px > 0)
+        .map(|(edge, px)| format!("{edge}: {px}px"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn surface_fit_guidance(
+    surface: &str,
+    fits: bool,
+    overflows: &BTreeMap<&'static str, i64>,
+) -> String {
+    if fits {
+        return String::new();
+    }
+    let max_overflow = overflows.values().copied().max().unwrap_or(0);
+    if max_overflow <= 0 {
+        return String::new();
+    }
+    format!("{surface} overflows the viewport by {max_overflow}px; consider responsive sizing")
+}
+
+fn surface_fit_guidance_lines_from_value(value: &Value) -> Vec<String> {
+    let guidance = interaction_surface_fit_from_value(value).guidance;
+    if guidance.is_empty() {
+        Vec::new()
+    } else {
+        vec![guidance]
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -13868,6 +13994,18 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             assert!(!evidence.contains(&"challenge_or_adversary_evidence".to_string()));
             assert!(!evidence.contains(&"failure_or_collision_evidence".to_string()));
         }
+    }
+
+    #[test]
+    fn nextjs_route_goal_binds_basic_profile_contract() {
+        let goal = "Create a route page";
+        let capabilities = inferred_required_capabilities("nextjs", goal);
+        let evidence = inferred_required_evidence("nextjs", goal, &capabilities);
+
+        assert!(capabilities.is_empty(), "{capabilities:?}");
+        assert!(completion_contract_required("nextjs", goal, &capabilities));
+        assert!(evidence.contains(&"nextjs_route_evidence".to_string()));
+        assert!(evidence.contains(&"build_command_or_dependency_missing_boundary".to_string()));
     }
 
     #[test]
@@ -19460,8 +19598,8 @@ if __name__ == "__main__":
                 interactive_game_page_without_restart_source().to_string(),
             ),
             read_static_page_reply(),
-            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(101)),
-            probe_nextjs_scaffold_reply(port, interactive_game_page_variant(102)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_without_restart_variant(101)),
+            probe_nextjs_scaffold_reply(port, interactive_game_page_without_restart_variant(102)),
         ]);
 
         let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
@@ -19658,6 +19796,77 @@ if __name__ == "__main__":
         assert!(
             guidance.contains(RESTART_PARTIAL_REPAIR_GUIDANCE),
             "{guidance}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn surface_fit_overflow_is_telemetry_not_gate_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        let events = dir.path().join(".anvil/runs/surface-fit/events.jsonl");
+        write_probe_nextjs_workspace(
+            dir.path(),
+            port,
+            &interactive_game_page_with_restart_hook_source(),
+        );
+        let run_dir = events.parent().unwrap();
+        std::fs::create_dir_all(run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("browser-readiness.json"),
+            r#"{"ok":true,"status":"passed","http_status":200,"route_rendered":true}"#,
+        )
+        .unwrap();
+        let mut interaction = interaction_state_changed_probe_result();
+        interaction["surface_fit"] = serde_json::json!({
+            "surface": "canvas",
+            "fits_viewport": false,
+            "overflow_top_px": 0,
+            "overflow_right_px": 22,
+            "overflow_bottom_px": 0,
+            "overflow_left_px": 0,
+            "viewport_width_px": 390,
+            "viewport_height_px": 844,
+            "rect_width_px": 412,
+            "rect_height_px": 600
+        });
+        std::fs::write(
+            run_dir.join("browser-interaction.json"),
+            serde_json::to_string_pretty(&interaction).unwrap(),
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: explicit_port_goal("Create an interactive browser game with restart flow", port),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "final".to_string(),
+                prompt: "Final acceptance".to_string(),
+            }],
+        };
+
+        let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
+
+        assert!(report.is_pass(), "{report:?}");
+        let event = latest_event(&events, "ultra_final_acceptance");
+        assert_eq!(
+            event.get("release_gate_status").and_then(Value::as_str),
+            Some("pass")
+        );
+        assert_eq!(
+            event
+                .get("surface_fit")
+                .and_then(|fit| fit.get("fits_viewport"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            event.get("surface_fit_guidance").and_then(Value::as_str),
+            Some("canvas overflows the viewport by 22px; consider responsive sizing")
         );
     }
 
@@ -22232,6 +22441,11 @@ export function useGame(canvasRef: RefObject<HTMLCanvasElement | null>) {
 
     fn interactive_game_page_variant(label: usize) -> String {
         interactive_game_page_source()
+            .replace("score {score}", &format!("score {{score}} health {label}"))
+    }
+
+    fn interactive_game_page_without_restart_variant(label: usize) -> String {
+        interactive_game_page_without_restart_source()
             .replace("score {score}", &format!("score {{score}} health {label}"))
     }
 

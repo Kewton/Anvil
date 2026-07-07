@@ -98,6 +98,20 @@ pub struct CanvasSnapshotEvidence {
     pub pixel_hashes: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SurfaceFitEvidence {
+    pub surface: String,
+    pub fits_viewport: bool,
+    pub overflow_top_px: i64,
+    pub overflow_right_px: i64,
+    pub overflow_bottom_px: i64,
+    pub overflow_left_px: i64,
+    pub viewport_width_px: i64,
+    pub viewport_height_px: i64,
+    pub rect_width_px: i64,
+    pub rect_height_px: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 pub struct BrowserInteractionProbeOptions {
     pub persistence_required: bool,
@@ -130,6 +144,7 @@ pub struct BrowserInteractionObservation {
     pub canvas_blank_after_start: Option<bool>,
     pub canvas_blank_after_inputs: Option<bool>,
     pub state_dimensions_changed: Vec<String>,
+    pub surface_fit: Option<SurfaceFitEvidence>,
     pub restart_hook_reachable_after_start: bool,
     pub restart_hook_count_after_start: usize,
     pub persistence_after_reload: String,
@@ -1176,6 +1191,7 @@ let candidate_table = [];
 let input_dispatches = [];
 let canvas_snapshots = [];
 let state_dimensions_changed = [];
+let surface_fit = null;
 let restart_hook_reachable_after_start = false;
 let restart_hook_count_after_start = 0;
 let persistence_after_reload = "not_evaluated";
@@ -1292,6 +1308,56 @@ async function surfaceSnapshot(page) {
       canvas_count: canvases.length,
       interactive_control_count: controls.length,
       title_text_excerpt: title.slice(0, 120)
+    };
+  });
+}
+
+async function surfaceFitSnapshot(page) {
+  return await page.evaluate(() => {
+    const visibleElement = (el) => {
+      if (!el) return false;
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== "none"
+        && style.visibility !== "hidden"
+        && rect.width > 0
+        && rect.height > 0;
+    };
+    const selectors = [
+      ["canvas", "canvas"],
+      ['[data-anvil-state]', "state"],
+      ['[data-anvil-action="primary"]', "primary"],
+      ["button,[role=button],input,select,textarea,[contenteditable='true'],[data-anvil-action]", "interactive"]
+    ];
+    let selected = null;
+    let surface = "";
+    for (const [selector, label] of selectors) {
+      const candidate = Array.from(document.querySelectorAll(selector)).find(visibleElement);
+      if (candidate) {
+        selected = candidate;
+        surface = label === "canvas" ? "canvas" : `${candidate.tagName.toLowerCase()}:${label}`;
+        break;
+      }
+    }
+    if (!selected) return null;
+    const rect = selected.getBoundingClientRect();
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    const overflowLeft = Math.max(0, Math.ceil(-rect.left));
+    const overflowTop = Math.max(0, Math.ceil(-rect.top));
+    const overflowRight = Math.max(0, Math.ceil(rect.right - viewportWidth));
+    const overflowBottom = Math.max(0, Math.ceil(rect.bottom - viewportHeight));
+    return {
+      surface,
+      fits_viewport: overflowLeft === 0 && overflowTop === 0 && overflowRight === 0 && overflowBottom === 0,
+      overflow_top_px: overflowTop,
+      overflow_right_px: overflowRight,
+      overflow_bottom_px: overflowBottom,
+      overflow_left_px: overflowLeft,
+      viewport_width_px: Math.round(viewportWidth),
+      viewport_height_px: Math.round(viewportHeight),
+      rect_width_px: Math.round(rect.width),
+      rect_height_px: Math.round(rect.height)
     };
   });
 }
@@ -2383,6 +2449,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
     steps.push("surface_visible");
     mark("observing");
     post_js_surface = await surfaceSnapshot(page);
+    surface_fit = await surfaceFitSnapshot(page);
     contract_hooks = await contractHookStatus(page);
     contract_hook_status = contract_hooks.status;
     action_hooks = contract_hooks.action_hooks || [];
@@ -2534,6 +2601,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       canvas_blank_after_start: canvasBlankAfterStart,
       canvas_blank_after_inputs: canvasBlankAfterInputs,
       state_dimensions_changed,
+      surface_fit,
       restart_hook_reachable_after_start,
       restart_hook_count_after_start,
       persistence_after_reload,
@@ -2611,6 +2679,7 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       canvas_blank_after_start: canvasBlankForSnapshot("after_start"),
       canvas_blank_after_inputs: canvasBlankForSnapshot("after_inputs"),
       state_dimensions_changed,
+      surface_fit,
       restart_hook_reachable_after_start,
       restart_hook_count_after_start,
       persistence_after_reload,
@@ -2731,6 +2800,7 @@ fn merge_script_stdout_failure_value(mut value: Value, logs: &InteractionStdio) 
             "canvas_blank_after_start",
             "canvas_blank_after_inputs",
             "state_dimensions_changed",
+            "surface_fit",
             "restart_hook_reachable_after_start",
             "restart_hook_count_after_start",
             "persistence_after_reload",
@@ -3016,6 +3086,7 @@ fn observation_from_value(
     let canvas_blank_after_inputs =
         canvas_blank_snapshot_value(&value, &canvas_snapshots, "after_inputs");
     let state_dimensions_changed = string_array_field(&value, "state_dimensions_changed");
+    let surface_fit = surface_fit_from_value(&value);
     let restart_hook_reachable_after_start = value
         .get("restart_hook_reachable_after_start")
         .and_then(Value::as_bool)
@@ -3119,6 +3190,7 @@ fn observation_from_value(
         canvas_blank_after_start,
         canvas_blank_after_inputs,
         state_dimensions_changed,
+        surface_fit,
         restart_hook_reachable_after_start,
         restart_hook_count_after_start,
         persistence_after_reload,
@@ -3386,6 +3458,39 @@ fn canvas_blank_snapshot_value(
         .and_then(|snapshot| snapshot.canvas_blank)
 }
 
+fn surface_fit_from_value(value: &Value) -> Option<SurfaceFitEvidence> {
+    let fit = value.get("surface_fit")?.as_object()?;
+    let number = |name: &str| {
+        fit.get(name)
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                fit.get(name)
+                    .and_then(Value::as_f64)
+                    .map(|value| value.round() as i64)
+            })
+            .unwrap_or(0)
+    };
+    Some(SurfaceFitEvidence {
+        surface: fit
+            .get("surface")
+            .and_then(Value::as_str)
+            .unwrap_or("surface")
+            .to_string(),
+        fits_viewport: fit
+            .get("fits_viewport")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        overflow_top_px: number("overflow_top_px"),
+        overflow_right_px: number("overflow_right_px"),
+        overflow_bottom_px: number("overflow_bottom_px"),
+        overflow_left_px: number("overflow_left_px"),
+        viewport_width_px: number("viewport_width_px"),
+        viewport_height_px: number("viewport_height_px"),
+        rect_width_px: number("rect_width_px"),
+        rect_height_px: number("rect_height_px"),
+    })
+}
+
 fn interaction_taxonomy_failure_kind(
     transition_observed: bool,
     input_evaluated_after_start: bool,
@@ -3502,6 +3607,7 @@ fn failure_observation(
         canvas_blank_after_start: None,
         canvas_blank_after_inputs: None,
         state_dimensions_changed: Vec::new(),
+        surface_fit: None,
         restart_hook_reachable_after_start: false,
         restart_hook_count_after_start: 0,
         persistence_after_reload: "not_evaluated".to_string(),
@@ -3720,6 +3826,7 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "canvas_blank_after_start": observation.canvas_blank_after_start,
         "canvas_blank_after_inputs": observation.canvas_blank_after_inputs,
         "state_dimensions_changed": &observation.state_dimensions_changed,
+        "surface_fit": &observation.surface_fit,
         "restart_hook_reachable_after_start": observation.restart_hook_reachable_after_start,
         "restart_hook_count_after_start": observation.restart_hook_count_after_start,
         "persistence_after_reload": observation.persistence_after_reload,
@@ -4238,6 +4345,49 @@ mod tests {
                 .get("restart_hook_count_after_start")
                 .and_then(Value::as_u64),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn normalized_interaction_json_preserves_surface_fit_telemetry() {
+        let observation = observe_probe_value(json!({
+            "ok": true,
+            "status": "passed",
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
+            "input_state_change": true,
+            "state_changed": true,
+            "visible_state_changed": true,
+            "surface_fit": {
+                "surface": "canvas",
+                "fits_viewport": false,
+                "overflow_top_px": 0,
+                "overflow_right_px": 22,
+                "overflow_bottom_px": 0,
+                "overflow_left_px": 0,
+                "viewport_width_px": 390,
+                "viewport_height_px": 844,
+                "rect_width_px": 412,
+                "rect_height_px": 600
+            },
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "input_state_change"
+            ]
+        }));
+
+        let fit = observation.surface_fit.as_ref().expect("surface fit");
+        assert_eq!(fit.surface, "canvas");
+        assert!(!fit.fits_viewport);
+        assert_eq!(fit.overflow_right_px, 22);
+        let projected = interaction_observation_json(&observation);
+        assert_eq!(
+            projected
+                .get("surface_fit")
+                .and_then(|fit| fit.get("overflow_right_px"))
+                .and_then(Value::as_i64),
+            Some(22)
         );
     }
 

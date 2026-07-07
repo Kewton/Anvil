@@ -483,19 +483,15 @@ impl DomainProfile for NextjsProfile {
         capabilities
     }
 
-    fn infer_required_evidence(&self, goal: &str, required_capabilities: &[String]) -> Vec<String> {
-        let mut evidence = Vec::new();
-        let app_like_goal =
-            signals::contains_app_like_token(goal) || !required_capabilities.is_empty();
-        if app_like_goal {
-            merge_unique_strings(
-                &mut evidence,
-                &[
-                    "nextjs_route_evidence".to_string(),
-                    "build_command_or_dependency_missing_boundary".to_string(),
-                ],
-            );
-        }
+    fn infer_required_evidence(
+        &self,
+        _goal: &str,
+        required_capabilities: &[String],
+    ) -> Vec<String> {
+        let mut evidence = vec![
+            "nextjs_route_evidence".to_string(),
+            "build_command_or_dependency_missing_boundary".to_string(),
+        ];
         for capability in required_capabilities {
             merge_unique_strings(&mut evidence, &required_evidence_for_capability(capability));
         }
@@ -514,25 +510,8 @@ impl DomainProfile for NextjsProfile {
         Vec::new()
     }
 
-    fn completion_contract_required(&self, goal: &str, required_capabilities: &[String]) -> bool {
-        let interactive_goal = signals::contains_app_like_token(goal)
-            || signals::contains_browser_probe_token(goal)
-            || signals::contains_canvas_token(goal);
-        let interactive_capability = required_capabilities.iter().any(|capability| {
-            matches!(
-                capability.as_str(),
-                "stateful_interaction"
-                    | "start_or_restart_flow"
-                    | "player_control"
-                    | "adversary_or_challenge"
-                    | "progression_or_score"
-                    | "failure_or_collision_rule"
-                    | "persistence"
-                    | "browser_interaction"
-                    | "playable_ui"
-            )
-        });
-        interactive_capability || interactive_goal
+    fn completion_contract_required(&self, _goal: &str, _required_capabilities: &[String]) -> bool {
+        true
     }
 }
 

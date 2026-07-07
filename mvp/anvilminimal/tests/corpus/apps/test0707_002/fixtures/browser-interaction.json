@@ -1,0 +1,53 @@
+{
+  "ok": true,
+  "status": "passed",
+  "interaction_success": true,
+  "interaction_performed": true,
+  "input_event_observed": true,
+  "start_transition": true,
+  "input_state_evaluated_after_start": true,
+  "input_state_change": true,
+  "state_changed": true,
+  "visible_state_changed": true,
+  "probe_mode": "contract",
+  "contract_hook_status": "usable",
+  "contract_hooks": {
+    "usable": true,
+    "primary_present": true,
+    "restart_present": false,
+    "valid_state_count": 1
+  },
+  "action_hooks": ["primary"],
+  "restart_hook_reachable_after_start": false,
+  "restart_hook_count_after_start": 0,
+  "restart_reachability": "terminal_state_not_reached",
+  "steps": [
+    "surface_visible",
+    "start_transition",
+    "control_input_dispatched",
+    "input_state_evaluated_after_start",
+    "input_state_change",
+    "recovery_transition:not_observed"
+  ],
+  "before_marker": "{\"states\":[{\"index\":0,\"state\":{\"screen\":\"menu\",\"score\":0,\"lives\":3}}]}",
+  "after_marker": "{\"states\":[{\"index\":0,\"state\":{\"screen\":\"playing\",\"score\":0,\"lives\":3}}]}",
+  "input_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"playerX\":180,\"score\":0}}]}",
+  "input_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"playerX\":160,\"score\":0}}]}",
+  "recovery_before_marker": "{\"states\":[{\"index\":0,\"state\":{\"screen\":\"playing\",\"score\":0,\"lives\":3}}]}",
+  "recovery_after_marker": "{\"states\":[{\"index\":0,\"state\":{\"screen\":\"playing\",\"score\":0,\"lives\":3}}]}",
+  "recovery_transition": false,
+  "recovery_transition_status": "not_observed",
+  "state_dimensions_changed": ["playerX"],
+  "surface_fit": {
+    "surface": "canvas",
+    "fits_viewport": true,
+    "overflow_top_px": 0,
+    "overflow_right_px": 0,
+    "overflow_bottom_px": 0,
+    "overflow_left_px": 0,
+    "viewport_width_px": 1280,
+    "viewport_height_px": 720,
+    "rect_width_px": 720,
+    "rect_height_px": 480
+  }
+}
