@@ -1185,6 +1185,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
     );
     diagnostics.sort();
     diagnostics.dedup();
+    prune_non_gate_relevant_weak_evidence(&mut weak_evidence, &missing_evidence, &diagnostics);
     let inconclusive = !inconclusive_reasons.is_empty();
     let weak_evidence_blocks_completion = !weak_evidence.is_empty()
         && source_first_completion_authority_required(
@@ -1255,6 +1256,11 @@ pub(crate) fn refresh_runtime_acceptance_report(
         required_capabilities,
         &report.artifact_obligations,
         &report.missing_evidence,
+    );
+    prune_non_gate_relevant_weak_evidence(
+        &mut report.weak_evidence,
+        &report.missing_evidence,
+        &report.diagnostics,
     );
     let weak_evidence_blocks_completion = !report.weak_evidence.is_empty()
         && source_first_completion_authority_required(
@@ -1903,18 +1909,56 @@ fn collect_route_unbound_capability_evidence(
         if route_scanned_kinds.is_empty() {
             continue;
         }
-        weak.push(format!("route_unbound:{}", file.rel));
-        if route_scanned_kinds.iter().any(|kind| {
-            let key = kind.as_str();
-            required_evidence.contains(key) && missing.contains(key)
-        }) {
+        let matching_missing = route_scanned_kinds
+            .iter()
+            .map(|kind| kind.as_str())
+            .filter(|key| required_evidence.contains(*key) && missing.contains(*key))
+            .collect::<Vec<_>>();
+        if matching_missing.is_empty() {
+            diagnostics.push(format!("route_unbound_informational:{}", file.rel));
+        } else {
+            weak.push(format!("route_unbound:{}", file.rel));
             diagnostics.push(format!("route_unbound_capability_artifact:{}", file.rel));
+            for evidence in matching_missing {
+                diagnostics.push(format!(
+                    "route_unbound_capability_artifact:{}:{evidence}",
+                    file.rel
+                ));
+            }
         }
     }
     weak.sort();
     weak.dedup();
     diagnostics.sort();
     diagnostics.dedup();
+}
+
+fn prune_non_gate_relevant_weak_evidence(
+    weak: &mut Vec<String>,
+    missing_evidence: &[String],
+    diagnostics: &[String],
+) {
+    let missing = missing_evidence.iter().cloned().collect::<BTreeSet<_>>();
+    weak.retain(|evidence| weak_evidence_gate_relevant(evidence, &missing, diagnostics));
+}
+
+fn weak_evidence_gate_relevant(
+    evidence: &str,
+    missing_evidence: &BTreeSet<String>,
+    diagnostics: &[String],
+) -> bool {
+    let Some(path) = evidence.strip_prefix("route_unbound:") else {
+        return true;
+    };
+    diagnostics.iter().any(|diagnostic| {
+        let Some(rest) = diagnostic.strip_prefix("route_unbound_capability_artifact:") else {
+            return false;
+        };
+        let Some((diagnostic_path, missing_key)) = rest.rsplit_once(':') else {
+            return false;
+        };
+        diagnostic_path == path && missing_evidence.contains(missing_key)
+    })
 }
 
 fn source_scanned_evidence_kind(kind: EvidenceKind) -> bool {
@@ -4048,6 +4092,52 @@ export interface GameState {
                 .all(|item| !item.contains("global.d.ts") && !item.contains("globals.css")),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn route_unbound_residual_is_informational_when_required_evidence_is_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/components")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            route_bound_page_with_space_invaders_code(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/components/UnusedSpaceInvaders.tsx"),
+            route_bound_space_invaders_component(),
+        )
+        .unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &[
+                "src/app/page.tsx".to_string(),
+                "src/components/UnusedSpaceInvaders.tsx".to_string(),
+            ],
+            &[],
+            &[
+                "player_control".to_string(),
+                "progression_or_score".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(
+            report.weak_evidence.is_empty(),
+            "residual route-unbound diagnostics must not downgrade acceptance: {report:?}"
+        );
+        assert!(
+            report.diagnostics.contains(
+                &"route_unbound_informational:src/components/UnusedSpaceInvaders.tsx".to_string()
+            ),
+            "{report:?}"
+        );
+        assert_eq!(report.primary_reason, "pass");
     }
 
     #[test]

@@ -27,10 +27,10 @@ restart_or_recoverable_state_evidence = "Strong"
 nextjs_route_evidence = "Strong"
 
 [weak_evidence]
-contains = ["route_unbound:src/components/SpaceInvaders.tsx"]
+contains = []
 
 [diagnostics]
-contains = []
+contains = ["route_unbound_informational:src/components/SpaceInvaders.tsx"]
 
 [compile]
 expect = "build_passed"

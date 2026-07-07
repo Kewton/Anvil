@@ -243,6 +243,49 @@ fn conformance_negative_earned_assurance_catches_failed_python_probe_pass_fields
 }
 
 #[test]
+fn conformance_negative_hierarchy_honesty_rejects_static_route_unbound_release_failure() {
+    let trace = Trace {
+        scenario: MatrixScenario::Nextjs,
+        events: vec![json!({
+            "event": "ultra_final_acceptance",
+            "runtime_acceptance_status": "pass",
+            "final_acceptance_status": "incomplete",
+            "release_gate_status": "failed",
+            "release_gate_reasons": ["weak_verification_evidence:route_unbound:src/app/global.d.ts"],
+            "required_evidence": [
+                "implementation_artifact",
+                "nextjs_route_evidence",
+                "user_input_handler_evidence",
+                "stateful_update_evidence"
+            ],
+            "missing_evidence": [],
+            "evidence_tiers": {
+                "implementation_artifact": "strong",
+                "nextjs_route_evidence": "strong",
+                "user_input_handler_evidence": "strong",
+                "stateful_update_evidence": "weak_behavior_corroborated"
+            },
+            "runtime_acceptance_diagnostics": [
+                "route_unbound_informational:src/app/global.d.ts"
+            ],
+            "browser_readiness_applicable": true,
+            "browser_readiness_execution_status": "performed",
+            "browser_readiness_status": "passed",
+            "interaction_evidence_applicable": true,
+            "interaction_evidence_execution_status": "performed",
+            "interaction_evidence_status": "passed"
+        })],
+        summary: terminal_summary("failed"),
+        output: String::new(),
+    };
+
+    assert_contract_fails(
+        "hierarchy_honest_release_gate",
+        check_hierarchy_honest_release_gate(&trace),
+    );
+}
+
+#[test]
 fn conformance_negative_precise_exhaustion_rejects_bare_iteration_reason() {
     let trace = Trace {
         scenario: MatrixScenario::Nextjs,
@@ -433,6 +476,10 @@ fn assert_conformance_contracts(trace: &Trace) {
         ("precise_exhaustion", check_precise_exhaustion(trace)),
         ("oracle_tristate", check_oracle_tristate(trace)),
         ("degradation_labeling", check_degradation_labeling(trace)),
+        (
+            "hierarchy_honest_release_gate",
+            check_hierarchy_honest_release_gate(trace),
+        ),
     ] {
         result.unwrap_or_else(|err| panic!("{} failed for {}: {err}", name, trace.scenario.name()));
     }
@@ -525,6 +572,51 @@ fn check_earned_assurance(trace: &Trace) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn check_hierarchy_honest_release_gate(trace: &Trace) -> Result<(), String> {
+    for event in completion_events(trace) {
+        let event_name = string_field(event, "event").unwrap_or("<unknown>");
+        if !required_evidence_satisfied_by_arbitration(event) {
+            continue;
+        }
+        let release_reasons = string_array(event, "release_gate_reasons");
+        let static_route_reason = release_reasons.iter().any(|reason| {
+            reason.contains("weak_verification_evidence:route_unbound:")
+                || reason.contains("route_unbound:src/")
+        });
+        if !static_route_reason {
+            continue;
+        }
+        if matches!(
+            string_field(event, "release_gate_status"),
+            Some("failed" | "partial")
+        ) || !release_reasons.is_empty()
+        {
+            return Err(format!(
+                "hierarchy_honest_release_gate: {event_name} let static route-unbound diagnostics override satisfied required evidence"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn required_evidence_satisfied_by_arbitration(event: &Value) -> bool {
+    let required = string_array(event, "required_evidence");
+    if required.is_empty() {
+        return false;
+    }
+    let missing = string_array(event, "missing_evidence");
+    if required
+        .iter()
+        .any(|evidence| missing.iter().any(|missing| missing == evidence))
+    {
+        return false;
+    }
+    required.iter().all(|evidence| {
+        string_field_path(event, &["evidence_tiers", evidence])
+            .is_some_and(|tier| !matches!(tier, "" | "absent" | "weak"))
+    })
 }
 
 fn check_monotonic_rebind(trace: &Trace) -> Result<(), String> {
@@ -1807,6 +1899,14 @@ fn completion_events(trace: &Trace) -> Vec<&Value> {
 
 fn string_field<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
     event.get(key).and_then(Value::as_str)
+}
+
+fn string_field_path<'a>(event: &'a Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = event;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str()
 }
 
 fn bool_field(event: &Value, key: &str) -> Option<bool> {
