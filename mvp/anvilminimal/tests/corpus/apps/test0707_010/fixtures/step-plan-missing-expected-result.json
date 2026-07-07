@@ -1,0 +1,12 @@
+{
+  "goal": "Implement the core Space Invaders game engine within app/page.tsx using an HTML5 canvas. Develop a complete game loop handling player movement, enemy grid synchronization, projectile firing, collision detection, score tracking, and game over conditions.",
+  "steps": [
+    {
+      "id": "implement-game-engine",
+      "kind": "implement",
+      "instruction": "Create `src/app/page.tsx` as a route-bound Space Invaders game engine with a canvas render loop, keyboard input, synchronized enemy grid, projectile firing, collision detection, score tracking, lives, and game-over state.",
+      "expected_paths": ["src/app/page.tsx"],
+      "verify": ["test -f src/app/page.tsx"]
+    }
+  ]
+}

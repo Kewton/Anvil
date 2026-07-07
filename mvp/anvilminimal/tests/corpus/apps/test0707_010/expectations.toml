@@ -1,0 +1,40 @@
+case_id = "test0707_010"
+source = "UAT test0707_010"
+required_paths = ["package.json", "src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["moe", "empty-planner", "missing-expected-result", "node-env"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = []
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/moe-planner-events.jsonl = [
+  "\"planner_model\":\"qwen3.6:35b-a3b-coding-nvfp4\"",
+  "\"content_len\":0",
+  "\"planner_error_kind\":\"planner_schema_error\"",
+  "StepPlan missing expected_result in step 1"
+]
+fixtures/step-plan-missing-expected-result.json = [
+  "\"id\": \"implement-game-engine\"",
+  "\"kind\": \"implement\"",
+  "\"instruction\": \"Create `src/app/page.tsx`",
+  "\"expected_paths\": [\"src/app/page.tsx\"]"
+]

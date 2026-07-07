@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -243,7 +243,7 @@ fn probe_browser_readiness_with_options(
         .stderr(Stdio::piped())
         .env("PORT", spec.port.to_string());
     for (key, value) in &spec.command.env {
-        command.env(key, value);
+        apply_probe_command_env(&mut command, key, value);
     }
     let child = match bounded_process::spawn_child(&mut command) {
         Ok(child) => child,
@@ -352,6 +352,18 @@ fn probe_browser_readiness_with_options(
         true,
         cleanup.reaped,
     )
+}
+
+fn apply_probe_command_env(command: &mut Command, key: &str, value: &str) {
+    if key == "NODE_ENV" && !is_canonical_node_env(value) {
+        command.env_remove("NODE_ENV");
+        return;
+    }
+    command.env(key, value);
+}
+
+fn is_canonical_node_env(value: &str) -> bool {
+    matches!(value, "development" | "production" | "test")
 }
 
 fn observe_nextjs_build(
@@ -965,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_server_succeeds_with_parent_node_env_production() {
+    fn mock_server_succeeds_with_parent_node_env_staging() {
         let status = run_ignored_browser_probe_harness(
             "minimal_loop::browser_probe::tests::browser_probe_normalized_env_harness",
         );
@@ -979,6 +991,22 @@ mod tests {
         let port = free_port();
         let observation =
             probe_with_mock_child(dir.path(), port, "env-sensitive", 0, Duration::from_secs(5));
+        assert!(observation.ok, "{observation:?}");
+        assert_eq!(observation.http_status, Some(200));
+    }
+
+    #[test]
+    fn probe_command_env_scrubs_non_standard_node_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port();
+        let observation = probe_with_mock_child_and_env(
+            dir.path(),
+            port,
+            "env-sensitive",
+            0,
+            Duration::from_secs(5),
+            vec![("NODE_ENV".to_string(), "staging".to_string())],
+        );
         assert!(observation.ok, "{observation:?}");
         assert_eq!(observation.http_status, Some(200));
     }
@@ -1082,7 +1110,37 @@ mod tests {
         startup_delay_ms: u64,
         timeout: Duration,
     ) -> BrowserReadinessObservation {
+        probe_with_mock_child_and_env(root, port, status, startup_delay_ms, timeout, Vec::new())
+    }
+
+    fn probe_with_mock_child_and_env(
+        root: &Path,
+        port: u16,
+        status: &str,
+        startup_delay_ms: u64,
+        timeout: Duration,
+        extra_env: Vec<(String, String)>,
+    ) -> BrowserReadinessObservation {
         let exe = std::env::current_exe().unwrap();
+        let mut env = vec![
+            (
+                "ANVIL_BROWSER_PROBE_MOCK_CHILD".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "ANVIL_BROWSER_PROBE_MOCK_PORT".to_string(),
+                port.to_string(),
+            ),
+            (
+                "ANVIL_BROWSER_PROBE_MOCK_STATUS".to_string(),
+                status.to_string(),
+            ),
+            (
+                "ANVIL_BROWSER_PROBE_MOCK_DELAY_MS".to_string(),
+                startup_delay_ms.to_string(),
+            ),
+        ];
+        env.extend(extra_env);
         let command = ProbeCommand {
             program: exe.display().to_string(),
             args: vec![
@@ -1091,24 +1149,7 @@ mod tests {
                 "minimal_loop::browser_probe::tests::browser_probe_mock_server_child".to_string(),
                 "--nocapture".to_string(),
             ],
-            env: vec![
-                (
-                    "ANVIL_BROWSER_PROBE_MOCK_CHILD".to_string(),
-                    "1".to_string(),
-                ),
-                (
-                    "ANVIL_BROWSER_PROBE_MOCK_PORT".to_string(),
-                    port.to_string(),
-                ),
-                (
-                    "ANVIL_BROWSER_PROBE_MOCK_STATUS".to_string(),
-                    status.to_string(),
-                ),
-                (
-                    "ANVIL_BROWSER_PROBE_MOCK_DELAY_MS".to_string(),
-                    startup_delay_ms.to_string(),
-                ),
-            ],
+            env,
             display: "mock browser probe child".to_string(),
         };
         probe_browser_readiness_with_options(
@@ -1134,7 +1175,7 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         std::process::Command::new(exe)
             .args(["--ignored", "--exact", test_name, "--nocapture"])
-            .env("NODE_ENV", "production")
+            .env("NODE_ENV", "staging")
             .env("NODE_OPTIONS", "--require ./host-hook.js")
             .status()
             .unwrap()
