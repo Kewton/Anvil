@@ -1527,18 +1527,7 @@ fn verification_repair_path(
 }
 
 fn looks_like_implementation_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    if looks_like_setup_path(&lower)
-        || looks_like_style_path(&lower)
-        || looks_like_test_file(&lower)
-        || lower.ends_with(".md")
-        || lower.ends_with(".d.ts")
-        || lower.ends_with("layout.tsx")
-        || lower.ends_with("layout.jsx")
-    {
-        return false;
-    }
-    looks_like_source_or_test(&lower)
+    is_evidence_bearing_implementation_candidate_path(path)
 }
 
 fn evidence_kinds_for_capability(capability: &str) -> Vec<EvidenceKind> {
@@ -1645,7 +1634,23 @@ fn collect_workspace_evidence(root: &Path) -> WorkspaceEvidence {
         if rel.eq_ignore_ascii_case("README.md") {
             evidence.readme = true;
         }
-        if !looks_like_source_or_test(&rel) {
+        if looks_like_test_file(&rel)
+            && looks_like_source_or_test(&rel)
+            && !looks_like_declaration_file_path(&rel.to_ascii_lowercase())
+            && !looks_like_style_path(&rel.to_ascii_lowercase())
+        {
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let file = SourceFile::new_with_route_bound(
+                rel.clone(),
+                content,
+                route_bound_files.contains(Path::new(&rel)),
+            );
+            evidence.test_files.push(file.clone());
+            continue;
+        }
+        if !is_evidence_bearing_implementation_candidate_path(&rel) {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
@@ -1656,35 +1661,37 @@ fn collect_workspace_evidence(root: &Path) -> WorkspaceEvidence {
             content,
             route_bound_files.contains(Path::new(&rel)),
         );
-        if looks_like_test_file(&rel) {
-            evidence.test_files.push(file.clone());
-        }
         evidence.source_files.push(file);
     }
     evidence
 }
 
-fn route_bound_source_files(workspace: &WorkspaceEvidence) -> impl Iterator<Item = &SourceFile> {
+fn evidence_bearing_implementation_files(
+    workspace: &WorkspaceEvidence,
+) -> impl Iterator<Item = &SourceFile> {
     workspace
         .source_files
         .iter()
-        .filter(|file| file.route_bound)
+        .filter(|file| is_evidence_bearing_implementation_candidate_path(&file.rel))
+}
+
+fn route_bound_source_files(workspace: &WorkspaceEvidence) -> impl Iterator<Item = &SourceFile> {
+    evidence_bearing_implementation_files(workspace).filter(|file| file.route_bound)
 }
 
 fn route_unbound_source_files(workspace: &WorkspaceEvidence) -> impl Iterator<Item = &SourceFile> {
-    workspace
-        .source_files
-        .iter()
+    evidence_bearing_implementation_files(workspace)
         .filter(|file| !file.route_bound && is_route_importable_source_path(&file.rel))
 }
 
 fn is_route_importable_source_path(path: &str) -> bool {
-    Path::new(path).extension().is_some_and(|ext| {
-        matches!(
-            ext.to_string_lossy().to_ascii_lowercase().as_str(),
-            "tsx" | "ts" | "jsx" | "js" | "css"
-        )
-    })
+    is_evidence_bearing_implementation_candidate_path(path)
+        && Path::new(path).extension().is_some_and(|ext| {
+            matches!(
+                ext.to_string_lossy().to_ascii_lowercase().as_str(),
+                "tsx" | "ts" | "jsx" | "js"
+            )
+        })
 }
 
 pub fn comment_stripped_source_corpus(root: &Path) -> String {
@@ -1799,11 +1806,15 @@ fn has_test_artifact(workspace: &WorkspaceEvidence) -> bool {
 }
 
 fn has_assertion_or_test_evidence(workspace: &WorkspaceEvidence) -> bool {
-    workspace.source_files.iter().any(|file| {
-        has_inline_test_or_self_test(file)
-            || contains_assertion(&file.content)
-            || file.content.contains("#[test]")
-    })
+    workspace
+        .source_files
+        .iter()
+        .chain(&workspace.test_files)
+        .any(|file| {
+            has_inline_test_or_self_test(file)
+                || contains_assertion(&file.content)
+                || file.content.contains("#[test]")
+        })
 }
 
 fn has_inline_test_or_self_test(file: &SourceFile) -> bool {
@@ -2297,34 +2308,77 @@ fn artifact_role_for_file(file: &SourceFile) -> ArtifactRoleLite {
     if looks_like_scaffold_file(file) {
         return ArtifactRoleLite::Scaffold;
     }
-    if looks_like_source_or_test(&file.rel) && !file.content.trim().is_empty() {
+    if is_evidence_bearing_implementation_candidate_path(&file.rel)
+        && !file.content.trim().is_empty()
+    {
         return ArtifactRoleLite::Implementation;
     }
     ArtifactRoleLite::Scaffold
 }
 
+fn is_evidence_bearing_implementation_candidate_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if looks_like_setup_path(&lower)
+        || looks_like_style_path(&lower)
+        || looks_like_test_file(&lower)
+        || looks_like_declaration_file_path(&lower)
+        || lower.ends_with(".md")
+        || lower.ends_with("layout.tsx")
+        || lower.ends_with("layout.jsx")
+    {
+        return false;
+    }
+    looks_like_source_or_test(&lower)
+}
+
 fn looks_like_setup_path(lower_path: &str) -> bool {
+    looks_like_lockfile_path(lower_path)
+        || looks_like_pure_config_path(lower_path)
+        || matches!(
+            lower_path,
+            "package.json" | "cargo.toml" | "pyproject.toml" | "requirements.txt"
+        )
+}
+
+fn looks_like_declaration_file_path(lower_path: &str) -> bool {
+    lower_path.ends_with(".d.ts")
+        || lower_path.ends_with(".d.mts")
+        || lower_path.ends_with(".d.cts")
+}
+
+fn looks_like_lockfile_path(lower_path: &str) -> bool {
     matches!(
         lower_path,
-        "package.json"
-            | "package-lock.json"
-            | "pnpm-lock.yaml"
-            | "yarn.lock"
-            | "bun.lockb"
-            | "cargo.toml"
-            | "cargo.lock"
-            | "pyproject.toml"
-            | "requirements.txt"
-            | "tsconfig.json"
+        "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" | "bun.lockb" | "cargo.lock"
+    )
+}
+
+fn looks_like_pure_config_path(lower_path: &str) -> bool {
+    matches!(
+        lower_path,
+        "tsconfig.json"
+            | "jsconfig.json"
             | "next.config.js"
             | "next.config.mjs"
             | "next.config.ts"
             | "postcss.config.js"
+            | "postcss.config.cjs"
+            | "postcss.config.mjs"
             | "tailwind.config.js"
+            | "tailwind.config.cjs"
+            | "tailwind.config.mjs"
             | "tailwind.config.ts"
+            | "eslint.config.js"
+            | "eslint.config.cjs"
+            | "eslint.config.mjs"
+            | "eslint.config.ts"
+            | ".eslintrc"
+            | ".eslintrc.js"
+            | ".eslintrc.cjs"
+            | ".eslintrc.json"
             | "vite.config.js"
             | "vite.config.ts"
-    ) || lower_path.ends_with(".d.ts")
+    )
 }
 
 fn looks_like_style_path(lower_path: &str) -> bool {
@@ -2372,6 +2426,11 @@ fn evidence_kinds_for_file(
         }
         ArtifactRoleLite::AcceptanceEvidence => kinds.push(EvidenceKind::RequestedContent),
         ArtifactRoleLite::Setup | ArtifactRoleLite::Scaffold | ArtifactRoleLite::Style => {}
+    }
+    if !is_evidence_bearing_implementation_candidate_path(&file.rel) {
+        kinds.sort_by_key(|kind| kind.as_str());
+        kinds.dedup();
+        return kinds;
     }
     if has_inline_test_or_self_test(file) || contains_assertion(&file.content) {
         kinds.push(EvidenceKind::TestArtifact);
@@ -3810,6 +3869,185 @@ export default function SpaceInvaders(){
   return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); setEnemies([{ x: 10, y: 20 }]); }}>Restart</button><canvas /><p>score {score} enemy collision {gameState}</p></main>;
 }
 "#
+    }
+
+    fn route_bound_page_with_space_invaders_code() -> &'static str {
+        r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  const [gameState, setGameState] = useState("ready");
+  const [enemies, setEnemies] = useState([{ x: 10, y: 20 }]);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") {
+        setGameState("playing");
+        setScore((value) => value + 1);
+      }
+    };
+    const frame = requestAnimationFrame(() => {
+      const collision = enemies.some((enemy) => enemy.x > 0);
+      if (collision) setGameState("gameover");
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [enemies]);
+  return <main><button onClick={() => setGameState("playing")}>Start</button><button onClick={() => { setGameState("ready"); setScore(0); setEnemies([{ x: 10, y: 20 }]); }}>Restart</button><canvas /><p>score {score} enemy collision {gameState}</p></main>;
+}
+"#
+    }
+
+    fn evidence_source_function_body<'a>(source: &'a str, marker: &str) -> &'a str {
+        let start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing marker {marker}"));
+        let rest = &source[start..];
+        let end = rest
+            .find("\nfn ")
+            .or_else(|| rest.find("\n#[cfg(test)]"))
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn evidence_bearing_implementation_candidate_predicate_excludes_support_artifacts() {
+        for path in [
+            "src/app/global.d.ts",
+            "next-env.d.ts",
+            "tsconfig.json",
+            "next.config.js",
+            "tailwind.config.ts",
+            "postcss.config.js",
+            "eslint.config.js",
+            ".eslintrc.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "src/app/globals.css",
+            "styles/app.scss",
+        ] {
+            assert!(
+                !is_evidence_bearing_implementation_candidate_path(path),
+                "{path} must not be implementation evidence-bearing"
+            );
+        }
+        for path in [
+            "src/app/page.tsx",
+            "src/components/Game.tsx",
+            "src/main.rs",
+            "app.js",
+        ] {
+            assert!(
+                is_evidence_bearing_implementation_candidate_path(path),
+                "{path} should remain implementation evidence-bearing"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_scan_sites_use_evidence_bearing_candidate_predicate() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/minimal_loop/evidence.rs");
+        let source = std::fs::read_to_string(path).unwrap();
+        for marker in [
+            "fn collect_workspace_evidence",
+            "fn evidence_bearing_implementation_files",
+            "fn route_unbound_source_files",
+            "fn is_route_importable_source_path",
+            "fn looks_like_implementation_path",
+            "fn artifact_role_for_file",
+            "fn evidence_kinds_for_file",
+        ] {
+            let body = evidence_source_function_body(&source, marker);
+            assert!(
+                body.contains("is_evidence_bearing_implementation_candidate_path")
+                    || body.contains("evidence_bearing_implementation_files"),
+                "{marker} bypasses evidence-bearing candidate predicate:\n{body}"
+            );
+        }
+        let setup_body = evidence_source_function_body(&source, "fn looks_like_setup_path");
+        assert!(
+            !setup_body.contains(".d.ts"),
+            "declaration files must not be hidden in setup-path classification"
+        );
+    }
+
+    #[test]
+    fn declaration_config_lock_and_stylesheet_do_not_emit_route_unbound_weak_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            route_bound_page_with_space_invaders_code(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/global.d.ts"),
+            r#"declare module "*.css";
+export interface GameState {
+  score: number;
+  enemyCount: number;
+  status: "START" | "PLAYING" | "GAME_OVER";
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tailwind.config.ts"),
+            "export default { content: ['./src/app/**/*.{ts,tsx}'] };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("postcss.config.js"),
+            "module.exports = {};\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("package-lock.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/app/globals.css"),
+            "score { color: red; }\n",
+        )
+        .unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &[
+                "src/app/page.tsx".to_string(),
+                "src/app/global.d.ts".to_string(),
+                "src/app/globals.css".to_string(),
+                "tailwind.config.ts".to_string(),
+                "postcss.config.js".to_string(),
+                "package-lock.json".to_string(),
+            ],
+            &[],
+            &[
+                "player_control".to_string(),
+                "progression_or_score".to_string(),
+                "adversary_or_challenge".to_string(),
+            ],
+            &[],
+            &["implementation".to_string()],
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(
+            report
+                .weak_evidence
+                .iter()
+                .all(|item| !item.contains("global.d.ts") && !item.contains("globals.css")),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|item| !item.contains("global.d.ts") && !item.contains("globals.css")),
+            "{report:?}"
+        );
     }
 
     #[test]
