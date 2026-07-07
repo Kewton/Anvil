@@ -1,0 +1,6 @@
+Compile error: src/app/page.tsx:14:3 Type error: Expected 3 arguments, but got 4.
+Compile error location: src/app/page.tsx:14:3
+Compile error message: Type error: Expected 3 arguments, but got 4.
+TypeScript call-arity repair for `renderSprite`: Expected 3 arguments, but got 4.
+Actual same-file signature for `renderSprite`: function renderSprite(ctx: CanvasRenderingContext2D, sprite: Sprite, scale: number) {
+TypeScript call-arity remedy menu for `renderSprite`: remove the extra argument, or extend the signature -- keep call sites consistent.

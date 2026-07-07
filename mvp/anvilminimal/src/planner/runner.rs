@@ -57,10 +57,10 @@ use crate::planner::lint::{
 use crate::planner::profile::{
     GENERIC_INTERACTIVE_CONTRACT_CAPABILITY, PhaseVerificationMode, ProfileBehaviorProbeReport,
     ProfileInferenceSource, ProfileSnapshot, canonical_profile_name, domain_profile, infer_profile,
-    profile_auto_repair, profile_before_phase, profile_expected_paths, profile_generation_rules,
-    profile_guidance, profile_post_step_repair, profile_quality_expectations,
-    profile_runtime_contract, profile_setup_scaffold_paths, verify_profile_final,
-    verify_profile_invariant,
+    is_nextjs_profile, profile_auto_repair, profile_before_phase, profile_expected_paths,
+    profile_generation_rules, profile_guidance, profile_post_step_repair,
+    profile_quality_expectations, profile_runtime_contract, profile_setup_scaffold_paths,
+    verify_profile_final, verify_profile_invariant,
 };
 use crate::planner::repair::{
     RecoveryHandoff, RepairContext, build_compact_compile_repair_prompt_with_context,
@@ -3174,10 +3174,11 @@ fn fresh_profile_invariant_failure_evidence(
 ) -> ProfileInvariantFailureEvidence {
     let report =
         verify_profile_invariant(&config.workspace_root, &plan.profile, &plan.goal, snapshot);
-    let mut required = required_paths.to_vec();
+    let mut required =
+        profile_invariant_expected_paths(&config.workspace_root, &plan.profile, required_paths);
     merge_unique_strings(
         &mut required,
-        &profile_setup_scaffold_paths(&config.workspace_root, &plan.profile),
+        &profile_invariant_setup_paths(&config.workspace_root, &plan.profile),
     );
     let mut missing_paths = missing_final_artifacts(&config.workspace_root, &required);
     merge_unique_strings(&mut missing_paths, &report.missing_paths);
@@ -3204,6 +3205,22 @@ fn fresh_profile_invariant_failure_evidence(
         report,
         missing_paths,
         failure_evidence,
+    }
+}
+
+fn profile_invariant_expected_paths(root: &Path, profile: &str, paths: &[String]) -> Vec<String> {
+    if is_nextjs_profile(profile) {
+        crate::planner::profiles::nextjs::filter_setup_invariant_paths(root, paths.to_vec())
+    } else {
+        paths.to_vec()
+    }
+}
+
+fn profile_invariant_setup_paths(root: &Path, profile: &str) -> Vec<String> {
+    if is_nextjs_profile(profile) {
+        crate::planner::profiles::nextjs::setup_invariant_required_paths(root)
+    } else {
+        profile_setup_scaffold_paths(root, profile)
     }
 }
 
@@ -4850,7 +4867,11 @@ fn repair_intermediate_profile_invariant(
         ));
     }
 
-    let expected_paths = profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+    let expected_paths = profile_invariant_expected_paths(
+        &config.workspace_root,
+        &plan.profile,
+        &profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal),
+    );
     let repair_prompt = profile_invariant_model_repair_prompt(
         plan,
         phase,
@@ -11234,6 +11255,11 @@ fn ultra_plan_generation_system_prompt(profile: &str, style: &str, intent: &str)
     let profile_rules = profile_generation_rules(profile, intent).unwrap_or(
         "- Profile generic: keep phases concrete, local, deterministic, and safe. Separate setup, implementation, and verification responsibilities.\n",
     );
+    let styling_choice_rule = if is_nextjs_profile(profile) {
+        "- For Next.js styling, use the default Tailwind scaffold coherently, or plain CSS coherently -- never a half-configured mix.\n"
+    } else {
+        ""
+    };
     format!(
         "You are Anvil's ultra planner. You do not execute tools or emit tool calls. Produce a top-level phase plan whose phases will each be executed by /plan-run.\n\
 Output YAML only, with this exact shape:\n\
@@ -11254,7 +11280,7 @@ Rules:\n\
 - Phase descriptions must not request dev-server startup or page-load/browser-route verification outside the final phase.\n\
 - Browser readiness and page-route acceptance are verified by the runtime at final acceptance.\n\
 - Stop at a clean final verification or cleanup phase.\n\
-{profile_rules}{style_rules}"
+{styling_choice_rule}{profile_rules}{style_rules}"
     )
 }
 
@@ -13697,6 +13723,11 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
                 .contains("dependency setup before any npm run build")
         );
         assert!(messages[0].content.contains("Tailwind"));
+        assert!(
+            messages[0]
+                .content
+                .contains("default Tailwind scaffold coherently, or plain CSS coherently")
+        );
         assert_eq!(messages[1].role, "user");
         assert!(
             messages[1]

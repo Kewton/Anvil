@@ -311,7 +311,18 @@ pub fn setup_scaffold_paths(root: &Path) -> Vec<String> {
 }
 
 pub fn setup_invariant_required_paths(root: &Path) -> Vec<String> {
-    setup_scaffold_paths(root)
+    filter_setup_invariant_paths(root, setup_scaffold_paths(root))
+}
+
+pub fn filter_setup_invariant_paths(root: &Path, paths: Vec<String>) -> Vec<String> {
+    if plain_css_without_tailwind_artifacts(root) {
+        paths
+            .into_iter()
+            .filter(|path| !tailwind_stack_scaffold_path(path))
+            .collect()
+    } else {
+        paths
+    }
 }
 
 pub fn expected_paths(root: &Path, _goal: &str) -> Vec<String> {
@@ -1485,6 +1496,23 @@ fn tailwind_failure(message: impl AsRef<str>) -> String {
     format!("tailwind_contract_failure: {}", message.as_ref())
 }
 
+fn plain_css_without_tailwind_artifacts(root: &Path) -> bool {
+    let package = std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .unwrap_or(Value::Null);
+    !uses_tailwind(root, &package)
+}
+
+fn tailwind_stack_scaffold_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with("postcss.config.js")
+        || lower.ends_with("postcss.config.cjs")
+        || lower.ends_with("postcss.config.mjs")
+        || lower.ends_with("postcss.config")
+        || lower.contains("tailwind.config.")
+}
+
 fn client_component_contract_failure(root: &Path) -> Option<String> {
     for rel in [
         "src/app/page.tsx",
@@ -2463,6 +2491,17 @@ export default function Page() {
         )
         .unwrap();
         assert!(verify(dir.path(), "3011").is_pass());
+        assert!(verify_invariant(dir.path(), "3011").is_pass());
+        let invariant_paths = setup_invariant_required_paths(dir.path());
+        assert!(!invariant_paths.contains(&"postcss.config.js".to_string()));
+        assert!(!invariant_paths.contains(&"tailwind.config.ts".to_string()));
+        assert!(invariant_paths.contains(&"src/app/globals.css".to_string()));
+
+        let report = verify_invariant(dir.path(), "3011");
+        assert!(!auto_repair(dir.path(), "3011", &report).unwrap());
+        assert!(!dir.path().join("postcss.config.js").exists());
+        assert!(!dir.path().join("tailwind.config.ts").exists());
+        assert!(!dir.path().join("tailwind.config.js").exists());
     }
 
     #[test]
@@ -2522,6 +2561,31 @@ export default function Page() {
         assert!(!repair_tailwind_contract(dir.path(), "3011", &reason).unwrap());
         let after = std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn partial_tailwind_config_without_directives_still_repairs_coherence() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0","tailwindcss":"^3.4.19","postcss":"^8.5.15","autoprefixer":"^10.4.20"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tailwind.config.ts"),
+            "export default { content: ['./src/**/*.{ts,tsx}'] };\n",
+        )
+        .unwrap();
+
+        let report = verify_invariant(dir.path(), "3011");
+        let reason = report.primary_reason();
+        assert!(reason.contains("PostCSS config file missing for Tailwind"));
+        assert!(repair_tailwind_contract(dir.path(), "3011", &reason).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap(),
+            canonical_postcss_config()
+        );
+        assert!(verify_invariant(dir.path(), "3011").is_pass());
     }
 
     #[test]

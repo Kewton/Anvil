@@ -1,0 +1,4 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: #10151f; color: #f8fbff; }
+button { font: inherit; }
+.panel { min-height: 100vh; display: grid; place-items: center; gap: 16px; }

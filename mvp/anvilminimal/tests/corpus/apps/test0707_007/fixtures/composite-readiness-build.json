@@ -1,0 +1,8 @@
+{
+  "shape": "browser_readiness_failed_build_verifier_failed_compile_errors",
+  "browser_readiness_status": "failed:build_verifier_failed",
+  "interaction_evidence_status": "not_exercised:build_verifier_failed",
+  "compile_error": "Type error: Expected 3 arguments, but got 4.",
+  "expected_repair_target": "implementation",
+  "styling": "plain_css_no_tailwind_artifacts"
+}

@@ -1,0 +1,45 @@
+case_id = "test0707_007"
+source = "UAT test0707_007"
+required_paths = ["package.json", "src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css", "src/app/global.d.ts"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact", "interactive_ui_source_evidence", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["plain", "css", "arity", "renderSprite"]
+
+[route_closure]
+include = ["src/app/page.tsx"]
+exclude = []
+
+[evidence]
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_failed"
+
+[json_fields]
+fixtures/composite-readiness-build.json:shape = "browser_readiness_failed_build_verifier_failed_compile_errors"
+fixtures/composite-readiness-build.json:browser_readiness_status = "failed:build_verifier_failed"
+fixtures/composite-readiness-build.json:interaction_evidence_status = "not_exercised:build_verifier_failed"
+fixtures/composite-readiness-build.json:expected_repair_target = "implementation"
+fixtures/composite-readiness-build.json:styling = "plain_css_no_tailwind_artifacts"
+
+[fixture_contains]
+fixtures/compile-repair-prompt.txt = [
+  "Compile error: src/app/page.tsx:14:3 Type error: Expected 3 arguments, but got 4.",
+  "TypeScript call-arity repair for `renderSprite`: Expected 3 arguments, but got 4.",
+  "Actual same-file signature for `renderSprite`: function renderSprite(ctx: CanvasRenderingContext2D, sprite: Sprite, scale: number) {",
+  "remove the extra argument, or extend the signature -- keep call sites consistent."
+]
