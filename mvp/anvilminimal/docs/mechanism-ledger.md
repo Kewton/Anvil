@@ -49,6 +49,16 @@ Status: complete on 2026-07-06.
 | Corpus closure | complete | 2026-07-06 | Local residual and golden fixtures in [generality.md#clause-evidence](generality.md#clause-evidence). |
 | Runbook closure | complete | 2026-07-06 | Local-provider timeout and co-residency notes in [uat/scenarios.md#command-shape](uat/scenarios.md#command-shape). |
 
+## Local Single-Model GAME Track Cross-Reference
+
+Status: complete on 2026-07-07.
+
+| milestone | status | date | reference |
+|---|---|---|---|
+| Instructions 81-87 | complete | 2026-07-07 | Single-model GAME verdict in [generality.md#recommended-model-tier](generality.md#recommended-model-tier). |
+| Corpus closure | complete | 2026-07-07 | Golden local single-model GAME full-pass fixture in [local-single-qwen36-game-full-pass](../tests/corpus/apps/local-single-qwen36-game-full-pass/expectations.toml). |
+| Contract-design closure | complete | 2026-07-07 | Invisible-only observability contract principle in [generality.md#contract-design-principle](generality.md#contract-design-principle). |
+
 ## Promotion-Path Incident Chain
 
 | incident | committed evidence | fix | permanent guard |
@@ -79,6 +89,36 @@ Reviewer-process lessons:
 - Landing conditions must be pre-committed before final rounds. The expected
   terminal distribution, corpus harvest duty, and no-false-full criteria must
   be written down before calling a measurement round final.
+
+## Local Single-Model GAME Incident Chain
+
+Instructions 81-87 closed the local single-model GAME quality track. The
+mechanisms below are permanent because each fix maps to an observed failure
+mode rather than a single prompt string.
+
+| instruction | incident | fix | permanent guard |
+|---|---|---|---|
+| 81 | Local GAME runs stalled on broad evidence failures whose repair prompts did not name the root-cause implementation target. | Root-cause-mapped repair guidance now anchors missing gameplay evidence to route-bound implementation files and concrete source obligations. | Repair prompts must name the missing capability/evidence, implementation target, and bounded change surface instead of asking for generic evidence. |
+| 82A' | Restart evidence risked becoming a visible-design mandate rather than an honesty boundary. | Reachability-honest classification treats in-play restart/recovery as behavioral evidence, while unreachable or overlay-only restart degrades to unverified/partial. | Observability contracts may require invisible hooks only; visible restart placement remains a preference. |
+| 83A | Compile repair for class/member mismatches lacked the receiver definition context needed for local models to repair both sides consistently. | Class-receiver definition context and public API extraction are included in compile repair prompts. | Corpus fixtures assert imported class context and a remedy menu for keeping caller/callee contracts consistent. |
+| 84A' | Side effects in expected paths and generated artifacts could pollute dependency/setup lifecycles or verifier targeting. | Two-tier side-effect sanitization separates task artifacts from setup/generated paths before lifecycle setup and repair targeting. | Runner tests keep side-effect paths out of dependency lifecycle setup and verifier false-positive repairs. |
+| 85 | Repeated no-edit compile repair attempts consumed wall clock without re-anchoring source context. | Compact repair sessions escalate after zero-edit/no-progress compile repair turns and carry anchored compile frames forward. | Compile repair tests require compact-session prompts to preserve frame excerpts and tool-schema reminders. |
+| 86A | Final acceptance composite failures could target the outer readiness label and miss inner build verifier compile errors. | Composite unwrapping targets implementation compile repair when readiness/acceptance fails because build verifier produced parseable compile errors. | `browser_readiness_failed:build_verifier_failed` with compile frames routes to the shared compile ladder. |
+| 86C | Probe evidence was labeled missing or unavailable when the probe was provisioned but never exercised because an upstream gate failed. | `not_exercised:<upstream_reason>` vocabulary distinguishes unreached probes from missing probe infrastructure. | Summary/gate-table and evidence-tier tests require `not_exercised` wording for upstream build/readiness failures. |
+| 86D' | Styling invariants forced Tailwind into plain-CSS apps and created incoherent stacks. | Presence-conditional styling accepts plain CSS with zero Tailwind artifacts and repairs only partially present Tailwind stacks. | Plain-CSS and partial-Tailwind fixtures guard the coherence boundary. |
+| 87A | Lifecycle-captured SWC source frames were present but not parsed, causing build failures to terminate as dependency setup lifecycle failures. | Lifecycle-frame routing parses SWC `Error:` frames without a `Failed to compile` banner and classifies them as compile errors. | Parser and verifier tests require lifecycle source frames to enter implementation compile repair. |
+| 87B | Recovery UltraPlan YAML could fail render/parse roundtrip and be discarded. | Recovery roundtrip hardening uses JSON-compatible YAML quoting and writes loadable `needs_review` artifacts on validation failure. | Roundtrip tests cover quotes, backslashes, multiline, Japanese, and the exact recovery-prompt shape. |
+
+## Review Process Rule
+
+Any instruction touching contracts, invariants, or vocabularies requires a
+one-paragraph overfitting review at issue time. The review must say what the
+change fossilizes, whose design freedom it narrows, and what degradation path
+keeps declined preferences honest. This rule is mandatory because 82A' caught
+restart reachability drifting toward visible UX control, 84A' caught artifact
+and setup side effects that could narrow legitimate implementation shapes, and
+86D' caught Tailwind stack injection fossilizing one styling choice over plain
+CSS.
 
 ## Boundedness Guarantees
 

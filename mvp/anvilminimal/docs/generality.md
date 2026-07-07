@@ -119,6 +119,44 @@ Measured evidence:
   was measured against this 27b/35b model pair. New model families may require a
   new dialect-absorption round; that is expected bounded cost, not a portability
   claim for unseen output dialects.
+- Local single-model GAME quality track, instructions 81-87, culminated in
+  `test0707_009` on build `a9fea8ee`, using
+  `qwen3.6:27b-coding-nvfp4` for the single local model configuration. The
+  six-run series moved the failure frontier from phase 0, to phase 1, to the
+  final acceptance gate, then to a full pass with behavioral verification. The
+  full-pass run recorded browser readiness `passed`, interaction evidence
+  `passed`, state changes in `aliensRemaining` and `score`, a primary start
+  transition, and an in-play recovery/restart transition. This is a distinct
+  local data point from the 27b/35b mixed-pair verdict above: single 27b can
+  complete the GAME path after the 81-87 guard sequence, but the observation is
+  narrow to that track and does not revise the broader recommended tier.
+  Residual `fits_viewport=false` / bottom overflow 136px is informational
+  presentation quality guidance, not a release gate.
+
+Model-tier observations:
+
+| configuration | sample | distribution / frontier | verdict |
+|---|---|---|---|
+| `gemini-3.5-flash` implementation/planner | Q1-final `test0704-999-Q1-62_001`, 8 runs | 6 full / 1 reasoned partial / 1 behavioral failed, 8/8 honest terminal states | Recommended implementation tier baseline. |
+| Local mixed pair: `qwen3.6:27b-coding-nvfp4` planner + `ornith:35b` executor | `test0704-999-Q1-62646566676869707172_001`, 8 runs | 2/8 full, 8/8 honest terminal states; web 1/6 | Below recommended tier for reliable web delivery; CLI moderately viable. |
+| Local single model: `qwen3.6:27b-coding-nvfp4` | GAME quality track instructions 81-87, six-run series ending at `test0707_009` | frontier advanced phase0 -> phase1 -> final gate -> full pass with behavioral verification, in-play restart/recovery, score and enemy-state mutation | Golden local single-model GAME reference; narrow positive data point, not a broad tier upgrade. |
+
+## Contract-Design Principle
+
+Observability contracts may require only invisible instrumentation: data
+attributes, state snapshots, and other non-visible probe hooks. Demands on
+visible design, including control placement, reachability, or UX layout, are
+preferences offered as tradeoffs. When declined or absent, the runner degrades
+honestly to unverified or partial evidence instead of forcing design choices.
+
+Two recent applications make this boundary permanent. Instruction 82A' treats
+restart reachability as evidence honesty: an in-play restart/recovery path can
+earn behavioral verification, while an overlay-only or unreachable restart is
+reported as unverified/partial rather than rejected as a required visible
+layout. Instruction 86D' treats styling as presence-conditional coherence:
+Tailwind artifacts must be coherent when present, but plain CSS with no
+Tailwind artifacts is a valid Next.js path and must not be overwritten by
+forced stack injection.
 
 ## Q1 Final Quality Baseline
 
