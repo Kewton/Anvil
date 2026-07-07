@@ -127,6 +127,49 @@ pub fn arbitrate_final_acceptance(
     let mut records = BTreeMap::new();
 
     let Some(observation) = observation else {
+        if let Some(upstream_reason) = report
+            .interaction_evidence_status
+            .strip_prefix("not_exercised:")
+            .map(str::to_string)
+        {
+            for (key, static_tier) in static_tiers {
+                let not_exercised = mark_not_exercised_if_probe_required_weak(
+                    report,
+                    &key,
+                    &static_tier,
+                    &upstream_reason,
+                );
+                let final_tier = if not_exercised {
+                    format!("not_exercised:{upstream_reason}")
+                } else {
+                    static_tier.clone()
+                };
+                records.insert(
+                    key,
+                    EvidenceArbitrationRecord {
+                        final_tier,
+                        static_tier,
+                        behavioral_observation: format!("not_exercised:{upstream_reason}"),
+                        decided_by: if not_exercised {
+                            "upstream_gate_not_exercised"
+                        } else {
+                            "static"
+                        }
+                        .to_string(),
+                    },
+                );
+            }
+            refresh_runtime_acceptance_report(
+                report,
+                required_capabilities,
+                required_evidence,
+                required_obligations,
+            );
+            return EvidenceArbitrationReport {
+                summary: format!("not exercised ({upstream_reason})"),
+                records,
+            };
+        }
         for (key, static_tier) in static_tiers {
             let unverified = mark_unverified_if_probe_required_weak(
                 report,
@@ -451,6 +494,26 @@ fn mark_unverified_evidence(report: &mut RuntimeAcceptanceReport, key: &str, rea
         .insert(key.to_string(), format!("unverified:{reason}"));
 }
 
+fn mark_not_exercised_evidence(report: &mut RuntimeAcceptanceReport, key: &str, reason: &str) {
+    report.missing_evidence.retain(|evidence| evidence != key);
+    report.weak_evidence.retain(|evidence| {
+        !evidence
+            .strip_prefix("weak_source_evidence:")
+            .is_some_and(|rest| rest.starts_with(key) && rest[key.len()..].starts_with(':'))
+    });
+    let classified = format!("{key}:not_exercised:{reason}");
+    if !report
+        .unverified_evidence
+        .iter()
+        .any(|evidence| evidence == &classified)
+    {
+        report.unverified_evidence.push(classified);
+    }
+    report
+        .evidence_tiers
+        .insert(key.to_string(), format!("not_exercised:{reason}"));
+}
+
 fn mark_unverified_if_probe_required_weak(
     report: &mut RuntimeAcceptanceReport,
     key: &str,
@@ -461,6 +524,19 @@ fn mark_unverified_if_probe_required_weak(
         return false;
     }
     mark_unverified_evidence(report, key, probe_reason);
+    true
+}
+
+fn mark_not_exercised_if_probe_required_weak(
+    report: &mut RuntimeAcceptanceReport,
+    key: &str,
+    static_tier: &str,
+    upstream_reason: &str,
+) -> bool {
+    if static_tier != "weak" || !PROBE_REQUIRED_BEHAVIOR_KEYS.contains(&key) {
+        return false;
+    }
+    mark_not_exercised_evidence(report, key, upstream_reason);
     true
 }
 
@@ -1338,6 +1414,60 @@ export default function Page() {
                 .map(|record| record.decided_by.as_str()),
             Some("probe_required")
         );
+    }
+
+    #[test]
+    fn upstream_build_failure_marks_weak_restart_not_exercised() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cross_file_weak_restart_fixture(dir.path());
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":false,"failure_kind":"build_verifier_failed","output_excerpt":"./src/app/page.tsx:1:1\nType error: Expected 3 arguments, but got 4.\n"}"#,
+        )
+        .unwrap();
+        let required = ["restart_or_recoverable_state_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        report.interaction_evidence_status = "not_exercised:build_verifier_failed".to_string();
+        assert_eq!(
+            report.interaction_evidence_status,
+            "not_exercised:build_verifier_failed"
+        );
+
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(
+            report.unverified_evidence.contains(
+                &"restart_or_recoverable_state_evidence:not_exercised:build_verifier_failed"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("not_exercised:build_verifier_failed")
+        );
+        assert_eq!(arbitration.summary, "not exercised (build_verifier_failed)");
+        assert_eq!(
+            arbitration
+                .records
+                .get("restart_or_recoverable_state_evidence")
+                .map(|record| record.decided_by.as_str()),
+            Some("upstream_gate_not_exercised")
+        );
+        assert!(!format!("{report:?}").contains("probe_unavailable"));
     }
 
     #[test]

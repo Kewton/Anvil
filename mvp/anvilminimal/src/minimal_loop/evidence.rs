@@ -360,6 +360,7 @@ enum BrowserEvidenceStatus {
     Passed,
     Failed(String),
     Unavailable(String),
+    NotExercised(String),
 }
 
 impl BrowserEvidenceStatus {
@@ -368,6 +369,7 @@ impl BrowserEvidenceStatus {
             Self::Passed => "passed".to_string(),
             Self::Failed(reason) => format!("failed:{reason}"),
             Self::Unavailable(reason) => format!("unavailable:{reason}"),
+            Self::NotExercised(reason) => format!("not_exercised:{reason}"),
         }
     }
 }
@@ -387,7 +389,7 @@ pub fn browser_interaction_evidence_for_dirs(
         BrowserEvidenceKind::BrowserReadiness,
         "browser_readiness_evidence_missing",
     );
-    let interaction = read_browser_evidence(
+    let mut interaction = read_browser_evidence(
         root,
         extra_dirs,
         &[
@@ -398,6 +400,11 @@ pub fn browser_interaction_evidence_for_dirs(
         BrowserEvidenceKind::Interaction,
         "interaction_evidence_missing",
     );
+    if let BrowserEvidenceStatus::Failed(reason) = &browser.0
+        && matches!(interaction.0, BrowserEvidenceStatus::Unavailable(_))
+    {
+        interaction.0 = BrowserEvidenceStatus::NotExercised(reason.clone());
+    }
     BrowserInteractionEvidence {
         browser_readiness_status: browser.0.as_status(),
         browser_readiness_evidence_path: browser.1,
@@ -743,6 +750,9 @@ fn record_browser_status(
             return;
         }
         inconclusive_reasons.push(format!("{label}_unavailable:{reason}"));
+    } else if status.starts_with("not_exercised:") {
+        // An upstream gate failed before this evidence could be run; report the
+        // upstream failure instead of inventing missing probe evidence.
     }
 }
 
@@ -5739,6 +5749,47 @@ export default function Page(){ return <button onClick={() => alert("ok")}>Go</b
                 .contains(&"browser_readiness_failed:http_500".to_string())
         );
         assert_eq!(report.browser_readiness_status, "failed:http_500");
+    }
+
+    #[test]
+    fn failed_readiness_marks_missing_interaction_not_exercised() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+export default function Page(){ return <button onClick={() => alert("ok")}>Go</button>; }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"ok":false,"failure_kind":"build_verifier_failed","output_excerpt":"./src/app/page.tsx:1:1\nType error: Expected 3 arguments, but got 4.\n"}"#,
+        )
+        .unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &["browser_interaction".to_string()],
+            &[],
+            &[],
+            &[],
+        );
+
+        assert!(!report.passed);
+        assert_eq!(
+            report.browser_readiness_status,
+            "failed:build_verifier_failed"
+        );
+        assert_eq!(
+            report.interaction_evidence_status,
+            "not_exercised:build_verifier_failed"
+        );
+        assert!(!report.inconclusive_reasons.iter().any(|reason| {
+            reason.contains("probe_unavailable") || reason.contains("interaction_evidence_missing")
+        }));
     }
 
     #[test]

@@ -7261,10 +7261,13 @@ fn browser_release_gate_with_options(
         ReleaseEvidenceKind::Interaction,
     );
     let browser_status = browser.status.as_status();
-    let interaction_status = interaction.status.as_status();
+    let mut interaction_status = interaction.status.as_status();
     let canvas_surface_missing =
         release_gate_canvas_surface_missing(canvas_surface_expected, &browser, &interaction);
     if let ReleaseEvidenceStatus::Failed(reason) = &browser.status {
+        if matches!(interaction.status, ReleaseEvidenceStatus::Unavailable(_)) {
+            interaction_status = format!("not_exercised:{reason}");
+        }
         return ReleaseGateSummary {
             status: "failed".to_string(),
             reasons: vec![format!("browser_readiness_failed:{reason}")],
@@ -18290,6 +18293,7 @@ if __name__ == "__main__":
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"release_gate_status\":\"failed\""));
         assert!(event_text.contains("\"browser_readiness_status\":\"failed:http_500\""));
+        assert!(event_text.contains("\"interaction_evidence_status\":\"not_exercised:http_500\""));
         assert!(event_text.contains("\"event\":\"recovery_prompt_saved\""));
         assert!(event_text.contains("\"recovery_handoff_kind\":\"browser_readiness_failed\""));
         assert!(event_text.contains("\"acceptance_layer\":\"release_gate\""));
@@ -18300,6 +18304,38 @@ if __name__ == "__main__":
         assert!(recovery_text.contains("release gate reason"));
         assert!(recovery_text.contains("browser readiness"));
         assert!(recovery_text.contains("Preferred verify/browser check"));
+    }
+
+    #[test]
+    fn release_gate_marks_interaction_not_exercised_after_build_readiness_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path().to_path_buf());
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            r#"{"status":"failed","ok":false,"failure_kind":"build_verifier_failed","output_excerpt":"./src/app/page.tsx:6:3\nType error: Expected 3 arguments, but got 4.\n"}"#,
+        )
+        .unwrap();
+
+        let gate = browser_release_gate(&cfg);
+
+        assert_eq!(gate.status, "failed");
+        assert_eq!(
+            gate.browser_readiness_status,
+            "failed:build_verifier_failed"
+        );
+        assert_eq!(
+            gate.interaction_evidence_status,
+            "not_exercised:build_verifier_failed"
+        );
+        let evidence =
+            release_recovery_failure_evidence(&gate, "failed", "release gate failed", None)
+                .join("\n");
+        assert!(evidence.contains("interaction evidence: not_exercised:build_verifier_failed"));
+        assert!(!evidence.contains("probe_unavailable"), "{evidence}");
+        assert!(
+            !evidence.contains("interaction_evidence_missing"),
+            "{evidence}"
+        );
     }
 
     #[test]
