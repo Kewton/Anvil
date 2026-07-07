@@ -327,6 +327,16 @@ pub fn publish_provider_started(scope: &str, deadline_secs: u64) -> bool {
     })
 }
 
+pub fn provider_scope_label(scope: &str) -> &'static str {
+    match scope {
+        "planner_ultra" => "planning the overall plan",
+        "planner_step" => "planning steps",
+        "executor" => "implementing",
+        "repair" => "repairing",
+        _ => "model turn",
+    }
+}
+
 pub fn publish_provider_finished(duration: Duration) -> bool {
     publish_global(StatusEvent::ProviderFinished {
         duration_secs: duration.as_secs(),

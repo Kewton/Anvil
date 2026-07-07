@@ -245,7 +245,6 @@ pub fn build_live_footer_lines(
         && runtime.command.is_none()
         && runtime.repair.is_none()
         && runtime.stage.is_none()
-        && runtime.last_event.is_none()
         && !runtime.interrupt_requested
         && !runtime.force_finalize_requested
     {
@@ -291,8 +290,10 @@ pub fn build_live_footer_lines(
     } else if let Some(provider) = &runtime.provider {
         let elapsed = now.elapsed_secs_since(provider.started_at);
         secondary.push(format!(
-            "provider {}s/{}s ({})",
-            elapsed, provider.deadline_secs, provider.scope
+            "{} {}s/{}s",
+            status_bus::provider_scope_label(&provider.scope),
+            elapsed,
+            provider.deadline_secs
         ));
     } else if let Some(stage) = &runtime.stage {
         secondary.push(stage.clone());
@@ -309,10 +310,6 @@ pub fn build_live_footer_lines(
             secondary.push(format!("repair {}/{}", repair.attempt, repair.max));
         }
     }
-    if let Some(last) = &runtime.last_event {
-        secondary.push(format!("last: {last}"));
-    }
-
     let prefix = if runtime.force_finalize_requested {
         "[stopping: force-finalizing…] "
     } else if runtime.interrupt_requested {
@@ -614,7 +611,7 @@ mod tests {
 
         assert_eq!(
             lines,
-            vec!["Phase 2/5 core-logic · implement · provider 47s/600s (planner_step)".to_string()]
+            vec!["Phase 2/5 core-logic · implement · planning steps 47s/600s".to_string()]
         );
     }
 
@@ -673,7 +670,29 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("[stopping: aborting current operation…] Phase 1/2"));
         assert!(lines[1].contains("repair 1/2"));
-        assert!(lines[1].contains("last: tool_args_path_normalized"));
+        assert!(!lines.join("\n").contains("last:"), "{lines:?}");
+    }
+
+    #[test]
+    fn live_footer_ignores_last_event_ticker() {
+        let runtime = RuntimeStatus {
+            last_event: Some("tool_args_path_normalized".to_string()),
+            ..RuntimeStatus::default()
+        };
+
+        let lines = build_live_footer_lines(
+            &status(None),
+            &runtime,
+            StatusTime::from_secs(0),
+            120,
+            false,
+        );
+
+        assert_eq!(
+            lines,
+            vec!["[act] provider:ollama model:m ctx:65536 tokens:n/a [yes]"]
+        );
+        assert!(!lines.join("\n").contains("last:"), "{lines:?}");
     }
 
     #[test]
