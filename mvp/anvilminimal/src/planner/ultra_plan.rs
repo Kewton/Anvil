@@ -42,14 +42,24 @@ impl UltraPlan {
 
 pub fn render_ultra_plan(plan: &UltraPlan) -> String {
     let mut out = format!(
-        "goal: {:?}\nprofile: {:?}\nstyle: {:?}\nintent: {:?}\nphases:\n",
-        plan.goal, plan.profile, plan.style, plan.intent
+        "goal: {}\nprofile: {}\nstyle: {}\nintent: {}\nphases:\n",
+        quote_yaml_string(&plan.goal),
+        quote_yaml_string(&plan.profile),
+        quote_yaml_string(&plan.style),
+        quote_yaml_string(&plan.intent)
     );
     for phase in &plan.phases {
-        out.push_str(&format!("  - id: {:?}\n", phase.id));
-        out.push_str(&format!("    prompt: {:?}\n", phase.prompt));
+        out.push_str(&format!("  - id: {}\n", quote_yaml_string(&phase.id)));
+        out.push_str(&format!(
+            "    prompt: {}\n",
+            quote_yaml_string(&phase.prompt)
+        ));
     }
     out
+}
+
+pub(crate) fn quote_yaml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
 }
 
 pub fn parse_ultra_plan(text: &str) -> anyhow::Result<UltraPlan> {
@@ -133,6 +143,36 @@ mod tests {
     fn ultra_yaml_round_trip() {
         let plan = UltraPlan::deterministic("goal", "nextjs", "default", "create");
         assert_eq!(parse_ultra_plan(&render_ultra_plan(&plan)).unwrap(), plan);
+    }
+
+    #[test]
+    fn ultra_yaml_round_trip_preserves_escaped_and_multiline_prompts() {
+        let plan = UltraPlan {
+            goal: "厚いゲーム: quotes \"inside\", slash \\, and multiline\nsecond line"
+                .to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "recover".to_string(),
+            phases: vec![
+                UltraPhase {
+                    id: "inspect-current-state".to_string(),
+                    prompt: "Inspect files with escaped quotes like \\\"boss\\\" and Windows path C:\\tmp\\game.\n日本語の行も保持する。".to_string(),
+                },
+                UltraPhase {
+                    id: "repair-final-acceptance".to_string(),
+                    prompt: "Repair the generated thick game without restarting.\nFailure evidence:\n- ./src/app/game.ts\n- Error:\n-   x Expected ',', got '}'\n- > Build failed because of webpack errors\nKeep template literals such as `Score: ${score}` intact.".to_string(),
+                },
+                UltraPhase {
+                    id: "verify-recovery".to_string(),
+                    prompt: "Run `npm run build`; if it fails, keep the exact SWC frame and repair only the syntax error.".to_string(),
+                },
+            ],
+        };
+
+        let rendered = render_ultra_plan(&plan);
+        let parsed = parse_ultra_plan(&rendered).unwrap();
+        assert_eq!(parsed, plan);
+        assert_eq!(parse_ultra_plan(&render_ultra_plan(&parsed)).unwrap(), plan);
     }
 
     #[test]

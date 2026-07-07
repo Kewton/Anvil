@@ -320,7 +320,38 @@ fn validate_recovery_yaml(path: &Path) -> Result<(), String> {
     if reparsed != parsed {
         return Err("recovery_yaml_roundtrip_mismatch".to_string());
     }
+    if let Some(reason) = recovery_yaml_needs_review_reason(&text) {
+        return Err(format!("recovery_yaml_needs_review: {reason}"));
+    }
     Ok(())
+}
+
+fn recovery_yaml_needs_review_reason(text: &str) -> Option<String> {
+    let mut needs_review = false;
+    let mut reason = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "recovery_needs_review: true" {
+            needs_review = true;
+        } else if let Some(value) = trimmed.strip_prefix("recovery_needs_review_reason:") {
+            reason = parse_recovery_metadata_string(value.trim());
+        }
+    }
+    needs_review.then(|| {
+        if reason.is_empty() {
+            "needs_review".to_string()
+        } else {
+            reason
+        }
+    })
+}
+
+fn parse_recovery_metadata_string(value: &str) -> String {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        serde_json::from_str(value).unwrap_or_else(|_| value.trim_matches('"').to_string())
+    } else {
+        value.trim_matches('"').trim_matches('\'').to_string()
+    }
 }
 
 fn recovery_artifact_check_summary(validation: &RecoveryArtifactValidation) -> String {

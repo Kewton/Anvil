@@ -5,7 +5,9 @@ use crate::minimal_loop::completion::{
     CompileRepairPromptProtection, compile_repair_prompt_section_with_root,
 };
 use crate::minimal_loop::repair_target::classify_repair_target;
-use crate::planner::ultra_plan::{UltraPhase, UltraPlan, parse_ultra_plan, render_ultra_plan};
+use crate::planner::ultra_plan::{
+    UltraPhase, UltraPlan, parse_ultra_plan, quote_yaml_string, render_ultra_plan,
+};
 use crate::planner::verify::VerificationReport;
 
 #[derive(Debug, Clone, Default)]
@@ -239,10 +241,21 @@ pub fn save_recovery_ultra_plan(
 ) -> anyhow::Result<std::path::PathBuf> {
     let plan = build_recovery_ultra_plan(handoff);
     let rendered = render_recovery_ultra_plan(handoff, &plan);
-    let parsed = parse_ultra_plan(&rendered)?;
-    if parsed != plan {
-        anyhow::bail!("recovery UltraPlan failed render/parse roundtrip");
-    }
+    save_recovery_ultra_plan_rendered(root, scope, handoff, &plan, rendered)
+}
+
+fn save_recovery_ultra_plan_rendered(
+    root: &Path,
+    scope: &str,
+    handoff: &RecoveryHandoff,
+    plan: &UltraPlan,
+    rendered: String,
+) -> anyhow::Result<std::path::PathBuf> {
+    let rendered = if let Some(reason) = recovery_ultra_plan_roundtrip_error(&rendered, plan) {
+        render_recovery_ultra_plan_with_review(handoff, plan, Some(&reason))
+    } else {
+        rendered
+    };
     let dir = root.join(".anvil").join("plans");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!(
@@ -254,32 +267,82 @@ pub fn save_recovery_ultra_plan(
 }
 
 fn render_recovery_ultra_plan(handoff: &RecoveryHandoff, plan: &UltraPlan) -> String {
+    render_recovery_ultra_plan_with_review(handoff, plan, None)
+}
+
+fn render_recovery_ultra_plan_with_review(
+    handoff: &RecoveryHandoff,
+    plan: &UltraPlan,
+    needs_review_reason: Option<&str>,
+) -> String {
     let mut out = String::new();
     out.push_str("# anvil-recovery-ultra-plan\n");
     out.push_str("recovery_schema_version: \"1\"\n");
+    if let Some(reason) = needs_review_reason {
+        out.push_str("recovery_needs_review: true\n");
+        out.push_str(&format!(
+            "recovery_needs_review_reason: {}\n",
+            quote_yaml_string(reason)
+        ));
+    }
     out.push_str(&format!(
-        "recovery_original_goal: {:?}\n",
-        handoff.original_goal
+        "recovery_original_goal: {}\n",
+        quote_yaml_string(&handoff.original_goal)
     ));
     out.push_str(&format!(
-        "recovery_failure_kind: {:?}\n",
-        handoff.failure_kind
+        "recovery_failure_kind: {}\n",
+        quote_yaml_string(&handoff.failure_kind)
     ));
-    out.push_str(&format!("recovery_profile: {:?}\n", handoff.profile));
+    out.push_str(&format!(
+        "recovery_profile: {}\n",
+        quote_yaml_string(&handoff.profile)
+    ));
     if let Some(failed_phase) = &handoff.failed_phase {
-        out.push_str(&format!("recovery_failed_phase: {:?}\n", failed_phase));
+        out.push_str(&format!(
+            "recovery_failed_phase: {}\n",
+            quote_yaml_string(failed_phase)
+        ));
     }
     if let Some(failed_step) = &handoff.failed_step {
-        out.push_str(&format!("recovery_failed_step: {:?}\n", failed_step));
+        out.push_str(&format!(
+            "recovery_failed_step: {}\n",
+            quote_yaml_string(failed_step)
+        ));
     }
     if !handoff.changed_paths.is_empty() {
         out.push_str("recovery_expected_completed_artifacts:\n");
         for path in &handoff.changed_paths {
-            out.push_str(&format!("  - {:?}\n", path));
+            out.push_str(&format!("  - {}\n", quote_yaml_string(path)));
         }
     }
     out.push_str(&render_ultra_plan(plan));
     out
+}
+
+fn recovery_ultra_plan_roundtrip_error(rendered: &str, expected: &UltraPlan) -> Option<String> {
+    let parsed = match parse_ultra_plan(rendered) {
+        Ok(parsed) => parsed,
+        Err(err) => return Some(format!("render_parse_failed: {err}")),
+    };
+    if &parsed != expected {
+        return Some("render_parse_mismatch".to_string());
+    }
+    match parse_ultra_plan(&render_ultra_plan(&parsed)) {
+        Ok(reparsed) if reparsed == parsed => None,
+        Ok(_) => Some("render_roundtrip_mismatch".to_string()),
+        Err(err) => Some(format!("render_roundtrip_parse_failed: {err}")),
+    }
+}
+
+#[cfg(test)]
+fn save_recovery_ultra_plan_rendered_for_test(
+    root: &Path,
+    scope: &str,
+    handoff: &RecoveryHandoff,
+    rendered: String,
+) -> anyhow::Result<std::path::PathBuf> {
+    let plan = build_recovery_ultra_plan(handoff);
+    save_recovery_ultra_plan_rendered(root, scope, handoff, &plan, rendered)
 }
 
 pub fn suggested_ultra_recovery_command(path: &Path, profile: &str) -> String {
@@ -715,6 +778,45 @@ mod tests {
             parse_ultra_plan(&render_ultra_plan(&parsed)).unwrap(),
             parsed
         );
+    }
+
+    #[test]
+    fn recovery_ultra_plan_save_writes_loadable_needs_review_on_roundtrip_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoff = RecoveryHandoff {
+            profile: "nextjs".to_string(),
+            original_goal: "Build \"thick\" game with path C:\\tmp\\game".to_string(),
+            failed_phase: Some("final-acceptance".to_string()),
+            failed_step: None,
+            failure_kind: "build_failed".to_string(),
+            failure_evidence: vec![
+                "./src/app/game.ts\nError:\n  x Expected ',', got '}'".to_string(),
+            ],
+            missing_paths: Vec::new(),
+            missing_capabilities: Vec::new(),
+            verify_commands: vec!["npm run build".to_string()],
+            changed_paths: vec!["src/app/game.ts".to_string()],
+            repair_targets: vec!["implementation".to_string()],
+        };
+        let broken_render =
+            "goal: \"wrong\"\nphases:\n  - id: \"bad\"\n    prompt: \"bad\"\n".to_string();
+
+        let path = save_recovery_ultra_plan_rendered_for_test(
+            dir.path(),
+            "phase-final-acceptance",
+            &handoff,
+            broken_render,
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("recovery_needs_review: true"), "{text}");
+        assert!(
+            text.contains("recovery_needs_review_reason: \"render_parse_mismatch\""),
+            "{text}"
+        );
+        let parsed = parse_ultra_plan(&text).unwrap();
+        assert_eq!(parsed, build_recovery_ultra_plan(&handoff));
     }
 
     #[test]
