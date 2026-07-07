@@ -1,0 +1,44 @@
+case_id = "test0707_003"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0707_003"
+required_paths = ["package.json", "src/app/page.tsx", "src/app/SpaceInvadersGame.tsx", "src/lib/game-engine.ts"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule", "nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence", "interactive_ui_source_evidence", "non_static_screen_evidence", "challenge_or_adversary_evidence", "score_or_progression_evidence", "failure_or_collision_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["invader", "SpaceInvadersEngine", "getState"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/SpaceInvadersGame.tsx", "src/lib/game-engine.ts"]
+exclude = []
+
+[evidence]
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+challenge_or_adversary_evidence = "Strong"
+score_or_progression_evidence = "Weak"
+failure_or_collision_evidence = "Weak"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_failed"
+
+[fixture_contains]
+fixtures/compile-repair-prompt.txt = [
+  "Imported definition context for `SpaceInvadersEngine` from src/lib/game-engine.ts:",
+  "Public API surface for `SpaceInvadersEngine`:",
+  "public start();",
+  "public pause();",
+  "public getState(): GameState;",
+  "call an existing member (e.g. poll getState() from the rAF loop), or add onStateChange to SpaceInvadersEngine's definition -- keep both files consistent"
+]

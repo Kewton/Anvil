@@ -1,0 +1,14 @@
+TypeScript cross-file API mismatch guidance:
+
+Imported definition context for `SpaceInvadersEngine` from src/lib/game-engine.ts:
+Public API surface for `SpaceInvadersEngine`:
+export class SpaceInvadersEngine {
+  public start();
+  public pause();
+  public reset();
+  public setKey(key: string, pressed: boolean);
+  public getState(): GameState;
+  public destroy();
+}
+
+TypeScript member repair menu: call an existing member (e.g. poll getState() from the rAF loop), or add onStateChange to SpaceInvadersEngine's definition -- keep both files consistent.

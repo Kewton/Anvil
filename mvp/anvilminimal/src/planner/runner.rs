@@ -10193,11 +10193,17 @@ fn emit_ultra_context_initialized(
     context: &UltraRunContext,
     session_message_count: usize,
 ) {
+    let phase_signal_text = ultra_plan_phase_signal_text(plan);
+    let requested_port =
+        effective_requested_port(&plan.profile, &plan.goal, Some(&phase_signal_text));
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
             "event": "ultra_context_initialized",
             "total_phases": plan.phases.len(),
+            "profile": plan.profile.clone(),
+            "requested_port": requested_port.as_ref().map(|requested| requested.telemetry.clone()),
+            "requested_port_value": requested_port.as_ref().map(|requested| requested.port),
             "shared_execution_session": true,
             "session_message_count": session_message_count,
             "pending_final_artifacts_count": context.pending_final_artifacts.len(),
@@ -23753,6 +23759,48 @@ exit 2\n",
             effective_requested_port("nextjs", "4000番ポートで起動", None).expect("explicit port");
         assert_eq!(explicit.port, 4000);
         assert_eq!(explicit.telemetry, "4000 (goal)");
+    }
+
+    #[test]
+    fn requested_port_is_bound_before_browser_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let plan = UltraPlan {
+            goal: "Build a Next.js game on port 4022".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![UltraPhase {
+                id: "core-game-engine".to_string(),
+                prompt: "Create the route-bound game and run npm run build".to_string(),
+            }],
+        };
+        let context = UltraRunContext::new(Vec::new());
+
+        emit_ultra_context_initialized(&cfg, &plan, &context, 0);
+        eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            json!({
+                "event": "run_stop",
+                "ok": false,
+                "reason": "implementation_compile_error",
+            }),
+        );
+
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"event\":\"ultra_context_initialized\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"requested_port\":\"4022 (goal)\""),
+            "{event_text}"
+        );
+        let snapshot = eval_events::latest_completion_snapshot(Some(&events));
+        assert_eq!(snapshot.requested_port, "4022 (goal)");
     }
 
     #[test]

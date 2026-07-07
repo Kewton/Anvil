@@ -29,6 +29,7 @@ struct CorpusCase {
     compile_expect: String,
     probe: Option<ProbeExpectation>,
     json_fields: BTreeMap<String, String>,
+    fixture_contains: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -187,6 +188,9 @@ fn generated_app_corpus_matches_detector_and_probe_expectations() {
 
         for (selector, expected) in &expectations.json_fields {
             assert_json_field(&case_dir, display, selector, expected);
+        }
+        for (fixture, expected_lines) in &expectations.fixture_contains {
+            assert_fixture_contains(&case_dir, display, fixture, expected_lines);
         }
     }
 }
@@ -349,6 +353,10 @@ fn parse_expectations(path: &Path) -> CorpusCase {
                 case.json_fields
                     .insert(key.to_string(), parse_string(value));
             }
+            "fixture_contains" => {
+                case.fixture_contains
+                    .insert(key.to_string(), parse_string_array(value));
+            }
             _ => panic!(
                 "{}:{}: unknown expectations section [{}]",
                 path.display(),
@@ -366,6 +374,27 @@ fn parse_expectations(path: &Path) -> CorpusCase {
             .to_string();
     }
     case
+}
+
+fn assert_fixture_contains(
+    case_dir: &Path,
+    display: &str,
+    fixture: &str,
+    expected_lines: &[String],
+) {
+    let fixture_path = case_dir.join(fixture);
+    let text = std::fs::read_to_string(&fixture_path).unwrap_or_else(|err| {
+        panic!(
+            "{display}: failed to read fixture {}: {err}",
+            fixture_path.display()
+        )
+    });
+    for expected in expected_lines {
+        assert!(
+            text.contains(expected),
+            "{display}: fixture {fixture} missing expected text {expected:?}"
+        );
+    }
 }
 
 fn assert_json_field(case_dir: &Path, display: &str, selector: &str, expected: &str) {
