@@ -313,6 +313,14 @@ pub fn publish_global(event: StatusEvent) -> bool {
     publisher.publish(event)
 }
 
+pub fn snapshot_global() -> Option<RuntimeStatus> {
+    let publisher = global_publisher()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    publisher.snapshot()
+}
+
 pub fn now() -> StatusTime {
     let started = STARTED_AT.get_or_init(Instant::now);
     let millis = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;

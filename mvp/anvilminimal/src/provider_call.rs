@@ -22,6 +22,13 @@ pub enum ProviderCallScope {
 }
 
 impl ProviderCallScope {
+    pub const ALL: [Self; 4] = [
+        Self::PlannerUltra,
+        Self::PlannerStep,
+        Self::Executor,
+        Self::Repair,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PlannerUltra => "planner_ultra",
@@ -41,6 +48,10 @@ impl ProviderCallScope {
 
     fn is_planner(self) -> bool {
         matches!(self, Self::PlannerUltra | Self::PlannerStep)
+    }
+
+    pub fn screen_label(self) -> &'static str {
+        crate::tui::status_bus::provider_scope_label(self.as_str())
     }
 }
 
@@ -111,7 +122,13 @@ where
     let provider = client.label().to_string();
     let timeout = Duration::from_secs(config.chat_timeout_secs);
     crate::tui::status_bus::publish_provider_started(scope.as_str(), config.chat_timeout_secs);
+    crate::tui::presentation::emit_provider_turn_started(
+        scope.as_str(),
+        model,
+        config.chat_timeout_secs,
+    );
     let started = Instant::now();
+    let mut next_progress_at = Duration::from_secs(60);
 
     if is_cancelled() {
         return provider_aborted_by_user(
@@ -129,6 +146,12 @@ where
         let result = client.chat(model, messages, tools, native_tools_enabled);
         let elapsed = started.elapsed();
         crate::tui::status_bus::publish_provider_finished(elapsed);
+        if result.is_ok() {
+            crate::tui::presentation::emit_provider_turn_completed(
+                scope.as_str(),
+                elapsed.as_secs(),
+            );
+        }
         emit_provider_turn_duration(
             config,
             ProviderTurnTelemetry {
@@ -206,11 +229,18 @@ where
                 aborted_by_user: false,
             };
         }
+        emit_provider_progress_if_due(started, config.chat_timeout_secs, &mut next_progress_at);
         let slice = PROVIDER_WAIT_SLICE.min(timeout.saturating_sub(elapsed));
         match rx.recv_timeout(slice) {
             Ok(result) => {
                 let elapsed = started.elapsed();
                 crate::tui::status_bus::publish_provider_finished(elapsed);
+                if result.is_ok() {
+                    crate::tui::presentation::emit_provider_turn_completed(
+                        scope.as_str(),
+                        elapsed.as_secs(),
+                    );
+                }
                 emit_provider_turn_duration(
                     config,
                     ProviderTurnTelemetry {
@@ -267,6 +297,27 @@ pub fn is_aborted_by_user(error: &str) -> bool {
 
 pub fn is_scoped_timeout(scope: ProviderCallScope, error: &str) -> bool {
     error.contains(scope.timeout_kind())
+}
+
+fn emit_provider_progress_if_due(
+    started: Instant,
+    deadline_secs: u64,
+    next_progress_at: &mut Duration,
+) {
+    let elapsed = started.elapsed();
+    if let Some(elapsed_secs) = provider_progress_due(elapsed, next_progress_at) {
+        crate::tui::presentation::emit_provider_turn_progress(elapsed_secs, deadline_secs);
+    }
+}
+
+fn provider_progress_due(elapsed: Duration, next_progress_at: &mut Duration) -> Option<u64> {
+    if elapsed < *next_progress_at {
+        return None;
+    }
+    while elapsed >= *next_progress_at {
+        *next_progress_at += Duration::from_secs(60);
+    }
+    Some(elapsed.as_secs())
 }
 
 fn provider_aborted_by_user(
@@ -519,5 +570,43 @@ mod tests {
         assert!(events.contains("\"classification\":\"aborted_by_user\""));
         assert!(events.contains("\"event\":\"provider_turn_aborted_by_user\""));
         assert!(!events.contains("\"event\":\"provider_turn_timeout\""));
+    }
+
+    #[test]
+    fn provider_scope_screen_labels_do_not_leak_enum_names() {
+        for scope in ProviderCallScope::ALL {
+            let label = scope.screen_label();
+            assert!(!label.contains('_'), "{scope:?}: {label}");
+            assert_ne!(label, scope.as_str());
+            assert!(!label.trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn provider_progress_due_is_bounded_to_once_per_minute() {
+        let mut next = Duration::from_secs(60);
+
+        assert_eq!(
+            provider_progress_due(Duration::from_secs(30), &mut next),
+            None
+        );
+        assert_eq!(
+            provider_progress_due(Duration::from_secs(59), &mut next),
+            None
+        );
+        assert_eq!(
+            provider_progress_due(Duration::from_secs(60), &mut next),
+            Some(60)
+        );
+        assert_eq!(next, Duration::from_secs(120));
+        assert_eq!(
+            provider_progress_due(Duration::from_secs(61), &mut next),
+            None
+        );
+        assert_eq!(
+            provider_progress_due(Duration::from_secs(120), &mut next),
+            Some(120)
+        );
+        assert_eq!(next, Duration::from_secs(180));
     }
 }

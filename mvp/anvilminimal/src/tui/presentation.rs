@@ -119,6 +119,88 @@ pub fn project_event(event: &Value) {
     emit_markdown(&line);
 }
 
+pub fn emit_provider_turn_started(scope: &str, model: &str, deadline_secs: u64) {
+    emit_activity_breadcrumb(&render_provider_turn_started(
+        scope,
+        model,
+        deadline_secs,
+        &provider_breadcrumb_context(scope),
+    ));
+}
+
+pub fn emit_provider_turn_progress(elapsed_secs: u64, deadline_secs: u64) {
+    emit_activity_breadcrumb(&render_provider_turn_progress(elapsed_secs, deadline_secs));
+}
+
+pub fn emit_provider_turn_completed(scope: &str, duration_secs: u64) {
+    emit_activity_breadcrumb(&render_provider_turn_completed(scope, duration_secs));
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderBreadcrumbContext {
+    pub phase: Option<ProviderBreadcrumbPhase>,
+    pub repair_target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderBreadcrumbPhase {
+    pub index: usize,
+    pub total: usize,
+    pub id: String,
+}
+
+pub fn render_provider_turn_started(
+    scope: &str,
+    model: &str,
+    deadline_secs: u64,
+    context: &ProviderBreadcrumbContext,
+) -> String {
+    let model = provider_model_label(model);
+    match scope {
+        "planner_step" => {
+            if let Some(phase) = &context.phase {
+                format!(
+                    "→ planning steps for phase {}/{} {} ({model}, up to {deadline_secs}s)",
+                    phase.index,
+                    phase.total,
+                    fit(&phase.id, 72)
+                )
+            } else {
+                format!("→ planning steps ({model}, up to {deadline_secs}s)")
+            }
+        }
+        "planner_ultra" => {
+            format!("→ planning the overall plan ({model}, up to {deadline_secs}s)")
+        }
+        "executor" => format!("→ implementing (model turn: {model}, up to {deadline_secs}s)"),
+        "repair" => {
+            if let Some(target) = &context.repair_target {
+                format!(
+                    "→ repairing: {} ({model}, up to {deadline_secs}s)",
+                    fit(target, 96)
+                )
+            } else {
+                format!("→ repairing ({model}, up to {deadline_secs}s)")
+            }
+        }
+        _ => format!("→ model turn ({model}, up to {deadline_secs}s)"),
+    }
+}
+
+pub fn render_provider_turn_progress(elapsed_secs: u64, deadline_secs: u64) -> String {
+    format!("… still waiting ({elapsed_secs}s/{deadline_secs}s)")
+}
+
+pub fn render_provider_turn_completed(scope: &str, duration_secs: u64) -> String {
+    match scope {
+        "planner_ultra" => format!("✓ overall plan ready ({duration_secs}s)"),
+        "planner_step" => format!("✓ step plan ready ({duration_secs}s)"),
+        "executor" => format!("✓ implementation turn finished ({duration_secs}s)"),
+        "repair" => format!("✓ repair turn finished ({duration_secs}s)"),
+        _ => format!("✓ model turn finished ({duration_secs}s)"),
+    }
+}
+
 pub fn render_current_plan() -> String {
     let state = lock_state().clone();
     let Some(plan) = state.ultra_plan else {
@@ -574,6 +656,49 @@ fn event_updates_current_activity(event: &Value) -> bool {
     )
 }
 
+fn emit_activity_breadcrumb(line: &str) {
+    lock_state().current_activity = Some(line.to_string());
+    emit_markdown(line);
+}
+
+fn provider_breadcrumb_context(scope: &str) -> ProviderBreadcrumbContext {
+    let state = lock_state().clone();
+    let phase = state.progress.current_phase.as_ref().and_then(|current| {
+        let plan = state.ultra_plan.as_ref()?;
+        let index = plan
+            .phases
+            .iter()
+            .position(|phase| phase.id == *current)?
+            .saturating_add(1);
+        Some(ProviderBreadcrumbPhase {
+            index,
+            total: plan.phases.len(),
+            id: current.clone(),
+        })
+    });
+    drop(state);
+    let repair_target = (scope == "repair")
+        .then(|| {
+            crate::tui::status_bus::snapshot_global()
+                .and_then(|runtime| runtime.repair.map(|repair| repair.kind))
+        })
+        .flatten();
+    ProviderBreadcrumbContext {
+        phase,
+        repair_target,
+    }
+}
+
+fn provider_model_label(model: &str) -> String {
+    model
+        .split(':')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(model)
+        .to_string()
+}
+
 fn render_step_projection_block(plan: &StepPlanProjection, progress: &PlanProgress) -> String {
     let mut lines = vec![format!("#### Phase: {}", fit(&plan.phase, PHASE_WIDTH))];
     for (index, step) in plan.steps.iter().enumerate() {
@@ -962,6 +1087,39 @@ mod tests {
         assert!(
             unclassified.is_empty(),
             "fixture should document every ignored event explicitly: {unclassified:?}"
+        );
+    }
+
+    #[test]
+    fn provider_turn_breadcrumb_snapshots_use_human_labels() {
+        let context = ProviderBreadcrumbContext {
+            phase: Some(ProviderBreadcrumbPhase {
+                index: 2,
+                total: 5,
+                id: "todo-logic-storage".to_string(),
+            }),
+            repair_target: Some("browser readiness".to_string()),
+        };
+
+        assert_eq!(
+            render_provider_turn_started("planner_step", "qwen3.6:27b-coding-nvfp4", 600, &context,),
+            "→ planning steps for phase 2/5 todo-logic-storage (qwen3.6, up to 600s)"
+        );
+        assert_eq!(
+            render_provider_turn_started("executor", "qwen3.6:27b-coding-nvfp4", 600, &context),
+            "→ implementing (model turn: qwen3.6, up to 600s)"
+        );
+        assert_eq!(
+            render_provider_turn_started("repair", "qwen3.6:27b-coding-nvfp4", 600, &context),
+            "→ repairing: browser readiness (qwen3.6, up to 600s)"
+        );
+        assert_eq!(
+            render_provider_turn_progress(120, 600),
+            "… still waiting (120s/600s)"
+        );
+        assert_eq!(
+            render_provider_turn_completed("planner_step", 98),
+            "✓ step plan ready (98s)"
         );
     }
 
