@@ -130,6 +130,8 @@ pub struct BrowserInteractionObservation {
     pub canvas_blank_after_start: Option<bool>,
     pub canvas_blank_after_inputs: Option<bool>,
     pub state_dimensions_changed: Vec<String>,
+    pub restart_hook_reachable_after_start: bool,
+    pub restart_hook_count_after_start: usize,
     pub persistence_after_reload: String,
     pub persistence_after_reload_reason: String,
     pub persistence_changed_dimensions: Vec<String>,
@@ -1174,6 +1176,8 @@ let candidate_table = [];
 let input_dispatches = [];
 let canvas_snapshots = [];
 let state_dimensions_changed = [];
+let restart_hook_reachable_after_start = false;
+let restart_hook_count_after_start = 0;
 let persistence_after_reload = "not_evaluated";
 let persistence_after_reload_reason = "";
 let persistence_changed_dimensions = [];
@@ -1901,6 +1905,30 @@ async function contractHookStatus(page) {
   });
 }
 
+async function restartHookReachability(page) {
+  return await page.evaluate(() => {
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+    const hooks = Array.from(document.querySelectorAll('[data-anvil-action="restart"]'));
+    const visible = hooks.some((el) => {
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const disabled = !!el.disabled || el.getAttribute("aria-disabled") === "true";
+      return !disabled
+        && style.display !== "none"
+        && style.visibility !== "hidden"
+        && style.pointerEvents !== "none"
+        && rect.width > 0
+        && rect.height > 0
+        && rect.right > 0
+        && rect.bottom > 0
+        && (!viewportWidth || rect.left < viewportWidth)
+        && (!viewportHeight || rect.top < viewportHeight);
+    });
+    return { reachable: visible, count: hooks.length };
+  });
+}
+
 async function activeMarker(page, mode) {
   return mode === "contract" ? await contractStateMarker(page) : await marker(page);
 }
@@ -2309,6 +2337,16 @@ async function attemptContractRecoveryTransition(page, postStartMarker) {
         }
       } catch (_) {}
     }
+    recovery_before_marker = await activeMarker(page, "contract");
+    try {
+      await page.keyboard.press("r");
+      recovery_after_marker = await markerAfterActiveChange(page, "contract", recovery_before_marker, 700);
+      if (contractResetWardChange(recovery_before_marker, recovery_after_marker, postStartMarker)) {
+        steps.push("recovery_transition");
+        recovery_transition_status = "observed";
+        return;
+      }
+    } catch (_) {}
     await page.waitForTimeout(120);
   }
   steps.push("recovery_transition:not_observed");
@@ -2391,6 +2429,14 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       }
     }
     await recordCanvasSnapshot(page, "after_start");
+    if (transitionObserved) {
+      const restartReachability = await restartHookReachability(page);
+      restart_hook_reachable_after_start = !!restartReachability.reachable;
+      restart_hook_count_after_start = restartReachability.count || 0;
+      if (restart_hook_reachable_after_start) {
+        steps.push("restart_hook_reachable_after_start");
+      }
+    }
 
     const textEntryObserved = await attemptTextEntry(page, probe_mode);
 
@@ -2488,6 +2534,8 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       canvas_blank_after_start: canvasBlankAfterStart,
       canvas_blank_after_inputs: canvasBlankAfterInputs,
       state_dimensions_changed,
+      restart_hook_reachable_after_start,
+      restart_hook_count_after_start,
       persistence_after_reload,
       persistence_after_reload_reason,
       persistence_changed_dimensions,
@@ -2563,6 +2611,8 @@ function interactionFailureKind(transitionObserved, inputEvaluated, inputStateCh
       canvas_blank_after_start: canvasBlankForSnapshot("after_start"),
       canvas_blank_after_inputs: canvasBlankForSnapshot("after_inputs"),
       state_dimensions_changed,
+      restart_hook_reachable_after_start,
+      restart_hook_count_after_start,
       persistence_after_reload,
       persistence_after_reload_reason,
       persistence_changed_dimensions,
@@ -2681,6 +2731,8 @@ fn merge_script_stdout_failure_value(mut value: Value, logs: &InteractionStdio) 
             "canvas_blank_after_start",
             "canvas_blank_after_inputs",
             "state_dimensions_changed",
+            "restart_hook_reachable_after_start",
+            "restart_hook_count_after_start",
             "persistence_after_reload",
             "persistence_changed_dimensions",
             "persistence_before_reload_marker",
@@ -2964,6 +3016,18 @@ fn observation_from_value(
     let canvas_blank_after_inputs =
         canvas_blank_snapshot_value(&value, &canvas_snapshots, "after_inputs");
     let state_dimensions_changed = string_array_field(&value, "state_dimensions_changed");
+    let restart_hook_reachable_after_start = value
+        .get("restart_hook_reachable_after_start")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || steps
+            .iter()
+            .any(|step| step == "restart_hook_reachable_after_start");
+    let restart_hook_count_after_start = value
+        .get("restart_hook_count_after_start")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
     let mut persistence_after_reload = value
         .get("persistence_after_reload")
         .and_then(Value::as_str)
@@ -3055,6 +3119,8 @@ fn observation_from_value(
         canvas_blank_after_start,
         canvas_blank_after_inputs,
         state_dimensions_changed,
+        restart_hook_reachable_after_start,
+        restart_hook_count_after_start,
         persistence_after_reload,
         persistence_after_reload_reason,
         persistence_changed_dimensions,
@@ -3436,6 +3502,8 @@ fn failure_observation(
         canvas_blank_after_start: None,
         canvas_blank_after_inputs: None,
         state_dimensions_changed: Vec::new(),
+        restart_hook_reachable_after_start: false,
+        restart_hook_count_after_start: 0,
         persistence_after_reload: "not_evaluated".to_string(),
         persistence_after_reload_reason: "reload_failed".to_string(),
         persistence_changed_dimensions: Vec::new(),
@@ -3652,6 +3720,8 @@ fn interaction_observation_json(observation: &BrowserInteractionObservation) -> 
         "canvas_blank_after_start": observation.canvas_blank_after_start,
         "canvas_blank_after_inputs": observation.canvas_blank_after_inputs,
         "state_dimensions_changed": &observation.state_dimensions_changed,
+        "restart_hook_reachable_after_start": observation.restart_hook_reachable_after_start,
+        "restart_hook_count_after_start": observation.restart_hook_count_after_start,
         "persistence_after_reload": observation.persistence_after_reload,
         "persistence_after_reload_reason": observation.persistence_after_reload_reason,
         "persistence_changed_dimensions": &observation.persistence_changed_dimensions,
@@ -4131,6 +4201,43 @@ mod tests {
                 .get("persistence_after_reload_reason")
                 .and_then(Value::as_str),
             Some("no_mutation_observed")
+        );
+    }
+
+    #[test]
+    fn normalized_interaction_json_preserves_restart_reachability_after_start() {
+        let observation = observe_probe_value(json!({
+            "ok": true,
+            "status": "passed",
+            "start_transition": true,
+            "input_state_evaluated_after_start": true,
+            "input_state_change": true,
+            "state_changed": true,
+            "visible_state_changed": true,
+            "restart_hook_reachable_after_start": true,
+            "restart_hook_count_after_start": 1,
+            "steps": [
+                "surface_visible",
+                "start_transition",
+                "input_state_change",
+                "restart_hook_reachable_after_start"
+            ]
+        }));
+
+        assert!(observation.restart_hook_reachable_after_start);
+        assert_eq!(observation.restart_hook_count_after_start, 1);
+        let projected = interaction_observation_json(&observation);
+        assert_eq!(
+            projected
+                .get("restart_hook_reachable_after_start")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            projected
+                .get("restart_hook_count_after_start")
+                .and_then(Value::as_u64),
+            Some(1)
         );
     }
 

@@ -2256,9 +2256,26 @@ fn render_completion_summary(
     if !projection.unverified_evidence.is_empty() {
         lines.push("Unverified (probe required):".to_string());
         lines.push(render_summary_bullets(&projection.unverified_evidence));
-        lines.push(
-            crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION.to_string(),
-        );
+        if projection
+            .unverified_evidence
+            .iter()
+            .any(|evidence| evidence.contains(":unverified:probe_unavailable"))
+        {
+            lines.push(
+                crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+                    .to_string(),
+            );
+        }
+        if projection
+            .unverified_evidence
+            .iter()
+            .any(|evidence| evidence.contains(":unverified:terminal_state_not_reached"))
+        {
+            lines.push(
+                "Restart verification: either expose an in-play restart control, or accept the partial classification (the restart exists but cannot be behaviorally verified by the generic probe)."
+                    .to_string(),
+            );
+        }
     }
     if interaction_unverified_probe_unavailable(
         &projection.release_gate,
@@ -3199,6 +3216,48 @@ mod tests {
         assert!(summary.contains("Token echoed: true"), "{summary}");
         assert!(
             summary.contains("Text input state change: true"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn completion_summary_renders_restart_terminal_partial_guidance_without_probe_setup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_status": "partial",
+                "final_acceptance_status": "partial",
+                "release_gate_status": "partial",
+                "release_gate_reasons": ["interaction_unverified:terminal_state_not_reached"],
+                "unverified_evidence": [
+                    "restart_or_recoverable_state_evidence:unverified:terminal_state_not_reached"
+                ],
+            }),
+        );
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(true, &snapshot);
+        let summary = render_completion_summary(
+            "tui_command",
+            None,
+            Some("/ultra-plan-run"),
+            "completed",
+            "",
+            &projection,
+        );
+
+        assert!(
+            summary.contains(
+                "Restart verification: either expose an in-play restart control, or accept the partial classification"
+            ),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains(
+                crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+            ),
             "{summary}"
         );
     }

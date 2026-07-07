@@ -67,6 +67,8 @@ struct BehaviorObservation {
     token_echoed_after_reload: bool,
     text_input_state_change: bool,
     recovery_transition: RecoveryTransition,
+    restart_hook_present: bool,
+    restart_hook_reachable_after_start: bool,
     persistence_after_reload: PersistenceAfterReload,
 }
 
@@ -329,7 +331,13 @@ fn behavioral_decision(
             RecoveryTransition::NotObserved
                 if observation.start_transition && observation.input_state_change =>
             {
-                BehavioralDecision::Fail("not_observed_by_probe")
+                if !observation.restart_hook_reachable_after_start
+                    && restart_exists_for_unreached_terminal(static_tier, observation)
+                {
+                    BehavioralDecision::Unverified("terminal_state_not_reached")
+                } else {
+                    BehavioralDecision::Fail("not_observed_by_probe")
+                }
             }
             RecoveryTransition::NotObserved if observation.start_transition => {
                 BehavioralDecision::Fail("input_state_change_missing_after_start")
@@ -339,7 +347,13 @@ fn behavioral_decision(
                 if observation.ok && static_tier == "strong" {
                     BehavioralDecision::Static("strong_static_required")
                 } else if observation.start_transition && observation.input_state_change {
-                    BehavioralDecision::Fail("not_observed_by_probe")
+                    if !observation.restart_hook_reachable_after_start
+                        && restart_exists_for_unreached_terminal(static_tier, observation)
+                    {
+                        BehavioralDecision::Unverified("terminal_state_not_reached")
+                    } else {
+                        BehavioralDecision::Fail("not_observed_by_probe")
+                    }
                 } else if observation.start_transition {
                     BehavioralDecision::Fail("input_state_change_missing_after_start")
                 } else {
@@ -378,6 +392,13 @@ fn behavioral_decision(
     } else {
         "probe_failed"
     })
+}
+
+fn restart_exists_for_unreached_terminal(
+    static_tier: &str,
+    observation: &BehaviorObservation,
+) -> bool {
+    static_tier == "strong" || observation.restart_hook_present
 }
 
 fn satisfy_evidence(report: &mut RuntimeAcceptanceReport, key: &str, tier: &str) {
@@ -559,6 +580,14 @@ impl BehaviorObservation {
             == Some(true)
             || steps.contains("text_input_state_change");
         let recovery_transition = recovery_transition(value, &steps);
+        let restart_hook_present = bool_field_deep(value, &["restart_present"]) == Some(true)
+            || contract_hook_bool(value, "restart_present") == Some(true)
+            || string_array_field_deep(value, "action_hooks")
+                .iter()
+                .any(|hook| hook == "restart");
+        let restart_hook_reachable_after_start =
+            bool_field_deep(value, &["restart_hook_reachable_after_start"]) == Some(true)
+                || steps.contains("restart_hook_reachable_after_start");
         let persistence_after_reload = persistence_after_reload(value, &steps);
         Some(Self {
             ok,
@@ -574,6 +603,8 @@ impl BehaviorObservation {
             token_echoed_after_reload,
             text_input_state_change,
             recovery_transition,
+            restart_hook_present,
+            restart_hook_reachable_after_start,
             persistence_after_reload,
         })
     }
@@ -720,6 +751,34 @@ fn text_field_deep(value: &Value, names: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+fn string_array_field_deep(value: &Value, name: &str) -> Vec<String> {
+    value_scopes(value)
+        .into_iter()
+        .find_map(|scope| {
+            scope
+                .get(name)
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+fn contract_hook_bool(value: &Value, name: &str) -> Option<bool> {
+    value_scopes(value).into_iter().find_map(|scope| {
+        scope
+            .get("contract_hooks")
+            .and_then(|hooks| hooks.get(name))
+            .and_then(Value::as_bool)
+    })
 }
 
 fn value_scopes(value: &Value) -> Vec<&Value> {
@@ -1299,7 +1358,7 @@ export default function Page() {
                 .evidence_tiers
                 .get("restart_or_recoverable_state_evidence")
                 .map(String::as_str),
-            Some("absent"),
+            Some("weak"),
             "{report:?}"
         );
         let arbitration = arbitrate_final_acceptance(
@@ -1422,6 +1481,174 @@ export default function Page() {
             Some("not_observed_by_probe")
         );
         assert!(!arbitration.summary.contains("probe unavailable"));
+    }
+
+    #[test]
+    fn overlay_only_restart_after_success_is_unverified_terminal_state_not_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [score, setScore] = useState(0);
+  const [gameOver, setGameOver] = useState(false);
+  const [enemies, setEnemies] = useState([{ x: 1 }]);
+  const restart = () => {
+    setGameOver(false);
+    setScore(0);
+    setEnemies([{ x: 1 }]);
+  };
+  return <main data-anvil-state={JSON.stringify({ score, gameOver, enemies })}>
+    <button data-anvil-action="primary" onClick={() => setScore((value) => value + 1)}>Start</button>
+    <canvas />
+    <p>score {score} enemy collision {gameOver ? "game over" : "playing"}</p>
+    {gameOver ? <button data-anvil-action="restart" onClick={restart}>Restart</button> : null}
+  </main>;
+}
+"#,
+        );
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "restart_hook_reachable_after_start": false,
+                "steps": [
+                    "surface_visible",
+                    "start_transition",
+                    "control_input_dispatched",
+                    "input_state_evaluated_after_start",
+                    "input_state_change",
+                    "recovery_transition:not_observed"
+                ],
+                "before_marker": "menu",
+                "after_marker": "playing",
+                "input_before_marker": "score:0",
+                "input_after_marker": "score:1",
+                "recovery_before_marker": "playing",
+                "recovery_after_marker": "playing",
+                "recovery_transition": false,
+                "recovery_transition_status": "not_observed"
+            }),
+        );
+        let required = ["restart_or_recoverable_state_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("strong"),
+            "{report:?}"
+        );
+        let arbitration = arbitrate_final_acceptance(
+            &mut report,
+            dir.path(),
+            &[dir.path().join(".anvil/runs/test")],
+            &[],
+            &required
+                .iter()
+                .map(|evidence| evidence.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(
+            report.unverified_evidence.contains(
+                &"restart_or_recoverable_state_evidence:unverified:terminal_state_not_reached"
+                    .to_string()
+            )
+        );
+        assert!(
+            !report
+                .missing_evidence
+                .contains(&"restart_or_recoverable_state_evidence".to_string())
+        );
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("unverified:terminal_state_not_reached")
+        );
+        assert_eq!(
+            arbitration
+                .records
+                .get("restart_or_recoverable_state_evidence")
+                .map(|record| record.behavioral_observation.as_str()),
+            Some("terminal_state_not_reached")
+        );
+    }
+
+    #[test]
+    fn no_restart_implementation_after_success_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [score, setScore] = useState(0);
+  return <main data-anvil-state={JSON.stringify({ score })}>
+    <button data-anvil-action="primary" onClick={() => setScore((value) => value + 1)}>Start</button>
+    <canvas />
+    <p>score {score} enemy collision</p>
+  </main>;
+}
+"#,
+        );
+        write_interaction(
+            dir.path(),
+            json!({
+                "ok": true,
+                "status": "passed",
+                "interaction_success": true,
+                "interaction_performed": true,
+                "input_event_observed": true,
+                "state_changed": true,
+                "restart_hook_reachable_after_start": false,
+                "steps": [
+                    "surface_visible",
+                    "start_transition",
+                    "control_input_dispatched",
+                    "input_state_evaluated_after_start",
+                    "input_state_change",
+                    "recovery_transition:not_observed"
+                ],
+                "before_marker": "menu",
+                "after_marker": "playing",
+                "input_before_marker": "score:0",
+                "input_after_marker": "score:1",
+                "recovery_transition": false,
+                "recovery_transition_status": "not_observed"
+            }),
+        );
+        let required = ["restart_or_recoverable_state_evidence"];
+        let mut report = report_for(dir.path(), &required);
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("weak"),
+            "{report:?}"
+        );
+        arbitrate(dir.path(), &mut report, &required);
+
+        assert!(!report.passed, "{report:?}");
+        assert!(report.unverified_evidence.is_empty(), "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"restart_or_recoverable_state_evidence".to_string()),
+            "{report:?}"
+        );
     }
 
     #[test]

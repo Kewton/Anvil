@@ -114,6 +114,7 @@ const PERSISTENCE_RELOAD_REPAIR_REQUIREMENT: &str = "load persisted state on mou
 const TEXT_ECHO_REPAIR_REQUIREMENT: &str = "token never rendered; render the input's content reactively (no manual rebuild) - the typed text must appear in the preview/list";
 const TEXT_ECHO_AFTER_RELOAD_REPAIR_REQUIREMENT: &str =
     "preview renders only after reload - make it reactive to input";
+const RESTART_PARTIAL_REPAIR_GUIDANCE: &str = "either expose an in-play restart control, or accept the partial classification (the restart exists but cannot be behaviorally verified by the generic probe)";
 const APP_BEHAVIOR_PROBE_FAILURE_KINDS: [&str; 15] = [
     "canvas_blank",
     "interaction_state_change_missing",
@@ -6299,6 +6300,8 @@ fn emit_browser_interaction_probe_event(config: &Config, outcome: &InteractionPr
                     "source_diagnostics": &source_diagnostic_labels,
                     "unattached_ref_diagnostics": &source_diagnostics,
                     "state_dimensions_changed": &observation.state_dimensions_changed,
+                    "restart_hook_reachable_after_start": observation.restart_hook_reachable_after_start,
+                    "restart_hook_count_after_start": observation.restart_hook_count_after_start,
                     "persistence_after_reload": observation.persistence_after_reload.as_str(),
                     "persistence_after_reload_reason": observation.persistence_after_reload_reason.as_str(),
                     "persistence_changed_dimensions": &observation.persistence_changed_dimensions,
@@ -7055,6 +7058,12 @@ fn runtime_acceptance_repair_guidance(
                     .to_string(),
             ),
             _ => {}
+        }
+    }
+    for evidence in &acceptance.unverified_evidence {
+        if evidence == "restart_or_recoverable_state_evidence:unverified:terminal_state_not_reached"
+        {
+            guidance.push(RESTART_PARTIAL_REPAIR_GUIDANCE.to_string());
         }
     }
     for weak in &acceptance.weak_evidence {
@@ -9186,6 +9195,13 @@ fn release_recovery_failure_kind(
         if release_gate
             .reasons
             .iter()
+            .any(|reason| reason.contains("interaction_unverified:terminal_state_not_reached"))
+        {
+            return "interaction_unverified_terminal_state_not_reached".to_string();
+        }
+        if release_gate
+            .reasons
+            .iter()
             .any(|reason| reason.contains("interaction_unverified:probe_unavailable"))
         {
             return "interaction_unverified_probe_unavailable".to_string();
@@ -9410,6 +9426,13 @@ fn interaction_probe_failure_evidence_lines(path: &str) -> Vec<String> {
             "interaction restart hook present: {restart_present}"
         ));
     }
+    if let Some(restart_reachable) =
+        raw_bool_field_deep(&value, "restart_hook_reachable_after_start")
+    {
+        lines.push(format!(
+            "interaction restart hook reachable after start: {restart_reachable}"
+        ));
+    }
     let inputs = raw_string_array_field_deep(&value, "input_dispatches");
     if !inputs.is_empty() {
         lines.push(format!(
@@ -9460,6 +9483,10 @@ fn release_recovery_repair_targets(
         .reasons
         .iter()
         .any(|reason| reason.contains("interaction_unverified:probe_unavailable"));
+    let restart_terminal_unreached = release_gate
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("interaction_unverified:terminal_state_not_reached"));
     let interaction_probe_infrastructure =
         release_gate_has_interaction_probe_infrastructure_failure(release_gate);
     if browser_status.contains("tailwind_dev_pipeline_failure")
@@ -9481,6 +9508,9 @@ fn release_recovery_repair_targets(
     }
     if interaction_status.starts_with("failed:") && !interaction_probe_infrastructure {
         targets.extend(interaction_repair_targets_for_reason(&interaction_status));
+    }
+    if restart_terminal_unreached {
+        targets.push("restart_reachability_or_accept_partial".to_string());
     }
     if let Some(report) = runtime_acceptance {
         targets.extend(
@@ -11967,6 +11997,13 @@ fn final_acceptance_behavioral_probe_context(
         }
         if let Some(restart_present) = raw_contract_hook_bool(value, "restart_present") {
             lines.push(format!("- restart hook present: {restart_present}"));
+        }
+        if let Some(restart_reachable) =
+            raw_bool_field_deep(value, "restart_hook_reachable_after_start")
+        {
+            lines.push(format!(
+                "- restart hook reachable after start: {restart_reachable}"
+            ));
         }
         let action_hooks = raw_string_array_field_deep(value, "action_hooks");
         if !action_hooks.is_empty() {
@@ -19062,20 +19099,26 @@ if __name__ == "__main__":
 
     #[test]
     #[cfg(unix)]
-    fn recovery_transition_not_observed_after_probe_success_is_implementation_failure() {
+    fn overlay_only_restart_after_probe_success_is_partial_terminal_unreached() {
         let _probe_guard = dev_server_probe_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let port = free_local_port();
         let events = dir
             .path()
-            .join(".anvil/runs/recovery-not-observed/events.jsonl");
-        enable_dev_server_probe_test_override(dir.path());
-        write_probe_nextjs_workspace(dir.path(), port, interactive_game_page_source());
-        interaction_probe::write_test_availability_override(dir.path(), true);
-        interaction_probe::write_test_result_override(
-            dir.path(),
-            &recovery_not_observed_probe_result(),
-        );
+            .join(".anvil/runs/overlay-restart-partial/events.jsonl");
+        write_probe_nextjs_workspace(dir.path(), port, overlay_only_restart_game_page_source());
+        let run_dir = events.parent().unwrap();
+        std::fs::create_dir_all(run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("browser-readiness.json"),
+            r#"{"ok":true,"status":"passed","http_status":200,"route_rendered":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("browser-interaction.json"),
+            serde_json::to_string_pretty(&recovery_not_observed_probe_result()).unwrap(),
+        )
+        .unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
@@ -19092,24 +19135,59 @@ if __name__ == "__main__":
 
         let report = ultra_final_acceptance_report(&plan, &cfg).unwrap();
 
-        assert!(!report.is_pass(), "{report:?}");
+        assert!(report.is_pass(), "{report:?}");
         let event_text = std::fs::read_to_string(&events).unwrap();
         assert!(
-            event_text.contains("\"missing_evidence\":[\"restart_or_recoverable_state_evidence\"]")
+            event_text.contains(
+                "restart_or_recoverable_state_evidence:unverified:terminal_state_not_reached"
+            ),
+            "{event_text}"
         );
-        assert!(!event_text.contains("interaction_unverified:not_observed_by_probe"));
+        assert!(
+            event_text.contains("interaction_unverified:terminal_state_not_reached"),
+            "{event_text}"
+        );
+        assert!(event_text.contains("\"release_gate_status\":\"partial\""));
+        let ultra = latest_event(&events, "ultra_final_acceptance");
+        let recovery_prompt_path = ultra
+            .get("recovery_prompt_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let recovery_prompt =
+            std::fs::read_to_string(dir.path().join(recovery_prompt_path)).unwrap();
+        assert!(
+            recovery_prompt.contains(RESTART_PARTIAL_REPAIR_GUIDANCE),
+            "{recovery_prompt}"
+        );
+        assert!(
+            !event_text
+                .contains("\"missing_evidence\":[\"restart_or_recoverable_state_evidence\"]")
+        );
         assert!(!event_text.contains("probe_unavailable"), "{event_text}");
         assert!(
             !event_text.contains("/setup-interaction-probe"),
             "{event_text}"
         );
-        let ultra = latest_event(&events, "ultra_final_acceptance");
         assert_eq!(
             ultra
                 .get("evidence_tiers")
                 .and_then(|tiers| tiers.get("restart_or_recoverable_state_evidence"))
                 .and_then(Value::as_str),
-            Some("absent")
+            Some("unverified:terminal_state_not_reached")
+        );
+        assert_eq!(
+            ultra
+                .get("runtime_acceptance_status")
+                .and_then(Value::as_str),
+            Some("partial")
+        );
+        assert_eq!(
+            ultra
+                .get("evidence_arbitration")
+                .and_then(|arbitration| arbitration.get("restart_or_recoverable_state_evidence"))
+                .and_then(|record| record.get("behavioral_observation"))
+                .and_then(Value::as_str),
+            Some("terminal_state_not_reached")
         );
     }
 
@@ -19561,6 +19639,24 @@ if __name__ == "__main__":
         );
         assert!(
             guidance.contains("consolidate into page.tsx and delete the dead component"),
+            "{guidance}"
+        );
+    }
+
+    #[test]
+    fn runtime_guidance_for_restart_terminal_unreached_offers_partial_choice() {
+        let report = RuntimeAcceptanceReport {
+            unverified_evidence: vec![
+                "restart_or_recoverable_state_evidence:unverified:terminal_state_not_reached"
+                    .to_string(),
+            ],
+            ..RuntimeAcceptanceReport::default()
+        };
+
+        let guidance = runtime_acceptance_repair_guidance(&report).join("\n");
+
+        assert!(
+            guidance.contains(RESTART_PARTIAL_REPAIR_GUIDANCE),
             "{guidance}"
         );
     }
@@ -21571,6 +21667,60 @@ export default function Page(){
             "<button onClick={restart}>Restart</button>",
             "<button data-anvil-action=\"restart\" onClick={restart}>Restart</button>",
         )
+    }
+
+    fn overlay_only_restart_game_page_source() -> &'static str {
+        r#""use client";
+import { useEffect, useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(0);
+  const [gameOver, setGameOver] = useState(false);
+  const [screen, setScreen] = useState("menu");
+  const [bullets, setBullets] = useState<{ x: number; y: number }[]>([]);
+  const [enemies, setEnemies] = useState([{ x: 10, y: 20 }]);
+  const fireBullet = () => {
+    setScreen("playing");
+    setBullets((items) => [...items, { x: 10, y: 90 }]);
+    setScore((value) => value + 1);
+  };
+  const restart = () => {
+    setGameOver(false);
+    setScreen("menu");
+    setScore(0);
+    setBullets([]);
+    setEnemies([{ x: 10, y: 20 }]);
+  };
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft" || event.key === " ") fireBullet();
+    };
+    const frame = requestAnimationFrame(() => {
+      bullets.forEach((bullet) => {
+        enemies.forEach((enemy) => {
+          if (Math.abs(bullet.x - enemy.x) < 12 && Math.abs(bullet.y - enemy.y) < 12) {
+            setGameOver(true);
+            setScore((value) => value + 10);
+          }
+        });
+      });
+      setEnemies((items) => items.map((enemy) => ({ ...enemy, x: enemy.x + 1 })));
+    });
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [bullets, enemies]);
+  return (
+    <main data-anvil-state={JSON.stringify({ screen, score, gameOver, bullets, enemies })}>
+      <button data-anvil-action="primary" onClick={fireBullet}>Start</button>
+      <canvas />
+      <p>score {score} enemy collision {gameOver ? "game over" : screen}</p>
+      {gameOver ? <button data-anvil-action="restart" onClick={restart}>Restart</button> : null}
+    </main>
+  );
+}
+"#
     }
 
     fn generated_data_mutation_plan_json(goal: &str) -> String {

@@ -704,6 +704,7 @@ pub(crate) fn format_verify_feedback_with_contract(
         if failure.contains("missing_required_capabilities")
             || failure.contains("missing_required_evidence")
             || failure.contains("weak_verification_evidence")
+            || failure.contains("unverified runtime evidence")
         {
             lines.push(
                 "Capability evidence guidance: add the smallest concrete test/check/UI evidence requested by the task, then keep the existing verification strong enough to exercise that evidence."
@@ -1265,7 +1266,14 @@ fn evidence_repair_guidance(failure: &str) -> Vec<String> {
                 .to_string(),
         );
     }
-    if failure.contains("restart_or_recoverable_state_evidence") {
+    if failure.contains("restart_or_recoverable_state_evidence")
+        && failure.contains("terminal_state_not_reached")
+    {
+        lines.push(
+            "For restart_or_recoverable_state_evidence partial verification, either expose an in-play restart control, or accept the partial classification (the restart exists but cannot be behaviorally verified by the generic probe)."
+                .to_string(),
+        );
+    } else if failure.contains("restart_or_recoverable_state_evidence") {
         lines.push(
             "For restart_or_recoverable_state_evidence, edit the task implementation artifact to provide a reachable terminal/failure state and a restart control (data-anvil-action=\"restart\") that resets observable state."
                 .to_string(),
@@ -2030,6 +2038,28 @@ export default function Page() {\n\
         assert!(feedback.contains("score/progression updates"));
         assert!(feedback.contains("state mutations over time or in response to input"));
         assert!(feedback.contains("wire keyboard, pointer, click, touch, or form handlers"));
+    }
+
+    #[test]
+    fn restart_terminal_unreached_feedback_offers_in_play_or_accept_partial() {
+        let mut report = VerificationReport::pass();
+        report.push_profile_failure(
+            "unverified runtime evidence: restart_or_recoverable_state_evidence:unverified:terminal_state_not_reached"
+                .to_string(),
+        );
+
+        let feedback = format_verify_feedback(&report);
+
+        assert!(
+            feedback.contains(
+                "either expose an in-play restart control, or accept the partial classification"
+            ),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("cannot be behaviorally verified by the generic probe"),
+            "{feedback}"
+        );
     }
 
     #[test]

@@ -20,16 +20,16 @@ pub fn requested_or_default_port(goal: &str) -> u16 {
 pub fn generation_rules(intent: &str) -> &'static str {
     match intent {
         "create" => {
-            "- Profile nextjs/create: preserve a real Next.js app contract. Include next/react/react-dom dependencies, keep scripts.build as next build, and end with a build verification phase. Put dependency setup before any npm run build verification when node_modules is not already present; setup instructions may install dependencies, but verify must not contain npm install. If dependency setup is not allowed or cannot run, stop with dependency_missing instead of claiming build success. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, add task-agnostic observability hooks on route-bound UI: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state after each render. When the contract includes start_or_restart_flow, also expose data-anvil-action=\"restart\" on a control that resets observable state and is reachable during use or from a terminal state. If you use Tailwind utility classes or @tailwind directives, include tailwindcss/postcss/autoprefixer and create tailwind.config.* plus postcss.config.*; postcss.config plugins must include BOTH tailwindcss and autoprefixer. Otherwise use plain CSS and do not write Tailwind utility classes. Keep scripts.dev and scripts.start on the explicit requested port when the goal or plan requests one; otherwise use port 3011 with next dev/start -p 3011 or --port 3011.\n"
+            "- Profile nextjs/create: preserve a real Next.js app contract. Include next/react/react-dom dependencies, keep scripts.build as next build, and end with a build verification phase. Put dependency setup before any npm run build verification when node_modules is not already present; setup instructions may install dependencies, but verify must not contain npm install. If dependency setup is not allowed or cannot run, stop with dependency_missing instead of claiming build success. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, add task-agnostic observability hooks on route-bound UI: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state after each render. When the contract includes start_or_restart_flow, the restart affordance may live anywhere; note that a restart reachable during play (hook or R-key) allows behavioral verification, while an overlay-only restart will verify as unverified:terminal_state_not_reached (partial). If you use Tailwind utility classes or @tailwind directives, include tailwindcss/postcss/autoprefixer and create tailwind.config.* plus postcss.config.*; postcss.config plugins must include BOTH tailwindcss and autoprefixer. Otherwise use plain CSS and do not write Tailwind utility classes. Keep scripts.dev and scripts.start on the explicit requested port when the goal or plan requests one; otherwise use port 3011 with next dev/start -p 3011 or --port 3011.\n"
         }
         "fix" => {
-            "- Profile nextjs/fix: preserve the existing Next.js structure and verifier integrity. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, preserve or add task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, preserve or add data-anvil-action=\"restart\" on a control that resets observable state and is reachable during use or from a terminal state. Do not weaken next/react/react-dom dependencies, scripts.build, app/page, layout, or TypeScript configuration to make a failing verifier pass.\n"
+            "- Profile nextjs/fix: preserve the existing Next.js structure and verifier integrity. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, preserve or add task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, the restart affordance may live anywhere; note that a restart reachable during play (hook or R-key) allows behavioral verification, while an overlay-only restart will verify as unverified:terminal_state_not_reached (partial). Do not weaken next/react/react-dom dependencies, scripts.build, app/page, layout, or TypeScript configuration to make a failing verifier pass.\n"
         }
         "research" => {
             "- Profile nextjs/research: inspect the existing app and produce concrete findings. Do not modify source unless the user explicitly asks for fixes.\n"
         }
         _ => {
-            "- Profile nextjs: preserve a real Next.js app when present. Keep next/react/react-dom dependencies, scripts.build as next build, app/ or pages/ entrypoints, and a final build verification phase. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, add task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, also expose data-anvil-action=\"restart\" on a control that resets observable state and is reachable during use or from a terminal state. Keep styling toolchains internally consistent; if Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n"
+            "- Profile nextjs: preserve a real Next.js app when present. Keep next/react/react-dom dependencies, scripts.build as next build, app/ or pages/ entrypoints, and a final build verification phase. Keep a single route-bound implementation; do not leave capability components unimported. For interactive UI, add task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, the restart affordance may live anywhere; note that a restart reachable during play (hook or R-key) allows behavioral verification, while an overlay-only restart will verify as unverified:terminal_state_not_reached (partial). Keep styling toolchains internally consistent; if Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n"
         }
     }
 }
@@ -227,7 +227,7 @@ pub fn guidance(goal: &str) -> String {
          For TypeScript/TSX apps, create tsconfig.json before treating the app as complete. \
          Keep a single route-bound implementation; do not leave capability components unimported. \
          Do not use deprecated moduleResolution=node10 or target=ES5; prefer moduleResolution=bundler and target=ES2017 or newer. \
-         For interactive UI, expose task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state containing JSON for meaningful visible state after each render. When the contract includes start_or_restart_flow, also expose data-anvil-action=\"restart\" on a reachable control that resets observable state.{port}"
+         For interactive UI, expose task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state containing JSON for meaningful visible state after each render. When the contract includes start_or_restart_flow, the restart affordance may live anywhere; note that a restart reachable during play (hook or R-key) allows behavioral verification, while an overlay-only restart will verify as unverified:terminal_state_not_reached (partial).{port}"
     )
 }
 
@@ -252,7 +252,7 @@ pub fn runtime_contract(intent: &str, goal: &str) -> String {
 - If using Tailwind utility classes or @tailwind directives, keep the Tailwind toolchain complete: tailwindcss/postcss/autoprefixer dependencies, tailwind.config.*, and postcss.config plugins with BOTH tailwindcss and autoprefixer. Otherwise use plain CSS.\n\
 - Keep TypeScript and app router configuration coherent.\n\
 - Keep a single route-bound implementation; do not leave capability components unimported.\n\
-- For interactive UI, expose data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state after each render. When the contract includes start_or_restart_flow, expose data-anvil-action=\"restart\" on a reachable control that resets observable state.\n\
+- For interactive UI, expose data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state after each render. When the contract includes start_or_restart_flow, the restart affordance may live anywhere; note that a restart reachable during play (hook or R-key) allows behavioral verification, while an overlay-only restart will verify as unverified:terminal_state_not_reached (partial).\n\
 - Do not treat scaffold-only, package-only, or build-only output as complete."
         ),
         "fix" => format!(
@@ -264,7 +264,7 @@ pub fn runtime_contract(intent: &str, goal: &str) -> String {
 - If Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n\
 - Keep TypeScript and app router configuration coherent.\n\
 - Keep a single route-bound implementation; do not leave capability components unimported.\n\
-- For interactive UI, preserve or add data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, preserve or add data-anvil-action=\"restart\" on a reachable control that resets observable state.\n\
+- For interactive UI, preserve or add data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, the restart affordance may live anywhere; note that a restart reachable during play (hook or R-key) allows behavioral verification, while an overlay-only restart will verify as unverified:terminal_state_not_reached (partial).\n\
 - Do not treat scaffold-only, package-only, or build-only output as complete."
         ),
         "research" | "investigate" => {
@@ -282,7 +282,7 @@ pub fn runtime_contract(intent: &str, goal: &str) -> String {
 {port}\n\
 - Keep styling and TypeScript toolchains internally consistent; if Tailwind is used, postcss.config plugins must include BOTH tailwindcss and autoprefixer.\n\
 - Keep a single route-bound implementation; do not leave capability components unimported.\n\
-- For interactive UI, expose data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, expose data-anvil-action=\"restart\" on a reachable control that resets observable state.\n\
+- For interactive UI, expose data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, the restart affordance may live anywhere; note that a restart reachable during play (hook or R-key) allows behavioral verification, while an overlay-only restart will verify as unverified:terminal_state_not_reached (partial).\n\
 - Do not treat scaffold-only, package-only, or build-only output as complete."
         ),
     }
@@ -1754,9 +1754,17 @@ mod tests {
 
         assert!(text.contains("data-anvil-action=\"primary\""), "{text}");
         assert!(text.contains("data-anvil-action=\"input\""), "{text}");
-        assert!(text.contains("data-anvil-action=\"restart\""), "{text}");
         assert!(text.contains("data-anvil-state"), "{text}");
         assert!(text.contains("JSON snapshot"), "{text}");
+        assert!(
+            text.contains("restart affordance may live anywhere"),
+            "{text}"
+        );
+        assert!(text.contains("hook or R-key"), "{text}");
+        assert!(
+            text.contains("unverified:terminal_state_not_reached"),
+            "{text}"
+        );
     }
 
     #[test]
