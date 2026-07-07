@@ -792,6 +792,9 @@ pub(crate) fn compile_error_repair_guidance_with_root(
             if let Some(suggestion) = compiler_suggestion(&error.message) {
                 lines.push(format!("Compiler suggestion: {suggestion}"));
             }
+            if let Some(guidance) = nullability_narrowing_repair_guidance(error) {
+                lines.push(guidance);
+            }
             lines.push(format!(
                 "You MUST modify {} using the edit tool; a reply without file edits fails this repair.",
                 error.path
@@ -813,6 +816,27 @@ pub(crate) fn compile_error_repair_guidance_with_root(
             lines
         })
         .collect()
+}
+
+fn nullability_narrowing_repair_guidance(error: &CompileError) -> Option<String> {
+    if !typescript_nullability_message(&error.message) {
+        return None;
+    }
+    let variable = extract_first_quoted_symbol(&error.message)?;
+    Some(format!(
+        "TypeScript nullability repair for `{variable}`: inside the closure at line {}, add `if (!{variable}) return;` before first use, or capture a non-null local after the outer check.",
+        error.line
+    ))
+}
+
+fn typescript_nullability_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("is possibly 'null'")
+        || lower.contains("is possibly \"null\"")
+        || lower.contains("is possibly `null`")
+        || lower.contains("is possibly 'undefined'")
+        || lower.contains("is possibly \"undefined\"")
+        || lower.contains("is possibly `undefined`")
 }
 
 fn type_script_cross_file_definition_guidance(root: &Path, error: &CompileError) -> Vec<String> {
@@ -1777,6 +1801,30 @@ export class SpaceInvadersEngine {\n\
         assert!(
             prompt.contains(
                 "call an existing member (e.g. poll getState() from the rAF loop), or add onStateChange to SpaceInvadersEngine's definition -- keep both files consistent"
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn compile_repair_prompt_includes_nullability_narrowing_remedy() {
+        let prompt = compile_repair_prompt_section(
+            &[CompileError {
+                path: "src/app/page.tsx".to_string(),
+                line: 409,
+                column: 7,
+                message: "Type error: 'ctx' is possibly 'null'.".to_string(),
+                excerpt: "407 |\n408 |       // Render\n409 |       ctx.save();\n|       ^"
+                    .to_string(),
+                symbol: None,
+                route_bound: Some(true),
+            }],
+            CompileRepairPromptProtection::default(),
+        );
+
+        assert!(
+            prompt.contains(
+                "TypeScript nullability repair for `ctx`: inside the closure at line 409, add `if (!ctx) return;` before first use, or capture a non-null local after the outer check."
             ),
             "{prompt}"
         );

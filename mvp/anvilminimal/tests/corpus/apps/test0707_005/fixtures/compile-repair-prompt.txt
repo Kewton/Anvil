@@ -1,0 +1,6 @@
+TypeScript nullability repair guidance:
+
+Compile error: src/app/page.tsx:409:7 Type error: 'ctx' is possibly 'null'.
+Compile error location: src/app/page.tsx:409:7
+Compile error message: Type error: 'ctx' is possibly 'null'.
+TypeScript nullability repair for `ctx`: inside the closure at line 409, add `if (!ctx) return;` before first use, or capture a non-null local after the outer check.

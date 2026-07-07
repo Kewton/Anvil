@@ -1,0 +1,45 @@
+case_id = "test0707_005"
+source = "/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0707_005"
+required_paths = ["package.json", "src/app/page.tsx"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule", "nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence", "interactive_ui_source_evidence", "non_static_screen_evidence", "challenge_or_adversary_evidence", "score_or_progression_evidence", "failure_or_collision_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "ctx"]
+
+[route_closure]
+include = ["src/app/page.tsx"]
+exclude = []
+
+[evidence]
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+challenge_or_adversary_evidence = "Strong"
+score_or_progression_evidence = "Weak"
+failure_or_collision_evidence = "Weak"
+restart_or_recoverable_state_evidence = "Weak"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = [
+  "weak_source_evidence:failure_or_collision_evidence:failure/collision needs a game-over transition or conditional overlap/intersect/distance comparison",
+  "weak_source_evidence:restart_or_recoverable_state_evidence:wire a handler (e.g. onClick) to a function that resets score AND entities and transitions out of the game-over state",
+  "weak_source_evidence:score_or_progression_evidence:score/progression needs an executable update such as score +=, score++, score =, or setScore(...)"
+]
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_failed"
+
+[fixture_contains]
+fixtures/compile-repair-prompt.txt = [
+  "Compile error: src/app/page.tsx:409:7 Type error: 'ctx' is possibly 'null'.",
+  "TypeScript nullability repair for `ctx`: inside the closure at line 409, add `if (!ctx) return;` before first use, or capture a non-null local after the outer check."
+]
