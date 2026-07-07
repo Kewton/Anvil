@@ -1,0 +1,29 @@
+case_id = "test0708_004"
+source = "UAT test0708_004"
+required_paths = ["package.json", "tsconfig.json", "postcss.config.js", "tailwind.config.ts", "src/app/layout.tsx", "src/app/page.tsx", "src/app/globals.css", "src/app/global.d.ts"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "nextjs_route", "stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule"]
+required_evidence = ["nextjs_route_evidence", "build_command_or_dependency_missing_boundary", "implementation_artifact", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence", "interactive_ui_source_evidence", "non_static_screen_evidence", "restart_or_recoverable_state_evidence", "challenge_or_adversary_evidence", "score_or_progression_evidence", "failure_or_collision_evidence"]
+required_obligations = ["implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "score", "restart", "collision", "verify"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = ["src/app/global.d.ts"]
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_passed"
+
+[fixture_contains]
+fixtures/events-verify-shell-control.jsonl = [
+  "test -f src/app/page.tsx && echo \\\"pass\\\" || echo \\\"fail\\\"",
+  "\"verify_command_violation_kind\":\"shell_control_syntax\"",
+  "recoverable tool error repeated: verify_command_policy_error"
+]

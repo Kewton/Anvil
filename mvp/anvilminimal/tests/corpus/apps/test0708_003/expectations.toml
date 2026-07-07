@@ -1,0 +1,42 @@
+case_id = "test0708_003"
+source = "UAT test0708_003"
+required_paths = ["package.json", "tsconfig.json", "postcss.config.js", "tailwind.config.ts", "src/app/layout.tsx", "src/app/page.tsx", "src/app/globals.css", "src/app/global.d.ts"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "nextjs_route", "stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule"]
+required_evidence = ["nextjs_route_evidence", "build_command_or_dependency_missing_boundary", "implementation_artifact", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence", "interactive_ui_source_evidence", "non_static_screen_evidence", "restart_or_recoverable_state_evidence", "challenge_or_adversary_evidence", "score_or_progression_evidence", "failure_or_collision_evidence"]
+required_obligations = ["implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "score", "restart", "collision", "player"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = ["src/app/global.d.ts"]
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_failed"
+
+[json_fields]
+fixtures/browser-readiness.json:status = "failed"
+fixtures/browser-readiness.json:failure_kind = "build_verifier_failed"
+fixtures/browser-readiness.json:build_output_path = "fixtures/full-build-output.log"
+
+[fixture_contains]
+fixtures/browser-readiness.json = [
+  "Cannot find name 'player'. Did you mean 'PLAYER_W'?",
+  "full-build-output.log"
+]
+fixtures/full-build-output.log = [
+  "./src/app/page.tsx:440:25",
+  "Cannot find name 'player'. Did you mean 'PLAYER_W'?"
+]
+fixtures/events-final-acceptance.jsonl = [
+  "\"repair_target\":\"test_or_evidence\"",
+  "\"compile_errors\":[]",
+  "browser_probe_output: command failed: npm run build"
+]

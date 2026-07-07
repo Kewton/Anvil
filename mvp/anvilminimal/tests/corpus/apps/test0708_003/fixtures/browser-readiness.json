@@ -1,0 +1,8 @@
+{
+  "status": "failed",
+  "ok": false,
+  "failure_kind": "build_verifier_failed",
+  "browser_failure_kind": "build_verifier_failed",
+  "output_excerpt": "command failed: npm run build outcome: CommandFailed status: exit status: 1 elapsed_ms: 2718 summary: Failed to compile. Type error: Cannot find name 'player'. Did you mean 'PLAYER_W'?",
+  "build_output_path": "fixtures/full-build-output.log"
+}
