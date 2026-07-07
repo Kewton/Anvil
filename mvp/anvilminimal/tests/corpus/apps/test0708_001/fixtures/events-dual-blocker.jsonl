@@ -1,0 +1,7 @@
+{"event":"ultra_plan_raw_output_shape","attempt":1,"content_len":0,"planner_model":"qwen3.6:35b-a3b-coding-nvfp4"}
+{"event":"planner_error","planner_error_kind":"planner_schema_error","planner_error_message":"UltraPlan missing goal","repair_attempt":1}
+{"event":"ultra_plan_raw_output_shape","attempt":2,"content_len":0,"planner_model":"qwen3.6:35b-a3b-coding-nvfp4"}
+{"event":"planner_error","planner_error_kind":"planner_schema_error","planner_error_message":"UltraPlan missing goal","repair_attempt":2}
+{"event":"dependency_setup_reconciliation","trigger":"manifest_repair","status":"passed","added":["package-lock.json","node_modules/.bin/next"]}
+{"event":"ultra_final_acceptance_failed","primary_reason":"browser_readiness_failed:build_verifier_failed","repair_target":"package_config","compile_errors":[]}
+{"event":"final_acceptance_repair_exhausted","repair_target":"package_config","compile_errors":[],"profile_failures":["browser_probe_output: Next.js build dependency setup missing: node_modules/tailwindcss, node_modules/postcss, node_modules/autoprefixer"]}

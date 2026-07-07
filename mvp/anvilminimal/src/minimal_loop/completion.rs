@@ -798,6 +798,9 @@ pub(crate) fn compile_error_repair_guidance_with_root(
             if let Some(guidance) = call_arity_repair_guidance(root, error) {
                 lines.extend(guidance);
             }
+            if let Some(guidance) = duplicate_binding_repair_guidance(error) {
+                lines.push(guidance);
+            }
             lines.push(format!(
                 "You MUST modify {} using the edit tool; a reply without file edits fails this repair.",
                 error.path
@@ -870,6 +873,60 @@ fn typescript_call_arity_message(message: &str) -> Option<(usize, usize)> {
         .take_while(|ch| ch.is_ascii_digit())
         .collect::<String>();
     Some((expected.trim().parse().ok()?, got.parse().ok()?))
+}
+
+fn duplicate_binding_repair_guidance(error: &CompileError) -> Option<String> {
+    let symbol = typescript_duplicate_binding_message(&error.message)?;
+    let mut line_numbers = compile_excerpt_source_line_numbers(&error.excerpt);
+    if error.line > 0 && !line_numbers.contains(&error.line) {
+        line_numbers.push(error.line);
+    }
+    line_numbers.sort_unstable();
+    line_numbers.dedup();
+    let earlier = *line_numbers.first()?;
+    let later = *line_numbers.last()?;
+    if earlier == later {
+        return Some(format!(
+            "TypeScript duplicate-binding repair for `{symbol}`: line {later} redeclares `{symbol}` in the same block; remove or rename the redeclaration so only one binding remains in scope."
+        ));
+    }
+    Some(format!(
+        "TypeScript duplicate-binding repair for `{symbol}`: lines {earlier} and {later} both declare `{symbol}`; remove or rename the later redeclaration (line {later}); the earlier binding (line {earlier}) is already in scope in this block."
+    ))
+}
+
+fn typescript_duplicate_binding_message(message: &str) -> Option<String> {
+    message
+        .to_ascii_lowercase()
+        .contains("defined multiple times")
+        .then(|| extract_first_quoted_symbol(message))
+        .flatten()
+}
+
+fn compile_excerpt_source_line_numbers(excerpt: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for line in excerpt.lines() {
+        let Some((left, _)) = line.split_once('|') else {
+            continue;
+        };
+        let Some(raw_line) = left.split_whitespace().find(|part| {
+            part.chars()
+                .all(|ch| ch.is_ascii_digit() || ch == '>' || ch == ':')
+                && part.chars().any(|ch| ch.is_ascii_digit())
+        }) else {
+            continue;
+        };
+        let digits = raw_line
+            .chars()
+            .filter(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if let Ok(line_number) = digits.parse::<usize>()
+            && !out.contains(&line_number)
+        {
+            out.push(line_number);
+        }
+    }
+    out
 }
 
 fn call_callee_for_error_column(line: &str, column: usize) -> Option<String> {
@@ -1786,6 +1843,29 @@ export default function Page() {\n\
         assert!(
             prompt.contains(
                 "remove the extra argument, or extend the signature -- keep call sites consistent"
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn compile_repair_prompt_includes_duplicate_binding_line_remedy() {
+        let prompt = compile_repair_prompt_section(
+            &[CompileError {
+                path: "src/app/page.tsx".to_string(),
+                line: 479,
+                column: 13,
+                message: "the name `player` is defined multiple times".to_string(),
+                excerpt: "  359 |       const player = playerRef.current;\n      :             ------ previous definition of `player` here\n  479 |       const player = playerRef.current;\n      :             ------ `player` redefined here".to_string(),
+                symbol: None,
+                route_bound: Some(true),
+            }],
+            CompileRepairPromptProtection::default(),
+        );
+
+        assert!(
+            prompt.contains(
+                "lines 359 and 479 both declare `player`; remove or rename the later redeclaration (line 479); the earlier binding (line 359) is already in scope in this block"
             ),
             "{prompt}"
         );

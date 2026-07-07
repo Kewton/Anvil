@@ -1,0 +1,11 @@
+./src/app/page.tsx
+Error:
+  x the name `player` is defined multiple times
+
+   ,-[./src/app/page.tsx:479:1]
+359 |       const player = playerRef.current;
+    :             ------ previous definition of `player` here
+479 |       const player = playerRef.current;
+    :             ------ `player` redefined here
+   `----
+> Build failed because of webpack errors

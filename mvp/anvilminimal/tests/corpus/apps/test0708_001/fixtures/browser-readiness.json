@@ -1,0 +1,10 @@
+{
+  "browser_failure_kind": "build_verifier_failed",
+  "failure_kind": "build_verifier_failed",
+  "interaction_evidence_status": "not_exercised:build_verifier_failed",
+  "ok": false,
+  "output_excerpt": "Next.js build dependency setup missing: node_modules/tailwindcss, node_modules/postcss, node_modules/autoprefixer",
+  "route": "/",
+  "route_rendered": false,
+  "status": "failed"
+}

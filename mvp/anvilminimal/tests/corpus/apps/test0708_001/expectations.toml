@@ -1,0 +1,46 @@
+case_id = "test0708_001"
+source = "UAT uat-test0708-001"
+required_paths = ["package.json", "tsconfig.json", "postcss.config.js", "tailwind.config.ts", "src/app/layout.tsx", "src/app/page.tsx", "src/app/globals.css", "src/app/global.d.ts"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "nextjs_route", "stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule"]
+required_evidence = ["nextjs_route_evidence", "build_command_or_dependency_missing_boundary", "implementation_artifact", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence", "interactive_ui_source_evidence", "non_static_screen_evidence", "restart_or_recoverable_state_evidence", "challenge_or_adversary_evidence", "score_or_progression_evidence", "failure_or_collision_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "score", "restart", "collision", "duplicate"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = ["src/app/global.d.ts"]
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_failed"
+
+[json_fields]
+fixtures/browser-readiness.json:status = "failed"
+fixtures/browser-readiness.json:failure_kind = "build_verifier_failed"
+fixtures/browser-readiness.json:interaction_evidence_status = "not_exercised:build_verifier_failed"
+
+[fixture_contains]
+fixtures/browser-readiness.json = [
+  "Next.js build dependency setup missing: node_modules/tailwindcss, node_modules/postcss, node_modules/autoprefixer"
+]
+fixtures/duplicate-binding-build-output.txt = [
+  "./src/app/page.tsx",
+  "the name `player` is defined multiple times",
+  "359 |       const player = playerRef.current;",
+  "479 |       const player = playerRef.current;",
+  "> Build failed because of webpack errors"
+]
+fixtures/events-dual-blocker.jsonl = [
+  "\"content_len\":0",
+  "\"planner_error_kind\":\"planner_schema_error\"",
+  "\"trigger\":\"manifest_repair\"",
+  "\"repair_target\":\"package_config\"",
+  "\"browser_probe_output: Next.js build dependency setup missing"
+]

@@ -1147,6 +1147,35 @@ stderr:
     }
 
     #[test]
+    fn parse_swc_duplicate_binding_frame_preserves_both_definition_lines() {
+        let output = r#"
+./src/app/page.tsx
+Error:
+  x the name `player` is defined multiple times
+
+   ,-[./src/app/page.tsx:479:1]
+359 |       const player = playerRef.current;
+    :             ------ previous definition of `player` here
+479 |       const player = playerRef.current;
+    :             ------ `player` redefined here
+   `----
+> Build failed because of webpack errors
+"#;
+
+        let errors = parse_compile_errors(output);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "src/app/page.tsx");
+        assert_eq!(errors[0].line, 479);
+        assert_eq!(
+            errors[0].message,
+            "the name `player` is defined multiple times"
+        );
+        assert!(errors[0].excerpt.contains("359 |"), "{errors:?}");
+        assert!(errors[0].excerpt.contains("479 |"), "{errors:?}");
+    }
+
+    #[test]
     fn next_build_reports_dependency_missing_before_execution() {
         let dir = TempDir::new().unwrap();
         let requirement = requirement_from_deferred(
