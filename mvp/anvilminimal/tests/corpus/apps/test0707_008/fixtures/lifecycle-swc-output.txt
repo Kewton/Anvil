@@ -1,0 +1,19 @@
+outcome: CommandFailed
+status: exit status: 1
+elapsed_ms: 18421
+summary: Error: > Build failed because of webpack errors
+stdout:
+./src/app/game.ts
+Error:
+  x Expected ',', got '}'
+
+   ,-[./src/app/game.ts:634:1]
+631 |   const asteroids = [
+632 |     { x: 10, y: 20 },
+633 |     { x: 30, y: 40 }
+634 |   }
+    |   ^
+635 |   return asteroids
+   `----
+> Build failed because of webpack errors
+stderr:

@@ -1,0 +1,44 @@
+case_id = "test0707_008"
+source = "UAT test0707_008"
+required_paths = ["package.json", "src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css", "src/app/game.ts"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "nextjs_route", "stateful_interaction"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact", "interactive_ui_source_evidence", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["thick", "game", "syntax", "swc", "template"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/game.ts"]
+exclude = []
+
+[evidence]
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_failed"
+
+[fixture_contains]
+fixtures/lifecycle-swc-output.txt = [
+  "./src/app/game.ts",
+  "x Expected ',', got '}'",
+  ",-[./src/app/game.ts:634:1]",
+  "> Build failed because of webpack errors"
+]
+fixtures/recovery-ultra-plan.yaml = [
+  "Build a \\\"thick\\\" browser game",
+  "escaped quotes like \\\\\\\"boss\\\\\\\"",
+  "Expected ',', got '}'",
+  "template literal"
+]

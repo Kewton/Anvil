@@ -1,0 +1,17 @@
+# anvil-recovery-ultra-plan
+recovery_schema_version: "1"
+recovery_original_goal: "Build a \"thick\" browser game with a template literal HUD"
+recovery_failure_kind: "implementation_compile_error"
+recovery_profile: "nextjs"
+recovery_failed_phase: "final-acceptance"
+goal: "Build a \"thick\" browser game with a template literal HUD"
+profile: "nextjs"
+style: "recovery"
+intent: "recover"
+phases:
+  - id: "inspect-current-state"
+    prompt: "Inspect files with escaped quotes like \\\"boss\\\" and keep Japanese text: 修復対象を確認する。"
+  - id: "repair-final-acceptance"
+    prompt: "Repair ./src/app/game.ts where SWC reported Expected ',', got '}'. Preserve the template literal HUD such as `Score: ${score}`."
+  - id: "verify-recovery"
+    prompt: "Run `npm run build` and keep the lifecycle-captured SWC frame if another syntax error appears."
