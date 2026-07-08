@@ -357,6 +357,7 @@ fn scaffold_file_content(project_root: &Path, project_rel: &str) -> Option<&'sta
         "src/app/globals.css" => Some(canonical_tailwind_css()),
         "src/app/global.d.ts" => Some(canonical_global_d_ts()),
         "src/app/layout.tsx" => Some(canonical_layout_tsx()),
+        "src/app/page.tsx" => Some(fallback_page()),
         rel if rel == setup_tailwind_config_rel(project_root) => Some(canonical_tailwind_config()),
         _ => None,
     }
@@ -2167,12 +2168,14 @@ mod tests {
     }
 
     #[test]
-    fn complete_scaffold_does_not_author_application_page() {
+    fn complete_scaffold_authors_absent_application_page() {
         let dir = tempfile::tempdir().unwrap();
         let created = complete_scaffold(dir.path(), &["src/app/page.tsx".to_string()]).unwrap();
 
-        assert!(created.is_empty());
-        assert!(!dir.path().join("src/app/page.tsx").exists());
+        assert_eq!(created, vec!["src/app/page.tsx".to_string()]);
+        let page = std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap();
+        assert!(page.contains("export default function Page"), "{page}");
+        assert!(page.contains("INTERACTIVE CHALLENGE"), "{page}");
     }
 
     #[test]

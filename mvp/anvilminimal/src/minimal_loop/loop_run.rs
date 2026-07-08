@@ -1359,6 +1359,34 @@ pub(crate) fn run_session_with_outcome_with_options(
                 artifact_non_edit_streak =
                     artifact_non_edit_streak.saturating_add(ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD);
                 artifact_recovery_state.record_action("no_tool_missing_artifacts");
+                if maybe_rescue_artifact_recovery_exhaustion(
+                    config,
+                    &options,
+                    user_prompt,
+                    ArtifactRecoveryRescueInput {
+                        state: &artifact_recovery_state,
+                        non_edit_streak: artifact_non_edit_streak,
+                        enabled: artifact_recovery_enabled,
+                        missing_paths: &missing,
+                    },
+                    &mut changed_paths,
+                )? {
+                    missing = missing_paths(&config.workspace_root, &required_paths);
+                    if missing.is_empty() {
+                        return Ok(stop_for_required_artifacts_satisfied(
+                            config,
+                            &required_paths,
+                            RequiredArtifactsStop {
+                                changed_paths,
+                                iterations: iterations_used,
+                                tool_calls: tool_call_count,
+                                verify_attempts,
+                                last_blocking_reason,
+                                last_provider_error,
+                            },
+                        ));
+                    }
+                }
                 if let Some(feedback) = maybe_artifact_recovery_feedback(
                     &mut artifact_recovery_state,
                     &mut artifact_non_edit_streak,
@@ -2202,6 +2230,34 @@ pub(crate) fn run_session_with_outcome_with_options(
                 ));
             }
         }
+        if maybe_rescue_artifact_recovery_exhaustion(
+            config,
+            &options,
+            user_prompt,
+            ArtifactRecoveryRescueInput {
+                state: &artifact_recovery_state,
+                non_edit_streak: artifact_non_edit_streak,
+                enabled: artifact_recovery_enabled,
+                missing_paths: &missing,
+            },
+            &mut changed_paths,
+        )? {
+            missing = missing_paths(&config.workspace_root, &required_paths);
+            if missing.is_empty() {
+                return Ok(stop_for_required_artifacts_satisfied(
+                    config,
+                    &required_paths,
+                    RequiredArtifactsStop {
+                        changed_paths,
+                        iterations: iterations_used,
+                        tool_calls: tool_call_count,
+                        verify_attempts,
+                        last_blocking_reason,
+                        last_provider_error,
+                    },
+                ));
+            }
+        }
         if let Some(feedback) = maybe_artifact_recovery_feedback(
             &mut artifact_recovery_state,
             &mut artifact_non_edit_streak,
@@ -2424,6 +2480,38 @@ fn setup_scaffold_completion_applicable(
     missing_paths.iter().all(|path| {
         scaffold_paths.contains(path) || python_cli_entrypoint_scaffold_path(config, path)
     })
+}
+
+struct ArtifactRecoveryRescueInput<'a> {
+    state: &'a ArtifactRecoveryState,
+    non_edit_streak: usize,
+    enabled: bool,
+    missing_paths: &'a [String],
+}
+
+fn maybe_rescue_artifact_recovery_exhaustion(
+    config: &Config,
+    options: &RunSessionOptions,
+    user_prompt: &str,
+    input: ArtifactRecoveryRescueInput<'_>,
+    changed_paths: &mut Vec<String>,
+) -> anyhow::Result<bool> {
+    if !input.enabled
+        || input.missing_paths.is_empty()
+        || input.non_edit_streak < ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD
+        || input.state.target_attempts < ARTIFACT_RECOVERY_ATTEMPT_LIMIT
+    {
+        return Ok(false);
+    }
+    let created = maybe_complete_setup_scaffold(
+        config,
+        options,
+        user_prompt,
+        input.missing_paths,
+        SetupScaffoldCompletionTrigger::Exhausted,
+        changed_paths,
+    )?;
+    Ok(!created.is_empty())
 }
 
 fn setup_step_or_phase(options: &RunSessionOptions, user_prompt: &str) -> bool {
@@ -6013,7 +6101,7 @@ export default function Page(){
     }
 
     #[test]
-    fn setup_scaffold_completion_does_not_author_nextjs_application_page() {
+    fn setup_scaffold_completion_authors_absent_nextjs_application_page() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
@@ -6030,7 +6118,7 @@ export default function Page(){
         };
         let mut session = SessionSnapshot::new();
 
-        let err = run_session_with_outcome_with_options(
+        let outcome = run_session_with_outcome_with_options(
             &mut fake,
             &mut session,
             "Scaffold the Next.js setup files.",
@@ -6039,13 +6127,64 @@ export default function Page(){
             &NOOP_UI,
             RunSessionOptions::plan_step(RunSessionStepKind::Setup),
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap();
 
-        assert!(err.contains("artifact recovery exhausted"), "{err}");
-        assert!(!dir.path().join("src/app/page.tsx").exists());
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert!(dir.path().join("src/app/page.tsx").exists());
+        let page = std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap();
+        assert!(page.contains("export default function Page"), "{page}");
         let event_text = std::fs::read_to_string(events).unwrap_or_default();
-        assert!(!event_text.contains("\"event\":\"setup_scaffold_completed\""));
+        assert!(event_text.contains("\"event\":\"setup_scaffold_completed\""));
+        assert!(event_text.contains("\"trigger\":\"budget_low\""));
+    }
+
+    #[test]
+    fn artifact_recovery_exhaustion_rescues_nextjs_setup_page_scaffold() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 8;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply::text("I will create the page.")),
+                Ok(AssistantReply::text("Still preparing.")),
+                Ok(AssistantReply::text("I need to write it.")),
+                Ok(AssistantReply::text("Scaffold now.")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Scaffold the Next.js setup page for test0708_018.",
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert!(dir.path().join("src/app/page.tsx").is_file());
+        assert!(
+            outcome
+                .changed_paths
+                .contains(&"src/app/page.tsx".to_string())
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"artifact_stagnation_feedback\""));
+        assert!(event_text.contains("\"event\":\"setup_scaffold_completed\""));
+        assert!(event_text.contains("\"trigger\":\"exhausted\""));
+        assert!(!event_text.contains("\"reason\":\"artifact_recovery_exhausted\""));
     }
 
     #[test]
