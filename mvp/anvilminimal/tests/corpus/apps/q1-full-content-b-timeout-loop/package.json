@@ -1,0 +1,17 @@
+{
+  "scripts": {
+    "dev": "next dev -p 3011",
+    "build": "next build"
+  },
+  "dependencies": {
+    "next": "15.3.4",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0"
+  }
+}

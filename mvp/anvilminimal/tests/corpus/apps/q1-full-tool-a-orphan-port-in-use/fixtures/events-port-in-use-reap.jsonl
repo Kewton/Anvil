@@ -1,0 +1,5 @@
+{"event":"dev_server_spawned","run_label":"tool_a","pid":30110,"command":"npm run dev","origin_phase":"phase-2-readiness","port":3011}
+{"event":"dev_server_port_in_use_retry","port":3011,"owner_pid":30110,"owner_command":"next-server","registered_child":true,"reaped":true}
+{"event":"server_reaped","pid":30110,"command":"npm run dev","origin_phase":"phase-2-readiness","reason":"readiness_port_in_use_retry","ok":true}
+{"event":"dev_server_readiness_retry","port":3011,"result":"retry_after_reap"}
+{"event":"loop_stop","reason":"port_in_use: pid 30110 (next-server)","last_blocking_reason":"port_in_use: registered run child reaped and readiness retried"}

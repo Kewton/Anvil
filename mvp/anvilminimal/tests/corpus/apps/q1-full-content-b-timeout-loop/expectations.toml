@@ -1,0 +1,42 @@
+case_id = "q1-full-content-b-timeout-loop"
+source = "Q1-full content_b"
+required_paths = ["package.json", "tsconfig.json", "next-env.d.ts", "src/app/layout.tsx", "src/app/page.tsx"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["content", "timeout", "bounded", "button"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx"]
+exclude = ["next-env.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+src/app/page.tsx = [
+  "Content B Timeout Corpus",
+  "data-anvil-action=\"primary\"",
+  "setCount"
+]
+fixtures/events-command-timeout-loop.jsonl = [
+  "\"run_label\":\"content_b\"",
+  "ls -R && cat package.json",
+  "\"duration_ms\":180000",
+  "\"event\":\"command_timeout_repetition\"",
+  "\"repeat_count\":3",
+  "\"terminal\":true",
+  "\"reason\":\"command_timeout_loop\""
+]

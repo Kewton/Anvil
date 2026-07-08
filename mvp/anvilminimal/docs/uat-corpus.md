@@ -153,15 +153,33 @@ mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
 mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
   /Users/maenokota/share/work/localwork/commandagent_mvp/01/q1-full/game_b \
   q1-full-game-b-evidence-repair-inspect-only
+
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/q1-full/content_b \
+  q1-full-content-b-timeout-loop
+
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/q1-full/tool_a \
+  q1-full-tool-a-orphan-port-in-use
 ```
 
 `cli_a` pins the model tendency to combine CSV fixture creation and program
 verification in one multi-line verify command with a file-writing redirect; the
 live unit fixture asserts this remains rejected with Write-tool remedy text.
 `q1-full-tool-a-read-only-stagnation` pins the repeated Read/Grep implement-loop
-shape and the K=3/K=5 intervention vocabulary. `q1-full-game-b-evidence-repair-
-inspect-only` pins evidence-target repair turns that inspect without editing
-until the compact/regeneration rung accepts a source change.
+shape and the K=3/K=5 intervention vocabulary.
+`q1-full-game-b-evidence-repair-inspect-only` pins evidence-target repair turns
+that inspect without editing until the compact/regeneration rung accepts a
+source change.
+
+The boundedness follow-up harvests are diagnostic fixtures. `content_b` pins the
+wide `ls -R && cat package.json` loop: each Bash attempt reached the 180s cap
+because recursive listing walked the workspace/dependency tree, and the old
+exact error identity was too strict to aggregate variants.
+`q1-full-tool-a-orphan-port-in-use` pins the mid-run readiness conflict where
+port 3011 was held by a registered Next dev-server child from the same run,
+requiring deterministic reap, one retry, and owner-honest vocabulary instead of
+empty exhaustion.
 
 The script copies `src/**`, `package.json`, and common Next.js/TypeScript/
 Tailwind/PostCSS config files. It intentionally does not copy `node_modules`,
