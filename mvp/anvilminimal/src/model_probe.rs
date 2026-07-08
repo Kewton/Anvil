@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,6 +52,67 @@ pub struct ProbeRole {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelProbeMetrics {
     pub task_count: usize,
+    pub path_argument_count: usize,
+    pub absolute_path_count: usize,
+    pub absolute_path_rate: f64,
+    pub corrupted_path_count: usize,
+    pub shell_command_count: usize,
+    pub shell_control_count: usize,
+    pub shell_control_rate: f64,
+    pub shell_control_breakdown: ShellControlBreakdown,
+    pub edit_anchor: EditAnchorMetrics,
+    pub repair_follow_through: RepairFollowThroughMetrics,
+    pub regeneration_follow_through: String,
+    pub json_response_count: usize,
+    pub json_valid_count: usize,
+    pub json_valid_rate: f64,
+    pub missing_field_kinds: BTreeMap<String, usize>,
+    pub empty_response_count: usize,
+    pub empty_response_rate: f64,
+    pub malformed_tool_call_count: usize,
+    pub malformed_tool_call_rate: f64,
+    pub latency_ms: LatencyStats,
+    pub token_telemetry: TokenTelemetryMetrics,
+    pub context_truncation_suspected_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ShellControlBreakdown {
+    pub and_and: usize,
+    pub semicolon: usize,
+    pub pipe: usize,
+    pub redirect: usize,
+    pub cd: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EditAnchorMetrics {
+    pub exact: usize,
+    pub salvageable: usize,
+    pub miss: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RepairFollowThroughMetrics {
+    pub appended: String,
+    pub compact: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LatencyStats {
+    pub count: usize,
+    pub min_ms: Option<u64>,
+    pub p50_ms: Option<u64>,
+    pub max_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TokenTelemetryMetrics {
+    pub estimated_prompt_tokens_sent_total: u64,
+    pub prompt_eval_count_total: u64,
+    pub eval_count_total: u64,
+    pub missing_prompt_eval_count: usize,
+    pub finish_reasons: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,9 +263,7 @@ pub fn run_with_output_dir(
         let evidence = match task.kind {
             ProbeTaskKind::Session => {
                 let mut session = match task.id {
-                    "edit_own" => write_simple_session
-                        .clone()
-                        .unwrap_or_else(SessionSnapshot::new),
+                    "edit_own" => write_simple_session.clone().unwrap_or_default(),
                     "repair_appended" => appended_repair_session(),
                     _ => SessionSnapshot::new(),
                 };
@@ -243,6 +303,7 @@ pub fn run_with_output_dir(
         },
         metrics: ModelProbeMetrics {
             task_count: tasks.len(),
+            ..compute_metrics(&tasks)
         },
         no_network_guarantee: no_network_commands(&tasks),
         tasks,
@@ -580,6 +641,257 @@ fn no_network_commands(tasks: &[ModelProbeTaskEvidence]) -> bool {
         })
 }
 
+fn compute_metrics(tasks: &[ModelProbeTaskEvidence]) -> ModelProbeMetrics {
+    let mut metrics = ModelProbeMetrics {
+        task_count: tasks.len(),
+        ..ModelProbeMetrics::default()
+    };
+    let mut edit_calls = 0usize;
+    let mut latencies = Vec::new();
+    for task in tasks {
+        if task.final_text.trim().is_empty() && task.raw_tool_calls.is_empty() {
+            metrics.empty_response_count += 1;
+        }
+        for call in &task.raw_tool_calls {
+            if malformed_tool_call(call) {
+                metrics.malformed_tool_call_count += 1;
+            }
+            if call.name == "Edit" {
+                edit_calls += 1;
+            }
+            if let Some(path) = call.arguments.get("path").and_then(Value::as_str) {
+                metrics.path_argument_count += 1;
+                if path_is_absolute(path) {
+                    metrics.absolute_path_count += 1;
+                }
+                if path_looks_corrupted(path) {
+                    metrics.corrupted_path_count += 1;
+                }
+            }
+        }
+        for command in &task.raw_commands {
+            metrics.shell_command_count += 1;
+            let mut controlled = false;
+            if command.contains("&&") {
+                metrics.shell_control_breakdown.and_and += 1;
+                controlled = true;
+            }
+            if command_contains_semicolon(command) {
+                metrics.shell_control_breakdown.semicolon += 1;
+                controlled = true;
+            }
+            if command.contains('|') {
+                metrics.shell_control_breakdown.pipe += 1;
+                controlled = true;
+            }
+            if command.contains('>') || command.contains('<') {
+                metrics.shell_control_breakdown.redirect += 1;
+                controlled = true;
+            }
+            if command_uses_cd(command) {
+                metrics.shell_control_breakdown.cd += 1;
+                controlled = true;
+            }
+            if controlled {
+                metrics.shell_control_count += 1;
+            }
+        }
+        for event in &task.notable_events {
+            match event.get("event").and_then(Value::as_str) {
+                Some("edit_anchor_salvaged") => metrics.edit_anchor.salvageable += 1,
+                Some("tool_validation_error")
+                    if event.get("name").and_then(Value::as_str) == Some("Edit")
+                        && event.get("error_kind").and_then(Value::as_str)
+                            == Some("edit_anchor_not_found") =>
+                {
+                    metrics.edit_anchor.miss += 1;
+                }
+                Some("context_truncation_suspected") => {
+                    metrics.context_truncation_suspected_count += 1;
+                }
+                _ => {}
+            }
+        }
+        for event in &task.provider_turns {
+            if let Some(value) = event.get("duration_ms").and_then(Value::as_u64) {
+                latencies.push(value);
+            }
+            if let Some(value) = event
+                .get("estimated_prompt_tokens_sent")
+                .and_then(Value::as_u64)
+            {
+                metrics.token_telemetry.estimated_prompt_tokens_sent_total += value;
+            }
+            if let Some(value) = event.get("prompt_eval_count").and_then(Value::as_u64) {
+                metrics.token_telemetry.prompt_eval_count_total += value;
+            } else {
+                metrics.token_telemetry.missing_prompt_eval_count += 1;
+            }
+            if let Some(value) = event.get("eval_count").and_then(Value::as_u64) {
+                metrics.token_telemetry.eval_count_total += value;
+            }
+            if let Some(reason) = event.get("finish_reason").and_then(Value::as_str) {
+                *metrics
+                    .token_telemetry
+                    .finish_reasons
+                    .entry(reason.to_string())
+                    .or_default() += 1;
+            }
+        }
+        if task.id == "repair_appended" {
+            metrics.repair_follow_through.appended = follow_through(task);
+        } else if task.id == "repair_compact" {
+            metrics.repair_follow_through.compact = follow_through(task);
+        } else if task.id == "regenerate" {
+            metrics.regeneration_follow_through = follow_through(task);
+        } else if task.id == "json_schema" {
+            metrics.json_response_count += 1;
+            match analyze_json_schema_response(&task.final_text) {
+                JsonSchemaAnalysis::Valid { missing_fields } => {
+                    metrics.json_valid_count += 1;
+                    for field in missing_fields {
+                        *metrics.missing_field_kinds.entry(field).or_default() += 1;
+                    }
+                }
+                JsonSchemaAnalysis::Invalid => {}
+            }
+        }
+    }
+    metrics.edit_anchor.exact = edit_calls
+        .saturating_sub(metrics.edit_anchor.salvageable)
+        .saturating_sub(metrics.edit_anchor.miss);
+    metrics.absolute_path_rate = ratio(metrics.absolute_path_count, metrics.path_argument_count);
+    metrics.shell_control_rate = ratio(metrics.shell_control_count, metrics.shell_command_count);
+    metrics.empty_response_rate = ratio(metrics.empty_response_count, tasks.len());
+    let tool_call_count = tasks
+        .iter()
+        .map(|task| task.raw_tool_calls.len())
+        .sum::<usize>();
+    metrics.malformed_tool_call_rate = ratio(metrics.malformed_tool_call_count, tool_call_count);
+    metrics.json_valid_rate = ratio(metrics.json_valid_count, metrics.json_response_count);
+    metrics.latency_ms = latency_stats(latencies);
+    metrics
+}
+
+enum JsonSchemaAnalysis {
+    Valid { missing_fields: Vec<String> },
+    Invalid,
+}
+
+fn analyze_json_schema_response(text: &str) -> JsonSchemaAnalysis {
+    let Ok(value) = serde_json::from_str::<Value>(text.trim()) else {
+        return JsonSchemaAnalysis::Invalid;
+    };
+    let Some(steps) = value.get("steps").and_then(Value::as_array) else {
+        return JsonSchemaAnalysis::Invalid;
+    };
+    let mut missing = Vec::new();
+    for step in steps {
+        if !step.get("instruction").is_some_and(Value::is_string) {
+            missing.push("semantic:instruction".to_string());
+        }
+        if !step.get("kind").is_some_and(Value::is_string) {
+            missing.push("semantic:kind".to_string());
+        }
+        if !step.get("expected_paths").is_some_and(Value::is_array) {
+            missing.push("semantic:expected_paths".to_string());
+        }
+        if !step.get("expected_result").is_some_and(Value::is_string) {
+            missing.push("descriptive:expected_result".to_string());
+        }
+    }
+    JsonSchemaAnalysis::Valid {
+        missing_fields: missing,
+    }
+}
+
+fn follow_through(task: &ModelProbeTaskEvidence) -> String {
+    if !task.changed_paths.is_empty()
+        || task
+            .raw_tool_calls
+            .iter()
+            .any(|call| call.name == "Write" || call.name == "Edit")
+            && task.ok
+    {
+        "edited".to_string()
+    } else if task.final_text.trim().is_empty() && task.raw_tool_calls.is_empty() {
+        "empty".to_string()
+    } else if task.raw_tool_calls.is_empty() {
+        "prose".to_string()
+    } else {
+        "tool_error".to_string()
+    }
+}
+
+fn malformed_tool_call(call: &RawToolCallEvidence) -> bool {
+    match call.name.as_str() {
+        "Bash" => !call.arguments.get("command").is_some_and(Value::is_string),
+        "Read" | "Write" => {
+            !call.arguments.get("path").is_some_and(Value::is_string)
+                || (call.name == "Write"
+                    && !call.arguments.get("content").is_some_and(Value::is_string))
+        }
+        "Edit" => {
+            !call.arguments.get("path").is_some_and(Value::is_string)
+                || !call
+                    .arguments
+                    .get("old_string")
+                    .is_some_and(Value::is_string)
+                || !call
+                    .arguments
+                    .get("new_string")
+                    .is_some_and(Value::is_string)
+        }
+        "Glob" => !call.arguments.get("pattern").is_some_and(Value::is_string),
+        "Grep" => !call.arguments.get("pattern").is_some_and(Value::is_string),
+        _ => true,
+    }
+}
+
+fn path_is_absolute(path: &str) -> bool {
+    path.starts_with('/') || path.get(1..3).is_some_and(|rest| rest == ":\\")
+}
+
+fn path_looks_corrupted(path: &str) -> bool {
+    path.starts_with("workdir/")
+        || path.contains("/workdir/")
+        || path.contains("commandagent_mvp")
+        || path.contains("//")
+}
+
+fn command_contains_semicolon(command: &str) -> bool {
+    command.contains(';')
+}
+
+fn command_uses_cd(command: &str) -> bool {
+    let trimmed = command.trim_start();
+    trimmed.starts_with("cd ")
+        || trimmed.starts_with("cd\t")
+        || command.contains("&& cd ")
+        || command.contains("; cd ")
+}
+
+fn latency_stats(mut values: Vec<u64>) -> LatencyStats {
+    if values.is_empty() {
+        return LatencyStats::default();
+    }
+    values.sort_unstable();
+    LatencyStats {
+        count: values.len(),
+        min_ms: values.first().copied(),
+        p50_ms: values.get(values.len() / 2).copied(),
+        max_ms: values.last().copied(),
+    }
+}
+
+fn ratio(numerator: usize, denominator: usize) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
 fn read_event_values(path: &Path) -> Vec<Value> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
@@ -620,6 +932,205 @@ fn notable_events(events: Vec<Value>) -> Vec<Value> {
 }
 
 fn render_card(report: &ModelProbeReport) -> String {
+    let metrics = &report.metrics;
+    let mut lines = vec![
+        "# Model Probe Card".to_string(),
+        String::new(),
+        format!("- Version: {}", report.version),
+        format!("- Scope: {}", report.scope),
+        format!(
+            "- Executor: {:?} `{}`",
+            report.executor.provider, report.executor.model
+        ),
+        format!(
+            "- Planner: {:?} `{}`",
+            report.planner.provider, report.planner.model
+        ),
+        format!("- Tasks: {}", metrics.task_count),
+        format!(
+            "- No-network guarantee: {}",
+            if report.no_network_guarantee {
+                "passed"
+            } else {
+                "failed"
+            }
+        ),
+        String::new(),
+        "## Dialect Metrics".to_string(),
+        String::new(),
+        format!(
+            "- absolute_path_rate: {} ({}/{})",
+            percent(metrics.absolute_path_rate),
+            metrics.absolute_path_count,
+            metrics.path_argument_count
+        ),
+        format!("- corrupted_path_count: {}", metrics.corrupted_path_count),
+        format!(
+            "- shell_control_rate: {} ({}/{})",
+            percent(metrics.shell_control_rate),
+            metrics.shell_control_count,
+            metrics.shell_command_count
+        ),
+        format!(
+            "- shell_control_breakdown: &&={} ;={} pipe={} redirect={} cd={}",
+            metrics.shell_control_breakdown.and_and,
+            metrics.shell_control_breakdown.semicolon,
+            metrics.shell_control_breakdown.pipe,
+            metrics.shell_control_breakdown.redirect,
+            metrics.shell_control_breakdown.cd
+        ),
+        format!(
+            "- edit_anchor: exact={} salvageable={} miss={}",
+            metrics.edit_anchor.exact, metrics.edit_anchor.salvageable, metrics.edit_anchor.miss
+        ),
+        format!(
+            "- repair_follow_through: appended={} compact={}",
+            empty_if_missing(&metrics.repair_follow_through.appended),
+            empty_if_missing(&metrics.repair_follow_through.compact)
+        ),
+        format!(
+            "- regeneration_follow_through: {}",
+            empty_if_missing(&metrics.regeneration_follow_through)
+        ),
+        format!(
+            "- json_valid_rate: {} ({}/{})",
+            percent(metrics.json_valid_rate),
+            metrics.json_valid_count,
+            metrics.json_response_count
+        ),
+        format!(
+            "- missing_field_kinds: {}",
+            render_map(&metrics.missing_field_kinds)
+        ),
+        format!(
+            "- empty_response_rate: {} ({}/{})",
+            percent(metrics.empty_response_rate),
+            metrics.empty_response_count,
+            metrics.task_count
+        ),
+        format!(
+            "- malformed_tool_call_rate: {} ({})",
+            percent(metrics.malformed_tool_call_rate),
+            metrics.malformed_tool_call_count
+        ),
+        format!(
+            "- latency_ms: count={} min={} p50={} max={}",
+            metrics.latency_ms.count,
+            option_u64(metrics.latency_ms.min_ms),
+            option_u64(metrics.latency_ms.p50_ms),
+            option_u64(metrics.latency_ms.max_ms)
+        ),
+        format!(
+            "- token_telemetry: estimated_prompt_total={} prompt_eval_total={} eval_total={} missing_prompt_eval_count={} finish_reasons={}",
+            metrics.token_telemetry.estimated_prompt_tokens_sent_total,
+            metrics.token_telemetry.prompt_eval_count_total,
+            metrics.token_telemetry.eval_count_total,
+            metrics.token_telemetry.missing_prompt_eval_count,
+            render_map(&metrics.token_telemetry.finish_reasons)
+        ),
+        format!(
+            "- context_truncation_suspected_count: {}",
+            metrics.context_truncation_suspected_count
+        ),
+        String::new(),
+        "## Absorption Map".to_string(),
+        String::new(),
+    ];
+    let absorption = absorption_lines(metrics);
+    if absorption.is_empty() {
+        lines.push("- No elevated dialect indicator in this battery.".to_string());
+    } else {
+        lines.extend(absorption);
+    }
+    lines.extend([
+        String::new(),
+        "This card is for human review and tier-table evidence only. Probe results never auto-configure runtime behavior.".to_string(),
+        "Profile JSON records raw tool calls and commands verbatim.".to_string(),
+        "This is a dialect indicator battery, not a capability benchmark.".to_string(),
+    ]);
+    lines.join("\n")
+}
+
+fn absorption_lines(metrics: &ModelProbeMetrics) -> Vec<String> {
+    let mut lines = Vec::new();
+    if metrics.absolute_path_rate > 0.0 {
+        lines.push(
+            "- Elevated absolute path use => tool path normalization will be hot.".to_string(),
+        );
+    }
+    if metrics.corrupted_path_count > 0 {
+        lines.push("- Corrupted/root-anchored paths observed => path salvage and confinement feedback will be hot.".to_string());
+    }
+    if metrics.shell_control_count > 0 {
+        lines.push(
+            "- Shell-control commands observed => bash/verify normalization will be hot."
+                .to_string(),
+        );
+    }
+    if metrics.edit_anchor.salvageable > 0 || metrics.edit_anchor.miss > 0 {
+        lines.push("- Edit anchor drift observed => edit-anchor salvage and full-file Write escalation are relevant.".to_string());
+    }
+    if metrics.repair_follow_through.appended != "edited"
+        && metrics.repair_follow_through.compact == "edited"
+    {
+        lines.push(
+            "- Compact-only repair follow-through => expect the 85 compact-session rung to matter."
+                .to_string(),
+        );
+    }
+    if metrics.regeneration_follow_through != "edited"
+        && !metrics.regeneration_follow_through.is_empty()
+    {
+        lines.push("- Regeneration did not follow through => expect the 96 full-file regeneration rung to be risky.".to_string());
+    }
+    if metrics.json_valid_rate < 1.0 || !metrics.missing_field_kinds.is_empty() {
+        lines.push("- JSON/schema drift observed => planner schema repair and descriptive-field defaulting will be hot.".to_string());
+    }
+    if metrics.empty_response_count > 0 {
+        lines.push("- Empty responses observed => empty-response ladder and fresh-session retry will be hot.".to_string());
+    }
+    if metrics.malformed_tool_call_count > 0 {
+        lines.push("- Malformed tool calls observed => argument recovery and recoverable tool feedback will be hot.".to_string());
+    }
+    if metrics.context_truncation_suspected_count > 0 {
+        lines.push(
+            "- Context truncation warning fired => review 98C token telemetry before UAT."
+                .to_string(),
+        );
+    }
+    lines
+}
+
+fn percent(value: f64) -> String {
+    format!("{:.0}%", value * 100.0)
+}
+
+fn empty_if_missing(value: &str) -> &str {
+    if value.is_empty() {
+        "not_observed"
+    } else {
+        value
+    }
+}
+
+fn option_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn render_map<T: std::fmt::Display>(map: &BTreeMap<String, T>) -> String {
+    if map.is_empty() {
+        return "none".to_string();
+    }
+    map.iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[allow(dead_code)]
+fn render_legacy_card(report: &ModelProbeReport) -> String {
     format!(
         "# Model Probe Card\n\n- Version: {}\n- Scope: {}\n- Executor: {:?} `{}`\n- Planner: {:?} `{}`\n- Tasks: {}\n- Profile JSON records raw tool calls and commands verbatim.\n- No-network guarantee: {}\n\nThis is a dialect indicator battery, not a capability benchmark.\n",
         report.version,
