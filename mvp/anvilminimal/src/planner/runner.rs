@@ -7631,10 +7631,11 @@ fn runtime_acceptance_repair_guidance(
     let mut guidance = Vec::new();
     for evidence in &acceptance.missing_evidence {
         match evidence.as_str() {
-            "restart_or_recoverable_state_evidence" => guidance.push(
-                "provide a reachable terminal/failure state and a restart control (data-anvil-action=\"restart\") that resets observable state"
-                    .to_string(),
-            ),
+            "restart_or_recoverable_state_evidence" => {
+                guidance.push(crate::minimal_loop::feedback::capability_evidence_remedy_line(
+                    evidence,
+                ));
+            }
             "persistence_evidence" => {
                 guidance.push(PERSISTENCE_RELOAD_REPAIR_REQUIREMENT.to_string())
             }
@@ -12630,6 +12631,8 @@ fn final_acceptance_repair_prompt(
         final_acceptance_adherence_guidance(report, repair_target, adherence_missing);
     let behavioral_probe_context =
         final_acceptance_behavioral_probe_context(report, expected_paths);
+    let restart_attachment_guidance =
+        final_acceptance_restart_attachment_guidance(root, plan, report);
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
     let compile_errors = compile_repair_prompt_section_with_root(
@@ -12654,6 +12657,7 @@ Compile errors:\n{compile_errors}\n\n\
 Command failures:\n{command_failures}\n\n\
 Profile failures:\n{profile_failures}\n\n\
 {behavioral_probe_context}\
+{restart_attachment_guidance}\
 {adherence_guidance}\
 Expected paths to preserve or create:\n{expected}\n\n\
 {prior_context}\n\n\
@@ -12675,9 +12679,31 @@ Bounded repair rules:\n\
         command_failures = command_failures,
         profile_failures = profile_failures,
         behavioral_probe_context = behavioral_probe_context,
+        restart_attachment_guidance = restart_attachment_guidance,
         adherence_guidance = adherence_guidance,
         expected = expected,
         prior_context = context.render_prompt_section(),
+    )
+}
+
+fn final_acceptance_restart_attachment_guidance(
+    root: &Path,
+    plan: &UltraPlan,
+    report: &VerificationReport,
+) -> String {
+    if !verification_missing_signals(report)
+        .iter()
+        .any(|key| key == "restart_or_recoverable_state_evidence")
+    {
+        return String::new();
+    }
+    let guidance = restart_hook_attachment_guidance(root, &plan.profile);
+    if guidance.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Restart hook attachment guidance:\n{}\n\n",
+        render_prompt_bullets(&guidance)
     )
 }
 
@@ -17706,6 +17732,89 @@ if __name__ == "__main__":
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"recovery_prompt_path\":\".anvil/repairs/"));
         assert!(event_text.contains("\"recovery_ultra_plan_path\":\".anvil/plans/"));
+    }
+
+    #[test]
+    fn exhaustion_with_pending_contract_state_names_capability_keys() {
+        let reason = exhaustion_reason_with_pending_contract_state(
+            "loop_progress_exhausted: no concrete blocker recorded",
+            &["restart_or_recoverable_state_evidence".to_string()],
+        );
+
+        assert_eq!(
+            reason,
+            "capability_evidence_unresolved:restart_or_recoverable_state_evidence"
+        );
+    }
+
+    #[test]
+    fn restart_hook_attachment_guidance_cites_route_bound_file_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("src/app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("page.tsx"),
+            r#""use client";
+export default function Page() {
+  const restartGame = () => {};
+  return <main>
+    <button onClick={restartGame}>TRY AGAIN</button>
+  </main>;
+}
+"#,
+        )
+        .unwrap();
+
+        let guidance = restart_hook_attachment_guidance(dir.path(), "nextjs").join("\n");
+
+        assert!(
+            guidance.contains("add data-anvil-action=\"restart\""),
+            "{guidance}"
+        );
+        assert!(guidance.contains("the TRY AGAIN button"), "{guidance}");
+        assert!(guidance.contains("src/app/page.tsx:5"), "{guidance}");
+    }
+
+    #[test]
+    fn capability_evidence_failure_evidence_leads_with_remedies() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("src/app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("page.tsx"),
+            r#""use client";
+export default function Page() {
+  const playAgain = () => {};
+  return <button onClick={playAgain}>PLAY AGAIN</button>;
+}
+"#,
+        )
+        .unwrap();
+        let evidence = capability_evidence_failure_evidence(
+            dir.path(),
+            "nextjs",
+            &["restart_or_recoverable_state_evidence".to_string()],
+            "capability_evidence_unresolved:restart_or_recoverable_state_evidence",
+        );
+
+        assert!(
+            evidence
+                .first()
+                .is_some_and(|line| line.contains("data-anvil-action=\"restart\"")),
+            "{evidence:#?}"
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|line| line.contains("src/app/page.tsx:4")),
+            "{evidence:#?}"
+        );
+        assert!(
+            evidence
+                .iter()
+                .any(|line| line.contains("exhaustion classification")),
+            "{evidence:#?}"
+        );
     }
 
     #[test]
