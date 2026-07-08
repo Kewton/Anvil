@@ -10,13 +10,14 @@ use crate::eval_events;
 use crate::mode::ExecutionMode;
 use crate::planner::profile::{profile_complete_scaffold, profile_setup_scaffold_paths};
 use crate::planner::verify::{
-    diagnose_verify_command, normalize_verify_command,
-    normalize_verify_command_for_oracle_repair_with_root,
+    RuntimeCommandConnector, RuntimeNormalizedCommandSegment, diagnose_verify_command,
+    normalize_runtime_bash_command_for_boundary, normalize_verify_command,
 };
 use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::ChatClient;
 use crate::state::{ConversationMessage, SessionSnapshot};
 use crate::tools::args_recovery::recover_tool_arguments;
+use crate::tools::bash::BashOutcomeKind;
 use crate::tools::path_guard::{
     resolve_existing, resolve_optional_existing, validate_workspace_relative,
 };
@@ -384,6 +385,7 @@ struct RuntimeBashPolicyDecision {
     violation_kind: &'static str,
     reason: String,
     normalized_command: Option<String>,
+    split_segments: Vec<RuntimeNormalizedCommandSegment>,
     normalization_kind: &'static str,
     normalization_reason: String,
 }
@@ -403,26 +405,15 @@ impl RuntimeBashPolicyDecision {
                 violation_kind: "",
                 reason: "runtime Bash is not deterministic verifier evidence".to_string(),
                 normalized_command: None,
+                split_segments: Vec::new(),
                 normalization_kind: "",
                 normalization_reason: String::new(),
             };
         }
-        let mut effective_command = command.to_string();
-        let mut normalized_command = None;
-        let mut normalization_kind = "";
-        let mut normalization_reason = String::new();
-        if let Some(repair) = normalize_verify_command_for_oracle_repair_with_root(command, root)
-            && repair.normalized != command
-        {
-            normalization_kind = repair.kind;
-            normalization_reason = repair.reason;
-            effective_command = repair.normalized.clone();
-            normalized_command = Some(repair.normalized);
-        }
-        let normalized_verify_command = match normalize_verify_command(&effective_command) {
-            Ok(command) => command,
+        let normalized_plan = match normalize_runtime_bash_command_for_boundary(command, root) {
+            Ok(plan) => plan,
             Err(err) => {
-                let diagnosis = diagnose_verify_command(&effective_command);
+                let diagnosis = diagnose_verify_command(command);
                 let violation = diagnosis
                     .violation
                     .unwrap_or(crate::planner::verify::VerifyCommandViolationKind::Blocked);
@@ -437,18 +428,15 @@ impl RuntimeBashPolicyDecision {
                     policy_error_kind: "verify_command_policy_error",
                     violation_kind: violation.as_str(),
                     reason,
-                    normalized_command,
-                    normalization_kind,
-                    normalization_reason,
+                    normalized_command: None,
+                    split_segments: Vec::new(),
+                    normalization_kind: "",
+                    normalization_reason: String::new(),
                 };
             }
         };
-        if normalized_verify_command.as_str() != effective_command {
-            if normalization_kind.is_empty() {
-                normalization_kind = "shared_verify_normalized";
-            }
-            normalized_command = Some(normalized_verify_command.as_str().to_string());
-        }
+        let normalized_command = (normalized_plan.normalized_command != command.trim())
+            .then(|| normalized_plan.normalized_command.clone());
         let reason = if normalized_command.is_some() {
             "runtime Bash admitted as deterministic verifier evidence after mechanical normalization"
         } else {
@@ -465,8 +453,9 @@ impl RuntimeBashPolicyDecision {
             violation_kind: "",
             reason: reason.to_string(),
             normalized_command,
-            normalization_kind,
-            normalization_reason,
+            split_segments: normalized_plan.segments,
+            normalization_kind: normalized_plan.normalization_kind,
+            normalization_reason: normalized_plan.normalization_reason,
         }
     }
 }
@@ -544,6 +533,76 @@ fn emit_runtime_bash_policy(
             "command_summary": eval_events::body_snippet(command),
         }),
     );
+}
+
+fn execute_split_runtime_bash<F, G>(
+    segments: &[RuntimeNormalizedCommandSegment],
+    root: &Path,
+    offline: bool,
+    is_cancelled: F,
+    is_force_cancelled: G,
+) -> anyhow::Result<String>
+where
+    F: Fn() -> bool,
+    G: Fn() -> bool,
+{
+    let mut out = Vec::new();
+    let mut and_chain_failed = false;
+    let mut first_failure: Option<(usize, String, BashOutcomeKind)> = None;
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.connector == RuntimeCommandConnector::Always {
+            and_chain_failed = false;
+        }
+        let command = segment.command.as_str();
+        if segment.connector == RuntimeCommandConnector::AndThen && and_chain_failed {
+            out.push(format!(
+                "segment {} skipped by && short-circuit: {}",
+                index + 1,
+                command
+            ));
+            continue;
+        }
+        let outcome = crate::tools::bash::run_structured_cancel_and_force(
+            command,
+            root,
+            offline,
+            Duration::from_secs(180),
+            &is_cancelled,
+            &is_force_cancelled,
+        )?;
+        match outcome.kind {
+            BashOutcomeKind::Blocked => bail!("{}", outcome.summary),
+            BashOutcomeKind::Timeout => bail!(
+                "command_timeout: {command}\n{}",
+                crate::tools::bash::format_outcome(&outcome)
+            ),
+            BashOutcomeKind::Cancelled => bail!(
+                "command_aborted_by_user: interrupted by user: {command}\n{}",
+                crate::tools::bash::format_outcome(&outcome)
+            ),
+            BashOutcomeKind::Success | BashOutcomeKind::CommandFailed => {}
+        }
+        out.push(format!(
+            "segment {} command: {}\n{}",
+            index + 1,
+            command,
+            crate::tools::bash::format_outcome(&outcome)
+        ));
+        if outcome.kind == BashOutcomeKind::Success {
+            and_chain_failed = false;
+        } else {
+            and_chain_failed = true;
+            if first_failure.is_none() {
+                first_failure = Some((index + 1, command.to_string(), outcome.kind));
+            }
+        }
+    }
+    let combined = if let Some((index, command, kind)) = first_failure {
+        format!("combined_outcome: {kind:?}\nfailing_segment: {index} `{command}`")
+    } else {
+        "combined_outcome: Success".to_string()
+    };
+    Ok(format!("{combined}\n{}", out.join("\n\n")))
 }
 
 #[derive(Debug, Default)]
@@ -1306,6 +1365,7 @@ pub(crate) fn run_session_with_outcome_with_options(
         let mut batch_had_recoverable_tool_error = false;
         let missing_before_batch = missing_paths(&config.workspace_root, &required_paths);
         for mut call in tool_calls {
+            let mut split_bash_segments = Vec::new();
             if ui.interrupted() {
                 bail!("interrupted by user");
             }
@@ -1428,16 +1488,27 @@ pub(crate) fn run_session_with_outcome_with_options(
                     );
                     set_bash_command(&mut call.arguments, normalized_command);
                 }
+                split_bash_segments = decision.split_segments.clone();
             }
             let result = {
                 let _guard = ui.before_tool_call(&call.name);
-                registry.execute_with_cancel(
-                    &call.name,
-                    &call.arguments,
-                    &context,
-                    || ui.interrupted(),
-                    || ui.force_interrupted(),
-                )
+                if call.name == "Bash" && split_bash_segments.len() > 1 {
+                    execute_split_runtime_bash(
+                        &split_bash_segments,
+                        &context.root,
+                        context.offline,
+                        || ui.interrupted(),
+                        || ui.force_interrupted(),
+                    )
+                } else {
+                    registry.execute_with_cancel(
+                        &call.name,
+                        &call.arguments,
+                        &context,
+                        || ui.interrupted(),
+                        || ui.force_interrupted(),
+                    )
+                }
             };
             let result = match result {
                 Ok(result) => {
@@ -4658,7 +4729,7 @@ export default function Page(){
     }
 
     #[test]
-    fn verify_step_bash_shell_control_is_policy_error_not_evidence() {
+    fn verify_step_bash_semantic_pipe_is_policy_error_not_evidence() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"scripts":{}}"#).unwrap();
         let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
@@ -4670,7 +4741,7 @@ export default function Page(){
                     content: String::new(),
                     tool_calls: vec![ToolCall::new(
                         "Bash",
-                        json!({"command":"grep -q 3011 package.json && echo \"Port 3011 configured\""}),
+                        json!({"command":"cat package.json | grep 3011"}),
                     )],
                     prompt_tokens: None,
                     completion_tokens: None,
@@ -4728,6 +4799,123 @@ export default function Page(){
             })
             .count();
         assert_eq!(successful_bash_execs, 1);
+    }
+
+    #[test]
+    fn verify_step_runtime_splits_shell_control_bash_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"}}"#,
+        )
+        .unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path.clone());
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Bash",
+                    json!({"command":"ls -R src/app && node -p \"require('./package.json').scripts.build\""}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create app. Verify the current step.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        let bash_result = session
+            .messages
+            .iter()
+            .find(|message| message.role == "tool" && message.name.as_deref() == Some("Bash"))
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        assert!(
+            bash_result.contains("combined_outcome: Success"),
+            "{bash_result}"
+        );
+        assert!(
+            bash_result.contains("segment 1 command: ls -R src/app"),
+            "{bash_result}"
+        );
+        assert!(
+            bash_result.contains("segment 2 command: node -p"),
+            "{bash_result}"
+        );
+        assert!(bash_result.contains("page.tsx"), "{bash_result}");
+        assert!(bash_result.contains("next build"), "{bash_result}");
+        let events = event_values(&events_path);
+        assert!(
+            !events.iter().any(
+                |event| event.get("event").and_then(Value::as_str) == Some("tool_policy_error")
+            ),
+            "{events:?}"
+        );
+        let policy = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("runtime_bash_policy"))
+            .unwrap();
+        assert_eq!(
+            policy.get("normalization_kind").and_then(Value::as_str),
+            Some("shell_control_split")
+        );
+    }
+
+    #[test]
+    fn verify_step_runtime_preserves_and_short_circuit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command":"false && echo x"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create app. Verify the current step.",
+            &[],
+            &config(dir.path().to_path_buf()),
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        let bash_result = session
+            .messages
+            .iter()
+            .find(|message| message.role == "tool" && message.name.as_deref() == Some("Bash"))
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        assert!(
+            bash_result.contains("combined_outcome: CommandFailed"),
+            "{bash_result}"
+        );
+        assert!(
+            bash_result.contains("segment 2 skipped by && short-circuit: echo x"),
+            "{bash_result}"
+        );
+        assert!(!bash_result.contains("stdout:\nx"), "{bash_result}");
     }
 
     #[test]
@@ -4904,9 +5092,22 @@ export default function Page(){
         let policy_call = implementation[..execute_index]
             .rfind("runtime_bash_policy_decision(")
             .expect("Bash policy decision before tool execution");
+        let policy_impl = implementation
+            .split("fn recovered_bash_command(")
+            .next()
+            .unwrap_or(implementation);
+        policy_impl
+            .find("normalize_runtime_bash_command_for_boundary(")
+            .expect("runtime Bash policy routes through the shared normalizer");
+        policy_impl
+            .find("RuntimeBashPolicyDecision::for_step(")
+            .expect("runtime Bash policy call constructs decisions through the normalized path");
         let normalized_set = implementation[policy_call..execute_index]
             .find("set_bash_command(&mut call.arguments, normalized_command)")
             .expect("normalized verifier command is written back before execution");
+        implementation[policy_call..execute_index]
+            .find("execute_split_runtime_bash(")
+            .expect("runtime Bash shell-control split executes through bounded segments");
         let substitute_set = implementation[policy_call..execute_index]
             .find("set_bash_command(&mut call.arguments, substitute)")
             .expect("repetition substitution is written back before repeated-error bail");

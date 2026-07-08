@@ -195,7 +195,7 @@ where
     }
 }
 
-fn format_outcome(outcome: &BashOutcome) -> String {
+pub fn format_outcome(outcome: &BashOutcome) -> String {
     format!(
         "outcome: {:?}\nstatus: {}\nelapsed_ms: {}\nsummary: {}\nstdout:\n{}\nstderr:\n{}",
         outcome.kind,

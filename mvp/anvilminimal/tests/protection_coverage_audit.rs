@@ -85,6 +85,10 @@ fn protection_coverage_table_rejects_unregistered_mock_sites() {
             r#"fn f(root: &std::path::Path) { let _ = crate::minimal_loop::verifier_env::run_checked("npm run build", root, false); }"#,
         ),
         (
+            "src/new_runtime_bash.rs",
+            r#"fn runtime_bash_policy_decision(command: &str) { let _ = crate::planner::verify::diagnose_verify_command(command); }"#,
+        ),
+        (
             "src/new_compile.rs",
             r#"fn f(excerpt: &str) { let _ = crate::minimal_loop::build_verifier::parse_compile_errors(excerpt); }"#,
         ),
@@ -172,14 +176,30 @@ fn audit_verify_normalization_boundary(corpus: &AuditCorpus, rule: &ProtectionRu
     if loop_run.contains("registry.execute_with_cancel(")
         && !(loop_run.contains("runtime_bash_policy_decision(")
             && loop_run.contains("set_bash_command(")
-            && loop_run.contains("normalize_verify_command("))
+            && loop_run.contains("normalize_runtime_bash_command_for_boundary(")
+            && loop_run.contains("execute_split_runtime_bash("))
     {
         violations.push(
             "in-session tool execution boundary is not routed through normalizer".to_string(),
         );
     }
+    if loop_run.contains("fn runtime_bash_policy_decision(")
+        && !loop_run.contains("normalize_runtime_bash_command_for_boundary(")
+    {
+        violations
+            .push("runtime_bash_policy entry point bypasses shared runtime normalizer".to_string());
+    }
     for (path, text) in corpus.rust_files() {
         for (line_index, line) in text.lines().enumerate() {
+            if line.contains("runtime_bash_policy_decision(")
+                && !rule.allowlist.contains(&path.as_str())
+                && !line.trim_start().starts_with("///")
+            {
+                violations.push(format!(
+                    "{path}:{} runtime bash policy entry point is not registered",
+                    line_index + 1
+                ));
+            }
             let calls_executor = line.contains("verifier_env::run_checked(")
                 || (path == "src/minimal_loop/verifier_env.rs"
                     && line.contains("pub fn run_checked("))

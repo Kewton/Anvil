@@ -170,6 +170,35 @@ impl std::fmt::Display for NormalizedVerifyCommand {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeCommandConnector {
+    Always,
+    AndThen,
+}
+
+impl RuntimeCommandConnector {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => ";",
+            Self::AndThen => "&&",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeNormalizedCommandSegment {
+    pub connector: RuntimeCommandConnector,
+    pub command: NormalizedVerifyCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeNormalizedCommandPlan {
+    pub normalized_command: String,
+    pub normalization_kind: &'static str,
+    pub normalization_reason: String,
+    pub segments: Vec<RuntimeNormalizedCommandSegment>,
+}
+
 impl VerificationReport {
     pub fn pass() -> Self {
         Self {
@@ -1079,6 +1108,72 @@ pub fn normalize_planner_verify_command(command: &str) -> anyhow::Result<Vec<Str
     normalize_planner_shell_and_verify_command(trimmed)
 }
 
+pub fn normalize_runtime_bash_command_for_boundary(
+    command: &str,
+    root: &Path,
+) -> anyhow::Result<RuntimeNormalizedCommandPlan> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{}", VerifyCommandViolationKind::Empty.message());
+    }
+    let mut current = trimmed.to_string();
+    let mut reasons = Vec::new();
+    let mut kinds = Vec::new();
+    if let Some(repair) = normalize_verify_command_for_oracle_repair_with_root(trimmed, root)
+        && repair.normalized != current
+    {
+        current = repair.normalized;
+        reasons.push(repair.reason);
+        kinds.push(repair.kind);
+    }
+    if let Ok(normalized) = normalize_verify_command(&current) {
+        let normalized_command = normalized.as_str().to_string();
+        if normalized_command != current && kinds.is_empty() {
+            kinds.push("shared_verify_normalized");
+        }
+        return Ok(RuntimeNormalizedCommandPlan {
+            normalized_command,
+            normalization_kind: kinds.last().copied().unwrap_or(""),
+            normalization_reason: reasons.join("; "),
+            segments: vec![RuntimeNormalizedCommandSegment {
+                connector: RuntimeCommandConnector::Always,
+                command: normalized,
+            }],
+        });
+    }
+    let segments = split_runtime_shell_segments(&current)?;
+    if segments.len() <= 1 {
+        let normalized = normalize_verify_command(&current)?;
+        return Ok(RuntimeNormalizedCommandPlan {
+            normalized_command: normalized.as_str().to_string(),
+            normalization_kind: kinds.last().copied().unwrap_or(""),
+            normalization_reason: reasons.join("; "),
+            segments: vec![RuntimeNormalizedCommandSegment {
+                connector: RuntimeCommandConnector::Always,
+                command: normalized,
+            }],
+        });
+    }
+    let mut normalized_segments = Vec::new();
+    for (connector, segment) in segments {
+        let normalized = normalize_verify_command(segment.trim())?;
+        normalized_segments.push(RuntimeNormalizedCommandSegment {
+            connector,
+            command: normalized,
+        });
+    }
+    let normalized_command = join_runtime_shell_segments(&normalized_segments);
+    if normalized_command != trimmed {
+        reasons.push("shell_control_split: runtime Bash command split into bounded segments with original short-circuit semantics".to_string());
+    }
+    Ok(RuntimeNormalizedCommandPlan {
+        normalized_command,
+        normalization_kind: "shell_control_split",
+        normalization_reason: reasons.join("; "),
+        segments: normalized_segments,
+    })
+}
+
 pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
     let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
@@ -1839,6 +1934,87 @@ fn normalize_planner_shell_and_verify_command(command: &str) -> anyhow::Result<V
     Ok(out)
 }
 
+fn split_runtime_shell_segments(
+    command: &str,
+) -> anyhow::Result<Vec<(RuntimeCommandConnector, String)>> {
+    let bytes = command.as_bytes();
+    let mut single = false;
+    let mut double = false;
+    let mut start = 0usize;
+    let mut connector = RuntimeCommandConnector::Always;
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' if !double => {
+                single = !single;
+                index += 1;
+            }
+            b'"' if !single => {
+                double = !double;
+                index += 1;
+            }
+            b'&' if !single && !double => {
+                if index + 1 < bytes.len() && bytes[index + 1] == b'&' {
+                    push_runtime_shell_segment(&mut out, connector, &command[start..index])?;
+                    connector = RuntimeCommandConnector::AndThen;
+                    index += 2;
+                    start = index;
+                } else {
+                    anyhow::bail!(
+                        "{}",
+                        VerifyCommandViolationKind::ShellControlSyntax.message()
+                    );
+                }
+            }
+            b';' if !single && !double => {
+                push_runtime_shell_segment(&mut out, connector, &command[start..index])?;
+                connector = RuntimeCommandConnector::Always;
+                index += 1;
+                start = index;
+            }
+            _ => index += 1,
+        }
+    }
+    if single || double {
+        anyhow::bail!(
+            "{}",
+            VerifyCommandViolationKind::ShellControlSyntax.message()
+        );
+    }
+    push_runtime_shell_segment(&mut out, connector, &command[start..])?;
+    Ok(out)
+}
+
+fn push_runtime_shell_segment(
+    out: &mut Vec<(RuntimeCommandConnector, String)>,
+    connector: RuntimeCommandConnector,
+    segment: &str,
+) -> anyhow::Result<()> {
+    let segment = segment.trim();
+    if segment.is_empty() {
+        anyhow::bail!(
+            "{}",
+            VerifyCommandViolationKind::ShellControlSyntax.message()
+        );
+    }
+    out.push((connector, segment.to_string()));
+    Ok(())
+}
+
+fn join_runtime_shell_segments(segments: &[RuntimeNormalizedCommandSegment]) -> String {
+    let mut out = String::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+            out.push_str(segment.connector.as_str());
+            out.push(' ');
+        }
+        out.push_str(segment.command.as_str());
+    }
+    out
+}
+
 fn has_unsupported_shell_control_for_planner_split(command: &str) -> bool {
     if command.contains("$(") {
         return true;
@@ -2351,6 +2527,42 @@ mod tests {
             normalize_planner_verify_command("npm run build && test -f package.json").unwrap();
         assert_eq!(normalized, vec!["npm run build", "test -f package.json"]);
         assert!(validate_verify_command("npm run build && test -f package.json").is_err());
+    }
+
+    #[test]
+    fn runtime_bash_normalizer_splits_shell_control_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = normalize_runtime_bash_command_for_boundary(
+            r#"ls -R src/app && node -p "require('./package.json').scripts.build"; test -f package.json"#,
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.normalization_kind, "shell_control_split");
+        assert_eq!(plan.segments.len(), 3);
+        assert_eq!(plan.segments[0].connector, RuntimeCommandConnector::Always);
+        assert_eq!(plan.segments[1].connector, RuntimeCommandConnector::AndThen);
+        assert_eq!(plan.segments[2].connector, RuntimeCommandConnector::Always);
+        assert_eq!(plan.segments[0].command.as_str(), "ls -R src/app");
+        assert_eq!(
+            plan.segments[1].command.as_str(),
+            r#"node -p "require('./package.json').scripts.build""#
+        );
+        assert_eq!(plan.segments[2].command.as_str(), "test -f package.json");
+    }
+
+    #[test]
+    fn runtime_bash_normalizer_rejects_semantic_pipe_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        let err =
+            normalize_runtime_bash_command_for_boundary("npm run build | grep error", dir.path())
+                .unwrap_err()
+                .to_string();
+
+        assert!(
+            err.contains("verify command may not use shell control syntax"),
+            "{err}"
+        );
     }
 
     #[test]
