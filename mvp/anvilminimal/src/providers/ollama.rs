@@ -13,7 +13,8 @@ use super::{AssistantReply, ChatClient};
 pub struct OllamaClient {
     base_url: String,
     http: Client,
-    max_predict: usize,
+    request_options: Value,
+    keep_alive: &'static str,
     retries: usize,
 }
 
@@ -31,7 +32,10 @@ impl OllamaClient {
         Ok(Self {
             base_url,
             http,
-            max_predict,
+            request_options: json!({
+                "num_predict": max_predict,
+            }),
+            keep_alive: "10m",
             retries,
         })
     }
@@ -73,15 +77,7 @@ impl ChatClient for OllamaClient {
         tools: &[ToolSpec],
         native_tools_enabled: bool,
     ) -> anyhow::Result<AssistantReply> {
-        let mut body = json!({
-            "model": model,
-            "messages": ollama_messages(messages),
-            "stream": false,
-            "options": { "num_predict": self.max_predict },
-        });
-        if native_tools_enabled && !tools.is_empty() {
-            body["tools"] = json!(tools);
-        }
+        let body = self.chat_request_body(model, messages, tools, native_tools_enabled);
         for attempt in 0..=self.retries {
             match self
                 .http
@@ -105,6 +101,28 @@ impl ChatClient for OllamaClient {
             }
         }
         unreachable!("retry loop always returns or bails")
+    }
+}
+
+impl OllamaClient {
+    fn chat_request_body(
+        &self,
+        model: &str,
+        messages: &[ConversationMessage],
+        tools: &[ToolSpec],
+        native_tools_enabled: bool,
+    ) -> Value {
+        let mut body = json!({
+            "model": model,
+            "messages": ollama_messages(messages),
+            "stream": false,
+            "keep_alive": self.keep_alive,
+            "options": self.request_options.clone(),
+        });
+        if native_tools_enabled && !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
+        body
     }
 }
 
@@ -210,6 +228,7 @@ pub fn parse_chat_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::ConversationMessage;
 
     #[test]
     fn parses_tags() {
@@ -217,5 +236,26 @@ mod tests {
             parse_tags_response(r#"{"models":[{"name":"m"}]}"#).unwrap(),
             vec!["m"]
         );
+    }
+
+    #[test]
+    fn request_body_is_stable_and_keeps_alive() {
+        let client = OllamaClient::new("http://localhost".to_string(), 1, 42, 0).unwrap();
+        let messages = vec![ConversationMessage::user("hello")];
+        let tools: Vec<ToolSpec> = Vec::new();
+        let first = client.chat_request_body("m", &messages, &tools, false);
+        let second = client.chat_request_body("m", &messages, &tools, false);
+
+        assert_eq!(first, second);
+        assert_eq!(first.get("keep_alive").and_then(Value::as_str), Some("10m"));
+        assert_eq!(
+            first
+                .get("options")
+                .and_then(Value::as_object)
+                .and_then(|options| options.get("num_predict"))
+                .and_then(Value::as_u64),
+            Some(42)
+        );
+        assert!(first.get("tools").is_none());
     }
 }

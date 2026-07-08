@@ -93,6 +93,7 @@ impl TimeProfile {
             } else {
                 Value::Null
             },
+            "cache_proxy_prompt_eval_over_estimated_prompt_tokens": self.tokens.cache_proxy_ratio_percent().map(Value::from).unwrap_or(Value::Null),
             "eval_count": if self.tokens.eval_observed {
                 Value::from(self.tokens.eval_count)
             } else {
@@ -125,6 +126,9 @@ impl TimeProfile {
                 observed_u64(self.tokens.eval_observed, self.tokens.eval_count),
             ));
         }
+        if let Some(cache_proxy_percent) = self.tokens.cache_proxy_ratio_percent() {
+            line.push_str(&format!(" · cache proxy {}%", cache_proxy_percent));
+        }
         line
     }
 
@@ -151,6 +155,15 @@ impl TimeProfile {
             ));
         }
         lines.join("\n")
+    }
+}
+
+impl TokenTotals {
+    pub fn cache_proxy_ratio_percent(&self) -> Option<u64> {
+        if !self.prompt_eval_observed || self.estimated_prompt_tokens_sent == 0 {
+            return None;
+        }
+        Some(self.prompt_eval_count.saturating_mul(100) / self.estimated_prompt_tokens_sent)
     }
 }
 
@@ -429,6 +442,7 @@ mod tests {
         let summary = profile.summary_line();
         assert!(summary.contains("Time profile: provider 56%"));
         assert!(summary.contains("tokens prompt_eval=2000 eval=300"));
+        assert!(summary.contains("cache proxy 66%"));
         let table = profile.phase_table_markdown();
         assert!(table.contains("| setup | 30s | 10s | 20s | 0s | 0s | 0s |"));
         assert!(table.contains("| play | 42s | 30s | 0s | 0s | 12s | 0s |"));

@@ -560,6 +560,12 @@ fn emit_provider_turn_duration(config: &Config, telemetry: ProviderTurnTelemetry
         "eval_count": telemetry.eval_count,
         "finish_reason": telemetry.finish_reason.as_str(),
     });
+    if let Some(prompt_eval_count) = telemetry.prompt_eval_count
+        && telemetry.estimated_prompt_tokens > 0
+    {
+        value["cache_proxy_prompt_eval_over_estimated_prompt_tokens"] =
+            json!(prompt_eval_count as f64 / telemetry.estimated_prompt_tokens as f64);
+    }
     if telemetry.aborted_by_user {
         value["classification"] = json!("aborted_by_user");
     }
