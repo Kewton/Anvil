@@ -125,7 +125,11 @@ impl ToolRegistry {
                     .get("replace_all")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                crate::tools::edit::run(&path, old, new, replace_all)
+                let output = crate::tools::edit::run(&path, old, new, replace_all)?;
+                if output.contains("edit_anchor_salvaged") {
+                    emit_edit_anchor_salvaged(context, &normalized, &output);
+                }
+                Ok(output)
             }
             "Glob" => {
                 let pattern = required_string(arguments, "pattern")?;
@@ -184,6 +188,18 @@ fn emit_path_normalized(context: &ToolContext, tool: &str, original: &str, norma
             "tool": tool,
             "original": original,
             "normalized": normalized,
+        }),
+    );
+}
+
+fn emit_edit_anchor_salvaged(context: &ToolContext, path: &str, output: &str) {
+    eval_events::emit(
+        context.eval_events_path.as_deref(),
+        json!({
+            "event": "edit_anchor_salvaged",
+            "path": path,
+            "method": "whitespace_normalized_unique_region",
+            "result": eval_events::body_snippet(output),
         }),
     );
 }
@@ -367,6 +383,40 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a/b.txt")).unwrap(),
             "ok"
         );
+    }
+
+    #[test]
+    fn edit_anchor_salvage_emits_telemetry() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(dir.path().join("a.txt"), "const  x = 1;\n").unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+        };
+
+        let output = registry
+            .execute(
+                "Edit",
+                &json!({"path":"a.txt","old_string":"const x = 1;","new_string":"const x = 2;"}),
+                &context,
+            )
+            .unwrap();
+
+        assert!(output.contains("edit_anchor_salvaged"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "const x = 2;\n"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"edit_anchor_salvaged""#));
+        assert!(event_text.contains(r#""path":"a.txt""#));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -765,6 +765,7 @@ pub(crate) fn run_session_with_outcome_with_options(
     let mut artifact_recovery_state = ArtifactRecoveryState::default();
     let mut verify_repair_state = VerifyRepairState::default();
     let mut recoverable_tool_error_state = RecoverableToolErrorState::default();
+    let mut edit_anchor_failures_by_path: BTreeMap<String, usize> = BTreeMap::new();
     let mut malformed_native_tool_feedbacks = 0usize;
     let step_capability_gate = StepCapabilityGate::from_prompt(user_prompt, &options);
     let iteration_limit = if contract_runtime_enabled && completion_contract.is_some() {
@@ -1403,7 +1404,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                                 decision.policy_error_kind
                             );
                         }
-                        let feedback = recoverable_tool_feedback(&call.name, &policy_error);
+                        let feedback = recoverable_tool_feedback(&call.name, &policy_error, None);
                         session.messages.push(ConversationMessage::tool_result(
                             call.name,
                             Some(call.id),
@@ -1497,7 +1498,20 @@ pub(crate) fn run_session_with_outcome_with_options(
                         );
                         bail!("recoverable tool error repeated: {kind}");
                     }
-                    recoverable_tool_feedback(&call.name, &err)
+                    let edit_anchor_failure = if kind == "edit_anchor_not_found" {
+                        edit_anchor_tracking_path(&config.workspace_root, &call.arguments).map(
+                            |path| {
+                                let count = edit_anchor_failures_by_path
+                                    .entry(path.clone())
+                                    .or_default();
+                                *count += 1;
+                                (path, *count)
+                            },
+                        )
+                    } else {
+                        None
+                    };
+                    recoverable_tool_feedback(&call.name, &err, edit_anchor_failure)
                 }
                 Err(err) => {
                     eval_events::emit(
@@ -3924,16 +3938,38 @@ fn looks_like_action_prompt(content: &str) -> bool {
         || lower.contains("追加")
 }
 
-fn recoverable_tool_feedback(name: &str, err: &anyhow::Error) -> String {
+fn recoverable_tool_feedback(
+    name: &str,
+    err: &anyhow::Error,
+    edit_anchor_failure: Option<(String, usize)>,
+) -> String {
     let err_text = err.to_string();
     if err_text.contains("verify_command_policy_error") {
         return format!(
             "Tool call `{name}` was rejected by deterministic verify policy: {err_text}. Allowed alternatives: use one bounded verifier command such as `npm run build`, `cargo test`, `python -m compileall -q src`, or `test -f relative/path`; move dependency installation or dev-server startup to setup/runtime phases, not verify."
         );
     }
+    if let Some((path, count)) = edit_anchor_failure {
+        let mut feedback = format!(
+            "Tool call `{name}` was rejected with a recoverable validation error: {err_text}. Retry with the Edit tool using the deterministic best-match excerpt and re-anchor mandate from the error."
+        );
+        if count >= 2 {
+            feedback.push_str(&format!(
+                " This is edit anchor failure #{count} for `{path}` in this step; switch to the Write tool and write the complete corrected file content for that one file."
+            ));
+        }
+        return feedback;
+    }
     format!(
         "Tool call `{name}` was rejected with a recoverable validation error: {err}. Retry with the same tool or another available tool using a valid JSON object that matches the tool schema."
     )
+}
+
+fn edit_anchor_tracking_path(root: &Path, arguments: &serde_json::Value) -> Option<String> {
+    let raw = arguments.get("path")?.as_str()?;
+    let path = resolve_optional_existing(root, raw).ok()?;
+    let root = root.canonicalize().ok()?;
+    Some(crate::tools::path_guard::relative_display(&root, &path))
 }
 
 fn changed_path_from_call(root: &Path, arguments: &serde_json::Value) -> Option<String> {
@@ -6015,7 +6051,50 @@ export default function Page(){
                     content: String::new(),
                     tool_calls: vec![ToolCall::new(
                         "Edit",
+                        json!({"path":"a.txt","old_string":"actual missing","new_string":"replacement"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("final")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let result = run_session(
+            &mut fake,
+            &mut session,
+            "Summarize workspace",
+            &config(dir.path().to_path_buf()),
+        )
+        .unwrap();
+        assert_eq!(result, "final");
+        assert!(session.messages.iter().any(|message| message.role == "tool"
+            && message.content.contains("edit_anchor_not_found")
+            && message.content.contains("Deterministic best-match region")
+            && message.content.contains("actual content")
+            && message.content.contains("Re-anchor mandate")));
+    }
+
+    #[test]
+    fn repeated_edit_anchor_failures_on_same_file_prompt_full_file_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "actual content\n").unwrap();
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Edit",
                         json!({"path":"a.txt","old_string":"missing anchor","new_string":"replacement"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Edit",
+                        json!({"path":"a.txt","old_string":"other missing anchor","new_string":"replacement"}),
                     )],
                     prompt_tokens: None,
                     completion_tokens: None,
@@ -6034,7 +6113,12 @@ export default function Page(){
         assert_eq!(result, "final");
         assert!(
             session.messages.iter().any(|message| message.role == "tool"
-                && message.content.contains("edit_anchor_not_found"))
+                && message.content.contains("anchor failure #2")
+                && message.content.contains("Write tool")
+                && message.content.contains("complete corrected file content")
+                && message.content.contains("`a.txt`")),
+            "{:?}",
+            session.messages
         );
     }
 
