@@ -566,7 +566,7 @@ fn verify_setup_dependency_state_with_setup_observed_inner(
                 npm_program,
                 offline,
             );
-        record_build_lifecycle_result(&mut report, &requirement.command, &lifecycle);
+        record_build_lifecycle_result(root, &mut report, &requirement.command, &lifecycle);
         build_lifecycles.push(lifecycle);
     }
     (report, build_lifecycles)
@@ -615,7 +615,7 @@ fn verify_step_with_setup_observed_with_options(
                     npm_program,
                     offline,
                 );
-            let passed = record_build_lifecycle_result(&mut report, command, &lifecycle);
+            let passed = record_build_lifecycle_result(root, &mut report, command, &lifecycle);
             build_lifecycles.push(lifecycle);
             if passed {
                 continue;
@@ -640,7 +640,7 @@ fn verify_step_with_setup_observed_with_options(
                     npm_program,
                     offline,
                 );
-            let passed = record_build_lifecycle_result(&mut report, command, &lifecycle);
+            let passed = record_build_lifecycle_result(root, &mut report, command, &lifecycle);
             build_lifecycles.push(lifecycle);
             if passed {
                 continue;
@@ -697,7 +697,7 @@ fn verify_step_with_setup_observed_with_options(
                                 offline,
                             );
                         let passed =
-                            record_build_lifecycle_result(&mut report, command, &lifecycle);
+                            record_build_lifecycle_result(root, &mut report, command, &lifecycle);
                         build_lifecycles.push(lifecycle);
                         if passed {
                             continue;
@@ -983,6 +983,12 @@ fn handle_failed_verify_command(
             outcome.elapsed_ms,
         );
     }
+    if let Some(remedy) = invalid_semver_manifest_remedy(root, &formatted) {
+        return VerifyCommandRunResult::Failed {
+            command: command_text.to_string(),
+            reason: format!("command failed: {command_text}\n{remedy}\n{formatted}"),
+        };
+    }
     if !is_verify_command_tool_usage_error(command_text, &outcome) {
         return VerifyCommandRunResult::Failed {
             command: command_text.to_string(),
@@ -1058,6 +1064,173 @@ fn handle_failed_verify_command(
             reason: verify_command_false_negative_reason(command_text, &err.to_string()),
         },
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InvalidSemverManifestEntry {
+    name: String,
+    range: String,
+}
+
+fn invalid_semver_manifest_remedy(root: &Path, output: &str) -> Option<String> {
+    let entry = invalid_semver_manifest_entry(root, output)?;
+    let example = corrected_semver_example(&entry.range);
+    Some(format!(
+        "invalid_semver_manifest_entry: \"{}\": \"{}\" is not valid semver - use e.g. \"{}\"",
+        entry.name, entry.range, example
+    ))
+}
+
+fn invalid_semver_manifest_entry(root: &Path, output: &str) -> Option<InvalidSemverManifestEntry> {
+    let range = invalid_semver_range_from_output(output)?;
+    let name = manifest_dependency_name_for_range(root, &range)
+        .or_else(|| invalid_semver_name_from_output(output))?;
+    Some(InvalidSemverManifestEntry { name, range })
+}
+
+fn invalid_semver_range_from_output(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("invalid comparator")
+            || lower.contains("invalid version")
+            || lower.contains("invalid semver")
+            || lower.contains("not valid semver"))
+        {
+            continue;
+        }
+        if let Some(range) = quoted_semver_like_token(line) {
+            return Some(range);
+        }
+        if let Some((_, suffix)) = line.split_once(':')
+            && let Some(range) = suffix
+                .split_whitespace()
+                .find(|token| semver_like_token(token))
+        {
+            return Some(trim_semver_token(range));
+        }
+    }
+    None
+}
+
+fn invalid_semver_name_from_output(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("invalid comparator")
+            || lower.contains("invalid version")
+            || lower.contains("invalid semver")
+            || lower.contains("not valid semver"))
+        {
+            continue;
+        }
+        for token in line.split_whitespace() {
+            let token = token.trim_matches(|ch: char| {
+                matches!(ch, '"' | '\'' | '`' | ',' | ';' | ':' | '(' | ')')
+            });
+            if let Some((name, _)) = token.split_once('@')
+                && !name.is_empty()
+            {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn quoted_semver_like_token(line: &str) -> Option<String> {
+    for quote in ['"', '\'', '`'] {
+        let mut rest = line;
+        while let Some(start) = rest.find(quote) {
+            let after = &rest[start + quote.len_utf8()..];
+            let Some(end) = after.find(quote) else {
+                break;
+            };
+            let candidate = &after[..end];
+            if semver_like_token(candidate) {
+                return Some(trim_semver_token(candidate));
+            }
+            rest = &after[end + quote.len_utf8()..];
+        }
+    }
+    None
+}
+
+fn semver_like_token(token: &str) -> bool {
+    let trimmed = trim_semver_token(token);
+    let without_prefix = trimmed
+        .trim_start_matches('^')
+        .trim_start_matches('~')
+        .trim_start_matches(">=")
+        .trim_start_matches("<=")
+        .trim_start_matches('>')
+        .trim_start_matches('<')
+        .trim_start_matches('=');
+    !without_prefix.is_empty()
+        && without_prefix
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_digit())
+        && without_prefix.contains('.')
+}
+
+fn trim_semver_token(token: &str) -> String {
+    token
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | ',' | ';' | ':' | ')' | '(' | '[' | ']'
+            )
+        })
+        .to_string()
+}
+
+fn manifest_dependency_name_for_range(root: &Path, range: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(root.join("package.json")).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    for section in [
+        "dependencies",
+        "devDependencies",
+        "optionalDependencies",
+        "peerDependencies",
+    ] {
+        let Some(deps) = value.get(section).and_then(serde_json::Value::as_object) else {
+            continue;
+        };
+        for (name, value) in deps {
+            if value.as_str() == Some(range) {
+                return Some(name.clone());
+            }
+        }
+    }
+    None
+}
+
+fn corrected_semver_example(range: &str) -> String {
+    let prefix = range
+        .chars()
+        .take_while(|ch| matches!(ch, '^' | '~' | '>' | '<' | '='))
+        .collect::<String>();
+    let body = range.trim_start_matches(['^', '~', '>', '<', '=']);
+    let mut parts = body.split('.').collect::<Vec<_>>();
+    while parts.len() < 3 {
+        parts.push("0");
+    }
+    let normalized = parts
+        .into_iter()
+        .take(3)
+        .map(|part| {
+            let digits = part
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if digits.is_empty() {
+                "0".to_string()
+            } else {
+                digits
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    format!("{prefix}{normalized}")
 }
 
 fn handle_verify_command_timeout(
@@ -1235,6 +1408,7 @@ fn outcome_exit_code(outcome: &BashOutcome) -> Option<i32> {
 }
 
 fn record_build_lifecycle_result(
+    root: &Path,
     report: &mut VerificationReport,
     command: &str,
     lifecycle: &BuildVerifierLifecycleObservation,
@@ -1243,10 +1417,11 @@ fn record_build_lifecycle_result(
     match observation.status {
         BuildVerifierStatus::Passed => true,
         BuildVerifierStatus::DependencyMissing => {
-            report.push_dependency_missing(format!(
-                "dependency_setup_missing: {}",
-                dependency_lifecycle_report_reason(lifecycle)
-            ));
+            let reason = lifecycle_reason_with_invalid_semver_remedy(
+                root,
+                dependency_lifecycle_report_reason(lifecycle),
+            );
+            report.push_dependency_missing(format!("dependency_setup_missing: {}", reason));
             false
         }
         BuildVerifierStatus::PolicyRejected => {
@@ -1266,12 +1441,13 @@ fn record_build_lifecycle_result(
         BuildVerifierStatus::Failed => {
             let compile_errors = lifecycle.final_observation().compile_errors.clone();
             if compile_errors.is_empty() {
+                let reason = lifecycle_reason_with_invalid_semver_remedy(
+                    root,
+                    lifecycle_failure_with_setup_output(lifecycle),
+                );
                 report.push_command_failure(
                     command.to_string(),
-                    format!(
-                        "dependency_setup_lifecycle_failed: {}",
-                        lifecycle_failure_with_setup_output(lifecycle)
-                    ),
+                    format!("dependency_setup_lifecycle_failed: {reason}"),
                 );
             } else {
                 report.push_compile_errors(command.to_string(), compile_errors);
@@ -1298,6 +1474,14 @@ fn dependency_lifecycle_report_reason(lifecycle: &BuildVerifierLifecycleObservat
         return reason;
     }
     lifecycle.final_reason.clone()
+}
+
+fn lifecycle_reason_with_invalid_semver_remedy(root: &Path, reason: String) -> String {
+    if let Some(remedy) = invalid_semver_manifest_remedy(root, &reason) {
+        format!("{remedy}; {reason}")
+    } else {
+        reason
+    }
 }
 
 fn lifecycle_failure_with_setup_output(lifecycle: &BuildVerifierLifecycleObservation) -> String {
@@ -3391,6 +3575,111 @@ EOF\n\
                 .as_ref()
                 .is_some_and(|after| after.attempted)
         );
+    }
+
+    #[test]
+    fn verify_install_segment_substitutes_reconcile_then_runs_remaining_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/test/events.jsonl");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"next build"},"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"}}"#,
+        )
+        .unwrap();
+        let fake_npm = dir.path().join("fake-npm.sh");
+        write_executable(
+            &fake_npm,
+            "#!/bin/sh\n\
+             mkdir -p node_modules/.bin node_modules/next\n\
+             echo '{\"version\":\"14.2.0\"}' > node_modules/next/package.json\n\
+             cat > node_modules/.bin/npm <<'EOS'\n\
+             #!/bin/sh\n\
+             if [ \"$1\" = \"run\" ] && [ \"$2\" = \"build\" ]; then\n\
+               echo build-ok\n\
+               exit 0\n\
+             fi\n\
+             exit 2\n\
+             EOS\n\
+             chmod +x node_modules/.bin/npm\n\
+             touch node_modules/.bin/next\n\
+             touch package-lock.json\n\
+             exit 0\n",
+        );
+        let step = PlanStep {
+            id: "verify-build".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Verify build".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["npm install && npm run build".to_string()],
+        };
+
+        let (report, lifecycles) = verify_step_with_setup_observed_with_options(
+            dir.path(),
+            &step,
+            Some("nextjs"),
+            NodeDependencySetupAuthority::PlanSetupStep,
+            &fake_npm,
+            false,
+            Some(&events),
+        );
+
+        assert!(report.is_pass(), "{report:?}");
+        assert_eq!(lifecycles.len(), 1, "{lifecycles:?}");
+        assert_eq!(lifecycles[0].final_status, BuildVerifierStatus::Passed);
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"verify_install_substituted\""));
+        assert!(event_text.contains("\"trigger\":\"verify_segment\""));
+        assert!(event_text.contains("dependency installs are owned by the runtime"));
+    }
+
+    #[test]
+    fn pip_install_segment_substitutes_before_remaining_python_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.py"), "print('ok')\n").unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\ndependencies = []\n",
+        )
+        .unwrap();
+        let step = PlanStep {
+            id: "verify-python".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Verify Python".to_string(),
+            expected_paths: Vec::new(),
+            verify: vec!["pip install -e . && python -m compileall -q src".to_string()],
+        };
+
+        let report = verify_step_with_setup_observed_with_options(
+            dir.path(),
+            &step,
+            Some("python-cli"),
+            NodeDependencySetupAuthority::PlanSetupStep,
+            Path::new("npm"),
+            false,
+            None,
+        )
+        .0;
+
+        assert!(report.is_pass(), "{report:?}");
+    }
+
+    #[test]
+    fn invalid_semver_output_names_manifest_entry_and_corrected_example() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"react-markdown":"^8.0.C"}}"#,
+        )
+        .unwrap();
+        let output = "npm ERR! Invalid comparator: ^8.0.C\nnpm ERR! A complete log is available\n";
+
+        let remedy = invalid_semver_manifest_remedy(dir.path(), output).unwrap();
+
+        assert!(remedy.contains(r#""react-markdown": "^8.0.C" is not valid semver"#));
+        assert!(remedy.contains(r#"use e.g. "^8.0.0""#), "{remedy}");
     }
 
     #[test]
