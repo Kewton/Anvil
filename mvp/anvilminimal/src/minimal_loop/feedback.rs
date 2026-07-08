@@ -169,6 +169,18 @@ pub fn artifact_stagnation_for_target(
     )
 }
 
+pub fn read_only_stagnation(objective: &str, streak: usize) -> String {
+    format!(
+        "Inspection is sufficient - implement now via Write/Edit; remaining objective: {objective}. Your next response must mutate the workspace with exactly one Write or Edit tool call. read_only_streak={streak}"
+    )
+}
+
+pub fn read_only_stagnation_compact(objective: &str, streak: usize) -> String {
+    format!(
+        "Compact restatement: implement the requested change now. Objective: {objective}. Do not inspect again, do not answer in prose, and do not run verification. Use Write or Edit for the concrete implementation change. read_only_streak={streak}"
+    )
+}
+
 pub fn verify_repair_edit_required(
     signature: &str,
     attempt: usize,

@@ -133,6 +133,8 @@ impl std::error::Error for RunSessionError {}
 
 const ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD: usize = 3;
 const ARTIFACT_RECOVERY_ATTEMPT_LIMIT: usize = 3;
+const READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD: usize = 3;
+const READ_ONLY_STAGNATION_COMPACT_THRESHOLD: usize = 5;
 const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 1;
 const RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT: usize = 2;
 const MALFORMED_NATIVE_TOOL_RETRY_LIMIT: usize = 2;
@@ -821,6 +823,7 @@ pub(crate) fn run_session_with_outcome_with_options(
     let artifact_recovery_enabled =
         explicit_required_paths || (contract_runtime_enabled && completion_contract.is_some());
     let mut artifact_non_edit_streak = 0usize;
+    let mut read_only_streak = 0usize;
     let mut artifact_recovery_state = ArtifactRecoveryState::default();
     let mut verify_repair_state = VerifyRepairState::default();
     let mut recoverable_tool_error_state = RecoverableToolErrorState::default();
@@ -1362,6 +1365,7 @@ pub(crate) fn run_session_with_outcome_with_options(
         let mut batch_had_edit = false;
         let mut batch_changed_paths = Vec::new();
         let mut batch_non_edit_tools = 0usize;
+        let mut batch_all_read_only_tools = !tool_calls.is_empty();
         let mut batch_had_recoverable_tool_error = false;
         let missing_before_batch = missing_paths(&config.workspace_root, &required_paths);
         for mut call in tool_calls {
@@ -1370,6 +1374,9 @@ pub(crate) fn run_session_with_outcome_with_options(
                 bail!("interrupted by user");
             }
             let call_is_edit = matches!(call.name.as_str(), "Write" | "Edit");
+            if !matches!(call.name.as_str(), "Read" | "Glob" | "Grep") {
+                batch_all_read_only_tools = false;
+            }
             if call_is_edit {
                 batch_had_edit = true;
             } else {
@@ -1523,6 +1530,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     );
                     if matches!(call.name.as_str(), "Write" | "Edit") {
                         write_or_edit_seen = true;
+                        read_only_streak = 0;
                         if let Some(path) =
                             changed_path_from_call(&config.workspace_root, &call.arguments)
                         {
@@ -1607,6 +1615,7 @@ pub(crate) fn run_session_with_outcome_with_options(
         let batch_reduced_missing_paths = missing_after_batch.len() < missing_before_batch.len();
         if batch_reduced_missing_paths {
             artifact_non_edit_streak = 0;
+            read_only_streak = 0;
             artifact_recovery_state.record_action("required_artifact_progress");
         } else {
             artifact_non_edit_streak += if batch_non_edit_tools > 0 {
@@ -1621,6 +1630,24 @@ pub(crate) fn run_session_with_outcome_with_options(
             } else if batch_non_edit_tools > 0 {
                 artifact_recovery_state.record_action("non_edit_tool");
             }
+        }
+        if implement_step(&options)
+            && batch_all_read_only_tools
+            && !batch_had_recoverable_tool_error
+        {
+            read_only_streak = read_only_streak.saturating_add(1);
+            if let Some(feedback) = maybe_read_only_stagnation_feedback(
+                config.eval_events_path.as_deref(),
+                user_prompt,
+                read_only_streak,
+                &options,
+            ) {
+                last_blocking_reason = Some("model_stagnation:read_only_loop".to_string());
+                pending_feedback = Some(feedback);
+                continue;
+            }
+        } else if !batch_all_read_only_tools {
+            read_only_streak = 0;
         }
         if required_paths.is_empty()
             && options.allows_tool_only_step_completion()
@@ -1904,9 +1931,17 @@ pub(crate) fn run_session_with_outcome_with_options(
     } else {
         None
     };
+    let read_only_stagnation_reason =
+        if missing.is_empty() && read_only_streak >= READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD {
+            Some("model_stagnation:read_only_loop".to_string())
+        } else {
+            None
+        };
     let reason = if !non_scaffold_missing.is_empty() {
         "artifact_follow_through_exhausted".to_string()
     } else if let Some(reason) = &capability_exhaustion_reason {
+        reason.clone()
+    } else if let Some(reason) = &read_only_stagnation_reason {
         reason.clone()
     } else if missing.is_empty() {
         "loop_progress_exhausted".to_string()
@@ -1922,6 +1957,7 @@ pub(crate) fn run_session_with_outcome_with_options(
             "missing_evidence": exhaustion_context.missing_evidence.clone(),
             "missing_obligations": exhaustion_context.missing_obligations.clone(),
             "artifact_stagnation_feedback_count": artifact_stagnation_feedback_count,
+            "read_only_streak": read_only_streak,
             "verify_attempts": verify_attempts,
             "last_blocking_reason": last_blocking_reason,
             "last_provider_error": last_provider_error.as_deref().map(eval_events::body_snippet),
@@ -1939,6 +1975,10 @@ pub(crate) fn run_session_with_outcome_with_options(
             exhaustion_context.repair_target = Some("required_evidence_missing".to_string());
         }
         return Err(RunSessionError::new(reason, exhaustion_context).into());
+    }
+    if let Some(reason) = read_only_stagnation_reason {
+        let objective = read_only_objective_excerpt(user_prompt);
+        bail!("{reason}: objective: {objective}");
     }
     let blocker = if missing.is_empty() {
         last_blocking_reason
@@ -3732,6 +3772,45 @@ fn should_emit_artifact_recovery(
         && !contract.is_some_and(|contract| contract.dependency_precondition_active(root))
 }
 
+fn implement_step(options: &RunSessionOptions) -> bool {
+    options.step_kind == Some(RunSessionStepKind::Implement)
+}
+
+fn read_only_objective_excerpt(user_prompt: &str) -> String {
+    eval_events::body_snippet(user_prompt)
+}
+
+fn maybe_read_only_stagnation_feedback(
+    eval_events_path: Option<&Path>,
+    user_prompt: &str,
+    read_only_streak: usize,
+    options: &RunSessionOptions,
+) -> Option<String> {
+    let stage = match read_only_streak {
+        READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD => "intervention",
+        READ_ONLY_STAGNATION_COMPACT_THRESHOLD => "compact_restatement",
+        _ => return None,
+    };
+    let objective = read_only_objective_excerpt(user_prompt);
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "read_only_stagnation_feedback",
+            "stage": stage,
+            "read_only_streak": read_only_streak,
+            "objective": objective,
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+        }),
+    );
+    Some(if stage == "compact_restatement" {
+        super::feedback::read_only_stagnation_compact(&objective, read_only_streak)
+    } else {
+        super::feedback::read_only_stagnation(&objective, read_only_streak)
+    })
+}
+
 struct ArtifactRecoveryFeedbackContext<'a> {
     eval_events_path: Option<&'a Path>,
     enabled: bool,
@@ -4132,6 +4211,15 @@ mod tests {
         AssistantReply {
             content: String::new(),
             tool_calls: Vec::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
+        }
+    }
+
+    fn read_reply(path: &str) -> AssistantReply {
+        AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new("Read", json!({"path": path}))],
             prompt_tokens: None,
             completion_tokens: None,
         }
@@ -5566,6 +5654,126 @@ export default function Page(){
             RunStopReason::RequiredArtifactsSatisfiedAfterTool
         );
         assert!(dir.path().join("date-helper.js").is_file());
+    }
+
+    #[test]
+    fn implement_read_only_stagnation_nudges_then_write_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "facts").unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 4;
+        let mut fake = RecordingFake {
+            replies: vec![
+                Ok(read_reply("notes.md")),
+                Ok(read_reply("notes.md")),
+                Ok(read_reply("notes.md")),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path":"implemented.txt","content":"done\n"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+            requests: Vec::new(),
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Implement the requested helper after inspecting notes.md.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        assert!(dir.path().join("implemented.txt").is_file());
+        let events = event_values(&events);
+        let feedback = events
+            .iter()
+            .find(|event| {
+                event.get("event").and_then(Value::as_str) == Some("read_only_stagnation_feedback")
+            })
+            .expect("read-only feedback event");
+        assert_eq!(
+            feedback.get("stage").and_then(Value::as_str),
+            Some("intervention")
+        );
+        assert!(
+            fake.requests.iter().any(|request| {
+                request.iter().any(|message| {
+                    message
+                        .content
+                        .contains("Inspection is sufficient - implement now via Write/Edit")
+                })
+            }),
+            "{:#?}",
+            fake.requests
+        );
+    }
+
+    #[test]
+    fn implement_read_only_stagnation_exhausts_with_honest_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "facts").unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 2;
+        let mut fake = Fake {
+            replies: (0..5).map(|_| Ok(read_reply("notes.md"))).collect(),
+        };
+        let mut session = SessionSnapshot::new();
+        let err = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Implement the requested helper after inspecting notes.md.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("model_stagnation:read_only_loop"), "{err}");
+        assert!(err.contains("objective:"), "{err}");
+        assert!(!err.contains("no concrete blocker recorded"), "{err}");
+        let events = event_values(&events);
+        let stages = events
+            .iter()
+            .filter(|event| {
+                event.get("event").and_then(Value::as_str) == Some("read_only_stagnation_feedback")
+            })
+            .map(|event| {
+                event
+                    .get("stage")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stages, vec!["intervention", "compact_restatement"]);
+        let stop = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("loop_stop"))
+            .unwrap();
+        assert_eq!(
+            stop.get("reason").and_then(Value::as_str),
+            Some("model_stagnation:read_only_loop")
+        );
+        assert_eq!(
+            stop.get("read_only_streak").and_then(Value::as_u64),
+            Some(5)
+        );
     }
 
     #[test]
