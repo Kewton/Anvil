@@ -135,6 +135,12 @@ Measured evidence:
 
 Model-tier observations:
 
+New model-family entries follow the standard order in
+[model-probe.md](model-probe.md): model-probe card review, CLI and TOOL smoke
+checks, then the full scenario round with pre-committed landing criteria. The
+tier table cites the probe profile as dialect evidence, not as a capability
+benchmark or an automatic runtime configuration source.
+
 | configuration | sample | distribution / frontier | verdict |
 |---|---|---|---|
 | `gemini-3.5-flash` implementation/planner | Q1-final `test0704-999-Q1-62_001`, 8 runs | 6 full / 1 reasoned partial / 1 behavioral failed, 8/8 honest terminal states | Recommended implementation tier baseline. |

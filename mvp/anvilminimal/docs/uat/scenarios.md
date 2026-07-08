@@ -63,6 +63,15 @@ inside the configured 600-second provider-turn bound and produce progress
 telemetry. Budget or timeout failures must still terminate with concrete
 bounded handoff reasons.
 
+New-model acceptance order: before any scenario UAT for a new model family or
+version, run the model behavior probe documented in
+[../model-probe.md](../model-probe.md), review its card, then run two smoke
+checks (one CLI and one TOOL), then the full scenario round with landing
+criteria committed before measurement. The tier-table entry cites the probe
+profile. Re-run the probe when the model version or digest changes; for
+cloud-hosted models, re-run it before every measurement campaign because model
+identity is not pinned.
+
 ## Preflight Runbook
 
 1. Version check: `anvilminimal --version` must exactly match the intended

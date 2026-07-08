@@ -340,6 +340,7 @@ fn run_probe_session(
     let mut task_config = config.clone();
     task_config.model = config.model.clone();
     let options = probe_run_options(task.step_kind);
+    let message_count_before = session.messages.len();
     let result = run_session_with_outcome_with_options(
         client,
         session,
@@ -349,7 +350,7 @@ fn run_probe_session(
         &NOOP_UI,
         options,
     );
-    let raw_tool_calls = raw_tool_calls_from_session(session);
+    let raw_tool_calls = raw_tool_calls_from_session_since(session, message_count_before);
     let raw_commands = raw_commands_from_calls(&raw_tool_calls);
     let events = read_event_values(events_path);
     let new_events = events.into_iter().skip(events_before).collect::<Vec<_>>();
@@ -590,10 +591,14 @@ fn appended_repair_session() -> SessionSnapshot {
     session
 }
 
-fn raw_tool_calls_from_session(session: &SessionSnapshot) -> Vec<RawToolCallEvidence> {
+fn raw_tool_calls_from_session_since(
+    session: &SessionSnapshot,
+    message_count_before: usize,
+) -> Vec<RawToolCallEvidence> {
     session
         .messages
         .iter()
+        .skip(message_count_before)
         .filter(|message| message.role == "assistant")
         .flat_map(|message| message.tool_calls.iter())
         .map(raw_tool_call_from_call)
@@ -646,18 +651,19 @@ fn compute_metrics(tasks: &[ModelProbeTaskEvidence]) -> ModelProbeMetrics {
         task_count: tasks.len(),
         ..ModelProbeMetrics::default()
     };
-    let mut edit_calls = 0usize;
     let mut latencies = Vec::new();
     for task in tasks {
         if task.final_text.trim().is_empty() && task.raw_tool_calls.is_empty() {
             metrics.empty_response_count += 1;
         }
+        let task_edit_calls = task
+            .raw_tool_calls
+            .iter()
+            .filter(|call| call.name == "Edit")
+            .count();
         for call in &task.raw_tool_calls {
             if malformed_tool_call(call) {
                 metrics.malformed_tool_call_count += 1;
-            }
-            if call.name == "Edit" {
-                edit_calls += 1;
             }
             if let Some(path) = call.arguments.get("path").and_then(Value::as_str) {
                 metrics.path_argument_count += 1;
@@ -696,15 +702,17 @@ fn compute_metrics(tasks: &[ModelProbeTaskEvidence]) -> ModelProbeMetrics {
                 metrics.shell_control_count += 1;
             }
         }
+        let mut task_salvageable = 0usize;
+        let mut task_miss = 0usize;
         for event in &task.notable_events {
             match event.get("event").and_then(Value::as_str) {
-                Some("edit_anchor_salvaged") => metrics.edit_anchor.salvageable += 1,
+                Some("edit_anchor_salvaged") => task_salvageable += 1,
                 Some("tool_validation_error")
                     if event.get("name").and_then(Value::as_str) == Some("Edit")
                         && event.get("error_kind").and_then(Value::as_str)
                             == Some("edit_anchor_not_found") =>
                 {
-                    metrics.edit_anchor.miss += 1;
+                    task_miss += 1;
                 }
                 Some("context_truncation_suspected") => {
                     metrics.context_truncation_suspected_count += 1;
@@ -712,6 +720,12 @@ fn compute_metrics(tasks: &[ModelProbeTaskEvidence]) -> ModelProbeMetrics {
                 _ => {}
             }
         }
+        let task_salvageable = task_salvageable.min(task_edit_calls);
+        let remaining_edit_calls = task_edit_calls.saturating_sub(task_salvageable);
+        let task_miss = task_miss.min(remaining_edit_calls);
+        metrics.edit_anchor.salvageable += task_salvageable;
+        metrics.edit_anchor.miss += task_miss;
+        metrics.edit_anchor.exact += remaining_edit_calls.saturating_sub(task_miss);
         for event in &task.provider_turns {
             if let Some(value) = event.get("duration_ms").and_then(Value::as_u64) {
                 latencies.push(value);
@@ -757,9 +771,6 @@ fn compute_metrics(tasks: &[ModelProbeTaskEvidence]) -> ModelProbeMetrics {
             }
         }
     }
-    metrics.edit_anchor.exact = edit_calls
-        .saturating_sub(metrics.edit_anchor.salvageable)
-        .saturating_sub(metrics.edit_anchor.miss);
     metrics.absolute_path_rate = ratio(metrics.absolute_path_count, metrics.path_argument_count);
     metrics.shell_control_rate = ratio(metrics.shell_control_count, metrics.shell_command_count);
     metrics.empty_response_rate = ratio(metrics.empty_response_count, tasks.len());
@@ -806,13 +817,7 @@ fn analyze_json_schema_response(text: &str) -> JsonSchemaAnalysis {
 }
 
 fn follow_through(task: &ModelProbeTaskEvidence) -> String {
-    if !task.changed_paths.is_empty()
-        || task
-            .raw_tool_calls
-            .iter()
-            .any(|call| call.name == "Write" || call.name == "Edit")
-            && task.ok
-    {
+    if !task.changed_paths.is_empty() {
         "edited".to_string()
     } else if task.final_text.trim().is_empty() && task.raw_tool_calls.is_empty() {
         "empty".to_string()
@@ -1129,25 +1134,6 @@ fn render_map<T: std::fmt::Display>(map: &BTreeMap<String, T>) -> String {
         .join(", ")
 }
 
-#[allow(dead_code)]
-fn render_legacy_card(report: &ModelProbeReport) -> String {
-    format!(
-        "# Model Probe Card\n\n- Version: {}\n- Scope: {}\n- Executor: {:?} `{}`\n- Planner: {:?} `{}`\n- Tasks: {}\n- Profile JSON records raw tool calls and commands verbatim.\n- No-network guarantee: {}\n\nThis is a dialect indicator battery, not a capability benchmark.\n",
-        report.version,
-        report.scope,
-        report.executor.provider,
-        report.executor.model,
-        report.planner.provider,
-        report.planner.model,
-        report.metrics.task_count,
-        if report.no_network_guarantee {
-            "passed"
-        } else {
-            "failed"
-        }
-    )
-}
-
 fn default_model_profiles_dir(config: &Config) -> anyhow::Result<PathBuf> {
     if let Some(home) = std::env::var_os("HOME") {
         return Ok(PathBuf::from(home).join(".anvil/model-profiles"));
@@ -1198,4 +1184,310 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u64, u64) {
     let m = mp + if mp < 10 { 3 } else { -9 };
     let year = y + if m <= 2 { 1 } else { 0 };
     (year, m as u64, d as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use clap::Parser;
+    use serde_json::json;
+
+    use super::*;
+    use crate::cli::Cli;
+    use crate::tools::registry::ToolSpec;
+
+    #[test]
+    fn scripted_probe_run_computes_metrics_card_and_cleans_scratch() {
+        let cwd = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let cwd_arg = cwd.path().to_string_lossy().into_owned();
+        let mut config = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd_arg,
+            "--model",
+            "fixture-executor",
+            "--planner-model",
+            "fixture-planner",
+            "--model-probe",
+        ]))
+        .unwrap();
+        config.chat_timeout_secs = 5;
+        config.state_dir = output.path().join("state");
+
+        let mut planner = ScriptedProbeClient::new("planner");
+        let mut executor = ScriptedProbeClient::new("executor");
+        let result = run_with_output_dir(
+            &config,
+            &mut planner,
+            &mut executor,
+            output.path().join("profiles"),
+        )
+        .unwrap();
+
+        assert!(result.scratch_cleaned);
+        assert!(!result.scratch_path.exists());
+        assert!(result.profile_path.exists());
+        assert!(result.card_path.exists());
+
+        let report: ModelProbeReport =
+            serde_json::from_str(&fs::read_to_string(&result.profile_path).unwrap()).unwrap();
+        assert_eq!(report.version, MODEL_PROBE_VERSION);
+        assert_eq!(report.metrics.task_count, 10);
+        assert!(report.no_network_guarantee);
+        assert_eq!(report.metrics.absolute_path_count, 1);
+        assert!(report.metrics.absolute_path_rate > 0.0);
+        assert_eq!(report.metrics.corrupted_path_count, 1);
+        assert_eq!(report.metrics.shell_command_count, 2);
+        assert_eq!(report.metrics.shell_control_count, 2);
+        assert_eq!(report.metrics.shell_control_breakdown.and_and, 2);
+        assert_eq!(report.metrics.shell_control_breakdown.pipe, 1);
+        assert_eq!(report.metrics.shell_control_breakdown.redirect, 1);
+        assert_eq!(report.metrics.shell_control_breakdown.cd, 1);
+        assert_eq!(report.metrics.edit_anchor.salvageable, 1);
+        assert_eq!(report.metrics.edit_anchor.miss, 2);
+        assert_eq!(report.metrics.edit_anchor.exact, 1);
+        assert_eq!(report.metrics.repair_follow_through.appended, "tool_error");
+        assert_eq!(report.metrics.repair_follow_through.compact, "edited");
+        assert_eq!(report.metrics.regeneration_follow_through, "edited");
+        assert_eq!(report.metrics.json_response_count, 1);
+        assert_eq!(report.metrics.json_valid_count, 1);
+        assert_eq!(
+            report
+                .metrics
+                .missing_field_kinds
+                .get("descriptive:expected_result"),
+            Some(&1)
+        );
+        assert_eq!(report.metrics.malformed_tool_call_count, 1);
+        assert!(report.metrics.latency_ms.count >= 10);
+        assert!(report.metrics.token_telemetry.prompt_eval_count_total > 0);
+        assert!(report.metrics.token_telemetry.eval_count_total > 0);
+        assert_eq!(
+            report.metrics.token_telemetry.finish_reasons.get("stop"),
+            Some(&report.metrics.latency_ms.count)
+        );
+
+        let write_deep = report
+            .tasks
+            .iter()
+            .find(|task| task.id == "write_deep")
+            .unwrap();
+        assert!(write_deep.raw_tool_calls.iter().any(|call| {
+            call.arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.starts_with('/'))
+        }));
+        assert!(write_deep.raw_tool_calls.iter().any(|call| {
+            call.arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| path.contains("workdir"))
+        }));
+
+        let edit_own = report
+            .tasks
+            .iter()
+            .find(|task| task.id == "edit_own")
+            .unwrap();
+        assert_eq!(edit_own.raw_tool_calls.len(), 1);
+        assert_eq!(edit_own.raw_tool_calls[0].name, "Edit");
+
+        let card = fs::read_to_string(&result.card_path).unwrap();
+        for expected in [
+            "# Model Probe Card",
+            "- Scope: N=10 micro-tasks; dialect indicators, not a capability benchmark",
+            "- No-network guarantee: passed",
+            "- shell_control_breakdown: &&=2 ;=0 pipe=1 redirect=1 cd=1",
+            "- Compact-only repair follow-through => expect the 85 compact-session rung to matter.",
+            "- JSON/schema drift observed => planner schema repair and descriptive-field defaulting will be hot.",
+            "Probe results never auto-configure runtime behavior.",
+        ] {
+            assert!(card.contains(expected), "card missing {expected}\n{card}");
+        }
+    }
+
+    struct ScriptedProbeClient {
+        label: &'static str,
+        calls: Vec<String>,
+    }
+
+    impl ScriptedProbeClient {
+        fn new(label: &'static str) -> Self {
+            Self {
+                label,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl ChatClient for ScriptedProbeClient {
+        fn label(&self) -> &str {
+            self.label
+        }
+
+        fn supports_native_tools(&self, _model: &str) -> bool {
+            true
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            messages: &[ConversationMessage],
+            _tools: &[ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            let joined = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let task = task_id(&joined).unwrap_or("unknown");
+            let prior_same_task = self
+                .calls
+                .iter()
+                .filter(|call| task_id(call).is_some_and(|prior| prior == task))
+                .count();
+            self.calls.push(joined.clone());
+            let root = workspace_root_from_messages(messages);
+            if prior_same_task > 0 && task != "verify_json" {
+                return Ok(reply_text("no further tool action after probe feedback"));
+            }
+            Ok(match task {
+                "write_simple" => reply_with_tools(vec![ToolCall::new(
+                    "Write",
+                    json!({
+                        "path": "src/util/math.ts",
+                        "content": "export function add(a: number, b: number) {\n  const total = a + b;\n  return total;\n}\n",
+                    }),
+                )]),
+                "write_deep" => {
+                    let deep =
+                        "src/a/b/c/d/e/model-probe-long-file-name-with-many-segments-and-dashes.ts";
+                    reply_with_tools(vec![
+                        ToolCall::new(
+                            "Write",
+                            json!({
+                                "path": root.join(deep).to_string_lossy(),
+                                "content": "export const deepProbe = true;\n",
+                            }),
+                        ),
+                        ToolCall::new("Write", json!({"path": "workdir/corrupted.ts"})),
+                    ])
+                }
+                "edit_provided" => reply_with_tools(vec![ToolCall::new(
+                    "Edit",
+                    json!({
+                        "path": "src/provided/edit-target.txt",
+                        "old_string": "gamma   delta",
+                        "new_string": "gamma epsilon",
+                    }),
+                )]),
+                "edit_own" => reply_with_tools(vec![ToolCall::new(
+                    "Edit",
+                    json!({
+                        "path": "src/util/math.ts",
+                        "old_string": "export function add",
+                        "new_string": "export function sum",
+                    }),
+                )]),
+                "verify_exist" => reply_with_tools(vec![ToolCall::new(
+                    "Bash",
+                    json!({"command": "test -f src/util/math.ts && echo pass"}),
+                )]),
+                "verify_json" if prior_same_task == 0 => reply_with_tools(vec![ToolCall::new(
+                    "Bash",
+                    json!({"command": "cd . && node -p \"require('./package.json').scripts.build\" | cat > probe.txt"}),
+                )]),
+                "verify_json" => reply_text("verification attempt recorded after policy feedback"),
+                "repair_appended" => reply_with_tools(vec![ToolCall::new(
+                    "Edit",
+                    json!({
+                        "path": "src/repair/appended.ts",
+                        "old_string": "return 0;",
+                        "new_string": "return 1;",
+                    }),
+                )]),
+                "repair_compact" => reply_with_tools(vec![
+                    ToolCall::new(
+                        "Edit",
+                        json!({
+                            "path": "src/repair/compact.ts",
+                            "old_string": "return 2;",
+                            "new_string": "return 1;",
+                        }),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({
+                            "path": "src/repair/compact.ts",
+                            "content": "export function value() {\n  return 1;\n}\n",
+                        }),
+                    ),
+                ]),
+                "regenerate" => reply_with_tools(vec![ToolCall::new(
+                    "Write",
+                    json!({
+                        "path": "src/repair/regenerate.ts",
+                        "content": "export function value() {\n  return 1;\n}\n",
+                    }),
+                )]),
+                "json_schema" => reply_text(
+                    r#"{"steps":[{"instruction":"write math helper","kind":"implement","expected_paths":["src/util/math.ts"]}]}"#,
+                ),
+                other => anyhow::bail!("unhandled model-probe task {other}: {joined}"),
+            })
+        }
+    }
+
+    fn reply_with_tools(tool_calls: Vec<ToolCall>) -> AssistantReply {
+        AssistantReply {
+            content: String::new(),
+            tool_calls,
+            prompt_tokens: Some(120),
+            completion_tokens: Some(20),
+        }
+    }
+
+    fn reply_text(content: impl Into<String>) -> AssistantReply {
+        AssistantReply {
+            content: content.into(),
+            tool_calls: Vec::new(),
+            prompt_tokens: Some(90),
+            completion_tokens: Some(12),
+        }
+    }
+
+    fn task_id(text: &str) -> Option<&'static str> {
+        let marker = "MODEL PROBE task ";
+        let (_, after) = text.rsplit_once(marker)?;
+        [
+            "write_simple",
+            "write_deep",
+            "edit_provided",
+            "edit_own",
+            "verify_exist",
+            "verify_json",
+            "repair_appended",
+            "repair_compact",
+            "regenerate",
+            "json_schema",
+        ]
+        .into_iter()
+        .find(|task| after.starts_with(task))
+    }
+
+    fn workspace_root_from_messages(messages: &[ConversationMessage]) -> PathBuf {
+        messages
+            .iter()
+            .find_map(|message| {
+                let (_, after) = message.content.split_once("Work only inside workspace `")?;
+                let (path, _) = after.split_once('`')?;
+                Some(PathBuf::from(path))
+            })
+            .unwrap_or_else(std::env::temp_dir)
+    }
 }
