@@ -4,6 +4,18 @@ use anyhow::{Context, bail};
 
 const EXPECTED_PATH_FORM: &str = "use workspace-relative paths";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspacePathNormalizationKind {
+    AbsoluteInsideWorkspace,
+    RootAnchorSalvage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePathNormalization {
+    pub relative: String,
+    pub kind: WorkspacePathNormalizationKind,
+}
+
 pub fn validate_workspace_relative(raw: &str) -> anyhow::Result<()> {
     if raw.is_empty() {
         bail!("path is empty");
@@ -31,6 +43,13 @@ pub fn validate_workspace_relative(raw: &str) -> anyhow::Result<()> {
 }
 
 pub fn normalize_absolute_workspace_path(root: &Path, raw: &str) -> anyhow::Result<Option<String>> {
+    Ok(normalize_workspace_path(root, raw)?.map(|normalization| normalization.relative))
+}
+
+pub fn normalize_workspace_path(
+    root: &Path,
+    raw: &str,
+) -> anyhow::Result<Option<WorkspacePathNormalization>> {
     if raw.as_bytes().contains(&0) {
         bail!("path contains NUL byte; {EXPECTED_PATH_FORM}");
     }
@@ -45,19 +64,46 @@ pub fn normalize_absolute_workspace_path(root: &Path, raw: &str) -> anyhow::Resu
     let root = root
         .canonicalize()
         .context("workspace root is not accessible")?;
-    let canonical = canonicalize_with_missing_leaf(path).with_context(|| {
-        format!("path escapes workspace or parent is not accessible; {EXPECTED_PATH_FORM}")
-    })?;
-    ensure_inside(&root, &canonical)?;
-    let relative = canonical
-        .strip_prefix(&root)
-        .context("path escapes workspace")?;
-    let relative = relative.to_string_lossy().replace('\\', "/");
-    Ok(Some(if relative.is_empty() {
-        ".".to_string()
-    } else {
-        relative
-    }))
+    match canonicalize_with_missing_leaf(path) {
+        Ok(canonical) if ensure_inside(&root, &canonical).is_ok() => {
+            let relative = canonical
+                .strip_prefix(&root)
+                .context("path escapes workspace")?;
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            Ok(Some(WorkspacePathNormalization {
+                relative: if relative.is_empty() {
+                    ".".to_string()
+                } else {
+                    relative
+                },
+                kind: WorkspacePathNormalizationKind::AbsoluteInsideWorkspace,
+            }))
+        }
+        Ok(_) => {
+            if let Some(relative) = root_anchor_salvage(&root, path) {
+                Ok(Some(WorkspacePathNormalization {
+                    relative,
+                    kind: WorkspacePathNormalizationKind::RootAnchorSalvage,
+                }))
+            } else {
+                bail!("path escapes workspace; {EXPECTED_PATH_FORM}")
+            }
+        }
+        Err(err) => {
+            if let Some(relative) = root_anchor_salvage(&root, path) {
+                Ok(Some(WorkspacePathNormalization {
+                    relative,
+                    kind: WorkspacePathNormalizationKind::RootAnchorSalvage,
+                }))
+            } else {
+                Err(err).with_context(|| {
+                    format!(
+                        "path escapes workspace or parent is not accessible; {EXPECTED_PATH_FORM}"
+                    )
+                })
+            }
+        }
+    }
 }
 
 pub fn normalize_absolute_workspace_glob(root: &Path, raw: &str) -> anyhow::Result<Option<String>> {
@@ -215,6 +261,44 @@ fn strip_redundant_root_prefix(root: &Path, raw: &str) -> PathBuf {
     }
 }
 
+fn root_anchor_salvage(root: &Path, raw: &Path) -> Option<String> {
+    let root_components = normal_components(root);
+    let raw_components = normal_components(raw);
+    if root_components.is_empty() || raw_components.is_empty() {
+        return None;
+    }
+    let anchor_len = root_components.len().min(2);
+    let anchor = &root_components[root_components.len() - anchor_len..];
+    let mut matches = raw_components
+        .windows(anchor_len)
+        .enumerate()
+        .filter_map(|(index, window)| (window == anchor).then_some(index))
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return None;
+    }
+    let index = matches.pop()?;
+    let tail = &raw_components[index + anchor_len..];
+    let relative = if tail.is_empty() {
+        ".".to_string()
+    } else {
+        tail.join("/")
+    };
+    if validate_workspace_relative(&relative).is_err() {
+        return None;
+    }
+    Some(relative)
+}
+
+fn normal_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn missing_path_message(root: &Path, raw: &str) -> String {
     if let Some(candidate) = missing_path_candidate(root, raw) {
         format!(
@@ -288,6 +372,46 @@ mod tests {
         );
         let path = resolve_existing(dir.path(), &raw).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "ok");
+    }
+
+    #[test]
+    fn salvages_absolute_path_with_unique_root_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0708_013");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        let raw = dir
+            .path()
+            .join("share/work/commandagent_mvp/01/test0708_013/package.json");
+        let normalization = normalize_workspace_path(&root, raw.to_str().unwrap())
+            .unwrap()
+            .expect("salvaged");
+
+        assert_eq!(normalization.relative, "package.json");
+        assert_eq!(
+            normalization.kind,
+            WorkspacePathNormalizationKind::RootAnchorSalvage
+        );
+        let path = resolve_existing(&root, &normalization.relative).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "{}");
+    }
+
+    #[test]
+    fn root_anchor_salvage_requires_unique_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0708_013");
+        std::fs::create_dir_all(&root).unwrap();
+        let raw = dir
+            .path()
+            .join("share/01/test0708_013/archive/01/test0708_013/package.json");
+
+        let err = normalize_workspace_path(&root, raw.to_str().unwrap()).unwrap_err();
+
+        assert!(err.to_string().contains("path escapes workspace"), "{err}");
     }
 
     #[test]

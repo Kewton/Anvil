@@ -9,8 +9,8 @@ use crate::mode::ExecutionMode;
 
 use super::args_recovery::recover_tool_arguments;
 use super::path_guard::{
-    normalize_absolute_workspace_glob, normalize_absolute_workspace_path, resolve_existing,
-    resolve_for_create, resolve_optional_existing,
+    WorkspacePathNormalizationKind, normalize_absolute_workspace_glob, normalize_workspace_path,
+    resolve_existing, resolve_for_create, resolve_optional_existing,
 };
 use super::workspace_policy::{WorkspacePolicy, ensure_tool_path_allowed};
 
@@ -161,10 +161,17 @@ impl ToolRegistry {
 }
 
 fn normalize_path_arg(context: &ToolContext, tool: &str, raw: &str) -> anyhow::Result<String> {
-    match normalize_absolute_workspace_path(&context.root, raw)? {
-        Some(normalized) => {
-            emit_path_normalized(context, tool, raw, &normalized);
-            Ok(normalized)
+    match normalize_workspace_path(&context.root, raw)? {
+        Some(normalization) => {
+            match normalization.kind {
+                WorkspacePathNormalizationKind::AbsoluteInsideWorkspace => {
+                    emit_path_normalized(context, tool, raw, &normalization.relative);
+                }
+                WorkspacePathNormalizationKind::RootAnchorSalvage => {
+                    emit_path_salvaged(context, tool, raw, &normalization.relative);
+                }
+            }
+            Ok(normalization.relative)
         }
         None => Ok(raw.to_string()),
     }
@@ -188,6 +195,19 @@ fn emit_path_normalized(context: &ToolContext, tool: &str, original: &str, norma
             "tool": tool,
             "original": original,
             "normalized": normalized,
+        }),
+    );
+}
+
+fn emit_path_salvaged(context: &ToolContext, tool: &str, original: &str, normalized: &str) {
+    eval_events::emit(
+        context.eval_events_path.as_deref(),
+        json!({
+            "event": "tool_args_path_salvaged",
+            "tool": tool,
+            "original": original,
+            "normalized": normalized,
+            "method": "root_anchor_last_two_components",
         }),
     );
 }
@@ -448,6 +468,47 @@ mod tests {
         assert!(event_text.contains(r#""event":"tool_args_path_normalized""#));
         assert!(event_text.contains(r#""tool":"Write""#));
         assert!(event_text.contains(r#""normalized":"src/app/page.tsx""#));
+    }
+
+    #[test]
+    fn root_anchor_absolute_write_is_salvaged_and_audited() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0708_013");
+        std::fs::create_dir_all(&root).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+        };
+        let raw = dir
+            .path()
+            .join("share/work/commandagent_mvp/01/test0708_013/package.json");
+
+        registry
+            .execute(
+                "Write",
+                &json!({"path": raw.display().to_string(), "content":"{}"}),
+                &context,
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json")).unwrap(),
+            "{}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"tool_args_path_salvaged""#));
+        assert!(event_text.contains(r#""tool":"Write""#));
+        assert!(event_text.contains(r#""normalized":"package.json""#));
+        assert!(event_text.contains(r#""method":"root_anchor_last_two_components""#));
     }
 
     #[test]
