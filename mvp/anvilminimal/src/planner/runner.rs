@@ -106,6 +106,7 @@ const PLANNER_PROVIDER_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(80)
 const ULTRA_PLAN_GENERATION_ATTEMPTS: usize = 3;
 const FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS: usize = 2;
 const FINAL_ACCEPTANCE_COMPILE_NO_SNAPSHOT_EXTRA_ATTEMPTS: usize = 1;
+const FINAL_ACCEPTANCE_EVIDENCE_NO_CHANGE_EXTRA_ATTEMPTS: usize = 2;
 const FINAL_ACCEPTANCE_REPAIR_WALL_CLOCK_CAP: Duration = Duration::from_secs(240);
 const NEXTJS_DEV_SERVER_DEFAULT_PORT: u16 = 3011;
 const NEXTJS_DEV_SERVER_READY_TIMEOUT: Duration = Duration::from_secs(8);
@@ -5093,10 +5094,12 @@ pub fn run_ultra_plan_with_ui(
         let mut attempts_run = 0;
         let mut exhausted_reason = "bounded_repair_exhausted".to_string();
         let mut compile_no_source_change_count = 0usize;
+        let mut evidence_no_source_change_count = 0usize;
         let mut compile_no_snapshot_narrow_retry_used = false;
         let mut max_repair_attempts = FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS;
         for attempt in 1..=FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS
             + FINAL_ACCEPTANCE_COMPILE_NO_SNAPSHOT_EXTRA_ATTEMPTS
+                .max(FINAL_ACCEPTANCE_EVIDENCE_NO_CHANGE_EXTRA_ATTEMPTS)
         {
             if attempt > max_repair_attempts {
                 break;
@@ -5107,13 +5110,152 @@ pub fn run_ultra_plan_with_ui(
             }
             attempts_run = attempt;
             let repair_target = classify_repair_target(&acceptance_report);
+            let expected_paths =
+                final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
+            let evidence_zero_edit_eligible =
+                evidence_repair_zero_edit_eligible(&acceptance_report, repair_target);
+            if evidence_zero_edit_eligible
+                && evidence_no_source_change_count >= 3
+                && let Some(target_path) = final_acceptance_evidence_regeneration_target(
+                    &config.workspace_root,
+                    &plan.profile,
+                    &expected_paths,
+                )
+            {
+                let Some(target_abs) =
+                    writable_workspace_source_path(&config.workspace_root, &target_path)
+                else {
+                    emit_evidence_regeneration_event(
+                        config,
+                        false,
+                        false,
+                        Some(&target_path),
+                        &verification_missing_signals(&acceptance_report),
+                        &verification_missing_signals(&acceptance_report),
+                        &[],
+                        "target_path_rejected",
+                    );
+                    break;
+                };
+                let before_content = match std::fs::read(&target_abs) {
+                    Ok(content) => content,
+                    Err(err) => {
+                        emit_evidence_regeneration_event(
+                            config,
+                            false,
+                            false,
+                            Some(&target_path),
+                            &verification_missing_signals(&acceptance_report),
+                            &verification_missing_signals(&acceptance_report),
+                            &[],
+                            &format!("snapshot_read_error:{err}"),
+                        );
+                        break;
+                    }
+                };
+                let before_keys = verification_missing_signals(&acceptance_report);
+                let regeneration_prompt = build_final_acceptance_evidence_regeneration_prompt(
+                    &config.workspace_root,
+                    plan,
+                    &acceptance_report,
+                    &target_path,
+                );
+                let mut regeneration_session = SessionSnapshot::new();
+                let regeneration = run_final_acceptance_repair_with_ultra_session(
+                    execution,
+                    &mut regeneration_session,
+                    &regeneration_prompt,
+                    std::slice::from_ref(&target_path),
+                    &repair_config,
+                    ui,
+                );
+                let regeneration = match regeneration {
+                    Ok(regeneration) => regeneration,
+                    Err(err) => {
+                        let _ = std::fs::write(&target_abs, &before_content);
+                        emit_evidence_regeneration_event(
+                            config,
+                            true,
+                            false,
+                            Some(&target_path),
+                            &before_keys,
+                            &before_keys,
+                            &[],
+                            &format!(
+                                "regeneration_turn_error:{}",
+                                eval_events::body_snippet(&err.to_string())
+                            ),
+                        );
+                        exhausted_reason = "evidence_repair_no_source_change".to_string();
+                        break;
+                    }
+                };
+                clear_final_acceptance_browser_probe_evidence(config);
+                let (regenerated_report, regenerated_deterministic_remedies) =
+                    ultra_final_acceptance_report_with_deterministic_remedies(
+                        plan,
+                        config,
+                        attempt,
+                        &mut setup_authority_state,
+                    )?;
+                let after_keys = verification_missing_signals(&regenerated_report);
+                let resolved = resolved_missing_signals(&before_keys, &after_keys);
+                let mut regeneration_changed_paths = regeneration.changed_paths.clone();
+                regeneration_changed_paths.sort();
+                regeneration_changed_paths.dedup();
+                let accepted = !resolved.is_empty()
+                    && regenerated_report.compile_errors.is_empty()
+                    && regenerated_report.dependency_missing.is_empty();
+                emit_evidence_regeneration_event(
+                    config,
+                    true,
+                    accepted,
+                    Some(&target_path),
+                    &before_keys,
+                    &after_keys,
+                    &regeneration_changed_paths,
+                    if accepted {
+                        "accepted"
+                    } else if resolved.is_empty() {
+                        "missing_evidence_not_reduced"
+                    } else {
+                        "build_or_dependency_regressed"
+                    },
+                );
+                if accepted {
+                    push_context_items_capped(
+                        &mut ultra_context.created_or_changed_paths,
+                        &regeneration_changed_paths,
+                        ULTRA_CONTEXT_MAX_PATHS,
+                        &mut ultra_context.truncated,
+                    );
+                    push_context_items_capped(
+                        &mut ultra_context.last_repair_changed_paths,
+                        &regeneration_changed_paths,
+                        ULTRA_CONTEXT_MAX_PATHS,
+                        &mut ultra_context.truncated,
+                    );
+                    deterministic_remedies_applied = regenerated_deterministic_remedies;
+                    acceptance_report = regenerated_report;
+                    if acceptance_report.is_pass() {
+                        break;
+                    }
+                    continue;
+                }
+                let _ = std::fs::write(&target_abs, &before_content);
+                exhausted_reason = "evidence_repair_no_source_change".to_string();
+                break;
+            }
             let compile_reanchored_retry =
                 compile_no_source_change_count > 0 && !acceptance_report.compile_errors.is_empty();
+            let (repair_session_mode, evidence_reanchored_retry, evidence_compact_retry) =
+                evidence_repair_retry_mode(
+                    evidence_zero_edit_eligible,
+                    evidence_no_source_change_count,
+                );
             let compile_narrow_no_snapshot_retry = compile_no_snapshot_narrow_retry_used
                 && compile_no_source_change_count >= FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS
                 && !acceptance_report.compile_errors.is_empty();
-            let expected_paths =
-                final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
             let before_missing_keys = verification_missing_signals(&acceptance_report);
             let before_route_bound_paths =
                 route_bound_source_paths(&config.workspace_root, &plan.profile);
@@ -5124,7 +5266,7 @@ pub fn run_ultra_plan_with_ui(
                 &expected_paths,
                 &[],
             );
-            let repair_prompt = final_acceptance_repair_prompt(
+            let mut repair_prompt = final_acceptance_repair_prompt(
                 &config.workspace_root,
                 plan,
                 &acceptance_report,
@@ -5136,6 +5278,15 @@ pub fn run_ultra_plan_with_ui(
                 compile_reanchored_retry,
                 compile_narrow_no_snapshot_retry,
             );
+            if evidence_reanchored_retry {
+                repair_prompt = format!(
+                    "Evidence repair re-anchor mandate: the previous repair turn made no source changes. Inspection is complete; make a concrete Write/Edit change for the pending evidence keys now.\n\n{repair_prompt}"
+                );
+            } else if evidence_compact_retry {
+                repair_prompt = format!(
+                    "Repair session mode: compact.\nEvidence repair compact mandate: use a fresh, minimal context and make the concrete Write/Edit change for the pending evidence keys. Do not inspect only.\n\n{repair_prompt}"
+                );
+            }
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
@@ -5156,18 +5307,32 @@ pub fn run_ultra_plan_with_ui(
                     "max_iterations": repair_config.max_iterations,
                     "shared_execution_session": true,
                     "compile_reanchored_retry": compile_reanchored_retry,
+                    "evidence_reanchored_retry": evidence_reanchored_retry,
+                    "repair_session_mode": repair_session_mode,
                     "compile_narrow_no_snapshot_retry": compile_narrow_no_snapshot_retry,
                     "session_message_count": ultra_session.messages.len(),
                 }),
             );
-            let repair_outcome = match run_final_acceptance_repair_with_ultra_session(
-                execution,
-                &mut ultra_session,
-                &repair_prompt,
-                &expected_paths,
-                &repair_config,
-                ui,
-            ) {
+            let repair_outcome = match if evidence_compact_retry {
+                let mut compact_session = SessionSnapshot::new();
+                run_final_acceptance_repair_with_ultra_session(
+                    execution,
+                    &mut compact_session,
+                    &repair_prompt,
+                    &expected_paths,
+                    &repair_config,
+                    ui,
+                )
+            } else {
+                run_final_acceptance_repair_with_ultra_session(
+                    execution,
+                    &mut ultra_session,
+                    &repair_prompt,
+                    &expected_paths,
+                    &repair_config,
+                    ui,
+                )
+            } {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     let err_text = err.to_string();
@@ -5303,6 +5468,7 @@ pub fn run_ultra_plan_with_ui(
                     "iterations": repair_outcome.iterations,
                     "tool_calls": repair_outcome.tool_calls,
                     "shared_execution_session": true,
+                    "repair_session_mode": repair_session_mode,
                     "session_message_count": ultra_session.messages.len(),
                 }),
             );
@@ -5349,7 +5515,14 @@ pub fn run_ultra_plan_with_ui(
             }
             compile_no_source_change_count = 0;
             if actual_changed_paths.is_empty() {
-                exhausted_reason = "final_acceptance_repair_no_source_change".to_string();
+                if evidence_zero_edit_eligible {
+                    evidence_no_source_change_count += 1;
+                    exhausted_reason = "evidence_repair_no_source_change".to_string();
+                    max_repair_attempts = FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS
+                        + FINAL_ACCEPTANCE_EVIDENCE_NO_CHANGE_EXTRA_ATTEMPTS;
+                } else {
+                    exhausted_reason = "final_acceptance_repair_no_source_change".to_string();
+                }
                 eval_events::emit(
                     config.eval_events_path.as_deref(),
                     json!({
@@ -5358,15 +5531,21 @@ pub fn run_ultra_plan_with_ui(
                         "lifecycle_stage": "final_acceptance_repair",
                         "attempt": attempt,
                         "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
-                        "failure_kind": "final_acceptance_repair_no_source_change",
+                        "failure_kind": if evidence_zero_edit_eligible { "evidence_repair_no_source_change" } else { "final_acceptance_repair_no_source_change" },
                         "repair_target": repair_target.as_str(),
                         "reported_changed_paths": repair_outcome.changed_paths.clone(),
                         "route_bound_changed_paths": route_bound_changed_paths.clone(),
+                        "repair_session_mode": repair_session_mode,
+                        "evidence_no_source_change_count": evidence_no_source_change_count,
                         "reprobe_skipped": true,
                     }),
                 );
+                if evidence_zero_edit_eligible {
+                    continue;
+                }
                 break;
             }
+            evidence_no_source_change_count = 0;
             clear_final_acceptance_browser_probe_evidence(config);
             (acceptance_report, deterministic_remedies_applied) =
                 ultra_final_acceptance_report_with_deterministic_remedies(
@@ -12692,6 +12871,103 @@ fn changed_paths_only_target(changed_paths: &[String], target_path: &str) -> boo
     changed.len() == 1 && changed.contains(target_path)
 }
 
+fn evidence_repair_zero_edit_eligible(
+    report: &VerificationReport,
+    repair_target: RepairTarget,
+) -> bool {
+    report.compile_errors.is_empty()
+        && repair_target == RepairTarget::Implementation
+        && !verification_missing_signals(report).is_empty()
+}
+
+fn evidence_repair_retry_mode(
+    evidence_zero_edit_eligible: bool,
+    evidence_no_source_change_count: usize,
+) -> (&'static str, bool, bool) {
+    let reanchored_retry = evidence_zero_edit_eligible && evidence_no_source_change_count == 1;
+    let compact_retry = evidence_zero_edit_eligible && evidence_no_source_change_count >= 2;
+    (
+        if compact_retry { "compact" } else { "appended" },
+        reanchored_retry,
+        compact_retry,
+    )
+}
+
+fn final_acceptance_evidence_regeneration_target(
+    root: &Path,
+    profile: &str,
+    expected_paths: &[String],
+) -> Option<String> {
+    route_bound_source_paths(root, profile)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            expected_paths
+                .iter()
+                .find_map(|path| safe_source_rel_path(path))
+        })
+}
+
+fn build_final_acceptance_evidence_regeneration_prompt(
+    root: &Path,
+    plan: &UltraPlan,
+    report: &VerificationReport,
+    target_path: &str,
+) -> String {
+    let current_content = std::fs::read_to_string(root.join(target_path)).unwrap_or_default();
+    let pending_keys = verification_missing_signals(report);
+    format!(
+        "Repair session mode: compact regeneration.\n\
+Evidence-target regeneration for final acceptance.\n\n\
+Original ultra goal:\n{goal}\n\n\
+Pending evidence keys:\n{keys}\n\n\
+Current content of {target_path}:\n\
+```tsx\n\
+{current_content}\n\
+```\n\n\
+Regeneration mandate:\n\
+- This is generation, not incremental editing.\n\
+- Write the complete corrected file via the Write tool (full content, one file only): {target_path}.\n\
+- Add concrete route-bound implementation evidence for the pending keys without weakening build or verification.\n\
+- Do not modify any other file.\n\
+- Stop immediately after the Write tool call.",
+        goal = plan.goal,
+        keys = render_prompt_bullets(&pending_keys),
+        current_content = current_content,
+        target_path = target_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_evidence_regeneration_event(
+    config: &Config,
+    fired: bool,
+    accepted: bool,
+    target_path: Option<&str>,
+    before_keys: &[String],
+    after_keys: &[String],
+    changed_paths: &[String],
+    reason: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "repair_regeneration",
+            "lifecycle_stage": "final_acceptance_repair",
+            "fired": fired,
+            "accepted": accepted,
+            "target_path": target_path.unwrap_or_default(),
+            "reason": reason,
+            "before_missing_evidence": before_keys,
+            "after_missing_evidence": after_keys,
+            "resolved_missing_evidence": resolved_missing_signals(before_keys, after_keys),
+            "changed_paths": changed_paths,
+            "repair_session_mode": if fired { "compact_regeneration" } else { "" },
+            "regeneration_gate": "evidence_static_present_and_build_passes",
+        }),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_compile_regeneration_event(
     config: &Config,
@@ -15770,6 +16046,94 @@ dependencies = ["requests"]
             r#""deterministic_remedies_applied":["declared_dependencies_not_ready_install"]"#
         ));
         assert!(event_text.contains(r#""trigger":"declared_dependencies_not_ready""#));
+    }
+
+    #[test]
+    fn final_acceptance_evidence_regeneration_prompt_targets_route_bound_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){ return <button>Restart</button>; }\n",
+        )
+        .unwrap();
+        let mut report = VerificationReport::profile_failed(
+            "missing_required_evidence:restart_or_recoverable_state_evidence",
+        );
+        report.compile_errors.clear();
+        let plan = UltraPlan::deterministic(
+            "Create an interactive browser game with restart flow",
+            "nextjs",
+            "default",
+            "create",
+        );
+
+        assert!(evidence_repair_zero_edit_eligible(
+            &report,
+            RepairTarget::Implementation
+        ));
+        let target = final_acceptance_evidence_regeneration_target(
+            dir.path(),
+            "nextjs",
+            &["src/app/page.tsx".to_string()],
+        )
+        .expect("evidence regeneration target");
+        let prompt = build_final_acceptance_evidence_regeneration_prompt(
+            dir.path(),
+            &plan,
+            &report,
+            &target,
+        );
+
+        assert_eq!(target, "src/app/page.tsx");
+        assert!(prompt.contains("Repair session mode: compact regeneration"));
+        assert!(prompt.contains("restart_or_recoverable_state_evidence"));
+        assert!(prompt.contains("Current content of src/app/page.tsx"));
+        assert!(prompt.contains(
+            "Write the complete corrected file via the Write tool (full content, one file only): src/app/page.tsx"
+        ));
+    }
+
+    #[test]
+    fn final_acceptance_evidence_regeneration_event_records_gate_and_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        emit_evidence_regeneration_event(
+            &cfg,
+            true,
+            true,
+            Some("src/app/page.tsx"),
+            &["restart_or_recoverable_state_evidence".to_string()],
+            &[],
+            &["src/app/page.tsx".to_string()],
+            "accepted",
+        );
+
+        let event = latest_event(&events, "repair_regeneration");
+        assert_eq!(
+            event.get("lifecycle_stage").and_then(Value::as_str),
+            Some("final_acceptance_repair")
+        );
+        assert_eq!(
+            event.get("repair_session_mode").and_then(Value::as_str),
+            Some("compact_regeneration")
+        );
+        assert_eq!(
+            event.get("regeneration_gate").and_then(Value::as_str),
+            Some("evidence_static_present_and_build_passes")
+        );
+        assert_eq!(event.get("accepted").and_then(Value::as_bool), Some(true));
+        assert!(
+            event
+                .get("resolved_missing_evidence")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| item.as_str() == Some("restart_or_recoverable_state_evidence"))),
+            "{event}"
+        );
     }
 
     #[test]
@@ -21275,88 +21639,26 @@ if __name__ == "__main__":
     }
 
     #[test]
-    #[cfg(unix)]
-    fn final_acceptance_no_change_repair_skips_extra_probe_cycle() {
-        let _probe_guard = dev_server_probe_test_guard();
-        let dir = tempfile::tempdir().unwrap();
-        let port = free_local_port();
-        let events = dir.path().join(".anvil/runs/no-change-cycle/events.jsonl");
-        enable_dev_server_probe_test_override(dir.path());
-        interaction_probe::write_test_availability_override(dir.path(), true);
-        interaction_probe::write_test_result_override(
-            dir.path(),
-            &recovery_not_observed_probe_result(),
-        );
-        let mut cfg = config(dir.path().to_path_buf());
-        cfg.profile = "nextjs".to_string();
-        cfg.eval_events_path = Some(events.clone());
-        let plan = UltraPlan {
-            goal: explicit_port_goal("Create an interactive browser game with restart flow", port),
-            profile: "nextjs".to_string(),
-            style: "default".to_string(),
-            intent: "create".to_string(),
-            phases: vec![
-                UltraPhase {
-                    id: "first".to_string(),
-                    prompt: "Scaffold the app".to_string(),
-                },
-                UltraPhase {
-                    id: "final".to_string(),
-                    prompt: "Final implementation pass".to_string(),
-                },
-            ],
-        };
-        let unchanged_page = interactive_game_page_without_restart_source();
-        let mut planner = FakeClient::new(vec![
-            AssistantReply::text(generated_nextjs_artifact_plan_json_with_build_verify(
-                "Create buildable app",
-            )),
-            AssistantReply::text(static_phase_step_plan_json(true)),
-        ]);
-        let mut execution = FakeClient::new(vec![
-            probe_nextjs_scaffold_reply(port, unchanged_page.to_string()),
-            read_static_page_reply(),
-            AssistantReply {
-                content: String::new(),
-                tool_calls: vec![crate::state::ToolCall::new(
-                    "Write",
-                    serde_json::json!({"path":"src/app/page.tsx","content":unchanged_page}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            },
-        ]);
+    fn final_acceptance_evidence_no_change_uses_reanchor_then_compact_ladder() {
+        let (mode, reanchored, compact) = evidence_repair_retry_mode(true, 0);
+        assert_eq!(mode, "appended");
+        assert!(!reanchored);
+        assert!(!compact);
 
-        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
-            .unwrap_err()
-            .to_string();
+        let (mode, reanchored, compact) = evidence_repair_retry_mode(true, 1);
+        assert_eq!(mode, "appended");
+        assert!(reanchored);
+        assert!(!compact);
 
-        assert!(
-            err.contains("ultra final acceptance failed after bounded repair"),
-            "{err}"
-        );
-        let event_text = std::fs::read_to_string(&events).unwrap();
-        assert_eq!(
-            event_text
-                .matches("\"event\":\"ultra_final_acceptance\"")
-                .count(),
-            1,
-            "{event_text}"
-        );
-        assert_eq!(
-            event_text
-                .matches("\"event\":\"browser_interaction_probe\"")
-                .count(),
-            1,
-            "{event_text}"
-        );
-        assert!(
-            event_text.contains("\"reprobe_skipped\":true"),
-            "{event_text}"
-        );
-        assert!(
-            event_text.contains("\"failure_kind\":\"final_acceptance_repair_no_source_change\"")
-        );
+        let (mode, reanchored, compact) = evidence_repair_retry_mode(true, 2);
+        assert_eq!(mode, "compact");
+        assert!(!reanchored);
+        assert!(compact);
+
+        let (mode, reanchored, compact) = evidence_repair_retry_mode(false, 3);
+        assert_eq!(mode, "appended");
+        assert!(!reanchored);
+        assert!(!compact);
     }
 
     #[test]
