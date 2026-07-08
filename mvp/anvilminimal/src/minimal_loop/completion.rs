@@ -15,7 +15,9 @@ use crate::minimal_loop::import_scan::{
     ImportedDefinitionExcerpt, imported_symbol_definition_excerpt,
 };
 use crate::minimal_loop::repair_target::{RepairTarget, classify_repair_target};
-use crate::planner::verify::{VerificationReport, validate_verify_command};
+use crate::planner::verify::{
+    VerificationReport, normalize_verify_command, validate_verify_command,
+};
 use crate::tools::path_guard::{
     resolve_existing, resolve_optional_existing, validate_workspace_relative,
 };
@@ -294,7 +296,15 @@ impl CompletionContract {
                 build_verifier_observations.push(lifecycle);
                 continue;
             }
-            match crate::minimal_loop::verifier_env::run_checked(command, root, offline) {
+            let normalized_command = match normalize_verify_command(command) {
+                Ok(command) => command,
+                Err(err) => {
+                    report.push_command_failure(command.clone(), err.to_string());
+                    continue;
+                }
+            };
+            match crate::minimal_loop::verifier_env::run_checked(&normalized_command, root, offline)
+            {
                 Ok(output) => {
                     if command.contains("npm") && output.contains("0 tests") {
                         report.push_command_failure(command.clone(), "Node 0 tests rejected");

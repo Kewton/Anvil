@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 
 use crate::bounded_process::{self, BoundedProcessOutcomeKind};
+use crate::planner::verify::NormalizedVerifyCommand;
 use crate::tools::bash::{BashOutcome, BashOutcomeKind};
 
 const DEFAULT_VERIFY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -156,24 +157,32 @@ pub fn with_env_node_env_remediation(output: &str) -> String {
     }
 }
 
-pub fn run_checked(command: &str, root: &Path, offline: bool) -> anyhow::Result<String> {
-    let outcome = run_structured(command, root, offline, DEFAULT_VERIFY_TIMEOUT)?;
+pub fn run_checked(
+    command: &NormalizedVerifyCommand,
+    root: &Path,
+    offline: bool,
+) -> anyhow::Result<String> {
+    let command_text = command.as_str();
+    let outcome = run_structured(command_text, root, offline, DEFAULT_VERIFY_TIMEOUT)?;
     let formatted = format_outcome(&outcome);
     if !outcome.is_success() {
-        if is_dev_or_start_verify_command(command) && is_env_node_env_conflict_output(&formatted) {
+        if is_dev_or_start_verify_command(command_text)
+            && is_env_node_env_conflict_output(&formatted)
+        {
             bail!("{}", env_node_env_conflict_reason(&formatted));
         }
-        bail!("command failed: {command}\n{formatted}");
+        bail!("command failed: {command_text}\n{formatted}");
     }
     Ok(formatted)
 }
 
-pub(crate) fn run_structured_for_verify_with_profile(
-    command: &str,
+pub fn run_structured_for_verify_with_profile(
+    command: &NormalizedVerifyCommand,
     root: &Path,
     profile: Option<&str>,
     offline: bool,
 ) -> anyhow::Result<BashOutcome> {
+    let command = command.as_str();
     run_structured(
         command,
         root,

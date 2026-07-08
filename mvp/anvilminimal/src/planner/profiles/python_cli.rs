@@ -18,7 +18,7 @@ use crate::planner::profile::{
     DomainProfile, ProfileBehaviorProbeReport, ProfileBuildOracle, ProfileQualityExpectations,
     ProfileSnapshot, profile_failure,
 };
-use crate::planner::verify::VerificationReport;
+use crate::planner::verify::{VerificationReport, normalize_verify_command};
 
 const DEFAULT_PACKAGE: &str = "anvil_app";
 const COMPILE_COMMAND: &str = "python -m compileall -q src";
@@ -509,7 +509,8 @@ fn verify_invariant_contract(root: &Path) -> VerificationReport {
 }
 
 fn compile_report(root: &Path) -> VerificationReport {
-    match verifier_env::run_checked(COMPILE_COMMAND, root, false) {
+    let normalized_command = normalize_verify_command(COMPILE_COMMAND).expect("compile command");
+    match verifier_env::run_checked(&normalized_command, root, false) {
         Ok(_) => VerificationReport::pass(),
         Err(err) => {
             let text = err.to_string();

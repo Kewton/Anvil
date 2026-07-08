@@ -10,7 +10,8 @@ use crate::eval_events;
 use crate::mode::ExecutionMode;
 use crate::planner::profile::{profile_complete_scaffold, profile_setup_scaffold_paths};
 use crate::planner::verify::{
-    diagnose_verify_command, normalize_verify_command_for_oracle_repair_with_root,
+    diagnose_verify_command, normalize_verify_command,
+    normalize_verify_command_for_oracle_repair_with_root,
 };
 use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::ChatClient;
@@ -418,25 +419,35 @@ impl RuntimeBashPolicyDecision {
             effective_command = repair.normalized.clone();
             normalized_command = Some(repair.normalized);
         }
-        let diagnosis = diagnose_verify_command(&effective_command);
-        if let Some(violation) = diagnosis.violation {
-            let reason = diagnosis
-                .reason
-                .unwrap_or_else(|| violation.message().to_string());
-            return Self {
-                step_kind: step_kind.as_str(),
-                bash_policy_purpose: step_kind.bash_policy_purpose(),
-                verifier_policy_checked: true,
-                verifier_policy_ok: false,
-                deterministic_verifier_evidence: false,
-                blocked: true,
-                policy_error_kind: "verify_command_policy_error",
-                violation_kind: violation.as_str(),
-                reason,
-                normalized_command,
-                normalization_kind,
-                normalization_reason,
-            };
+        let normalized_verify_command = match normalize_verify_command(&effective_command) {
+            Ok(command) => command,
+            Err(err) => {
+                let diagnosis = diagnose_verify_command(&effective_command);
+                let violation = diagnosis
+                    .violation
+                    .unwrap_or(crate::planner::verify::VerifyCommandViolationKind::Blocked);
+                let reason = diagnosis.reason.unwrap_or_else(|| err.to_string());
+                return Self {
+                    step_kind: step_kind.as_str(),
+                    bash_policy_purpose: step_kind.bash_policy_purpose(),
+                    verifier_policy_checked: true,
+                    verifier_policy_ok: false,
+                    deterministic_verifier_evidence: false,
+                    blocked: true,
+                    policy_error_kind: "verify_command_policy_error",
+                    violation_kind: violation.as_str(),
+                    reason,
+                    normalized_command,
+                    normalization_kind,
+                    normalization_reason,
+                };
+            }
+        };
+        if normalized_verify_command.as_str() != effective_command {
+            if normalization_kind.is_empty() {
+                normalization_kind = "shared_verify_normalized";
+            }
+            normalized_command = Some(normalized_verify_command.as_str().to_string());
         }
         let reason = if normalized_command.is_some() {
             "runtime Bash admitted as deterministic verifier evidence after mechanical normalization"
@@ -504,7 +515,9 @@ fn deterministic_verify_substitute(root: &Path, required_paths: &[String]) -> Op
         .or_else(|| required_paths.first())?;
     crate::tools::path_guard::validate_workspace_relative(path).ok()?;
     let command = format!("test -f {path}");
-    (diagnose_verify_command(&command).violation.is_none()).then_some(command)
+    normalize_verify_command(&command)
+        .ok()
+        .map(|command| command.into_string())
 }
 
 fn emit_runtime_bash_policy(

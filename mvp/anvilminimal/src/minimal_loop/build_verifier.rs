@@ -8,7 +8,7 @@ use crate::minimal_loop::dependency_setup::{
 };
 use crate::minimal_loop::verifier_env;
 use crate::planner::profile::{build_oracle_for_command, profile_for_build_requirement};
-use crate::planner::verify::validate_verify_command;
+use crate::planner::verify::normalize_verify_command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompileError {
@@ -401,23 +401,26 @@ pub fn observe_requirement(
     let profile = profile_for_build_requirement(requirement);
     let dependency_ready = !requirement.requires_dependency_setup
         || profile.dependency_ready(root, &requirement.command);
-    if let Err(err) = validate_verify_command(&requirement.command) {
-        return BuildVerifierObservation {
-            command: requirement.command.clone(),
-            profile: requirement.profile.clone(),
-            authority: requirement.authority.clone(),
-            required_for_completion: requirement.required_for_completion,
-            requires_dependency_setup: requirement.requires_dependency_setup,
-            dependency_ready,
-            attempted: false,
-            status: BuildVerifierStatus::PolicyRejected,
-            primary_reason: err.to_string(),
-            output_snippet: String::new(),
-            output_path: String::new(),
-            compile_errors: Vec::new(),
-            foreign_toolchain: None,
-        };
-    }
+    let normalized_command = match normalize_verify_command(&requirement.command) {
+        Ok(command) => command,
+        Err(err) => {
+            return BuildVerifierObservation {
+                command: requirement.command.clone(),
+                profile: requirement.profile.clone(),
+                authority: requirement.authority.clone(),
+                required_for_completion: requirement.required_for_completion,
+                requires_dependency_setup: requirement.requires_dependency_setup,
+                dependency_ready,
+                attempted: false,
+                status: BuildVerifierStatus::PolicyRejected,
+                primary_reason: err.to_string(),
+                output_snippet: String::new(),
+                output_path: String::new(),
+                compile_errors: Vec::new(),
+                foreign_toolchain: None,
+            };
+        }
+    };
     if !dependency_ready {
         let foreign_toolchain = profile.foreign_toolchain(root, requirement);
         let mut primary_reason = profile.dependency_missing_reason(root, &requirement.command);
@@ -440,7 +443,7 @@ pub fn observe_requirement(
             foreign_toolchain,
         };
     }
-    match verifier_env::run_checked(&requirement.command, root, false) {
+    match verifier_env::run_checked(&normalized_command, root, false) {
         Ok(output) => BuildVerifierObservation {
             command: requirement.command.clone(),
             profile: requirement.profile.clone(),

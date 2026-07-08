@@ -136,6 +136,40 @@ pub struct VerifyCommandDiagnosis {
     pub reason: Option<String>,
 }
 
+/// A verifier command admitted by the shared normalization pipeline.
+///
+/// Raw strings cannot be passed to verifier execution boundaries:
+///
+/// ```compile_fail
+/// use anvilminimal::minimal_loop::verifier_env::run_checked;
+///
+/// let raw = "npm run build";
+/// let root = std::path::Path::new(".");
+/// let _ = run_checked(raw, root, false);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedVerifyCommand(String);
+
+impl NormalizedVerifyCommand {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.0
+    }
+
+    fn new(normalized: String) -> Self {
+        Self(normalized)
+    }
+}
+
+impl std::fmt::Display for NormalizedVerifyCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl VerificationReport {
     pub fn pass() -> Self {
         Self {
@@ -476,12 +510,14 @@ fn verify_step_with_setup_observed_with_options(
         }
     }
     for command in &step.verify {
-        if let Err(err) = validate_verify_command(command)
-            && !verify_policy_error_allows_runtime_oracle(command)
-        {
-            report.push_command_failure(command.clone(), err.to_string());
-            continue;
-        }
+        let normalized_command = match normalize_verify_command(command) {
+            Ok(command) => command,
+            Err(err) => {
+                report.push_command_failure(command.clone(), err.to_string());
+                continue;
+            }
+        };
+        let command = normalized_command.as_str();
         if let Some(requirement) = build_verifier::requirement_from_deferred(
             command,
             build_verifier_profile(profile, command),
@@ -530,7 +566,7 @@ fn verify_step_with_setup_observed_with_options(
             continue;
         }
         match run_verify_command_with_runtime_oracle(
-            command,
+            &normalized_command,
             root,
             profile,
             false,
@@ -548,11 +584,11 @@ fn verify_step_with_setup_observed_with_options(
                 }
                 if step.expected_result_kind() == ExpectedResult::Fail {
                     report.push_command_failure(
-                        command.clone(),
+                        command.to_string(),
                         "expected command to fail but it passed",
                     );
                 } else if command.contains("npm") && output.contains("0 tests") {
-                    report.push_command_failure(command.clone(), "Node 0 tests rejected");
+                    report.push_command_failure(command.to_string(), "Node 0 tests rejected");
                 }
             }
             VerifyCommandRunResult::Failed {
@@ -629,7 +665,7 @@ enum VerifyCommandRunResult {
 }
 
 fn run_verify_command_with_runtime_oracle(
-    command: &str,
+    command: &NormalizedVerifyCommand,
     root: &Path,
     profile: Option<&str>,
     offline: bool,
@@ -644,20 +680,21 @@ fn run_verify_command_with_runtime_oracle(
             handle_failed_verify_command(command, root, profile, offline, eval_events_path, outcome)
         }
         Err(err) => VerifyCommandRunResult::Failed {
-            command: command.to_string(),
+            command: command.as_str().to_string(),
             reason: format!("failed to run verifier command: {err}"),
         },
     }
 }
 
 fn handle_failed_verify_command(
-    command: &str,
+    command: &NormalizedVerifyCommand,
     root: &Path,
     profile: Option<&str>,
     offline: bool,
     eval_events_path: Option<&Path>,
     outcome: BashOutcome,
 ) -> VerifyCommandRunResult {
+    let command_text = command.as_str();
     let formatted = verifier_env::format_verify_outcome(&outcome);
     if outcome.kind == BashOutcomeKind::Timeout {
         return handle_verify_command_timeout(
@@ -670,26 +707,35 @@ fn handle_failed_verify_command(
             outcome.elapsed_ms,
         );
     }
-    if !is_verify_command_tool_usage_error(command, &outcome) {
+    if !is_verify_command_tool_usage_error(command_text, &outcome) {
         return VerifyCommandRunResult::Failed {
-            command: command.to_string(),
-            reason: format!("command failed: {command}\n{formatted}"),
+            command: command_text.to_string(),
+            reason: format!("command failed: {command_text}\n{formatted}"),
         };
     }
-    let Some(repair) = normalize_verify_command_for_oracle_repair(command) else {
+    let Some(repair) = normalize_verify_command_for_oracle_repair(command_text) else {
         return VerifyCommandRunResult::FalseNegative {
-            command: command.to_string(),
-            reason: verify_command_false_negative_reason(command, &formatted),
+            command: command_text.to_string(),
+            reason: verify_command_false_negative_reason(command_text, &formatted),
         };
     };
-    if repair.normalized == command {
+    if repair.normalized == command_text {
         return VerifyCommandRunResult::FalseNegative {
-            command: command.to_string(),
-            reason: verify_command_false_negative_reason(command, &formatted),
+            command: command_text.to_string(),
+            reason: verify_command_false_negative_reason(command_text, &formatted),
         };
     }
+    let repaired_command = match normalize_verify_command(&repair.normalized) {
+        Ok(command) => command,
+        Err(err) => {
+            return VerifyCommandRunResult::FalseNegative {
+                command: repair.normalized,
+                reason: verify_command_false_negative_reason(command_text, &err.to_string()),
+            };
+        }
+    };
     match verifier_env::run_structured_for_verify_with_profile(
-        &repair.normalized,
+        &repaired_command,
         root,
         profile,
         offline,
@@ -701,44 +747,45 @@ fn handle_failed_verify_command(
                     "event": "verify_command_normalized_at_runtime",
                     "classification": "verify_command_false_negative_candidate",
                     "normalization_source": repair.kind,
-                    "original": eval_events::body_snippet(command),
-                    "repaired": eval_events::body_snippet(&repair.normalized),
+                    "original": eval_events::body_snippet(command_text),
+                    "repaired": eval_events::body_snippet(repaired_command.as_str()),
                 }),
             );
             VerifyCommandRunResult::Passed {
                 output: verifier_env::format_verify_outcome(&repaired_outcome),
                 normalization: Some(RuntimeCommandNormalization {
-                    original: command.to_string(),
-                    repaired: repair.normalized,
+                    original: command_text.to_string(),
+                    repaired: repaired_command.into_string(),
                 }),
             }
         }
         Ok(repaired_outcome) => {
             let repaired_formatted = verifier_env::format_verify_outcome(&repaired_outcome);
-            if is_verify_command_tool_usage_error(&repair.normalized, &repaired_outcome) {
+            if is_verify_command_tool_usage_error(repaired_command.as_str(), &repaired_outcome) {
                 VerifyCommandRunResult::FalseNegative {
-                    command: repair.normalized,
-                    reason: verify_command_false_negative_reason(command, &repaired_formatted),
+                    command: repaired_command.into_string(),
+                    reason: verify_command_false_negative_reason(command_text, &repaired_formatted),
                 }
             } else {
                 VerifyCommandRunResult::Failed {
-                    command: repair.normalized.clone(),
+                    command: repaired_command.as_str().to_string(),
                     reason: format!(
                         "command failed: {}\n{}",
-                        repair.normalized, repaired_formatted
+                        repaired_command.as_str(),
+                        repaired_formatted
                     ),
                 }
             }
         }
         Err(err) => VerifyCommandRunResult::FalseNegative {
-            command: repair.normalized,
-            reason: verify_command_false_negative_reason(command, &err.to_string()),
+            command: repaired_command.into_string(),
+            reason: verify_command_false_negative_reason(command_text, &err.to_string()),
         },
     }
 }
 
 fn handle_verify_command_timeout(
-    command: &str,
+    command: &NormalizedVerifyCommand,
     root: &Path,
     profile: Option<&str>,
     offline: bool,
@@ -746,7 +793,8 @@ fn handle_verify_command_timeout(
     formatted: &str,
     elapsed_ms: u128,
 ) -> VerifyCommandRunResult {
-    let substitution = verify_timeout_substitution(command, root, profile);
+    let command_text = command.as_str();
+    let substitution = verify_timeout_substitution(command_text, root, profile);
     if let Some(substitution) = substitution {
         eval_events::emit(
             eval_events_path,
@@ -754,11 +802,11 @@ fn handle_verify_command_timeout(
                 "event": "verify_command_timeout",
                 "classification": "OracleError",
                 "repair_target": "verifier_command",
-                "command": eval_events::body_snippet(command),
+                "command": eval_events::body_snippet(command_text),
                 "elapsed_ms": elapsed_ms.min(u128::from(u64::MAX)) as u64,
                 "guidance": "the verify command hangs - replace it with a bounded check",
                 "substitution_attempted": true,
-                "substitution_command": eval_events::body_snippet(&substitution),
+                "substitution_command": eval_events::body_snippet(substitution.as_str()),
             }),
         );
         match verifier_env::run_structured_for_verify_with_profile(
@@ -773,16 +821,16 @@ fn handle_verify_command_timeout(
                     serde_json::json!({
                         "event": "verify_command_timeout_substitution",
                         "classification": "OracleError",
-                        "original": eval_events::body_snippet(command),
-                        "substitution": eval_events::body_snippet(&substitution),
+                        "original": eval_events::body_snippet(command_text),
+                        "substitution": eval_events::body_snippet(substitution.as_str()),
                         "status": "passed",
                     }),
                 );
                 return VerifyCommandRunResult::Passed {
                     output: verifier_env::format_verify_outcome(&substitution_outcome),
                     normalization: Some(RuntimeCommandNormalization {
-                        original: command.to_string(),
-                        repaired: substitution,
+                        original: command_text.to_string(),
+                        repaired: substitution.into_string(),
                     }),
                 };
             }
@@ -792,9 +840,9 @@ fn handle_verify_command_timeout(
                 return VerifyCommandRunResult::FalseNegative {
                     command: command.to_string(),
                     reason: verify_command_timeout_reason(
-                        command,
+                        command_text,
                         formatted,
-                        Some(&substitution),
+                        Some(substitution.as_str()),
                         Some(&substitution_formatted),
                     ),
                 };
@@ -803,9 +851,9 @@ fn handle_verify_command_timeout(
                 return VerifyCommandRunResult::FalseNegative {
                     command: command.to_string(),
                     reason: verify_command_timeout_reason(
-                        command,
+                        command_text,
                         formatted,
-                        Some(&substitution),
+                        Some(substitution.as_str()),
                         Some(&err.to_string()),
                     ),
                 };
@@ -818,15 +866,15 @@ fn handle_verify_command_timeout(
             "event": "verify_command_timeout",
             "classification": "OracleError",
             "repair_target": "verifier_command",
-            "command": eval_events::body_snippet(command),
+            "command": eval_events::body_snippet(command_text),
             "elapsed_ms": elapsed_ms.min(u128::from(u64::MAX)) as u64,
             "guidance": "the verify command hangs - replace it with a bounded check",
             "substitution_attempted": false,
         }),
     );
     VerifyCommandRunResult::FalseNegative {
-        command: command.to_string(),
-        reason: verify_command_timeout_reason(command, formatted, None, None),
+        command: command_text.to_string(),
+        reason: verify_command_timeout_reason(command_text, formatted, None, None),
     }
 }
 
@@ -855,13 +903,14 @@ fn verify_timeout_substitution(
     command: &str,
     root: &Path,
     profile: Option<&str>,
-) -> Option<String> {
+) -> Option<NormalizedVerifyCommand> {
     if profile != Some("python-cli") || !is_pytest_verify_command(command) {
         return None;
     }
     root.join("src")
         .is_dir()
-        .then(|| "python -m compileall -q src".to_string())
+        .then(|| normalize_verify_command("python -m compileall -q src").ok())
+        .flatten()
 }
 
 fn is_pytest_verify_command(command: &str) -> bool {
@@ -879,16 +928,6 @@ fn verify_command_false_negative_reason(command: &str, tool_error: &str) -> Stri
         "verify_command_false_negative: the verify command is malformed; the artifact may already satisfy the requirement; command=`{}`; tool_error={}",
         command,
         eval_events::body_snippet(tool_error)
-    )
-}
-
-fn verify_policy_error_allows_runtime_oracle(command: &str) -> bool {
-    matches!(
-        diagnose_verify_command(command).violation,
-        Some(
-            VerifyCommandViolationKind::GrepDashPattern
-                | VerifyCommandViolationKind::PackageJsonScriptGrep
-        )
     )
 }
 
@@ -997,19 +1036,10 @@ fn lifecycle_failure_with_setup_output(lifecycle: &BuildVerifierLifecycleObserva
 }
 
 pub fn validate_verify_command(command: &str) -> anyhow::Result<()> {
-    let diagnosis = diagnose_verify_command(command);
-    if let Some(violation) = diagnosis.violation {
-        anyhow::bail!(
-            "{}",
-            diagnosis
-                .reason
-                .unwrap_or_else(|| violation.message().to_string())
-        );
-    }
-    Ok(())
+    normalize_verify_command(command).map(|_| ())
 }
 
-pub fn normalize_verify_command(command: &str) -> anyhow::Result<String> {
+pub fn normalize_verify_command(command: &str) -> anyhow::Result<NormalizedVerifyCommand> {
     let diagnosis = diagnose_verify_command(command);
     if let Some(violation) = diagnosis.violation {
         if matches!(
@@ -1023,7 +1053,7 @@ pub fn normalize_verify_command(command: &str) -> anyhow::Result<String> {
                 | VerifyCommandViolationKind::SuccessFailureEchoStripped
                 | VerifyCommandViolationKind::WorkspaceCdNormalized
         ) {
-            return Ok(diagnosis.normalized);
+            return Ok(NormalizedVerifyCommand::new(diagnosis.normalized));
         }
         anyhow::bail!(
             "{}",
@@ -1032,7 +1062,7 @@ pub fn normalize_verify_command(command: &str) -> anyhow::Result<String> {
                 .unwrap_or_else(|| violation.message().to_string())
         );
     }
-    Ok(diagnosis.normalized)
+    Ok(NormalizedVerifyCommand::new(diagnosis.normalized))
 }
 
 pub fn normalize_planner_verify_command(command: &str) -> anyhow::Result<Vec<String>> {
@@ -1041,7 +1071,7 @@ pub fn normalize_planner_verify_command(command: &str) -> anyhow::Result<Vec<Str
         return Ok(Vec::new());
     }
     if !contains_shell_control_syntax(trimmed) {
-        return Ok(vec![normalize_verify_command(trimmed)?]);
+        return Ok(vec![normalize_verify_command(trimmed)?.into_string()]);
     }
     normalize_planner_shell_and_verify_command(trimmed)
 }
@@ -1789,13 +1819,13 @@ fn normalize_planner_shell_and_verify_command(command: &str) -> anyhow::Result<V
     let mut out = Vec::new();
     for part in command.split("&&") {
         let normalized = normalize_verify_command(part.trim())?;
-        if !is_safe_split_verify_fragment(&normalized) {
+        if !is_safe_split_verify_fragment(normalized.as_str()) {
             anyhow::bail!(
                 "verify command shell split contains unsupported fragment: {}",
                 normalized
             );
         }
-        out.push(normalized);
+        out.push(normalized.into_string());
     }
     if out.is_empty() {
         anyhow::bail!(
@@ -2143,7 +2173,7 @@ mod tests {
     #[test]
     fn verify_command_normalizes_safe_whitespace_only() {
         let normalized = normalize_verify_command("  cargo   test   --locked  ").unwrap();
-        assert_eq!(normalized, "cargo test --locked");
+        assert_eq!(normalized.as_str(), "cargo test --locked");
     }
 
     #[test]
@@ -2181,11 +2211,15 @@ mod tests {
         );
         assert_eq!(diagnosis.normalized, "npm run build");
         assert_eq!(
-            normalize_verify_command("npm run build | head -n 20").unwrap(),
+            normalize_verify_command("npm run build | head -n 20")
+                .unwrap()
+                .as_str(),
             "npm run build"
         );
         assert_eq!(
-            normalize_verify_command("npm run build | tail 80").unwrap(),
+            normalize_verify_command("npm run build | tail 80")
+                .unwrap()
+                .as_str(),
             "npm run build"
         );
         assert!(
@@ -2851,20 +2885,12 @@ EOF\n\
             report.verifier_command_false_negatives.is_empty(),
             "{report:?}"
         );
-        assert_eq!(report.runtime_command_normalizations.len(), 1);
-        assert_eq!(
-            report.runtime_command_normalizations[0].original,
-            r#"grep -q "-p 3011" package.json"#
-        );
-        assert_eq!(
-            report.runtime_command_normalizations[0].repaired,
-            r#"grep -q -- "-p 3011" package.json"#
-        );
-        let event_text = std::fs::read_to_string(events).unwrap();
-        assert!(event_text.contains("\"event\":\"verify_command_normalized_at_runtime\""));
         assert!(
-            event_text.contains("\"classification\":\"verify_command_false_negative_candidate\"")
+            report.runtime_command_normalizations.is_empty(),
+            "{report:?}"
         );
+        let event_text = std::fs::read_to_string(events).unwrap_or_default();
+        assert!(!event_text.contains("\"verify_command_false_negative_candidate\""));
     }
 
     #[test]
@@ -2958,15 +2984,10 @@ EOF\n\
             std::time::Duration::from_millis(20),
         )
         .unwrap();
+        let command = normalize_verify_command("sleep 5").unwrap();
 
-        let result = handle_failed_verify_command(
-            "sleep 5",
-            dir.path(),
-            None,
-            false,
-            Some(&events),
-            outcome,
-        );
+        let result =
+            handle_failed_verify_command(&command, dir.path(), None, false, Some(&events), outcome);
 
         let VerifyCommandRunResult::FalseNegative { command, reason } = result else {
             panic!("expected false negative, got {result:?}");
@@ -3005,9 +3026,10 @@ EOF\n\
             elapsed_ms: 60_000,
             summary: "command timed out after 60000 ms".to_string(),
         };
+        let command = normalize_verify_command("python -m pytest").unwrap();
 
         let result = handle_failed_verify_command(
-            "python -m pytest",
+            &command,
             dir.path(),
             Some("python-cli"),
             false,

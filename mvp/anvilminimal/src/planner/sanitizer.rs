@@ -1136,15 +1136,10 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
             }],
         };
 
-        let lint_before = lint_step_plan_report_with_workspace(&plan, Some(dir.path()));
-        assert!(
-            lint_before.errors.iter().any(|err| {
-                err.category == "verify_policy"
-                    && err
-                        .message
-                        .contains("grep pattern begins with '-' but command lacks `--` or `-e`")
-            }),
-            "{lint_before:?}"
+        let diagnosis = diagnose_verify_command(&plan.steps[0].verify[0]);
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::GrepDashPattern)
         );
         let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
 
