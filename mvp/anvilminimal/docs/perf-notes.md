@@ -77,3 +77,24 @@ Decision outcomes:
 - keep stable plus the tail-objective fix when only the tail was insufficient;
 - revert the default to legacy if stable alone reproducibly causes setup-phase
   no-tool stagnation that legacy avoids.
+
+Verdict for test0708_018:
+
+- stable-layout behavioral regression confirmed;
+- measured cache benefit zero: prompt_eval stayed near the estimated prompt
+  size instead of dropping after turn 1;
+- default `prompt_layout` now resolves to `legacy`, with `stable` retained
+  behind the flag for A/B runs and replay.
+
+## History-Size Audit
+
+The corpus audit shows prompt growth is dominated by tool-result echoes rather
+than model prose. The bound-history change now clips tool payloads at the
+session boundary and on outbound request assembly, so the prompt no longer
+replays full file/command bodies.
+
+| history component | observed growth driver | mitigation |
+| --- | --- | --- |
+| tool-result echoes | file contents, build output, browser transcripts | bound at source and on request assembly |
+| model text | plan/repair narration and step explanations | stable prefix hoisting; tail-only variability |
+| fresh feedback | missing-path lists, repair hints, and progress nudges | keep the tail concise and objective-first |

@@ -156,7 +156,7 @@ mod tests {
             context_budget: 65536,
             model: "m\x1b[31m".to_string(),
             provider: Provider::Ollama,
-            prompt_layout: crate::config::PromptLayout::Stable,
+            prompt_layout: crate::config::PromptLayout::Legacy,
             planner_model: "pm".to_string(),
             planner_provider: Provider::Gemini,
             ollama_host: "http://localhost:11434".to_string(),
@@ -217,7 +217,7 @@ mod tests {
         assert!(out.contains("anvilminimal"));
         assert!(out.contains(&crate::build_info::commit_with_dirty()));
         assert!(out.contains("context_budget=65536 (default)"));
-        assert!(out.contains("prompt_layout=stable (default)"));
+        assert!(out.contains("prompt_layout=legacy (default)"));
         assert!(out.contains("footer=on (default)"));
         assert!(out.contains("yes=true"));
         assert!(!out.contains("╔═╗"));

@@ -64,8 +64,8 @@ impl From<FooterArg> for FooterMode {
 #[serde(rename_all = "kebab-case")]
 pub enum PromptLayout {
     #[default]
-    Stable,
     Legacy,
+    Stable,
 }
 
 impl PromptLayout {
@@ -304,7 +304,7 @@ impl Config {
                     .and_then(|preset| preset.prompt_layout.clone())
             })
             .or_else(|| config_file_prompt_layout(&workspace_root))
-            .unwrap_or_else(|| sourced(PromptLayout::Stable, "default"));
+            .unwrap_or_else(|| sourced(PromptLayout::Legacy, "default"));
         let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
         let action = action_from_cli(&cli)?;
         let eval_events_path = crate::eval_events::path_from_env_or_default(&workspace_root);
@@ -1188,9 +1188,9 @@ narration = "quiet"
     }
 
     #[test]
-    fn prompt_layout_flag_wins_over_config_and_defaults_stable() {
+    fn prompt_layout_flag_wins_over_config_and_defaults_legacy() {
         let default = Config::from_cli(Cli::parse_from(["anvilminimal"])).unwrap();
-        assert_eq!(default.prompt_layout, PromptLayout::Stable);
+        assert_eq!(default.prompt_layout, PromptLayout::Legacy);
         assert_eq!(default.field_sources.prompt_layout, "default");
 
         let dir = tempfile::tempdir().unwrap();

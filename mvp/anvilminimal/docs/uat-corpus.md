@@ -211,6 +211,10 @@ rescue authoring that page at exhaustion. The prompt fixtures pin both
 session families so A/B runs can compare behavior against the same content
 ordered differently.
 
+The stableB workspace harvest for the A/B verdict lives in the same case
+bundle; `docs/perf-notes.md` records the confirmed stable-layout regression,
+the zero cache-benefit measurement, and the default flip back to `legacy`.
+
 The boundedness follow-up harvests are diagnostic fixtures. `content_b` pins the
 wide `ls -R && cat package.json` loop: each Bash attempt reached the 180s cap
 because recursive listing walked the workspace/dependency tree, and the old

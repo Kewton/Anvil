@@ -1048,7 +1048,7 @@ mod tests {
 
     #[test]
     fn activity_narration_scripted_sequence_snapshot() {
-        let events = vec![
+        let events = [
             json!({"event": "step_prompt_contract", "step_id": "write-page", "step_kind": "implement"}),
             json!({
                 "event": "tool_call_raw",
@@ -1214,16 +1214,18 @@ mod tests {
 
     #[test]
     fn status_card_snapshot_includes_sources_port_and_probe() {
-        let mut sources = ConfigFieldSources::default();
-        sources.model = "flag".to_string();
-        sources.provider = "preset:local".to_string();
-        sources.planner_model = "preset:local".to_string();
-        sources.planner_provider = "preset:local".to_string();
-        sources.chat_timeout_secs = "preset:local".to_string();
-        sources.context_budget = "flag".to_string();
-        sources.profile = "preset:local".to_string();
-        sources.narration = "preset:local".to_string();
-        sources.footer = "preset:local".to_string();
+        let sources = ConfigFieldSources {
+            model: "flag".to_string(),
+            provider: "preset:local".to_string(),
+            planner_model: "preset:local".to_string(),
+            planner_provider: "preset:local".to_string(),
+            context_budget: "flag".to_string(),
+            chat_timeout_secs: "preset:local".to_string(),
+            prompt_layout: "default".to_string(),
+            profile: "preset:local".to_string(),
+            narration: "preset:local".to_string(),
+            footer: "preset:local".to_string(),
+        };
         let config = Config {
             workspace_root: std::path::PathBuf::from("."),
             state_dir: std::path::PathBuf::from("state"),
