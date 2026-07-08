@@ -12643,6 +12643,15 @@ fn build_step_plan_user_prompt_stable(goal: &str, config: &Config) -> String {
             }
         }
     }
+    if let Some(note) = preprovisioned_scaffold_note(&config.workspace_root, &config.profile) {
+        if !prompt.is_empty() {
+            prompt.push('\n');
+        }
+        prompt.push_str("Pre-provisioned scaffold note:\n");
+        prompt.push_str("- ");
+        prompt.push_str(&note);
+        prompt.push('\n');
+    }
     if is_ultra_phase_step_goal(goal) {
         if !prompt.is_empty() {
             prompt.push('\n');
@@ -12709,6 +12718,12 @@ fn build_step_plan_user_prompt_legacy(goal: &str, config: &Config) -> String {
             }
         }
     }
+    if let Some(note) = preprovisioned_scaffold_note(&config.workspace_root, &config.profile) {
+        prompt.push_str("\n\nPre-provisioned scaffold note:\n");
+        prompt.push_str("- ");
+        prompt.push_str(&note);
+        prompt.push('\n');
+    }
     if is_ultra_phase_step_goal(goal) {
         prompt.push_str("\nUltra phase hard constraints:\n");
         prompt.push_str("- StepPlan.goal must be ONE short sentence naming the phase outcome; never copy the phase context, unmet-requirements, or adherence lists into goal -- details belong in step instructions.\n");
@@ -12723,6 +12738,13 @@ fn build_step_plan_user_prompt_legacy(goal: &str, config: &Config) -> String {
         prompt.push_str("  - curl http://localhost:3011\n");
     }
     prompt
+}
+
+fn preprovisioned_scaffold_note(root: &Path, profile: &str) -> Option<String> {
+    let scaffold_paths = profile_setup_scaffold_paths(root, profile);
+    (!scaffold_paths.is_empty()).then(|| {
+        "Required scaffold files are authored before phase 1 when absent; verify or extend the scaffold rather than re-planning file creation.".to_string()
+    })
 }
 
 fn is_ultra_phase_step_goal(goal: &str) -> bool {
@@ -13093,26 +13115,43 @@ fn ultra_phase_prompt_stable(
     } else {
         ""
     };
-    format!(
-        "Profile generation rules:\n{}\nProfile runtime contract:\n{}\n{}Deterministic verification preference:\n{}\n{}\n\nOriginal ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\n{}{}{}",
-        generation_rules,
-        runtime_contract,
-        route_bound_constraint,
-        preferred_verify,
-        required,
-        plan.goal,
-        plan.profile,
-        plan.style,
-        plan.intent,
-        phase.id,
-        phase.prompt,
-        workspace_snapshot,
-        prior_context,
-        unmet_final_requirements,
-        requested_features,
-        capability_section,
-        evidence_section
-    )
+    let scaffold_note = preprovisioned_scaffold_note(&config.workspace_root, &plan.profile)
+        .map(|note| format!("\nPre-provisioned scaffold note:\n- {note}\n"))
+        .unwrap_or_default();
+    let mut prompt = String::new();
+    prompt.push_str("Profile generation rules:\n");
+    prompt.push_str(generation_rules);
+    prompt.push_str("\nProfile runtime contract:\n");
+    prompt.push_str(&runtime_contract);
+    prompt.push_str(route_bound_constraint);
+    prompt.push_str(&scaffold_note);
+    prompt.push_str("Deterministic verification preference:\n");
+    prompt.push_str(&preferred_verify);
+    prompt.push('\n');
+    prompt.push_str(&required);
+    prompt.push_str("\n\nOriginal ultra goal: ");
+    prompt.push_str(&plan.goal);
+    prompt.push_str("\nProfile: ");
+    prompt.push_str(&plan.profile);
+    prompt.push_str("\nStyle: ");
+    prompt.push_str(&plan.style);
+    prompt.push_str("\nIntent: ");
+    prompt.push_str(&plan.intent);
+    prompt.push_str("\nPhase id: ");
+    prompt.push_str(&phase.id);
+    prompt.push_str("\nPhase task: ");
+    prompt.push_str(&phase.prompt);
+    prompt.push_str("\n\nWorkspace snapshot:\n");
+    prompt.push_str(&workspace_snapshot);
+    prompt.push_str("\n\n");
+    prompt.push_str(&prior_context);
+    prompt.push_str("\n\n");
+    prompt.push_str(&unmet_final_requirements);
+    prompt.push_str("\n\n");
+    prompt.push_str(&requested_features);
+    prompt.push_str(&capability_section);
+    prompt.push_str(&evidence_section);
+    prompt
 }
 
 fn ultra_phase_prompt_legacy(
@@ -13190,26 +13229,43 @@ fn ultra_phase_prompt_legacy(
     } else {
         ""
     };
-    format!(
-        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\n{}\n\nProfile generation rules:\n{}\nProfile runtime contract:\n{}\n{}Deterministic verification preference:\n{}\n{}{}{}",
-        plan.goal,
-        plan.profile,
-        plan.style,
-        plan.intent,
-        phase.id,
-        phase.prompt,
-        workspace_snapshot,
-        prior_context,
-        unmet_final_requirements,
-        requested_features,
-        generation_rules,
-        runtime_contract,
-        route_bound_constraint,
-        preferred_verify,
-        required,
-        capability_section,
-        evidence_section
-    )
+    let scaffold_note = preprovisioned_scaffold_note(&config.workspace_root, &plan.profile)
+        .map(|note| format!("\nPre-provisioned scaffold note:\n- {note}\n"))
+        .unwrap_or_default();
+    let mut prompt = String::new();
+    prompt.push_str("Original ultra goal: ");
+    prompt.push_str(&plan.goal);
+    prompt.push_str("\nProfile: ");
+    prompt.push_str(&plan.profile);
+    prompt.push_str("\nStyle: ");
+    prompt.push_str(&plan.style);
+    prompt.push_str("\nIntent: ");
+    prompt.push_str(&plan.intent);
+    prompt.push_str("\nPhase id: ");
+    prompt.push_str(&phase.id);
+    prompt.push_str("\nPhase task: ");
+    prompt.push_str(&phase.prompt);
+    prompt.push_str("\n\nWorkspace snapshot:\n");
+    prompt.push_str(&workspace_snapshot);
+    prompt.push_str("\n\n");
+    prompt.push_str(&prior_context);
+    prompt.push_str("\n\n");
+    prompt.push_str(&unmet_final_requirements);
+    prompt.push_str("\n\n");
+    prompt.push_str(&requested_features);
+    prompt.push_str("\n\nProfile generation rules:\n");
+    prompt.push_str(generation_rules);
+    prompt.push_str("\nProfile runtime contract:\n");
+    prompt.push_str(&runtime_contract);
+    prompt.push_str(route_bound_constraint);
+    prompt.push_str(&scaffold_note);
+    prompt.push_str("Deterministic verification preference:\n");
+    prompt.push_str(&preferred_verify);
+    prompt.push('\n');
+    prompt.push_str(&required);
+    prompt.push_str(&capability_section);
+    prompt.push_str(&evidence_section);
+    prompt
 }
 
 fn final_acceptance_repair_expected_paths(

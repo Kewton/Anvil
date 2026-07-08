@@ -384,7 +384,7 @@ pub fn quality_expectations(root: &Path, goal: &str) -> ProfileQualityExpectatio
             "yarn install".to_string(),
         ],
         dependency_order_hint: Some(
-            "Create package.json and a Next.js entrypoint before npm run build".to_string(),
+            "Create package.json and a Next.js entrypoint before npm run build. Known-profile scaffolds are pre-provisioned before phase 1 when absent; verify or extend existing scaffold rather than re-planning file creation.".to_string(),
         ),
     }
 }
@@ -2176,6 +2176,15 @@ mod tests {
         let page = std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap();
         assert!(page.contains("export default function Page"), "{page}");
         assert!(page.contains("INTERACTIVE CHALLENGE"), "{page}");
+    }
+
+    #[test]
+    fn before_phase_pre_provisions_missing_nextjs_scaffold() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::planner::profile::profile_before_phase(dir.path(), "nextjs").unwrap();
+        assert!(dir.path().join("package.json").is_file());
+        assert!(dir.path().join("src/app/page.tsx").is_file());
+        assert!(dir.path().join("src/app/layout.tsx").is_file());
     }
 
     #[test]

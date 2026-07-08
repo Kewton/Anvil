@@ -317,6 +317,14 @@ impl DomainProfile for NextjsProfile {
         crate::planner::profiles::nextjs::setup_scaffold_paths(root)
     }
 
+    fn before_phase(&self, root: &Path) -> anyhow::Result<ProfileSnapshot> {
+        let scaffold_paths = self.setup_scaffold_paths(root);
+        if !scaffold_paths.is_empty() {
+            let _ = self.complete_scaffold(root, &scaffold_paths)?;
+        }
+        Ok(ProfileSnapshot::None)
+    }
+
     fn complete_scaffold(
         &self,
         root: &Path,
@@ -532,6 +540,10 @@ impl DomainProfile for DataProfile {
     }
 
     fn before_phase(&self, root: &Path) -> anyhow::Result<ProfileSnapshot> {
+        let scaffold_paths = self.setup_scaffold_paths(root);
+        if !scaffold_paths.is_empty() {
+            let _ = self.complete_scaffold(root, &scaffold_paths)?;
+        }
         Ok(ProfileSnapshot::Data(
             crate::planner::profiles::data::before_phase(root)?,
         ))

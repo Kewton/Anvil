@@ -46,6 +46,14 @@ impl DomainProfile for PythonCliProfile {
         scaffold_paths(root)
     }
 
+    fn before_phase(&self, root: &Path) -> anyhow::Result<ProfileSnapshot> {
+        let scaffold_paths = scaffold_paths(root);
+        if !scaffold_paths.is_empty() {
+            let _ = complete_scaffold(root, &scaffold_paths)?;
+        }
+        Ok(ProfileSnapshot::None)
+    }
+
     fn complete_scaffold(
         &self,
         root: &Path,
@@ -871,6 +879,16 @@ SyntaxError: invalid syntax
         let main = std::fs::read_to_string(dir.path().join("src/csv_stats/main.py")).unwrap();
         assert!(main.contains("def main()"), "{main}");
         assert!(verify_invariant_contract(dir.path()).is_pass());
+    }
+
+    #[test]
+    fn before_phase_pre_provisions_python_cli_scaffold() {
+        let dir = tempfile::tempdir().unwrap();
+
+        crate::planner::profile::profile_before_phase(dir.path(), "python-cli").unwrap();
+
+        assert!(dir.path().join("pyproject.toml").is_file());
+        assert!(dir.path().join("src/anvil_app/main.py").is_file());
     }
 
     #[test]
