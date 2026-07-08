@@ -1099,8 +1099,30 @@ pub fn normalize_planner_verify_command(command: &str) -> anyhow::Result<Vec<Str
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    if let Ok(normalized) = normalize_verify_command(trimmed) {
-        return Ok(vec![normalized.into_string()]);
+    let lines = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() > 1 {
+        let mut out = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let normalized = normalize_planner_verify_command(line).map_err(|err| {
+                anyhow::anyhow!(
+                    "multi-line verify command line {} rejected: {}",
+                    index + 1,
+                    err
+                )
+            })?;
+            out.extend(normalized);
+        }
+        return Ok(out);
+    }
+    let normalized_attempt = normalize_verify_command(trimmed);
+    match normalized_attempt {
+        Ok(normalized) => return Ok(vec![normalized.into_string()]),
+        Err(err) if contains_file_redirect_syntax(trimmed) => return Err(err),
+        Err(_) => {}
     }
     if !contains_shell_control_syntax(trimmed) {
         return Ok(vec![normalize_verify_command(trimmed)?.into_string()]);
@@ -1126,7 +1148,9 @@ pub fn normalize_runtime_bash_command_for_boundary(
         reasons.push(repair.reason);
         kinds.push(repair.kind);
     }
-    if let Ok(normalized) = normalize_verify_command(&current) {
+    if !has_multiple_command_lines(&current)
+        && let Ok(normalized) = normalize_verify_command(&current)
+    {
         let normalized_command = normalized.as_str().to_string();
         if normalized_command != current && kinds.is_empty() {
             kinds.push("shared_verify_normalized");
@@ -1206,6 +1230,13 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
         );
     }
     if contains_shell_control_syntax(&normalized) {
+        if contains_file_redirect_syntax(&normalized) {
+            return verify_command_violation(
+                normalized,
+                VerifyCommandViolationKind::ShellControlSyntax,
+                Some("verify command may not create or write files with shell redirects; create files with the Write tool; keep verify to one deterministic command. For python-cli behavior probes, fixture CSVs already exist when required; verify should run the deterministic python command against those fixtures.".to_string()),
+            );
+        }
         if let Some(diagnosis) = diagnose_leading_cd_verify_command(&normalized) {
             return diagnosis;
         }
@@ -1973,6 +2004,16 @@ fn split_runtime_shell_segments(
                 index += 1;
                 start = index;
             }
+            b'\n' | b'\r' if !single && !double => {
+                push_runtime_shell_segment(&mut out, connector, &command[start..index])?;
+                connector = RuntimeCommandConnector::Always;
+                if bytes[index] == b'\r' && index + 1 < bytes.len() && bytes[index + 1] == b'\n' {
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                start = index;
+            }
             _ => index += 1,
         }
     }
@@ -2045,6 +2086,19 @@ fn contains_single_ampersand(command: &str) -> bool {
         return true;
     }
     false
+}
+
+fn contains_file_redirect_syntax(command: &str) -> bool {
+    find_outside_quotes(command, ">").is_some() || find_outside_quotes(command, "<").is_some()
+}
+
+fn has_multiple_command_lines(command: &str) -> bool {
+    command
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(2)
+        .count()
+        > 1
 }
 
 fn is_safe_split_verify_fragment(command: &str) -> bool {
@@ -2549,6 +2603,55 @@ mod tests {
             r#"node -p "require('./package.json').scripts.build""#
         );
         assert_eq!(plan.segments[2].command.as_str(), "test -f package.json");
+    }
+
+    #[test]
+    fn runtime_bash_normalizer_splits_multiline_commands_as_sequential_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = normalize_runtime_bash_command_for_boundary(
+            "test -f package.json\npython -m compileall -q src",
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.normalization_kind, "shell_control_split");
+        assert_eq!(plan.segments.len(), 2);
+        assert_eq!(plan.segments[0].connector, RuntimeCommandConnector::Always);
+        assert_eq!(plan.segments[1].connector, RuntimeCommandConnector::Always);
+        assert_eq!(plan.segments[0].command.as_str(), "test -f package.json");
+        assert_eq!(
+            plan.segments[1].command.as_str(),
+            "python -m compileall -q src"
+        );
+    }
+
+    #[test]
+    fn planner_verify_normalization_splits_multiline_commands() {
+        let normalized =
+            normalize_planner_verify_command("test -f package.json\npython -m compileall -q src")
+                .unwrap();
+
+        assert_eq!(
+            normalized,
+            vec!["test -f package.json", "python -m compileall -q src"]
+        );
+    }
+
+    #[test]
+    fn verify_redirect_rejection_names_write_tool_remedy_and_python_fixture_guidance() {
+        let command =
+            std::fs::read_to_string("tests/fixtures/q1_full/cli_a_verify_redirect_command.txt")
+                .unwrap();
+        let err = normalize_planner_verify_command(&command)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("create files with the Write tool"), "{err}");
+        assert!(
+            err.contains("keep verify to one deterministic command"),
+            "{err}"
+        );
+        assert!(err.contains("python-cli behavior probes"), "{err}");
     }
 
     #[test]

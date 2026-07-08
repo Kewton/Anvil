@@ -4096,7 +4096,7 @@ fn recoverable_tool_feedback(
     let err_text = err.to_string();
     if err_text.contains("verify_command_policy_error") {
         return format!(
-            "Tool call `{name}` was rejected by deterministic verify policy: {err_text}. Allowed alternatives: use one bounded verifier command such as `npm run build`, `cargo test`, `python -m compileall -q src`, or `test -f relative/path`; move dependency installation or dev-server startup to setup/runtime phases, not verify."
+            "Tool call `{name}` was rejected by deterministic verify policy: {err_text}. Allowed alternatives: use one bounded verifier command such as `npm run build`, `cargo test`, `python -m compileall -q src`, or `test -f relative/path`; create files with the Write tool; keep verify to one deterministic command; python-cli behavior-probe fixture CSVs already exist when required; move dependency installation or dev-server startup to setup/runtime phases, not verify."
         );
     }
     if let Some((path, count)) = edit_anchor_failure {
@@ -4963,6 +4963,122 @@ export default function Page(){
         assert_eq!(
             policy.get("normalization_kind").and_then(Value::as_str),
             Some("shell_control_split")
+        );
+    }
+
+    #[test]
+    fn verify_step_runtime_splits_multiline_bash_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("src/main.py"), "print('ok')\n").unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path.clone());
+        cfg.max_iterations = 2;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Bash",
+                        json!({"command":"test -f package.json\npython -m compileall -q src"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Verify the current step.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        let bash_result = session
+            .messages
+            .iter()
+            .find(|message| message.role == "tool" && message.name.as_deref() == Some("Bash"))
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        assert!(
+            bash_result.contains("combined_outcome: Success"),
+            "{bash_result}"
+        );
+        assert!(
+            bash_result.contains("segment 2 command: python -m compileall -q src"),
+            "{bash_result}"
+        );
+        let events = event_values(&events_path);
+        let policy = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("runtime_bash_policy"))
+            .unwrap();
+        assert_eq!(
+            policy.get("normalization_kind").and_then(Value::as_str),
+            Some("shell_control_split")
+        );
+    }
+
+    #[test]
+    fn verify_step_redirect_rejection_feedback_names_write_tool_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path);
+        cfg.max_iterations = 2;
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Bash",
+                        json!({"command":"cat > fixtures/input.csv\npython src/main.py fixtures/input.csv"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply::text("done")),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Verify the current step.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        let feedback = session
+            .messages
+            .iter()
+            .find(|message| message.role == "tool" && message.name.as_deref() == Some("Bash"))
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        assert!(
+            feedback.contains("create files with the Write tool"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("keep verify to one deterministic command"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("python-cli behavior-probe fixture CSVs already exist"),
+            "{feedback}"
         );
     }
 
