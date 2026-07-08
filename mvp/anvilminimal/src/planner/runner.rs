@@ -565,20 +565,23 @@ fn generate_step_plan_with_ui_for_phase(
                 );
                 let verify_before_repair = collect_step_verify_commands(&plan);
                 repair_generated_step_plan_contract(&mut plan);
+                let verify_after_repair = collect_step_verify_commands(&plan);
+                let verify_was_normalized = verify_before_repair != verify_after_repair;
                 emit_planner_verify_command_normalized(
                     config,
                     client.label(),
                     model,
                     attempt,
                     &verify_before_repair,
-                    &collect_step_verify_commands(&plan),
+                    &verify_after_repair,
                 );
                 strengthen_step_plan_for_profile(&mut plan, config);
                 repair_generated_step_plan_contract(&mut plan);
                 let sanitizer_report =
                     sanitize_step_plan_against_policy(&mut plan, Some(&config.workspace_root));
-                let plan_was_sanitized =
-                    !generated_sanitization.is_empty() || !sanitizer_report.is_empty();
+                let plan_was_sanitized = verify_was_normalized
+                    || !generated_sanitization.is_empty()
+                    || !sanitizer_report.is_empty();
                 emit_planner_plan_sanitized(
                     config,
                     client.label(),
@@ -13653,6 +13656,69 @@ mod tests {
             event_text.contains("\"normalized_commands\":[\"npm test\",\"test -f package.json\"]")
         );
         assert!(!event_text.contains("\"event\":\"planner_error\""));
+    }
+
+    #[test]
+    fn status_echo_verify_is_normalized_before_plan_time_policy_diagnosis() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let generated = r#"{"goal":"goal","steps":[{"id":"s1","kind":"implement","expected_result":"pass","instruction":"Create src/app/page.tsx for the app route.","expected_paths":["src/app/page.tsx"],"verify":["test -f src/app/page.tsx && echo \"pass\" || echo \"fail\""]}]}"#;
+        let mut planner = FakeClient::new(vec![AssistantReply::text(generated)]);
+
+        let plan = generate_step_plan(&mut planner, "goal", &cfg).unwrap();
+
+        assert_eq!(plan.steps[0].verify, vec!["test -f src/app/page.tsx"]);
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"planner_verify_command_normalized\""));
+        assert!(event_text.contains("\"normalized_commands\":[\"test -f src/app/page.tsx\"]"));
+        assert!(!event_text.contains("\"event\":\"planner_error\""));
+    }
+
+    #[test]
+    fn setup_phase_lint_exhaustion_uses_known_profile_fallback_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.profile_explicit = true;
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Phase id: project-setup\nPhase task: Scaffold a Next.js application with Tailwind CSS configuration and port 3011 scripts.";
+        let invalid = r#"{
+          "goal": "Phase id: project-setup\nPhase task: Scaffold a Next.js application with Tailwind CSS configuration and port 3011 scripts.",
+          "steps": [
+            {
+              "id": "setup-nextjs",
+              "kind": "setup",
+              "expected_result": "pass",
+              "instruction": "Create the package and Tailwind scaffold.",
+              "expected_paths": ["package.json", "tailwind.config.js", "postcss.config.js", "app/layout.js", "app/page.js"],
+              "verify": ["cat package.json | grep -q '\"next\"' && test -f tailwind.config.js && test -f app/layout.js"]
+            }
+          ]
+        }"#;
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(invalid),
+            AssistantReply::text(invalid),
+            AssistantReply::text(invalid),
+        ]);
+
+        let plan = generate_step_plan(&mut planner, goal, &cfg).unwrap();
+
+        assert_eq!(plan.steps[0].id, "fallback-setup");
+        assert_eq!(plan.steps[0].step_kind(), StepKind::Setup);
+        assert!(
+            plan.steps[0]
+                .expected_paths
+                .iter()
+                .any(|path| path == "src/app/page.tsx"),
+            "{plan:?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"planner_error_kind\":\"verify_command_policy_error\""));
+        assert!(event_text.contains("\"event\":\"planner_fallback_plan\""));
+        assert!(event_text.contains("\"profile\":\"nextjs\""));
     }
 
     #[test]

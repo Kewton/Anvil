@@ -373,9 +373,6 @@ fn normalize_verify_command(command: &str) -> Vec<String> {
     if let Some(path) = node_exists_sync_path(trimmed) {
         return vec![format!("test -f {path}")];
     }
-    if !trimmed.contains("&&") {
-        return vec![trimmed.split_whitespace().collect::<Vec<_>>().join(" ")];
-    }
     if let Ok(commands) = crate::planner::verify::normalize_planner_verify_command(trimmed) {
         return commands;
     }

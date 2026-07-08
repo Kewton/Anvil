@@ -1070,6 +1070,9 @@ pub fn normalize_planner_verify_command(command: &str) -> anyhow::Result<Vec<Str
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
+    if let Ok(normalized) = normalize_verify_command(trimmed) {
+        return Ok(vec![normalized.into_string()]);
+    }
     if !contains_shell_control_syntax(trimmed) {
         return Ok(vec![normalize_verify_command(trimmed)?.into_string()]);
     }
@@ -2384,6 +2387,16 @@ mod tests {
             normalized,
             vec!["npm test", "npm run build", "test -f src/app/page.tsx"]
         );
+    }
+
+    #[test]
+    fn planner_verify_normalization_strips_status_echo_before_shell_policy() {
+        let normalized = normalize_planner_verify_command(
+            r#"test -f src/app/page.tsx && echo "pass" || echo "fail""#,
+        )
+        .unwrap();
+
+        assert_eq!(normalized, vec!["test -f src/app/page.tsx"]);
     }
 
     #[test]
