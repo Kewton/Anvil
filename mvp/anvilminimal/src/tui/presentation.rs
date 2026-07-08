@@ -257,6 +257,23 @@ pub fn render_status_card(config: &Config) -> String {
             )
         }
     };
+    let live_time = crate::tui::status_bus::snapshot_global()
+        .map(|status| {
+            let totals = status.time_totals;
+            if totals.total_secs() == 0 {
+                "running total not yet observed".to_string()
+            } else {
+                format!(
+                    "running total {} (provider {}, command {})",
+                    crate::time_profile::format_duration(totals.total_secs().saturating_mul(1_000)),
+                    crate::time_profile::format_duration(
+                        totals.provider_secs.saturating_mul(1_000)
+                    ),
+                    crate::time_profile::format_duration(totals.command_secs.saturating_mul(1_000))
+                )
+            }
+        })
+        .unwrap_or_else(|| "not running".to_string());
     [
         "### Status".to_string(),
         format!("- Model: {} ({})", config.model, config.field_sources.model),
@@ -289,6 +306,7 @@ pub fn render_status_card(config: &Config) -> String {
         format!("- Inference: {inference}"),
         format!("- Port: {}", status_port(config)),
         format!("- Probe: {probe}"),
+        format!("- Time profile: {live_time}"),
         format!(
             "- Narration: {} ({})",
             narration_label(config.narration),

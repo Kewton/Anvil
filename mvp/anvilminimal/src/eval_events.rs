@@ -974,6 +974,10 @@ pub fn render_terminal_summary_card(
     if let Some(telemetry) = terminal_card_telemetry(projection) {
         lines.push(format!("- Telemetry: {telemetry}"));
     }
+    let time_profile = crate::time_profile::aggregate_events(&events);
+    if time_profile.total_ms() > 0 {
+        lines.push(format!("- {}", time_profile.summary_line()));
+    }
     if !projection.recovery_prompt_path.is_empty() {
         lines.push(format!(
             "- Recovery prompt: {}",
@@ -2576,6 +2580,10 @@ fn render_tui_command_completion_summary(
             .unwrap_or(lines.len());
         lines.insert(profile_index, line);
     }
+    if let Some(time_profile) = crate::time_profile::render_summary_sections(events) {
+        lines.push(String::new());
+        lines.push(time_profile);
+    }
     lines.push(String::new());
     lines.push(render_phase_breakdown_for_summary(
         &phase_breakdown_for_tui_summary(events, previous_summary, terminal_status),
@@ -2969,6 +2977,53 @@ mod tests {
         assert!(
             telemetry.contains("context_truncation_suspected=1"),
             "{telemetry}"
+        );
+    }
+
+    #[test]
+    fn tui_summary_renders_time_profile_from_existing_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".anvil/runs/time/events.jsonl");
+        emit(
+            Some(&path),
+            json!({"event": "ultra_phase_start", "phase_id": "setup"}),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "provider_turn_duration",
+                "caller_scope": "planner_step",
+                "duration_ms": 20_000,
+                "estimated_prompt_tokens_sent": 2000,
+                "prompt_eval_count": 1200,
+                "eval_count": 200,
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({"event": "dependency_build_lifecycle", "setup_duration_ms": 10_000}),
+        );
+        let projection = project_completion(true, &CompletionSnapshot::empty());
+
+        write_tui_command_completion_summary(
+            Some(&path),
+            "/ultra-plan-run",
+            "completed",
+            "",
+            "completed",
+            &projection,
+        );
+
+        let summary = std::fs::read_to_string(path.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains("Time profile: provider 67%"), "{summary}");
+        assert!(
+            summary.contains("tokens prompt_eval=1200 eval=200"),
+            "{summary}"
+        );
+        assert!(summary.contains("Time profile by phase:"), "{summary}");
+        assert!(
+            summary.contains("| setup | 30s | 20s | 10s | 0s | 0s | 0s |"),
+            "{summary}"
         );
     }
 

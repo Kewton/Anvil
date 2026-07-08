@@ -215,6 +215,16 @@ fn add_known(current: Option<u64>, delta: Option<u64>) -> Option<u64> {
     }
 }
 
+fn format_secs(secs: u64) -> String {
+    let minutes = secs / 60;
+    let seconds = secs % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m{seconds:02}s")
+    }
+}
+
 pub fn build_footer_line(status: &UiStatus, use_color: bool) -> String {
     let tokens = match status.token_total() {
         Some(value) => format_token_count(value),
@@ -309,6 +319,14 @@ pub fn build_live_footer_lines(
         } else {
             secondary.push(format!("repair {}/{}", repair.attempt, repair.max));
         }
+    }
+    if runtime.time_totals.total_secs() > 0 {
+        secondary.push(format!(
+            "time total:{} provider:{} cmd:{}",
+            format_secs(runtime.time_totals.total_secs()),
+            format_secs(runtime.time_totals.provider_secs),
+            format_secs(runtime.time_totals.command_secs),
+        ));
     }
     let prefix = if runtime.force_finalize_requested {
         "[stopping: force-finalizing…] "

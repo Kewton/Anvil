@@ -15,6 +15,7 @@ pub mod providers;
 pub mod repl;
 pub mod runs;
 pub mod state;
+pub mod time_profile;
 pub mod tools;
 pub mod tui;
 pub mod util;
@@ -361,6 +362,8 @@ fn emit_direct_command_stop_with_status(
     let failure_kind = terminal_status.failure_kind();
     let stop_reason = direct_stop_reason_for_result(result, terminal_status);
     let event_projection = direct_event_projection_for_status(&completion, terminal_status);
+    let time_profile = time_profile::aggregate_event_path(config.eval_events_path.as_deref());
+    let time_profile_event = time_profile.to_event_json();
 
     eval_events::emit(
         config.eval_events_path.as_deref(),
@@ -396,8 +399,25 @@ fn emit_direct_command_stop_with_status(
             "recovery_ultra_plan_path": &completion.recovery_ultra_plan_path,
             "suggested_recovery_command": &completion.suggested_recovery_command,
             "suggested_recovery_yaml_command": &completion.suggested_recovery_yaml_command,
+            "time_profile_total_ms": time_profile.total_ms(),
+            "time_profile_provider_ms": time_profile.provider.total_ms(),
+            "time_profile_installs_ms": time_profile.installs_ms,
+            "time_profile_builds_ms": time_profile.builds_ms,
+            "time_profile_probe_ms": time_profile.probe_ms,
+            "time_profile": time_profile_event,
         }),
     );
+    if time_profile.total_ms() > 0 {
+        eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "time_profile",
+                "lifecycle_stage": "direct_cli_command",
+                "command": command,
+                "profile": time_profile.to_event_json(),
+            }),
+        );
+    }
     eval_events::write_tui_command_completion_summary(
         config.eval_events_path.as_deref(),
         command,

@@ -496,6 +496,9 @@ fn emit_tui_command_stop_with_status(
     let failure_kind = terminal_status.failure_kind();
     let stop_reason = stop_reason_for_result(result, terminal_status);
     let event_projection = event_projection_for_terminal_status(&completion, terminal_status);
+    let time_profile =
+        crate::time_profile::aggregate_event_path(config.eval_events_path.as_deref());
+    let time_profile_event = time_profile.to_event_json();
     crate::eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -560,8 +563,25 @@ fn emit_tui_command_stop_with_status(
             "planner_quality_issue_count": completion.planner_quality_issue_count,
             "planner_repaired": completion.planner_repaired,
             "planner_release_risk": completion.planner_release_risk,
+            "time_profile_total_ms": time_profile.total_ms(),
+            "time_profile_provider_ms": time_profile.provider.total_ms(),
+            "time_profile_installs_ms": time_profile.installs_ms,
+            "time_profile_builds_ms": time_profile.builds_ms,
+            "time_profile_probe_ms": time_profile.probe_ms,
+            "time_profile": time_profile_event,
         }),
     );
+    if time_profile.total_ms() > 0 {
+        crate::eval_events::emit(
+            config.eval_events_path.as_deref(),
+            json!({
+                "event": "time_profile",
+                "lifecycle_stage": "tui_command",
+                "command": command,
+                "profile": time_profile.to_event_json(),
+            }),
+        );
+    }
     crate::eval_events::write_tui_command_completion_summary(
         config.eval_events_path.as_deref(),
         command,

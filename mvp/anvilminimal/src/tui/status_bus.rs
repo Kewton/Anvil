@@ -60,6 +60,18 @@ pub struct RepairStatus {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeTimeTotals {
+    pub provider_secs: u64,
+    pub command_secs: u64,
+}
+
+impl RuntimeTimeTotals {
+    pub fn total_secs(self) -> u64 {
+        self.provider_secs.saturating_add(self.command_secs)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeStatus {
     pub generation: u64,
@@ -72,6 +84,7 @@ pub struct RuntimeStatus {
     pub last_event: Option<String>,
     pub interrupt_requested: bool,
     pub force_finalize_requested: bool,
+    pub time_totals: RuntimeTimeTotals,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +116,9 @@ pub enum StatusEvent {
         cap_secs: u64,
         started_at: StatusTime,
     },
-    CommandFinished,
+    CommandFinished {
+        finished_at: StatusTime,
+    },
     Repair {
         attempt: usize,
         max: usize,
@@ -240,6 +255,10 @@ fn apply_event(status: &mut RuntimeStatus, event: StatusEvent) {
         }
         StatusEvent::ProviderFinished { duration_secs } => {
             status.provider = None;
+            status.time_totals.provider_secs = status
+                .time_totals
+                .provider_secs
+                .saturating_add(duration_secs);
             status.last_event = Some(format!("provider_turn_finished:{duration_secs}s"));
         }
         StatusEvent::CommandStarted {
@@ -254,7 +273,13 @@ fn apply_event(status: &mut RuntimeStatus, event: StatusEvent) {
                 started_at,
             });
         }
-        StatusEvent::CommandFinished => {
+        StatusEvent::CommandFinished { finished_at } => {
+            if let Some(command) = &status.command {
+                status.time_totals.command_secs = status
+                    .time_totals
+                    .command_secs
+                    .saturating_add(finished_at.elapsed_secs_since(command.started_at));
+            }
             status.command = None;
         }
         StatusEvent::Repair { attempt, max, kind } => {
@@ -360,7 +385,7 @@ pub fn publish_command_started(command: &std::process::Command, cap: Duration) -
 }
 
 pub fn publish_command_finished() -> bool {
-    publish_global(StatusEvent::CommandFinished)
+    publish_global(StatusEvent::CommandFinished { finished_at: now() })
 }
 
 pub fn publish_interrupt_requested() -> bool {
@@ -516,6 +541,31 @@ mod tests {
 
         assert!(snapshot.interrupt_requested);
         assert!(snapshot.force_finalize_requested);
+    }
+
+    #[test]
+    fn bus_tracks_live_time_totals() {
+        let (publisher, subscriber) = channel();
+
+        assert!(publisher.publish(StatusEvent::ProviderStarted {
+            scope: "executor".to_string(),
+            deadline_secs: 600,
+            started_at: StatusTime::from_secs(0),
+        }));
+        assert!(publisher.publish(StatusEvent::ProviderFinished { duration_secs: 12 }));
+        assert!(publisher.publish(StatusEvent::CommandStarted {
+            excerpt: "npm run build".to_string(),
+            cap_secs: 120,
+            started_at: StatusTime::from_secs(20),
+        }));
+        assert!(publisher.publish(StatusEvent::CommandFinished {
+            finished_at: StatusTime::from_secs(29),
+        }));
+
+        let snapshot = subscriber.snapshot();
+        assert_eq!(snapshot.time_totals.provider_secs, 12);
+        assert_eq!(snapshot.time_totals.command_secs, 9);
+        assert_eq!(snapshot.time_totals.total_secs(), 21);
     }
 
     #[test]
