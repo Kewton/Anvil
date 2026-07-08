@@ -262,6 +262,11 @@ impl DirectCommandCompletionGuard {
                         if !signal_finalized.swap(true, Ordering::AcqRel) {
                             let result: anyhow::Result<()> =
                                 Err(anyhow::anyhow!("interrupted by user"));
+                            bounded_process::reap_registered_server_children_for_workspace(
+                                signal_config.eval_events_path.as_deref(),
+                                "direct_cli_sigint",
+                                &signal_config.workspace_root,
+                            );
                             emit_direct_command_stop_with_status(
                                 &signal_config,
                                 &signal_command,
@@ -341,6 +346,11 @@ fn emit_direct_command_stop_with_status(
     result: &anyhow::Result<()>,
     requested_status: DirectCommandStatus,
 ) -> eval_events::CompletionProjection {
+    bounded_process::reap_registered_server_children_for_workspace(
+        config.eval_events_path.as_deref(),
+        "direct_cli_stop",
+        &config.workspace_root,
+    );
     let requested_ok = requested_status.ok();
     let mut completion_snapshot =
         eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
@@ -544,6 +554,11 @@ fn emit_run_start(config: &Config) {
 }
 
 fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
+    bounded_process::reap_registered_server_children_for_workspace(
+        config.eval_events_path.as_deref(),
+        "run_stop",
+        &config.workspace_root,
+    );
     let (ok, stop_reason, failure_kind) = match result {
         Ok(()) => (true, "completed".to_string(), ""),
         Err(err) => (

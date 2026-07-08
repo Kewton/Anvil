@@ -4974,6 +4974,11 @@ pub fn run_ultra_plan_with_ui(
                 None,
                 None,
             );
+            bounded_process::reap_registered_server_children_for_workspace(
+                config.eval_events_path.as_deref(),
+                "phase_transition",
+                &config.workspace_root,
+            );
             reconcile_manifest_changed_dependencies_if_needed(
                 config,
                 &plan.profile,
@@ -5032,6 +5037,11 @@ pub fn run_ultra_plan_with_ui(
             Some(true),
             None,
             None,
+        );
+        bounded_process::reap_registered_server_children_for_workspace(
+            config.eval_events_path.as_deref(),
+            "phase_transition",
+            &config.workspace_root,
         );
         reconcile_manifest_changed_dependencies_if_needed(
             config,
@@ -8506,8 +8516,44 @@ fn run_nextjs_dev_route_probe_with_runtime(
     };
 
     if localhost_port_accepts_connection(spec.port) {
+        let owner = dev_server_port_owner(spec.port);
+        if let Some(owner) = &owner
+            && owner
+                .pid
+                .and_then(bounded_process::registered_server_child)
+                .is_some()
+        {
+            let reaped = owner.pid.is_some_and(|pid| {
+                bounded_process::reap_registered_server_child(
+                    pid,
+                    config.eval_events_path.as_deref(),
+                    "readiness_port_in_use_retry",
+                )
+            });
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "dev_server_port_in_use_retry",
+                    "port": spec.port,
+                    "owner_pid": owner.pid,
+                    "owner_command": owner.command,
+                    "registered_child": true,
+                    "reaped": reaped,
+                }),
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+
+    if localhost_port_accepts_connection(spec.port) {
+        let owner = dev_server_port_owner(spec.port);
         let failure_kind = "port_in_use";
-        let output_excerpt = dev_server_output_excerpt_for_port(failure_kind, "", spec.port);
+        let owner_text = owner
+            .as_ref()
+            .map(DevServerPortOwner::display)
+            .unwrap_or_else(|| "unknown owner".to_string());
+        let output_excerpt =
+            dev_server_output_excerpt_for_port(failure_kind, &owner_text, spec.port);
         emit_dev_server_unavailable_lifecycle(
             config,
             spec.port,
@@ -8619,6 +8665,15 @@ fn run_nextjs_dev_route_probe_with_runtime(
     };
 
     let pid = child.id();
+    bounded_process::register_server_child(
+        &child,
+        spec.command_display.clone(),
+        format!(
+            "final_acceptance_cycle_{}",
+            current_final_acceptance_cycle_index()
+        ),
+        &config.workspace_root,
+    );
     emit_dev_server_lifecycle_stage(
         config,
         "start",
@@ -8675,7 +8730,7 @@ fn run_nextjs_dev_route_probe_with_runtime(
                     &output_excerpt,
                 );
                 write_release_evidence_json(evidence_path, &evidence);
-                let cleanup = cleanup_fn(child, &logs);
+                let cleanup = cleanup_registered_dev_server_child(cleanup_fn, child, &logs);
                 emit_dev_server_cleanup_lifecycle_stage(
                     config,
                     cleanup.ok,
@@ -8730,7 +8785,7 @@ fn run_nextjs_dev_route_probe_with_runtime(
                     &output_excerpt,
                 );
                 write_release_evidence_json(evidence_path, &evidence);
-                let cleanup = cleanup_fn(child, &logs);
+                let cleanup = cleanup_registered_dev_server_child(cleanup_fn, child, &logs);
                 emit_dev_server_cleanup_lifecycle_stage(
                     config,
                     cleanup.ok,
@@ -8825,7 +8880,7 @@ fn run_nextjs_dev_route_probe_with_runtime(
                         );
                     emit_browser_interaction_probe_event(config, &interaction);
                 }
-                let cleanup = cleanup_fn(child, &logs);
+                let cleanup = cleanup_registered_dev_server_child(cleanup_fn, child, &logs);
                 emit_dev_server_cleanup_lifecycle_stage(
                     config,
                     cleanup.ok,
@@ -8882,7 +8937,7 @@ fn run_nextjs_dev_route_probe_with_runtime(
         &output_excerpt,
     );
     write_release_evidence_json(evidence_path, &evidence);
-    let cleanup = cleanup_fn(child, &logs);
+    let cleanup = cleanup_registered_dev_server_child(cleanup_fn, child, &logs);
     emit_dev_server_cleanup_lifecycle_stage(
         config,
         cleanup.ok,
@@ -9129,6 +9184,58 @@ fn port_in_use_remediation(output: &str, port: u16) -> String {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DevServerPortOwner {
+    pid: Option<u32>,
+    command: String,
+}
+
+impl DevServerPortOwner {
+    fn display(&self) -> String {
+        match (self.pid, self.command.trim()) {
+            (Some(pid), command) if !command.is_empty() => format!("pid {pid} ({command})"),
+            (Some(pid), _) => format!("pid {pid}"),
+            (None, command) if !command.is_empty() => command.to_string(),
+            (None, _) => "unknown owner".to_string(),
+        }
+    }
+}
+
+fn dev_server_port_owner(port: u16) -> Option<DevServerPortOwner> {
+    let port_spec = format!("-iTCP:{port}");
+    let mut command = std::process::Command::new("lsof");
+    command
+        .args(["-nP", &port_spec, "-sTCP:LISTEN", "-F", "pc"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = bounded_process::run_with_timeout(&mut command, Duration::from_secs(2)).ok()?;
+    if !output.success() {
+        return None;
+    }
+    parse_dev_server_port_owner(&String::from_utf8(output.stdout).ok()?)
+}
+
+fn parse_dev_server_port_owner(text: &str) -> Option<DevServerPortOwner> {
+    let mut pid = None;
+    let mut command = None;
+    for line in text.lines() {
+        if let Some(raw) = line.strip_prefix('p') {
+            pid = raw.parse::<u32>().ok();
+        } else if let Some(raw) = line.strip_prefix('c') {
+            command = Some(raw.to_string());
+        }
+        if pid.is_some() && command.is_some() {
+            break;
+        }
+    }
+    pid.or_else(|| command.as_ref().map(|_| 0))
+        .map(|pid_value| DevServerPortOwner {
+            pid: (pid_value != 0).then_some(pid_value),
+            command: command.unwrap_or_default(),
+        })
+}
+
 fn tailwind_dev_pipeline_failure(lower_text: &str) -> bool {
     lower_text.contains("@tailwind")
         && (lower_text.contains("module parse failed")
@@ -9191,6 +9298,17 @@ fn cleanup_dev_server_child(mut child: Child, logs: &DevServerLogPaths) -> DevSe
     {
         cleanup_dev_server_child_non_unix(&mut child, logs)
     }
+}
+
+fn cleanup_registered_dev_server_child(
+    cleanup_fn: DevServerCleanupFn,
+    child: Child,
+    logs: &DevServerLogPaths,
+) -> DevServerCleanup {
+    let pid = child.id();
+    let cleanup = cleanup_fn(child, logs);
+    bounded_process::unregister_server_child(pid);
+    cleanup
 }
 
 #[cfg(unix)]
@@ -14216,6 +14334,14 @@ mod tests {
             dev_server_output_excerpt(&kind, output)
                 .contains(verifier_env::ENV_NODE_ENV_REMEDIATION)
         );
+    }
+
+    #[test]
+    fn dev_server_port_owner_parser_preserves_pid_and_command() {
+        let owner = parse_dev_server_port_owner("p30110\ncnext-server\n").unwrap();
+        assert_eq!(owner.pid, Some(30110));
+        assert_eq!(owner.command, "next-server");
+        assert_eq!(owner.display(), "pid 30110 (next-server)");
     }
 
     #[test]

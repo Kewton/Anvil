@@ -267,6 +267,12 @@ fn probe_browser_readiness_with_options(
             );
         }
     };
+    bounded_process::register_server_child(
+        &child,
+        spec.command.display.clone(),
+        "browser_readiness_probe",
+        root,
+    );
     let mut child = ChildGuard::new(child);
     let deadline = started + timeout;
     let mut last_error = String::new();
@@ -753,11 +759,16 @@ struct CleanupObservation {
 
 struct ChildGuard {
     child: Option<Child>,
+    pid: u32,
 }
 
 impl ChildGuard {
     fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+        let pid = child.id();
+        Self {
+            child: Some(child),
+            pid,
+        }
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -776,14 +787,20 @@ impl ChildGuard {
         };
         terminate_child(&mut child);
         match child.wait_with_output() {
-            Ok(output) => CleanupObservation {
-                reaped: true,
-                output_excerpt: output_excerpt(&output),
-            },
-            Err(err) => CleanupObservation {
-                reaped: false,
-                output_excerpt: err.to_string(),
-            },
+            Ok(output) => {
+                bounded_process::unregister_server_child(self.pid);
+                CleanupObservation {
+                    reaped: true,
+                    output_excerpt: output_excerpt(&output),
+                }
+            }
+            Err(err) => {
+                bounded_process::unregister_server_child(self.pid);
+                CleanupObservation {
+                    reaped: false,
+                    output_excerpt: err.to_string(),
+                }
+            }
         }
     }
 }
@@ -793,6 +810,7 @@ impl Drop for ChildGuard {
         if let Some(child) = self.child.as_mut() {
             terminate_child(child);
             let _ = child.wait();
+            bounded_process::unregister_server_child(self.pid);
         }
     }
 }

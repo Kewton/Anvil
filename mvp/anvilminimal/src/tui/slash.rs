@@ -67,6 +67,11 @@ impl TuiCommandCompletionGuard {
         result: &anyhow::Result<String>,
         status: TuiTerminalStatus,
     ) -> crate::eval_events::CompletionProjection {
+        crate::bounded_process::reap_registered_server_children_for_workspace(
+            self.config.eval_events_path.as_deref(),
+            "tui_command_finalize",
+            &self.config.workspace_root,
+        );
         let completion =
             emit_tui_command_stop_with_status(&self.config, &self.command, result, status);
         self.finalized = true;
@@ -151,6 +156,11 @@ impl Drop for TuiCommandCompletionGuard {
         }
         let result: anyhow::Result<String> =
             Err(anyhow::anyhow!("command aborted before completion"));
+        crate::bounded_process::reap_registered_server_children_for_workspace(
+            self.config.eval_events_path.as_deref(),
+            "tui_command_drop",
+            &self.config.workspace_root,
+        );
         let _ = emit_tui_command_stop_with_status(
             &self.config,
             &self.command,
