@@ -1,0 +1,49 @@
+{
+  "goal": "Scaffold a Next.js application with Tailwind CSS configuration and port 3011 scripts.",
+  "steps": [
+    {
+      "id": "inspect-workspace",
+      "kind": "inspect",
+      "instruction": "Check if the workspace is empty or contains existing project files.",
+      "expected_paths": [],
+      "verify": [],
+      "expected_result": "pass"
+    },
+    {
+      "id": "setup-package",
+      "kind": "setup",
+      "instruction": "Create package.json with Next.js, React, Tailwind dependencies and scripts running on port 3011.",
+      "expected_paths": ["package.json"],
+      "verify": [
+        "grep -q '\"dev\": \"next dev -p 3011\"' package.json && grep -q '\"start\": \"next start -p 3011\"' package.json"
+      ],
+      "expected_result": "pass"
+    },
+    {
+      "id": "setup-tailwind",
+      "kind": "setup",
+      "instruction": "Create Tailwind and PostCSS configuration files.",
+      "expected_paths": ["tailwind.config.js", "postcss.config.js"],
+      "verify": ["test -f tailwind.config.js && test -f postcss.config.js"],
+      "expected_result": "pass"
+    },
+    {
+      "id": "setup-app-router",
+      "kind": "setup",
+      "instruction": "Create the initial App Router layout and page files.",
+      "expected_paths": ["app/layout.js", "app/page.js"],
+      "verify": ["test -f app/layout.js && test -f app/page.js"],
+      "expected_result": "pass"
+    },
+    {
+      "id": "verify-nextjs-dependency",
+      "kind": "verify",
+      "instruction": "Verify that package.json declares Next.js and scaffold files exist.",
+      "expected_paths": [],
+      "verify": [
+        "cat package.json | grep -q '\"next\"' && test -f tailwind.config.js && test -f app/layout.js"
+      ],
+      "expected_result": "pass"
+    }
+  ]
+}

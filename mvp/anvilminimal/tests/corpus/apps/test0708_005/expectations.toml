@@ -1,0 +1,50 @@
+case_id = "test0708_005"
+source = "UAT test0708_005"
+required_paths = ["package.json", "src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["early-death-profile", "verify-normalization", "setup-fallback"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = []
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/events-early-death-profile.jsonl = [
+  "\"event\":\"tui_command_start\"",
+  "\"profile\":\"nextjs\"",
+  "\"event\":\"ultra_context_initialized\"",
+  "\"planner_error_kind\":\"verify_command_policy_error\"",
+  "\"event\":\"recovery_prompt_saved\"",
+  "\"recovery_profile\":\"nextjs\"",
+  "\"event\":\"tui_command_stop\"",
+  "\"effective_profile\":\"generic\"",
+  "\"event\":\"run_stop\""
+]
+fixtures/ultra-plan.yaml = [
+  "profile: \"nextjs\"",
+  "id: \"project-setup\"",
+  "Configure package.json scripts for dev and start to explicitly run on port 3011"
+]
+fixtures/step-plan-shell-control.json = [
+  "\"id\": \"setup-package\"",
+  "grep -q '\\\"dev\\\": \\\"next dev -p 3011\\\"' package.json && grep -q '\\\"start\\\": \\\"next start -p 3011\\\"' package.json",
+  "test -f tailwind.config.js && test -f postcss.config.js",
+  "cat package.json | grep -q '\\\"next\\\"' && test -f tailwind.config.js && test -f app/layout.js"
+]

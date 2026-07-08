@@ -1,0 +1,13 @@
+goal: "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。"
+profile: "nextjs"
+style: "default"
+intent: "create"
+phases:
+  - id: "project-setup"
+    prompt: "Scaffold a Next.js application using the default Tailwind CSS configuration. Configure package.json scripts for dev and start to explicitly run on port 3011. Ensure next, react, react-dom, tailwindcss, postcss, and autoprefixer are defined as dependencies. Verify the project structure, configuration files, and script definitions are correctly generated and ready for development."
+  - id: "game-engine"
+    prompt: "Implement the core Space Invaders game engine using React hooks and state management. Design logic for player movement, shooting, enemy grid generation, synchronized enemy movement, collision detection, score tracking, and lives. Structure the game state to support menu, playing, and game over phases. Output a cohesive game logic module that can be consumed by the UI layer."
+  - id: "ui-integration"
+    prompt: "Build the route-bound game page integrating the game engine with a responsive canvas or DOM-based UI. Apply a cohesive Tailwind CSS styling scheme for a polished space-themed aesthetic. Add the required observability hooks: data-anvil-action=\"primary\" on the main start/restart control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state after each render. Ensure the page correctly renders the game UI and integrates all game logic."
+  - id: "build-verification"
+    prompt: "Execute a final build verification using next build. Confirm all dependencies are resolved, scripts correctly target port 3011, and the application compiles without errors. Verify that the game logic and UI are fully integrated, observability hooks are correctly placed, and the build output is clean. Document final cleanup steps if necessary."
