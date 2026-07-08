@@ -194,6 +194,23 @@ shape and the K=3/K=5 intervention vocabulary.
 that inspect without editing until the compact/regeneration rung accepts a
 source change.
 
+Post-104 prompt-layout follow-up:
+
+```sh
+# Manual reduced fixture from qwen27b GAME test0708_018:
+tests/corpus/apps/test0708_018
+```
+
+`test0708_018` pins the new qwen27b setup-phase behavior observed immediately
+after the prompt-prefix reordering: artifact recovery saw
+`no_tool_missing_artifacts` for `src/app/page.tsx` three times while the
+project setup scaffold otherwise existed. The source snapshot intentionally
+omits `src/app/page.tsx`; the event fixture records the deterministic scaffold
+rescue authoring that page at exhaustion. The prompt fixtures pin both
+`stable` and `legacy` layouts for the affected StepPlan and step-execution
+session families so A/B runs can compare behavior against the same content
+ordered differently.
+
 The boundedness follow-up harvests are diagnostic fixtures. `content_b` pins the
 wide `ls -R && cat package.json` loop: each Bash attempt reached the 180s cap
 because recursive listing walked the workspace/dependency tree, and the old

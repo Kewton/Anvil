@@ -1,0 +1,65 @@
+case_id = "test0708_018"
+source = "UAT test0708_018"
+required_paths = ["package.json", "src/app/layout.tsx", "src/app/globals.css"]
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["prompt-layout", "no-tool", "artifact-recovery", "src/app/page.tsx"]
+acceptance_passed = true
+primary_reason = "pass"
+
+[route_closure]
+include = []
+exclude = []
+
+[evidence]
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/events-no-tool-setup-stagnation.jsonl = [
+  "\"event\":\"run_start\"",
+  "\"model\":\"qwen3.6:27b-coding-nvfp4\"",
+  "\"prompt_layout\":\"stable\"",
+  "\"event\":\"artifact_recovery_feedback\"",
+  "\"reason\":\"no_tool_missing_artifacts\"",
+  "\"missing_paths\":[\"src/app/page.tsx\"]",
+  "\"attempt\":3",
+  "\"event\":\"setup_scaffold_completed\"",
+  "\"trigger\":\"exhausted\"",
+  "\"paths\":[\"src/app/page.tsx\"]"
+]
+fixtures/step-plan-stable.md = [
+  "Prompt layout: stable",
+  "Stable prefix",
+  "Current objective: produce a setup StepPlan that creates src/app/page.tsx",
+  "Return only JSON"
+]
+fixtures/step-plan-legacy.md = [
+  "Prompt layout: legacy",
+  "Phase context first",
+  "Current phase: project-setup",
+  "Return only JSON"
+]
+fixtures/step-execution-stable.md = [
+  "Prompt layout: stable",
+  "Stable prefix",
+  "Current objective: Create the missing setup artifact src/app/page.tsx",
+  "Missing required artifact(s): src/app/page.tsx",
+  "Emit exactly one Write or Edit tool call now"
+]
+fixtures/step-execution-legacy.md = [
+  "Prompt layout: legacy",
+  "Current step first",
+  "Expected paths: src/app/page.tsx",
+  "Step execution rules"
+]
