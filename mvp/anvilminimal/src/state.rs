@@ -62,9 +62,10 @@ impl ConversationMessage {
         tool_call_id: Option<impl Into<String>>,
         content: impl Into<String>,
     ) -> Self {
+        let content = crate::eval_events::body_snippet_whole_tokens(&content.into());
         Self {
             role: "tool".to_string(),
-            content: content.into(),
+            content,
             name: Some(name.into()),
             tool_call_id: tool_call_id.map(Into::into),
             tool_calls: Vec::new(),

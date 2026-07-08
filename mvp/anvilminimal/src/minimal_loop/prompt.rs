@@ -72,6 +72,11 @@ fn sanitize_history_message_for_request(message: &ConversationMessage) -> Conver
         cloned.content.clear();
         return cloned;
     }
+    if message.role == "tool" {
+        let mut cloned = message.clone();
+        cloned.content = crate::eval_events::body_snippet_whole_tokens(&cloned.content);
+        return cloned;
+    }
     message.clone()
 }
 
@@ -137,5 +142,27 @@ mod tests {
         assert!(messages[1].content.is_empty());
         assert_eq!(history[0].content, "I will create it now.");
         assert!(messages[0].content.contains("Profile guidance"));
+    }
+
+    #[test]
+    fn tool_history_messages_are_bounded_before_requesting() {
+        let history = vec![ConversationMessage {
+            role: "tool".to_string(),
+            content: format!("{}{}", "x".repeat(1200), "y".repeat(1200)),
+            name: Some("Write".to_string()),
+            tool_call_id: Some("tool-call-1".to_string()),
+            tool_calls: Vec::new(),
+        }];
+        let messages = build_request_messages(
+            &history,
+            ToolRegistry::default().specs(),
+            Path::new("/tmp/work"),
+            None,
+            None,
+            ToolPromptMode::Native,
+        );
+        assert!(messages[1].content.chars().count() <= 500);
+        assert!(messages[1].content.ends_with('x') || messages[1].content.ends_with('y'));
+        assert!(history[0].content.chars().count() > messages[1].content.chars().count());
     }
 }

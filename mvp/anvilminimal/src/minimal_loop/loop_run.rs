@@ -7685,8 +7685,7 @@ Required final artifacts:
         let bash_result = session
             .messages
             .iter()
-            .filter(|message| message.role == "tool" && message.name.as_deref() == Some("Bash"))
-            .next_back()
+            .rfind(|message| message.role == "tool" && message.name.as_deref() == Some("Bash"))
             .map(|message| message.content.as_str())
             .unwrap_or_default();
         assert!(bash_result.contains("outcome: Success"), "{bash_result}");
