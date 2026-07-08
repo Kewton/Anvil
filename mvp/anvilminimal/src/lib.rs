@@ -7,6 +7,7 @@ pub mod config;
 pub mod eval_events;
 pub mod minimal_loop;
 pub mod mode;
+pub mod model_probe;
 pub mod planner;
 pub mod preflight;
 pub mod provider_call;
@@ -161,6 +162,14 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 for line in report.summary_lines() {
                     println!("{line}");
                 }
+                Ok(())
+            }
+            Action::ModelProbe => {
+                let mut execution = providers::client_from_config(&config, false)?;
+                let mut planner_client = providers::client_from_config(&config, true)?;
+                let output =
+                    model_probe::run_configured(&config, &mut *planner_client, &mut *execution)?;
+                println!("{}", output.card);
                 Ok(())
             }
             Action::UxDemo => tui::ux_demo::run(&config),
@@ -322,6 +331,7 @@ fn direct_command_for_action(action: &Action) -> Option<&'static str> {
         Action::UltraPlanRun(_) => Some("--ultra-plan-run"),
         Action::RunUltraPlan(_) => Some("--run-ultra-plan"),
         Action::SetupInteractionProbe => Some("--setup-interaction-probe"),
+        Action::ModelProbe => Some("--model-probe"),
     }
 }
 

@@ -335,6 +335,10 @@ pub fn handle_command(
                 crate::minimal_loop::interaction_probe::setup_interaction_probe_with_stdout_progress()?;
                 Ok(report.summary_lines().join("\n"))
             }
+            "/model-probe" => {
+                let output = crate::model_probe::run_configured(&config, planner, execution)?;
+                Ok(output.card)
+            }
             other => bail!("unknown slash command: {other}; type /help for commands"),
         }
     }));
@@ -401,6 +405,7 @@ fn render_help() -> String {
         "/ultra-plan-run <goal> - generate and run an UltraPlan",
         "/run-ultra-plan <path> - run an existing UltraPlan",
         "/setup-interaction-probe - install the interaction readiness probe",
+        "/model-probe - run the bounded model behavior probe battery",
         "/exit or /quit - leave the TUI",
         "Footer: use --footer off to disable the fixed footer; breadcrumbs remain in scrollback.",
         "Interrupt: Esc/Ctrl-C once = prompt abort; twice = force finalize.",

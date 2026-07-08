@@ -54,6 +54,12 @@ pub struct Cli {
     pub runs: bool,
     #[arg(long, action = ArgAction::SetTrue, help = "Run the offline presentation UX demo")]
     pub ux_demo: bool,
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Run the bounded model behavior probe battery"
+    )]
+    pub model_probe: bool,
     #[arg(long)]
     pub profile: Option<String>,
     #[arg(long, default_value = "default")]
@@ -142,6 +148,12 @@ mod tests {
     fn help_includes_ux_demo() {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--ux-demo"));
+    }
+
+    #[test]
+    fn help_includes_model_probe() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--model-probe"));
     }
 
     #[test]
