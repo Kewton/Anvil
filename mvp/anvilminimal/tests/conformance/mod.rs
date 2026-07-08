@@ -305,6 +305,30 @@ fn conformance_negative_precise_exhaustion_rejects_bare_iteration_reason() {
 }
 
 #[test]
+fn conformance_negative_precise_exhaustion_rejects_no_blocker_with_pending_evidence() {
+    let trace = Trace {
+        scenario: MatrixScenario::Nextjs,
+        events: vec![
+            json!({
+                "event": "ultra_phase_context_attached",
+                "pending_capability_evidence": ["restart_or_recoverable_state_evidence"],
+                "pending_capability_evidence_count": 1
+            }),
+            json!({
+                "event": "loop_stop",
+                "reason": "loop_progress_exhausted",
+                "last_blocking_reason": "no concrete blocker recorded"
+            }),
+            terminal_stop("partial"),
+        ],
+        summary: terminal_summary("partial"),
+        output: String::new(),
+    };
+
+    assert_contract_fails("precise_exhaustion", check_precise_exhaustion(&trace));
+}
+
+#[test]
 fn conformance_negative_bounded_provider_turns_catches_silent_phase_context_window() {
     let trace = Trace {
         scenario: MatrixScenario::GenericStatic,
@@ -998,18 +1022,32 @@ fn check_bounded_child_processes(trace: &Trace) -> Result<(), String> {
 }
 
 fn check_precise_exhaustion(trace: &Trace) -> Result<(), String> {
-    for event in trace.events.iter().filter(|event| {
-        matches!(
+    let mut pending_contract_keys: Vec<String> = Vec::new();
+    for event in &trace.events {
+        let keys = pending_contract_evidence_keys(event);
+        if event.get("pending_capability_evidence").is_some() || !keys.is_empty() {
+            pending_contract_keys = keys;
+        }
+        if !matches!(
             string_field(event, "event"),
-            Some("loop_stop" | "tui_command_stop")
-        )
-    }) {
+            Some("loop_stop" | "tui_command_stop" | "ultra_phase_failed")
+        ) {
+            continue;
+        }
+        let mut event_pending = pending_contract_evidence_keys(event);
+        if event_pending.is_empty() {
+            event_pending = pending_contract_keys.clone();
+        }
+        let pending_contract = !event_pending.is_empty();
+        let mut saw_capability_unresolved = false;
+        let mut saw_loop_progress_exhausted = false;
         for key in [
             "reason",
             "primary_reason",
             "stop_reason",
             "failure_reason",
             "task_reason",
+            "last_blocking_reason",
         ] {
             let Some(value) = string_field(event, key) else {
                 continue;
@@ -1019,9 +1057,41 @@ fn check_precise_exhaustion(trace: &Trace) -> Result<(), String> {
                     "precise_exhaustion: terminal {key} stranded at budget label {value:?} in {event}"
                 ));
             }
+            if value.contains("capability_evidence_unresolved:") {
+                saw_capability_unresolved = true;
+            }
+            if value.contains("loop_progress_exhausted") {
+                saw_loop_progress_exhausted = true;
+            }
+            if pending_contract && value.contains("no concrete blocker recorded") {
+                return Err(format!(
+                    "precise_exhaustion: {key} claimed no concrete blocker while pending contract evidence existed ({event_pending:?}) in {event}"
+                ));
+            }
+        }
+        if pending_contract && saw_loop_progress_exhausted && !saw_capability_unresolved {
+            return Err(format!(
+                "precise_exhaustion: loop exhaustion with pending contract evidence must classify capability_evidence_unresolved ({event_pending:?}) in {event}"
+            ));
         }
     }
     Ok(())
+}
+
+fn pending_contract_evidence_keys(event: &Value) -> Vec<String> {
+    let mut keys = string_array(event, "pending_capability_evidence");
+    for field in [
+        "missing_evidence",
+        "missing_capabilities",
+        "missing_obligations",
+    ] {
+        for value in string_array(event, field) {
+            if !keys.contains(&value) {
+                keys.push(value);
+            }
+        }
+    }
+    keys
 }
 
 fn stranded_budget_label(value: &str) -> bool {

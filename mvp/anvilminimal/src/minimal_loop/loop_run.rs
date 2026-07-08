@@ -1812,18 +1812,30 @@ pub(crate) fn run_session_with_outcome_with_options(
     }
     let non_scaffold_missing = non_scaffold_missing_paths(config, &missing);
     let artifact_stagnation_feedback_count = artifact_recovery_state.target_attempts;
-    let reason = if !non_scaffold_missing.is_empty() {
-        "artifact_follow_through_exhausted"
-    } else if missing.is_empty() {
-        "loop_progress_exhausted"
+    let mut exhaustion_context = verify_repair_state.pending_error_context.clone();
+    let pending_contract_keys = pending_contract_keys_from_error_context(&exhaustion_context);
+    let capability_exhaustion_reason = if missing.is_empty() {
+        super::feedback::capability_evidence_unresolved_reason(&pending_contract_keys)
     } else {
-        "scaffold_artifact_follow_through_exhausted"
+        None
+    };
+    let reason = if !non_scaffold_missing.is_empty() {
+        "artifact_follow_through_exhausted".to_string()
+    } else if let Some(reason) = &capability_exhaustion_reason {
+        reason.clone()
+    } else if missing.is_empty() {
+        "loop_progress_exhausted".to_string()
+    } else {
+        "scaffold_artifact_follow_through_exhausted".to_string()
     };
     let loop_stop_event = json!({
             "event": "loop_stop",
-            "reason": reason,
+            "reason": reason.clone(),
             "missing_paths": missing,
             "non_scaffold_missing_paths": non_scaffold_missing.clone(),
+            "missing_capabilities": exhaustion_context.missing_capabilities.clone(),
+            "missing_evidence": exhaustion_context.missing_evidence.clone(),
+            "missing_obligations": exhaustion_context.missing_obligations.clone(),
             "artifact_stagnation_feedback_count": artifact_stagnation_feedback_count,
             "verify_attempts": verify_attempts,
             "last_blocking_reason": last_blocking_reason,
@@ -1837,6 +1849,12 @@ pub(crate) fn run_session_with_outcome_with_options(
             artifact_stagnation_feedback_count
         );
     }
+    if let Some(reason) = capability_exhaustion_reason {
+        if exhaustion_context.repair_target.is_none() {
+            exhaustion_context.repair_target = Some("required_evidence_missing".to_string());
+        }
+        return Err(RunSessionError::new(reason, exhaustion_context).into());
+    }
     let blocker = if missing.is_empty() {
         last_blocking_reason
             .as_deref()
@@ -1845,7 +1863,24 @@ pub(crate) fn run_session_with_outcome_with_options(
     } else {
         format!("missing scaffold paths: {}", missing.join(", "))
     };
-    bail!("{reason}: {blocker}")
+    if exhaustion_context.is_empty() {
+        bail!("{reason}: {blocker}")
+    }
+    Err(RunSessionError::new(format!("{reason}: {blocker}"), exhaustion_context).into())
+}
+
+fn pending_contract_keys_from_error_context(context: &RunSessionErrorContext) -> Vec<String> {
+    let mut keys = Vec::new();
+    for key in &context.missing_capabilities {
+        push_unique(&mut keys, key.clone());
+    }
+    for key in &context.missing_evidence {
+        push_unique(&mut keys, key.clone());
+    }
+    for key in &context.missing_obligations {
+        push_unique(&mut keys, key.clone());
+    }
+    keys
 }
 
 fn missing_paths(root: &std::path::Path, required_paths: &[String]) -> Vec<String> {

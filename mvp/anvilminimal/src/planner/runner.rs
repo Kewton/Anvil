@@ -29,6 +29,9 @@ use crate::minimal_loop::evidence::{
     RuntimeAcceptanceReport, comment_stripped_source_corpus, required_evidence_for_capability,
     verify_runtime_acceptance_with_browser_dirs_and_hints,
 };
+use crate::minimal_loop::feedback::{
+    capability_evidence_remedy_lines, capability_evidence_unresolved_reason,
+};
 use crate::minimal_loop::import_scan::{
     MissingImport, UnattachedRefDiagnostic, format_missing_import_findings,
     missing_import_target_rel, route_bound_closure, route_bound_unattached_ref_diagnostics,
@@ -966,9 +969,10 @@ impl UltraRunContext {
         if self.pending_capability_evidence.is_empty() {
             return "Unmet final requirements from earlier phases:\n- none".to_string();
         }
+        let pending = pending_capability_context_items(&self.pending_capability_evidence);
         render_bounded_prompt_section(
             "Unmet final requirements from earlier phases:",
-            &self.pending_capability_evidence,
+            &pending,
             Some("Close these requirements when they are in scope for this phase."),
             ULTRA_PROMPT_GUIDANCE_MAX_LINES,
         )
@@ -1084,7 +1088,7 @@ impl UltraRunContext {
         append_context_list(
             &mut lines,
             "Pending capability/evidence",
-            &self.pending_capability_evidence,
+            &pending_capability_context_items(&self.pending_capability_evidence),
         );
         append_context_list(
             &mut lines,
@@ -3577,6 +3581,156 @@ fn runtime_missing_signals(report: &RuntimeAcceptanceReport) -> Vec<String> {
     out
 }
 
+fn exhaustion_reason_with_pending_contract_state(message: &str, pending_keys: &[String]) -> String {
+    if !is_exhaustion_message(message) {
+        return message.to_string();
+    }
+    capability_evidence_unresolved_reason(pending_keys).unwrap_or_else(|| message.to_string())
+}
+
+fn is_exhaustion_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("loop_progress_exhausted")
+        || lower.contains("progress_exhausted")
+        || lower.contains("iteration")
+        || lower.contains("exhausted")
+}
+
+fn capability_evidence_failure_evidence(
+    root: &Path,
+    profile: &str,
+    pending_keys: &[String],
+    reason: &str,
+) -> Vec<String> {
+    let mut evidence = capability_evidence_remedy_lines(pending_keys);
+    if pending_keys
+        .iter()
+        .any(|key| key == "restart_or_recoverable_state_evidence")
+    {
+        merge_unique_strings(
+            &mut evidence,
+            &restart_hook_attachment_guidance(root, profile),
+        );
+    }
+    if evidence.is_empty() {
+        evidence.push(reason.to_string());
+    } else {
+        evidence.push(format!("exhaustion classification: {reason}"));
+    }
+    evidence
+}
+
+fn restart_hook_attachment_guidance(root: &Path, profile: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for rel in route_bound_closure(root, profile) {
+        if !restart_hook_scan_candidate(&rel) {
+            continue;
+        }
+        let full = root.join(&rel);
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            continue;
+        };
+        let lines = content.lines().collect::<Vec<_>>();
+        for (index, line) in lines.iter().enumerate() {
+            if !restart_attachment_candidate_line(line) {
+                continue;
+            }
+            let block = restart_attachment_block(&lines, index);
+            if has_restart_action_attribute(&block) || restart_block_is_initial_primary(&block) {
+                continue;
+            }
+            let label = restart_attachment_label(&block);
+            let line_number = restart_attachment_line_number(&lines, index);
+            out.push(format!(
+                "restart hook attachment point: add data-anvil-action=\"restart\" to {label} at {}:{}",
+                rel.display(),
+                line_number
+            ));
+        }
+    }
+    dedup_strings(out)
+}
+
+fn restart_hook_scan_candidate(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("tsx" | "jsx" | "ts" | "js")
+    )
+}
+
+fn restart_attachment_candidate_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let restart_named_click = lower.contains("onclick")
+        && (lower.contains("restart") || lower.contains("reset") || lower.contains("again"));
+    let restart_key_handler = (lower.contains("onkeydown")
+        || lower.contains("keyup")
+        || lower.contains("keydown")
+        || lower.contains("addeventlistener"))
+        && (line.contains("'r'")
+            || line.contains("\"r\"")
+            || line.contains("`r`")
+            || lower.contains("keyr"));
+    restart_named_click || restart_key_handler
+}
+
+fn has_restart_action_attribute(line: &str) -> bool {
+    line.contains("data-anvil-action=\"restart\"")
+        || line.contains("data-anvil-action='restart'")
+        || line.contains("data-anvil-action={`restart`}")
+}
+
+fn restart_attachment_line_number(lines: &[&str], index: usize) -> usize {
+    let start = index.saturating_sub(4);
+    for candidate in (start..=index).rev() {
+        if lines
+            .get(candidate)
+            .is_some_and(|line| line.to_ascii_lowercase().contains("<button"))
+        {
+            return candidate + 1;
+        }
+    }
+    index + 1
+}
+
+fn restart_attachment_block(lines: &[&str], index: usize) -> String {
+    let mut block = String::new();
+    for line in lines.iter().skip(index).take(8) {
+        block.push_str(line);
+        block.push('\n');
+        if line.to_ascii_lowercase().contains("</button>") {
+            break;
+        }
+    }
+    block
+}
+
+fn restart_block_is_initial_primary(block: &str) -> bool {
+    let lower = block.to_ascii_lowercase();
+    lower.contains("data-anvil-action=\"primary\"")
+        || lower.contains("data-anvil-action='primary'")
+        || lower.contains("start game")
+        || lower.contains(">start<")
+}
+
+fn restart_attachment_label(text: &str) -> &'static str {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("try again") {
+        "the TRY AGAIN button"
+    } else if lower.contains("restart") {
+        "the restart button"
+    } else if lower.contains("new game") {
+        "the NEW GAME button"
+    } else if lower.contains("play again") || lower.contains("again") {
+        "the PLAY AGAIN button"
+    } else if lower.contains("reset") {
+        "the reset button"
+    } else if lower.contains("keydown") || lower.contains("keyr") {
+        "the R-key restart handler's visible restart control"
+    } else {
+        "the restart-shaped control"
+    }
+}
+
 fn verification_missing_signals(report: &VerificationReport) -> Vec<String> {
     let mut out = Vec::new();
     merge_unique_strings(
@@ -3887,6 +4041,17 @@ fn append_context_list(lines: &mut Vec<String>, label: &str, values: &[String]) 
     for value in values {
         lines.push(format!("  - {value}"));
     }
+}
+
+fn pending_capability_context_items(keys: &[String]) -> Vec<String> {
+    let mut out = keys.to_vec();
+    for remedy in capability_evidence_remedy_lines(keys) {
+        let line = format!("remedy: {remedy}");
+        if !out.contains(&line) {
+            out.push(line);
+        }
+    }
+    out
 }
 
 fn render_bounded_prompt_section(
@@ -4298,7 +4463,13 @@ pub fn run_ultra_plan_with_ui(
         ) {
             Ok(outcome) => outcome,
             Err(err) => {
-                let message = err.message.clone();
+                let mut pending_signals = ultra_context.pending_capability_evidence.clone();
+                merge_unique_strings(
+                    &mut pending_signals,
+                    &err.partial_outcome.observed_contract_keys(),
+                );
+                let message =
+                    exhaustion_reason_with_pending_contract_state(&err.message, &pending_signals);
                 ultra_context.update_after_failure(
                     phase,
                     &err.partial_outcome,
@@ -4324,8 +4495,17 @@ pub fn run_ultra_plan_with_ui(
                     Some(&message),
                     None,
                 );
-                let missing_signals = err.partial_outcome.observed_contract_keys();
-                let handoff = save_ultra_phase_recovery_handoff(
+                merge_unique_strings(
+                    &mut pending_signals,
+                    &ultra_context.pending_capability_evidence,
+                );
+                let failure_evidence = capability_evidence_failure_evidence(
+                    &config.workspace_root,
+                    &plan.profile,
+                    &pending_signals,
+                    &message,
+                );
+                let handoff = save_ultra_phase_recovery_handoff_with_evidence(
                     config,
                     plan,
                     phase,
@@ -4336,9 +4516,10 @@ pub fn run_ultra_plan_with_ui(
                             &config.workspace_root,
                             &final_expected_paths,
                         ),
-                        missing_signals: &missing_signals,
+                        missing_signals: &pending_signals,
                         repair_targets: &err.partial_outcome.repair_targets,
                     },
+                    &failure_evidence,
                 );
                 return Err(anyhow::anyhow!(
                     "{}",
@@ -14685,7 +14866,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             adherence.len() <= ULTRA_PROMPT_GUIDANCE_MAX_LINES,
             "{adherence:#?}"
         );
-        assert!(unmet.iter().any(|line| line.contains("… and 15 more")));
+        assert!(unmet.iter().any(|line| line.contains("… and ")));
         assert!(adherence.iter().any(|line| line.contains("… and 24 more")));
     }
 
