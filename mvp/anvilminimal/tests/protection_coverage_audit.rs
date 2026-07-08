@@ -89,6 +89,10 @@ fn protection_coverage_table_rejects_unregistered_mock_sites() {
             r#"fn runtime_bash_policy_decision(command: &str) { let _ = crate::planner::verify::diagnose_verify_command(command); }"#,
         ),
         (
+            "src/planner/lint.rs",
+            r#"fn lint(command: &str) { let _ = crate::planner::verify::validate_verify_command(command); }"#,
+        ),
+        (
             "src/new_compile.rs",
             r#"fn f(excerpt: &str) { let _ = crate::minimal_loop::build_verifier::parse_compile_errors(excerpt); }"#,
         ),
@@ -188,6 +192,13 @@ fn audit_verify_normalization_boundary(corpus: &AuditCorpus, rule: &ProtectionRu
     {
         violations
             .push("runtime_bash_policy entry point bypasses shared runtime normalizer".to_string());
+    }
+    let planner_lint = corpus.file("src/planner/lint.rs");
+    if planner_lint.contains("validate_verify_command(")
+        && !planner_lint.contains("normalize_planner_verify_command(")
+    {
+        violations
+            .push("StepPlan verify-policy lint bypasses shared planner normalizer".to_string());
     }
     for (path, text) in corpus.rust_files() {
         for (line_index, line) in text.lines().enumerate() {

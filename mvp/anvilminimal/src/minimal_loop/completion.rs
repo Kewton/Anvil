@@ -16,7 +16,8 @@ use crate::minimal_loop::import_scan::{
 };
 use crate::minimal_loop::repair_target::{RepairTarget, classify_repair_target};
 use crate::planner::verify::{
-    VerificationReport, normalize_verify_command, validate_verify_command,
+    VerificationReport, normalize_planner_verify_command, normalize_verify_command,
+    validate_verify_command,
 };
 use crate::tools::path_guard::{
     resolve_existing, resolve_optional_existing, validate_workspace_relative,
@@ -90,9 +91,11 @@ impl CompletionContract {
         let mut seen_commands = BTreeSet::new();
         let mut commands = Vec::new();
         for command in self.verify_commands {
-            validate_verify_command(&command)?;
-            if seen_commands.insert(command.clone()) {
-                commands.push(command);
+            for normalized in normalize_planner_verify_command(&command)? {
+                validate_verify_command(&normalized)?;
+                if seen_commands.insert(normalized.clone()) {
+                    commands.push(normalized);
+                }
             }
         }
         self.required_paths = paths;
@@ -120,6 +123,13 @@ impl CompletionContract {
         let mut seen_deferred = BTreeSet::new();
         let mut deferred = Vec::new();
         for mut requirement in self.deferred_verify_requirements {
+            let normalized = normalize_planner_verify_command(&requirement.command)?;
+            if normalized.len() != 1 {
+                bail!(
+                    "deferred verify requirement must be one deterministic command after normalization"
+                );
+            }
+            requirement.command = normalized.into_iter().next().unwrap_or_default();
             validate_verify_command(&requirement.command)?;
             requirement.reason = requirement.reason.trim().to_string();
             requirement.authority = requirement.authority.trim().to_string();
@@ -236,13 +246,9 @@ impl CompletionContract {
                 report.push_missing_path(path.clone());
             }
         }
-        for command in &self.verify_commands {
-            if let Err(err) = validate_verify_command(command) {
-                report.push_command_failure(command.clone(), err.to_string());
-                continue;
-            }
+        for command in normalized_contract_verify_commands(&self.verify_commands, &mut report) {
             if let Some(build_requirement) = build_verifier::requirement_from_deferred(
-                command,
+                &command,
                 self.active_profile(),
                 "completion verify command",
                 "completion_contract",
@@ -296,7 +302,7 @@ impl CompletionContract {
                 build_verifier_observations.push(lifecycle);
                 continue;
             }
-            let normalized_command = match normalize_verify_command(command) {
+            let normalized_command = match normalize_verify_command(&command) {
                 Ok(command) => command,
                 Err(err) => {
                     report.push_command_failure(command.clone(), err.to_string());
@@ -309,18 +315,18 @@ impl CompletionContract {
                     if command.contains("npm") && output.contains("0 tests") {
                         report.push_command_failure(command.clone(), "Node 0 tests rejected");
                     } else if let Some(reason) =
-                        classify_python_test_discovery_failure(root, command, &output)
+                        classify_python_test_discovery_failure(root, &command, &output)
                     {
                         report.push_command_failure(command.clone(), reason);
                     }
                 }
-                Err(err) if is_dependency_missing_error(command, &err.to_string()) => {
+                Err(err) if is_dependency_missing_error(&command, &err.to_string()) => {
                     report.push_dependency_missing(command.clone());
                 }
                 Err(err) => {
                     let reason = err.to_string();
                     if let Some(reason) =
-                        classify_python_test_discovery_failure(root, command, &reason)
+                        classify_python_test_discovery_failure(root, &command, &reason)
                     {
                         report.push_command_failure(command.clone(), reason);
                     } else {
@@ -583,6 +589,20 @@ impl CompletionContract {
             requirement.command, requirement.status, requirement.reason
         )
     }
+}
+
+fn normalized_contract_verify_commands(
+    commands: &[String],
+    report: &mut VerificationReport,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for command in commands {
+        match normalize_planner_verify_command(command) {
+            Ok(normalized) => out.extend(normalized),
+            Err(err) => report.push_command_failure(command.clone(), err.to_string()),
+        }
+    }
+    out
 }
 
 fn setup_authority_for_deferred(
@@ -2304,6 +2324,33 @@ export class SpaceInvadersEngine {\n\
     }
 
     #[test]
+    fn structured_contract_splits_multi_grep_verify_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = CompletionContract {
+            required_paths: Vec::new(),
+            verify_commands: vec![
+                r#"grep -q "alpha" src/report.txt && grep -q "beta" src/report.txt"#.to_string(),
+            ],
+            profile: None,
+            goal: None,
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: Vec::new(),
+            evidence_hint_tokens: Vec::new(),
+            required_obligations: Vec::new(),
+            deferred_verify_requirements: Vec::new(),
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("unsupported fragment"), "{err}");
+        assert!(err.contains("allowed categories"), "{err}");
+        assert!(!err.contains("may not use shell control syntax"), "{err}");
+    }
+
+    #[test]
     fn structured_contract_deduplicates_capabilities_and_derives_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let contract = CompletionContract {
@@ -2491,7 +2538,7 @@ export class SpaceInvadersEngine {\n\
         let dir = tempfile::tempdir().unwrap();
         for command in [
             "npm install",
-            "npm test && npm run build",
+            "npm run build | grep error",
             "next dev -p 3011",
         ] {
             let err = CompletionContract {

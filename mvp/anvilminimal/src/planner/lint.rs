@@ -237,7 +237,7 @@ pub fn lint_step_plan_report_with_workspace(
             if crate::planner::verify::dependency_install_verify_segment(command).is_some() {
                 continue;
             }
-            if let Err(err) = crate::planner::verify::validate_verify_command(command) {
+            if let Err(err) = validate_verify_command_for_lint(command) {
                 report.push("verify_policy", err.to_string());
             }
         }
@@ -254,6 +254,17 @@ pub fn lint_step_plan_report_with_workspace(
     report
 }
 
+fn validate_verify_command_for_lint(command: &str) -> anyhow::Result<()> {
+    if crate::planner::verify::dependency_install_verify_segment(command).is_some() {
+        return Ok(());
+    }
+    let normalized = crate::planner::verify::normalize_planner_verify_command(command)?;
+    for command in normalized {
+        crate::planner::verify::validate_verify_command(&command)?;
+    }
+    Ok(())
+}
+
 pub fn diagnose_step_plan_dependency_order(
     plan: &StepPlan,
     work_root: Option<&Path>,
@@ -264,7 +275,7 @@ pub fn diagnose_step_plan_dependency_order(
     let workspace_has_nextjs_entrypoint = work_root.is_some_and(workspace_has_nextjs_entrypoint);
     for (step_index, step) in plan.steps.iter().enumerate() {
         for (command_index, command) in step.verify.iter().enumerate() {
-            if crate::planner::verify::validate_verify_command(command).is_err() {
+            if validate_verify_command_for_lint(command).is_err() {
                 continue;
             }
             for (kind, message) in diagnose_verify_dependency_order(
@@ -1071,6 +1082,29 @@ mod tests {
     }
 
     #[test]
+    fn lint_splits_multi_grep_verify_before_policy_diagnosis() {
+        let mut check = step("verify-files", "Verify generated files");
+        check.kind = "verify".to_string();
+        check.verify =
+            vec![r#"grep -q "alpha" src/report.txt && grep -q "beta" src/report.txt"#.to_string()];
+        let plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![check],
+        };
+
+        let report = lint_step_plan_report(&plan);
+
+        assert!(!report.is_pass(), "{report:?}");
+        let message = report.primary_message();
+        assert!(
+            message.contains("unsupported fragment")
+                && message.contains("allowed categories")
+                && !message.contains("may not use shell control syntax"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn ultra_phase_repl_command_is_rejected() {
         let plan = UltraPlan {
             goal: "goal".to_string(),
@@ -1556,7 +1590,7 @@ mod tests {
                     expected_result: "pass".to_string(),
                     instruction: "Create first".to_string(),
                     expected_paths: Vec::new(),
-                    verify: vec!["npm test && npm run build".to_string()],
+                    verify: vec!["npm test | grep ok".to_string()],
                 },
                 PlanStep {
                     id: "s2".to_string(),

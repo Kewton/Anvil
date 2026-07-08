@@ -2418,7 +2418,7 @@ fn normalize_planner_shell_and_verify_command(command: &str) -> anyhow::Result<V
         let normalized = normalize_verify_command(part.trim())?;
         if !is_safe_split_verify_fragment(normalized.as_str()) {
             anyhow::bail!(
-                "verify command shell split contains unsupported fragment: {}",
+                "verify command shell split contains unsupported fragment: {}; allowed categories: npm/pnpm/yarn test-build-lint-typecheck, next build, cargo check/build/test/fmt --check, pytest/unittest, python py_compile, TypeScript typecheck, node --check, or test -f/-d/-s relative/path",
                 normalized
             );
         }
