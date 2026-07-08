@@ -452,6 +452,7 @@ fn probe_run_options(step_kind: RunSessionStepKind) -> RunSessionOptions {
         step_kind: Some(step_kind),
         dependency_setup_authority:
             crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority::None,
+        step_wall_clock_cap: None,
     }
 }
 

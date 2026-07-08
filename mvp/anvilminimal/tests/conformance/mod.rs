@@ -329,6 +329,22 @@ fn conformance_negative_precise_exhaustion_rejects_no_blocker_with_pending_evide
 }
 
 #[test]
+fn conformance_negative_precise_exhaustion_rejects_empty_handed_no_blocker() {
+    let trace = Trace {
+        scenario: MatrixScenario::GenericStatic,
+        events: vec![json!({
+            "event": "loop_stop",
+            "reason": "loop_progress_exhausted",
+            "last_blocking_reason": "no concrete blocker recorded"
+        })],
+        summary: terminal_summary("failed"),
+        output: String::new(),
+    };
+
+    assert_contract_fails("precise_exhaustion", check_precise_exhaustion(&trace));
+}
+
+#[test]
 fn conformance_negative_precise_exhaustion_checks_final_acceptance_exhaustion() {
     let trace = Trace {
         scenario: MatrixScenario::Nextjs,
@@ -495,6 +511,59 @@ fn conformance_boundedness_covers_hanging_bash_tool() {
 
     check_honest_terminal(&trace).unwrap_or_else(|err| panic!("{err}"));
     check_bounded_child_processes(&trace).unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+fn conformance_boundedness_covers_timeout_loop_escalation() {
+    let trace = Trace {
+        scenario: MatrixScenario::GenericStatic,
+        events: vec![
+            json!({
+                "event": "command_timeout_repetition",
+                "name": "Bash",
+                "repeat_count": 3,
+                "terminal": true,
+                "similarity_key": "ls -R",
+                "duration_ms": 180000,
+            }),
+            json!({
+                "event": "loop_stop",
+                "reason": "command_timeout_loop",
+                "dominant_time_sink": "command `ls -R` took 180000 ms",
+            }),
+            terminal_stop("failed"),
+        ],
+        summary: terminal_summary("failed"),
+        output: String::new(),
+    };
+
+    check_bounded_child_processes(&trace).unwrap_or_else(|err| panic!("{err}"));
+    check_precise_exhaustion(&trace).unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+fn conformance_negative_timeout_loop_requires_honest_terminal_reason() {
+    let trace = Trace {
+        scenario: MatrixScenario::GenericStatic,
+        events: vec![
+            json!({
+                "event": "command_timeout_repetition",
+                "name": "Bash",
+                "repeat_count": 3,
+                "terminal": true,
+                "similarity_key": "ls -R",
+                "duration_ms": 180000,
+            }),
+            terminal_stop("failed"),
+        ],
+        summary: terminal_summary("failed"),
+        output: String::new(),
+    };
+
+    assert_contract_fails(
+        "bounded_child_processes",
+        check_bounded_child_processes(&trace),
+    );
 }
 
 fn assert_conformance_contracts(trace: &Trace) {
@@ -1025,6 +1094,26 @@ fn check_bounded_child_processes(trace: &Trace) -> Result<(), String> {
             ));
         }
     }
+    let terminal_timeout_loop = events_named(&trace.events, "command_timeout_repetition")
+        .iter()
+        .any(|event| {
+            bool_field(event, "terminal") == Some(true)
+                || u64_field(event, "repeat_count").unwrap_or_default() >= 3
+        });
+    if terminal_timeout_loop {
+        let stopped_honestly = trace.events.iter().any(|event| {
+            matches!(
+                string_field(event, "event"),
+                Some("loop_stop" | "tui_command_stop" | "ultra_phase_failed")
+            ) && event.to_string().contains("command_timeout_loop")
+        });
+        if !stopped_honestly {
+            return Err(
+                "bounded_child_processes: terminal command timeout repetition did not stop as command_timeout_loop"
+                    .to_string(),
+            );
+        }
+    }
     let tool_execute_events = events_named(&trace.events, "tool_execute");
     let tool_validation_events = events_named(&trace.events, "tool_validation_error");
     let user_command_abort = tool_execute_events
@@ -1093,9 +1182,9 @@ fn check_precise_exhaustion(trace: &Trace) -> Result<(), String> {
             {
                 saw_loop_progress_exhausted = true;
             }
-            if pending_contract && value.contains("no concrete blocker recorded") {
+            if value.contains("no concrete blocker recorded") {
                 return Err(format!(
-                    "precise_exhaustion: {key} claimed no concrete blocker while pending contract evidence existed ({event_pending:?}) in {event}"
+                    "precise_exhaustion: {key} used empty-handed no-blocker vocabulary ({event_pending:?}) in {event}"
                 ));
             }
         }

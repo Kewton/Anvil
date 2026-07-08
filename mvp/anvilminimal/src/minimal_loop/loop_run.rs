@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use serde_json::{Value, json};
@@ -15,7 +15,7 @@ use crate::planner::verify::{
 };
 use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::ChatClient;
-use crate::state::{ConversationMessage, SessionSnapshot};
+use crate::state::{ConversationMessage, SessionSnapshot, ToolCall};
 use crate::tools::args_recovery::recover_tool_arguments;
 use crate::tools::bash::BashOutcomeKind;
 use crate::tools::path_guard::{
@@ -138,6 +138,9 @@ const READ_ONLY_STAGNATION_COMPACT_THRESHOLD: usize = 5;
 const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 1;
 const RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT: usize = 2;
 const MALFORMED_NATIVE_TOOL_RETRY_LIMIT: usize = 2;
+const DEFAULT_STEP_WALL_CLOCK_CAP: Duration = Duration::from_secs(15 * 60);
+const COMMAND_TIMEOUT_STRATEGY_FEEDBACK_AT: usize = 2;
+const COMMAND_TIMEOUT_LOOP_LIMIT: usize = 3;
 const EMPTY_RESPONSE_RECOVERY_EXTRA_ITERATIONS: usize = 3;
 const SETUP_SCAFFOLD_COMPLETION_REMAINING_THRESHOLD: usize = 2;
 
@@ -213,6 +216,7 @@ pub(crate) struct RunSessionOptions {
     pub scope: RunSessionScope,
     pub step_kind: Option<RunSessionStepKind>,
     pub dependency_setup_authority: NodeDependencySetupAuthority,
+    pub step_wall_clock_cap: Option<Duration>,
 }
 
 impl Default for RunSessionOptions {
@@ -227,6 +231,7 @@ impl Default for RunSessionOptions {
             scope: RunSessionScope::MinimalLoop,
             step_kind: None,
             dependency_setup_authority: NodeDependencySetupAuthority::None,
+            step_wall_clock_cap: None,
         }
     }
 }
@@ -262,6 +267,7 @@ impl RunSessionOptions {
             scope: RunSessionScope::PlanRunStep,
             step_kind: Some(step_kind),
             dependency_setup_authority: NodeDependencySetupAuthority::None,
+            step_wall_clock_cap: None,
         }
     }
 
@@ -323,6 +329,95 @@ fn provider_call_scope_for_options(
     match options.scope {
         RunSessionScope::MinimalLoop | RunSessionScope::PlanRunStep => ProviderCallScope::Executor,
     }
+}
+
+fn step_wall_clock_cap(options: &RunSessionOptions) -> Duration {
+    options
+        .step_wall_clock_cap
+        .or_else(step_wall_clock_cap_from_env)
+        .unwrap_or(DEFAULT_STEP_WALL_CLOCK_CAP)
+}
+
+fn step_wall_clock_cap_from_env() -> Option<Duration> {
+    let value = std::env::var("ANVIL_STEP_WALL_CLOCK_CAP_MS").ok()?;
+    let millis = value.trim().parse::<u64>().ok()?;
+    Some(Duration::from_millis(millis))
+}
+
+fn record_time_sink(sinks: &mut Vec<TimeSink>, sink: TimeSink) {
+    if sink.duration_ms == 0 {
+        return;
+    }
+    sinks.push(sink);
+    sinks.sort_by(|a, b| b.duration_ms.cmp(&a.duration_ms));
+    sinks.truncate(5);
+}
+
+fn dominant_time_sink_text(sinks: &[TimeSink]) -> String {
+    sinks
+        .first()
+        .map(|sink| {
+            format!(
+                "{} `{}` took {} ms",
+                sink.kind, sink.label, sink.duration_ms
+            )
+        })
+        .unwrap_or_else(|| "no timed command/provider recorded".to_string())
+}
+
+fn command_timeout_similarity_key(message: &str) -> String {
+    let command = extract_command_timeout_command(message).unwrap_or_else(|| message.to_string());
+    let normalized = command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if normalized.contains("ls -r") {
+        return "ls -R".to_string();
+    }
+    normalized
+        .split(['&', ';', '|'])
+        .next()
+        .unwrap_or(normalized.as_str())
+        .split_whitespace()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn extract_command_timeout_command(message: &str) -> Option<String> {
+    let rest = message.strip_prefix("command_timeout: ")?;
+    Some(rest.lines().next()?.trim().to_string())
+}
+
+fn command_timeout_sink_label(message: &str) -> String {
+    let command = extract_command_timeout_command(message).unwrap_or_else(|| "unknown".to_string());
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("ls -r") {
+        if lower.contains("node_modules") || !lower.contains("src/") {
+            return "ls -R recurses the workspace and can traverse node_modules; list src/ or specific files instead".to_string();
+        }
+        return "recursive directory listing is the dominant sink; list the smallest relevant directory instead".to_string();
+    }
+    format!(
+        "command timeout sink: {}",
+        eval_events::body_snippet(&command)
+    )
+}
+
+fn command_timeout_strategy_feedback(message: &str, repeats: usize) -> String {
+    format!(
+        "Bash command timed out repeatedly (similar timeout #{repeats}). {}. Change strategy now: avoid broad recursive listings, inspect targeted files/directories, or use Read/Glob/Grep for bounded inspection.",
+        command_timeout_sink_label(message)
+    )
+}
+
+fn continue_with_timeout_feedback(session: &mut SessionSnapshot, call: ToolCall, feedback: String) {
+    session.messages.push(ConversationMessage::tool_result(
+        call.name,
+        Some(call.id),
+        feedback,
+    ));
 }
 
 impl ContractEnforcement {
@@ -696,7 +791,15 @@ struct RecoverableToolErrorState {
 
 impl RecoverableToolErrorState {
     fn record(&mut self, tool_name: &str, err: &anyhow::Error) -> usize {
-        let key = format!("{tool_name}:{}:{}", tool_error_kind(err), err);
+        let kind = tool_error_kind(err);
+        let key = if kind == "command_timeout" {
+            format!(
+                "{tool_name}:{kind}:{}",
+                command_timeout_similarity_key(&err.to_string())
+            )
+        } else {
+            format!("{tool_name}:{kind}:{err}")
+        };
         if self.key.as_deref() == Some(key.as_str()) {
             self.repeats += 1;
         } else {
@@ -710,6 +813,13 @@ impl RecoverableToolErrorState {
         self.key = None;
         self.repeats = 0;
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct TimeSink {
+    kind: &'static str,
+    label: String,
+    duration_ms: u128,
 }
 
 pub fn run_session(
@@ -830,6 +940,9 @@ pub(crate) fn run_session_with_outcome_with_options(
     let mut edit_anchor_failures_by_path: BTreeMap<String, usize> = BTreeMap::new();
     let mut malformed_native_tool_feedbacks = 0usize;
     let step_capability_gate = StepCapabilityGate::from_prompt(user_prompt, &options);
+    let step_started = Instant::now();
+    let step_wall_clock_cap = step_wall_clock_cap(&options);
+    let mut time_sinks: Vec<TimeSink> = Vec::new();
     let iteration_limit = if contract_runtime_enabled && completion_contract.is_some() {
         config.max_iterations
             + ARTIFACT_RECOVERY_ATTEMPT_LIMIT.saturating_mul(required_paths.len().max(1))
@@ -846,6 +959,24 @@ pub(crate) fn run_session_with_outcome_with_options(
     for iteration in 0..iteration_limit {
         let iterations_used = iteration + 1;
         let remaining_iterations = iteration_limit.saturating_sub(iterations_used);
+        if step_started.elapsed() >= step_wall_clock_cap {
+            let dominant = dominant_time_sink_text(&time_sinks);
+            eval_events::emit(
+                config.eval_events_path.as_deref(),
+                json!({
+                    "event": "loop_stop",
+                    "reason": "step_wall_clock_exhausted",
+                    "elapsed_ms": step_started.elapsed().as_millis(),
+                    "cap_ms": step_wall_clock_cap.as_millis(),
+                    "dominant_time_sink": dominant,
+                    "top_time_sinks": time_sinks,
+                    "session_scope": options.scope.as_str(),
+                    "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+                    "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+                }),
+            );
+            bail!("step_wall_clock_exhausted: {dominant}");
+        }
         if ui.interrupted() {
             bail!("interrupted by user");
         }
@@ -916,6 +1047,14 @@ pub(crate) fn run_session_with_outcome_with_options(
             )
         };
         let provider_turn_elapsed = chat_outcome.elapsed;
+        record_time_sink(
+            &mut time_sinks,
+            TimeSink {
+                kind: "provider",
+                label: call_scope.as_str().to_string(),
+                duration_ms: provider_turn_elapsed.as_millis(),
+            },
+        );
         let provider_turn_timed_out = chat_outcome.timed_out
             || provider_turn_elapsed >= Duration::from_secs(config.chat_timeout_secs);
         let chat_result = chat_outcome.result;
@@ -1547,12 +1686,24 @@ pub(crate) fn run_session_with_outcome_with_options(
                 Err(err) if recoverable_tool_error(&err) => {
                     batch_had_recoverable_tool_error = true;
                     let kind = tool_error_kind(&err);
+                    let err_text = err.to_string();
                     let repeats = recoverable_tool_error_state.record(&call.name, &err);
                     let duration_ms = if kind == "command_timeout" {
-                        extract_elapsed_ms(&err.to_string())
+                        extract_elapsed_ms(&err_text)
                     } else {
                         None
                     };
+                    if let Some(duration_ms) = duration_ms {
+                        record_time_sink(
+                            &mut time_sinks,
+                            TimeSink {
+                                kind: "command",
+                                label: extract_command_timeout_command(&err_text)
+                                    .unwrap_or_else(|| call.name.clone()),
+                                duration_ms: u128::from(duration_ms),
+                            },
+                        );
+                    }
                     eval_events::emit(
                         config.eval_events_path.as_deref(),
                         json!({
@@ -1564,6 +1715,45 @@ pub(crate) fn run_session_with_outcome_with_options(
                             "duration_ms": duration_ms,
                         }),
                     );
+                    if kind == "command_timeout" {
+                        let sink = command_timeout_sink_label(&err_text);
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "command_timeout_repetition",
+                                "name": call.name.as_str(),
+                                "repeat_count": repeats,
+                                "similarity_key": command_timeout_similarity_key(&err_text),
+                                "sink": sink,
+                                "duration_ms": duration_ms,
+                                "strategy_feedback": repeats == COMMAND_TIMEOUT_STRATEGY_FEEDBACK_AT,
+                                "terminal": repeats >= COMMAND_TIMEOUT_LOOP_LIMIT,
+                            }),
+                        );
+                        if repeats >= COMMAND_TIMEOUT_LOOP_LIMIT {
+                            eval_events::emit(
+                                config.eval_events_path.as_deref(),
+                                json!({
+                                    "event": "loop_stop",
+                                    "reason": "command_timeout_loop",
+                                    "name": call.name.as_str(),
+                                    "error_kind": kind,
+                                    "repeat_count": repeats,
+                                    "sink": sink,
+                                    "top_time_sinks": time_sinks,
+                                }),
+                            );
+                            bail!("command_timeout_loop: {sink}");
+                        }
+                        if repeats == COMMAND_TIMEOUT_STRATEGY_FEEDBACK_AT {
+                            continue_with_timeout_feedback(
+                                session,
+                                call,
+                                command_timeout_strategy_feedback(&err_text, repeats),
+                            );
+                            continue;
+                        }
+                    }
                     if repeats > RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT {
                         eval_events::emit(
                             config.eval_events_path.as_deref(),
@@ -1605,6 +1795,19 @@ pub(crate) fn run_session_with_outcome_with_options(
                     return Err(err);
                 }
             };
+            if call.name == "Bash"
+                && let Some(duration_ms) = extract_elapsed_ms(&result)
+            {
+                record_time_sink(
+                    &mut time_sinks,
+                    TimeSink {
+                        kind: "command",
+                        label: recovered_bash_command(&call.name, &call.arguments)
+                            .unwrap_or_else(|| "Bash".to_string()),
+                        duration_ms: u128::from(duration_ms),
+                    },
+                );
+            }
             session.messages.push(ConversationMessage::tool_result(
                 call.name,
                 Some(call.id),
@@ -1937,11 +2140,23 @@ pub(crate) fn run_session_with_outcome_with_options(
         } else {
             None
         };
+    let no_progress_stagnation_reason = if missing.is_empty()
+        && read_only_stagnation_reason.is_none()
+        && capability_exhaustion_reason.is_none()
+        && last_blocking_reason.is_none()
+        && last_provider_error.is_none()
+    {
+        Some("model_stagnation:no_progress_recorded".to_string())
+    } else {
+        None
+    };
     let reason = if !non_scaffold_missing.is_empty() {
         "artifact_follow_through_exhausted".to_string()
     } else if let Some(reason) = &capability_exhaustion_reason {
         reason.clone()
     } else if let Some(reason) = &read_only_stagnation_reason {
+        reason.clone()
+    } else if let Some(reason) = &no_progress_stagnation_reason {
         reason.clone()
     } else if missing.is_empty() {
         "loop_progress_exhausted".to_string()
@@ -1980,10 +2195,14 @@ pub(crate) fn run_session_with_outcome_with_options(
         let objective = read_only_objective_excerpt(user_prompt);
         bail!("{reason}: objective: {objective}");
     }
+    if let Some(reason) = no_progress_stagnation_reason {
+        let objective = read_only_objective_excerpt(user_prompt);
+        bail!("{reason}: objective: {objective}");
+    }
     let blocker = if missing.is_empty() {
         last_blocking_reason
             .as_deref()
-            .unwrap_or("no concrete blocker recorded")
+            .unwrap_or("progress stalled without a recorded artifact, capability, environment, or tool blocker")
             .to_string()
     } else {
         format!("missing scaffold paths: {}", missing.join(", "))
@@ -4263,6 +4482,75 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn command_timeout_repetition_uses_similarity_and_guides_strategy_change() {
+        let mut state = RecoverableToolErrorState::default();
+        let first = anyhow::anyhow!(
+            "command_timeout: ls -R && cat package.json\nstatus: timed out\nelapsed_ms: 180001"
+        );
+        let second = anyhow::anyhow!(
+            "command_timeout: ls -R src/app && cat package.json\nstatus: timed out\nelapsed_ms: 180013"
+        );
+        let third =
+            anyhow::anyhow!("command_timeout: LS    -R\nstatus: timed out\nelapsed_ms: 180021");
+
+        assert_eq!(state.record("Bash", &first), 1);
+        assert_eq!(state.record("Bash", &second), 2);
+        assert_eq!(state.record("Bash", &third), 3);
+        assert_eq!(command_timeout_similarity_key(&first.to_string()), "ls -R");
+        let feedback = command_timeout_strategy_feedback(&first.to_string(), 2);
+        assert!(feedback.contains("ls -R recurses"), "{feedback}");
+        assert!(feedback.contains("node_modules"), "{feedback}");
+        assert!(feedback.contains("list src/"), "{feedback}");
+    }
+
+    #[test]
+    fn step_wall_clock_cap_self_terminates_with_time_sink() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "facts").unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 8;
+        let mut fake = DelayedFake {
+            replies: vec![(Duration::from_millis(5), Ok(read_reply("notes.md")))],
+        };
+        let mut session = SessionSnapshot::new();
+        let mut options = RunSessionOptions::plan_step(RunSessionStepKind::Implement);
+        options.step_wall_clock_cap = Some(Duration::from_millis(1));
+
+        let err = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Implement the requested helper after inspecting notes.md.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            options,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("step_wall_clock_exhausted"), "{err}");
+        assert!(err.contains("provider"), "{err}");
+        let events = event_values(&events);
+        let stop = events
+            .iter()
+            .find(|event| event.get("event").and_then(Value::as_str) == Some("loop_stop"))
+            .unwrap();
+        assert_eq!(
+            stop.get("reason").and_then(Value::as_str),
+            Some("step_wall_clock_exhausted")
+        );
+        assert!(
+            stop.get("dominant_time_sink")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("provider"),
+            "{stop}"
+        );
     }
 
     #[test]
