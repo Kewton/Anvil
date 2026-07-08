@@ -140,6 +140,7 @@ Model-tier observations:
 | `gemini-3.5-flash` implementation/planner | Q1-final `test0704-999-Q1-62_001`, 8 runs | 6 full / 1 reasoned partial / 1 behavioral failed, 8/8 honest terminal states | Recommended implementation tier baseline. |
 | Local mixed pair: `qwen3.6:27b-coding-nvfp4` planner + `ornith:35b` executor | `test0704-999-Q1-62646566676869707172_001`, 8 runs | 2/8 full, 8/8 honest terminal states; web 1/6 | Below recommended tier for reliable web delivery; CLI moderately viable. |
 | Local single model: `qwen3.6:27b-coding-nvfp4` | GAME quality track instructions 81-87, six-run series ending at `test0707_009` | frontier advanced phase0 -> phase1 -> final gate -> full pass with behavioral verification, in-play restart/recovery, score and enemy-state mutation | Golden local single-model GAME reference; narrow positive data point, not a broad tier upgrade. |
+| Cloud single model: `gemma4:31b-cloud` | `test0708_009` GAME run | Cross-file hook contract mismatch reached compile repair, but compact zero-edit repair exhausted without regeneration; no last-known-good page snapshot existed for rollback. | Model-family datum for zero-edit repair behavior; motivates regeneration rung and does not change tier recommendation. |
 
 ## Contract-Design Principle
 

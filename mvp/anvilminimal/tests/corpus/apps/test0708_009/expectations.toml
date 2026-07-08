@@ -1,0 +1,58 @@
+case_id = "test0708_009"
+source = "UAT test0708_009"
+required_paths = ["package.json", "tsconfig.json", "postcss.config.js", "tailwind.config.ts", "src/app/layout.tsx", "src/app/page.tsx", "src/hooks/useGameEngine.ts", "src/app/globals.css", "src/app/global.d.ts"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "hook", "movePlayer", "shoot"]
+acceptance_passed = true
+primary_reason = "pass"
+
+[route_closure]
+include = ["src/app/page.tsx", "src/hooks/useGameEngine.ts", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = ["src/app/global.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+src/app/page.tsx = [
+  "movePlayer,",
+  "shoot,",
+  "if (gameState !== 'playing') return;",
+  "} = useGameEngine();"
+]
+src/hooks/useGameEngine.ts = [
+  "export function useGameEngine()",
+  "return {",
+  "phase,",
+  "restartGame,",
+  "CANVAS_WIDTH"
+]
+fixtures/events-zero-edit-regeneration.jsonl = [
+  "\"step_id\":\"verify-engine-build\"",
+  "\"primary_reason\":\"implementation_compile_error: src/app/page.tsx:8:5",
+  "\"primary_reason\":\"implementation_compile_error: src/app/page.tsx:14:5",
+  "\"repair_session_mode\":\"appended\"",
+  "\"repair_session_mode\":\"compact\"",
+  "\"compile_repair_no_source_change\":true",
+  "\"reason\":\"snapshot_missing:src/app/page.tsx\"",
+  "\"failure_kind\":\"compile_repair_no_source_change\""
+]
+fixtures/recovery-prompt.md = [
+  "Compile error excerpt for src/app/page.tsx:14:5",
+  "14 |     movePlayer,",
+  "Compile repair re-anchor: the previous compile repair turn changed no files"
+]

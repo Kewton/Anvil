@@ -86,6 +86,12 @@ readiness, interaction pass, start transition, in-play recovery/restart
 transition, and score/enemy state mutation. Its `fits_viewport=false` browser
 fixture is informational presentation-quality evidence, not a release gate.
 
+`test0708_009` records the `gemma4:31b-cloud` zero-edit compile repair shape:
+a route-bound page destructures `movePlayer`/`shoot` from an imported
+`useGameEngine` hook whose returned API exposes different members, and compact
+repair exhausted without source edits or a rollback snapshot. It is the corpus
+fixture for the repair-as-regeneration rung.
+
 The script copies `src/**`, `package.json`, and common Next.js/TypeScript/
 Tailwind/PostCSS config files. It intentionally does not copy `node_modules`,
 `.next`, `.anvil`, lockfiles, logs, screenshots, or other generated artifacts.
