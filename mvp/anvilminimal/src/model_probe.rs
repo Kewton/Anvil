@@ -72,6 +72,8 @@ pub struct ModelProbeMetrics {
     pub malformed_tool_call_count: usize,
     pub malformed_tool_call_rate: f64,
     pub latency_ms: LatencyStats,
+    pub first_turn_latency_ms: LatencyStats,
+    pub later_turn_latency_ms: LatencyStats,
     pub token_telemetry: TokenTelemetryMetrics,
     pub context_truncation_suspected_count: usize,
 }
@@ -665,6 +667,8 @@ fn compute_metrics(tasks: &[ModelProbeTaskEvidence]) -> ModelProbeMetrics {
         ..ModelProbeMetrics::default()
     };
     let mut latencies = Vec::new();
+    let mut first_turn_latencies = Vec::new();
+    let mut later_turn_latencies = Vec::new();
     for task in tasks {
         if task.final_text.trim().is_empty() && task.raw_tool_calls.is_empty() {
             metrics.empty_response_count += 1;
@@ -739,9 +743,14 @@ fn compute_metrics(tasks: &[ModelProbeTaskEvidence]) -> ModelProbeMetrics {
         metrics.edit_anchor.salvageable += task_salvageable;
         metrics.edit_anchor.miss += task_miss;
         metrics.edit_anchor.exact += remaining_edit_calls.saturating_sub(task_miss);
-        for event in &task.provider_turns {
+        for (index, event) in task.provider_turns.iter().enumerate() {
             if let Some(value) = event.get("duration_ms").and_then(Value::as_u64) {
                 latencies.push(value);
+                if index == 0 {
+                    first_turn_latencies.push(value);
+                } else {
+                    later_turn_latencies.push(value);
+                }
             }
             if let Some(value) = event
                 .get("estimated_prompt_tokens_sent")
@@ -794,6 +803,8 @@ fn compute_metrics(tasks: &[ModelProbeTaskEvidence]) -> ModelProbeMetrics {
     metrics.malformed_tool_call_rate = ratio(metrics.malformed_tool_call_count, tool_call_count);
     metrics.json_valid_rate = ratio(metrics.json_valid_count, metrics.json_response_count);
     metrics.latency_ms = latency_stats(latencies);
+    metrics.first_turn_latency_ms = latency_stats(first_turn_latencies);
+    metrics.later_turn_latency_ms = latency_stats(later_turn_latencies);
     metrics
 }
 
@@ -1039,6 +1050,11 @@ fn render_card(report: &ModelProbeReport) -> String {
             option_u64(metrics.latency_ms.max_ms)
         ),
         format!(
+            "- latency_cache_note: first_turn_p50={} later_turn_p50={} (cache-effect visibility; compare only within the same provider/model run)",
+            option_u64(metrics.first_turn_latency_ms.p50_ms),
+            option_u64(metrics.later_turn_latency_ms.p50_ms)
+        ),
+        format!(
             "- token_telemetry: estimated_prompt_total={} prompt_eval_total={} eval_total={} missing_prompt_eval_count={} finish_reasons={}",
             metrics.token_telemetry.estimated_prompt_tokens_sent_total,
             metrics.token_telemetry.prompt_eval_count_total,
@@ -1276,6 +1292,7 @@ mod tests {
         );
         assert_eq!(report.metrics.malformed_tool_call_count, 1);
         assert!(report.metrics.latency_ms.count >= 10);
+        assert!(report.metrics.first_turn_latency_ms.count >= 10);
         assert!(report.metrics.token_telemetry.prompt_eval_count_total > 0);
         assert!(report.metrics.token_telemetry.eval_count_total > 0);
         assert_eq!(
@@ -1333,6 +1350,7 @@ mod tests {
             "- Scope: N=11 micro-tasks; dialect indicators, not a capability benchmark",
             "- No-network guarantee: passed",
             "- shell_control_breakdown: &&=2 ;=0 pipe=1 redirect=1 cd=1",
+            "- latency_cache_note: first_turn_p50=",
             "- Compact-only repair follow-through => expect the 85 compact-session rung to matter.",
             "- JSON/schema drift observed => planner schema repair and descriptive-field defaulting will be hot.",
             "Probe results never auto-configure runtime behavior.",

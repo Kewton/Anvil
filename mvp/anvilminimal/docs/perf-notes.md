@@ -23,3 +23,23 @@ Fix direction: keep every section and its wording, but move stable policy,
 profile/goal/plan context, and invariant guidance before variable counters,
 fresh feedback, carry-forward state, and retry/rung labels. This is an ordering
 change only; verification semantics and prompt meaning remain unchanged.
+
+## Baseline Measurement Protocol
+
+Speed-track comparisons use a before/after pair, not an assertion. Run one GAME
+scenario on the qwen27b single-model local configuration before the prefix
+stability change, or use the nearest corpus timing run as the baseline when a
+fresh pre-change run is unavailable. Then run the same GAME scenario after the
+change with the same host, model, profile, context budget, and Ollama residency
+settings.
+
+The committed comparison surface is the `Time profile:` line in `summary.md`.
+Record:
+
+- provider prefill share: `prompt_eval_count` versus `eval_count` when the
+  provider reports both fields;
+- total wall clock from the same profile line;
+- whether the run used single-model planner/executor and Ollama keep-alive.
+
+Treat movement as observational unless the run identity, hardware, model
+residency, and scenario prompt are held constant.

@@ -139,7 +139,11 @@ New model-family entries follow the standard order in
 [model-probe.md](model-probe.md): model-probe card review, CLI and TOOL smoke
 checks, then the full scenario round with pre-committed landing criteria. The
 tier table cites the probe profile as dialect evidence, not as a capability
-benchmark or an automatic runtime configuration source.
+benchmark or an automatic runtime configuration source. For local speed
+measurements, the recommended zero-risk default is a single Ollama model used
+for both planner and executor with the model kept resident by Ollama-side
+keep-alive settings; cloud-hosted providers benefit from prefix stability only
+when the server exposes compatible prompt caching.
 
 | configuration | sample | distribution / frontier | verdict |
 |---|---|---|---|

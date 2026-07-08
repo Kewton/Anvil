@@ -54,7 +54,8 @@ The profile computes:
 - `json_valid_rate` and `missing_field_kinds`
 - `empty_response_rate`
 - `malformed_tool_call_rate`
-- per-call latency stats
+- per-call latency stats, plus a first-turn versus later-turn latency note for
+  cache-effect visibility within the same provider/model run
 - provider token telemetry from the 98C provider-turn events, including
   context-truncation warnings when they fire
 

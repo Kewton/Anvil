@@ -26,6 +26,29 @@ anvilminimal --yes --context-budget 65536 \
 /ultra-plan-run --profile nextjs <SCENARIO_PROMPT>
 ```
 
+Speed-recommended local preset: for local-only measurement campaigns, prefer a
+single Ollama model for both executor and planner so the server does not swap
+model weights between phases. Example `.anvil/config.toml` preset:
+
+```toml
+[preset.local-single-speed]
+provider = "ollama"
+model = "qwen3.6:27b-coding-nvfp4"
+planner_provider = "ollama"
+planner_model = "qwen3.6:27b-coding-nvfp4"
+context_budget = 65536
+chat_timeout_secs = 600
+profile = "nextjs"
+narration = "normal"
+footer = "on"
+```
+
+Keep the model resident across turns and phases using Ollama-side keep-alive
+settings appropriate for the host. This is an operational speed setting only:
+it does not change gates, oracles, arbitration, or runtime repair behavior.
+Cloud-hosted providers gain nothing from prompt-prefix cache reuse unless the
+provider/server explicitly supports prompt caching.
+
 Use a fresh empty workdir per scenario. Do not run the three explicit Next.js
 scenarios or the `AMBIGUOUS` scenario in parallel because web-gated runs use
 port 3011. The CLI scenario uses `--profile python-cli`, does not bind a port,
