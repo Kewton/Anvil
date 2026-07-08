@@ -151,6 +151,7 @@ where
         messages,
         tools,
         native_tools_enabled,
+        config.prompt_layout.as_str(),
     );
     crate::tui::status_bus::publish_provider_started(scope.as_str(), config.chat_timeout_secs);
     crate::tui::presentation::emit_provider_turn_started(
@@ -388,13 +389,15 @@ fn estimate_stable_prefix_chars(
     messages: &[ConversationMessage],
     tools: &[ToolSpec],
     native_tools_enabled: bool,
+    prompt_layout: &str,
 ) -> u64 {
     let prompt = prompt_prefix_text(messages, tools, native_tools_enabled);
     let key = format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}",
         provider,
         model,
         scope.as_str(),
+        prompt_layout,
         native_tools_enabled,
         tools.len()
     );
@@ -545,6 +548,7 @@ fn emit_provider_turn_duration(config: &Config, telemetry: ProviderTurnTelemetry
         "timeout_ms": Duration::from_secs(config.chat_timeout_secs).as_millis().min(u128::from(u64::MAX)) as u64,
         "timeout_secs": config.chat_timeout_secs,
         "timeout_source": config.chat_timeout_source,
+        "prompt_layout": config.prompt_layout.as_str(),
         "timed_out": telemetry.timed_out,
         "aborted_by_user": telemetry.aborted_by_user,
         "ok": telemetry.ok,
@@ -624,14 +628,15 @@ fn emit_provider_turn_timeout(
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
-            "event": "provider_turn_timeout",
-            "caller_scope": scope.as_str(),
-            "provider": provider,
-            "model": eval_events::body_snippet(model),
-            "classification": scope.timeout_kind(),
-            "duration_ms": elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+        "event": "provider_turn_timeout",
+        "caller_scope": scope.as_str(),
+        "provider": provider,
+        "model": eval_events::body_snippet(model),
+        "classification": scope.timeout_kind(),
+        "duration_ms": elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
             "timeout_secs": config.chat_timeout_secs,
             "timeout_source": config.chat_timeout_source,
+            "prompt_layout": config.prompt_layout.as_str(),
         }),
     );
 }
@@ -734,6 +739,7 @@ mod tests {
             context_budget: 1000,
             model: "m".to_string(),
             provider: Provider::Ollama,
+            prompt_layout: crate::config::PromptLayout::Stable,
             planner_model: "m".to_string(),
             planner_provider: Provider::Ollama,
             ollama_host: "http://localhost:11434".to_string(),
@@ -855,6 +861,7 @@ mod tests {
 
         let events = std::fs::read_to_string(events_path).expect("events");
         assert!(events.contains("\"event\":\"provider_turn_duration\""));
+        assert!(events.contains("\"prompt_layout\":\"stable\""));
         assert!(events.contains("\"estimated_prompt_tokens_sent\""));
         assert!(events.contains("\"prompt_eval_count\":10"));
         assert!(events.contains("\"eval_count\":2"));

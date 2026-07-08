@@ -1234,6 +1234,7 @@ mod tests {
             context_budget: 999,
             model: "flag-model".to_string(),
             provider: Provider::Ollama,
+            prompt_layout: crate::config::PromptLayout::Stable,
             planner_model: "planner".to_string(),
             planner_provider: Provider::Gemini,
             ollama_host: "http://localhost:11434".to_string(),

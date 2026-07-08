@@ -7,7 +7,7 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::bounded_process;
-use crate::config::Config;
+use crate::config::{Config, PromptLayout};
 use crate::eval_events;
 use crate::minimal_loop::behavior_evidence::{self, EvidenceArbitrationReport};
 use crate::minimal_loop::browser_probe::{
@@ -2020,7 +2020,7 @@ fn run_step(
     mut run_setup_authority: Option<&mut UltraRunSetupAuthorityState>,
 ) -> Result<StepRunOutcome, StepRunError> {
     let mut runtime_step = step.clone();
-    let instruction = build_step_prompt(plan, step, prompt_context);
+    let instruction = build_step_prompt(plan, step, prompt_context, config.prompt_layout);
     emit_step_prompt_contract(config, step, prompt_context, &instruction);
     if step.step_kind() == StepKind::Report
         && step.expected_paths.is_empty()
@@ -2198,6 +2198,7 @@ fn run_step(
         changed_files: initial.changed_paths.clone(),
         initial_stop_reason: Some(format!("{:?}", initial.stop_reason)),
         workspace_root: Some(config.workspace_root.clone()),
+        prompt_layout: config.prompt_layout,
         ..RepairContext::default()
     };
     let mut current_report = report;
@@ -5278,6 +5279,7 @@ pub fn run_ultra_plan_with_ui(
             );
             let mut repair_prompt = final_acceptance_repair_prompt(
                 &config.workspace_root,
+                config.prompt_layout,
                 plan,
                 &acceptance_report,
                 &ultra_context,
@@ -12590,6 +12592,13 @@ fn plan_generation_system_prompt() -> String {
 }
 
 fn build_step_plan_user_prompt(goal: &str, config: &Config) -> String {
+    match config.prompt_layout {
+        PromptLayout::Stable => build_step_plan_user_prompt_stable(goal, config),
+        PromptLayout::Legacy => build_step_plan_user_prompt_legacy(goal, config),
+    }
+}
+
+fn build_step_plan_user_prompt_stable(goal: &str, config: &Config) -> String {
     let mut prompt = String::new();
     let expected_paths = profile_expected_paths(&config.workspace_root, &config.profile, goal);
     if !expected_paths.is_empty() {
@@ -12655,6 +12664,64 @@ fn build_step_plan_user_prompt(goal: &str, config: &Config) -> String {
     }
     prompt.push_str("Create a step plan for this task:\n");
     prompt.push_str(goal);
+    prompt
+}
+
+fn build_step_plan_user_prompt_legacy(goal: &str, config: &Config) -> String {
+    let mut prompt = format!("Create a step plan for this task:\n{goal}");
+    let expected_paths = profile_expected_paths(&config.workspace_root, &config.profile, goal);
+    if !expected_paths.is_empty() {
+        prompt.push_str("\n\nRequired final artifacts:\n");
+        for path in expected_paths {
+            prompt.push_str("- ");
+            prompt.push_str(&path);
+            prompt.push('\n');
+        }
+    }
+    let expectations = profile_quality_expectations(&config.workspace_root, &config.profile, goal);
+    if !expectations.preferred_verify.is_empty()
+        || !expectations
+            .dependency_order_hint
+            .as_deref()
+            .unwrap_or("")
+            .is_empty()
+    {
+        prompt.push_str("\nProfile verification expectations:\n");
+        if !expectations.preferred_verify.is_empty() {
+            prompt.push_str("- Preferred deterministic verify commands:\n");
+            for command in expectations.preferred_verify {
+                prompt.push_str("  - ");
+                prompt.push_str(&command);
+                prompt.push('\n');
+            }
+        }
+        if let Some(hint) = expectations.dependency_order_hint {
+            prompt.push_str("- Order: ");
+            prompt.push_str(&hint);
+            prompt.push('\n');
+        }
+        if !expectations.forbidden_verify.is_empty() {
+            prompt.push_str("- Do not use these in verify:\n");
+            for command in expectations.forbidden_verify {
+                prompt.push_str("  - ");
+                prompt.push_str(&command);
+                prompt.push('\n');
+            }
+        }
+    }
+    if is_ultra_phase_step_goal(goal) {
+        prompt.push_str("\nUltra phase hard constraints:\n");
+        prompt.push_str("- StepPlan.goal must be ONE short sentence naming the phase outcome; never copy the phase context, unmet-requirements, or adherence lists into goal -- details belong in step instructions.\n");
+        prompt.push_str("- Do not put dev-server startup, page-load probes, curl localhost, or dependency installation in verify.\n");
+        prompt.push_str("- Browser readiness is verified by the runtime at final acceptance.\n");
+        prompt.push_str("- GOOD verify examples:\n");
+        prompt.push_str("  - test -f package.json\n");
+        prompt.push_str("  - node -p \"require('./package.json').scripts.dev\"\n");
+        prompt.push_str("- BAD verify examples:\n");
+        prompt.push_str("  - npm install\n");
+        prompt.push_str("  - npm run dev\n");
+        prompt.push_str("  - curl http://localhost:3011\n");
+    }
     prompt
 }
 
@@ -12757,7 +12824,23 @@ fn strengthen_step_plan_for_profile(plan: &mut StepPlan, config: &Config) {
     }
 }
 
-fn build_step_prompt(_plan: &StepPlan, step: &PlanStep, context: &StepPromptContext) -> String {
+fn build_step_prompt(
+    plan: &StepPlan,
+    step: &PlanStep,
+    context: &StepPromptContext,
+    layout: PromptLayout,
+) -> String {
+    match layout {
+        PromptLayout::Stable => build_step_prompt_stable(plan, step, context),
+        PromptLayout::Legacy => build_step_prompt_legacy(plan, step, context),
+    }
+}
+
+fn build_step_prompt_stable(
+    _plan: &StepPlan,
+    step: &PlanStep,
+    context: &StepPromptContext,
+) -> String {
     let mut prompt = String::new();
     prompt.push_str("Execute exactly one StepPlan step.\n\n");
     prompt.push_str("Overall goal:\n");
@@ -12783,6 +12866,9 @@ fn build_step_prompt(_plan: &StepPlan, step: &PlanStep, context: &StepPromptCont
 - Report an explicit blocker only when the blocker cannot be resolved locally.",
     );
 
+    prompt.push_str("\n\nCurrent objective: ");
+    prompt.push_str(&eval_events::body_snippet(&step.instruction));
+
     prompt.push_str("\n\nCurrent step id:\n");
     prompt.push_str(&step.id);
     prompt.push_str("\n\nCurrent step kind:\n");
@@ -12801,6 +12887,56 @@ fn build_step_prompt(_plan: &StepPlan, step: &PlanStep, context: &StepPromptCont
 
     prompt.push_str("\n\nExpected verification result:\n");
     prompt.push_str(step_expected_result(step));
+    prompt
+}
+
+fn build_step_prompt_legacy(
+    _plan: &StepPlan,
+    step: &PlanStep,
+    context: &StepPromptContext,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Execute exactly one StepPlan step.\n\n");
+    prompt.push_str("Overall goal:\n");
+    prompt.push_str(&context.overall_goal);
+    prompt.push_str("\n\nCurrent step id:\n");
+    prompt.push_str(&step.id);
+    prompt.push_str("\n\nCurrent step kind:\n");
+    prompt.push_str(&step.kind);
+    prompt.push_str("\n\nCurrent step instruction:\n");
+    prompt.push_str(&step.instruction);
+
+    prompt.push_str("\n\nRequired final artifacts:\n");
+    append_bullets_or_none(&mut prompt, &context.required_final_artifacts);
+
+    prompt.push_str("\n\nRequired final capabilities:\n");
+    append_bullets_or_none(&mut prompt, &context.final_required_capabilities);
+
+    prompt.push_str("\n\nRequired final evidence:\n");
+    append_bullets_or_none(&mut prompt, &context.final_required_evidence);
+
+    prompt.push_str("\n\nArtifacts available from previous steps:\n");
+    append_bullets_or_none(&mut prompt, &context.prior_expected_paths);
+
+    prompt.push_str("\n\nExpected paths after this step:\n");
+    append_bullets_or_none(&mut prompt, &step.expected_paths);
+
+    prompt.push_str("\n\nVerification commands for this step:\n");
+    append_bullets_or_none(&mut prompt, &step.verify);
+
+    prompt.push_str("\n\nExpected verification result:\n");
+    prompt.push_str(step_expected_result(step));
+
+    prompt.push_str(
+        "\n\nStep execution rules:\n\
+- Work only on the current step unless a prior artifact is required to verify this step.\n\
+- Prefer Write/Edit/MultiEdit for declared expected paths.\n\
+- If this step has verification commands, use them as the deterministic success contract.\n\
+- If verification fails, make a bounded step-local repair and re-check the declared contract.\n\
+- For Next.js/App Router work, keep a single route-bound implementation; do not leave capability components unimported.\n\
+- Do not claim the plan is complete until this step's expected paths and verification contract are satisfied.\n\
+- Report an explicit blocker only when the blocker cannot be resolved locally.",
+    );
     prompt
 }
 
@@ -12871,6 +13007,18 @@ fn prompt_with_required_paths(instruction: &str, paths: &[String]) -> String {
 }
 
 fn ultra_phase_prompt(
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    config: &Config,
+    context: &UltraRunContext,
+) -> String {
+    match config.prompt_layout {
+        PromptLayout::Stable => ultra_phase_prompt_stable(plan, phase, config, context),
+        PromptLayout::Legacy => ultra_phase_prompt_legacy(plan, phase, config, context),
+    }
+}
+
+fn ultra_phase_prompt_stable(
     plan: &UltraPlan,
     phase: &UltraPhase,
     config: &Config,
@@ -12962,6 +13110,103 @@ fn ultra_phase_prompt(
         prior_context,
         unmet_final_requirements,
         requested_features,
+        capability_section,
+        evidence_section
+    )
+}
+
+fn ultra_phase_prompt_legacy(
+    plan: &UltraPlan,
+    phase: &UltraPhase,
+    config: &Config,
+    context: &UltraRunContext,
+) -> String {
+    let expected_paths = profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal);
+    let expectations =
+        profile_quality_expectations(&config.workspace_root, &plan.profile, &plan.goal);
+    let generation_rules =
+        profile_generation_rules(&plan.profile, &plan.intent).unwrap_or("- none\n");
+    let runtime_contract = profile_runtime_contract(&plan.profile, &plan.intent, &plan.goal);
+    let phase_contract_text = format!("{}\n{}", plan.goal, phase.prompt);
+    let required_capabilities = inferred_required_capabilities(&plan.profile, &phase_contract_text);
+    let required_evidence =
+        inferred_required_evidence(&plan.profile, &phase_contract_text, &required_capabilities);
+    let required = if expected_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nRequired final artifacts:\n{}",
+            expected_paths
+                .iter()
+                .map(|path| format!("- {path}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let capability_section = if required_capabilities.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nRequired final capabilities:\n{}",
+            required_capabilities
+                .iter()
+                .map(|capability| format!("- {capability}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let evidence_section = if required_evidence.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nRequired final evidence:\n{}",
+            required_evidence
+                .iter()
+                .map(|evidence| format!("- {evidence}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let preferred_verify = if expectations.preferred_verify.is_empty() {
+        "- none".to_string()
+    } else {
+        expectations
+            .preferred_verify
+            .iter()
+            .map(|command| format!("- {command}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let workspace_snapshot = compact_workspace_snapshot(&config.workspace_root);
+    let prior_context = context.render_prompt_section();
+    let unmet_final_requirements = context.render_unmet_final_requirements_section();
+    let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
+    let requested_features = render_requested_features_not_detected_line(&plan_adherence.missing);
+    let route_bound_constraint = if matches!(
+        plan.profile.as_str(),
+        "nextjs" | "next-js" | "next.js"
+    ) {
+        "\nRoute-bound implementation constraint:\n- Keep a single route-bound implementation; do not leave capability components unimported.\n"
+    } else {
+        ""
+    };
+    format!(
+        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\n{}\n\nProfile generation rules:\n{}\nProfile runtime contract:\n{}\n{}Deterministic verification preference:\n{}\n{}{}{}",
+        plan.goal,
+        plan.profile,
+        plan.style,
+        plan.intent,
+        phase.id,
+        phase.prompt,
+        workspace_snapshot,
+        prior_context,
+        unmet_final_requirements,
+        requested_features,
+        generation_rules,
+        runtime_contract,
+        route_bound_constraint,
+        preferred_verify,
+        required,
         capability_section,
         evidence_section
     )
@@ -13387,6 +13632,48 @@ fn final_acceptance_pending_evidence_guidance(
 #[allow(clippy::too_many_arguments)]
 fn final_acceptance_repair_prompt(
     root: &Path,
+    layout: PromptLayout,
+    plan: &UltraPlan,
+    report: &VerificationReport,
+    context: &UltraRunContext,
+    repair_target: &str,
+    expected_paths: &[String],
+    adherence_missing: &[String],
+    repair_budget: (usize, usize),
+    compile_reanchored_retry: bool,
+    compile_narrow_no_snapshot_retry: bool,
+) -> String {
+    match layout {
+        PromptLayout::Stable => final_acceptance_repair_prompt_stable(
+            root,
+            plan,
+            report,
+            context,
+            repair_target,
+            expected_paths,
+            adherence_missing,
+            repair_budget,
+            compile_reanchored_retry,
+            compile_narrow_no_snapshot_retry,
+        ),
+        PromptLayout::Legacy => final_acceptance_repair_prompt_legacy(
+            root,
+            plan,
+            report,
+            context,
+            repair_target,
+            expected_paths,
+            adherence_missing,
+            repair_budget,
+            compile_reanchored_retry,
+            compile_narrow_no_snapshot_retry,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn final_acceptance_repair_prompt_stable(
+    root: &Path,
     plan: &UltraPlan,
     report: &VerificationReport,
     context: &UltraRunContext,
@@ -13441,10 +13728,93 @@ Profile failures:\n{profile_failures}\n\n\
 {adherence_guidance}\
 Expected paths to preserve or create:\n{expected}\n\n\
 {prior_context}\n\n\
+Current objective: repair final acceptance for {goal}; primary reason {primary_reason}; target {repair_target}.\n\n\
 Final acceptance failure:\n\
 - primary reason: {primary_reason}\n\
 - repair target: {repair_target}\n\
 - attempt: {attempt}/{max_attempts}",
+        goal = plan.goal,
+        profile = plan.profile,
+        intent = plan.intent,
+        primary_reason = report.primary_reason(),
+        repair_target = repair_target,
+        attempt = attempt,
+        max_attempts = max_attempts,
+        pending_evidence_guidance = pending_evidence_guidance,
+        missing = missing,
+        dependencies = dependencies,
+        compile_errors = compile_errors,
+        command_failures = command_failures,
+        profile_failures = profile_failures,
+        behavioral_probe_context = behavioral_probe_context,
+        restart_attachment_guidance = restart_attachment_guidance,
+        adherence_guidance = adherence_guidance,
+        expected = expected,
+        prior_context = context.render_prompt_section(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn final_acceptance_repair_prompt_legacy(
+    root: &Path,
+    plan: &UltraPlan,
+    report: &VerificationReport,
+    context: &UltraRunContext,
+    repair_target: &str,
+    expected_paths: &[String],
+    adherence_missing: &[String],
+    repair_budget: (usize, usize),
+    compile_reanchored_retry: bool,
+    compile_narrow_no_snapshot_retry: bool,
+) -> String {
+    let (attempt, max_attempts) = repair_budget;
+    let expected = render_prompt_bullets(expected_paths);
+    let missing = render_prompt_bullets(&report.missing_paths);
+    let dependencies = render_prompt_bullets(&report.dependency_missing);
+    let profile_failures = final_acceptance_model_fixable_profile_failures(report);
+    let profile_failures = render_prompt_bullets(&profile_failures);
+    let adherence_guidance =
+        final_acceptance_adherence_guidance(report, repair_target, adherence_missing);
+    let behavioral_probe_context =
+        final_acceptance_behavioral_probe_context(report, expected_paths);
+    let restart_attachment_guidance =
+        final_acceptance_restart_attachment_guidance(root, plan, report);
+    let pending_evidence_guidance =
+        final_acceptance_pending_evidence_guidance(root, &plan.profile, report);
+    let command_failures = command_failure_summaries(report);
+    let command_failures = render_prompt_bullets(&command_failures);
+    let compile_errors = compile_repair_prompt_section_with_root(
+        Some(root),
+        &report.compile_errors,
+        CompileRepairPromptProtection {
+            reanchored_retry: compile_reanchored_retry,
+            narrow_no_snapshot_retry: compile_narrow_no_snapshot_retry,
+        },
+    );
+    format!(
+        "Repair the final acceptance failure for the current ultra run.\n\n\
+Original ultra goal:\n{goal}\n\n\
+Profile: {profile}\nIntent: {intent}\n\n\
+Final acceptance failure:\n\
+- primary reason: {primary_reason}\n\
+- repair target: {repair_target}\n\
+- attempt: {attempt}/{max_attempts}\n\n\
+Pending capability evidence remedies:\n{pending_evidence_guidance}\n\n\
+Missing paths:\n{missing}\n\n\
+Dependency failures:\n{dependencies}\n\n\
+Compile errors:\n{compile_errors}\n\n\
+Command failures:\n{command_failures}\n\n\
+Profile failures:\n{profile_failures}\n\n\
+{behavioral_probe_context}\
+{restart_attachment_guidance}\
+{adherence_guidance}\
+Expected paths to preserve or create:\n{expected}\n\n\
+{prior_context}\n\n\
+Bounded repair rules:\n\
+- This is a bounded final acceptance repair, not a new planning cycle.\n\
+- Repair the concrete missing or failed acceptance obligations without weakening verification, package scripts, or profile contracts.\n\
+- If a scaffold exists, continue task-specific implementation instead of treating scaffold/build-only output as complete.\n\
+- Prefer the smallest necessary file changes, then stop.",
         goal = plan.goal,
         profile = plan.profile,
         intent = plan.intent,
@@ -14939,7 +15309,7 @@ mod tests {
             final_required_evidence: vec!["interactive_ui_source_evidence".to_string()],
             completion_contract_path: None,
         };
-        let prompt = build_step_prompt(&plan, &plan.steps[0], &context);
+        let prompt = build_step_prompt(&plan, &plan.steps[0], &context, PromptLayout::Stable);
         assert!(prompt.contains("Overall goal:"));
         assert!(prompt.contains("Build a game"));
         assert!(prompt.contains("Current step id:"));
@@ -15010,8 +15380,8 @@ mod tests {
             final_required_evidence: vec!["interactive_ui_source_evidence".to_string()],
             completion_contract_path: None,
         };
-        let first = build_step_prompt(&plan, &plan.steps[0], &context);
-        let second = build_step_prompt(&plan, &plan.steps[1], &context);
+        let first = build_step_prompt(&plan, &plan.steps[0], &context, PromptLayout::Stable);
+        let second = build_step_prompt(&plan, &plan.steps[1], &context, PromptLayout::Stable);
 
         let prefix = common_prefix(&first, &second);
 
@@ -15019,7 +15389,61 @@ mod tests {
         assert!(prefix.contains("Required final capabilities:"), "{prefix}");
         assert!(prefix.contains("Required final evidence:"), "{prefix}");
         assert!(prefix.contains("Step execution rules:"), "{prefix}");
-        assert!(prefix.ends_with("Current step id:\n"), "{prefix}");
+        assert!(prefix.ends_with("Current objective: "), "{prefix}");
+    }
+
+    #[test]
+    fn prompt_layout_legacy_restores_phase_first_order() {
+        let mut cfg = config(PathBuf::from("/tmp/work"));
+        cfg.profile = "nextjs".to_string();
+        cfg.prompt_layout = PromptLayout::Legacy;
+        let prompt = build_step_plan_user_prompt(
+            "Original ultra goal: Build a game\nPhase id: setup\nPhase task: Scaffold",
+            &cfg,
+        );
+
+        assert!(
+            prompt.starts_with("Create a step plan for this task:"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.find("Create a step plan for this task:").unwrap()
+                < prompt.find("Required final artifacts:").unwrap(),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn stable_step_prompt_tail_opens_with_current_objective() {
+        let plan = StepPlan {
+            goal: "Build a game".to_string(),
+            steps: vec![PlanStep {
+                id: "create-page".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create src/app/page.tsx for the game".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: Vec::new(),
+            }],
+        };
+        let context = StepPromptContext {
+            overall_goal: plan.goal.clone(),
+            required_final_artifacts: vec!["src/app/page.tsx".to_string()],
+            prior_expected_paths: Vec::new(),
+            final_required_capabilities: Vec::new(),
+            final_required_evidence: Vec::new(),
+            completion_contract_path: None,
+        };
+
+        let prompt = build_step_prompt(&plan, &plan.steps[0], &context, PromptLayout::Stable);
+        let current_objective = prompt.find("Current objective:").unwrap();
+        let current_step = prompt.find("Current step id:").unwrap();
+
+        assert!(current_objective < current_step, "{prompt}");
+        assert!(
+            prompt.contains("Current objective: Create src/app/page.tsx for the game"),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -15107,6 +15531,7 @@ mod tests {
         );
         let first = final_acceptance_repair_prompt(
             dir.path(),
+            PromptLayout::Stable,
             &plan,
             &report,
             &context,
@@ -15119,6 +15544,7 @@ mod tests {
         );
         let second = final_acceptance_repair_prompt(
             dir.path(),
+            PromptLayout::Stable,
             &plan,
             &report,
             &context,
@@ -21122,6 +21548,7 @@ if __name__ == "__main__":
         };
         let prompt = final_acceptance_repair_prompt(
             Path::new("."),
+            PromptLayout::Stable,
             &plan,
             &report,
             &UltraRunContext::default(),
@@ -21297,6 +21724,7 @@ if __name__ == "__main__":
         let expected_paths = final_acceptance_repair_expected_paths(&plan, &cfg, &report).unwrap();
         let prompt = final_acceptance_repair_prompt(
             &cfg.workspace_root,
+            PromptLayout::Stable,
             &plan,
             &report,
             &UltraRunContext::default(),
@@ -21644,6 +22072,7 @@ if __name__ == "__main__":
             final_acceptance_repair_expected_paths(&plan, &cfg, &initial_report).unwrap();
         let repair_prompt = final_acceptance_repair_prompt(
             &cfg.workspace_root,
+            PromptLayout::Stable,
             &plan,
             &initial_report,
             &UltraRunContext::default(),
@@ -21745,6 +22174,7 @@ if __name__ == "__main__":
                 final_acceptance_repair_expected_paths(&plan, &cfg, &report).unwrap();
             let prompt = final_acceptance_repair_prompt(
                 &cfg.workspace_root,
+                PromptLayout::Stable,
                 &plan,
                 &report,
                 &UltraRunContext::default(),
@@ -22281,6 +22711,7 @@ if __name__ == "__main__":
 
         let prompt = final_acceptance_repair_prompt(
             Path::new("."),
+            PromptLayout::Stable,
             &plan,
             &report,
             &UltraRunContext::default(),
@@ -25798,6 +26229,7 @@ exit 2\n",
             .expect("expected paths");
         let repair_prompt = final_acceptance_repair_prompt(
             &cfg.workspace_root,
+            PromptLayout::Stable,
             &plan,
             &initial_report,
             &UltraRunContext::default(),
@@ -26663,6 +27095,7 @@ export default function Page() {\n\
         let plan = static_compile_repair_plan();
         let prompt = final_acceptance_repair_prompt(
             dir.path(),
+            PromptLayout::Stable,
             &plan,
             &report,
             &UltraRunContext::default(),
@@ -26761,6 +27194,7 @@ Type error: Cannot find name 'player'. Did you mean 'PLAYER_W'?\n\n\
         );
         let prompt = final_acceptance_repair_prompt(
             dir.path(),
+            PromptLayout::Stable,
             &static_compile_repair_plan(),
             &report,
             &UltraRunContext::default(),
@@ -26998,6 +27432,7 @@ Type error: Cannot find name 'player'. Did you mean 'PLAYER_W'?\n\n\
             context_budget: 1000,
             model: "m".to_string(),
             provider: crate::config::Provider::Ollama,
+            prompt_layout: crate::config::PromptLayout::Stable,
             planner_model: "m".to_string(),
             planner_provider: crate::config::Provider::Ollama,
             ollama_host: "http://localhost:11434".to_string(),

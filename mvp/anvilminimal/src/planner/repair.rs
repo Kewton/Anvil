@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::config::PromptLayout;
 use crate::eval_events;
 use crate::minimal_loop::completion::{
     CompileRepairPromptProtection, compile_repair_prompt_section_with_root,
@@ -30,6 +31,7 @@ pub struct RepairContext {
     pub compile_reanchored_retry: bool,
     pub compile_narrow_no_snapshot_retry: bool,
     pub workspace_root: Option<PathBuf>,
+    pub prompt_layout: PromptLayout,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,6 +54,17 @@ pub fn build_repair_prompt(step_id: &str, report: &VerificationReport) -> String
 }
 
 pub fn build_repair_prompt_with_context(
+    step_id: &str,
+    report: &VerificationReport,
+    context: &RepairContext,
+) -> String {
+    match context.prompt_layout {
+        PromptLayout::Stable => build_repair_prompt_stable(step_id, report, context),
+        PromptLayout::Legacy => build_repair_prompt_legacy(step_id, report, context),
+    }
+}
+
+fn build_repair_prompt_stable(
     step_id: &str,
     report: &VerificationReport,
     context: &RepairContext,
@@ -130,6 +143,85 @@ pub fn build_repair_prompt_with_context(
     prompt
 }
 
+fn build_repair_prompt_legacy(
+    step_id: &str,
+    report: &VerificationReport,
+    context: &RepairContext,
+) -> String {
+    let repair_target = classify_repair_target(report);
+    let mut prompt = format!(
+        "Repair step `{step_id}`. Verification failed: {}.\n\
+Repair target: {}. {}\n\
+Make the smallest bounded change, then stop.",
+        report.primary_reason(),
+        repair_target.as_str(),
+        repair_target.guidance()
+    );
+    if let Some(goal) = &context.overall_goal {
+        prompt.push_str("\n\nOverall goal:\n");
+        prompt.push_str(goal);
+    }
+    if let (Some(attempt), Some(max)) = (context.repair_attempt, context.max_repair_turns) {
+        prompt.push_str("\n\nRepair budget:\n");
+        prompt.push_str(&format!("- attempt {attempt}/{max}\n"));
+    }
+    if !context.required_final_artifacts.is_empty() {
+        prompt.push_str("\n\nRequired final artifacts:\n");
+        prompt.push_str(&bullet_list(&context.required_final_artifacts));
+    }
+    if let Some(instruction) = &context.step_instruction {
+        prompt.push_str("\n\nCurrent step instruction:\n");
+        prompt.push_str(instruction);
+    }
+    if !context.expected_paths.is_empty() {
+        prompt.push_str("\n\nExpected paths after this step:\n");
+        prompt.push_str(&bullet_list(&context.expected_paths));
+    }
+    if !context.verify_commands.is_empty() {
+        prompt.push_str("\n\nVerification commands for this step:\n");
+        prompt.push_str(&bullet_list(&context.verify_commands));
+    }
+    if !report.compile_errors.is_empty() {
+        prompt.push_str("\n\nCompile errors:\n");
+        prompt.push_str(&compile_repair_prompt_section_with_root(
+            context.workspace_root.as_deref(),
+            &report.compile_errors,
+            CompileRepairPromptProtection {
+                reanchored_retry: context.compile_reanchored_retry,
+                narrow_no_snapshot_retry: context.compile_narrow_no_snapshot_retry,
+            },
+        ));
+    }
+    if let Some(expected) = &context.expected_result {
+        prompt.push_str("\n\nExpected verification result:\n");
+        prompt.push_str(expected);
+    }
+    if !report.missing_paths.is_empty() {
+        prompt.push_str("\n\nMissing expected paths:\n");
+        prompt.push_str(&bullet_list(&report.missing_paths));
+    }
+    if !report.command_failures.is_empty() {
+        prompt.push_str("\n\nCommand failures:\n");
+        let failures = report
+            .command_failures
+            .iter()
+            .map(|failure| format!("{}: {}", failure.command, failure.reason))
+            .collect::<Vec<_>>();
+        prompt.push_str(&bullet_list(&failures));
+    }
+    if !context.changed_files.is_empty() {
+        prompt.push_str("\n\nFiles already changed in this step:\n");
+        prompt.push_str(&bullet_list(&context.changed_files));
+    }
+    if let Some(warning) = &context.progress_warning {
+        prompt.push_str("\n\nProgress warning:\n");
+        prompt.push_str(warning);
+    }
+    prompt.push_str("\n\n");
+    prompt.push_str(&repair_rules_prefix());
+    prompt
+}
+
 pub fn build_compact_compile_repair_prompt_with_context(
     step_id: &str,
     report: &VerificationReport,
@@ -143,8 +235,12 @@ pub fn build_compact_compile_repair_prompt_with_context(
             narrow_no_snapshot_retry: context.compile_narrow_no_snapshot_retry,
         },
     );
+    let prefix = match context.prompt_layout {
+        PromptLayout::Stable => format!("{}\n\n", repair_rules_prefix()),
+        PromptLayout::Legacy => String::new(),
+    };
     format!(
-        "{}\n\n\
+        "{prefix}\
 Repair session mode: compact.\n\
 Compile-error repair for step `{step_id}`.\n\n\
 Compile error frames and remedies:\n\
@@ -152,8 +248,7 @@ Compile error frames and remedies:\n\
 Tool schema reminder:\n\
 - Use Write or Edit tool calls to modify the failing source file.\n\
 - Do not answer in prose only; a response without a source edit fails this compile repair.\n\
-- Keep the change bounded to the compile frame above, then stop.",
-        repair_rules_prefix()
+- Keep the change bounded to the compile frame above, then stop."
     )
 }
 
@@ -176,8 +271,12 @@ pub fn build_compile_regeneration_prompt_with_context(
         .as_deref()
         .and_then(|root| std::fs::read_to_string(root.join(target_path)).ok())
         .unwrap_or_default();
+    let prefix = match context.prompt_layout {
+        PromptLayout::Stable => format!("{}\n\n", repair_rules_prefix()),
+        PromptLayout::Legacy => String::new(),
+    };
     format!(
-        "{}\n\n\
+        "{prefix}\
 Repair session mode: compact regeneration.\n\
 Compile-error regeneration for step `{step_id}`.\n\n\
 Compile error frames and remedies:\n\
@@ -191,8 +290,7 @@ Regeneration mandate:\n\
 - Write the complete corrected file via the Write tool (full content, one file only): {target_path}.\n\
 - Do not modify any other file.\n\
 - Preserve the user's app intent and keep caller/callee contracts consistent with the definition context above.\n\
-- Stop immediately after the Write tool call.",
-        repair_rules_prefix()
+- Stop immediately after the Write tool call."
     )
 }
 

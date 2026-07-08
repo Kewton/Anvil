@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::cli::{Cli, FooterArg, ProviderArg};
+use crate::cli::{Cli, FooterArg, PromptLayoutArg, ProviderArg};
 use crate::planner::profile::{ProfileInference, infer_profile};
 
 pub const LOCAL_PROVIDER_CHAT_TIMEOUT_SECS: u64 = 600;
@@ -60,6 +60,40 @@ impl From<FooterArg> for FooterMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptLayout {
+    #[default]
+    Stable,
+    Legacy,
+}
+
+impl PromptLayout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Legacy => "legacy",
+        }
+    }
+
+    fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim() {
+            "stable" => Some(Self::Stable),
+            "legacy" => Some(Self::Legacy),
+            _ => None,
+        }
+    }
+}
+
+impl From<PromptLayoutArg> for PromptLayout {
+    fn from(value: PromptLayoutArg) -> Self {
+        match value {
+            PromptLayoutArg::Stable => Self::Stable,
+            PromptLayoutArg::Legacy => Self::Legacy,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Repl,
@@ -108,6 +142,7 @@ pub struct Config {
     pub context_budget: usize,
     pub model: String,
     pub provider: Provider,
+    pub prompt_layout: PromptLayout,
     pub planner_model: String,
     pub planner_provider: Provider,
     pub ollama_host: String,
@@ -136,6 +171,7 @@ pub struct ConfigFieldSources {
     pub planner_provider: String,
     pub context_budget: String,
     pub chat_timeout_secs: String,
+    pub prompt_layout: String,
     pub profile: String,
     pub narration: String,
     pub footer: String,
@@ -150,6 +186,7 @@ impl Default for ConfigFieldSources {
             planner_provider: "default".to_string(),
             context_budget: "default".to_string(),
             chat_timeout_secs: "default".to_string(),
+            prompt_layout: "default".to_string(),
             profile: "default".to_string(),
             narration: "default".to_string(),
             footer: "default".to_string(),
@@ -178,6 +215,7 @@ struct PresetConfig {
     planner_provider: Option<Sourced<Provider>>,
     context_budget: Option<Sourced<usize>>,
     chat_timeout_secs: Option<Sourced<u64>>,
+    prompt_layout: Option<Sourced<PromptLayout>>,
     profile: Option<Sourced<String>>,
     narration: Option<Sourced<NarrationMode>>,
     footer: Option<Sourced<FooterMode>>,
@@ -188,6 +226,7 @@ struct ConfigFile {
     presets: HashMap<String, PresetConfig>,
     narration: Option<Sourced<NarrationMode>>,
     footer: Option<Sourced<FooterMode>>,
+    prompt_layout: Option<Sourced<PromptLayout>>,
 }
 
 impl Config {
@@ -256,6 +295,16 @@ impl Config {
             Some(value) => (value.value, value.source),
             None => resolve_chat_timeout(None, provider.value, planner_provider.value),
         };
+        let prompt_layout = cli
+            .prompt_layout
+            .map(|value| sourced(PromptLayout::from(value), "flag"))
+            .or_else(|| {
+                preset
+                    .as_ref()
+                    .and_then(|preset| preset.prompt_layout.clone())
+            })
+            .or_else(|| config_file_prompt_layout(&workspace_root))
+            .unwrap_or_else(|| sourced(PromptLayout::Stable, "default"));
         let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
         let action = action_from_cli(&cli)?;
         let eval_events_path = crate::eval_events::path_from_env_or_default(&workspace_root);
@@ -303,6 +352,7 @@ impl Config {
             planner_provider: planner_provider.source.clone(),
             context_budget: context_budget.source.clone(),
             chat_timeout_secs: chat_timeout_source.clone(),
+            prompt_layout: prompt_layout.source.clone(),
             profile: profile.source.clone(),
             narration: narration.source.clone(),
             footer: footer.source.clone(),
@@ -317,6 +367,7 @@ impl Config {
             context_budget: context_budget.value,
             model: model.value,
             provider: provider.value,
+            prompt_layout: prompt_layout.value,
             planner_model: planner_model.value,
             planner_provider: planner_provider.value,
             ollama_host: cli.ollama_host,
@@ -359,6 +410,7 @@ fn load_named_preset(root: &Path, name: Option<&str>) -> anyhow::Result<Option<P
         merge_preset_field(&mut merged.planner_provider, &preset.planner_provider);
         merge_preset_field(&mut merged.context_budget, &preset.context_budget);
         merge_preset_field(&mut merged.chat_timeout_secs, &preset.chat_timeout_secs);
+        merge_preset_field(&mut merged.prompt_layout, &preset.prompt_layout);
         merge_preset_field(&mut merged.profile, &preset.profile);
         merge_preset_field(&mut merged.narration, &preset.narration);
         merge_preset_field(&mut merged.footer, &preset.footer);
@@ -417,12 +469,27 @@ fn config_file_footer(root: &Path) -> Option<Sourced<FooterMode>> {
     legacy_config_file_footer(root)
 }
 
+fn config_file_prompt_layout(root: &Path) -> Option<Sourced<PromptLayout>> {
+    for path in config_paths(root) {
+        if let Ok(Some(file)) = parse_config_file_if_present(&path)
+            && let Some(prompt_layout) = file.prompt_layout
+        {
+            return Some(prompt_layout);
+        }
+    }
+    legacy_config_file_prompt_layout(root)
+}
+
 fn legacy_config_file_narration(root: &Path) -> Option<Sourced<NarrationMode>> {
     legacy_config_file_value(root, "narration", NarrationMode::from_config_value)
 }
 
 fn legacy_config_file_footer(root: &Path) -> Option<Sourced<FooterMode>> {
     legacy_config_file_value(root, "footer", FooterMode::from_config_value)
+}
+
+fn legacy_config_file_prompt_layout(root: &Path) -> Option<Sourced<PromptLayout>> {
+    legacy_config_file_value(root, "prompt_layout", PromptLayout::from_config_value)
 }
 
 fn legacy_config_file_value<T>(
@@ -546,6 +613,16 @@ fn parse_top_level_key(
             ));
             Ok(())
         }
+        "prompt_layout" => {
+            file.prompt_layout = Some(sourced(
+                parse_prompt_layout_value(path, line_no, key, value)?,
+                format!(
+                    "config:{}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
+            ));
+            Ok(())
+        }
         _ => bail!("{}:{} unknown config key '{key}'", path.display(), line_no),
     }
 }
@@ -612,6 +689,12 @@ fn parse_preset_key(
         "footer" => {
             preset.footer = Some(sourced(
                 parse_footer_value(path, line_no, &full_key, value)?,
+                source,
+            ))
+        }
+        "prompt_layout" => {
+            preset.prompt_layout = Some(sourced(
+                parse_prompt_layout_value(path, line_no, &full_key, value)?,
                 source,
             ))
         }
@@ -704,6 +787,22 @@ fn parse_footer_value(
     let value = parse_string_value(path, line_no, key, value)?;
     FooterMode::from_config_value(&value).ok_or_else(|| {
         anyhow::anyhow!("{}:{} {key} expects footer on|off", path.display(), line_no)
+    })
+}
+
+fn parse_prompt_layout_value(
+    path: &Path,
+    line_no: usize,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<PromptLayout> {
+    let value = parse_string_value(path, line_no, key, value)?;
+    PromptLayout::from_config_value(&value).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}:{} {key} expects prompt_layout stable|legacy",
+            path.display(),
+            line_no
+        )
     })
 }
 
@@ -1044,6 +1143,7 @@ planner_model = "preset-planner"
 planner_provider = "gemini"
 context_budget = 12345
 chat_timeout_secs = 77
+prompt_layout = "legacy"
 profile = "nextjs"
 narration = "quiet"
 "#,
@@ -1077,12 +1177,49 @@ narration = "quiet"
         assert_eq!(config.field_sources.planner_model, "preset:local");
         assert_eq!(config.chat_timeout_secs, 77);
         assert_eq!(config.field_sources.chat_timeout_secs, "preset:local");
+        assert_eq!(config.prompt_layout, PromptLayout::Legacy);
+        assert_eq!(config.field_sources.prompt_layout, "preset:local");
         assert_eq!(config.profile, "nextjs");
         assert_eq!(config.field_sources.profile, "preset:local");
         assert!(config.profile_explicit);
         assert!(config.profile_inference.is_none());
         assert_eq!(config.narration, NarrationMode::Quiet);
         assert_eq!(config.field_sources.narration, "preset:local");
+    }
+
+    #[test]
+    fn prompt_layout_flag_wins_over_config_and_defaults_stable() {
+        let default = Config::from_cli(Cli::parse_from(["anvilminimal"])).unwrap();
+        assert_eq!(default.prompt_layout, PromptLayout::Stable);
+        assert_eq!(default.field_sources.prompt_layout, "default");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+        std::fs::write(
+            dir.path().join(".anvil/config.toml"),
+            "prompt_layout = \"legacy\"\n",
+        )
+        .unwrap();
+
+        let from_config =
+            Config::from_cli(Cli::parse_from(["anvilminimal", "--cwd", &cwd])).unwrap();
+        assert_eq!(from_config.prompt_layout, PromptLayout::Legacy);
+        assert_eq!(
+            from_config.field_sources.prompt_layout,
+            "config:config.toml"
+        );
+
+        let from_flag = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--prompt-layout",
+            "stable",
+        ]))
+        .unwrap();
+        assert_eq!(from_flag.prompt_layout, PromptLayout::Stable);
+        assert_eq!(from_flag.field_sources.prompt_layout, "flag");
     }
 
     #[test]

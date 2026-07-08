@@ -382,6 +382,7 @@ fn emit_direct_command_stop_with_status(
             "task_status": &event_projection.task_status,
             "profile": &completion.profile,
             "effective_profile": &completion.effective_profile,
+            "prompt_layout": config.prompt_layout.as_str(),
             "contract_origin": &completion.contract_origin,
             "assurance_level": &completion.assurance_level,
             "assurance_reason": &completion.assurance_reason,
@@ -507,6 +508,7 @@ fn emit_run_start(config: &Config) {
             "planner_model": eval_events::body_snippet(&config.planner_model),
             "chat_timeout_secs": config.chat_timeout_secs,
             "chat_timeout_source": config.chat_timeout_source,
+            "prompt_layout": config.prompt_layout.as_str(),
             "profile": config.profile,
             "profile_inferred": config
                 .profile_inference
@@ -604,6 +606,7 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "task_status": &completion.task_status,
             "profile": &completion.profile,
             "effective_profile": &completion.effective_profile,
+            "prompt_layout": config.prompt_layout.as_str(),
             "contract_origin": &completion.contract_origin,
             "assurance_level": &completion.assurance_level,
             "assurance_reason": &completion.assurance_reason,
@@ -685,6 +688,9 @@ fn apply_config_completion_metadata(
     if snapshot.effective_profile.trim().is_empty() {
         snapshot.effective_profile = snapshot.profile.clone();
     }
+    if snapshot.prompt_layout.trim().is_empty() {
+        snapshot.prompt_layout = config.prompt_layout.as_str().to_string();
+    }
     if crate::planner::profile::canonical_profile_name(&snapshot.profile) == "generic" {
         if snapshot.assurance_level == "static" {
             snapshot.assurance_reason = eval_events::GENERIC_STATIC_ASSURANCE_REASON.to_string();
@@ -718,6 +724,7 @@ mod tests {
             context_budget: 1000,
             model: "m".to_string(),
             provider: Provider::Ollama,
+            prompt_layout: crate::config::PromptLayout::Stable,
             planner_model: "m".to_string(),
             planner_provider: Provider::Ollama,
             ollama_host: "http://localhost:11434".to_string(),

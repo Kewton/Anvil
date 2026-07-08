@@ -15,6 +15,12 @@ pub enum FooterArg {
     Off,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PromptLayoutArg {
+    Stable,
+    Legacy,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "anvilminimal")]
 #[command(about = "Minimal loop + YAML plan runner MVP")]
@@ -30,6 +36,13 @@ pub struct Cli {
     pub model: Option<String>,
     #[arg(long, value_enum)]
     pub provider: Option<ProviderArg>,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "stable|legacy",
+        help = "Choose prompt section order for A/B measurement"
+    )]
+    pub prompt_layout: Option<PromptLayoutArg>,
     #[arg(long)]
     pub planner_model: Option<String>,
     #[arg(long, value_enum)]
@@ -136,6 +149,13 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--footer"));
         assert!(help.contains("on|off"));
+    }
+
+    #[test]
+    fn help_includes_prompt_layout() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--prompt-layout"));
+        assert!(help.contains("stable|legacy"));
     }
 
     #[test]

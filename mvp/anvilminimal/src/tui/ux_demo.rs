@@ -261,6 +261,7 @@ mod tests {
             context_budget: 65_536,
             model: "m".to_string(),
             provider: Provider::Ollama,
+            prompt_layout: crate::config::PromptLayout::Stable,
             planner_model: "pm".to_string(),
             planner_provider: Provider::Ollama,
             ollama_host: "http://localhost:11434".to_string(),

@@ -176,6 +176,7 @@ pub struct ParsedSlash {
     pub profile: String,
     pub profile_explicit: bool,
     pub profile_inference: Option<crate::planner::profile::ProfileInference>,
+    pub prompt_layout: crate::config::PromptLayout,
     pub style: String,
     pub goal: String,
 }
@@ -201,6 +202,7 @@ pub fn parse_slash(line: &str, config: &Config) -> anyhow::Result<ParsedSlash> {
         profile,
         profile_explicit: parsed_profile.profile_explicit,
         profile_inference,
+        prompt_layout: parsed_profile.prompt_layout,
         style: parsed_profile.style,
         goal,
     })
@@ -230,6 +232,8 @@ pub fn handle_command(
     config.profile = parsed.profile;
     config.profile_explicit = parsed.profile_explicit;
     config.profile_inference = parsed.profile_inference;
+    config.prompt_layout = parsed.prompt_layout;
+    config.field_sources.prompt_layout = "slash".to_string();
     config.style = parsed.style;
     if let Some(inference) = config.profile_inference {
         crate::eval_events::emit(
@@ -250,6 +254,7 @@ pub fn handle_command(
             "lifecycle_stage": "tui_command",
             "command": &parsed.command,
             "profile": &config.profile,
+            "prompt_layout": config.prompt_layout.as_str(),
             "profile_inferred": config
                 .profile_inference
                 .map(|inference| inference.profile)
@@ -517,6 +522,7 @@ fn emit_tui_command_stop_with_status(
             "task_status": &event_projection.task_status,
             "profile": &completion.profile,
             "effective_profile": &completion.effective_profile,
+            "prompt_layout": config.prompt_layout.as_str(),
             "contract_origin": &completion.contract_origin,
             "assurance_level": &completion.assurance_level,
             "assurance_reason": &completion.assurance_reason,
@@ -617,6 +623,9 @@ fn apply_config_completion_metadata(
     }
     if snapshot.effective_profile.trim().is_empty() {
         snapshot.effective_profile = snapshot.profile.clone();
+    }
+    if snapshot.prompt_layout.trim().is_empty() {
+        snapshot.prompt_layout = config.prompt_layout.as_str().to_string();
     }
     if crate::planner::profile::canonical_profile_name(&snapshot.profile) == "generic" {
         if snapshot.assurance_level == "static" {
@@ -740,6 +749,7 @@ pub fn parse_profile_style(args: &[String], config: &Config) -> (String, String,
 struct ParsedProfileStyle {
     profile: String,
     profile_explicit: bool,
+    prompt_layout: crate::config::PromptLayout,
     style: String,
     rest: Vec<String>,
 }
@@ -747,6 +757,7 @@ struct ParsedProfileStyle {
 fn parse_profile_style_details(args: &[String], config: &Config) -> ParsedProfileStyle {
     let mut profile = config.profile.clone();
     let mut profile_explicit = config.profile_explicit;
+    let mut prompt_layout = config.prompt_layout;
     let mut style = config.style.clone();
     let mut rest = Vec::new();
     let mut i = 0;
@@ -761,6 +772,14 @@ fn parse_profile_style_details(args: &[String], config: &Config) -> ParsedProfil
                 style = args[i + 1].clone();
                 i += 2;
             }
+            "--prompt-layout" if i + 1 < args.len() => {
+                prompt_layout = match args[i + 1].as_str() {
+                    "stable" => crate::config::PromptLayout::Stable,
+                    "legacy" => crate::config::PromptLayout::Legacy,
+                    _ => prompt_layout,
+                };
+                i += 2;
+            }
             _ => {
                 rest.push(args[i].clone());
                 i += 1;
@@ -770,6 +789,7 @@ fn parse_profile_style_details(args: &[String], config: &Config) -> ParsedProfil
     ParsedProfileStyle {
         profile,
         profile_explicit,
+        prompt_layout,
         style,
         rest,
     }
@@ -847,6 +867,7 @@ mod tests {
             context_budget: 1000,
             model: "m".to_string(),
             provider: crate::config::Provider::Ollama,
+            prompt_layout: crate::config::PromptLayout::Stable,
             planner_model: "m".to_string(),
             planner_provider: crate::config::Provider::Ollama,
             ollama_host: "http://localhost:11434".to_string(),
@@ -889,7 +910,15 @@ mod tests {
     fn parse_slash_uses_config_defaults() {
         let parsed = parse_slash("/plan-run goal", &config()).unwrap();
         assert_eq!(parsed.profile, "generic");
+        assert_eq!(parsed.prompt_layout, crate::config::PromptLayout::Stable);
         assert_eq!(parsed.style, "default");
+        assert_eq!(parsed.goal, "goal");
+    }
+
+    #[test]
+    fn parse_slash_accepts_prompt_layout_override() {
+        let parsed = parse_slash("/ultra-plan-run --prompt-layout legacy goal", &config()).unwrap();
+        assert_eq!(parsed.prompt_layout, crate::config::PromptLayout::Legacy);
         assert_eq!(parsed.goal, "goal");
     }
 

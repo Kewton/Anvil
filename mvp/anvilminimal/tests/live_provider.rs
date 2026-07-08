@@ -367,6 +367,7 @@ fn live_openai_responses_no_tool_http_smoke() {
         model: std::env::var("ANVIL_OPENAI_SMOKE_MODEL")
             .unwrap_or_else(|_| "gpt-5.4-mini".to_string()),
         provider: Provider::Openai,
+        prompt_layout: anvilminimal::config::PromptLayout::Stable,
         planner_model: "unused".to_string(),
         planner_provider: Provider::Openai,
         ollama_host: "http://127.0.0.1:11434".to_string(),
@@ -433,6 +434,7 @@ fn live_gemini_interactions_no_tool_http_smoke() {
         context_budget: 4096,
         model: "unused".to_string(),
         provider: Provider::Ollama,
+        prompt_layout: anvilminimal::config::PromptLayout::Stable,
         planner_model: std::env::var("ANVIL_GEMINI_SMOKE_MODEL")
             .unwrap_or_else(|_| "gemini-3.5-flash".to_string()),
         planner_provider: Provider::Gemini,
@@ -604,6 +606,7 @@ fn smoke_config(tmp_root: &Path, key_root: PathBuf, provider: Provider) -> Confi
         context_budget: 4096,
         model: "unused".to_string(),
         provider,
+        prompt_layout: anvilminimal::config::PromptLayout::Stable,
         planner_model: "unused".to_string(),
         planner_provider: provider,
         ollama_host: "http://127.0.0.1:11434".to_string(),

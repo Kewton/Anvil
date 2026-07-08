@@ -197,6 +197,7 @@ pub fn append_run_summary(path: Option<&Path>, text: &str) {
 pub struct CompletionSnapshot {
     pub profile: String,
     pub effective_profile: String,
+    pub prompt_layout: String,
     pub contract_origin: String,
     pub assurance_level: String,
     pub assurance_reason: String,
@@ -257,6 +258,7 @@ impl CompletionSnapshot {
         Self {
             profile: String::new(),
             effective_profile: String::new(),
+            prompt_layout: String::new(),
             contract_origin: "initial".to_string(),
             assurance_level: String::new(),
             assurance_reason: String::new(),
@@ -329,6 +331,7 @@ pub struct CompletionProjection {
     pub task_status: String,
     pub profile: String,
     pub effective_profile: String,
+    pub prompt_layout: String,
     pub contract_origin: String,
     pub assurance_level: String,
     pub assurance_reason: String,
@@ -433,6 +436,11 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
     if let Some(profile) = latest_lifecycle_profile_fields(&events) {
         profile.apply_to(&mut snapshot);
     }
+    if snapshot.prompt_layout.trim().is_empty()
+        && let Some(prompt_layout) = latest_prompt_layout(&events)
+    {
+        snapshot.prompt_layout = prompt_layout;
+    }
     if let Some(reinference) = latest_profile_reinference_after(&events, latest_completion_index) {
         reinference.apply_to(&mut snapshot);
     }
@@ -501,6 +509,7 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         task_status,
         profile: snapshot.profile.clone(),
         effective_profile: snapshot_effective_profile(snapshot),
+        prompt_layout: snapshot.prompt_layout.clone(),
         contract_origin: snapshot.contract_origin.clone(),
         assurance_level,
         assurance_reason,
@@ -1739,6 +1748,11 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .or_else(|| event.get("profile").and_then(Value::as_str))
             .unwrap_or("")
             .to_string(),
+        prompt_layout: event
+            .get("prompt_layout")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         contract_origin: event
             .get("contract_origin")
             .and_then(Value::as_str)
@@ -1957,6 +1971,7 @@ struct ProfileReinferenceFields {
 struct LifecycleProfileFields {
     profile: String,
     effective_profile: String,
+    prompt_layout: String,
     profile_inferred: String,
     profile_inference_source: String,
     requested_port: String,
@@ -1992,11 +2007,24 @@ impl LifecycleProfileFields {
         if snapshot.contract_origin == "initial" && !self.contract_origin.is_empty() {
             snapshot.contract_origin = self.contract_origin;
         }
+        if snapshot.prompt_layout.trim().is_empty() && !self.prompt_layout.is_empty() {
+            snapshot.prompt_layout = self.prompt_layout;
+        }
     }
 }
 
 fn latest_lifecycle_profile_fields(events: &[Value]) -> Option<LifecycleProfileFields> {
     events.iter().rev().find_map(lifecycle_profile_fields)
+}
+
+fn latest_prompt_layout(events: &[Value]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| event.get("prompt_layout").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn lifecycle_profile_fields(event: &Value) -> Option<LifecycleProfileFields> {
@@ -2024,6 +2052,11 @@ fn lifecycle_profile_fields(event: &Value) -> Option<LifecycleProfileFields> {
     Some(LifecycleProfileFields {
         profile: profile.to_string(),
         effective_profile: profile.to_string(),
+        prompt_layout: event
+            .get("prompt_layout")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         profile_inferred: event
             .get("profile_inferred")
             .and_then(Value::as_str)
@@ -2275,6 +2308,10 @@ fn render_completion_summary(
         format!(
             "Effective profile: {}",
             missing_if_empty(&projection.effective_profile)
+        ),
+        format!(
+            "Prompt layout: {}",
+            missing_if_empty(&projection.prompt_layout)
         ),
         format!("Contract origin: {}", projection.contract_origin),
         format!("Runtime acceptance: {}", projection.runtime_acceptance),
@@ -3125,6 +3162,7 @@ mod tests {
                 "event": "tui_command_start",
                 "command": "/ultra-plan-run",
                 "profile": "nextjs",
+                "prompt_layout": "legacy",
                 "style": "default",
             }),
         );
@@ -3149,8 +3187,10 @@ mod tests {
 
         assert_eq!(snapshot.profile, "nextjs");
         assert_eq!(snapshot.effective_profile, "nextjs");
+        assert_eq!(snapshot.prompt_layout, "legacy");
         assert_eq!(snapshot.requested_port, "3011 (goal)");
         assert_eq!(projection.effective_profile, "nextjs");
+        assert_eq!(projection.prompt_layout, "legacy");
     }
 
     #[test]

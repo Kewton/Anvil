@@ -43,3 +43,37 @@ Record:
 
 Treat movement as observational unless the run identity, hardware, model
 residency, and scenario prompt are held constant.
+
+## Prompt Layout A/B Protocol
+
+The `prompt_layout` setting is an instrumentation toggle for discriminating
+layout-sensitive model behavior. It never changes verification semantics.
+
+- `stable`: the 104B prefix-stable order, with stable policy/profile sections
+  first and per-turn state at the tail. Tail blocks restate the current
+  objective so the dynamic end of the prompt is self-sufficient.
+- `legacy`: the pre-104B section order, preserved for A/B measurement.
+
+For the qwen27b GAME regression test0708_018, run two fresh local GAME attempts
+per layout:
+
+1. `prompt_layout = "stable"`
+2. `prompt_layout = "legacy"`
+
+Use the same model, host, profile, context budget, keep-alive setting, and
+scenario prompt. Record the `Time profile:` line and provider telemetry for each
+run, especially whether `prompt_eval_count` drops after the first turn in the
+same session.
+
+Pre-committed discrimination rule: if setup-phase `no_tool_missing_artifacts`
+stagnation occurs in one layout and not the other, prompt layout is the cause.
+If both layouts stagnate, treat it as model behavior and rely on deterministic
+scaffold rescue. If neither stagnates, keep the speed decision based on the
+prefill and wall-clock telemetry.
+
+Decision outcomes:
+
+- keep stable when it preserves behavior and improves prefill/wall clock;
+- keep stable plus the tail-objective fix when only the tail was insufficient;
+- revert the default to legacy if stable alone reproducibly causes setup-phase
+  no-tool stagnation that legacy avoids.

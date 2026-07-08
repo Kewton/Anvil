@@ -18,6 +18,7 @@ fn config(root: PathBuf) -> Config {
         context_budget: 1000,
         model: "m".to_string(),
         provider: Provider::Ollama,
+        prompt_layout: anvilminimal::config::PromptLayout::Stable,
         planner_model: "pm".to_string(),
         planner_provider: Provider::Gemini,
         ollama_host: "http://localhost:11434".to_string(),

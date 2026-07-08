@@ -82,13 +82,15 @@ pub fn render_startup_banner(config: &Config, style: BannerStyle) -> String {
         sanitize_banner_text(&config.workspace_root.display().to_string())
     ));
     out.push_str(&format!(
-        "context_budget={} ({}) timeout={}s ({}) profile={} ({}) narration={} ({}) footer={} ({}) yes={}\n",
+        "context_budget={} ({}) timeout={}s ({}) profile={} ({}) prompt_layout={} ({}) narration={} ({}) footer={} ({}) yes={}\n",
         config.context_budget,
         sanitize_banner_text(&config.field_sources.context_budget),
         config.chat_timeout_secs,
         sanitize_banner_text(&config.field_sources.chat_timeout_secs),
         sanitize_banner_text(&config.profile),
         sanitize_banner_text(&config.field_sources.profile),
+        config.prompt_layout.as_str(),
+        sanitize_banner_text(&config.field_sources.prompt_layout),
         narration_label(config.narration),
         sanitize_banner_text(&config.field_sources.narration),
         footer_label(config.no_footer),
@@ -154,6 +156,7 @@ mod tests {
             context_budget: 65536,
             model: "m\x1b[31m".to_string(),
             provider: Provider::Ollama,
+            prompt_layout: crate::config::PromptLayout::Stable,
             planner_model: "pm".to_string(),
             planner_provider: Provider::Gemini,
             ollama_host: "http://localhost:11434".to_string(),
@@ -214,6 +217,7 @@ mod tests {
         assert!(out.contains("anvilminimal"));
         assert!(out.contains(&crate::build_info::commit_with_dirty()));
         assert!(out.contains("context_budget=65536 (default)"));
+        assert!(out.contains("prompt_layout=stable (default)"));
         assert!(out.contains("footer=on (default)"));
         assert!(out.contains("yes=true"));
         assert!(!out.contains("╔═╗"));
