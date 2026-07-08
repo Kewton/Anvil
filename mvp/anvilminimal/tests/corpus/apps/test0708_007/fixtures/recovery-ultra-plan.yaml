@@ -1,0 +1,17 @@
+# anvil-recovery-ultra-plan
+recovery_schema_version: "1"
+recovery_original_goal: "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。"
+recovery_failure_kind: "phase_execute_error"
+recovery_profile: "nextjs"
+recovery_failed_phase: "final-verification"
+goal: "あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。"
+profile: "nextjs"
+style: "recovery"
+intent: "recover"
+phases:
+  - id: "inspect-current-state"
+    prompt: "Inspect the current workspace before changing files. Original goal: あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。. Failed acceptance layer or phase: final-verification. Failed step: unknown. Failure kind: phase_execute_error. Preserve useful existing artifacts and identify the smallest remaining implementation gap."
+  - id: "repair-final-verification"
+    prompt: "Repair the incomplete work for the failed phase without restarting from scratch.\nOriginal goal: あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。\nFailed acceptance layer or phase: final-verification\nFailed step: unknown\nMissing capability or artifact signals:\n- none\nFailure evidence:\n- loop_progress_exhausted: no concrete blocker recorded\nRepair targets:\n- none\nCreate or update the task-specific implementation artifacts needed to satisfy the original goal. Do not treat scaffold-only, setup-only, style-only, or build-only output as complete."
+  - id: "verify-recovery"
+    prompt: "Verify the recovered output with deterministic checks and repair only targeted failures.\nOriginal goal: あなたが考える最高に面白くかっこいいスペースインベーダーゲームを3011ポートで起動可能なnext.jsアプリとして開発してください。\nFailed acceptance layer or phase: final-verification\nPreferred verify/browser check:\n- use deterministic file existence, build, route, and capability evidence checks\n- avoid shell control syntax and interactive dev-server-only verification\nVerify preference: use the preferred checks above.\nExpected recovery result: runnable task-specific output, not only a saved plan or diagnostic report."

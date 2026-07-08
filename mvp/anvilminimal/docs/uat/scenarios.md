@@ -78,7 +78,9 @@ bounded handoff reasons.
    listener before each Next.js or `AMBIGUOUS` run. With the default-port
    policy, no cleanup check for 3000 is needed. If a previous 3011 dev server
    is still alive, stop it and record the cleanup. The CLI scenario has no
-   port.
+   port. When manually launching a generated Next.js dev server for inspection,
+   use `env -u NODE_ENV npm run dev` so manual checks match the normalized
+   runtime launcher environment.
 4. Evidence capture: attach `.anvil/runs/<run-id>/events.jsonl`,
    `.anvil/runs/<run-id>/summary.md`, any referenced
    `browser_readiness_evidence_path`, any referenced `interaction_evidence_path`,
