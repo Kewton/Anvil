@@ -7,7 +7,7 @@ use crate::planner::lint::{
 use crate::planner::side_effect_paths::{SideEffectPathTier, diagnose_expected_path};
 use crate::planner::step_plan::{PlanStep, StepKind, StepPlan};
 use crate::planner::verify::{
-    VerifyCommandViolationKind, diagnose_verify_command,
+    VerifyCommandViolationKind, dependency_install_verify_segment, diagnose_verify_command,
     normalize_verify_command_for_oracle_repair,
     normalize_verify_command_for_oracle_repair_with_root,
 };
@@ -549,6 +549,10 @@ fn remove_setup_or_dev_server_verify_commands(plan: &mut StepPlan, report: &mut 
         for command in original_verify {
             let diagnosis = diagnose_verify_command(&command);
             if diagnosis.violation != Some(VerifyCommandViolationKind::SetupOrDevServer) {
+                kept.push(command);
+                continue;
+            }
+            if dependency_install_verify_segment(&command).is_some() {
                 kept.push(command);
                 continue;
             }
@@ -1312,10 +1316,12 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
         let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
 
         assert_eq!(report.shell_control_splits.len(), 1);
-        assert_eq!(report.removed_commands.len(), 1);
-        assert_eq!(report.removed_commands[0].command, "npm install");
-        assert_eq!(plan.steps[0].kind, "setup");
-        assert_eq!(plan.steps[0].verify, vec!["test -f package.json"]);
+        assert!(report.removed_commands.is_empty(), "{report:?}");
+        assert_eq!(plan.steps[0].kind, "implement");
+        assert_eq!(
+            plan.steps[0].verify,
+            vec!["npm install", "test -f package.json"]
+        );
         assert!(
             lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
             "{plan:?}"
@@ -1381,10 +1387,14 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
 
         let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
 
-        assert_eq!(report.removed_commands.len(), 2);
-        assert_eq!(report.substituted_commands.len(), 1);
+        assert_eq!(report.removed_commands.len(), 1);
+        assert_eq!(
+            report.removed_commands[0].command,
+            "npm run dev & curl http://localhost:3011"
+        );
+        assert!(report.substituted_commands.is_empty(), "{report:?}");
         assert_eq!(plan.steps[0].kind, "setup");
-        assert_eq!(plan.steps[0].verify, vec!["test -f package.json"]);
+        assert_eq!(plan.steps[0].verify, vec!["npm install"]);
         assert!(plan.steps[1].verify.is_empty());
         assert!(
             plan.steps[1]

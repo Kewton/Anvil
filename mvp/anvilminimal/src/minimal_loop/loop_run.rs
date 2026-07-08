@@ -10,7 +10,8 @@ use crate::eval_events;
 use crate::mode::ExecutionMode;
 use crate::planner::profile::{profile_complete_scaffold, profile_setup_scaffold_paths};
 use crate::planner::verify::{
-    RuntimeCommandConnector, RuntimeNormalizedCommandSegment, diagnose_verify_command,
+    RuntimeCommandConnector, RuntimeNormalizedCommand, RuntimeNormalizedCommandSegment,
+    VerifyInstallCommandFamily, diagnose_verify_command,
     normalize_runtime_bash_command_for_boundary, normalize_verify_command,
 };
 use crate::provider_call::{self, ProviderCallScope};
@@ -32,7 +33,7 @@ use super::compact::compact_if_needed;
 use super::completion::{
     CompletionContract, format_verify_feedback_with_contract, target_implementation_files,
 };
-use super::dependency_setup::NodeDependencySetupAuthority;
+use super::dependency_setup::{self, NodeDependencySetupAuthority, NodeDependencySetupStatus};
 use super::evidence::{RuntimeAcceptanceReport, verify_runtime_acceptance};
 use super::import_scan::{format_missing_import_feedback, scan_relative_imports};
 use super::prompt::{ToolPromptMode, build_request_messages};
@@ -632,10 +633,14 @@ fn emit_runtime_bash_policy(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_split_runtime_bash<F, G>(
     segments: &[RuntimeNormalizedCommandSegment],
     root: &Path,
+    profile: &str,
+    setup_authority: NodeDependencySetupAuthority,
     offline: bool,
+    eval_events_path: Option<&Path>,
     is_cancelled: F,
     is_force_cancelled: G,
 ) -> anyhow::Result<String>
@@ -650,47 +655,82 @@ where
         if segment.connector == RuntimeCommandConnector::Always {
             and_chain_failed = false;
         }
-        let command = segment.command.as_str();
         if segment.connector == RuntimeCommandConnector::AndThen && and_chain_failed {
             out.push(format!(
                 "segment {} skipped by && short-circuit: {}",
                 index + 1,
-                command
+                segment.command.as_str()
             ));
             continue;
         }
-        let outcome = crate::tools::bash::run_structured_cancel_and_force(
-            command,
-            root,
-            offline,
-            Duration::from_secs(180),
-            &is_cancelled,
-            &is_force_cancelled,
-        )?;
-        match outcome.kind {
-            BashOutcomeKind::Blocked => bail!("{}", outcome.summary),
-            BashOutcomeKind::Timeout => bail!(
-                "command_timeout: {command}\n{}",
-                crate::tools::bash::format_outcome(&outcome)
-            ),
-            BashOutcomeKind::Cancelled => bail!(
-                "command_aborted_by_user: interrupted by user: {command}\n{}",
-                crate::tools::bash::format_outcome(&outcome)
-            ),
-            BashOutcomeKind::Success | BashOutcomeKind::CommandFailed => {}
-        }
-        out.push(format!(
-            "segment {} command: {}\n{}",
-            index + 1,
-            command,
-            crate::tools::bash::format_outcome(&outcome)
-        ));
-        if outcome.kind == BashOutcomeKind::Success {
-            and_chain_failed = false;
-        } else {
-            and_chain_failed = true;
-            if first_failure.is_none() {
-                first_failure = Some((index + 1, command.to_string(), outcome.kind));
+        let command = segment.command.as_str();
+        match &segment.command {
+            RuntimeNormalizedCommand::DependencyInstall { family, .. } => {
+                let setup = run_runtime_verify_install_substitution(
+                    root,
+                    profile,
+                    command,
+                    *family,
+                    setup_authority,
+                    offline,
+                    eval_events_path,
+                );
+                let passed = runtime_dependency_setup_allows_verify_continuation(&setup);
+                out.push(format!(
+                    "segment {} install substituted: {}\nsetup_status: {}\nfeedback: dependency installs are owned by the runtime; verify with the build/test command alone.",
+                    index + 1,
+                    command,
+                    setup.status.as_str()
+                ));
+                if passed {
+                    and_chain_failed = false;
+                } else {
+                    and_chain_failed = true;
+                    if first_failure.is_none() {
+                        first_failure = Some((
+                            index + 1,
+                            command.to_string(),
+                            BashOutcomeKind::CommandFailed,
+                        ));
+                    }
+                }
+            }
+            RuntimeNormalizedCommand::Verify(verify_command) => {
+                let command = verify_command.as_str();
+                let outcome = crate::tools::bash::run_structured_cancel_and_force(
+                    command,
+                    root,
+                    offline,
+                    Duration::from_secs(180),
+                    &is_cancelled,
+                    &is_force_cancelled,
+                )?;
+                match outcome.kind {
+                    BashOutcomeKind::Blocked => bail!("{}", outcome.summary),
+                    BashOutcomeKind::Timeout => bail!(
+                        "command_timeout: {command}\n{}",
+                        crate::tools::bash::format_outcome(&outcome)
+                    ),
+                    BashOutcomeKind::Cancelled => bail!(
+                        "command_aborted_by_user: interrupted by user: {command}\n{}",
+                        crate::tools::bash::format_outcome(&outcome)
+                    ),
+                    BashOutcomeKind::Success | BashOutcomeKind::CommandFailed => {}
+                }
+                out.push(format!(
+                    "segment {} command: {}\n{}",
+                    index + 1,
+                    command,
+                    crate::tools::bash::format_outcome(&outcome)
+                ));
+                if outcome.kind == BashOutcomeKind::Success {
+                    and_chain_failed = false;
+                } else {
+                    and_chain_failed = true;
+                    if first_failure.is_none() {
+                        first_failure = Some((index + 1, command.to_string(), outcome.kind));
+                    }
+                }
             }
         }
     }
@@ -700,6 +740,82 @@ where
         "combined_outcome: Success".to_string()
     };
     Ok(format!("{combined}\n{}", out.join("\n\n")))
+}
+
+fn run_runtime_verify_install_substitution(
+    root: &Path,
+    profile: &str,
+    command: &str,
+    family: VerifyInstallCommandFamily,
+    setup_authority: NodeDependencySetupAuthority,
+    offline: bool,
+    eval_events_path: Option<&Path>,
+) -> dependency_setup::NodeDependencySetupObservation {
+    let requirement = match family {
+        VerifyInstallCommandFamily::Python => {
+            dependency_setup::requirement_for_python_cli_dependencies(
+                root,
+                Some("python-cli"),
+                "verify_segment dependency reconciliation",
+                setup_authority,
+            )
+        }
+        VerifyInstallCommandFamily::Node => {
+            let canonical = profile.trim().to_ascii_lowercase();
+            if canonical == "nextjs"
+                && dependency_setup::package_json_declares_dependencies(root)
+                && !dependency_setup::next_build_dependencies_ready(root)
+            {
+                dependency_setup::requirement_for_next_build(
+                    root,
+                    Some("nextjs"),
+                    "verify_segment dependency reconciliation",
+                    setup_authority,
+                )
+            } else {
+                dependency_setup::requirement_for_node_declared_dependencies(
+                    root,
+                    Some(profile),
+                    "verify_segment dependency reconciliation",
+                    setup_authority,
+                )
+            }
+        }
+    };
+    let setup = dependency_setup::run_node_dependency_setup_with_program_and_offline(
+        root,
+        &requirement,
+        Path::new("npm"),
+        offline,
+    );
+    eval_events::emit(
+        eval_events_path,
+        json!({
+            "event": "verify_install_substituted",
+            "trigger": "verify_segment",
+            "command": eval_events::body_snippet(command),
+            "family": family.as_str(),
+            "setup_kind": setup.setup_kind.as_str(),
+            "setup_status": setup.status.as_str(),
+            "setup_attempted": setup.attempted,
+            "setup_authority": setup.authority.as_str(),
+            "feedback": "dependency installs are owned by the runtime; verify with the build/test command alone.",
+        }),
+    );
+    setup
+}
+
+fn runtime_dependency_setup_allows_verify_continuation(
+    setup: &dependency_setup::NodeDependencySetupObservation,
+) -> bool {
+    matches!(
+        setup.status,
+        NodeDependencySetupStatus::Passed | NodeDependencySetupStatus::NotRequired
+    ) || setup.primary_reason.contains("already present")
+        || setup.primary_reason.contains("has no dependency table")
+        || setup
+            .primary_reason
+            .contains("has no project.dependencies table")
 }
 
 #[derive(Debug, Default)]
@@ -1638,11 +1754,17 @@ pub(crate) fn run_session_with_outcome_with_options(
             }
             let result = {
                 let _guard = ui.before_tool_call(&call.name);
-                if call.name == "Bash" && split_bash_segments.len() > 1 {
+                let split_has_install = split_bash_segments
+                    .iter()
+                    .any(|segment| segment.command.install_family().is_some());
+                if call.name == "Bash" && (split_bash_segments.len() > 1 || split_has_install) {
                     execute_split_runtime_bash(
                         &split_bash_segments,
                         &context.root,
+                        &config.profile,
+                        options.dependency_setup_authority,
                         context.offline,
+                        config.eval_events_path.as_deref(),
                         || ui.interrupted(),
                         || ui.force_interrupted(),
                     )
@@ -5252,6 +5374,63 @@ export default function Page(){
             policy.get("normalization_kind").and_then(Value::as_str),
             Some("shell_control_split")
         );
+    }
+
+    #[test]
+    fn verify_step_runtime_substitutes_install_segment_before_verify_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"build":"node -e \"process.exit(0)\""},"dependencies":{}}"#,
+        )
+        .unwrap();
+        let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events_path.clone());
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Bash",
+                    json!({"command":"npm install && test -f package.json"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Verify the current step.",
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify)
+                .with_dependency_setup_authority(NodeDependencySetupAuthority::PlanSetupStep),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
+        let bash_result = session
+            .messages
+            .iter()
+            .find(|message| message.role == "tool" && message.name.as_deref() == Some("Bash"))
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        assert!(
+            bash_result.contains("segment 1 install substituted: npm install"),
+            "{bash_result}"
+        );
+        assert!(
+            bash_result.contains("segment 2 command: test -f package.json"),
+            "{bash_result}"
+        );
+        let events = event_values(&events_path);
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(Value::as_str) == Some("verify_install_substituted")
+                && event.get("trigger").and_then(Value::as_str) == Some("verify_segment")
+        }));
     }
 
     #[test]

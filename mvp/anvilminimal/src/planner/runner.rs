@@ -15086,7 +15086,7 @@ mod tests {
 
         assert_eq!(planner.messages.len(), 1);
         assert_eq!(plan.steps[0].kind, "setup");
-        assert_eq!(plan.steps[0].verify, vec!["test -f package.json"]);
+        assert_eq!(plan.steps[0].verify, vec!["npm install"]);
         assert!(plan.steps[1].verify.is_empty());
         assert!(
             plan.steps[1]

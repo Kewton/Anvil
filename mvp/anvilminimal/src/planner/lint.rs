@@ -234,6 +234,9 @@ pub fn lint_step_plan_report_with_workspace(
             }
         }
         for command in &step.verify {
+            if crate::planner::verify::dependency_install_verify_segment(command).is_some() {
+                continue;
+            }
             if let Err(err) = crate::planner::verify::validate_verify_command(command) {
                 report.push("verify_policy", err.to_string());
             }

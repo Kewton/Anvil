@@ -3,7 +3,9 @@ use std::path::Path;
 use crate::minimal_loop::build_verifier::{
     self, BuildVerifierLifecycleObservation, BuildVerifierStatus, CompileError,
 };
-use crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority;
+use crate::minimal_loop::dependency_setup::{
+    self, NodeDependencySetupAuthority, NodeDependencySetupObservation, NodeDependencySetupStatus,
+};
 use crate::minimal_loop::verifier_env;
 use crate::planner::step_plan::{ExpectedResult, PlanStep};
 use crate::tools::path_guard::{resolve_existing, validate_workspace_relative};
@@ -185,10 +187,58 @@ impl RuntimeCommandConnector {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyInstallCommandFamily {
+    Node,
+    Python,
+}
+
+impl VerifyInstallCommandFamily {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Python => "python",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeNormalizedCommand {
+    Verify(NormalizedVerifyCommand),
+    DependencyInstall {
+        command: String,
+        family: VerifyInstallCommandFamily,
+    },
+}
+
+impl RuntimeNormalizedCommand {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Verify(command) => command.as_str(),
+            Self::DependencyInstall { command, .. } => command.as_str(),
+        }
+    }
+
+    pub fn verify_command(&self) -> Option<&NormalizedVerifyCommand> {
+        match self {
+            Self::Verify(command) => Some(command),
+            Self::DependencyInstall { .. } => None,
+        }
+    }
+
+    pub fn install_family(&self) -> Option<VerifyInstallCommandFamily> {
+        match self {
+            Self::Verify(_) => None,
+            Self::DependencyInstall { family, .. } => Some(*family),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeNormalizedCommandSegment {
     pub connector: RuntimeCommandConnector,
-    pub command: NormalizedVerifyCommand,
+    pub command: RuntimeNormalizedCommand,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -538,14 +588,17 @@ fn verify_step_with_setup_observed_with_options(
             report.push_missing_path(path.clone());
         }
     }
-    for command in &step.verify {
-        let normalized_command = match normalize_verify_command(command) {
-            Ok(command) => command,
-            Err(err) => {
-                report.push_command_failure(command.clone(), err.to_string());
-                continue;
-            }
-        };
+    let prepared_verify = prepare_verify_commands_with_install_substitution(
+        root,
+        step,
+        profile,
+        setup_authority,
+        npm_program,
+        offline,
+        eval_events_path,
+        &mut report,
+    );
+    for normalized_command in prepared_verify {
         let command = normalized_command.as_str();
         if let Some(requirement) = build_verifier::requirement_from_deferred(
             command,
@@ -669,6 +722,200 @@ fn verify_step_with_setup_observed_with_options(
         }
     }
     (report, build_lifecycles)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_verify_commands_with_install_substitution(
+    root: &Path,
+    step: &PlanStep,
+    profile: Option<&str>,
+    setup_authority: NodeDependencySetupAuthority,
+    npm_program: &Path,
+    offline: bool,
+    eval_events_path: Option<&Path>,
+    report: &mut VerificationReport,
+) -> Vec<NormalizedVerifyCommand> {
+    let mut out = Vec::new();
+    for raw_command in &step.verify {
+        match normalize_verify_command(raw_command) {
+            Ok(command) => {
+                out.push(command);
+                continue;
+            }
+            Err(err) if !contains_shell_control_syntax(raw_command) => {
+                if let Some(family) = dependency_install_verify_segment(raw_command) {
+                    run_verify_install_substitution(
+                        root,
+                        raw_command,
+                        profile,
+                        family,
+                        setup_authority,
+                        npm_program,
+                        offline,
+                        eval_events_path,
+                        report,
+                    );
+                } else {
+                    report.push_command_failure(raw_command.clone(), err.to_string());
+                }
+                continue;
+            }
+            Err(_) => {}
+        }
+
+        let segments = match split_runtime_shell_segments(raw_command) {
+            Ok(segments) => segments,
+            Err(err) => {
+                report.push_command_failure(raw_command.clone(), err.to_string());
+                continue;
+            }
+        };
+        let mut and_chain_failed = false;
+        for (connector, segment) in segments {
+            if connector == RuntimeCommandConnector::Always {
+                and_chain_failed = false;
+            }
+            if connector == RuntimeCommandConnector::AndThen && and_chain_failed {
+                continue;
+            }
+            if let Some(family) = dependency_install_verify_segment(&segment) {
+                let passed = run_verify_install_substitution(
+                    root,
+                    &segment,
+                    profile,
+                    family,
+                    setup_authority,
+                    npm_program,
+                    offline,
+                    eval_events_path,
+                    report,
+                );
+                and_chain_failed = !passed;
+                continue;
+            }
+            match normalize_verify_command(&segment) {
+                Ok(command) => {
+                    out.push(command);
+                    and_chain_failed = false;
+                }
+                Err(err) => {
+                    report.push_command_failure(segment, err.to_string());
+                    and_chain_failed = true;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_verify_install_substitution(
+    root: &Path,
+    command: &str,
+    profile: Option<&str>,
+    family: VerifyInstallCommandFamily,
+    setup_authority: NodeDependencySetupAuthority,
+    npm_program: &Path,
+    offline: bool,
+    eval_events_path: Option<&Path>,
+    report: &mut VerificationReport,
+) -> bool {
+    let requirement =
+        verify_install_substitution_requirement(root, profile, family, setup_authority);
+    let setup = dependency_setup::run_node_dependency_setup_with_program_and_offline(
+        root,
+        &requirement,
+        npm_program,
+        offline,
+    );
+    emit_verify_install_substituted(eval_events_path, command, family, &setup);
+    if dependency_setup_observation_allows_verify_continuation(&setup) {
+        return true;
+    }
+    if setup.primary_reason == "dependency setup authority missing" {
+        report.push_dependency_missing(format!("dependency_setup_authority_required: {command}"));
+    } else {
+        report.push_dependency_missing(format!(
+            "dependency_setup_lifecycle_failed: {}",
+            setup.primary_reason
+        ));
+    }
+    false
+}
+
+fn verify_install_substitution_requirement(
+    root: &Path,
+    profile: Option<&str>,
+    family: VerifyInstallCommandFamily,
+    setup_authority: NodeDependencySetupAuthority,
+) -> dependency_setup::NodeDependencySetupRequirement {
+    let reason = "verify_segment dependency reconciliation";
+    match family {
+        VerifyInstallCommandFamily::Python => {
+            dependency_setup::requirement_for_python_cli_dependencies(
+                root,
+                Some("python-cli"),
+                reason,
+                setup_authority,
+            )
+        }
+        VerifyInstallCommandFamily::Node => {
+            let canonical = profile.unwrap_or_default().trim().to_ascii_lowercase();
+            if canonical == "nextjs"
+                && dependency_setup::package_json_declares_dependencies(root)
+                && !dependency_setup::next_build_dependencies_ready(root)
+            {
+                dependency_setup::requirement_for_next_build(
+                    root,
+                    Some("nextjs"),
+                    reason,
+                    setup_authority,
+                )
+            } else {
+                dependency_setup::requirement_for_node_declared_dependencies(
+                    root,
+                    profile,
+                    reason,
+                    setup_authority,
+                )
+            }
+        }
+    }
+}
+
+fn dependency_setup_observation_allows_verify_continuation(
+    setup: &NodeDependencySetupObservation,
+) -> bool {
+    matches!(
+        setup.status,
+        NodeDependencySetupStatus::Passed | NodeDependencySetupStatus::NotRequired
+    ) || setup.primary_reason.contains("already present")
+        || setup.primary_reason.contains("has no dependency table")
+        || setup
+            .primary_reason
+            .contains("has no project.dependencies table")
+}
+
+fn emit_verify_install_substituted(
+    path: Option<&Path>,
+    command: &str,
+    family: VerifyInstallCommandFamily,
+    setup: &NodeDependencySetupObservation,
+) {
+    eval_events::emit(
+        path,
+        serde_json::json!({
+            "event": "verify_install_substituted",
+            "trigger": "verify_segment",
+            "command": eval_events::body_snippet(command),
+            "family": family.as_str(),
+            "setup_kind": setup.setup_kind.as_str(),
+            "setup_status": setup.status.as_str(),
+            "setup_attempted": setup.attempted,
+            "setup_authority": setup.authority.as_str(),
+            "feedback": "dependency installs are owned by the runtime; verify with the build/test command alone.",
+        }),
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1161,26 +1408,14 @@ pub fn normalize_runtime_bash_command_for_boundary(
             normalization_reason: reasons.join("; "),
             segments: vec![RuntimeNormalizedCommandSegment {
                 connector: RuntimeCommandConnector::Always,
-                command: normalized,
+                command: RuntimeNormalizedCommand::Verify(normalized),
             }],
         });
     }
     let segments = split_runtime_shell_segments(&current)?;
-    if segments.len() <= 1 {
-        let normalized = normalize_verify_command(&current)?;
-        return Ok(RuntimeNormalizedCommandPlan {
-            normalized_command: normalized.as_str().to_string(),
-            normalization_kind: kinds.last().copied().unwrap_or(""),
-            normalization_reason: reasons.join("; "),
-            segments: vec![RuntimeNormalizedCommandSegment {
-                connector: RuntimeCommandConnector::Always,
-                command: normalized,
-            }],
-        });
-    }
     let mut normalized_segments = Vec::new();
     for (connector, segment) in segments {
-        let normalized = normalize_verify_command(segment.trim())?;
+        let normalized = normalize_runtime_shell_segment(segment.trim())?;
         normalized_segments.push(RuntimeNormalizedCommandSegment {
             connector,
             command: normalized,
@@ -1196,6 +1431,22 @@ pub fn normalize_runtime_bash_command_for_boundary(
         normalization_reason: reasons.join("; "),
         segments: normalized_segments,
     })
+}
+
+fn normalize_runtime_shell_segment(segment: &str) -> anyhow::Result<RuntimeNormalizedCommand> {
+    match normalize_verify_command(segment) {
+        Ok(command) => Ok(RuntimeNormalizedCommand::Verify(command)),
+        Err(err) => {
+            if let Some(family) = dependency_install_verify_segment(segment) {
+                Ok(RuntimeNormalizedCommand::DependencyInstall {
+                    command: segment.trim().to_string(),
+                    family,
+                })
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
@@ -1913,9 +2164,7 @@ fn is_setup_or_dev_server_verify_command(lower: &str) -> bool {
     if lower.starts_with("node -p ") || lower.starts_with("node --print ") {
         return false;
     }
-    lower.contains("npm install")
-        || lower.contains("pnpm install")
-        || lower.contains("yarn install")
+    dependency_install_verify_segment(lower).is_some()
         || lower.contains("cargo install")
         || lower.contains("npm run dev")
         || lower.contains("pnpm dev")
@@ -1929,6 +2178,41 @@ fn is_setup_or_dev_server_verify_command(lower: &str) -> bool {
         || lower.contains("python3 -m http.server")
         || lower.contains("server start")
         || lower.contains("serve ")
+}
+
+pub fn dependency_install_verify_segment(command: &str) -> Option<VerifyInstallCommandFamily> {
+    let tokens = shell_words_with_spans(command)?;
+    let values = tokens
+        .iter()
+        .map(|token| token.value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [program, subcommand, ..]
+            if matches!(program.as_str(), "npm" | "pnpm")
+                && matches!(subcommand.as_str(), "install" | "i") =>
+        {
+            Some(VerifyInstallCommandFamily::Node)
+        }
+        [program, subcommand, ..]
+            if program == "yarn" && matches!(subcommand.as_str(), "install" | "add") =>
+        {
+            Some(VerifyInstallCommandFamily::Node)
+        }
+        [program, subcommand, ..]
+            if matches!(program.as_str(), "pip" | "pip3") && subcommand == "install" =>
+        {
+            Some(VerifyInstallCommandFamily::Python)
+        }
+        [program, flag, module, subcommand, ..]
+            if matches!(program.as_str(), "python" | "python3")
+                && flag == "-m"
+                && module == "pip"
+                && subcommand == "install" =>
+        {
+            Some(VerifyInstallCommandFamily::Python)
+        }
+        _ => None,
+    }
 }
 
 fn is_localhost_reference(lower: &str) -> bool {
@@ -2603,6 +2887,22 @@ mod tests {
             r#"node -p "require('./package.json').scripts.build""#
         );
         assert_eq!(plan.segments[2].command.as_str(), "test -f package.json");
+    }
+
+    #[test]
+    fn runtime_bash_normalizer_admits_dependency_install_segment_for_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan =
+            normalize_runtime_bash_command_for_boundary("npm install && npm run build", dir.path())
+                .unwrap();
+
+        assert_eq!(plan.segments.len(), 2);
+        assert_eq!(
+            plan.segments[0].command.install_family(),
+            Some(VerifyInstallCommandFamily::Node)
+        );
+        assert_eq!(plan.segments[0].command.as_str(), "npm install");
+        assert_eq!(plan.segments[1].command.as_str(), "npm run build");
     }
 
     #[test]
