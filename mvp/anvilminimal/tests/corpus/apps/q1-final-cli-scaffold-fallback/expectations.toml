@@ -1,0 +1,35 @@
+case_id = "q1-final-cli-scaffold-fallback"
+source = "final gemma4-cloud CLI round"
+required_paths = ["fixtures/python-cli-setup-fallback.txt"]
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["python-cli", "setup-fallback"]
+acceptance_passed = true
+primary_reason = "pass"
+
+[route_closure]
+include = []
+exclude = []
+
+[evidence]
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/python-cli-setup-fallback.txt = [
+  "profile: python-cli",
+  "phase kind: setup",
+  "StepPlan lint exhausted",
+  "fallback-setup",
+  "test -f pyproject.toml"
+]

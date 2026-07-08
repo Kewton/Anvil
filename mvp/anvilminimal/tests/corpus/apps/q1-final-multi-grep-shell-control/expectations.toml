@@ -1,0 +1,34 @@
+case_id = "q1-final-multi-grep-shell-control"
+source = "final gemma4-cloud TOOL/GAME round"
+required_paths = ["fixtures/multi-grep-verify.txt"]
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["multi-grep", "verify-normalization"]
+acceptance_passed = true
+primary_reason = "pass"
+
+[route_closure]
+include = []
+exclude = []
+
+[evidence]
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/multi-grep-verify.txt = [
+  "grep -q \"START\" src/app/page.tsx && grep -q \"data-anvil-action\" src/app/page.tsx",
+  "shell_control",
+  "unsupported fragment",
+  "allowed categories"
+]

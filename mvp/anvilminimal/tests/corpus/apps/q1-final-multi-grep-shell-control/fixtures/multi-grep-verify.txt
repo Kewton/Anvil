@@ -1,0 +1,14 @@
+Raw verifier command:
+grep -q "START" src/app/page.tsx && grep -q "data-anvil-action" src/app/page.tsx
+
+Old diagnosis:
+verify command may not use shell control syntax
+
+Corrected diagnosis:
+The verifier entry point must first route through shared verify normalization.
+After splitting, the deterministic verifier category policy may reject grep
+fragments as an unsupported fragment, but the feedback must name allowed
+categories rather than reporting an unsplit shell_control failure.
+
+Required feedback marker:
+allowed categories

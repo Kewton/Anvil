@@ -49,6 +49,15 @@ Status: complete on 2026-07-06.
 | Corpus closure | complete | 2026-07-06 | Local residual and golden fixtures in [generality.md#clause-evidence](generality.md#clause-evidence). |
 | Runbook closure | complete | 2026-07-06 | Local-provider timeout and co-residency notes in [uat/scenarios.md#command-shape](uat/scenarios.md#command-shape). |
 
+## Multi-Model Generalization Track Cross-Reference
+
+Status: complete on 2026-07-08.
+
+| milestone | status | date | reference |
+|---|---|---|---|
+| Instructions 89-102 | complete | 2026-07-08 | Model-family adoption moved from repeated dialect-specific fixes to permanent assets: model probe, boundary audits, deterministic reconciliation, repair ladders, boundedness, and corpus-backed tier vocabulary. |
+| Tier vocabulary | complete | 2026-07-08 | `model_stagnation:read_only_loop` and repair follow-through classes record model limits for tier decisions; they are not system defects when the terminal state is honest and bounded. |
+
 ## Local Single-Model GAME Track Cross-Reference
 
 Status: complete on 2026-07-07.
@@ -120,6 +129,8 @@ mode rather than a single prompt string.
 | Q1 boundedness A/B | `content_b` repeatedly issued `ls -R && cat package.json`; each command hit the 180s Bash cap because broad recursive listing traversed the whole workspace including generated dependency trees. The old repeated-tool-error key used exact error text, so timeout variants were not aggregated reliably. | Step sessions now have a wall-clock cap, command/provider time sinks are recorded, similar command timeouts share a normalized prefix key, the second timeout gives strategy-change feedback, and the third terminates as `command_timeout_loop`. | Loop-run tests cover similarity grouping, strategy feedback, and step wall-clock expiry; conformance requires terminal timeout repetition to stop as `command_timeout_loop`. |
 | Q1 boundedness C | `tool_a` readiness found port 3011 occupied by a stale Next dev server from the same run rather than an unrelated external service. The earlier lifecycle cleanup was per call site, so the child survived into a later readiness cycle and terminal exhaustion could still say no blocker. | Bounded spawn now owns a run-scoped server child registry. Phase transitions, terminal guards, SIGINT/drop paths, and readiness `port_in_use` retry reap registered children with `server_reaped { origin_phase }`; external owners remain honest failures with pid/command. | Bounded-process and runner tests cover registry reaping telemetry and owner parsing; conformance rejects empty-handed no-blocker exhaustion vocabulary. |
 | Post-101 Q1 | `content_b` placed dependency installs in verify commands and later hit invalid npm semver, while `game_a` had camelCase/PascalCase collision logic that static evidence missed. | Verify install segments are substituted into runtime-owned dependency reconciliation before remaining verify commands run; invalid semver output names the manifest entry and corrected example; gameplay identifier matching is case-insensitive across source/browser evidence helpers. | Verify, runtime Bash, sanitizer/lint, semver remedy, evidence property, and corpus tests pin the install-substitution, invalid-semver, and camelCase/PascalCase evidence shapes. |
+| Final multi-model A | TOOL/GAME fixtures showed `grep X && grep Y` rejected as unsplit shell control at verifier lint/contract entry points even though plan/runtime/Bash boundaries had split machinery. | StepPlan lint and completion contract validation now enter the shared planner verify normalizer before policy diagnosis; unsupported split fragments fail with allowed verifier categories instead of a generic shell-control label. The 92C protection audit now treats StepPlan verify-policy lint as a normalizer boundary. | Lint, completion, and protection-coverage tests pin the multi-grep shape and prevent new direct lint bypasses. |
+| Final multi-model B | CLI fixtures showed setup StepPlan lint exhaustion under `python-cli` did not substitute the 94C setup fallback because the fallback was effectively Next.js-only. | Setup fallback now uses the profile scaffold boundary for known profiles; `python-cli` produces `pyproject.toml`, `src/<package>/main.py`, and setup-safe `test -f` verification rather than failing as phase scaffold exhaustion. Python compilation remains a later deterministic gate. | Runner tests cover lint-exhausted python-cli setup fallback; corpus fixture records the CLI scaffold shape. |
 
 ## Review Process Rule
 

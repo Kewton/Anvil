@@ -1,0 +1,12 @@
+profile: python-cli
+phase kind: setup
+
+Observed shape:
+StepPlan lint exhausted during the setup phase, but the fallback path was wired
+only for the Next.js scaffold profile. The python-cli profile already exposes
+setup scaffold paths through the DomainProfile boundary.
+
+Expected fallback:
+fallback-setup creates pyproject.toml and src/<package>/main.py, then uses
+setup-safe test -f checks such as test -f pyproject.toml so the phase can
+proceed. Python compilation remains a later deterministic verification gate.

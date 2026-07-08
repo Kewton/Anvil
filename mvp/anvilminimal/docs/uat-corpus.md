@@ -173,6 +173,18 @@ tests/corpus/apps/q1-post101-game-a-camelcase-collision
 tests/corpus/apps/q1-post101-content-b-invalid-semver
 ```
 
+Final multi-model harvests:
+
+```sh
+# Manual reduced fixtures from the final gemma4-cloud round:
+# - TOOL/GAME: multi-grep verify command reached an unsplit shell-control
+#   rejection at verifier lint/contract entry points.
+# - CLI: python-cli setup StepPlan lint exhaustion did not substitute the
+#   profile scaffold fallback.
+tests/corpus/apps/q1-final-multi-grep-shell-control
+tests/corpus/apps/q1-final-cli-scaffold-fallback
+```
+
 `cli_a` pins the model tendency to combine CSV fixture creation and program
 verification in one multi-line verify command with a file-writing redirect; the
 live unit fixture asserts this remains rejected with Write-tool remedy text.
