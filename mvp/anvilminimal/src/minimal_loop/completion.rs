@@ -811,6 +811,9 @@ pub(crate) fn compile_error_repair_guidance_with_root(
             if let Some(guidance) = duplicate_binding_repair_guidance(error) {
                 lines.push(guidance);
             }
+            if let Some(guidance) = postcss_plugins_key_repair_guidance(error) {
+                lines.push(guidance);
+            }
             lines.push(format!(
                 "You MUST modify {} using the edit tool; a reply without file edits fails this repair.",
                 error.path
@@ -911,6 +914,20 @@ fn typescript_duplicate_binding_message(message: &str) -> Option<String> {
         .contains("defined multiple times")
         .then(|| extract_first_quoted_symbol(message))
         .flatten()
+}
+
+fn postcss_plugins_key_repair_guidance(error: &CompileError) -> Option<String> {
+    let lower = error.message.to_ascii_lowercase();
+    if !(lower.contains("postcss")
+        && lower.contains("plugins")
+        && (lower.contains("must export") || lower.contains("export a")))
+    {
+        return None;
+    }
+    Some(
+        "PostCSS config-format remedy: make postcss.config.js export a plugins key using CommonJS, e.g. module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } }; or make the package coherently ESM with .mjs/package.json type module."
+            .to_string(),
+    )
 }
 
 fn compile_excerpt_source_line_numbers(excerpt: &str) -> Vec<usize> {
@@ -1955,6 +1972,27 @@ export default function Page() {\n\
             ),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn compile_repair_prompt_includes_postcss_plugins_key_remedy() {
+        let prompt = compile_repair_prompt_section(
+            &[CompileError {
+                path: "postcss.config.js".to_string(),
+                line: 1,
+                column: 1,
+                message: "Error: Your custom PostCSS configuration must export a `plugins` key."
+                    .to_string(),
+                excerpt: "Error: Your custom PostCSS configuration must export a `plugins` key."
+                    .to_string(),
+                symbol: None,
+                route_bound: None,
+            }],
+            CompileRepairPromptProtection::default(),
+        );
+
+        assert!(prompt.contains("PostCSS config-format remedy"), "{prompt}");
+        assert!(prompt.contains("module.exports = { plugins"), "{prompt}");
     }
 
     #[test]

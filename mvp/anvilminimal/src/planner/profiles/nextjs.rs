@@ -502,6 +502,17 @@ pub fn repair_tailwind_contract(root: &Path, goal: &str, reason: &str) -> anyhow
         )?;
         return Ok(changed);
     }
+    if reason.contains("PostCSS config uses ESM export default") {
+        changed |= write_file_if_changed(
+            &project_root.join("postcss.config.js"),
+            canonical_postcss_config(),
+        )?;
+        return Ok(changed);
+    }
+    if reason.contains("Tailwind config uses ESM export default") {
+        changed |= repair_tailwind_module_format(project_root)?;
+        return Ok(changed);
+    }
     if reason.contains("PostCSS config must include the Tailwind plugin")
         || reason.contains("PostCSS config must include autoprefixer")
     {
@@ -709,6 +720,10 @@ fn canonical_tailwind_config() -> &'static str {
     "import type { Config } from \"tailwindcss\";\n\nconst config: Config = {\n  content: [\n    \"./src/pages/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/components/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/app/**/*.{js,ts,jsx,tsx,mdx}\",\n  ],\n  theme: { extend: {} },\n  plugins: [],\n};\n\nexport default config;\n"
 }
 
+fn canonical_tailwind_config_cjs() -> &'static str {
+    "module.exports = {\n  content: [\n    \"./src/pages/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/components/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/app/**/*.{js,ts,jsx,tsx,mdx}\",\n  ],\n  theme: { extend: {} },\n  plugins: [],\n};\n"
+}
+
 fn canonical_package_json() -> &'static str {
     "{\n  \"name\": \"anvilminimal-nextjs-app\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \"dependencies\": {\n    \"next\": \"^14.2.0\",\n    \"react\": \"^18.3.0\",\n    \"react-dom\": \"^18.3.0\"\n  },\n  \"devDependencies\": {\n    \"@types/node\": \"^20.14.0\",\n    \"@types/react\": \"^18.3.0\",\n    \"@types/react-dom\": \"^18.3.0\",\n    \"autoprefixer\": \"^10.4.20\",\n    \"postcss\": \"^8.5.15\",\n    \"tailwindcss\": \"^3.4.19\",\n    \"typescript\": \"^5.5.0\"\n  },\n  \"scripts\": {\n    \"build\": \"next build\",\n    \"dev\": \"next dev -p 3011\",\n    \"start\": \"next start -p 3011\"\n  }\n}\n"
 }
@@ -843,6 +858,16 @@ fn repair_postcss_plugins(root: &Path) -> anyhow::Result<bool> {
     let repaired = insert_missing_postcss_plugins(&content, needs_tailwind, needs_autoprefixer)
         .unwrap_or_else(|| canonical_postcss_config().to_string());
     write_file_if_changed(&path, &repaired)
+}
+
+fn repair_tailwind_module_format(root: &Path) -> anyhow::Result<bool> {
+    let Some(path) = tailwind_config_paths(root)
+        .into_iter()
+        .find(|path| js_config_uses_esm_default_export(path))
+    else {
+        return Ok(false);
+    };
+    write_file_if_changed(&path, canonical_tailwind_config_cjs())
 }
 
 fn insert_missing_postcss_plugins(
@@ -1460,6 +1485,19 @@ fn tailwind_contract_failure(root: &Path, package: &Value) -> Option<String> {
     let Some(postcss_config) = postcss_config_path(root) else {
         return Some(tailwind_failure("PostCSS config file missing for Tailwind"));
     };
+    if let Some(reason) = module_format_contract_failure(
+        package,
+        &postcss_config,
+        "PostCSS config",
+        "use CommonJS module.exports or rename the config to .mjs/add package.json type module",
+    ) {
+        return Some(tailwind_failure(reason));
+    }
+    for tailwind_config in &tailwind_configs {
+        if let Some(reason) = tailwind_module_format_contract_failure(package, tailwind_config) {
+            return Some(tailwind_failure(reason));
+        }
+    }
     let postcss_config = std::fs::read_to_string(postcss_config).unwrap_or_default();
     let postcss_lower = postcss_config.to_ascii_lowercase();
     if !(postcss_lower.contains("tailwindcss") || postcss_lower.contains("@tailwindcss/postcss")) {
@@ -1610,6 +1648,57 @@ fn postcss_config_path(root: &Path) -> Option<PathBuf> {
     .iter()
     .map(|rel| root.join(rel))
     .find(|path| path.is_file())
+}
+
+fn module_format_contract_failure(
+    package: &Value,
+    path: &Path,
+    label: &str,
+    remedy: &str,
+) -> Option<String> {
+    if package_type_module(package) || !js_config_uses_esm_default_export(path) {
+        return None;
+    }
+    Some(format!(
+        "{label} uses ESM export default but package.json lacks \"type\":\"module\"; {remedy}"
+    ))
+}
+
+fn tailwind_module_format_contract_failure(package: &Value, path: &Path) -> Option<String> {
+    module_format_contract_failure(
+        package,
+        path,
+        "Tailwind config",
+        "use CommonJS module.exports or rename the config to .mjs/add package.json type module",
+    )
+}
+
+fn package_type_module(package: &Value) -> bool {
+    package
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "module")
+}
+
+fn js_config_uses_esm_default_export(path: &Path) -> bool {
+    if !is_common_js_module_boundary(path) {
+        return false;
+    }
+    std::fs::read_to_string(path).is_ok_and(|content| {
+        content
+            .lines()
+            .any(|line| line.trim_start().starts_with("export default"))
+    })
+}
+
+fn is_common_js_module_boundary(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name.ends_with(".mjs") || name.ends_with(".cjs") || name.ends_with(".ts") {
+        return false;
+    }
+    name.ends_with(".js") || matches!(name, "postcss.config" | "tailwind.config")
 }
 
 fn tailwind_directive_files(root: &Path) -> Vec<PathBuf> {
@@ -2342,6 +2431,39 @@ export default function Page() {
     }
 
     #[test]
+    fn nextjs_rejects_esm_postcss_js_without_module_type_and_repairs_to_cjs() {
+        let dir = complete_tailwind_app(
+            "export default { plugins: { tailwindcss: {}, autoprefixer: {} } };\n",
+        );
+        let report = verify_invariant(dir.path(), "3011");
+        let reason = report.primary_reason();
+        assert!(
+            reason.contains("PostCSS config uses ESM export default"),
+            "{reason}"
+        );
+
+        assert!(repair_tailwind_contract(dir.path(), "3011", &reason).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap(),
+            canonical_postcss_config()
+        );
+        assert!(verify_invariant(dir.path(), "3011").is_pass());
+    }
+
+    #[test]
+    fn nextjs_allows_esm_postcss_mjs_config() {
+        let dir = complete_tailwind_app(canonical_postcss_config());
+        std::fs::remove_file(dir.path().join("postcss.config.js")).unwrap();
+        std::fs::write(
+            dir.path().join("postcss.config.mjs"),
+            "export default { plugins: { tailwindcss: {}, autoprefixer: {} } };\n",
+        )
+        .unwrap();
+
+        assert!(verify_invariant(dir.path(), "3011").is_pass());
+    }
+
+    #[test]
     fn nextjs_rejects_tailwind_without_autoprefixer_dependency() {
         let dir = complete_app();
         std::fs::write(
@@ -2596,7 +2718,7 @@ export default function Page() {
         let dir = complete_tailwind_app("export default [require('tailwindcss')];\n");
         let report = verify_invariant(dir.path(), "3011");
         let reason = report.primary_reason();
-        assert!(reason.contains("PostCSS config must include autoprefixer"));
+        assert!(reason.contains("PostCSS config uses ESM export default"));
 
         assert!(repair_tailwind_contract(dir.path(), "3011", &reason).unwrap());
         assert_eq!(
