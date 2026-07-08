@@ -161,6 +161,43 @@ Tool schema reminder:\n\
     )
 }
 
+pub fn build_compile_regeneration_prompt_with_context(
+    step_id: &str,
+    report: &VerificationReport,
+    context: &RepairContext,
+    target_path: &str,
+) -> String {
+    let compile_errors = compile_repair_prompt_section_with_root(
+        context.workspace_root.as_deref(),
+        &report.compile_errors,
+        CompileRepairPromptProtection {
+            reanchored_retry: true,
+            narrow_no_snapshot_retry: context.compile_narrow_no_snapshot_retry,
+        },
+    );
+    let current_content = context
+        .workspace_root
+        .as_deref()
+        .and_then(|root| std::fs::read_to_string(root.join(target_path)).ok())
+        .unwrap_or_default();
+    format!(
+        "Repair session mode: compact regeneration.\n\
+Compile-error regeneration for step `{step_id}`.\n\n\
+Compile error frames and remedies:\n\
+{compile_errors}\n\n\
+Current content of {target_path}:\n\
+```tsx\n\
+{current_content}\n\
+```\n\n\
+Regeneration mandate:\n\
+- This is generation, not incremental editing.\n\
+- Write the complete corrected file via the Write tool (full content, one file only): {target_path}.\n\
+- Do not modify any other file.\n\
+- Preserve the user's app intent and keep caller/callee contracts consistent with the definition context above.\n\
+- Stop immediately after the Write tool call."
+    )
+}
+
 pub fn save_repair_report(
     root: &Path,
     step_id: &str,

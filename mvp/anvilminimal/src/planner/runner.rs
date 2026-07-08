@@ -42,7 +42,7 @@ use crate::minimal_loop::interaction_probe::{
 };
 use crate::minimal_loop::loop_run::{
     ContractEnforcement, RunSessionError, RunSessionOptions, RunSessionOutcome, RunSessionStepKind,
-    extract_requested_artifact_paths, run_session_with_outcome_with_options,
+    RunStopReason, extract_requested_artifact_paths, run_session_with_outcome_with_options,
 };
 use crate::minimal_loop::reachability::{
     RepairReachability, assess_repair_reachability, reachability_failure_kind,
@@ -67,9 +67,10 @@ use crate::planner::profile::{
 };
 use crate::planner::repair::{
     RecoveryHandoff, RepairContext, build_compact_compile_repair_prompt_with_context,
-    build_repair_prompt_with_context, save_recovery_ultra_plan, save_repair_report_with_context,
-    save_ultra_recovery_prompt, suggested_recovery_ultra_plan_command,
-    suggested_ultra_recovery_command, workspace_relative_handoff_path,
+    build_compile_regeneration_prompt_with_context, build_repair_prompt_with_context,
+    save_recovery_ultra_plan, save_repair_report_with_context, save_ultra_recovery_prompt,
+    suggested_recovery_ultra_plan_command, suggested_ultra_recovery_command,
+    workspace_relative_handoff_path,
 };
 use crate::planner::sanitizer::{SanitizerReport, sanitize_step_plan_against_policy};
 use crate::planner::signals;
@@ -2265,18 +2266,43 @@ fn run_step(
                     )
                 }
             };
-            let repair = repair_result.map_err(|err| {
-                let message = err.to_string();
-                apply_session_error_observations(&mut outcome, &err, &message);
-                outcome.primary_failure = Some(message.clone());
-                outcome.stop_reason = Some("repair_turn_error".to_string());
-                outcome.repair_attempts = attempt;
-                outcome.partial = true;
-                StepRunError {
-                    message,
-                    outcome: outcome.clone(),
+            let repair = match repair_result {
+                Ok(repair) => repair,
+                Err(err)
+                    if repair_session_mode == RepairSessionMode::Compact
+                        && !current_report.compile_errors.is_empty()
+                        && err
+                            .to_string()
+                            .contains("missing tool call for action prompt") =>
+                {
+                    RunSessionOutcome {
+                        final_text: err.to_string(),
+                        stop_reason: RunStopReason::AssistantFinal,
+                        changed_paths: Vec::new(),
+                        iterations: 0,
+                        tool_calls: 0,
+                        missing_required_paths: Vec::new(),
+                        missing_capabilities: Vec::new(),
+                        missing_evidence: Vec::new(),
+                        missing_obligations: Vec::new(),
+                        verify_attempts: 0,
+                        last_blocking_reason: Some(err.to_string()),
+                        last_provider_error: None,
+                    }
                 }
-            })?;
+                Err(err) => {
+                    let message = err.to_string();
+                    apply_session_error_observations(&mut outcome, &err, &message);
+                    outcome.primary_failure = Some(message.clone());
+                    outcome.stop_reason = Some("repair_turn_error".to_string());
+                    outcome.repair_attempts = attempt;
+                    outcome.partial = true;
+                    return Err(StepRunError {
+                        message,
+                        outcome: outcome.clone(),
+                    });
+                }
+            };
             outcome.repair_attempts = attempt;
             repair_stop_reason = Some(format!("{:?}", repair.stop_reason));
             let changed_paths_before_repair = context.changed_files.clone();
@@ -2463,6 +2489,233 @@ fn run_step(
                 outcome.primary_failure = None;
                 outcome.stop_reason = repair_stop_reason.clone();
                 return Ok(outcome);
+            }
+            if compile_repair_no_change && repair_session_mode == RepairSessionMode::Compact {
+                match single_compile_regeneration_target(&retry) {
+                    Ok(target_path) => {
+                        let Some(target_abs) =
+                            writable_workspace_source_path(&config.workspace_root, &target_path)
+                        else {
+                            emit_compile_regeneration_event(
+                                config,
+                                Some(&step.id),
+                                "step_repair",
+                                false,
+                                false,
+                                0,
+                                Some(&target_path),
+                                "target_path_rejected",
+                                retry.compile_errors.len(),
+                                retry.compile_errors.len(),
+                                &[],
+                            );
+                            current_report = retry;
+                            terminal_repair_failure_kind =
+                                Some("compile_repair_no_source_change".to_string());
+                            break;
+                        };
+                        let before_content = match std::fs::read(&target_abs) {
+                            Ok(content) => content,
+                            Err(err) => {
+                                emit_compile_regeneration_event(
+                                    config,
+                                    Some(&step.id),
+                                    "step_repair",
+                                    false,
+                                    false,
+                                    0,
+                                    Some(&target_path),
+                                    &format!("snapshot_read_error:{err}"),
+                                    retry.compile_errors.len(),
+                                    retry.compile_errors.len(),
+                                    &[],
+                                );
+                                current_report = retry;
+                                terminal_repair_failure_kind =
+                                    Some("compile_repair_no_source_change".to_string());
+                                break;
+                            }
+                        };
+                        let before_error_count = retry.compile_errors.len();
+                        let regeneration_prompt = build_compile_regeneration_prompt_with_context(
+                            &step.id,
+                            &retry,
+                            &context,
+                            &target_path,
+                        );
+                        let mut regeneration_session = SessionSnapshot::new();
+                        let regeneration = run_session_with_outcome_with_options(
+                            client,
+                            &mut regeneration_session,
+                            &regeneration_prompt,
+                            std::slice::from_ref(&target_path),
+                            &repair_config,
+                            ui,
+                            step_options.clone(),
+                        );
+                        let regeneration = match regeneration {
+                            Ok(regeneration) => regeneration,
+                            Err(err) => {
+                                let _ = std::fs::write(&target_abs, &before_content);
+                                emit_compile_regeneration_event(
+                                    config,
+                                    Some(&step.id),
+                                    "step_repair",
+                                    true,
+                                    false,
+                                    0,
+                                    Some(&target_path),
+                                    &format!(
+                                        "regeneration_turn_error:{}",
+                                        eval_events::body_snippet(&err.to_string())
+                                    ),
+                                    before_error_count,
+                                    before_error_count,
+                                    &[],
+                                );
+                                current_report = retry;
+                                if compile_repair_no_change && no_change_repairs >= 2 {
+                                    terminal_repair_failure_kind =
+                                        Some("compile_repair_no_source_change".to_string());
+                                    break;
+                                }
+                                current_report_signature = retry_signature;
+                                continue;
+                            }
+                        };
+                        let mut regeneration_changed_paths = regeneration.changed_paths.clone();
+                        regeneration_changed_paths.sort();
+                        regeneration_changed_paths.dedup();
+                        let one_file_write =
+                            changed_paths_only_target(&regeneration_changed_paths, &target_path);
+                        let (regenerated_report, regeneration_lifecycles) =
+                            verify_step_with_profile_setup_observed_with_offline_and_events(
+                                &config.workspace_root,
+                                &runtime_step,
+                                Some(&config.profile),
+                                setup_authority,
+                                config.offline,
+                                config.eval_events_path.as_deref(),
+                            );
+                        apply_runtime_command_normalizations(
+                            &mut runtime_step,
+                            &regenerated_report,
+                        );
+                        context.verify_commands = runtime_step.verify.clone();
+                        for lifecycle in &regeneration_lifecycles {
+                            emit_dependency_build_lifecycle(
+                                config.eval_events_path.as_deref(),
+                                mode,
+                                Some(&step.id),
+                                lifecycle,
+                            );
+                        }
+                        let after_error_count = regenerated_report.compile_errors.len();
+                        let error_delta = before_error_count as i64 - after_error_count as i64;
+                        if one_file_write && error_delta > 0 {
+                            emit_compile_regeneration_event(
+                                config,
+                                Some(&step.id),
+                                "step_repair",
+                                true,
+                                true,
+                                error_delta,
+                                Some(&target_path),
+                                "accepted",
+                                before_error_count,
+                                after_error_count,
+                                &regeneration_changed_paths,
+                            );
+                            merge_changed_files(&mut context, std::slice::from_ref(&target_path));
+                            merge_unique_strings(
+                                &mut outcome.changed_paths,
+                                std::slice::from_ref(&target_path),
+                            );
+                            merge_unique_strings(
+                                &mut outcome.repair_changed_paths,
+                                std::slice::from_ref(&target_path),
+                            );
+                            if regenerated_report.is_pass() {
+                                if production_build_lifecycle_passed(&regeneration_lifecycles) {
+                                    snapshot_last_known_good_sources(
+                                        config,
+                                        mode,
+                                        Some(&step.id),
+                                        &config.profile,
+                                        &plan.goal,
+                                        &step.expected_paths,
+                                    );
+                                }
+                                outcome.primary_failure = None;
+                                outcome.stop_reason =
+                                    Some("compile_regeneration_applied".to_string());
+                                return Ok(outcome);
+                            }
+                            let regenerated_reachability = assess_repair_reachability(
+                                &regenerated_report,
+                                None,
+                                setup_authority,
+                                config.offline,
+                            );
+                            if !regenerated_reachability.reachable {
+                                terminal_repair_failure_kind = Some(
+                                    reachability_failure_kind(&regenerated_reachability)
+                                        .to_string(),
+                                );
+                                terminal_blocked_requirements =
+                                    regenerated_reachability.blocked_requirements.clone();
+                                context.progress_warning =
+                                    Some(reachability_recovery_reason(&regenerated_reachability));
+                                current_report = regenerated_report;
+                                emit_repair_unreachable(
+                                    config,
+                                    mode,
+                                    &step.id,
+                                    classify_repair_target(&current_report).as_str(),
+                                    &current_report.primary_reason(),
+                                    &regenerated_reachability,
+                                );
+                                break;
+                            }
+                            current_report_signature =
+                                verification_report_signature(&regenerated_report);
+                            previous_missing = regenerated_report.missing_paths.len();
+                            current_report = regenerated_report;
+                            continue;
+                        }
+                        let _ = std::fs::write(&target_abs, &before_content);
+                        emit_compile_regeneration_event(
+                            config,
+                            Some(&step.id),
+                            "step_repair",
+                            true,
+                            false,
+                            error_delta,
+                            Some(&target_path),
+                            if one_file_write {
+                                "compile_error_count_not_decreased"
+                            } else {
+                                "changed_paths_not_single_target"
+                            },
+                            before_error_count,
+                            after_error_count,
+                            &regeneration_changed_paths,
+                        );
+                    }
+                    Err(reason) => emit_compile_regeneration_event(
+                        config,
+                        Some(&step.id),
+                        "step_repair",
+                        false,
+                        false,
+                        0,
+                        None,
+                        &reason,
+                        retry.compile_errors.len(),
+                        retry.compile_errors.len(),
+                        &[],
+                    ),
+                }
             }
             current_reachability = retry_reachability;
             if !current_reachability.reachable {
@@ -12390,6 +12643,65 @@ fn compile_error_paths(errors: &[CompileError]) -> Vec<String> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+fn single_compile_regeneration_target(report: &VerificationReport) -> Result<String, String> {
+    if report.compile_errors.is_empty() {
+        return Err("no_compile_errors".to_string());
+    }
+    let paths = report
+        .compile_errors
+        .iter()
+        .filter_map(|error| safe_source_rel_path(&error.path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    match paths.as_slice() {
+        [path] => Ok(path.clone()),
+        [] => Err("no_safe_source_target".to_string()),
+        _ => Err("multi_file_compile_failure".to_string()),
+    }
+}
+
+fn changed_paths_only_target(changed_paths: &[String], target_path: &str) -> bool {
+    let changed = changed_paths
+        .iter()
+        .filter_map(|path| safe_source_rel_path(path))
+        .collect::<BTreeSet<_>>();
+    changed.len() == 1 && changed.contains(target_path)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_compile_regeneration_event(
+    config: &Config,
+    step_id: Option<&str>,
+    lifecycle_stage: &str,
+    fired: bool,
+    accepted: bool,
+    error_delta: i64,
+    target_path: Option<&str>,
+    reason: &str,
+    before_errors: usize,
+    after_errors: usize,
+    changed_paths: &[String],
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "repair_regeneration",
+            "step_id": step_id.unwrap_or_default(),
+            "lifecycle_stage": lifecycle_stage,
+            "fired": fired,
+            "accepted": accepted,
+            "error_delta": error_delta,
+            "target_path": target_path.unwrap_or_default(),
+            "reason": reason,
+            "before_compile_error_count": before_errors,
+            "after_compile_error_count": after_errors,
+            "changed_paths": changed_paths,
+            "repair_session_mode": if fired { "compact_regeneration" } else { "" },
+        }),
+    );
 }
 
 #[derive(Debug, Clone, Default)]
@@ -22720,6 +23032,73 @@ export default function Page() {
         }
     }
 
+    struct RegenerationCompileRepairClient {
+        messages: Vec<Vec<ConversationMessage>>,
+        initial_done: bool,
+        appended_repair_calls: usize,
+        compact_repair_calls: usize,
+        regeneration_calls: usize,
+        regeneration_reply: AssistantReply,
+    }
+
+    impl RegenerationCompileRepairClient {
+        fn new(regeneration_reply: AssistantReply) -> Self {
+            Self {
+                messages: Vec::new(),
+                initial_done: false,
+                appended_repair_calls: 0,
+                compact_repair_calls: 0,
+                regeneration_calls: 0,
+                regeneration_reply,
+            }
+        }
+    }
+
+    impl ChatClient for RegenerationCompileRepairClient {
+        fn label(&self) -> &str {
+            "regeneration-aware"
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            messages: &[ConversationMessage],
+            _tools: &[ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            self.messages.push(messages.to_vec());
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !self.initial_done {
+                self.initial_done = true;
+                return Ok(api_mismatch_initial_reply(3011));
+            }
+            if prompt.contains("Repair session mode: compact regeneration") {
+                self.regeneration_calls += 1;
+                return Ok(self.regeneration_reply.clone());
+            }
+            if prompt.contains("Repair session mode: compact") {
+                self.compact_repair_calls += 1;
+                return Ok(AssistantReply::text(
+                    "I understand the compile frame, but no edit is needed.",
+                ));
+            }
+            if prompt.contains("Property 'onStateChange'") {
+                self.appended_repair_calls += 1;
+                if self.appended_repair_calls == 1 {
+                    return Ok(api_mismatch_read_only_reply());
+                }
+                return Ok(AssistantReply::text(
+                    "The failing source was inspected, but no edit is needed.",
+                ));
+            }
+            anyhow::bail!("regeneration-aware fake client received unexpected prompt")
+        }
+    }
+
     struct FlakyClient {
         replies: Vec<AssistantReply>,
         messages: Vec<Vec<ConversationMessage>>,
@@ -24778,6 +25157,149 @@ exit 2\n",
 
     #[test]
     #[cfg(unix)]
+    fn step_verify_compile_regeneration_recovers_after_compact_zero_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/regeneration/events.jsonl");
+        write_api_mismatch_build_shim(dir.path());
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let mut execution = RegenerationCompileRepairClient::new(api_mismatch_poll_fix_reply());
+
+        let result =
+            run_step_plan(&mut execution, &api_mismatch_step_plan(), &cfg).unwrap_or_else(|err| {
+                let event_text = std::fs::read_to_string(&events).unwrap_or_default();
+                panic!("{err}\nEvents:\n{event_text}");
+            });
+
+        assert!(result.contains("plan-run complete"), "{result}");
+        assert_eq!(execution.regeneration_calls, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/SpaceInvadersGame.tsx")).unwrap(),
+            api_mismatch_poll_fixed_game_source()
+        );
+        let prompts = execution
+            .messages
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>();
+        let regeneration_prompt = prompts
+            .iter()
+            .find(|prompt| prompt.contains("Repair session mode: compact regeneration"))
+            .expect("regeneration prompt");
+        assert!(
+            regeneration_prompt.contains(
+                "Write the complete corrected file via the Write tool (full content, one file only): src/app/SpaceInvadersGame.tsx"
+            ),
+            "{regeneration_prompt}"
+        );
+        assert!(
+            regeneration_prompt.contains("Current content of src/app/SpaceInvadersGame.tsx"),
+            "{regeneration_prompt}"
+        );
+        assert!(
+            regeneration_prompt.contains(
+                "Imported definition context for `SpaceInvadersEngine` from src/lib/game-engine.ts:"
+            ),
+            "{regeneration_prompt}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"event\":\"repair_regeneration\""),
+            "{event_text}"
+        );
+        assert!(event_text.contains("\"fired\":true"), "{event_text}");
+        assert!(event_text.contains("\"accepted\":true"), "{event_text}");
+        assert!(event_text.contains("\"error_delta\":1"), "{event_text}");
+        assert!(
+            event_text.contains("\"target_path\":\"src/app/SpaceInvadersGame.tsx\""),
+            "{event_text}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn step_verify_compile_regeneration_restores_snapshot_when_not_improved() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir
+            .path()
+            .join(".anvil/runs/regeneration-reject/events.jsonl");
+        write_api_mismatch_build_shim(dir.path());
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let mut execution = RegenerationCompileRepairClient::new(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({"path":"src/app/SpaceInvadersGame.tsx","content":api_mismatch_broken_game_source()}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        });
+
+        let err = run_step_plan(&mut execution, &api_mismatch_step_plan(), &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("compile_repair_no_source_change"), "{err}");
+        assert_eq!(execution.regeneration_calls, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/SpaceInvadersGame.tsx")).unwrap(),
+            api_mismatch_broken_game_source()
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"event\":\"repair_regeneration\""),
+            "{event_text}"
+        );
+        assert!(event_text.contains("\"fired\":true"), "{event_text}");
+        assert!(event_text.contains("\"accepted\":false"), "{event_text}");
+        assert!(event_text.contains("\"error_delta\":0"), "{event_text}");
+        assert!(
+            event_text.contains("\"reason\":\"compile_error_count_not_decreased\""),
+            "{event_text}"
+        );
+    }
+
+    #[test]
+    fn compile_regeneration_target_skips_multi_file_failures() {
+        let mut report = VerificationReport::pass();
+        report.compile_errors = vec![
+            CompileError {
+                path: "src/app/page.tsx".to_string(),
+                line: 1,
+                column: 1,
+                message: "Type error: first".to_string(),
+                excerpt: String::new(),
+                symbol: None,
+                route_bound: Some(true),
+            },
+            CompileError {
+                path: "src/app/game.ts".to_string(),
+                line: 2,
+                column: 1,
+                message: "Type error: second".to_string(),
+                excerpt: String::new(),
+                symbol: None,
+                route_bound: Some(true),
+            },
+        ];
+
+        assert_eq!(
+            single_compile_regeneration_target(&report).unwrap_err(),
+            "multi_file_compile_failure"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn step_verify_compile_zero_edit_reanchors_then_reports_no_source_change() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir
@@ -24977,7 +25499,13 @@ exit 2\n",
             AssistantReply::text("The compile error remains unchanged again."),
             bash_true_reply(),
             AssistantReply::text("Continue after rollback."),
-            write_static_page_reply(static_good_page_source()),
+            write_static_page_reply(static_broken_page_source()),
+            read_static_page_reply(),
+            AssistantReply::text("phase three inspected after rollback."),
+            read_static_page_reply(),
+            AssistantReply::text("phase three verified rollback state."),
+            read_static_page_reply(),
+            AssistantReply::text("phase three preserved recovered page."),
             read_static_page_reply(),
             AssistantReply::text("phase three complete"),
         ]);
