@@ -11839,25 +11839,22 @@ fn command_list_summary(commands: &[String]) -> String {
 }
 
 fn fallback_step_plan_for_setup_phase(goal: &str, config: &Config) -> Option<StepPlan> {
-    if !known_profile_for_setup_fallback(&config.profile) || !looks_like_setup_phase_goal(goal) {
+    let profile = canonical_profile_name(&config.profile);
+    if !known_profile_for_setup_fallback(&profile) || !looks_like_setup_phase_goal(goal) {
         return None;
     }
-    let expected_paths = profile_setup_scaffold_paths(&config.workspace_root, &config.profile);
+    let expected_paths = profile_setup_scaffold_paths(&config.workspace_root, &profile);
     if expected_paths.is_empty() {
         return None;
     }
-    let verify = expected_paths
-        .iter()
-        .map(|path| format!("test -f {path}"))
-        .filter(|command| crate::planner::verify::validate_verify_command(command).is_ok())
-        .collect::<Vec<_>>();
+    let verify = fallback_setup_verify_commands(&expected_paths);
     let plan = StepPlan {
         goal: goal.to_string(),
         steps: vec![PlanStep {
             id: "fallback-setup".to_string(),
             kind: "setup".to_string(),
             expected_result: "pass".to_string(),
-            instruction: fallback_setup_instruction(&config.profile, goal, &expected_paths),
+            instruction: fallback_setup_instruction(&profile, goal, &expected_paths),
             expected_paths,
             verify,
         }],
@@ -11866,7 +11863,26 @@ fn fallback_step_plan_for_setup_phase(goal: &str, config: &Config) -> Option<Ste
     lint_report.is_pass().then_some(plan)
 }
 
+fn fallback_setup_verify_commands(expected_paths: &[String]) -> Vec<String> {
+    expected_paths
+        .iter()
+        .map(|path| format!("test -f {path}"))
+        .filter(|command| crate::planner::verify::validate_verify_command(command).is_ok())
+        .collect::<Vec<_>>()
+}
+
 fn fallback_setup_instruction(profile: &str, goal: &str, expected_paths: &[String]) -> String {
+    if profile == "python-cli" {
+        return format!(
+            "Create one coherent python-cli package scaffold for this setup phase: {goal}. \
+             Required files: {paths}. \
+             Coherence requirements: pyproject.toml declares the package metadata; \
+             src/<package>/main.py implements a CLI that reads stdin or argv and prints non-empty output that changes when input changes; \
+             keep dependency setup separate from verification and verify syntax with python -m compileall -q src.",
+            goal = compact_single_line(goal),
+            paths = expected_paths.join(", "),
+        );
+    }
     format!(
         "Create one coherent {profile} App Router scaffold for this setup phase: {goal}. \
          Required files: {paths}. \
@@ -11880,7 +11896,7 @@ fn fallback_setup_instruction(profile: &str, goal: &str, expected_paths: &[Strin
 }
 
 fn known_profile_for_setup_fallback(profile: &str) -> bool {
-    matches!(profile, "nextjs" | "next-js" | "next.js")
+    matches!(profile, "nextjs" | "python-cli")
 }
 
 fn looks_like_setup_phase_goal(goal: &str) -> bool {
@@ -15247,6 +15263,60 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
         );
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"event\":\"planner_fallback_plan\""));
+    }
+
+    #[test]
+    fn setup_phase_fallback_generates_python_cli_scaffold_after_lint_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "python-cli".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Original ultra goal: CSV processor CLI\n\
+Profile: python-cli\n\
+Style: default\n\
+Intent: create\n\
+Phase id: cli-setup\n\
+Phase task: Set up the Python CLI package scaffold";
+        let bad_plan = r#"{"goal":"bad setup","steps":[{"id":"bad","kind":"setup","expected_result":"pass","instruction":"Create pyproject.toml","expected_paths":["pyproject.toml"],"verify":["npm run build | grep error"]}]}"#;
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(bad_plan),
+            AssistantReply::text(bad_plan),
+            AssistantReply::text(bad_plan),
+        ]);
+
+        let plan = generate_step_plan(&mut planner, goal, &cfg).unwrap();
+
+        let expected_paths = profile_setup_scaffold_paths(dir.path(), "python-cli");
+        assert_eq!(planner.messages.len(), 3);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].kind, "setup");
+        assert_eq!(plan.steps[0].expected_paths, expected_paths);
+        assert_eq!(
+            plan.steps[0].verify,
+            plan.steps[0]
+                .expected_paths
+                .iter()
+                .map(|path| format!("test -f {path}"))
+                .collect::<Vec<_>>()
+        );
+        let instruction = &plan.steps[0].instruction;
+        assert!(
+            instruction.contains("python-cli package scaffold"),
+            "{instruction}"
+        );
+        assert!(instruction.contains("pyproject.toml"), "{instruction}");
+        assert!(
+            instruction.contains("python -m compileall -q src"),
+            "{instruction}"
+        );
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"planner_fallback_plan\""));
+        assert!(event_text.contains("\"profile\":\"python-cli\""));
     }
 
     #[test]
