@@ -12590,10 +12590,10 @@ fn plan_generation_system_prompt() -> String {
 }
 
 fn build_step_plan_user_prompt(goal: &str, config: &Config) -> String {
-    let mut prompt = format!("Create a step plan for this task:\n{goal}");
+    let mut prompt = String::new();
     let expected_paths = profile_expected_paths(&config.workspace_root, &config.profile, goal);
     if !expected_paths.is_empty() {
-        prompt.push_str("\n\nRequired final artifacts:\n");
+        prompt.push_str("Required final artifacts:\n");
         for path in expected_paths {
             prompt.push_str("- ");
             prompt.push_str(&path);
@@ -12608,7 +12608,10 @@ fn build_step_plan_user_prompt(goal: &str, config: &Config) -> String {
             .unwrap_or("")
             .is_empty()
     {
-        prompt.push_str("\nProfile verification expectations:\n");
+        if !prompt.is_empty() {
+            prompt.push('\n');
+        }
+        prompt.push_str("Profile verification expectations:\n");
         if !expectations.preferred_verify.is_empty() {
             prompt.push_str("- Preferred deterministic verify commands:\n");
             for command in expectations.preferred_verify {
@@ -12632,7 +12635,10 @@ fn build_step_plan_user_prompt(goal: &str, config: &Config) -> String {
         }
     }
     if is_ultra_phase_step_goal(goal) {
-        prompt.push_str("\nUltra phase hard constraints:\n");
+        if !prompt.is_empty() {
+            prompt.push('\n');
+        }
+        prompt.push_str("Ultra phase hard constraints:\n");
         prompt.push_str("- StepPlan.goal must be ONE short sentence naming the phase outcome; never copy the phase context, unmet-requirements, or adherence lists into goal -- details belong in step instructions.\n");
         prompt.push_str("- Do not put dev-server startup, page-load probes, curl localhost, or dependency installation in verify.\n");
         prompt.push_str("- Browser readiness is verified by the runtime at final acceptance.\n");
@@ -12644,6 +12650,11 @@ fn build_step_plan_user_prompt(goal: &str, config: &Config) -> String {
         prompt.push_str("  - npm run dev\n");
         prompt.push_str("  - curl http://localhost:3011\n");
     }
+    if !prompt.is_empty() {
+        prompt.push('\n');
+    }
+    prompt.push_str("Create a step plan for this task:\n");
+    prompt.push_str(goal);
     prompt
 }
 
@@ -12751,12 +12762,6 @@ fn build_step_prompt(_plan: &StepPlan, step: &PlanStep, context: &StepPromptCont
     prompt.push_str("Execute exactly one StepPlan step.\n\n");
     prompt.push_str("Overall goal:\n");
     prompt.push_str(&context.overall_goal);
-    prompt.push_str("\n\nCurrent step id:\n");
-    prompt.push_str(&step.id);
-    prompt.push_str("\n\nCurrent step kind:\n");
-    prompt.push_str(&step.kind);
-    prompt.push_str("\n\nCurrent step instruction:\n");
-    prompt.push_str(&step.instruction);
 
     prompt.push_str("\n\nRequired final artifacts:\n");
     append_bullets_or_none(&mut prompt, &context.required_final_artifacts);
@@ -12766,6 +12771,24 @@ fn build_step_prompt(_plan: &StepPlan, step: &PlanStep, context: &StepPromptCont
 
     prompt.push_str("\n\nRequired final evidence:\n");
     append_bullets_or_none(&mut prompt, &context.final_required_evidence);
+
+    prompt.push_str(
+        "\n\nStep execution rules:\n\
+- Work only on the current step unless a prior artifact is required to verify this step.\n\
+- Prefer Write/Edit/MultiEdit for declared expected paths.\n\
+- If this step has verification commands, use them as the deterministic success contract.\n\
+- If verification fails, make a bounded step-local repair and re-check the declared contract.\n\
+- For Next.js/App Router work, keep a single route-bound implementation; do not leave capability components unimported.\n\
+- Do not claim the plan is complete until this step's expected paths and verification contract are satisfied.\n\
+- Report an explicit blocker only when the blocker cannot be resolved locally.",
+    );
+
+    prompt.push_str("\n\nCurrent step id:\n");
+    prompt.push_str(&step.id);
+    prompt.push_str("\n\nCurrent step kind:\n");
+    prompt.push_str(&step.kind);
+    prompt.push_str("\n\nCurrent step instruction:\n");
+    prompt.push_str(&step.instruction);
 
     prompt.push_str("\n\nArtifacts available from previous steps:\n");
     append_bullets_or_none(&mut prompt, &context.prior_expected_paths);
@@ -12778,17 +12801,6 @@ fn build_step_prompt(_plan: &StepPlan, step: &PlanStep, context: &StepPromptCont
 
     prompt.push_str("\n\nExpected verification result:\n");
     prompt.push_str(step_expected_result(step));
-
-    prompt.push_str(
-        "\n\nStep execution rules:\n\
-- Work only on the current step unless a prior artifact is required to verify this step.\n\
-- Prefer Write/Edit/MultiEdit for declared expected paths.\n\
-- If this step has verification commands, use them as the deterministic success contract.\n\
-- If verification fails, make a bounded step-local repair and re-check the declared contract.\n\
-- For Next.js/App Router work, keep a single route-bound implementation; do not leave capability components unimported.\n\
-- Do not claim the plan is complete until this step's expected paths and verification contract are satisfied.\n\
-- Report an explicit blocker only when the blocker cannot be resolved locally.",
-    );
     prompt
 }
 
@@ -12934,7 +12946,12 @@ fn ultra_phase_prompt(
         ""
     };
     format!(
-        "Original ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\n{}\n\nProfile generation rules:\n{}\nProfile runtime contract:\n{}\n{}Deterministic verification preference:\n{}\n{}{}{}",
+        "Profile generation rules:\n{}\nProfile runtime contract:\n{}\n{}Deterministic verification preference:\n{}\n{}\n\nOriginal ultra goal: {}\nProfile: {}\nStyle: {}\nIntent: {}\nPhase id: {}\nPhase task: {}\n\nWorkspace snapshot:\n{}\n\n{}\n\n{}\n\n{}{}{}",
+        generation_rules,
+        runtime_contract,
+        route_bound_constraint,
+        preferred_verify,
+        required,
         plan.goal,
         plan.profile,
         plan.style,
@@ -12945,11 +12962,6 @@ fn ultra_phase_prompt(
         prior_context,
         unmet_final_requirements,
         requested_features,
-        generation_rules,
-        runtime_contract,
-        route_bound_constraint,
-        preferred_verify,
-        required,
         capability_section,
         evidence_section
     )
@@ -13411,12 +13423,13 @@ fn final_acceptance_repair_prompt(
     );
     format!(
         "Repair the final acceptance failure for the current ultra run.\n\n\
+Bounded repair rules:\n\
+- This is a bounded final acceptance repair, not a new planning cycle.\n\
+- Repair the concrete missing or failed acceptance obligations without weakening verification, package scripts, or profile contracts.\n\
+- If a scaffold exists, continue task-specific implementation instead of treating scaffold/build-only output as complete.\n\
+- Prefer the smallest necessary file changes, then stop.\n\n\
 Original ultra goal:\n{goal}\n\n\
 Profile: {profile}\nIntent: {intent}\n\n\
-Final acceptance failure:\n\
-- primary reason: {primary_reason}\n\
-- repair target: {repair_target}\n\
-- attempt: {attempt}/{max_attempts}\n\n\
 Pending capability evidence remedies:\n{pending_evidence_guidance}\n\n\
 Missing paths:\n{missing}\n\n\
 Dependency failures:\n{dependencies}\n\n\
@@ -13428,11 +13441,10 @@ Profile failures:\n{profile_failures}\n\n\
 {adherence_guidance}\
 Expected paths to preserve or create:\n{expected}\n\n\
 {prior_context}\n\n\
-Bounded repair rules:\n\
-- This is a bounded final acceptance repair, not a new planning cycle.\n\
-- Repair the concrete missing or failed acceptance obligations without weakening verification, package scripts, or profile contracts.\n\
-- If a scaffold exists, continue task-specific implementation instead of treating scaffold/build-only output as complete.\n\
-- Prefer the smallest necessary file changes, then stop.",
+Final acceptance failure:\n\
+- primary reason: {primary_reason}\n\
+- repair target: {repair_target}\n\
+- attempt: {attempt}/{max_attempts}",
         goal = plan.goal,
         profile = plan.profile,
         intent = plan.intent,
@@ -14332,6 +14344,14 @@ mod tests {
     use crate::state::ConversationMessage;
     use crate::tools::registry::ToolSpec;
 
+    fn common_prefix(left: &str, right: &str) -> String {
+        left.chars()
+            .zip(right.chars())
+            .take_while(|(left, right)| left == right)
+            .map(|(left, _)| left)
+            .collect()
+    }
+
     #[test]
     fn dev_server_marker_with_contamination_is_env_node_env_conflict() {
         let status = run_ignored_runner_harness(
@@ -14933,6 +14953,192 @@ mod tests {
         assert!(prompt.contains("Expected verification result:"));
         assert!(prompt.contains("Artifacts available from previous steps:"));
         assert!(prompt.contains("bounded step-local repair"));
+    }
+
+    #[test]
+    fn step_plan_prompt_prefix_keeps_profile_guidance_before_phase_goal() {
+        let mut cfg = config(PathBuf::from("/tmp/work"));
+        cfg.profile = "nextjs".to_string();
+        let first = build_step_plan_user_prompt(
+            "Original ultra goal: Build a game on port 3011\nProfile: nextjs\nStyle: default\nIntent: create\nPhase id: setup\nPhase task: Scaffold the app",
+            &cfg,
+        );
+        let second = build_step_plan_user_prompt(
+            "Original ultra goal: Build a game on port 3011\nProfile: nextjs\nStyle: default\nIntent: create\nPhase id: gameplay\nPhase task: Implement the gameplay",
+            &cfg,
+        );
+
+        let prefix = common_prefix(&first, &second);
+
+        assert!(prefix.contains("Required final artifacts:"), "{prefix}");
+        assert!(
+            prefix.contains("Profile verification expectations:"),
+            "{prefix}"
+        );
+        assert!(prefix.contains("Ultra phase hard constraints:"), "{prefix}");
+        assert!(prefix.ends_with("Phase id: "), "{prefix}");
+    }
+
+    #[test]
+    fn step_execution_prompt_prefix_covers_stable_contract_sections() {
+        let plan = StepPlan {
+            goal: "Build a game".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "create-page".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Create the page".to_string(),
+                    expected_paths: vec!["src/app/page.tsx".to_string()],
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "wire-input".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Wire keyboard input".to_string(),
+                    expected_paths: vec!["src/app/page.tsx".to_string()],
+                    verify: Vec::new(),
+                },
+            ],
+        };
+        let context = StepPromptContext {
+            overall_goal: plan.goal.clone(),
+            required_final_artifacts: vec!["src/app/page.tsx".to_string()],
+            prior_expected_paths: vec!["package.json".to_string()],
+            final_required_capabilities: vec!["player_control".to_string()],
+            final_required_evidence: vec!["interactive_ui_source_evidence".to_string()],
+            completion_contract_path: None,
+        };
+        let first = build_step_prompt(&plan, &plan.steps[0], &context);
+        let second = build_step_prompt(&plan, &plan.steps[1], &context);
+
+        let prefix = common_prefix(&first, &second);
+
+        assert!(prefix.contains("Required final artifacts:"), "{prefix}");
+        assert!(prefix.contains("Required final capabilities:"), "{prefix}");
+        assert!(prefix.contains("Required final evidence:"), "{prefix}");
+        assert!(prefix.contains("Step execution rules:"), "{prefix}");
+        assert!(prefix.ends_with("Current step id:\n"), "{prefix}");
+    }
+
+    #[test]
+    fn ultra_phase_prompt_prefix_covers_profile_contract_before_phase_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game on port 3011".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: vec![
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "setup".to_string(),
+                    prompt: "Set up the app shell".to_string(),
+                },
+                crate::planner::ultra_plan::UltraPhase {
+                    id: "gameplay".to_string(),
+                    prompt: "Implement keyboard gameplay".to_string(),
+                },
+            ],
+        };
+        let context = UltraRunContext::new(vec!["src/app/page.tsx".to_string()]);
+        let first = ultra_phase_prompt(
+            &plan,
+            &plan.phases[0],
+            &config(dir.path().to_path_buf()),
+            &context,
+        );
+        let second = ultra_phase_prompt(
+            &plan,
+            &plan.phases[1],
+            &config(dir.path().to_path_buf()),
+            &context,
+        );
+
+        let prefix = common_prefix(&first, &second);
+
+        assert!(prefix.contains("Profile generation rules:"), "{prefix}");
+        assert!(prefix.contains("Profile runtime contract:"), "{prefix}");
+        assert!(
+            prefix.contains("Deterministic verification preference:"),
+            "{prefix}"
+        );
+        assert!(prefix.contains("Required final artifacts:"), "{prefix}");
+        assert!(prefix.ends_with("Phase id: "), "{prefix}");
+    }
+
+    #[test]
+    fn repair_prompt_prefix_is_shared_across_anchored_and_compact_rungs() {
+        let report = VerificationReport::missing_path("src/app/page.tsx");
+        let context = RepairContext {
+            overall_goal: Some("Build app".to_string()),
+            required_final_artifacts: vec!["src/app/page.tsx".to_string()],
+            ..RepairContext::default()
+        };
+        let anchored = build_repair_prompt_with_context("create-page", &report, &context);
+        let compact = build_compact_compile_repair_prompt_with_context(
+            "create-page",
+            &VerificationReport::pass(),
+            &context,
+        );
+
+        let prefix = common_prefix(&anchored, &compact);
+
+        assert!(prefix.contains("Repair rules:"), "{prefix}");
+        assert!(
+            prefix.contains("Stop after the smallest bounded repair."),
+            "{prefix}"
+        );
+    }
+
+    #[test]
+    fn final_acceptance_repair_prompt_prefix_keeps_attempt_counter_at_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = UltraPlan {
+            goal: "Build a game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: Vec::new(),
+        };
+        let context = UltraRunContext::new(vec!["src/app/page.tsx".to_string()]);
+        let report = VerificationReport::profile_failed(
+            "missing_required_evidence:restart_or_recoverable_state_evidence",
+        );
+        let first = final_acceptance_repair_prompt(
+            dir.path(),
+            &plan,
+            &report,
+            &context,
+            "implementation",
+            &["src/app/page.tsx".to_string()],
+            &[],
+            (1, 2),
+            false,
+            false,
+        );
+        let second = final_acceptance_repair_prompt(
+            dir.path(),
+            &plan,
+            &report,
+            &context,
+            "implementation",
+            &["src/app/page.tsx".to_string()],
+            &[],
+            (2, 2),
+            false,
+            false,
+        );
+
+        let prefix = common_prefix(&first, &second);
+
+        assert!(prefix.contains("Bounded repair rules:"), "{prefix}");
+        assert!(prefix.contains("Original ultra goal:"), "{prefix}");
+        assert!(
+            prefix.contains("Pending capability evidence remedies:"),
+            "{prefix}"
+        );
+        assert!(prefix.ends_with("- attempt: "), "{prefix}");
     }
 
     #[test]

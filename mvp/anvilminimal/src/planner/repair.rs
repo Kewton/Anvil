@@ -57,25 +57,27 @@ pub fn build_repair_prompt_with_context(
     context: &RepairContext,
 ) -> String {
     let repair_target = classify_repair_target(report);
-    let mut prompt = format!(
-        "Repair step `{step_id}`. Verification failed: {}.\n\
-Repair target: {}. {}\n\
-Make the smallest bounded change, then stop.",
-        report.primary_reason(),
-        repair_target.as_str(),
-        repair_target.guidance()
-    );
+    let mut prompt = repair_rules_prefix();
     if let Some(goal) = &context.overall_goal {
         prompt.push_str("\n\nOverall goal:\n");
         prompt.push_str(goal);
     }
-    if let (Some(attempt), Some(max)) = (context.repair_attempt, context.max_repair_turns) {
-        prompt.push_str("\n\nRepair budget:\n");
-        prompt.push_str(&format!("- attempt {attempt}/{max}\n"));
-    }
     if !context.required_final_artifacts.is_empty() {
         prompt.push_str("\n\nRequired final artifacts:\n");
         prompt.push_str(&bullet_list(&context.required_final_artifacts));
+    }
+    prompt.push_str("\n\nRepair step `");
+    prompt.push_str(step_id);
+    prompt.push_str("`. Verification failed: ");
+    prompt.push_str(&report.primary_reason());
+    prompt.push_str(".\nRepair target: ");
+    prompt.push_str(repair_target.as_str());
+    prompt.push_str(". ");
+    prompt.push_str(repair_target.guidance());
+    prompt.push_str("\nMake the smallest bounded change, then stop.");
+    if let (Some(attempt), Some(max)) = (context.repair_attempt, context.max_repair_turns) {
+        prompt.push_str("\n\nRepair budget:\n");
+        prompt.push_str(&format!("- attempt {attempt}/{max}\n"));
     }
     if let Some(instruction) = &context.step_instruction {
         prompt.push_str("\n\nCurrent step instruction:\n");
@@ -125,14 +127,6 @@ Make the smallest bounded change, then stop.",
         prompt.push_str("\n\nProgress warning:\n");
         prompt.push_str(warning);
     }
-    prompt.push_str(
-        "\n\nRepair rules:\n\
-- Work only on this step's missing or failed artifacts.\n\
-- Treat verifier output as actionable feedback.\n\
-- If this is an expected failing red test step, preserve the expected failure instead of implementing the feature.\n\
-- Re-run only the declared deterministic verification mentally or via tools needed for this step.\n\
-- Stop after the smallest bounded repair.",
-    );
     prompt
 }
 
@@ -150,14 +144,16 @@ pub fn build_compact_compile_repair_prompt_with_context(
         },
     );
     format!(
-        "Repair session mode: compact.\n\
+        "{}\n\n\
+Repair session mode: compact.\n\
 Compile-error repair for step `{step_id}`.\n\n\
 Compile error frames and remedies:\n\
 {compile_errors}\n\n\
 Tool schema reminder:\n\
 - Use Write or Edit tool calls to modify the failing source file.\n\
 - Do not answer in prose only; a response without a source edit fails this compile repair.\n\
-- Keep the change bounded to the compile frame above, then stop."
+- Keep the change bounded to the compile frame above, then stop.",
+        repair_rules_prefix()
     )
 }
 
@@ -181,7 +177,8 @@ pub fn build_compile_regeneration_prompt_with_context(
         .and_then(|root| std::fs::read_to_string(root.join(target_path)).ok())
         .unwrap_or_default();
     format!(
-        "Repair session mode: compact regeneration.\n\
+        "{}\n\n\
+Repair session mode: compact regeneration.\n\
 Compile-error regeneration for step `{step_id}`.\n\n\
 Compile error frames and remedies:\n\
 {compile_errors}\n\n\
@@ -194,8 +191,19 @@ Regeneration mandate:\n\
 - Write the complete corrected file via the Write tool (full content, one file only): {target_path}.\n\
 - Do not modify any other file.\n\
 - Preserve the user's app intent and keep caller/callee contracts consistent with the definition context above.\n\
-- Stop immediately after the Write tool call."
+- Stop immediately after the Write tool call.",
+        repair_rules_prefix()
     )
+}
+
+fn repair_rules_prefix() -> String {
+    "Repair rules:\n\
+- Work only on this step's missing or failed artifacts.\n\
+- Treat verifier output as actionable feedback.\n\
+- If this is an expected failing red test step, preserve the expected failure instead of implementing the feature.\n\
+- Re-run only the declared deterministic verification mentally or via tools needed for this step.\n\
+- Stop after the smallest bounded repair."
+        .to_string()
 }
 
 pub fn save_repair_report(

@@ -80,6 +80,7 @@ struct ProviderTurnTelemetry<'a> {
     tool_count: usize,
     native_tools_enabled: bool,
     estimated_prompt_tokens: u64,
+    estimated_stable_prefix_chars: u64,
     prompt_eval_count: Option<u64>,
     eval_count: Option<u64>,
     finish_reason: String,
@@ -96,6 +97,7 @@ struct ProviderTurnTelemetryBase<'a> {
     tool_count: usize,
     native_tools_enabled: bool,
     estimated_prompt_tokens: u64,
+    estimated_stable_prefix_chars: u64,
     elapsed: Duration,
     timed_out: bool,
     aborted_by_user: bool,
@@ -142,6 +144,14 @@ where
     let timeout = Duration::from_secs(config.chat_timeout_secs);
     let estimated_prompt_tokens =
         estimate_prompt_tokens_sent(messages, tools, native_tools_enabled);
+    let estimated_stable_prefix_chars = estimate_stable_prefix_chars(
+        scope,
+        &provider,
+        model,
+        messages,
+        tools,
+        native_tools_enabled,
+    );
     crate::tui::status_bus::publish_provider_started(scope.as_str(), config.chat_timeout_secs);
     crate::tui::presentation::emit_provider_turn_started(
         scope.as_str(),
@@ -161,6 +171,7 @@ where
                 tool_count: tools.len(),
                 native_tools_enabled,
                 estimated_prompt_tokens,
+                estimated_stable_prefix_chars,
                 elapsed: started.elapsed(),
                 timed_out: false,
                 aborted_by_user: true,
@@ -188,6 +199,7 @@ where
                     tool_count: tools.len(),
                     native_tools_enabled,
                     estimated_prompt_tokens,
+                    estimated_stable_prefix_chars,
                     elapsed,
                     timed_out: elapsed >= timeout,
                     aborted_by_user: false,
@@ -225,6 +237,7 @@ where
                     tool_count,
                     native_tools_enabled,
                     estimated_prompt_tokens,
+                    estimated_stable_prefix_chars,
                     elapsed: started.elapsed(),
                     timed_out: false,
                     aborted_by_user: true,
@@ -244,6 +257,7 @@ where
                     tool_count,
                     native_tools_enabled,
                     estimated_prompt_tokens,
+                    estimated_stable_prefix_chars,
                     prompt_eval_count: None,
                     eval_count: None,
                     finish_reason: "timeout".to_string(),
@@ -289,6 +303,7 @@ where
                             tool_count,
                             native_tools_enabled,
                             estimated_prompt_tokens,
+                            estimated_stable_prefix_chars,
                             elapsed,
                             timed_out: false,
                             aborted_by_user: false,
@@ -316,6 +331,7 @@ where
                         tool_count,
                         native_tools_enabled,
                         estimated_prompt_tokens,
+                        estimated_stable_prefix_chars,
                         prompt_eval_count: None,
                         eval_count: None,
                         finish_reason: "error".to_string(),
@@ -365,6 +381,74 @@ fn provider_progress_due(elapsed: Duration, next_progress_at: &mut Duration) -> 
     Some(elapsed.as_secs())
 }
 
+fn estimate_stable_prefix_chars(
+    scope: ProviderCallScope,
+    provider: &str,
+    model: &str,
+    messages: &[ConversationMessage],
+    tools: &[ToolSpec],
+    native_tools_enabled: bool,
+) -> u64 {
+    let prompt = prompt_prefix_text(messages, tools, native_tools_enabled);
+    let key = format!(
+        "{}:{}:{}:{}:{}",
+        provider,
+        model,
+        scope.as_str(),
+        native_tools_enabled,
+        tools.len()
+    );
+    let mut cache = prompt_prefix_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prefix = cache
+        .get(&key)
+        .map(|previous| longest_common_prefix_chars(previous, &prompt))
+        .unwrap_or(0);
+    cache.insert(key, prompt);
+    prefix as u64
+}
+
+fn prompt_prefix_text(
+    messages: &[ConversationMessage],
+    tools: &[ToolSpec],
+    native_tools_enabled: bool,
+) -> String {
+    let mut text = String::new();
+    for message in messages {
+        text.push_str("role:");
+        text.push_str(&message.role);
+        text.push('\n');
+        if let Some(name) = &message.name {
+            text.push_str("name:");
+            text.push_str(name);
+            text.push('\n');
+        }
+        text.push_str("content:\n");
+        text.push_str(&message.content);
+        text.push('\n');
+    }
+    if native_tools_enabled {
+        text.push_str("tools:\n");
+        if let Ok(value) = serde_json::to_string(tools) {
+            text.push_str(&value);
+        }
+    }
+    text
+}
+
+fn longest_common_prefix_chars(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn prompt_prefix_cache() -> &'static Mutex<BTreeMap<String, String>> {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
 fn estimate_prompt_tokens_sent(
     messages: &[ConversationMessage],
     tools: &[ToolSpec],
@@ -403,6 +487,7 @@ fn provider_aborted_by_user(
             tool_count: base.tool_count,
             native_tools_enabled: base.native_tools_enabled,
             estimated_prompt_tokens: base.estimated_prompt_tokens,
+            estimated_stable_prefix_chars: base.estimated_stable_prefix_chars,
             prompt_eval_count: None,
             eval_count: None,
             finish_reason: "aborted_by_user".to_string(),
@@ -433,6 +518,7 @@ fn provider_turn_telemetry_from_result<'a>(
         tool_count: base.tool_count,
         native_tools_enabled: base.native_tools_enabled,
         estimated_prompt_tokens: base.estimated_prompt_tokens,
+        estimated_stable_prefix_chars: base.estimated_stable_prefix_chars,
         prompt_eval_count: reply.and_then(|reply| reply.prompt_tokens),
         eval_count: reply.and_then(|reply| reply.completion_tokens),
         finish_reason: if base.timed_out {
@@ -465,6 +551,7 @@ fn emit_provider_turn_duration(config: &Config, telemetry: ProviderTurnTelemetry
         "tools": telemetry.tool_count,
         "native_tools_enabled": telemetry.native_tools_enabled,
         "estimated_prompt_tokens_sent": telemetry.estimated_prompt_tokens,
+        "estimated_stable_prefix_chars": telemetry.estimated_stable_prefix_chars,
         "prompt_eval_count": telemetry.prompt_eval_count,
         "eval_count": telemetry.eval_count,
         "finish_reason": telemetry.finish_reason.as_str(),
@@ -775,6 +862,58 @@ mod tests {
         assert!(events.contains("\"event\":\"context_truncation_suspected\""));
         assert!(events.contains("\"level\":\"WARNING\""));
         assert!(events.contains("\"persistent_undercut_count\":2"));
+    }
+
+    #[test]
+    fn provider_turn_records_estimated_stable_prefix_chars() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events_path = tmp.path().join("events.jsonl");
+        let config = test_config(tmp.path(), events_path.clone(), 30);
+        let mut client = TokenClient;
+        let model = format!("prefix-test-{}", uuid::Uuid::now_v7());
+        for suffix in ["first", "second"] {
+            let outcome = chat(
+                &mut client,
+                &config,
+                ProviderCallScope::PlannerStep,
+                &model,
+                &[ConversationMessage::user(format!(
+                    "Stable prefix section.\n\nVariable tail: {suffix}"
+                ))],
+                &[],
+                false,
+            );
+            assert!(outcome.result.is_ok());
+        }
+
+        let text = std::fs::read_to_string(events_path).expect("events");
+        let turns = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| {
+                event
+                    .get("event")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name == "provider_turn_duration")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            turns[0]
+                .get("estimated_stable_prefix_chars")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        assert!(
+            turns[1]
+                .get("estimated_stable_prefix_chars")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                >= "role:user\ncontent:\nStable prefix section."
+                    .chars()
+                    .count() as u64,
+            "{text}"
+        );
     }
 
     #[test]
