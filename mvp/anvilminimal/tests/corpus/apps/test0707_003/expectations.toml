@@ -20,7 +20,7 @@ visible_interactive_surface_evidence = "Strong"
 user_input_handler_evidence = "Strong"
 stateful_update_evidence = "Strong"
 challenge_or_adversary_evidence = "Strong"
-score_or_progression_evidence = "Weak"
+score_or_progression_evidence = "Strong"
 failure_or_collision_evidence = "Weak"
 nextjs_route_evidence = "Strong"
 

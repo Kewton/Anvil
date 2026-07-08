@@ -828,7 +828,7 @@ fn string_array_field_contains(value: &Value, key: &str, needle: &str) -> bool {
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .any(|item| item == needle)
+        .any(|item| item.eq_ignore_ascii_case(needle))
 }
 
 pub fn required_evidence_for_capability(capability: &str) -> Vec<String> {
@@ -3143,6 +3143,49 @@ fn segment_has_state_mutation(segment: &str) -> bool {
     ]
     .iter()
     .any(|needle| segment.contains(needle))
+        || segment_has_generic_mutating_setter_call(segment)
+}
+
+fn segment_has_generic_mutating_setter_call(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if !is_identifier_start(bytes[cursor]) {
+            cursor += 1;
+            continue;
+        }
+        let Some((name, name_end)) = read_identifier(segment, cursor) else {
+            cursor += 1;
+            continue;
+        };
+        let mut after_name = skip_ascii_whitespace(segment, name_end);
+        if name.starts_with("set")
+            && setter_name_has_mutation_hint(name)
+            && bytes.get(after_name) == Some(&b'(')
+        {
+            after_name += 1;
+            if !segment
+                .get(after_name..)
+                .unwrap_or_default()
+                .trim_start()
+                .starts_with(')')
+            {
+                return true;
+            }
+        }
+        cursor = name_end;
+    }
+    false
+}
+
+fn setter_name_has_mutation_hint(name: &str) -> bool {
+    setter_name_has_entity_hint(name)
+        || score_reset_name_has_progress_hint(name)
+        || [
+            "state", "status", "mode", "phase", "position", "pos", "x", "y",
+        ]
+        .iter()
+        .any(|needle| identifier_contains(name, needle))
 }
 
 fn segment_has_non_audio_gameplay_call(segment: &str) -> bool {
@@ -3182,8 +3225,9 @@ fn is_identifier_continue(byte: u8) -> bool {
 }
 
 fn non_audio_gameplay_call_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
     if matches!(
-        name,
+        name.as_str(),
         "if" | "for"
             | "while"
             | "switch"
@@ -3205,7 +3249,7 @@ fn non_audio_gameplay_call_name(name: &str) -> bool {
             | "pause"
     ) || ["audio", "sound", "music", "beep", "tone"]
         .iter()
-        .any(|needle| name.contains(needle))
+        .any(|needle| identifier_contains(&name, needle))
     {
         return false;
     }
@@ -3229,7 +3273,7 @@ fn non_audio_gameplay_call_name(name: &str) -> bool {
         "advance",
     ]
     .iter()
-    .any(|needle| name.contains(needle))
+    .any(|needle| identifier_contains(&name, needle))
 }
 
 fn source_file_has_score_update_signal(file: &SourceFile) -> bool {
@@ -3253,16 +3297,52 @@ fn source_file_has_score_update_signal(file: &SourceFile) -> bool {
 }
 
 fn identifier_has_assignment_or_increment(lower: &str, name: &str) -> bool {
-    [
-        format!("{name} +="),
-        format!("{name}+="),
-        format!("{name}++"),
-        format!("++{name}"),
-        format!("{name} ="),
-        format!("{name}="),
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    let bytes = lower.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if !is_identifier_start(bytes[cursor]) {
+            cursor += 1;
+            continue;
+        }
+        let Some((identifier, identifier_end)) = read_identifier(lower, cursor) else {
+            cursor += 1;
+            continue;
+        };
+        if identifier_contains(identifier, name)
+            && (identifier_has_forward_assignment_or_increment(lower, identifier_end)
+                || identifier_has_prefix_increment(lower, cursor))
+        {
+            return true;
+        }
+        cursor = identifier_end;
+    }
+    false
+}
+
+fn identifier_has_forward_assignment_or_increment(text: &str, identifier_end: usize) -> bool {
+    let cursor = skip_ascii_whitespace(text, identifier_end);
+    let bytes = text.as_bytes();
+    matches!(
+        (bytes.get(cursor), bytes.get(cursor + 1)),
+        (Some(b'+'), Some(b'='))
+            | (Some(b'-'), Some(b'='))
+            | (Some(b'+'), Some(b'+'))
+            | (Some(b'-'), Some(b'-'))
+    ) || is_simple_assignment_operator(text, cursor)
+}
+
+fn identifier_has_prefix_increment(text: &str, identifier_start: usize) -> bool {
+    let prefix = &text.as_bytes()[..identifier_start];
+    let Some(previous) = prefix.iter().rposition(|byte| !byte.is_ascii_whitespace()) else {
+        return false;
+    };
+    if previous == 0 {
+        return false;
+    }
+    matches!(
+        (prefix.get(previous - 1), prefix.get(previous)),
+        (Some(b'+'), Some(b'+')) | (Some(b'-'), Some(b'-'))
+    )
 }
 
 fn source_file_has_game_over_transition(file: &SourceFile) -> bool {
@@ -3779,7 +3859,7 @@ fn assignment_value_starts_with_zero(segment: &str, value_start: usize) -> bool 
 fn score_reset_name_has_progress_hint(name: &str) -> bool {
     ["score", "points", "level", "progress"]
         .iter()
-        .any(|needle| name.contains(needle))
+        .any(|needle| identifier_contains(name, needle))
 }
 
 fn setter_name_has_entity_hint(name: &str) -> bool {
@@ -3805,7 +3885,7 @@ fn setter_name_has_entity_hint(name: &str) -> bool {
         "target",
     ]
     .iter()
-    .any(|needle| name.contains(needle))
+    .any(|needle| identifier_contains(name, needle))
 }
 
 fn restart_segment_references_recoverable_state(segment: &str) -> bool {
@@ -3855,6 +3935,7 @@ fn handler_reference_segments(lower: &str) -> Vec<&str> {
 }
 
 fn segment_contains_identifier(segment: &str, name: &str) -> bool {
+    let expected = name.to_ascii_lowercase();
     let mut cursor = 0usize;
     while cursor < segment.len() {
         if !is_identifier_start(segment.as_bytes()[cursor]) {
@@ -3865,7 +3946,7 @@ fn segment_contains_identifier(segment: &str, name: &str) -> bool {
             cursor += 1;
             continue;
         };
-        if identifier == name {
+        if identifier.to_ascii_lowercase() == expected {
             return true;
         }
         cursor = identifier_end;
@@ -3876,10 +3957,16 @@ fn segment_contains_identifier(segment: &str, name: &str) -> bool {
 fn restart_intent_function_name(name: &str) -> bool {
     ["restart", "reset", "init", "new"]
         .iter()
-        .any(|needle| name.contains(needle))
+        .any(|needle| identifier_contains(name, needle))
         && ["game", "state", "level"]
             .iter()
-            .any(|needle| name.contains(needle))
+            .any(|needle| identifier_contains(name, needle))
+}
+
+fn identifier_contains(identifier: &str, needle: &str) -> bool {
+    identifier
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -5299,6 +5386,20 @@ export default function Page(){
                 evidence_hint_tokens: &[],
             },
             Fixture {
+                family: "user_input_handler_camelcase_identifier_mutates",
+                path: "src/app/page.tsx",
+                content: r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [playerX, setPlayerX] = useState(0);
+  return <main onKeyDown={() => setPlayerX((value) => value + 1)}>{playerX}</main>;
+}
+"#,
+                required_evidence: &["user_input_handler_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
                 family: "stateful_update_usestate",
                 path: "src/app/page.tsx",
                 content: r#""use client";
@@ -5316,6 +5417,14 @@ export default function Page(){
                 family: "challenge_static_enemy",
                 path: "src/app/page.tsx",
                 content: "export default function Page(){ const enemy = { x: 1 }; return <main>{enemy.x}</main>; }\n",
+                required_evidence: &["challenge_or_adversary_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "challenge_pascalcase_enemy_identifier",
+                path: "src/app/page.tsx",
+                content: "export default function Page(){ const BossEnemy = { x: 1, y: 2 }; return <main>{BossEnemy.x}</main>; }\n",
                 required_evidence: &["challenge_or_adversary_evidence"],
                 verify_commands: &[],
                 evidence_hint_tokens: &[],
@@ -5344,6 +5453,14 @@ export default function Page(){
                 evidence_hint_tokens: &[],
             },
             Fixture {
+                family: "score_progression_camelcase_assignment",
+                path: "src/app/page.tsx",
+                content: "export default function Page(){ let playerScore = 0; playerScore += 10; return <main>{playerScore}</main>; }\n",
+                required_evidence: &["score_or_progression_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
                 family: "failure_game_over_transition_single_quote",
                 path: "src/app/page.tsx",
                 content: r#""use client";
@@ -5352,6 +5469,22 @@ export default function Page(){
   const [gameState, setGameState] = useState("playing");
   const collision = true;
   if (collision) setGameState('gameover');
+  return <main>{gameState}</main>;
+}
+"#,
+                required_evidence: &["failure_or_collision_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "failure_collision_camelcase_handler",
+                path: "src/app/page.tsx",
+                content: r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [gameState, setGameState] = useState("playing");
+  const CheckCollision = () => true;
+  if (CheckCollision()) setGameState("GAMEOVER");
   return <main>{gameState}</main>;
 }
 "#,
@@ -5377,6 +5510,27 @@ export default function Page(){
   const [gameOver] = useState(true);
   const [enemies, setEnemies] = useState([{ x: 1 }]);
   return <button onClick={() => { setGameState('playing'); setScore(0); setEnemies([{ x: 1 }]); }}>Restart {score} {String(gameOver)} {enemies.length}</button>;
+}
+"#,
+                required_evidence: &["restart_or_recoverable_state_evidence"],
+                verify_commands: &[],
+                evidence_hint_tokens: &[],
+            },
+            Fixture {
+                family: "restart_recoverable_pascalcase_attachment",
+                path: "src/app/page.tsx",
+                content: r#""use client";
+import { useState } from "react";
+export default function Page(){
+  const [score, setScore] = useState(3);
+  const [gameState, setGameState] = useState("GAMEOVER");
+  const [alienFleet, setAlienFleet] = useState([{ x: 1 }]);
+  const RestartGame = () => {
+    setScore(0);
+    setAlienFleet([{ x: 1 }]);
+    setGameState("PLAYING");
+  };
+  return <button onClick={RestartGame}>Restart {score} {gameState} {alienFleet.length}</button>;
 }
 "#,
                 required_evidence: &["restart_or_recoverable_state_evidence"],

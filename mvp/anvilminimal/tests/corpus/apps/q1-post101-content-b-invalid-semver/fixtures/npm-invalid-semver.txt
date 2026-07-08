@@ -1,0 +1,2 @@
+npm ERR! Invalid comparator: ^8.0.C
+invalid_semver_manifest_entry: "react-markdown": "^8.0.C" is not valid semver - use e.g. "^8.0.0"

@@ -1,0 +1,44 @@
+case_id = "q1-post101-game-a-camelcase-collision"
+source = "Q1 post-101 game_a"
+required_paths = ["package.json", "src/app/page.tsx"]
+verify_commands = []
+required_capabilities = ["stateful_interaction", "start_or_restart_flow", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule", "nextjs_route"]
+required_evidence = ["nextjs_route_evidence"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["alien", "score", "collision", "restart"]
+acceptance_passed = true
+primary_reason = "pass"
+
+[route_closure]
+include = ["src/app/page.tsx"]
+exclude = []
+
+[evidence]
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+challenge_or_adversary_evidence = "Strong"
+score_or_progression_evidence = "Strong"
+failure_or_collision_evidence = "Strong"
+restart_or_recoverable_state_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+src/app/page.tsx = [
+  "playerScore += 10",
+  "CheckCollision",
+  "RestartGame"
+]

@@ -163,6 +163,16 @@ mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
   q1-full-tool-a-orphan-port-in-use
 ```
 
+Post-101 harvests:
+
+```sh
+# Manual reduced fixtures from the post-101 Q1 round:
+# - game_a: camelCase/PascalCase gameplay evidence false-negative shape.
+# - content_b: invalid semver output and manifest entry remedy shape.
+tests/corpus/apps/q1-post101-game-a-camelcase-collision
+tests/corpus/apps/q1-post101-content-b-invalid-semver
+```
+
 `cli_a` pins the model tendency to combine CSV fixture creation and program
 verification in one multi-line verify command with a file-writing redirect; the
 live unit fixture asserts this remains rejected with Write-tool remedy text.
