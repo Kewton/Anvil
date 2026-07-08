@@ -44,6 +44,20 @@ the trait.
 Do not add provider abstractions, profile-specific runner branches, or
 profile-specific repair loops.
 
+## Development Guardrails
+
+New entry points and execution boundaries must be registered in
+`tests/protection_coverage_audit.rs` before they are used. Add or update the
+declarative protection row for the affected category, including the site
+predicate, required wrapper/type, and allowlist, then add a conformance pathway
+row when the boundary can affect runner outcomes.
+
+This rule exists because the instruction 92 parity-hole incidents showed the
+same failure class recurring at opt-in call sites: compile parsers received
+display excerpts instead of full command output, verify commands bypassed the
+shared normalizer, and terminal records were missing on some exit paths. New
+boundaries must make those bypasses type-impossible or CI-detected.
+
 ## Definition Of Done
 
 A new profile is not complete until `cargo test --test conformance` passes with
