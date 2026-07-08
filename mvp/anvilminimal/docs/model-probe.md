@@ -9,7 +9,7 @@ model-tier table evidence.
 The probe uses a throwaway scratch workspace under the system temp directory,
 cleans it after the run, and must not run package installs. Each task is one
 bounded session through the normal model/tool chokepoint unless noted below.
-The fixed battery version is `model-probe-v1`.
+The fixed battery version is `model-probe-v2`.
 
 ## Battery
 
@@ -32,7 +32,11 @@ The fixed battery version is `model-probe-v1`.
    The appended-vs-compact delta is the context-sensitivity signal.
 9. `regenerate`: rewrite the full corrected file via `Write`.
    This checks the instruction-96 full-file regeneration capability.
-10. `json_schema`: respond only with JSON matching the StepPlan-like schema.
+10. `csv_fixture_verify`: create a small CSV fixture, then verify a local
+    program can process it.
+    This elicits the live combine tendency where models try to create fixture
+    files inside verify commands with redirects or heredocs.
+11. `json_schema`: respond only with JSON matching the StepPlan-like schema.
     This measures planner parse rate and missing descriptive or semantic fields.
 
 Every task records raw tool calls and raw Bash commands verbatim in the JSON
@@ -59,8 +63,15 @@ path normalization/salvage, bash and verify normalization, edit-anchor salvage,
 compact repair rungs, full-file regeneration, schema repair/defaulting, empty
 response retries, malformed tool-call recovery, and token-truncation review.
 
-The card states its own scope: N=10 micro-tasks, dialect indicators, not a
+The card states its own scope: N=11 micro-tasks, dialect indicators, not a
 capability benchmark.
+
+Calibration note: `model-probe-v1` did not include a fixture-creation plus
+verification task, so it could under-sample the live python-cli tendency to
+combine CSV fixture creation and verification in one shell command. `v2` records
+that divergence honestly by adding `csv_fixture_verify`; old v1 cards remain
+valid for their stated N=10 dialect scope but should not be treated as evidence
+about redirect/heredoc fixture creation behavior.
 
 ## New-Model Procedure
 

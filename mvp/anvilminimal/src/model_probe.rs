@@ -19,7 +19,7 @@ use crate::providers::{AssistantReply, ChatClient};
 use crate::state::{ConversationMessage, SessionSnapshot, ToolCall};
 use crate::tui::NOOP_UI;
 
-pub const MODEL_PROBE_VERSION: &str = "model-probe-v1";
+pub const MODEL_PROBE_VERSION: &str = "model-probe-v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProbeOutput {
@@ -290,7 +290,10 @@ pub fn run_with_output_dir(
     let report = ModelProbeReport {
         version: MODEL_PROBE_VERSION.to_string(),
         generated_at: timestamp_label(),
-        scope: "N=10 micro-tasks; dialect indicators, not a capability benchmark".to_string(),
+        scope: format!(
+            "N={} micro-tasks; dialect indicators, not a capability benchmark",
+            tasks.len()
+        ),
         executor: ProbeRole {
             role: "executor".to_string(),
             provider: config.provider,
@@ -563,6 +566,15 @@ fn battery(root: &Path) -> Vec<ProbeTask> {
             required_paths: vec!["src/repair/regenerate.ts".to_string()],
             step_kind: RunSessionStepKind::Implement,
             prompt: "MODEL PROBE task regenerate: rewrite the full corrected file src/repair/regenerate.ts via the Write tool. It must export function value() { return 1; }. Do not install packages.".to_string(),
+        },
+        ProbeTask {
+            id: "csv_fixture_verify",
+            role: ProbeRoleKind::Executor,
+            session_mode: ProbeSessionMode::Fresh,
+            kind: ProbeTaskKind::Session,
+            required_paths: vec!["fixtures/model-probe.csv".to_string()],
+            step_kind: RunSessionStepKind::Implement,
+            prompt: "MODEL PROBE task csv_fixture_verify: create a small CSV fixture at fixtures/model-probe.csv with the Write tool, then verify a local program can process it with one Bash command. Do not use redirects, heredocs, npm, pip, or installs.".to_string(),
         },
         ProbeTask {
             id: "json_schema",
@@ -1235,12 +1247,12 @@ mod tests {
         let report: ModelProbeReport =
             serde_json::from_str(&fs::read_to_string(&result.profile_path).unwrap()).unwrap();
         assert_eq!(report.version, MODEL_PROBE_VERSION);
-        assert_eq!(report.metrics.task_count, 10);
+        assert_eq!(report.metrics.task_count, 11);
         assert!(report.no_network_guarantee);
         assert_eq!(report.metrics.absolute_path_count, 1);
         assert!(report.metrics.absolute_path_rate > 0.0);
         assert_eq!(report.metrics.corrupted_path_count, 1);
-        assert_eq!(report.metrics.shell_command_count, 2);
+        assert_eq!(report.metrics.shell_command_count, 3);
         assert_eq!(report.metrics.shell_control_count, 2);
         assert_eq!(report.metrics.shell_control_breakdown.and_and, 2);
         assert_eq!(report.metrics.shell_control_breakdown.pipe, 1);
@@ -1295,11 +1307,29 @@ mod tests {
             .unwrap();
         assert_eq!(edit_own.raw_tool_calls.len(), 1);
         assert_eq!(edit_own.raw_tool_calls[0].name, "Edit");
+        let csv_task = report
+            .tasks
+            .iter()
+            .find(|task| task.id == "csv_fixture_verify")
+            .unwrap();
+        assert!(
+            csv_task
+                .raw_tool_calls
+                .iter()
+                .any(|call| call.name == "Write")
+        );
+        assert!(
+            csv_task
+                .raw_commands
+                .iter()
+                .any(|command| command.contains("__import__('csv').DictReader")),
+            "{csv_task:?}"
+        );
 
         let card = fs::read_to_string(&result.card_path).unwrap();
         for expected in [
             "# Model Probe Card",
-            "- Scope: N=10 micro-tasks; dialect indicators, not a capability benchmark",
+            "- Scope: N=11 micro-tasks; dialect indicators, not a capability benchmark",
             "- No-network guarantee: passed",
             "- shell_control_breakdown: &&=2 ;=0 pipe=1 redirect=1 cd=1",
             "- Compact-only repair follow-through => expect the 85 compact-session rung to matter.",
@@ -1435,6 +1465,19 @@ mod tests {
                         "content": "export function value() {\n  return 1;\n}\n",
                     }),
                 )]),
+                "csv_fixture_verify" => reply_with_tools(vec![
+                    ToolCall::new(
+                        "Write",
+                        json!({
+                            "path": "fixtures/model-probe.csv",
+                            "content": "name,score\nalpha,1\nbeta,2\n",
+                        }),
+                    ),
+                    ToolCall::new(
+                        "Bash",
+                        json!({"command": "python3 -c \"print(len(list(__import__('csv').DictReader(open('fixtures/model-probe.csv')))))\""}),
+                    ),
+                ]),
                 "json_schema" => reply_text(
                     r#"{"steps":[{"instruction":"write math helper","kind":"implement","expected_paths":["src/util/math.ts"]}]}"#,
                 ),
@@ -1474,6 +1517,7 @@ mod tests {
             "repair_appended",
             "repair_compact",
             "regenerate",
+            "csv_fixture_verify",
             "json_schema",
         ]
         .into_iter()

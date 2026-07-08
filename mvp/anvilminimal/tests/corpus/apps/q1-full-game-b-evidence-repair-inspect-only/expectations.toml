@@ -1,0 +1,41 @@
+case_id = "q1-full-game-b-evidence-repair-inspect-only"
+source = "Q1-full game_b"
+required_paths = ["package.json", "tsconfig.json", "next-env.d.ts", "src/app/layout.tsx", "src/app/page.tsx"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["game", "restart", "score", "evidence", "regeneration"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx"]
+exclude = ["next-env.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+src/app/page.tsx = [
+  "Game B Evidence Repair",
+  "data-anvil-action=\"primary\"",
+  "Try Again",
+  "restartGame"
+]
+fixtures/events-evidence-repair-inspect-only.jsonl = [
+  "\"model\":\"gemma4:31b-cloud\"",
+  "\"failure_kind\":\"evidence_repair_no_source_change\"",
+  "\"repair_session_mode\":\"compact\"",
+  "\"event\":\"repair_regeneration\"",
+  "\"regeneration_gate\":\"evidence_static_present_and_build_passes\""
+]

@@ -140,6 +140,29 @@ mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
 `gemma4:31b-cloud` honest exhaustion datum where restart/input capability
 evidence remained pending and the terminal reason names those keys.
 
+The confirmed Q1-full diagnosis harvests are:
+
+```sh
+# Python CLI verify-boundary fixture, kept outside the Next.js app corpus.
+tests/fixtures/q1_full/cli_a_verify_redirect_command.txt
+
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/q1-full/tool_a \
+  q1-full-tool-a-read-only-stagnation
+
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/q1-full/game_b \
+  q1-full-game-b-evidence-repair-inspect-only
+```
+
+`cli_a` pins the model tendency to combine CSV fixture creation and program
+verification in one multi-line verify command with a file-writing redirect; the
+live unit fixture asserts this remains rejected with Write-tool remedy text.
+`q1-full-tool-a-read-only-stagnation` pins the repeated Read/Grep implement-loop
+shape and the K=3/K=5 intervention vocabulary. `q1-full-game-b-evidence-repair-
+inspect-only` pins evidence-target repair turns that inspect without editing
+until the compact/regeneration rung accepts a source change.
+
 The script copies `src/**`, `package.json`, and common Next.js/TypeScript/
 Tailwind/PostCSS config files. It intentionally does not copy `node_modules`,
 `.next`, `.anvil`, lockfiles, logs, screenshots, or other generated artifacts.

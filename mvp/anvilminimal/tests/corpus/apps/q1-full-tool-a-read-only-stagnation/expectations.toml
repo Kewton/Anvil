@@ -1,0 +1,40 @@
+case_id = "q1-full-tool-a-read-only-stagnation"
+source = "Q1-full tool_a"
+required_paths = ["package.json", "tsconfig.json", "next-env.d.ts", "src/app/layout.tsx", "src/app/page.tsx"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["tool", "todo", "stagnation", "read", "write"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx"]
+exclude = ["next-env.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+src/app/page.tsx = [
+  "Tool A Read Loop",
+  "data-anvil-action=\"primary\"",
+  "setItems"
+]
+fixtures/events-read-only-stagnation.jsonl = [
+  "\"model\":\"gemma4:31b-cloud\"",
+  "\"event\":\"read_only_stagnation_feedback\"",
+  "\"stage\":\"intervention\"",
+  "\"stage\":\"compact_restatement\"",
+  "\"reason\":\"model_stagnation:read_only_loop\""
+]
