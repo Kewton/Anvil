@@ -5424,23 +5424,40 @@ pub fn run_ultra_plan_with_ui(
             let target = classify_repair_target(&acceptance_report);
             let behavior_failure = final_acceptance_app_behavior_failure_kind(&acceptance_report);
             let report_reason = acceptance_report.primary_reason();
-            let reason = behavior_failure
+            let base_reason = behavior_failure
                 .clone()
                 .unwrap_or_else(|| report_reason.clone());
-            let failure_kind = if !acceptance_report.compile_errors.is_empty() {
+            let missing_signals = verification_missing_signals(&acceptance_report);
+            let pending_reason = capability_evidence_unresolved_reason(&missing_signals);
+            let exhausted_reason_for_event = pending_reason
+                .clone()
+                .unwrap_or_else(|| exhausted_reason.clone());
+            let reason = pending_reason
+                .as_ref()
+                .map(|pending| format!("{pending}; {base_reason}"))
+                .unwrap_or(base_reason);
+            let failure_kind = if let Some(pending) = pending_reason.clone() {
+                pending
+            } else if !acceptance_report.compile_errors.is_empty() {
                 "implementation_compile_error".to_string()
             } else {
                 behavior_failure
                     .clone()
                     .unwrap_or_else(|| "final_acceptance_repair_exhausted".to_string())
             };
-            let handoff_reason =
-                final_acceptance_recovery_reason(&acceptance_report, &reason, &exhausted_reason);
+            let handoff_reason = final_acceptance_recovery_reason(
+                &acceptance_report,
+                &reason,
+                &exhausted_reason_for_event,
+            );
             let repair_targets =
                 final_acceptance_recovery_repair_targets(&acceptance_report, target);
-            let missing_signals = verification_missing_signals(&acceptance_report);
-            let failure_evidence =
-                final_acceptance_recovery_failure_evidence(&acceptance_report, &handoff_reason);
+            let failure_evidence = final_acceptance_recovery_failure_evidence_with_context(
+                &config.workspace_root,
+                &plan.profile,
+                &acceptance_report,
+                &handoff_reason,
+            );
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
@@ -5455,9 +5472,13 @@ pub fn run_ultra_plan_with_ui(
                     "missing_paths": acceptance_report.missing_paths.clone(),
                     "compile_errors": acceptance_report.compile_errors.clone(),
                     "profile_failures": acceptance_report.profile_failures.clone(),
+                    "pending_capability_evidence": missing_signals.clone(),
+                    "pending_capability_evidence_count": missing_signals.len(),
+                    "capability_evidence_remedies": capability_evidence_remedy_lines(&missing_signals),
+                    "restart_hook_attachment_guidance": restart_hook_attachment_guidance(&config.workspace_root, &plan.profile),
                     "deterministic_remedies_applied": deterministic_remedies_applied.clone(),
                     "bounded_repair_exhausted": true,
-                    "exhausted_reason": exhausted_reason.clone(),
+                    "exhausted_reason": exhausted_reason_for_event.clone(),
                 }),
             );
             append_final_acceptance_cycle_summary(config, &final_acceptance_cycle_deltas);
@@ -12920,6 +12941,27 @@ fn obligation_repair_target_paths(report: &VerificationReport) -> Vec<String> {
         .collect()
 }
 
+fn final_acceptance_pending_evidence_guidance(
+    root: &Path,
+    profile: &str,
+    report: &VerificationReport,
+) -> String {
+    let pending_keys = verification_missing_signals(report);
+    if pending_keys.is_empty() {
+        return "- none".to_string();
+    }
+    let mut lines = capability_evidence_failure_evidence(
+        root,
+        profile,
+        &pending_keys,
+        &capability_evidence_unresolved_reason(&pending_keys).unwrap_or_default(),
+    );
+    if lines.is_empty() {
+        lines = capability_evidence_remedy_lines(&pending_keys);
+    }
+    render_prompt_bullets(&lines)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn final_acceptance_repair_prompt(
     root: &Path,
@@ -12945,6 +12987,8 @@ fn final_acceptance_repair_prompt(
         final_acceptance_behavioral_probe_context(report, expected_paths);
     let restart_attachment_guidance =
         final_acceptance_restart_attachment_guidance(root, plan, report);
+    let pending_evidence_guidance =
+        final_acceptance_pending_evidence_guidance(root, &plan.profile, report);
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
     let compile_errors = compile_repair_prompt_section_with_root(
@@ -12963,6 +13007,7 @@ Final acceptance failure:\n\
 - primary reason: {primary_reason}\n\
 - repair target: {repair_target}\n\
 - attempt: {attempt}/{max_attempts}\n\n\
+Pending capability evidence remedies:\n{pending_evidence_guidance}\n\n\
 Missing paths:\n{missing}\n\n\
 Dependency failures:\n{dependencies}\n\n\
 Compile errors:\n{compile_errors}\n\n\
@@ -12985,6 +13030,7 @@ Bounded repair rules:\n\
         repair_target = repair_target,
         attempt = attempt,
         max_attempts = max_attempts,
+        pending_evidence_guidance = pending_evidence_guidance,
         missing = missing,
         dependencies = dependencies,
         compile_errors = compile_errors,
@@ -13265,11 +13311,60 @@ fn final_acceptance_behavioral_probe_context(
     format!("{}\n\n", lines.join("\n"))
 }
 
+fn final_acceptance_concrete_interaction_requirement(failure_kind: &str) -> Option<&'static str> {
+    if failure_kind.contains("interaction_state_change_missing")
+        || failure_kind.contains("input_state_change_missing_after_start")
+        || failure_kind.contains("input_state_change_not_evaluated_after_start")
+        || failure_kind.contains("text_input_state_change_missing")
+    {
+        Some(INTERACTION_STATE_CHANGE_REPAIR_REQUIREMENT)
+    } else if failure_kind.contains("start_transition_missing") {
+        Some(INTERACTION_START_REPAIR_REQUIREMENT)
+    } else if failure_kind.contains("persistence_after_reload_reset") {
+        Some(PERSISTENCE_RELOAD_REPAIR_REQUIREMENT)
+    } else if failure_kind.contains("token_echo_after_reload_only") {
+        Some(TEXT_ECHO_AFTER_RELOAD_REPAIR_REQUIREMENT)
+    } else if failure_kind.contains("token_echo_missing") {
+        Some(TEXT_ECHO_REPAIR_REQUIREMENT)
+    } else {
+        None
+    }
+}
+
 fn final_acceptance_recovery_reason(
     report: &VerificationReport,
     reason: &str,
     exhausted_reason: &str,
 ) -> String {
+    let pending_keys = verification_missing_signals(report);
+    if let Some(pending_reason) = capability_evidence_unresolved_reason(&pending_keys) {
+        let mut out =
+            format!("{pending_reason}; final acceptance repair stopped: {exhausted_reason}");
+        if !reason.contains(&pending_reason) && !reason.trim().is_empty() {
+            out.push_str("; ");
+            out.push_str(reason);
+        }
+        if let Some(failure_kind) = final_acceptance_app_behavior_failure_kind(report) {
+            out.push_str("; behavioral probe reason: ");
+            out.push_str(&failure_kind);
+            if let Some(requirement) =
+                final_acceptance_concrete_interaction_requirement(&failure_kind)
+            {
+                out.push_str("\nconcrete requirement: ");
+                out.push_str(requirement);
+            }
+        }
+        for remedy in capability_evidence_remedy_lines(&pending_keys) {
+            out.push_str("\nremedy: ");
+            out.push_str(&remedy);
+        }
+        let context = final_acceptance_behavioral_probe_context(report, &[]);
+        if !context.is_empty() {
+            out.push('\n');
+            out.push_str(context.trim());
+        }
+        return out;
+    }
     let Some(failure_kind) = final_acceptance_app_behavior_failure_kind(report) else {
         return format!("{reason}; final acceptance repair stopped: {exhausted_reason}");
     };
@@ -13326,9 +13421,34 @@ fn final_acceptance_recovery_failure_evidence(
     report: &VerificationReport,
     reason: &str,
 ) -> Vec<String> {
+    final_acceptance_recovery_failure_evidence_base(None, "", report, reason)
+}
+
+fn final_acceptance_recovery_failure_evidence_with_context(
+    root: &Path,
+    profile: &str,
+    report: &VerificationReport,
+    reason: &str,
+) -> Vec<String> {
+    final_acceptance_recovery_failure_evidence_base(Some(root), profile, report, reason)
+}
+
+fn final_acceptance_recovery_failure_evidence_base(
+    root: Option<&Path>,
+    profile: &str,
+    report: &VerificationReport,
+    reason: &str,
+) -> Vec<String> {
+    let pending_keys = verification_missing_signals(report);
     let failure_kind = final_acceptance_app_behavior_failure_kind(report).unwrap_or_default();
     let probe_json = interaction_probe_json_from_report(report);
     let mut evidence = interaction_root_cause_repair_guidance(&failure_kind, probe_json.as_ref());
+    let pending_evidence = if let Some(root) = root.filter(|_| !pending_keys.is_empty()) {
+        capability_evidence_failure_evidence(root, profile, &pending_keys, reason)
+    } else {
+        capability_evidence_remedy_lines(&pending_keys)
+    };
+    merge_unique_strings(&mut evidence, &pending_evidence);
     evidence.extend(
         compile_error_repair_guidance(&report.compile_errors)
             .into_iter()
@@ -21312,10 +21432,50 @@ if __name__ == "__main__":
             exhausted
                 .get("primary_reason")
                 .and_then(Value::as_str)
-                .is_some_and(|reason| reason.contains("restart_or_recoverable_state_evidence")),
+                .is_some_and(|reason| reason.contains(
+                    "capability_evidence_unresolved:restart_or_recoverable_state_evidence"
+                )),
             "{exhausted}"
         );
+        assert_eq!(
+            exhausted.get("failure_kind").and_then(Value::as_str),
+            Some("capability_evidence_unresolved:restart_or_recoverable_state_evidence")
+        );
+        assert_eq!(
+            exhausted
+                .get("pending_capability_evidence_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
         let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains(
+                "restart_or_recoverable_state_evidence: add data-anvil-action=\\\"restart\\\""
+            ),
+            "{event_text}"
+        );
+        let repair_prompt = execution
+            .messages
+            .iter()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .map(|message| message.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .find(|prompt| prompt.contains("Repair the final acceptance failure"))
+            .expect("repair prompt");
+        assert!(
+            repair_prompt.contains("Pending capability evidence remedies:"),
+            "{repair_prompt}"
+        );
+        assert!(
+            repair_prompt.contains(
+                "restart_or_recoverable_state_evidence: add data-anvil-action=\"restart\""
+            ),
+            "{repair_prompt}"
+        );
         assert_eq!(
             event_text
                 .matches("\"event\":\"final_acceptance_cycle_complete\"")

@@ -1,0 +1,76 @@
+command failed: npm run build
+outcome: CommandFailed
+status: exit status: 1
+elapsed_ms: 1781
+summary: Failed to compile.
+Error: Your custom PostCSS configuration must export a `plugins` key.
+Error: Your custom PostCSS configuration must export a `plugins` key.
+at tryRunOrWebpackError (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:312989)
+-- inner error --
+Error: Your custom PostCSS configuration must export a `plugins` key.
+at tryRunOrWebpackError (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:312943)
+> Build failed because of webpack errors
+stdout:
+
+> space-invaders@1.0.0 build
+> next build
+
+  ▲ Next.js 14.2.35
+
+   Creating an optimized production build ...
+
+stderr:
+Warning: Your PostCSS configuration defines a field which is not supported (`__esModule`). Please remove this configuration value.
+Failed to compile.
+
+./src/app/globals.css.webpack[javascript/auto]!=!./node_modules/next/dist/build/webpack/loaders/css-loader/src/index.js??ruleSet[1].rules[14].oneOf[12].use[2]!./node_modules/next/dist/build/webpack/loaders/postcss-loader/src/index.js??ruleSet[1].rules[14].oneOf[12].use[3]!./src/app/globals.css
+Error: Your custom PostCSS configuration must export a `plugins` key.
+    at getPostCssPlugins (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/config/blocks/css/plugins.js:106:15)
+    at async /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/config/blocks/css/index.js:124:36
+    at async /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/loaders/postcss-loader/src/index.js:51:40
+    at async Span.traceAsyncFn (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/trace/trace.js:154:20)
+
+Import trace for requested module:
+./src/app/globals.css.webpack[javascript/auto]!=!./node_modules/next/dist/build/webpack/loaders/css-loader/src/index.js??ruleSet[1].rules[14].oneOf[12].use[2]!./node_modules/next/dist/build/webpack/loaders/postcss-loader/src/index.js??ruleSet[1].rules[14].oneOf[12].use[3]!./src/app/globals.css
+./src/app/globals.css
+
+./src/app/globals.css
+Error: Your custom PostCSS configuration must export a `plugins` key.
+    at getPostCssPlugins (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/config/blocks/css/plugins.js:106:15)
+    at async /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/config/blocks/css/index.js:124:36
+    at async /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/loaders/postcss-loader/src/index.js:51:40
+    at async Span.traceAsyncFn (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/trace/trace.js:154:20)
+    at tryRunOrWebpackError (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:312989)
+    at __webpack_require_module__ (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:131165)
+    at __nested_webpack_require_153728__ (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:130607)
+    at /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:131454
+    at symbolIterator (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/neo-async/async.js:1:14444)
+    at done (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/neo-async/async.js:1:14824)
+    at Hook.eval [as callAsync] (eval at create (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:13:28858), <anonymous>:15:1)
+    at Hook.CALL_ASYNC_DELEGATE [as _callAsync] (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:13:26012)
+    at /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:130328
+    at symbolIterator (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/neo-async/async.js:1:14402)
+-- inner error --
+Error: Your custom PostCSS configuration must export a `plugins` key.
+    at getPostCssPlugins (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/config/blocks/css/plugins.js:106:15)
+    at async /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/config/blocks/css/index.js:124:36
+    at async /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/loaders/postcss-loader/src/index.js:51:40
+    at async Span.traceAsyncFn (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/trace/trace.js:154:20)
+    at Object.<anonymous> (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/loaders/css-loader/src/index.js??ruleSet[1].rules[14].oneOf[12].use[2]!/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/loaders/postcss-loader/src/index.js??ruleSet[1].rules[14].oneOf[12].use[3]!/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/src/app/globals.css:1:7)
+    at /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:922493
+    at Hook.eval [as call] (eval at create (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:13:28636), <anonymous>:7:1)
+    at Hook.CALL_DELEGATE [as _call] (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:13:25906)
+    at /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:131198
+    at tryRunOrWebpackError (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:312943)
+    at __webpack_require_module__ (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:131165)
+    at __nested_webpack_require_153728__ (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:130607)
+    at /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/webpack/bundle5.js:28:131454
+    at symbolIterator (/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/compiled/neo-async/async.js:1:14444)
+
+Generated code for /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/loaders/css-loader/src/index.js??ruleSet[1].rules[14].oneOf[12].use[2]!/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/node_modules/next/dist/build/webpack/loaders/postcss-loader/src/index.js??ruleSet[1].rules[14].oneOf[12].use[3]!/Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010/src/app/globals.css
+
+Import trace for requested module:
+./src/app/globals.css
+
+
+> Build failed because of webpack errors

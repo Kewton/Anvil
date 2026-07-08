@@ -329,6 +329,29 @@ fn conformance_negative_precise_exhaustion_rejects_no_blocker_with_pending_evide
 }
 
 #[test]
+fn conformance_negative_precise_exhaustion_checks_final_acceptance_exhaustion() {
+    let trace = Trace {
+        scenario: MatrixScenario::Nextjs,
+        events: vec![
+            json!({
+                "event": "final_acceptance_repair_exhausted",
+                "primary_reason": "loop_progress_exhausted",
+                "pending_capability_evidence": [
+                    "restart_or_recoverable_state_evidence",
+                    "user_input_handler_evidence"
+                ],
+                "pending_capability_evidence_count": 2
+            }),
+            terminal_stop("partial"),
+        ],
+        summary: terminal_summary("partial"),
+        output: String::new(),
+    };
+
+    assert_contract_fails("precise_exhaustion", check_precise_exhaustion(&trace));
+}
+
+#[test]
 fn conformance_negative_bounded_provider_turns_catches_silent_phase_context_window() {
     let trace = Trace {
         scenario: MatrixScenario::GenericStatic,
@@ -1030,7 +1053,12 @@ fn check_precise_exhaustion(trace: &Trace) -> Result<(), String> {
         }
         if !matches!(
             string_field(event, "event"),
-            Some("loop_stop" | "tui_command_stop" | "ultra_phase_failed")
+            Some(
+                "loop_stop"
+                    | "tui_command_stop"
+                    | "ultra_phase_failed"
+                    | "final_acceptance_repair_exhausted"
+            )
         ) {
             continue;
         }
@@ -1060,7 +1088,9 @@ fn check_precise_exhaustion(trace: &Trace) -> Result<(), String> {
             if value.contains("capability_evidence_unresolved:") {
                 saw_capability_unresolved = true;
             }
-            if value.contains("loop_progress_exhausted") {
+            if value.contains("loop_progress_exhausted")
+                || value.to_ascii_lowercase().contains("exhausted")
+            {
                 saw_loop_progress_exhausted = true;
             }
             if pending_contract && value.contains("no concrete blocker recorded") {

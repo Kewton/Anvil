@@ -1,0 +1,45 @@
+case_id = "test0708_010"
+source = "UAT test0708_010"
+required_paths = ["package.json", "tsconfig.json", "postcss.config.js", "tailwind.config.ts", "src/app/layout.tsx", "src/app/page.tsx", "src/app/globals.css", "src/app/global.d.ts"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "postcss", "tailwind"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = ["src/app/global.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+postcss.config.js = [
+  "export default config;"
+]
+package.json = [
+  "\"scripts\"",
+  "\"tailwindcss\""
+]
+fixtures/build-verifier-npm-run-build.txt = [
+  "Error: Your custom PostCSS configuration must export a `plugins` key.",
+  "Warning: Your PostCSS configuration defines a field which is not supported (`__esModule`)."
+]
+fixtures/events-postcss-esm.jsonl = [
+  "\"event\":\"dependency_build_lifecycle\"",
+  "\"message\":\"Error: Your custom PostCSS configuration must export a `plugins` key.\"",
+  "\"repair_session_mode\":\"compact\"",
+  "\"failure_kind\":\"compile_repair_no_source_change\""
+]

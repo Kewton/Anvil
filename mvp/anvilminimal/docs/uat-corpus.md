@@ -92,6 +92,31 @@ a route-bound page destructures `movePlayer`/`shoot` from an imported
 repair exhausted without source edits or a rollback snapshot. It is the corpus
 fixture for the repair-as-regeneration rung.
 
+The post-95/96 residual harvests are:
+
+```sh
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_010 \
+  test0708_010
+
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_011 \
+  test0708_011
+
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_012 \
+  test0708_012
+```
+
+`test0708_010` pins the PostCSS module-format incoherence: `postcss.config.js`
+uses `export default` while `package.json` is not `type=module`, producing the
+Next/PostCSS `plugins` export build error. `test0708_011` pins repeated
+`edit_anchor_not_found` on a route-bound game implementation, motivating
+best-match anchor feedback, unique normalized salvage, and full-file Write
+escalation. `test0708_012` pins the gate-reached final-acceptance partial:
+browser readiness is 200 and interaction probing runs, but final acceptance
+exhaustion was not naming pending restart/input evidence honestly.
+
 The script copies `src/**`, `package.json`, and common Next.js/TypeScript/
 Tailwind/PostCSS config files. It intentionally does not copy `node_modules`,
 `.next`, `.anvil`, lockfiles, logs, screenshots, or other generated artifacts.

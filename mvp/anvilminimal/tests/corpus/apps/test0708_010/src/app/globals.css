@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    background-color: #000000;
+    color: #ffffff;
+    font-family: 'Courier New', monospace;
+  }
+}
+
+@layer components {
+  .neon-text {
+    text-shadow: 0 0 5px #39ff14, 0 0 10px #39ff14;
+  }
+  .neon-pink {
+    text-shadow: 0 0 5px #ff6ec7, 0 0 10px #ff6ec7;
+  }
+  .neon-blue {
+    text-shadow: 0 0 5px #00d4ff, 0 0 10px #00d4ff;
+  }
+}

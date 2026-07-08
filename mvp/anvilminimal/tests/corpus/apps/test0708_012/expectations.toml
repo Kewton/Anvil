@@ -1,0 +1,55 @@
+case_id = "test0708_012"
+source = "UAT test0708_012"
+required_paths = ["package.json", "tsconfig.json", "postcss.config.js", "tailwind.config.ts", "src/app/layout.tsx", "src/app/page.tsx", "src/app/globals.css", "src/app/global.d.ts"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "restart", "input"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = ["src/app/global.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+src/app/page.tsx = [
+  "data-anvil-action=\"primary\"",
+  "data-anvil-action=\"restart\"",
+  "gameData.current.keys['ArrowLeft']",
+  "gameData.current.keys['Space']"
+]
+fixtures/browser-readiness.json = [
+  "\"status\": \"ready\"",
+  "\"ok\": true",
+  "\"http_status\": 200"
+]
+fixtures/browser-interaction.json = [
+  "\"browser_failure_kind\": \"input_state_change_missing_after_start\"",
+  "\"action_hooks\": [",
+  "\"primary\""
+]
+fixtures/events-final-acceptance-pending.jsonl = [
+  "\"event\":\"ultra_final_acceptance_failed\"",
+  "\"selected_evidence_keys\":[\"restart_or_recoverable_state_evidence\"]",
+  "\"reason\":\"loop_progress_exhausted: no concrete blocker recorded\"",
+  "\"final_acceptance_status\":\"incomplete\"",
+  "\"interaction_evidence_status\":\"failed:input_state_change_missing_after_start\""
+]
+fixtures/recovery-prompt.md = [
+  "loop_progress_exhausted: no concrete blocker recorded",
+  "restart_or_recoverable_state_evidence"
+]

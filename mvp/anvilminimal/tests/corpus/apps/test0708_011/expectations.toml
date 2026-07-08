@@ -1,0 +1,44 @@
+case_id = "test0708_011"
+source = "UAT test0708_011"
+required_paths = ["package.json", "tsconfig.json", "postcss.config.js", "tailwind.config.ts", "src/app/layout.tsx", "src/app/page.tsx", "src/hooks/useGameLoop.ts", "src/app/globals.css", "src/app/global.d.ts"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "edit", "anchor"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/hooks/useGameLoop.ts", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = ["src/app/global.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+src/app/page.tsx = [
+  "import { useGameLoop } from '@/hooks/useGameLoop';",
+  "restartGame();"
+]
+fixtures/events-anchor-miss.jsonl = [
+  "\"error_kind\":\"edit_anchor_not_found\"",
+  "\"repeat_count\":1",
+  "\"repeat_count\":2",
+  "\"repeat_count\":3",
+  "\"reason\":\"recoverable_tool_error_repeated\""
+]
+fixtures/recovery-prompt.md = [
+  "phase: game-engine-core",
+  "recoverable tool error repeated: edit_anchor_not_found",
+  "exhaustion classification"
+]
