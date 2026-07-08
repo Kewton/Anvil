@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -37,6 +37,70 @@ impl CompileError {
 
     pub fn summary(&self) -> String {
         format!("{} {}", self.location(), self.message)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FullCommandOutput {
+    path: PathBuf,
+    text: String,
+}
+
+impl FullCommandOutput {
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn path_display(&self) -> String {
+        self.path.display().to_string()
+    }
+
+    pub fn excerpt(&self) -> OutputExcerpt {
+        OutputExcerpt(eval_events::body_snippet(&self.text))
+    }
+
+    pub(crate) fn from_bounded_executor(root: &Path, command: &str, output: &str) -> Self {
+        Self {
+            path: write_build_verifier_output(root, command, output)
+                .unwrap_or_else(|| PathBuf::from("")),
+            text: output.to_string(),
+        }
+    }
+
+    pub(crate) fn read_from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            text,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_text(text: &str) -> Self {
+        Self {
+            path: PathBuf::from("<test>"),
+            text: text.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputExcerpt(String);
+
+impl OutputExcerpt {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for OutputExcerpt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -394,8 +458,11 @@ pub fn observe_requirement(
         },
         Err(err) => {
             let reason = err.to_string();
-            let output_path = write_build_verifier_output(root, requirement, &reason);
-            let mut compile_errors = parse_compile_errors_for_requirement(requirement, &reason);
+            let full_output =
+                FullCommandOutput::from_bounded_executor(root, &requirement.command, &reason);
+            let output_excerpt = full_output.excerpt();
+            let mut compile_errors =
+                parse_compile_errors_for_requirement(requirement, &full_output);
             profile.annotate_compile_errors(root, &mut compile_errors);
             let status = if profile.dependency_missing_output(&reason) {
                 BuildVerifierStatus::DependencyMissing
@@ -415,9 +482,9 @@ pub fn observe_requirement(
                 dependency_ready,
                 attempted: true,
                 status,
-                primary_reason: eval_events::body_snippet(&reason),
-                output_snippet: eval_events::body_snippet(&reason),
-                output_path,
+                primary_reason: output_excerpt.as_str().to_string(),
+                output_snippet: output_excerpt.as_str().to_string(),
+                output_path: full_output.path_display(),
                 compile_errors,
                 foreign_toolchain: None,
             }
@@ -507,7 +574,8 @@ pub(crate) fn observe_dependency_missing_output_lifecycle_with_setup_program_and
     npm_program: &Path,
     offline: bool,
 ) -> BuildVerifierLifecycleObservation {
-    let snippet = eval_events::body_snippet(output);
+    let full_output = FullCommandOutput::from_bounded_executor(root, &requirement.command, output);
+    let snippet = full_output.excerpt().to_string();
     let before_setup = BuildVerifierObservation {
         command: requirement.command.clone(),
         profile: requirement.profile.clone(),
@@ -520,7 +588,7 @@ pub(crate) fn observe_dependency_missing_output_lifecycle_with_setup_program_and
         status: BuildVerifierStatus::DependencyMissing,
         primary_reason: snippet.clone(),
         output_snippet: snippet,
-        output_path: write_build_verifier_output(root, requirement, output),
+        output_path: full_output.path_display(),
         compile_errors: Vec::new(),
         foreign_toolchain: profile_for_build_requirement(requirement)
             .foreign_toolchain(root, requirement),
@@ -588,26 +656,19 @@ fn observe_requirement_lifecycle_from_before(
     }
 }
 
-fn write_build_verifier_output(
-    root: &Path,
-    requirement: &BuildVerifierRequirement,
-    output: &str,
-) -> String {
+fn write_build_verifier_output(root: &Path, command: &str, output: &str) -> Option<PathBuf> {
     if output.trim().is_empty() {
-        return String::new();
+        return None;
     }
     let dir = root.join(".anvil").join("evidence");
     if std::fs::create_dir_all(&dir).is_err() {
-        return String::new();
+        return None;
     }
-    let path = dir.join(format!(
-        "build-verifier-{}.log",
-        command_slug(&requirement.command)
-    ));
+    let path = dir.join(format!("build-verifier-{}.log", command_slug(command)));
     if std::fs::write(&path, output).is_err() {
-        return String::new();
+        return None;
     }
-    path.display().to_string()
+    Some(path)
 }
 
 fn command_slug(command: &str) -> String {
@@ -630,7 +691,21 @@ fn command_slug(command: &str) -> String {
     }
 }
 
-pub fn parse_compile_errors(output: &str) -> Vec<CompileError> {
+/// Parses compiler diagnostics only from a full bounded command output.
+///
+/// Display excerpts are intentionally not accepted by this API.
+///
+/// ```compile_fail
+/// use anvilminimal::minimal_loop::build_verifier::{parse_compile_errors, OutputExcerpt};
+///
+/// let excerpt: OutputExcerpt = todo!();
+/// let _ = parse_compile_errors(&excerpt);
+/// ```
+pub fn parse_compile_errors(output: &FullCommandOutput) -> Vec<CompileError> {
+    parse_compile_errors_text(output.as_str())
+}
+
+fn parse_compile_errors_text(output: &str) -> Vec<CompileError> {
     let clean = strip_ansi_sequences(output);
     let lines = clean.lines().collect::<Vec<_>>();
     let mut errors = Vec::new();
@@ -1021,7 +1096,7 @@ fn strip_ansi_sequences(value: &str) -> String {
 
 fn parse_compile_errors_for_requirement(
     requirement: &BuildVerifierRequirement,
-    output: &str,
+    output: &FullCommandOutput,
 ) -> Vec<CompileError> {
     let profile = profile_for_build_requirement(requirement);
     let errors = profile.parse_compile_errors(output);
@@ -1123,7 +1198,8 @@ Failed to compile.
 Type error: Cannot find name 'reset'.
 "#;
 
-        let errors = parse_compile_errors(output);
+        let output = FullCommandOutput::from_test_text(output);
+        let errors = parse_compile_errors(&output);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, "src/components/SpaceInvaders.tsx");
@@ -1151,7 +1227,8 @@ Error:
 13 |   )
 "#;
 
-        let errors = parse_compile_errors(output);
+        let output = FullCommandOutput::from_test_text(output);
+        let errors = parse_compile_errors(&output);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, "src/app/page.tsx");
@@ -1185,7 +1262,8 @@ Error:
 stderr:
 "#;
 
-        let errors = parse_compile_errors(output);
+        let output = FullCommandOutput::from_test_text(output);
+        let errors = parse_compile_errors(&output);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, "src/app/game.ts");
@@ -1212,7 +1290,8 @@ Error:
 > Build failed because of webpack errors
 "#;
 
-        let errors = parse_compile_errors(output);
+        let output = FullCommandOutput::from_test_text(output);
+        let errors = parse_compile_errors(&output);
 
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, "src/app/page.tsx");

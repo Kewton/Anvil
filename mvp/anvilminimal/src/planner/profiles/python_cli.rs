@@ -7,7 +7,9 @@ use serde_json::json;
 
 use crate::bounded_process::{self, BoundedProcessOutcomeKind};
 use crate::eval_events;
-use crate::minimal_loop::build_verifier::{BuildVerifierRequirement, CompileError};
+use crate::minimal_loop::build_verifier::{
+    BuildVerifierRequirement, CompileError, FullCommandOutput,
+};
 use crate::minimal_loop::dependency_setup::{
     self, NodeDependencySetupAuthority, NodeDependencySetupRequirement,
 };
@@ -151,8 +153,8 @@ impl DomainProfile for PythonCliProfile {
             || lower.contains("no such file or directory")
     }
 
-    fn parse_compile_errors(&self, output: &str) -> Vec<CompileError> {
-        parse_python_compile_errors(output)
+    fn parse_compile_errors(&self, output: &FullCommandOutput) -> Vec<CompileError> {
+        parse_python_compile_errors(output.as_str())
     }
 
     fn infer_required_capabilities(&self, _goal: &str) -> Vec<String> {
@@ -511,7 +513,9 @@ fn compile_report(root: &Path) -> VerificationReport {
         Ok(_) => VerificationReport::pass(),
         Err(err) => {
             let text = err.to_string();
-            let errors = parse_python_compile_errors(&text);
+            let full_output =
+                FullCommandOutput::from_bounded_executor(root, COMPILE_COMMAND, &text);
+            let errors = parse_python_compile_errors(full_output.as_str());
             let mut report = VerificationReport::pass();
             if errors.is_empty() {
                 report.push_command_failure(COMPILE_COMMAND, text);

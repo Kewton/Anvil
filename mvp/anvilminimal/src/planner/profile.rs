@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::minimal_loop::build_verifier::{
-    BuildVerifierRequirement, CompileError, ForeignToolchainObservation,
+    BuildVerifierRequirement, CompileError, ForeignToolchainObservation, FullCommandOutput,
 };
 use crate::minimal_loop::dependency_setup::{
     self, NodeDependencySetupAuthority, NodeDependencySetupRequirement,
@@ -161,7 +161,7 @@ pub trait DomainProfile: Sync {
         false
     }
 
-    fn parse_compile_errors(&self, _output: &str) -> Vec<CompileError> {
+    fn parse_compile_errors(&self, _output: &FullCommandOutput) -> Vec<CompileError> {
         Vec::new()
     }
 

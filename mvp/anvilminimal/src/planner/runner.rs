@@ -9989,10 +9989,12 @@ fn compile_errors_from_release_evidence_path(path: &str) -> Vec<CompileError> {
         return Vec::new();
     };
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
-        return build_verifier::parse_compile_errors(&text);
+        return build_verifier::FullCommandOutput::read_from_path(evidence_path)
+            .map(|output| build_verifier::parse_compile_errors(&output))
+            .unwrap_or_default();
     };
     let mut errors = Vec::new();
-    for output in release_evidence_compile_output_fields(&value, evidence_path) {
+    for output in release_evidence_compile_output_path_fields(&value, evidence_path) {
         for error in build_verifier::parse_compile_errors(&output) {
             if !errors.contains(&error) {
                 errors.push(error);
@@ -10002,16 +10004,11 @@ fn compile_errors_from_release_evidence_path(path: &str) -> Vec<CompileError> {
     errors
 }
 
-fn release_evidence_compile_output_fields(value: &Value, evidence_path: &Path) -> Vec<String> {
-    let full_outputs = release_evidence_compile_output_path_fields(value, evidence_path);
-    if !full_outputs.is_empty() {
-        return full_outputs;
-    }
-    release_evidence_compile_excerpt_fields(value)
-}
-
-fn release_evidence_compile_output_path_fields(value: &Value, evidence_path: &Path) -> Vec<String> {
-    let mut out = Vec::new();
+fn release_evidence_compile_output_path_fields(
+    value: &Value,
+    evidence_path: &Path,
+) -> Vec<build_verifier::FullCommandOutput> {
+    let mut out: Vec<build_verifier::FullCommandOutput> = Vec::new();
     let base_dir = evidence_path.parent().unwrap_or_else(|| Path::new("."));
     for scope in raw_value_scopes(value) {
         for key in [
@@ -10028,34 +10025,14 @@ fn release_evidence_compile_output_path_fields(value: &Value, evidence_path: &Pa
                 } else {
                     base_dir.join(path)
                 };
-                if let Ok(text) = std::fs::read_to_string(path)
-                    && !text.trim().is_empty()
-                    && !out.iter().any(|existing| existing == &text)
+                if let Ok(output) = build_verifier::FullCommandOutput::read_from_path(path)
+                    && !output.as_str().trim().is_empty()
+                    && !out
+                        .iter()
+                        .any(|existing| existing.as_str() == output.as_str())
                 {
-                    out.push(text);
+                    out.push(output);
                 }
-            }
-        }
-    }
-    out
-}
-
-fn release_evidence_compile_excerpt_fields(value: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    for scope in raw_value_scopes(value) {
-        for key in [
-            "output_excerpt",
-            "stderr",
-            "stdout",
-            "build_output",
-            "error",
-            "message",
-        ] {
-            if let Some(text) = scope.get(key).and_then(Value::as_str)
-                && !text.trim().is_empty()
-                && !out.iter().any(|existing| existing == text)
-            {
-                out.push(text.to_string());
             }
         }
     }
@@ -24893,6 +24870,12 @@ export default function Page() {\n\
 }\n",
         )
         .unwrap();
+        let full_output_path = dir.path().join("build-output.log");
+        std::fs::write(
+            &full_output_path,
+            "./src/app/page.tsx:6:3\nType error: Expected 3 arguments, but got 4.\n",
+        )
+        .unwrap();
         let readiness = dir.path().join("browser-readiness.json");
         std::fs::write(
             &readiness,
@@ -24900,7 +24883,8 @@ export default function Page() {\n\
                 "status": "failed",
                 "ok": false,
                 "failure_kind": "build_verifier_failed",
-                "output_excerpt": "./src/app/page.tsx:6:3\nType error: Expected 3 arguments, but got 4.\n"
+                "output_excerpt": "./src/app/page.tsx:6:3\nType error: Expected 3 arguments, but got 4.\n",
+                "build_output_path": "build-output.log"
             }))
             .unwrap(),
         )
@@ -24999,13 +24983,6 @@ Type error: Cannot find name 'player'. Did you mean 'PLAYER_W'?\n\n\
             .unwrap(),
         )
         .unwrap();
-        assert!(
-            build_verifier::parse_compile_errors(
-                "command failed: npm run build summary: Failed to compile. Type error: Cannot find name 'player'. Did you mean 'PLAYER_W'?"
-            )
-            .is_empty(),
-            "the display excerpt intentionally lacks the source anchor"
-        );
         let errors = compile_errors_from_release_evidence_path(&readiness.display().to_string());
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].path, "src/app/page.tsx");
