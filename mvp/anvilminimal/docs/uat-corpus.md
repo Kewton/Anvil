@@ -117,6 +117,29 @@ escalation. `test0708_012` pins the gate-reached final-acceptance partial:
 browser readiness is 200 and interaction probing runs, but final acceptance
 exhaustion was not naming pending restart/input evidence honestly.
 
+The post-97 five-run residual harvests are:
+
+```sh
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_013 \
+  test0708_013
+
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_016 \
+  test0708_016
+
+mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
+  /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0708_017 \
+  test0708_017
+```
+
+`test0708_013` pins the root-anchor path-salvage miss for an absolute
+`/Users/.../commandagent_mvp/01/test0708_013/package.json` tool path.
+`test0708_016` pins the Bash-tool shell-control boundary shape
+`ls -R src/app && node -p "..."`. `test0708_017` pins the
+`gemma4:31b-cloud` honest exhaustion datum where restart/input capability
+evidence remained pending and the terminal reason names those keys.
+
 The script copies `src/**`, `package.json`, and common Next.js/TypeScript/
 Tailwind/PostCSS config files. It intentionally does not copy `node_modules`,
 `.next`, `.anvil`, lockfiles, logs, screenshots, or other generated artifacts.

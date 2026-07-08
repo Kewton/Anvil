@@ -1,0 +1,3 @@
+{"event":"provider_turn_duration","caller_scope":"executor","provider":"ollama","model":"gemma4:31b-cloud","duration_ms":78241,"timeout_ms":600000,"timeout_secs":600,"timed_out":false,"aborted_by_user":false,"ok":true,"tools":6,"native_tools_enabled":true}
+{"event":"phase_loop_exhausted","reason":"loop_progress_exhausted","pending_capability_evidence":["restart_or_recoverable_state_evidence","input_state_change_evidence"]}
+{"event":"tui_command_stop","status":"incomplete","reason":"capability_evidence_unresolved:restart_or_recoverable_state_evidence,input_state_change_evidence","pending_capability_evidence":["restart_or_recoverable_state_evidence","input_state_change_evidence"]}

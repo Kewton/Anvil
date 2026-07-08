@@ -248,6 +248,7 @@ pub struct CompletionSnapshot {
     pub display_normalization_count: usize,
     pub display_salvaged_count: usize,
     pub display_substituted_count: usize,
+    pub context_truncation_warning_count: usize,
     pub compile_rollback_summaries: Vec<String>,
 }
 
@@ -307,6 +308,7 @@ impl CompletionSnapshot {
             display_normalization_count: 0,
             display_salvaged_count: 0,
             display_substituted_count: 0,
+            context_truncation_warning_count: 0,
             compile_rollback_summaries: Vec::new(),
         }
     }
@@ -380,6 +382,7 @@ pub struct CompletionProjection {
     pub display_normalization_count: usize,
     pub display_salvaged_count: usize,
     pub display_substituted_count: usize,
+    pub context_truncation_warning_count: usize,
     pub compile_rollback_summaries: Vec<String>,
 }
 
@@ -389,6 +392,7 @@ struct PlannerDiagnostics {
     display_normalization_count: usize,
     display_salvaged_count: usize,
     display_substituted_count: usize,
+    context_truncation_warning_count: usize,
     retry_count: usize,
     quality_warning_count: usize,
     quality_issue_count: usize,
@@ -446,6 +450,7 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
     snapshot.display_normalization_count = diagnostics.display_normalization_count;
     snapshot.display_salvaged_count = diagnostics.display_salvaged_count;
     snapshot.display_substituted_count = diagnostics.display_substituted_count;
+    snapshot.context_truncation_warning_count = diagnostics.context_truncation_warning_count;
     snapshot.compile_rollback_summaries = compile_rollback_summaries_from_events(&events);
     recovery_fields.apply_to(&mut snapshot);
     persistence_fields.apply_to(&mut snapshot);
@@ -551,6 +556,7 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         display_normalization_count: snapshot.display_normalization_count,
         display_salvaged_count: snapshot.display_salvaged_count,
         display_substituted_count: snapshot.display_substituted_count,
+        context_truncation_warning_count: snapshot.context_truncation_warning_count,
         compile_rollback_summaries: snapshot.compile_rollback_summaries.clone(),
     }
 }
@@ -681,6 +687,9 @@ fn planner_diagnostics_from_events(events: &[Value]) -> PlannerDiagnostics {
             }
             "verify_command_substituted" => {
                 diagnostics.display_substituted_count += 1;
+            }
+            "context_truncation_suspected" => {
+                diagnostics.context_truncation_warning_count += 1;
             }
             "planner_quality_retry"
             | "planner_quality_retry_degraded"
@@ -1079,6 +1088,12 @@ fn terminal_card_telemetry(projection: &CompletionProjection) -> Option<String> 
         parts.push(format!(
             "rollbacks={}",
             projection.compile_rollback_summaries.len()
+        ));
+    }
+    if projection.context_truncation_warning_count > 0 {
+        parts.push(format!(
+            "context_truncation_suspected={}",
+            projection.context_truncation_warning_count
         ));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
@@ -1919,6 +1934,7 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
         display_normalization_count: 0,
         display_salvaged_count: 0,
         display_substituted_count: 0,
+        context_truncation_warning_count: 0,
         compile_rollback_summaries: Vec::new(),
     })
 }
@@ -2310,6 +2326,17 @@ fn render_completion_summary(
             projection.planner_retry_count,
             projection.planner_quality_warning_count,
             projection.planner_quality_issue_count
+        ),
+        format!(
+            "Context truncation warning: {}",
+            if projection.context_truncation_warning_count > 0 {
+                format!(
+                    "suspected (warnings={})",
+                    projection.context_truncation_warning_count
+                )
+            } else {
+                "none".to_string()
+            }
         ),
         format!(
             "Release quality completion: {}",
@@ -2900,6 +2927,49 @@ mod tests {
         let path = default_run_events_path(dir.path());
         assert!(path.starts_with(dir.path().join(".anvil").join("runs")));
         assert_eq!(path.file_name().unwrap(), "events.jsonl");
+    }
+
+    #[test]
+    fn context_truncation_warning_projects_to_summary_and_terminal_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "context_truncation_suspected",
+                "level": "WARNING",
+                "caller_scope": "executor",
+                "provider": "ollama",
+                "model": "gemma4:31b-cloud",
+                "estimated_prompt_tokens_sent": 4096,
+                "prompt_eval_count": 1024,
+                "eval_count": 128,
+                "finish_reason": "length",
+                "persistent_undercut_count": 2,
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+        assert_eq!(snapshot.context_truncation_warning_count, 1);
+        let projection = project_completion(false, &snapshot);
+        assert_eq!(projection.context_truncation_warning_count, 1);
+        let summary = render_completion_summary(
+            "tui_command",
+            None,
+            Some("/run-ultra"),
+            "context telemetry",
+            "",
+            &projection,
+        );
+        assert!(
+            summary.contains("Context truncation warning: suspected (warnings=1)"),
+            "{summary}"
+        );
+        let telemetry = terminal_card_telemetry(&projection).unwrap_or_default();
+        assert!(
+            telemetry.contains("context_truncation_suspected=1"),
+            "{telemetry}"
+        );
     }
 
     #[test]

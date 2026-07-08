@@ -1,0 +1,2 @@
+{"event":"tool_call_raw","name":"Bash","arguments_shape":{"command":"ls -R src/app && node -p \"require('./package.json').scripts.build\""}}
+{"event":"runtime_bash_policy","command":"ls -R src/app && node -p \"require('./package.json').scripts.build\"","normalized_segments":["ls -R src/app","node -p \"require('./package.json').scripts.build\""],"phase_continues":true}

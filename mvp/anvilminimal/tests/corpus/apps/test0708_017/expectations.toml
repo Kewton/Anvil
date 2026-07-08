@@ -1,0 +1,39 @@
+case_id = "test0708_017"
+source = "UAT test0708_017"
+required_paths = ["package.json", "tsconfig.json", "next-env.d.ts", "src/app/layout.tsx", "src/app/page.tsx"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "restart", "input", "exhaustion"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx"]
+exclude = ["next-env.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+src/app/page.tsx = [
+  "data-anvil-action=\"primary\"",
+  "onClick={restartGame}",
+  "addEventListener(\"keydown\""
+]
+fixtures/events-capability-exhaustion.jsonl = [
+  "\"model\":\"gemma4:31b-cloud\"",
+  "\"reason\":\"capability_evidence_unresolved:restart_or_recoverable_state_evidence,input_state_change_evidence\"",
+  "\"pending_capability_evidence\":[\"restart_or_recoverable_state_evidence\",\"input_state_change_evidence\"]",
+  "\"loop_progress_exhausted\""
+]

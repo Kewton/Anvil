@@ -1,0 +1,39 @@
+case_id = "test0708_013"
+source = "UAT test0708_013"
+required_paths = ["package.json", "tsconfig.json", "next-env.d.ts", "src/app/layout.tsx", "src/app/page.tsx"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "package", "path", "salvage"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx"]
+exclude = ["next-env.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+src/app/page.tsx = [
+  "data-anvil-action=\"primary\"",
+  "data-anvil-action=\"restart\"",
+  "Space Invaders Path Salvage"
+]
+fixtures/events-path-salvage-miss.jsonl = [
+  "\"name\":\"Write\"",
+  "\"path\":\"/Users/example/share/work/commandagent_mvp/01/test0708_013/package.json\"",
+  "\"error_kind\":\"path_outside_workspace\"",
+  "\"root_anchor\":\"01/test0708_013\""
+]

@@ -1,0 +1,2 @@
+{"event":"tool_call_raw","name":"Write","arguments_shape":{"path":"/Users/example/share/work/commandagent_mvp/01/test0708_013/package.json"}}
+{"event":"tool_result","name":"Write","ok":false,"error_kind":"path_outside_workspace","path":"/Users/example/share/work/commandagent_mvp/01/test0708_013/package.json","root_anchor":"01/test0708_013"}

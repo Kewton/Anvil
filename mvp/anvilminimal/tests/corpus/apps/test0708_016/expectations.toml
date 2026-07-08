@@ -1,0 +1,39 @@
+case_id = "test0708_016"
+source = "UAT test0708_016"
+required_paths = ["package.json", "tsconfig.json", "next-env.d.ts", "src/app/layout.tsx", "src/app/page.tsx"]
+verify_commands = []
+required_capabilities = ["nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = ["setup", "implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["space", "invaders", "bash", "verify", "shell"]
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx"]
+exclude = ["next-env.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+src/app/page.tsx = [
+  "data-anvil-action=\"primary\"",
+  "data-anvil-action=\"restart\"",
+  "Bash Boundary Invaders"
+]
+fixtures/events-bash-boundary.jsonl = [
+  "ls -R src/app && node -p",
+  "\"runtime_bash_policy\"",
+  "\"normalized_segments\":[\"ls -R src/app\",\"node -p \\\"require('./package.json').scripts.build\\\"\"]",
+  "\"phase_continues\":true"
+]
