@@ -426,6 +426,9 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
             latest_completion_index = Some(index);
         }
     }
+    if let Some(profile) = latest_lifecycle_profile_fields(&events) {
+        profile.apply_to(&mut snapshot);
+    }
     if let Some(reinference) = latest_profile_reinference_after(&events, latest_completion_index) {
         reinference.apply_to(&mut snapshot);
     }
@@ -1930,6 +1933,111 @@ struct ProfileReinferenceFields {
     contract_origin: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleProfileFields {
+    profile: String,
+    effective_profile: String,
+    profile_inferred: String,
+    profile_inference_source: String,
+    requested_port: String,
+    contract_origin: String,
+}
+
+impl LifecycleProfileFields {
+    fn apply_to(self, snapshot: &mut CompletionSnapshot) {
+        let current =
+            crate::planner::profile::canonical_profile_name(&snapshot_effective_profile(snapshot));
+        let incoming = crate::planner::profile::canonical_profile_name(&self.effective_profile);
+        let should_replace_profile = snapshot.profile.trim().is_empty()
+            || (current == "generic" && known_non_generic_profile(&incoming));
+        if should_replace_profile {
+            snapshot.profile = self.profile.clone();
+            snapshot.effective_profile = self.effective_profile.clone();
+        } else if snapshot.effective_profile.trim().is_empty()
+            && !snapshot.profile.trim().is_empty()
+        {
+            snapshot.effective_profile = snapshot.profile.clone();
+        }
+        if snapshot.profile_inferred.trim().is_empty() && !self.profile_inferred.is_empty() {
+            snapshot.profile_inferred = self.profile_inferred;
+        }
+        if snapshot.profile_inference_source.trim().is_empty()
+            && !self.profile_inference_source.is_empty()
+        {
+            snapshot.profile_inference_source = self.profile_inference_source;
+        }
+        if snapshot.requested_port.trim().is_empty() && !self.requested_port.is_empty() {
+            snapshot.requested_port = self.requested_port;
+        }
+        if snapshot.contract_origin == "initial" && !self.contract_origin.is_empty() {
+            snapshot.contract_origin = self.contract_origin;
+        }
+    }
+}
+
+fn latest_lifecycle_profile_fields(events: &[Value]) -> Option<LifecycleProfileFields> {
+    events.iter().rev().find_map(lifecycle_profile_fields)
+}
+
+fn lifecycle_profile_fields(event: &Value) -> Option<LifecycleProfileFields> {
+    let name = event.get("event").and_then(Value::as_str)?;
+    if !matches!(
+        name,
+        "run_start"
+            | "tui_command_start"
+            | "ultra_context_initialized"
+            | "ultra_plan_generation_attempt"
+            | "ultra_plan_saved"
+            | "recovery_prompt_saved"
+            | "resume_start"
+    ) {
+        return None;
+    }
+    let profile = event
+        .get("effective_profile")
+        .or_else(|| event.get("profile"))
+        .or_else(|| event.get("recovery_profile"))
+        .or_else(|| event.get("resume_effective_profile"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(LifecycleProfileFields {
+        profile: profile.to_string(),
+        effective_profile: profile.to_string(),
+        profile_inferred: event
+            .get("profile_inferred")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        profile_inference_source: event
+            .get("profile_inference_source")
+            .or_else(|| event.get("from"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        requested_port: event
+            .get("requested_port")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                event
+                    .get("requested_port_value")
+                    .and_then(Value::as_u64)
+                    .map(|value| value.to_string())
+            })
+            .unwrap_or_default(),
+        contract_origin: event
+            .get("contract_origin")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn known_non_generic_profile(profile: &str) -> bool {
+    crate::planner::profile::domain_profile(profile).id() != "generic"
+}
+
 impl ProfileReinferenceFields {
     fn apply_to(self, snapshot: &mut CompletionSnapshot) {
         snapshot.profile = self.to_profile.clone();
@@ -2880,6 +2988,44 @@ mod tests {
         assert_eq!(snapshot.contract_origin, "promoted_union");
         assert!(snapshot.assurance_level.is_empty());
         assert!(snapshot.assurance_reason.is_empty());
+    }
+
+    #[test]
+    fn latest_completion_snapshot_uses_known_profile_from_early_lifecycle_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "tui_command_start",
+                "command": "/ultra-plan-run",
+                "profile": "nextjs",
+                "style": "default",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_context_initialized",
+                "profile": "nextjs",
+                "requested_port": "3011 (goal)",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "planner_error",
+                "planner_error_kind": "verify_command_policy_error",
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(false, &snapshot);
+
+        assert_eq!(snapshot.profile, "nextjs");
+        assert_eq!(snapshot.effective_profile, "nextjs");
+        assert_eq!(snapshot.requested_port, "3011 (goal)");
+        assert_eq!(projection.effective_profile, "nextjs");
     }
 
     #[test]

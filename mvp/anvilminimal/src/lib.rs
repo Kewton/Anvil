@@ -637,6 +637,9 @@ fn apply_config_completion_metadata(
     if snapshot.profile.trim().is_empty() {
         snapshot.profile = config.profile.clone();
     }
+    if snapshot.effective_profile.trim().is_empty() {
+        snapshot.effective_profile = snapshot.profile.clone();
+    }
     if crate::planner::profile::canonical_profile_name(&snapshot.profile) == "generic" {
         if snapshot.assurance_level == "static" {
             snapshot.assurance_reason = eval_events::GENERIC_STATIC_ASSURANCE_REASON.to_string();
@@ -746,6 +749,55 @@ mod tests {
         assert!(summary.contains("Session/REPL status: process_exited"));
         assert!(summary.contains("Final acceptance: not_checked"));
         assert!(summary.contains("Stop reason: completed"));
+    }
+
+    #[test]
+    fn run_stop_preserves_known_profile_from_early_death_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/test-run/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            json!({
+                "event": "tui_command_start",
+                "command": "/ultra-plan-run",
+                "profile": "nextjs",
+            }),
+        );
+        eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            json!({
+                "event": "ultra_context_initialized",
+                "profile": "nextjs",
+                "requested_port": "3011 (goal)",
+            }),
+        );
+        eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            json!({
+                "event": "planner_error",
+                "planner_error_kind": "verify_command_policy_error",
+            }),
+        );
+
+        let result: anyhow::Result<()> =
+            Err(anyhow::anyhow!("invalid StepPlan after corrective retries"));
+        emit_run_stop(&cfg, &result);
+
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        let run_stop = event_text
+            .lines()
+            .rfind(|line| line.contains(r#""event":"run_stop""#))
+            .unwrap();
+        assert!(
+            run_stop.contains(r#""effective_profile":"nextjs""#),
+            "{run_stop}"
+        );
+        assert!(!run_stop.contains("generic_profile_reduced_assurance"));
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains("Effective profile: nextjs"), "{summary}");
+        assert!(!summary.contains("Assurance: reduced"), "{summary}");
     }
 
     #[test]

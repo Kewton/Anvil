@@ -580,6 +580,9 @@ fn apply_config_completion_metadata(
     if snapshot.profile.trim().is_empty() {
         snapshot.profile = config.profile.clone();
     }
+    if snapshot.effective_profile.trim().is_empty() {
+        snapshot.effective_profile = snapshot.profile.clone();
+    }
     if crate::planner::profile::canonical_profile_name(&snapshot.profile) == "generic" {
         if snapshot.assurance_level == "static" {
             snapshot.assurance_reason =
@@ -975,6 +978,52 @@ mod tests {
         assert!(summary.contains(
             "Assurance: static (generic profile — minimal interactive contract verified statically; no behavioral verification)"
         ));
+    }
+
+    #[test]
+    fn tui_command_stop_preserves_known_profile_from_early_death_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let events = workspace.join(".anvil/runs/test/events.jsonl");
+        std::fs::create_dir_all(events.parent().unwrap()).unwrap();
+        let mut cfg = config();
+        cfg.workspace_root = workspace;
+        cfg.eval_events_path = Some(events.clone());
+        crate::eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            serde_json::json!({
+                "event": "tui_command_start",
+                "command": "/ultra-plan-run",
+                "profile": "nextjs",
+            }),
+        );
+        crate::eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            serde_json::json!({
+                "event": "ultra_context_initialized",
+                "profile": "nextjs",
+                "requested_port": "3011 (goal)",
+            }),
+        );
+
+        let result: anyhow::Result<String> =
+            Err(anyhow::anyhow!("invalid StepPlan after corrective retries"));
+        let projection = emit_tui_command_stop(&cfg, "/ultra-plan-run", &result);
+
+        assert_eq!(projection.effective_profile, "nextjs");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        let tui_stop = event_text
+            .lines()
+            .rfind(|line| line.contains(r#""event":"tui_command_stop""#))
+            .unwrap();
+        assert!(
+            tui_stop.contains(r#""effective_profile":"nextjs""#),
+            "{tui_stop}"
+        );
+        assert!(!tui_stop.contains("generic_profile_reduced_assurance"));
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains("Effective profile: nextjs"), "{summary}");
+        assert!(!summary.contains("Assurance: reduced"), "{summary}");
     }
 
     #[test]
