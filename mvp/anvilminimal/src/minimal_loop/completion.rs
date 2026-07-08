@@ -1053,6 +1053,13 @@ fn type_script_cross_file_definition_guidance(root: &Path, error: &CompileError)
             contexts.push(context);
         }
     }
+    if let Some(property) = property_missing_name(&error.message)
+        && let Some(imported_call) =
+            destructured_property_imported_call(root, &error.path, &property)
+        && let Some(context) = imported_symbol_definition_excerpt(root, &error.path, &imported_call)
+    {
+        contexts.push(context);
+    }
     let missing_property = property_missing_name(&error.message);
     let missing_type = property_missing_type_name(&error.message);
     if let Some(type_name) = missing_type.as_deref()
@@ -1154,6 +1161,17 @@ fn local_receiver_imported_call(root: &Path, source: &str, receiver: &str) -> Op
     imported_symbol_definition_excerpt(root, source, &callee).map(|_| callee)
 }
 
+fn destructured_property_imported_call(
+    root: &Path,
+    source: &str,
+    property: &str,
+) -> Option<String> {
+    let content = std::fs::read_to_string(root.join(source)).ok()?;
+    let assignment = find_object_destructure_assignment_expression(&content, property)?;
+    let callee = leading_call_identifier(&assignment)?;
+    imported_symbol_definition_excerpt(root, source, &callee).map(|_| callee)
+}
+
 fn find_local_assignment_expression(content: &str, receiver: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
@@ -1168,6 +1186,64 @@ fn find_local_assignment_expression(content: &str, receiver: &str) -> Option<Str
         }
     }
     None
+}
+
+fn find_object_destructure_assignment_expression(content: &str, property: &str) -> Option<String> {
+    let lines = content.lines().collect::<Vec<_>>();
+    for (start, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if !["const", "let", "var"]
+            .iter()
+            .any(|keyword| trimmed.starts_with(&format!("{keyword} {{")))
+        {
+            continue;
+        }
+        let mut block = String::new();
+        for line in lines.iter().skip(start).take(80) {
+            let trimmed = line.trim();
+            if !block.is_empty() {
+                block.push('\n');
+            }
+            block.push_str(trimmed);
+            if let Some(assignment) = destructure_assignment_after_close(trimmed)
+                && destructuring_contains_property(&block, property)
+            {
+                return Some(assignment);
+            }
+            if trimmed.ends_with(';') && !block.contains("} =") && !block.contains("}=") {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn destructure_assignment_after_close(line: &str) -> Option<String> {
+    line.split_once("} =")
+        .map(|(_, rest)| rest)
+        .or_else(|| line.split_once("}=").map(|(_, rest)| rest))
+        .map(|rest| rest.trim().trim_end_matches(';').to_string())
+        .filter(|rest| !rest.is_empty())
+}
+
+fn destructuring_contains_property(block: &str, property: &str) -> bool {
+    let Some((_, after_open)) = block.split_once('{') else {
+        return false;
+    };
+    let Some((inside, _)) = after_open.rsplit_once('}') else {
+        return false;
+    };
+    inside
+        .split([',', '\n'])
+        .map(|part| {
+            part.trim()
+                .trim_start_matches("...")
+                .split_once(':')
+                .map(|(name, _)| name)
+                .unwrap_or_else(|| part.split_once('=').map(|(name, _)| name).unwrap_or(part))
+                .trim()
+        })
+        .any(|name| name == property)
 }
 
 fn leading_call_identifier(expression: &str) -> Option<String> {
@@ -1991,6 +2067,82 @@ export default function Page() {\n\
         assert!(
             prompt.contains(
                 "TypeScript member repair menu: use an exported member, export the missing one, or remove the call."
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn compile_repair_prompt_includes_imported_hook_api_for_destructured_missing_property() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src/hooks")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "import { useGameEngine } from \"../hooks/useGameEngine\";\n\
+export default function Page() {\n\
+  const {\n\
+    phase,\n\
+    score,\n\
+    movePlayer,\n\
+  } = useGameEngine();\n\
+  return <main>{phase}{score}</main>;\n\
+}\n",
+        )
+        .unwrap();
+        let filler = (0..32)
+            .map(|index| format!("  const filler{index} = {index};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            dir.path().join("src/hooks/useGameEngine.ts"),
+            format!(
+                "export function useGameEngine() {{\n\
+  const phase = 'playing';\n\
+  const score = 10;\n\
+  const restartGame = () => undefined;\n\
+{filler}\n\
+  return {{\n\
+    phase,\n\
+    score,\n\
+    restartGame,\n\
+    CANVAS_WIDTH: 800,\n\
+    CANVAS_HEIGHT: 600\n\
+  }};\n\
+}}\n"
+            ),
+        )
+        .unwrap();
+        let prompt = compile_repair_prompt_section_with_root(
+            Some(dir.path()),
+            &[CompileError {
+                path: "src/app/page.tsx".to_string(),
+                line: 6,
+                column: 5,
+                message: "Type error: Property 'movePlayer' does not exist on type '{ phase: string; score: number; restartGame: () => undefined; CANVAS_WIDTH: number; CANVAS_HEIGHT: number; }'."
+                    .to_string(),
+                excerpt: "4 |     phase,\n5 |     score,\n6 |     movePlayer,\n  |     ^".to_string(),
+                symbol: None,
+                route_bound: Some(true),
+            }],
+            CompileRepairPromptProtection::default(),
+        );
+
+        assert!(
+            prompt.contains(
+                "Imported definition context for `useGameEngine` from src/hooks/useGameEngine.ts:"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Public API surface for `useGameEngine`:"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("return {\n    phase"), "{prompt}");
+        assert!(prompt.contains("restartGame"), "{prompt}");
+        assert!(
+            prompt.contains(
+                "TypeScript member repair menu: call an existing member, or add movePlayer to useGameEngine's definition -- keep both files consistent"
             ),
             "{prompt}"
         );

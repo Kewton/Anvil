@@ -424,7 +424,11 @@ fn exported_definition_excerpt(content: &str, symbol: &str) -> Option<String> {
     }
     let start = find_exported_definition_start(&lines, symbol)?;
     let end = bounded_definition_end(&lines, start);
-    Some(lines[start..end].join("\n"))
+    let bounded = lines[start..end].join("\n");
+    if bounded.contains("return {") {
+        return Some(bounded);
+    }
+    exported_function_return_object_api_surface_excerpt(&lines, symbol, start).or(Some(bounded))
 }
 
 fn find_exported_definition_start(lines: &[&str], symbol: &str) -> Option<usize> {
@@ -593,6 +597,92 @@ fn exported_object_literal_api_surface_excerpt(lines: &[&str], symbol: &str) -> 
     if out.len() <= 2 {
         return None;
     }
+    out.push("}".to_string());
+    Some(out.join("\n"))
+}
+
+fn exported_function_return_object_api_surface_excerpt(
+    lines: &[&str],
+    symbol: &str,
+    start: usize,
+) -> Option<String> {
+    let first = lines.get(start)?.trim_start();
+    if !(first.starts_with(&format!("export function {symbol}"))
+        || first.starts_with(&format!("export async function {symbol}")))
+    {
+        return None;
+    }
+    let signature = first
+        .split_once('{')
+        .map(|(head, _)| format!("{} {{", head.trim_end()))
+        .unwrap_or_else(|| first.to_string());
+
+    let mut function_depth = 0isize;
+    let mut seen_function_open = false;
+    for (index, line) in lines.iter().enumerate().skip(start) {
+        let trimmed = line.trim();
+        if seen_function_open && function_depth == 1 && trimmed.starts_with("return {") {
+            return function_return_object_surface(lines, symbol, &signature, index);
+        }
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => {
+                    function_depth += 1;
+                    seen_function_open = true;
+                }
+                '}' => function_depth -= 1,
+                _ => {}
+            }
+        }
+        if seen_function_open && function_depth <= 0 {
+            break;
+        }
+    }
+    None
+}
+
+fn function_return_object_surface(
+    lines: &[&str],
+    symbol: &str,
+    signature: &str,
+    return_index: usize,
+) -> Option<String> {
+    let mut out = vec![
+        format!("Public API surface for `{symbol}`:"),
+        signature.to_string(),
+        "  return {".to_string(),
+    ];
+    let mut object_depth = 0isize;
+    let mut seen_object_open = false;
+    for line in lines.iter().skip(return_index) {
+        let trimmed = line.trim();
+        if seen_object_open
+            && object_depth == 1
+            && let Some(signature) = object_member_signature(trimmed.trim_end_matches(';'))
+        {
+            out.push(format!("    {signature}"));
+            if out.len() >= 33 {
+                break;
+            }
+        }
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => {
+                    object_depth += 1;
+                    seen_object_open = true;
+                }
+                '}' => object_depth -= 1,
+                _ => {}
+            }
+        }
+        if seen_object_open && object_depth <= 0 {
+            break;
+        }
+    }
+    if out.len() <= 3 {
+        return None;
+    }
+    out.push("  }".to_string());
     out.push("}".to_string());
     Some(out.join("\n"))
 }
