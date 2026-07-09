@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::eval_events;
-use crate::providers::{AssistantReply, ChatClient};
+use crate::providers::{AssistantReply, ChatClient, ResponseTiming};
 use crate::state::ConversationMessage;
 use crate::tools::registry::ToolSpec;
 
@@ -83,6 +83,14 @@ struct ProviderTurnTelemetry<'a> {
     estimated_stable_prefix_chars: u64,
     prompt_eval_count: Option<u64>,
     eval_count: Option<u64>,
+    prompt_eval_duration: Option<u64>,
+    eval_duration: Option<u64>,
+    load_duration: Option<u64>,
+    total_duration: Option<u64>,
+    prefill_seconds: Option<f64>,
+    generation_seconds: Option<f64>,
+    load_seconds: Option<f64>,
+    tokens_per_second_eval: Option<f64>,
     finish_reason: String,
     elapsed: Duration,
     timed_out: bool,
@@ -101,6 +109,11 @@ struct ProviderTurnTelemetryBase<'a> {
     elapsed: Duration,
     timed_out: bool,
     aborted_by_user: bool,
+}
+
+struct ProviderWorkerResult {
+    result: anyhow::Result<AssistantReply>,
+    timing: Option<ResponseTiming>,
 }
 
 pub fn chat(
@@ -182,6 +195,7 @@ where
 
     let Some(mut worker_client) = client.boxed_clone() else {
         let result = client.chat(model, messages, tools, native_tools_enabled);
+        let timing = client.take_response_timing();
         let elapsed = started.elapsed();
         crate::tui::status_bus::publish_provider_finished(elapsed);
         if result.is_ok() {
@@ -206,6 +220,7 @@ where
                     aborted_by_user: false,
                 },
                 &result,
+                timing,
             ),
         );
         return ProviderCallOutcome {
@@ -224,7 +239,8 @@ where
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let result = worker_client.chat(&worker_model, &messages, &tools, native_tools_enabled);
-        let _ = tx.send(result);
+        let timing = worker_client.take_response_timing();
+        let _ = tx.send(ProviderWorkerResult { result, timing });
     });
 
     loop {
@@ -261,6 +277,14 @@ where
                     estimated_stable_prefix_chars,
                     prompt_eval_count: None,
                     eval_count: None,
+                    prompt_eval_duration: None,
+                    eval_duration: None,
+                    load_duration: None,
+                    total_duration: None,
+                    prefill_seconds: None,
+                    generation_seconds: None,
+                    load_seconds: None,
+                    tokens_per_second_eval: None,
                     finish_reason: "timeout".to_string(),
                     elapsed,
                     timed_out: true,
@@ -285,7 +309,8 @@ where
         emit_provider_progress_if_due(started, config.chat_timeout_secs, &mut next_progress_at);
         let slice = PROVIDER_WAIT_SLICE.min(timeout.saturating_sub(elapsed));
         match rx.recv_timeout(slice) {
-            Ok(result) => {
+            Ok(worker_result) => {
+                let ProviderWorkerResult { result, timing } = worker_result;
                 let elapsed = started.elapsed();
                 crate::tui::status_bus::publish_provider_finished(elapsed);
                 if result.is_ok() {
@@ -310,6 +335,7 @@ where
                             aborted_by_user: false,
                         },
                         &result,
+                        timing,
                     ),
                 );
                 return ProviderCallOutcome {
@@ -335,6 +361,14 @@ where
                         estimated_stable_prefix_chars,
                         prompt_eval_count: None,
                         eval_count: None,
+                        prompt_eval_duration: None,
+                        eval_duration: None,
+                        load_duration: None,
+                        total_duration: None,
+                        prefill_seconds: None,
+                        generation_seconds: None,
+                        load_seconds: None,
+                        tokens_per_second_eval: None,
                         finish_reason: "error".to_string(),
                         elapsed,
                         timed_out: false,
@@ -493,6 +527,14 @@ fn provider_aborted_by_user(
             estimated_stable_prefix_chars: base.estimated_stable_prefix_chars,
             prompt_eval_count: None,
             eval_count: None,
+            prompt_eval_duration: None,
+            eval_duration: None,
+            load_duration: None,
+            total_duration: None,
+            prefill_seconds: None,
+            generation_seconds: None,
+            load_seconds: None,
+            tokens_per_second_eval: None,
             finish_reason: "aborted_by_user".to_string(),
             elapsed,
             timed_out: false,
@@ -512,8 +554,25 @@ fn provider_aborted_by_user(
 fn provider_turn_telemetry_from_result<'a>(
     base: ProviderTurnTelemetryBase<'a>,
     result: &anyhow::Result<AssistantReply>,
+    timing: Option<ResponseTiming>,
 ) -> ProviderTurnTelemetry<'a> {
     let reply = result.as_ref().ok();
+    let prompt_eval_duration = timing
+        .as_ref()
+        .and_then(|timing| timing.prompt_eval_duration);
+    let eval_duration = timing.as_ref().and_then(|timing| timing.eval_duration);
+    let load_duration = timing.as_ref().and_then(|timing| timing.load_duration);
+    let total_duration = timing.as_ref().and_then(|timing| timing.total_duration);
+    let prefill_seconds = prompt_eval_duration.map(duration_seconds_from_ollama);
+    let generation_seconds = eval_duration.map(duration_seconds_from_ollama);
+    let load_seconds = load_duration.map(duration_seconds_from_ollama);
+    let tokens_per_second_eval = match (
+        reply.and_then(|reply| reply.completion_tokens),
+        generation_seconds,
+    ) {
+        (Some(tokens), Some(seconds)) if seconds > 0.0 => Some(tokens as f64 / seconds),
+        _ => None,
+    };
     ProviderTurnTelemetry {
         scope: base.scope,
         provider: base.provider,
@@ -524,6 +583,14 @@ fn provider_turn_telemetry_from_result<'a>(
         estimated_stable_prefix_chars: base.estimated_stable_prefix_chars,
         prompt_eval_count: reply.and_then(|reply| reply.prompt_tokens),
         eval_count: reply.and_then(|reply| reply.completion_tokens),
+        prompt_eval_duration,
+        eval_duration,
+        load_duration,
+        total_duration,
+        prefill_seconds,
+        generation_seconds,
+        load_seconds,
+        tokens_per_second_eval,
         finish_reason: if base.timed_out {
             "timeout".to_string()
         } else if result.is_ok() {
@@ -536,6 +603,10 @@ fn provider_turn_telemetry_from_result<'a>(
         aborted_by_user: base.aborted_by_user,
         ok: result.is_ok(),
     }
+}
+
+fn duration_seconds_from_ollama(value: u64) -> f64 {
+    value as f64 / 1_000_000_000.0
 }
 
 fn emit_provider_turn_duration(config: &Config, telemetry: ProviderTurnTelemetry<'_>) {
@@ -558,14 +629,16 @@ fn emit_provider_turn_duration(config: &Config, telemetry: ProviderTurnTelemetry
         "estimated_stable_prefix_chars": telemetry.estimated_stable_prefix_chars,
         "prompt_eval_count": telemetry.prompt_eval_count,
         "eval_count": telemetry.eval_count,
+        "prompt_eval_duration": telemetry.prompt_eval_duration,
+        "eval_duration": telemetry.eval_duration,
+        "load_duration": telemetry.load_duration,
+        "total_duration": telemetry.total_duration,
+        "prefill_seconds": telemetry.prefill_seconds,
+        "generation_seconds": telemetry.generation_seconds,
+        "load_seconds": telemetry.load_seconds,
+        "tokens_per_second_eval": telemetry.tokens_per_second_eval,
         "finish_reason": telemetry.finish_reason.as_str(),
     });
-    if let Some(prompt_eval_count) = telemetry.prompt_eval_count
-        && telemetry.estimated_prompt_tokens > 0
-    {
-        value["cache_proxy_prompt_eval_over_estimated_prompt_tokens"] =
-            json!(prompt_eval_count as f64 / telemetry.estimated_prompt_tokens as f64);
-    }
     if telemetry.aborted_by_user {
         value["classification"] = json!("aborted_by_user");
     }
@@ -724,6 +797,38 @@ mod tests {
         }
     }
 
+    struct TimingClient;
+
+    impl ChatClient for TimingClient {
+        fn label(&self) -> &str {
+            "timing-mock"
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            _messages: &[ConversationMessage],
+            _tools: &[ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            Ok(AssistantReply {
+                content: "ok".to_string(),
+                tool_calls: Vec::new(),
+                prompt_tokens: Some(16),
+                completion_tokens: Some(4),
+            })
+        }
+
+        fn take_response_timing(&mut self) -> Option<ResponseTiming> {
+            Some(ResponseTiming {
+                prompt_eval_duration: Some(4_000_000_000),
+                eval_duration: Some(2_000_000_000),
+                load_duration: Some(1_000_000_000),
+                total_duration: Some(7_000_000_000),
+            })
+        }
+    }
+
     #[test]
     fn planner_scope_timeout_kinds_are_stable() {
         assert_eq!(
@@ -875,6 +980,76 @@ mod tests {
         assert!(events.contains("\"event\":\"context_truncation_suspected\""));
         assert!(events.contains("\"level\":\"WARNING\""));
         assert!(events.contains("\"persistent_undercut_count\":2"));
+    }
+
+    #[test]
+    fn provider_turn_records_response_durations_and_derived_metrics() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events_path = tmp.path().join("events.jsonl");
+        let config = test_config(tmp.path(), events_path.clone(), 30);
+        let mut client = TimingClient;
+
+        let outcome = chat(
+            &mut client,
+            &config,
+            ProviderCallScope::Executor,
+            "timing-test-model",
+            &[ConversationMessage::user("prompt".to_string())],
+            &[],
+            false,
+        );
+
+        assert!(outcome.result.is_ok());
+        let events = std::fs::read_to_string(events_path).expect("events");
+        let turn = events
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| {
+                event
+                    .get("event")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| name == "provider_turn_duration")
+            })
+            .expect("provider turn duration event");
+        assert_eq!(
+            turn.get("prompt_eval_duration")
+                .and_then(serde_json::Value::as_u64),
+            Some(4_000_000_000)
+        );
+        assert_eq!(
+            turn.get("eval_duration")
+                .and_then(serde_json::Value::as_u64),
+            Some(2_000_000_000)
+        );
+        assert_eq!(
+            turn.get("load_duration")
+                .and_then(serde_json::Value::as_u64),
+            Some(1_000_000_000)
+        );
+        assert_eq!(
+            turn.get("total_duration")
+                .and_then(serde_json::Value::as_u64),
+            Some(7_000_000_000)
+        );
+        assert_eq!(
+            turn.get("prefill_seconds")
+                .and_then(serde_json::Value::as_f64),
+            Some(4.0)
+        );
+        assert_eq!(
+            turn.get("generation_seconds")
+                .and_then(serde_json::Value::as_f64),
+            Some(2.0)
+        );
+        assert_eq!(
+            turn.get("load_seconds").and_then(serde_json::Value::as_f64),
+            Some(1.0)
+        );
+        assert_eq!(
+            turn.get("tokens_per_second_eval")
+                .and_then(serde_json::Value::as_f64),
+            Some(2.0)
+        );
     }
 
     #[test]

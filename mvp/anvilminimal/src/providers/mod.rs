@@ -12,6 +12,14 @@ use crate::config::{Config, Provider};
 use crate::state::{ConversationMessage, ToolCall};
 use crate::tools::registry::ToolSpec;
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResponseTiming {
+    pub prompt_eval_duration: Option<u64>,
+    pub eval_duration: Option<u64>,
+    pub load_duration: Option<u64>,
+    pub total_duration: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantReply {
     pub content: String,
@@ -44,6 +52,9 @@ pub trait ChatClient: Send {
     }
     fn allows_xml_fallback(&self) -> bool {
         false
+    }
+    fn take_response_timing(&mut self) -> Option<ResponseTiming> {
+        None
     }
     fn chat(
         &mut self,

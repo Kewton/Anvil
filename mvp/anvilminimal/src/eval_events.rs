@@ -3034,6 +3034,10 @@ mod tests {
                 "estimated_prompt_tokens_sent": 2000,
                 "prompt_eval_count": 1200,
                 "eval_count": 200,
+                "prompt_eval_duration": 4_000_000_000u64,
+                "eval_duration": 12_000_000_000u64,
+                "load_duration": 2_000_000_000u64,
+                "total_duration": 20_000_000_000u64,
             }),
         );
         emit(
@@ -3054,7 +3058,7 @@ mod tests {
         let summary = std::fs::read_to_string(path.parent().unwrap().join("summary.md")).unwrap();
         assert!(summary.contains("Time profile: provider 67%"), "{summary}");
         assert!(
-            summary.contains("tokens prompt_eval=1200 eval=200"),
+            summary.contains("[prefill 20% · generation 60% · load 10%]"),
             "{summary}"
         );
         assert!(summary.contains("Time profile by phase:"), "{summary}");

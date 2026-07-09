@@ -7,7 +7,7 @@ use crate::tools::args_recovery::recover_tool_arguments;
 use crate::tools::registry::ToolSpec;
 
 use super::parsing::tool_names;
-use super::{AssistantReply, ChatClient};
+use super::{AssistantReply, ChatClient, ResponseTiming};
 
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
@@ -16,6 +16,7 @@ pub struct OllamaClient {
     request_options: Value,
     keep_alive: &'static str,
     retries: usize,
+    last_response_timing: Option<ResponseTiming>,
 }
 
 impl OllamaClient {
@@ -37,6 +38,7 @@ impl OllamaClient {
             }),
             keep_alive: "10m",
             retries,
+            last_response_timing: None,
         })
     }
 
@@ -70,6 +72,10 @@ impl ChatClient for OllamaClient {
         true
     }
 
+    fn take_response_timing(&mut self) -> Option<ResponseTiming> {
+        self.last_response_timing.take()
+    }
+
     fn chat(
         &mut self,
         model: &str,
@@ -86,11 +92,14 @@ impl ChatClient for OllamaClient {
                 .send()
             {
                 Ok(response) if response.status().is_success() => {
-                    return parse_chat_response(
-                        &response.text()?,
+                    let body = response.text()?;
+                    let (reply, timing) = parse_chat_response_with_timing(
+                        &body,
                         &tool_names(tools),
                         !native_tools_enabled,
-                    );
+                    )?;
+                    self.last_response_timing = timing;
+                    return Ok(reply);
                 }
                 Ok(response) if attempt == self.retries => {
                     anyhow::bail!("Ollama /api/chat failed: {}", response.status());
@@ -167,6 +176,14 @@ struct ChatResponse {
     prompt_eval_count: Option<u64>,
     #[serde(default)]
     eval_count: Option<u64>,
+    #[serde(default)]
+    prompt_eval_duration: Option<u64>,
+    #[serde(default)]
+    eval_duration: Option<u64>,
+    #[serde(default)]
+    load_duration: Option<u64>,
+    #[serde(default)]
+    total_duration: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -194,19 +211,36 @@ pub fn parse_chat_response(
     allowed_tools: &[String],
     xml_fallback: bool,
 ) -> anyhow::Result<AssistantReply> {
+    parse_chat_response_with_timing(body, allowed_tools, xml_fallback).map(|(reply, _)| reply)
+}
+
+fn parse_chat_response_with_timing(
+    body: &str,
+    allowed_tools: &[String],
+    xml_fallback: bool,
+) -> anyhow::Result<(AssistantReply, Option<ResponseTiming>)> {
     let parsed: ChatResponse = serde_json::from_str(body)?;
     let message = parsed
         .message
         .ok_or_else(|| anyhow::anyhow!("Ollama response missing message"))?;
+    let timing = Some(ResponseTiming {
+        prompt_eval_duration: parsed.prompt_eval_duration,
+        eval_duration: parsed.eval_duration,
+        load_duration: parsed.load_duration,
+        total_duration: parsed.total_duration,
+    });
     if xml_fallback {
         let (tool_calls, content) =
             super::xml_fallback::extract_tool_calls(&message.content, allowed_tools)?;
-        return Ok(AssistantReply {
-            content,
-            tool_calls,
-            prompt_tokens: parsed.prompt_eval_count,
-            completion_tokens: parsed.eval_count,
-        });
+        return Ok((
+            AssistantReply {
+                content,
+                tool_calls,
+                prompt_tokens: parsed.prompt_eval_count,
+                completion_tokens: parsed.eval_count,
+            },
+            timing,
+        ));
     }
     let tool_calls = message
         .tool_calls
@@ -217,12 +251,15 @@ pub fn parse_chat_response(
             ToolCall::new(call.function.name, arguments)
         })
         .collect();
-    Ok(AssistantReply {
-        content: message.content,
-        tool_calls,
-        prompt_tokens: parsed.prompt_eval_count,
-        completion_tokens: parsed.eval_count,
-    })
+    Ok((
+        AssistantReply {
+            content: message.content,
+            tool_calls,
+            prompt_tokens: parsed.prompt_eval_count,
+            completion_tokens: parsed.eval_count,
+        },
+        timing,
+    ))
 }
 
 #[cfg(test)]
@@ -257,5 +294,29 @@ mod tests {
             Some(42)
         );
         assert!(first.get("tools").is_none());
+    }
+
+    #[test]
+    fn parse_chat_response_records_duration_fields() {
+        let (reply, timing) = parse_chat_response_with_timing(
+            r#"{
+                "message": {"content":"ok"},
+                "prompt_eval_count": 10,
+                "eval_count": 2,
+                "prompt_eval_duration": 4000000000,
+                "eval_duration": 2000000000,
+                "load_duration": 1000000000,
+                "total_duration": 7000000000
+            }"#,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(reply.prompt_tokens, Some(10));
+        let timing = timing.expect("timing");
+        assert_eq!(timing.prompt_eval_duration, Some(4_000_000_000));
+        assert_eq!(timing.eval_duration, Some(2_000_000_000));
+        assert_eq!(timing.load_duration, Some(1_000_000_000));
+        assert_eq!(timing.total_duration, Some(7_000_000_000));
     }
 }

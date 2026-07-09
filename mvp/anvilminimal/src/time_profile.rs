@@ -34,6 +34,28 @@ pub struct TokenTotals {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderDurationTotals {
+    pub prompt_eval_duration: u64,
+    pub eval_duration: u64,
+    pub load_duration: u64,
+    pub total_duration: u64,
+    pub prompt_eval_observed: bool,
+    pub eval_observed: bool,
+    pub load_observed: bool,
+    pub total_observed: bool,
+}
+
+impl ProviderDurationTotals {
+    pub fn provider_total_duration(&self) -> u64 {
+        self.total_duration.max(
+            self.prompt_eval_duration
+                .saturating_add(self.eval_duration)
+                .saturating_add(self.load_duration),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PhaseTimeProfile {
     pub phase: String,
     pub provider_ms: u64,
@@ -56,6 +78,7 @@ impl PhaseTimeProfile {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TimeProfile {
     pub provider: ProviderScopeTotals,
+    pub provider_durations: ProviderDurationTotals,
     pub installs_ms: u64,
     pub builds_ms: u64,
     pub probe_ms: u64,
@@ -83,6 +106,26 @@ impl TimeProfile {
             "planner_ms": self.provider.planner_ms(),
             "executor_ms": self.provider.executor_ms,
             "repair_ms": self.provider.repair_ms,
+            "provider_prompt_eval_duration": if self.provider_durations.prompt_eval_observed {
+                Value::from(self.provider_durations.prompt_eval_duration)
+            } else {
+                Value::Null
+            },
+            "provider_eval_duration": if self.provider_durations.eval_observed {
+                Value::from(self.provider_durations.eval_duration)
+            } else {
+                Value::Null
+            },
+            "provider_load_duration": if self.provider_durations.load_observed {
+                Value::from(self.provider_durations.load_duration)
+            } else {
+                Value::Null
+            },
+            "provider_total_duration": if self.provider_durations.total_observed {
+                Value::from(self.provider_durations.total_duration)
+            } else {
+                Value::Null
+            },
             "installs_ms": self.installs_ms,
             "builds_ms": self.builds_ms,
             "probe_ms": self.probe_ms,
@@ -93,7 +136,6 @@ impl TimeProfile {
             } else {
                 Value::Null
             },
-            "cache_proxy_prompt_eval_over_estimated_prompt_tokens": self.tokens.cache_proxy_ratio_percent().map(Value::from).unwrap_or(Value::Null),
             "eval_count": if self.tokens.eval_observed {
                 Value::from(self.tokens.eval_count)
             } else {
@@ -105,31 +147,35 @@ impl TimeProfile {
     pub fn summary_line(&self) -> String {
         let total = self.total_ms();
         let provider = self.provider.total_ms();
-        let mut line = format!(
-            "Time profile: provider {} [planner {} / executor {} / repair {}] · installs {} · builds {} · probe {} · total {}",
+        let provider_duration_total = self.provider_durations.provider_total_duration();
+        let provider_breakdown = if provider_duration_total > 0 {
+            format!(
+                " [prefill {} · generation {} · load {}]",
+                percent(
+                    self.provider_durations.prompt_eval_duration,
+                    provider_duration_total
+                ),
+                percent(
+                    self.provider_durations.eval_duration,
+                    provider_duration_total
+                ),
+                percent(
+                    self.provider_durations.load_duration,
+                    provider_duration_total
+                ),
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "Time profile: provider {}{} · installs {} · builds {} · probe {} · total {}",
             percent(provider, total),
-            percent(self.provider.planner_ms(), total),
-            percent(self.provider.executor_ms, total),
-            percent(self.provider.repair_ms, total),
+            provider_breakdown,
             percent(self.installs_ms, total),
             percent(self.builds_ms, total),
             percent(self.probe_ms, total),
             format_duration(total),
-        );
-        if self.tokens.prompt_eval_observed || self.tokens.eval_observed {
-            line.push_str(&format!(
-                " · tokens prompt_eval={} eval={}",
-                observed_u64(
-                    self.tokens.prompt_eval_observed,
-                    self.tokens.prompt_eval_count
-                ),
-                observed_u64(self.tokens.eval_observed, self.tokens.eval_count),
-            ));
-        }
-        if let Some(cache_proxy_percent) = self.tokens.cache_proxy_ratio_percent() {
-            line.push_str(&format!(" · cache proxy {}%", cache_proxy_percent));
-        }
-        line
+        )
     }
 
     pub fn phase_table_markdown(&self) -> String {
@@ -155,15 +201,6 @@ impl TimeProfile {
             ));
         }
         lines.join("\n")
-    }
-}
-
-impl TokenTotals {
-    pub fn cache_proxy_ratio_percent(&self) -> Option<u64> {
-        if !self.prompt_eval_observed || self.estimated_prompt_tokens_sent == 0 {
-            return None;
-        }
-        Some(self.prompt_eval_count.saturating_mul(100) / self.estimated_prompt_tokens_sent)
     }
 }
 
@@ -196,6 +233,7 @@ pub fn aggregate_events(events: &[Value]) -> TimeProfile {
                             profile.provider.executor_ms.saturating_add(duration);
                     }
                 }
+                add_provider_duration_totals(&mut profile.provider_durations, event);
                 let phase = phase_entry(&mut phases, &current_phase);
                 phase.provider_ms = phase.provider_ms.saturating_add(duration);
                 add_token_totals(&mut profile.tokens, event);
@@ -365,6 +403,25 @@ fn duration_field(event: &Value, key: &str) -> Option<u64> {
     event.get(key).and_then(Value::as_u64)
 }
 
+fn add_provider_duration_totals(totals: &mut ProviderDurationTotals, event: &Value) {
+    if let Some(value) = event.get("prompt_eval_duration").and_then(Value::as_u64) {
+        totals.prompt_eval_observed = true;
+        totals.prompt_eval_duration = totals.prompt_eval_duration.saturating_add(value);
+    }
+    if let Some(value) = event.get("eval_duration").and_then(Value::as_u64) {
+        totals.eval_observed = true;
+        totals.eval_duration = totals.eval_duration.saturating_add(value);
+    }
+    if let Some(value) = event.get("load_duration").and_then(Value::as_u64) {
+        totals.load_observed = true;
+        totals.load_duration = totals.load_duration.saturating_add(value);
+    }
+    if let Some(value) = event.get("total_duration").and_then(Value::as_u64) {
+        totals.total_observed = true;
+        totals.total_duration = totals.total_duration.saturating_add(value);
+    }
+}
+
 fn add_token_totals(totals: &mut TokenTotals, event: &Value) {
     if let Some(value) = event
         .get("estimated_prompt_tokens_sent")
@@ -406,14 +463,6 @@ fn percent(part: u64, total: u64) -> String {
     }
 }
 
-fn observed_u64(observed: bool, value: u64) -> String {
-    if observed {
-        value.to_string()
-    } else {
-        "n/a".to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,10 +471,10 @@ mod tests {
     fn aggregates_time_profile_from_existing_event_stream() {
         let events = vec![
             json!({"event": "ultra_phase_start", "phase_id": "setup"}),
-            json!({"event": "provider_turn_duration", "caller_scope": "planner_ultra", "duration_ms": 10_000, "estimated_prompt_tokens_sent": 1000, "prompt_eval_count": 800, "eval_count": 100}),
+            json!({"event": "provider_turn_duration", "caller_scope": "planner_ultra", "duration_ms": 10_000, "estimated_prompt_tokens_sent": 1000, "prompt_eval_count": 800, "eval_count": 100, "prompt_eval_duration": 4_000_000_000u64, "eval_duration": 5_000_000_000u64, "load_duration": 1_000_000_000u64, "total_duration": 10_000_000_000u64}),
             json!({"event": "dependency_build_lifecycle", "setup_duration_ms": 20_000}),
             json!({"event": "ultra_phase_start", "phase_id": "play"}),
-            json!({"event": "provider_turn_duration", "caller_scope": "executor", "duration_ms": 30_000, "estimated_prompt_tokens_sent": 2000, "prompt_eval_count": 1200, "eval_count": 200}),
+            json!({"event": "provider_turn_duration", "caller_scope": "executor", "duration_ms": 30_000, "estimated_prompt_tokens_sent": 2000, "prompt_eval_count": 1200, "eval_count": 200, "prompt_eval_duration": 6_000_000_000u64, "eval_duration": 20_000_000_000u64, "load_duration": 4_000_000_000u64, "total_duration": 30_000_000_000u64}),
             json!({"event": "browser_probe", "elapsed_ms": 5_000}),
             json!({"event": "browser_interaction_probe", "duration_ms": 7_000}),
         ];
@@ -435,14 +484,19 @@ mod tests {
         assert_eq!(profile.total_ms(), 72_000);
         assert_eq!(profile.provider.planner_ultra_ms, 10_000);
         assert_eq!(profile.provider.executor_ms, 30_000);
+        assert_eq!(
+            profile.provider_durations.prompt_eval_duration,
+            10_000_000_000
+        );
+        assert_eq!(profile.provider_durations.eval_duration, 25_000_000_000);
+        assert_eq!(profile.provider_durations.load_duration, 5_000_000_000);
         assert_eq!(profile.installs_ms, 20_000);
         assert_eq!(profile.probe_ms, 12_000);
         assert_eq!(profile.tokens.prompt_eval_count, 2_000);
         assert_eq!(profile.tokens.eval_count, 300);
         let summary = profile.summary_line();
         assert!(summary.contains("Time profile: provider 56%"));
-        assert!(summary.contains("tokens prompt_eval=2000 eval=300"));
-        assert!(summary.contains("cache proxy 66%"));
+        assert!(summary.contains("[prefill 25% · generation 63% · load 13%]"));
         let table = profile.phase_table_markdown();
         assert!(table.contains("| setup | 30s | 10s | 20s | 0s | 0s | 0s |"));
         assert!(table.contains("| play | 42s | 30s | 0s | 0s | 12s | 0s |"));
@@ -460,6 +514,6 @@ mod tests {
 
         assert_eq!(profile.total_ms(), 1_500);
         assert!(!profile.tokens.prompt_eval_observed);
-        assert!(!profile.summary_line().contains("tokens prompt_eval"));
+        assert!(!profile.summary_line().contains("[prefill"));
     }
 }

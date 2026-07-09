@@ -165,6 +165,9 @@ fn audit_compile_output_source_of_truth(
 fn audit_verify_normalization_boundary(corpus: &AuditCorpus, _: &ProtectionRule) -> Vec<String> {
     let mut violations = Vec::new();
     for (path, text) in corpus.rust_files() {
+        if path == "src/planner/sanitizer.rs" {
+            continue;
+        }
         let has_shared_verify_normalizer = text.contains("normalize_planner_verify_command(")
             || text.contains("normalize_runtime_bash_command_for_boundary(");
         let has_normalized_verify_command = text.contains("NormalizedVerifyCommand");

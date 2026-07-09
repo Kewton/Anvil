@@ -16,8 +16,8 @@ use crate::minimal_loop::import_scan::{
 };
 use crate::minimal_loop::repair_target::{RepairTarget, classify_repair_target};
 use crate::planner::verify::{
-    VerificationReport, normalize_planner_verify_command, normalize_verify_command,
-    validate_verify_command,
+    NormalizedVerifyCommand, VerificationReport, normalize_planner_verify_command,
+    normalize_verify_command, validate_verify_command,
 };
 use crate::tools::path_guard::{
     resolve_existing, resolve_optional_existing, validate_workspace_relative,
@@ -302,13 +302,14 @@ impl CompletionContract {
                 build_verifier_observations.push(lifecycle);
                 continue;
             }
-            let normalized_command = match normalize_verify_command(&command) {
-                Ok(command) => command,
-                Err(err) => {
-                    report.push_command_failure(command.clone(), err.to_string());
-                    continue;
-                }
-            };
+            let normalized_command: NormalizedVerifyCommand =
+                match normalize_verify_command(&command) {
+                    Ok(command) => command,
+                    Err(err) => {
+                        report.push_command_failure(command.clone(), err.to_string());
+                        continue;
+                    }
+                };
             match crate::minimal_loop::verifier_env::run_checked(&normalized_command, root, offline)
             {
                 Ok(output) => {

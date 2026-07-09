@@ -11877,7 +11877,11 @@ fn fallback_setup_verify_commands(expected_paths: &[String]) -> Vec<String> {
     expected_paths
         .iter()
         .map(|path| format!("test -f {path}"))
-        .filter(|command| crate::planner::verify::validate_verify_command(command).is_ok())
+        .filter_map(|command| {
+            crate::planner::verify::normalize_verify_command(&command)
+                .ok()
+                .map(|normalized| normalized.into_string())
+        })
         .collect::<Vec<_>>()
 }
 
