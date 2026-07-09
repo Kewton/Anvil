@@ -56,3 +56,8 @@ fixtures/recovery-prompt.md = [
   "14 |     movePlayer,",
   "Compile repair re-anchor: the previous compile repair turn changed no files"
 ]
+fixtures/summary.md = [
+  "Compile-repair recurrence (test0708_009):",
+  "attempts 1/2 used appended repair sessions; attempt 3 used compact",
+  "run_stop false-success recording (historical): process exit success with release-gate failure"
+]
