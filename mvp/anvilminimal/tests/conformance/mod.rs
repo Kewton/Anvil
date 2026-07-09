@@ -458,6 +458,56 @@ fn conformance_honest_terminal_covers_simulated_panic_exit() {
 }
 
 #[test]
+fn conformance_negative_honest_terminal_rejects_false_success_run_stop_projection() {
+    let trace = Trace {
+        scenario: MatrixScenario::Nextjs,
+        events: vec![
+            json!({
+                "event": "tui_command_stop",
+                "status": "failed",
+                "completion_status": "incomplete",
+                "task_status": "failed",
+                "assurance_level": "partial",
+                "assurance_reason": "missing_required_evidence:restart_or_recoverable_state_evidence",
+                "effective_profile": "nextjs",
+                "contract_origin": "initial",
+                "build_commit": anvilminimal::build_info::COMMIT,
+                "build_timestamp": anvilminimal::build_info::TIMESTAMP,
+                "runtime_acceptance_status": "failed",
+                "final_acceptance_status": "incomplete",
+                "release_gate_status": "failed",
+                "release_quality_completion": "failed",
+                "next_action": "repair_release_gate_failure"
+            }),
+            json!({
+                "event": "run_stop",
+                "status": "complete",
+                "completion_status": "complete",
+                "task_status": "complete",
+                "assurance_level": "full",
+                "assurance_reason": "",
+                "effective_profile": "nextjs",
+                "contract_origin": "initial",
+                "build_commit": anvilminimal::build_info::COMMIT,
+                "build_timestamp": anvilminimal::build_info::TIMESTAMP,
+                "runtime_acceptance_status": "failed",
+                "final_acceptance_status": "incomplete",
+                "release_gate_status": "failed",
+                "release_quality_completion": "release_ready",
+                "next_action": "none"
+            }),
+        ],
+        summary: format!(
+            "{}\nStatus: failed\n",
+            anvilminimal::build_info::summary_line()
+        ),
+        output: String::new(),
+    };
+
+    assert_contract_fails("honest_terminal", check_honest_terminal(&trace));
+}
+
+#[test]
 fn conformance_boundedness_covers_hanging_dependency_setup() {
     let trace = Trace {
         scenario: MatrixScenario::Nextjs,
@@ -916,6 +966,32 @@ fn check_honest_terminal(trace: &Trace) -> Result<(), String> {
     }
     if !trace.summary.contains("Status: ") || trace.summary.contains("Status: running") {
         return Err("honest_terminal: summary has absent/running status".to_string());
+    }
+    if let Some(run_stop) = events_named(&trace.events, "run_stop").first() {
+        for key in [
+            "status",
+            "completion_status",
+            "task_status",
+            "assurance_level",
+            "assurance_reason",
+            "effective_profile",
+            "contract_origin",
+            "runtime_acceptance_status",
+            "final_acceptance_status",
+            "release_gate_status",
+            "release_quality_completion",
+            "next_action",
+        ] {
+            let run_value = string_field(run_stop, key);
+            let terminal_value = string_field(stop, key);
+            if terminal_value.is_some() && run_value != terminal_value {
+                return Err(format!(
+                    "honest_terminal: run_stop {key}={:?} does not match tui_command_stop {key}={:?}",
+                    run_value.unwrap_or(""),
+                    terminal_value.unwrap_or("")
+                ));
+            }
+        }
     }
     Ok(())
 }

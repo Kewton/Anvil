@@ -465,6 +465,222 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
     snapshot
 }
 
+pub fn latest_tui_command_stop_ok(path: Option<&Path>) -> Option<bool> {
+    latest_tui_command_stop_event(path).and_then(|event| event.get("ok").and_then(Value::as_bool))
+}
+
+pub fn latest_tui_command_stop_event(path: Option<&Path>) -> Option<Value> {
+    let path = path?;
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return None;
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .rev()
+        .find(|event: &Value| {
+            event.get("event").and_then(Value::as_str) == Some("tui_command_stop")
+        })
+}
+
+pub fn apply_tui_command_stop_projection(projection: &mut CompletionProjection, event: &Value) {
+    overlay_string(&mut projection.status, event, "status");
+    overlay_string(
+        &mut projection.command_completion,
+        event,
+        "command_completion_state",
+    );
+    overlay_string(&mut projection.task_status, event, "task_status");
+    overlay_string(&mut projection.profile, event, "profile");
+    overlay_string(
+        &mut projection.effective_profile,
+        event,
+        "effective_profile",
+    );
+    overlay_string(&mut projection.prompt_layout, event, "prompt_layout");
+    overlay_string(&mut projection.contract_origin, event, "contract_origin");
+    overlay_string(&mut projection.assurance_level, event, "assurance_level");
+    overlay_string(&mut projection.assurance_reason, event, "assurance_reason");
+    overlay_string(&mut projection.profile_inferred, event, "profile_inferred");
+    overlay_string(
+        &mut projection.profile_inference_source,
+        event,
+        "profile_inference_source",
+    );
+    overlay_string(&mut projection.requested_port, event, "requested_port");
+    overlay_string(
+        &mut projection.runtime_acceptance,
+        event,
+        "runtime_acceptance_status",
+    );
+    overlay_string(
+        &mut projection.final_acceptance,
+        event,
+        "final_acceptance_status",
+    );
+    overlay_string(&mut projection.release_gate, event, "release_gate_status");
+    overlay_bool(
+        &mut projection.completion_contract_verification_enabled,
+        event,
+        "completion_contract_verification_enabled",
+    );
+    overlay_bool(
+        &mut projection.completion_contract_path_merge_enabled,
+        event,
+        "completion_contract_path_merge_enabled",
+    );
+    overlay_string(
+        &mut projection.completion_contract_path,
+        event,
+        "completion_contract_path",
+    );
+    overlay_bool(
+        &mut projection.completion_contract_generated,
+        event,
+        "completion_contract_generated",
+    );
+    overlay_bool(
+        &mut projection.external_contract_checked,
+        event,
+        "external_contract_checked",
+    );
+    overlay_bool(
+        &mut projection.external_contract_ok,
+        event,
+        "external_contract_ok",
+    );
+    if event.get("release_gate_reasons").is_some() {
+        projection.release_gate_reasons = event_string_array(event, "release_gate_reasons");
+    }
+    overlay_bool(
+        &mut projection.browser_readiness_applicable,
+        event,
+        "browser_readiness_applicable",
+    );
+    overlay_string(
+        &mut projection.browser_readiness_execution_status,
+        event,
+        "browser_readiness_execution_status",
+    );
+    overlay_string(
+        &mut projection.browser_readiness,
+        event,
+        "browser_readiness_status",
+    );
+    overlay_string(
+        &mut projection.browser_readiness_evidence_path,
+        event,
+        "browser_readiness_evidence_path",
+    );
+    overlay_bool(
+        &mut projection.interaction_evidence_applicable,
+        event,
+        "interaction_evidence_applicable",
+    );
+    overlay_string(
+        &mut projection.interaction_evidence_execution_status,
+        event,
+        "interaction_evidence_execution_status",
+    );
+    overlay_string(
+        &mut projection.interaction_evidence,
+        event,
+        "interaction_evidence_status",
+    );
+    overlay_string(
+        &mut projection.interaction_evidence_path,
+        event,
+        "interaction_evidence_path",
+    );
+    if event.get("state_dimensions_changed").is_some() {
+        projection.state_dimensions_changed = event_string_array(event, "state_dimensions_changed");
+    }
+    if event.get("action_hooks").is_some() {
+        projection.action_hooks = event_string_array(event, "action_hooks");
+    }
+    overlay_string(
+        &mut projection.text_entry_target,
+        event,
+        "text_entry_target",
+    );
+    overlay_string(&mut projection.typed_token, event, "typed_token");
+    overlay_string(&mut projection.token_echoed, event, "token_echoed");
+    overlay_string(
+        &mut projection.text_input_state_change,
+        event,
+        "text_input_state_change",
+    );
+    overlay_string(
+        &mut projection.release_quality_completion,
+        event,
+        "release_quality_completion",
+    );
+    overlay_string(&mut projection.next_action, event, "next_action");
+    overlay_string(
+        &mut projection.recovery_prompt_path,
+        event,
+        "recovery_prompt_path",
+    );
+    overlay_string(
+        &mut projection.recovery_ultra_plan_path,
+        event,
+        "recovery_ultra_plan_path",
+    );
+    overlay_string(
+        &mut projection.suggested_recovery_command,
+        event,
+        "suggested_recovery_command",
+    );
+    overlay_string(
+        &mut projection.suggested_recovery_yaml_command,
+        event,
+        "suggested_recovery_yaml_command",
+    );
+    overlay_usize(
+        &mut projection.planner_verify_normalization_count,
+        event,
+        "planner_verify_normalization_count",
+    );
+    overlay_usize(
+        &mut projection.planner_retry_count,
+        event,
+        "planner_retry_count",
+    );
+    overlay_usize(
+        &mut projection.planner_quality_warning_count,
+        event,
+        "planner_quality_warning_count",
+    );
+    overlay_usize(
+        &mut projection.planner_quality_issue_count,
+        event,
+        "planner_quality_issue_count",
+    );
+    overlay_bool(&mut projection.planner_repaired, event, "planner_repaired");
+    overlay_bool(
+        &mut projection.planner_release_risk,
+        event,
+        "planner_release_risk",
+    );
+}
+
+fn overlay_string(target: &mut String, event: &Value, field: &str) {
+    if let Some(value) = event.get(field).and_then(Value::as_str) {
+        *target = value.to_string();
+    }
+}
+
+fn overlay_bool(target: &mut bool, event: &Value, field: &str) {
+    if let Some(value) = event.get(field).and_then(Value::as_bool) {
+        *target = value;
+    }
+}
+
+fn overlay_usize(target: &mut usize, event: &Value, field: &str) {
+    if let Some(value) = event.get(field).and_then(Value::as_u64) {
+        *target = value as usize;
+    }
+}
+
 pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> CompletionProjection {
     let command_completion = if ok { "completed" } else { "failed" }.to_string();
     let release_gate = if snapshot.release_gate_status.is_empty() {

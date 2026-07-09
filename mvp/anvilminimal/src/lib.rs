@@ -596,7 +596,16 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
     let mut completion_snapshot =
         eval_events::latest_completion_snapshot(config.eval_events_path.as_deref());
     apply_config_completion_metadata(config, &mut completion_snapshot);
-    let completion = eval_events::project_completion(ok, &completion_snapshot);
+    let terminal_stop =
+        eval_events::latest_tui_command_stop_event(config.eval_events_path.as_deref());
+    let terminal_ok = terminal_stop
+        .as_ref()
+        .and_then(|event| event.get("ok").and_then(serde_json::Value::as_bool))
+        .unwrap_or(ok);
+    let mut completion = eval_events::project_completion(terminal_ok, &completion_snapshot);
+    if let Some(event) = terminal_stop.as_ref() {
+        eval_events::apply_tui_command_stop_projection(&mut completion, event);
+    }
     eval_events::emit(
         config.eval_events_path.as_deref(),
         json!({
@@ -606,6 +615,7 @@ fn emit_run_stop(config: &Config, result: &anyhow::Result<()>) {
             "action": format!("{:?}", config.action),
             "stop_reason": stop_reason,
             "failure_kind": failure_kind,
+            "status": &completion.status,
             "completion_status": &completion.status,
             "task_status": &completion.task_status,
             "profile": &completion.profile,
@@ -805,6 +815,73 @@ mod tests {
         assert!(summary.contains("Session/REPL status: process_exited"));
         assert!(summary.contains("Final acceptance: not_checked"));
         assert!(summary.contains("Stop reason: completed"));
+    }
+
+    #[test]
+    fn run_stop_uses_tui_terminal_projection_after_failed_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/test-run/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        eval_events::emit(
+            cfg.eval_events_path.as_deref(),
+            json!({
+                "event": "tui_command_stop",
+                "ok": false,
+                "status": "failed",
+                "command_completion_state": "failed",
+                "completion_status": "incomplete",
+                "task_status": "failed",
+                "profile": "nextjs",
+                "effective_profile": "nextjs",
+                "contract_origin": "initial",
+                "assurance_level": "partial",
+                "assurance_reason": "missing_required_evidence:restart_or_recoverable_state_evidence",
+                "runtime_acceptance_status": "failed",
+                "final_acceptance_status": "incomplete",
+                "release_gate_status": "failed",
+                "release_quality_completion": "failed",
+                "next_action": "repair_release_gate_failure",
+            }),
+        );
+
+        let result: anyhow::Result<()> = Ok(());
+        emit_run_stop(&cfg, &result);
+
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        let run_stop = event_text
+            .lines()
+            .rfind(|line| line.contains(r#""event":"run_stop""#))
+            .unwrap();
+        let run_stop: serde_json::Value = serde_json::from_str(run_stop).unwrap();
+        assert_eq!(
+            run_stop.get("ok").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            run_stop.get("status").and_then(|value| value.as_str()),
+            Some("failed")
+        );
+        assert_eq!(
+            run_stop
+                .get("completion_status")
+                .and_then(|value| value.as_str()),
+            Some("failed")
+        );
+        assert_eq!(
+            run_stop.get("task_status").and_then(|value| value.as_str()),
+            Some("failed")
+        );
+        assert_eq!(
+            run_stop
+                .get("release_quality_completion")
+                .and_then(|value| value.as_str()),
+            Some("failed")
+        );
+        assert_eq!(
+            run_stop.get("next_action").and_then(|value| value.as_str()),
+            Some("repair_release_gate_failure")
+        );
     }
 
     #[test]
