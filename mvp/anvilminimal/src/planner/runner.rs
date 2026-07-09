@@ -15121,7 +15121,7 @@ fn run_final_acceptance_repair_with_ultra_session(
         expected_paths,
         config,
         ui,
-        RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+        RunSessionOptions::final_acceptance_repair(),
     )
 }
 
@@ -18769,6 +18769,125 @@ if __name__ == "__main__":
         assert!(event_text.contains("\"event\":\"final_acceptance_repair_start\""));
         assert!(event_text.contains("challenge_or_adversary_evidence"));
         assert!(!event_text.contains("\"event\":\"ultra_plan_complete\""));
+    }
+
+    #[test]
+    fn ultra_final_acceptance_repair_read_only_stagnation_gets_nudges() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_challenge_contract(dir.path()));
+        cfg.max_iterations = 4;
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(challenge_implement_step_plan_json()),
+            AssistantReply::text(challenge_setup_step_plan_json()),
+        ]);
+        let static_page =
+            "export default function Page(){ return <main><canvas>ready</canvas></main>; }";
+        let mut execution_replies = vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"phase-two.txt","content":"phase two"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ];
+        execution_replies.extend((0..40).map(|_| read_static_page_reply()));
+        let mut execution = FakeClient::new(execution_replies);
+        let plan = challenge_ultra_plan();
+
+        let err = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("model_stagnation:read_only_loop"), "{err}");
+        let stages = events_with_name(&events, "read_only_stagnation_feedback")
+            .iter()
+            .map(|event| {
+                event
+                    .get("stage")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stages, vec!["intervention", "compact_restatement"]);
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"lifecycle_stage\":\"final_acceptance_repair\""));
+    }
+
+    #[test]
+    fn ultra_final_acceptance_repair_edit_after_read_only_nudge_proceeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.completion_contract_path = Some(write_challenge_contract(dir.path()));
+        cfg.max_iterations = 4;
+        let mut planner = FakeClient::new(vec![
+            AssistantReply::text(challenge_implement_step_plan_json()),
+            AssistantReply::text(challenge_setup_step_plan_json()),
+        ]);
+        let static_page =
+            "export default function Page(){ return <main><canvas>ready</canvas></main>; }";
+        let mut execution = FakeClient::new(vec![
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"src/app/page.tsx","content":static_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Write",
+                    serde_json::json!({"path":"phase-two.txt","content":"phase two"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+            read_static_page_reply(),
+            read_static_page_reply(),
+            read_static_page_reply(),
+            AssistantReply {
+                content: String::new(),
+                tool_calls: vec![crate::state::ToolCall::new(
+                    "Edit",
+                    serde_json::json!({
+                        "path":"src/app/page.tsx",
+                        "old_string": static_page,
+                        "new_string": interactive_game_page_source()
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            },
+        ]);
+        let plan = challenge_ultra_plan();
+
+        let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
+
+        assert_eq!(result, "ultra-plan-run complete: 2 phases");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"read_only_stagnation_feedback\""));
+        assert!(event_text.contains("\"event\":\"final_acceptance_repair_complete\""));
+        assert!(event_text.contains("\"event\":\"ultra_plan_complete\""));
     }
 
     #[test]

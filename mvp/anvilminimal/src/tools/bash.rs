@@ -134,6 +134,16 @@ where
             summary: reason,
         });
     }
+    if let Some(rejection) = path_confinement_rejection(command, root) {
+        return Ok(BashOutcome {
+            kind: BashOutcomeKind::Blocked,
+            status: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            elapsed_ms: started.elapsed().as_millis(),
+            summary: rejection.message,
+        });
+    }
 
     let mut process = Command::new("sh");
     process.arg("-c").arg(command).current_dir(root);
@@ -239,6 +249,38 @@ pub fn blocked_reason(command: &str, offline: bool) -> Option<String> {
     None
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashPathConfinementRejection {
+    pub path: String,
+    pub root: String,
+    pub nearest_relative: String,
+    pub message: String,
+}
+
+pub fn path_confinement_rejection(
+    command: &str,
+    root: &Path,
+) -> Option<BashPathConfinementRejection> {
+    let raw_root = root.to_path_buf();
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    for candidate in absolute_path_candidates(command) {
+        if bash_path_allowed(candidate, &root, &raw_root) {
+            continue;
+        }
+        let nearest_relative = nearest_relative_form(candidate, &root);
+        let root_display = root.to_string_lossy().to_string();
+        return Some(BashPathConfinementRejection {
+            path: candidate.to_string(),
+            root: root_display.clone(),
+            nearest_relative: nearest_relative.clone(),
+            message: format!(
+                "bash_path_confinement_error: rejected absolute path `{candidate}` outside current workspace root `{root_display}`; use workspace-relative path `{nearest_relative}`"
+            ),
+        });
+    }
+    None
+}
+
 fn truncate_stream(value: &str) -> String {
     crate::util::excerpt_with_newline_marker(
         value,
@@ -276,7 +318,11 @@ fn line_references_outside_workspace(line: &str, root: &Path) -> bool {
     for candidate in absolute_path_candidates(line) {
         let path = Path::new(candidate);
         let comparable = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if path.is_absolute() && candidate != "/" && !comparable.starts_with(root) {
+        if path.is_absolute()
+            && candidate != "/"
+            && !comparable.starts_with(root)
+            && !is_system_prefix_allowed(&comparable)
+        {
             return true;
         }
     }
@@ -288,6 +334,10 @@ fn absolute_path_candidates(line: &str) -> impl Iterator<Item = &str> {
     let mut index = 0usize;
     while let Some(offset) = line[index..].find('/') {
         let start = index + offset;
+        if !is_absolute_path_candidate_start(line, start) {
+            index = start.saturating_add(1);
+            continue;
+        }
         let end = line[start..]
             .find(|ch: char| {
                 ch.is_whitespace()
@@ -302,6 +352,76 @@ fn absolute_path_candidates(line: &str) -> impl Iterator<Item = &str> {
         }
     }
     candidates.into_iter()
+}
+
+fn is_absolute_path_candidate_start(line: &str, start: usize) -> bool {
+    if start == 0 {
+        return true;
+    }
+    let Some(previous) = line[..start].chars().next_back() else {
+        return true;
+    };
+    previous.is_whitespace()
+        || matches!(
+            previous,
+            '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '=' | ':'
+        )
+}
+
+fn bash_path_allowed(candidate: &str, canonical_root: &Path, raw_root: &Path) -> bool {
+    let path = Path::new(candidate);
+    if !path.is_absolute() || candidate == "/" {
+        return true;
+    }
+    let comparable = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    comparable.starts_with(canonical_root)
+        || comparable.starts_with(raw_root)
+        || path.starts_with(canonical_root)
+        || path.starts_with(raw_root)
+        || is_system_prefix_allowed(&comparable)
+}
+
+fn is_system_prefix_allowed(path: &Path) -> bool {
+    ["/usr", "/bin", "/opt", "/etc", "/tmp"]
+        .iter()
+        .any(|prefix| path == Path::new(prefix) || path.starts_with(prefix))
+        || path == Path::new("/dev/null")
+}
+
+fn nearest_relative_form(candidate: &str, root: &Path) -> String {
+    let raw = Path::new(candidate);
+    let raw_components = normal_components(raw);
+    let root_components = normal_components(root);
+    if !root_components.is_empty() && raw_components.len() >= root_components.len() {
+        let anchor_len = root_components.len().min(2);
+        let anchor = &root_components[root_components.len() - anchor_len..];
+        let matches = raw_components
+            .windows(anchor_len)
+            .enumerate()
+            .filter_map(|(index, window)| (window == anchor).then_some(index))
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            let index = matches[0];
+            let tail = &raw_components[index + anchor_len..];
+            if tail.is_empty() {
+                return ".".to_string();
+            }
+            return tail.join("/");
+        }
+    }
+    raw.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn normal_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn build_summary(command: &str, kind: BashOutcomeKind, stdout: &str, stderr: &str) -> String {
@@ -446,21 +566,15 @@ mod tests {
     #[test]
     fn bash_output_marks_absolute_paths_outside_workspace() {
         let dir = tempfile::tempdir().unwrap();
-        let outside = dir
-            .path()
-            .parent()
-            .unwrap()
-            .join("sibling-project/file.txt");
-        let command = format!(
-            "printf 'found {}\\ninside {}\\n'",
+        let outside = Path::new("/Users/example/sibling-project/file.txt");
+        let output = format!(
+            "found {}\ninside {}\n",
             outside.display(),
             dir.path().display()
         );
-        let outcome =
-            run_structured(&command, dir.path(), false, DEFAULT_TIMEOUT, || false).unwrap();
+        let annotated = annotate_outside_workspace_output(&output, dir.path());
 
-        let outside_line = outcome
-            .stdout
+        let outside_line = annotated
             .lines()
             .find(|line| line.contains("sibling-project/file.txt"))
             .unwrap();
@@ -469,14 +583,43 @@ mod tests {
             "{outside_line}"
         );
 
-        let inside_line = outcome
-            .stdout
+        let inside_line = annotated
             .lines()
             .find(|line| line.contains(dir.path().to_str().unwrap()))
             .unwrap();
         assert!(
             !inside_line.contains(OUTSIDE_WORKSPACE_MARKER),
             "{inside_line}"
+        );
+    }
+
+    #[test]
+    fn bash_path_confinement_rejects_outside_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0709_camp_003");
+        std::fs::create_dir_all(&root).unwrap();
+        let command =
+            "ls /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0709_camp_003";
+
+        let rejection = path_confinement_rejection(command, &root).expect("rejected");
+
+        assert!(rejection.message.contains(&root.display().to_string()));
+        assert!(rejection.message.contains("test0709_camp_003"));
+    }
+
+    #[test]
+    fn bash_path_confinement_allows_common_commands_system_prefixes_and_workspace_absolute_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let package = root.join("package.json");
+
+        assert!(path_confinement_rejection("npm run build", root).is_none());
+        assert!(path_confinement_rejection("which node", root).is_none());
+        assert!(path_confinement_rejection("test -e /bin/sh", root).is_none());
+        assert!(
+            path_confinement_rejection(&format!("test -f {}", package.display()), root).is_none()
         );
     }
 }

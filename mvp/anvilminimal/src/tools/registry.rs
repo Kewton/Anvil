@@ -88,6 +88,11 @@ impl ToolRegistry {
         match name {
             "Bash" => {
                 let command = required_string(arguments, "command")?;
+                if let Some(rejection) =
+                    crate::tools::bash::path_confinement_rejection(command, &context.root)
+                {
+                    emit_bash_path_confinement_rejected(context, command, &rejection);
+                }
                 crate::tools::bash::run_with_cancel_and_force(
                     command,
                     &context.root,
@@ -283,6 +288,43 @@ fn emit_path_fallback_evaluated(
     );
 }
 
+fn emit_path_malformed(
+    context: &ToolContext,
+    tool: &str,
+    original: &str,
+    accepted: bool,
+    normalized: Option<&str>,
+) {
+    eval_events::emit(
+        context.eval_events_path.as_deref(),
+        json!({
+            "event": "tool_args_path_malformed",
+            "tool": tool,
+            "original": original,
+            "accepted": accepted,
+            "normalized": normalized.unwrap_or(""),
+            "kind": "missing_leading_slash_absolute",
+        }),
+    );
+}
+
+fn emit_bash_path_confinement_rejected(
+    context: &ToolContext,
+    command: &str,
+    rejection: &crate::tools::bash::BashPathConfinementRejection,
+) {
+    eval_events::emit(
+        context.eval_events_path.as_deref(),
+        json!({
+            "event": "bash_path_confinement_rejected",
+            "command": eval_events::body_snippet(command),
+            "path": rejection.path,
+            "root": rejection.root,
+            "nearest_relative": rejection.nearest_relative,
+        }),
+    );
+}
+
 fn emit_edit_anchor_salvaged(context: &ToolContext, path: &str, output: &str) {
     eval_events::emit(
         context.eval_events_path.as_deref(),
@@ -373,6 +415,8 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
         "stale_absolute_path_recoverable"
     } else if message.starts_with("unknown tool:") {
         "unknown_tool"
+    } else if message.contains("bash_path_confinement_error") {
+        "bash_path_confinement_error"
     } else if message.contains("path escapes workspace")
         || message.contains("path may not contain ..")
         || message.contains("absolute path is not allowed")
@@ -415,6 +459,8 @@ pub fn recoverable_tool_error(err: &anyhow::Error) -> bool {
         tool_error_kind(err),
         "missing_arg"
             | "unknown_tool"
+            | "tool_args_path_malformed"
+            | "bash_path_confinement_error"
             | "stale_absolute_path_recoverable"
             | "path_not_found_recoverable"
             | "command_timeout"
@@ -851,6 +897,70 @@ mod tests {
     #[test]
     fn dangerous_command() {
         assert!(crate::tools::bash::blocked_reason("rm -rf /", false).is_some());
+    }
+
+    #[test]
+    fn bash_rejects_absolute_path_outside_workspace_with_feedback_and_telemetry() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0709_camp_003");
+        std::fs::create_dir_all(&root).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+            expected_paths: Vec::new(),
+        };
+        let command =
+            "ls /Users/maenokota/share/work/localwork/commandagent_mvp/01/test0709_camp_003";
+
+        let err = registry
+            .execute("Bash", &json!({"command": command}), &context)
+            .unwrap_err();
+
+        assert_eq!(tool_error_kind(&err), "bash_path_confinement_error");
+        assert!(recoverable_tool_error(&err));
+        let message = err.to_string();
+        assert!(message.contains(&root.display().to_string()), "{message}");
+        assert!(message.contains("test0709_camp_003"), "{message}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"bash_path_confinement_rejected""#));
+    }
+
+    #[test]
+    fn bash_allows_system_prefixes_and_workspace_absolute_paths() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
+            expected_paths: Vec::new(),
+        };
+        let package = dir.path().join("package.json");
+
+        registry
+            .execute("Bash", &json!({"command":"test -e /bin/sh"}), &context)
+            .unwrap();
+        registry
+            .execute(
+                "Bash",
+                &json!({"command": format!("test -f {}", package.display())}),
+                &context,
+            )
+            .unwrap();
     }
 
     #[test]

@@ -219,6 +219,7 @@ pub(crate) struct RunSessionOptions {
     pub dependency_setup_authority: NodeDependencySetupAuthority,
     pub step_wall_clock_cap: Option<Duration>,
     pub path_fallback_candidates: Vec<String>,
+    pub require_mutation_before_contract_short_circuit: bool,
 }
 
 impl Default for RunSessionOptions {
@@ -235,6 +236,7 @@ impl Default for RunSessionOptions {
             dependency_setup_authority: NodeDependencySetupAuthority::None,
             step_wall_clock_cap: None,
             path_fallback_candidates: Vec::new(),
+            require_mutation_before_contract_short_circuit: false,
         }
     }
 }
@@ -242,6 +244,12 @@ impl Default for RunSessionOptions {
 impl RunSessionOptions {
     pub(crate) fn plan_step(step_kind: RunSessionStepKind) -> Self {
         Self::plan_step_with_enforcement(step_kind, ContractEnforcement::Enforce, None)
+    }
+
+    pub(crate) fn final_acceptance_repair() -> Self {
+        let mut options = Self::plan_step(RunSessionStepKind::Implement);
+        options.require_mutation_before_contract_short_circuit = true;
+        options
     }
 
     pub(crate) fn plan_step_with_enforcement(
@@ -272,6 +280,7 @@ impl RunSessionOptions {
             dependency_setup_authority: NodeDependencySetupAuthority::None,
             step_wall_clock_cap: None,
             path_fallback_candidates: Vec::new(),
+            require_mutation_before_contract_short_circuit: false,
         }
     }
 
@@ -889,6 +898,12 @@ impl StepShortCircuitAt {
     }
 }
 
+struct ShortCircuitContext<'a> {
+    verify_attempts: &'a mut usize,
+    at: StepShortCircuitAt,
+    write_or_edit_seen: bool,
+}
+
 #[derive(Debug)]
 enum VerifyRepairNoEditOutcome {
     NoPendingFailure,
@@ -1098,8 +1113,11 @@ pub(crate) fn run_session_with_outcome_with_options(
         completion_contract
             .as_ref()
             .filter(|_| contract_runtime_enabled),
-        &mut verify_attempts,
-        StepShortCircuitAt::Start,
+        ShortCircuitContext {
+            verify_attempts: &mut verify_attempts,
+            at: StepShortCircuitAt::Start,
+            write_or_edit_seen,
+        },
     )? {
         return Ok(outcome);
     }
@@ -1119,8 +1137,11 @@ pub(crate) fn run_session_with_outcome_with_options(
                 completion_contract
                     .as_ref()
                     .filter(|_| contract_runtime_enabled),
-                &mut verify_attempts,
-                StepShortCircuitAt::Iteration,
+                ShortCircuitContext {
+                    verify_attempts: &mut verify_attempts,
+                    at: StepShortCircuitAt::Iteration,
+                    write_or_edit_seen,
+                },
             )?
         {
             return Ok(outcome);
@@ -2472,9 +2493,13 @@ fn maybe_short_circuit_satisfied_step(
     user_prompt: &str,
     required_paths: &[String],
     contract: Option<&CompletionContract>,
-    verify_attempts: &mut usize,
-    at: StepShortCircuitAt,
+    context: ShortCircuitContext<'_>,
 ) -> anyhow::Result<Option<RunSessionOutcome>> {
+    let ShortCircuitContext {
+        verify_attempts,
+        at,
+        write_or_edit_seen,
+    } = context;
     if at == StepShortCircuitAt::Start && options.step_kind == Some(RunSessionStepKind::Implement) {
         return Ok(None);
     }
@@ -2487,6 +2512,9 @@ fn maybe_short_circuit_satisfied_step(
         return Ok(None);
     }
     if let Some(contract) = contract.filter(|_| has_contract_gate) {
+        if options.require_mutation_before_contract_short_circuit && !write_or_edit_seen {
+            return Ok(None);
+        }
         let attempts_before_probe = *verify_attempts;
         match verify_completion_contract_with_enforcement(
             &config.workspace_root,
