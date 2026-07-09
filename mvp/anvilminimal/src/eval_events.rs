@@ -3066,6 +3066,15 @@ mod tests {
             summary.contains("| setup | 30s | 20s | 10s | 0s | 0s | 0s |"),
             "{summary}"
         );
+        assert!(
+            summary.contains("Generation profile (duration-weighted eval tokens):"),
+            "{summary}"
+        );
+        assert!(summary.contains("| planner | 200 | 20s | 1 |"), "{summary}");
+        assert!(
+            summary.contains("| prose-only | 200 | 20s | 1 | 0B | 0B |"),
+            "{summary}"
+        );
     }
 
     #[test]

@@ -1,5 +1,27 @@
 # Performance Notes
 
+## Generation Volume Breakdown
+
+The first duration-calibrated GAME run was generation-dominated: `45m28s`
+total, with `4m38s` spent in prefill and `40m04s` in generation. The wall clock
+signal is now the useful lever; the older count-only cache verdicts stay
+invalidated.
+
+For the current corpus fixture `tests/corpus/apps/test0708_012/fixtures/events-final-acceptance-pending.jsonl`,
+the implementation rewrite happened at the `implement-visual-polish-tsx` turn
+(`src/app/page.tsx` write). That turn replaced the page implementation, but the
+final artifact still retained the `data-anvil-*` hooks, so the failure read as a
+behavioral miss rather than a literal hook-drop regression. The cheapest
+surviving measure is guidance: keep extending the instrumented skeleton and
+preserve `data-anvil-*` attributes instead of treating the scaffold as disposable
+output.
+
+The summary renderer now surfaces a `Generation profile` block alongside the
+existing time profile. It groups provider turns by caller scope
+(`planner`/`executor`/`repair`/`acceptance-repair`) and by turn type
+(`full-file Write`, `Edit`, `prose-only`, `tool-call`) so the volume shape stays
+visible even when the run itself is duration-only.
+
 ## Speed Track 1 Prefix Audit
 
 Audit source: reconstructed prompts from the corpus event fixtures
@@ -110,6 +132,8 @@ Calibration note for the current Ollama 0.31.1 chat path:
   prompt size grows.
 - The stable-layout behavioral regression verdict remains unchanged because it
   is based on behavior evidence, not token counts.
+- Current speed verdict: cache closed; generation-dominated; the 106C/D
+  wall-clock effect is approximately zero when compared at equal scope.
 
 ## History-Size Audit
 
