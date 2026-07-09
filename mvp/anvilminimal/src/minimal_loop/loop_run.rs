@@ -440,7 +440,7 @@ impl RunSessionScope {
 }
 
 impl RunSessionStepKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             RunSessionStepKind::Inspect => "inspect",
             RunSessionStepKind::Setup => "setup",
@@ -866,6 +866,21 @@ enum ContractVerificationOutcome {
     ObservationIncomplete(ContractObservation),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepShortCircuitAt {
+    Start,
+    Iteration,
+}
+
+impl StepShortCircuitAt {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Iteration => "iteration",
+        }
+    }
+}
+
 #[derive(Debug)]
 enum VerifyRepairNoEditOutcome {
     NoPendingFailure,
@@ -1067,12 +1082,40 @@ pub(crate) fn run_session_with_outcome_with_options(
         config.max_iterations
     }
     .saturating_add(EMPTY_RESPONSE_RECOVERY_EXTRA_ITERATIONS);
+    if let Some(outcome) = maybe_short_circuit_satisfied_step(
+        config,
+        &options,
+        user_prompt,
+        &required_paths,
+        completion_contract
+            .as_ref()
+            .filter(|_| contract_runtime_enabled),
+        &mut verify_attempts,
+        StepShortCircuitAt::Start,
+    )? {
+        return Ok(outcome);
+    }
     session
         .messages
         .push(ConversationMessage::user(user_prompt.to_string()));
     let profile_guidance = crate::planner::profile::profile_guidance(&config.profile, user_prompt);
 
     for iteration in 0..iteration_limit {
+        if iteration > 0
+            && let Some(outcome) = maybe_short_circuit_satisfied_step(
+                config,
+                &options,
+                user_prompt,
+                &required_paths,
+                completion_contract
+                    .as_ref()
+                    .filter(|_| contract_runtime_enabled),
+                &mut verify_attempts,
+                StepShortCircuitAt::Iteration,
+            )?
+        {
+            return Ok(outcome);
+        }
         let iterations_used = iteration + 1;
         let remaining_iterations = iteration_limit.saturating_sub(iterations_used);
         if step_started.elapsed() >= step_wall_clock_cap {
@@ -2411,6 +2454,98 @@ fn missing_paths(root: &std::path::Path, required_paths: &[String]) -> Vec<Strin
         .filter(|path| resolve_existing(root, path).is_err())
         .cloned()
         .collect()
+}
+
+fn maybe_short_circuit_satisfied_step(
+    config: &Config,
+    options: &RunSessionOptions,
+    user_prompt: &str,
+    required_paths: &[String],
+    contract: Option<&CompletionContract>,
+    verify_attempts: &mut usize,
+    at: StepShortCircuitAt,
+) -> anyhow::Result<Option<RunSessionOutcome>> {
+    if required_paths.is_empty() && !contract.is_some_and(CompletionContract::has_verify) {
+        return Ok(None);
+    }
+    let missing = missing_paths(&config.workspace_root, required_paths);
+    if !missing.is_empty() {
+        return Ok(None);
+    }
+    if let Some(contract) = contract.filter(|contract| contract.has_verify()) {
+        match verify_completion_contract_with_enforcement(
+            &config.workspace_root,
+            config.eval_events_path.as_deref(),
+            contract,
+            user_prompt,
+            verify_attempts,
+            None,
+            None,
+            &[],
+            &[],
+            &[],
+            false,
+            options.dependency_setup_authority,
+            config.offline,
+            options,
+        )? {
+            ContractVerificationOutcome::Satisfied => {
+                emit_step_short_circuited(config, options, required_paths, *verify_attempts, at);
+                return Ok(Some(RunSessionOutcome {
+                    final_text: format!("step short-circuited: {}", required_paths.join(", ")),
+                    stop_reason: RunStopReason::CompletionContractSatisfied,
+                    changed_paths: Vec::new(),
+                    iterations: 0,
+                    tool_calls: 0,
+                    missing_required_paths: Vec::new(),
+                    missing_capabilities: Vec::new(),
+                    missing_evidence: Vec::new(),
+                    missing_obligations: Vec::new(),
+                    verify_attempts: *verify_attempts,
+                    last_blocking_reason: None,
+                    last_provider_error: None,
+                }));
+            }
+            ContractVerificationOutcome::NeedsRepair(_)
+            | ContractVerificationOutcome::ObservationIncomplete(_) => return Ok(None),
+        }
+    }
+    emit_step_short_circuited(config, options, required_paths, *verify_attempts, at);
+    Ok(Some(RunSessionOutcome {
+        final_text: format!("step short-circuited: {}", required_paths.join(", ")),
+        stop_reason: RunStopReason::RequiredArtifactsSatisfiedAfterTool,
+        changed_paths: Vec::new(),
+        iterations: 0,
+        tool_calls: 0,
+        missing_required_paths: Vec::new(),
+        missing_capabilities: Vec::new(),
+        missing_evidence: Vec::new(),
+        missing_obligations: Vec::new(),
+        verify_attempts: *verify_attempts,
+        last_blocking_reason: None,
+        last_provider_error: None,
+    }))
+}
+
+fn emit_step_short_circuited(
+    config: &Config,
+    options: &RunSessionOptions,
+    required_paths: &[String],
+    verify_attempts: usize,
+    at: StepShortCircuitAt,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "step_short_circuited",
+            "at": at.as_str(),
+            "required_paths": required_paths,
+            "verify_attempts": verify_attempts,
+            "session_scope": options.scope.as_str(),
+            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
+            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
+        }),
+    );
 }
 
 fn non_scaffold_missing_paths(config: &Config, missing_paths: &[String]) -> Vec<String> {
@@ -6185,6 +6320,82 @@ export default function Page(){
         assert!(event_text.contains("\"event\":\"setup_scaffold_completed\""));
         assert!(event_text.contains("\"trigger\":\"exhausted\""));
         assert!(!event_text.contains("\"reason\":\"artifact_recovery_exhausted\""));
+    }
+
+    #[test]
+    fn pre_scaffolded_setup_step_short_circuits_without_model_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("src/app/page.tsx"), "ok").unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut fake = Fake {
+            replies: Vec::new(),
+        };
+        let mut session = SessionSnapshot::new();
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Scaffold the already present page.",
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap();
+
+        assert_eq!(fake.replies.len(), 0);
+        assert_eq!(outcome.iterations, 0);
+        assert_eq!(outcome.tool_calls, 0);
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        let events = event_values(&events);
+        assert!(events.iter().any(|event| {
+            event.get("event").and_then(Value::as_str) == Some("step_short_circuited")
+                && event.get("at").and_then(Value::as_str) == Some("start")
+        }));
+    }
+
+    #[test]
+    fn setup_step_with_missing_path_uses_normal_model_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut fake = Fake {
+            replies: vec![Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path": "src/app/page.tsx", "content": "ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            })],
+        };
+        let mut session = SessionSnapshot::new();
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Scaffold the missing page.",
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap();
+
+        assert_eq!(fake.replies.len(), 0);
+        assert_eq!(outcome.iterations, 1);
+        assert_eq!(outcome.tool_calls, 1);
+        assert!(dir.path().join("src/app/page.tsx").is_file());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(!event_text.contains("\"event\":\"step_short_circuited\""));
     }
 
     #[test]

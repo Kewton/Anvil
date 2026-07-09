@@ -2047,6 +2047,47 @@ fn run_step(
         phase_scope,
         contract_setup_authority,
     );
+    if step_short_circuit_precheck_applicable(step, &step_config) {
+        let (report, build_lifecycles) = verify_step_completion_observed(
+            config,
+            &runtime_step,
+            step,
+            phase_scope,
+            setup_authority,
+        );
+        apply_runtime_command_normalizations(&mut runtime_step, &report);
+        for lifecycle in &build_lifecycles {
+            emit_dependency_build_lifecycle(
+                config.eval_events_path.as_deref(),
+                mode,
+                Some(&step.id),
+                lifecycle,
+            );
+        }
+        if report.is_pass() {
+            emit_runner_step_short_circuited(
+                config,
+                step,
+                phase_scope,
+                &step.expected_paths,
+                "start",
+            );
+            if production_build_lifecycle_passed(&build_lifecycles) {
+                snapshot_last_known_good_sources(
+                    config,
+                    mode,
+                    Some(&step.id),
+                    &config.profile,
+                    prompt_context.overall_goal.as_str(),
+                    &step.expected_paths,
+                );
+            }
+            return Ok(StepRunOutcome {
+                stop_reason: Some("StepShortCircuited".to_string()),
+                ..StepRunOutcome::default()
+            });
+        }
+    }
     let initial = run_session_with_outcome_with_options(
         client,
         session,
@@ -2112,31 +2153,9 @@ fn run_step(
         outcome.partial = true;
         return Err(StepRunError { message, outcome });
     }
-    let (mut report, mut build_lifecycles) =
-        verify_step_with_profile_setup_observed_with_offline_and_events(
-            &config.workspace_root,
-            &runtime_step,
-            Some(&config.profile),
-            setup_authority,
-            config.offline,
-            config.eval_events_path.as_deref(),
-        );
+    let (report, build_lifecycles) =
+        verify_step_completion_observed(config, &runtime_step, step, phase_scope, setup_authority);
     apply_runtime_command_normalizations(&mut runtime_step, &report);
-    if should_run_setup_step_dependency_state_lifecycle(
-        &config.workspace_root,
-        step,
-        phase_scope,
-        setup_authority,
-    ) {
-        let (dependency_report, mut dependency_lifecycles) =
-            verify_setup_dependency_state_with_setup_observed_with_offline(
-                &config.workspace_root,
-                setup_authority,
-                config.offline,
-            );
-        merge_verification_report(&mut report, dependency_report);
-        build_lifecycles.append(&mut dependency_lifecycles);
-    }
     for lifecycle in &build_lifecycles {
         emit_dependency_build_lifecycle(
             config.eval_events_path.as_deref(),
@@ -3137,6 +3156,69 @@ fn step_run_session_options(
         phase_scope.map(str::to_string),
     )
     .with_dependency_setup_authority(setup_authority)
+}
+
+fn step_short_circuit_precheck_applicable(step: &PlanStep, config: &Config) -> bool {
+    if step.expected_paths.is_empty() && step.verify.is_empty() {
+        return false;
+    }
+    !(step.step_kind() == StepKind::Implement && config.completion_contract_path.is_some())
+}
+
+fn verify_step_completion_observed(
+    config: &Config,
+    runtime_step: &PlanStep,
+    original_step: &PlanStep,
+    phase_scope: Option<&str>,
+    setup_authority: NodeDependencySetupAuthority,
+) -> (VerificationReport, Vec<BuildVerifierLifecycleObservation>) {
+    let (mut report, mut build_lifecycles) =
+        verify_step_with_profile_setup_observed_with_offline_and_events(
+            &config.workspace_root,
+            runtime_step,
+            Some(&config.profile),
+            setup_authority,
+            config.offline,
+            config.eval_events_path.as_deref(),
+        );
+    if should_run_setup_step_dependency_state_lifecycle(
+        &config.workspace_root,
+        original_step,
+        phase_scope,
+        setup_authority,
+    ) {
+        let (dependency_report, mut dependency_lifecycles) =
+            verify_setup_dependency_state_with_setup_observed_with_offline(
+                &config.workspace_root,
+                setup_authority,
+                config.offline,
+            );
+        merge_verification_report(&mut report, dependency_report);
+        build_lifecycles.append(&mut dependency_lifecycles);
+    }
+    (report, build_lifecycles)
+}
+
+fn emit_runner_step_short_circuited(
+    config: &Config,
+    step: &PlanStep,
+    phase_scope: Option<&str>,
+    required_paths: &[String],
+    at: &str,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "step_short_circuited",
+            "at": at,
+            "step_id": step.id,
+            "step_kind": run_session_step_kind(step).as_str(),
+            "phase_scope": phase_scope.unwrap_or(""),
+            "required_paths": required_paths,
+            "verify_commands": step.verify.clone(),
+            "session_scope": "plan-run-step",
+        }),
+    );
 }
 
 fn run_session_step_kind(step: &PlanStep) -> RunSessionStepKind {
@@ -15156,6 +15238,37 @@ mod tests {
         let mut fake = FakeClient::new(vec![AssistantReply::text("done")]);
         let result = run_plan_file(&mut fake, &path, &config(dir.path().to_path_buf())).unwrap();
         assert_eq!(result, "plan-run complete: 1 steps");
+    }
+
+    #[test]
+    fn verify_step_short_circuits_when_expected_path_and_verify_already_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        std::fs::write(dir.path().join("done.txt"), "ok").unwrap();
+        let plan = StepPlan {
+            goal: "Verify existing artifact".to_string(),
+            steps: vec![PlanStep {
+                id: "verify-existing".to_string(),
+                kind: "verify".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Verify done.txt exists".to_string(),
+                expected_paths: vec!["done.txt".to_string()],
+                verify: vec!["test -f done.txt".to_string()],
+            }],
+        };
+        let path = save_step_plan(dir.path(), &plan).unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut fake = FakeClient::new(Vec::new());
+
+        let result = run_plan_file(&mut fake, &path, &cfg).unwrap();
+
+        assert_eq!(result, "plan-run complete: 1 steps");
+        assert_eq!(fake.messages.len(), 0);
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"step_short_circuited\""));
+        assert!(event_text.contains("\"at\":\"start\""));
+        assert!(event_text.contains("\"step_id\":\"verify-existing\""));
     }
 
     #[test]
