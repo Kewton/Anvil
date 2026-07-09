@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anvilminimal::config::{Action, Config, Provider};
@@ -533,6 +533,11 @@ fn free_local_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
+fn tui_integration_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap()
+}
+
 #[test]
 #[ignore]
 fn tui_fake_dev_server_child() {
@@ -562,6 +567,7 @@ fn tui_fake_dev_server_child() {
 
 #[test]
 fn tui_integration_records_model_and_tool_boundaries() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let mut client = FakeClient::new(
         "fake",
@@ -598,6 +604,7 @@ fn tui_integration_records_model_and_tool_boundaries() {
 
 #[test]
 fn tui_markdown_raw_session_storage() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let raw = "<think>secret</think># done";
     let mut client = FakeClient::new("fake", vec![AssistantReply::text(raw)]);
@@ -621,6 +628,7 @@ fn tui_markdown_raw_session_storage() {
 
 #[test]
 fn interrupt_boundaries_stop_before_model_call() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let mut client = FakeClient::new("fake", vec![AssistantReply::text("unused")]);
     let mut session = SessionSnapshot::new();
@@ -641,6 +649,7 @@ fn interrupt_boundaries_stop_before_model_call() {
 
 #[test]
 fn planner_uses_ui_for_planner_model_call() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let json = r#"{"goal":"test","steps":[{"id":"s1","kind":"report","instruction":"say done","expected_paths":[],"verify":[],"expected_result":"pass"}]}"#;
     let mut planner = FakeClient::new("planner", vec![AssistantReply::text(json)]);
@@ -658,6 +667,7 @@ fn planner_uses_ui_for_planner_model_call() {
 
 #[test]
 fn primary_ultra_plan_run_renders_plan_then_activity_then_summary() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let mut cfg = config(dir.path().to_path_buf());
@@ -724,6 +734,7 @@ fn primary_ultra_plan_run_renders_plan_then_activity_then_summary() {
 
 #[test]
 fn in_flight_provider_interrupt_finishes_before_sleep_and_writes_terminal_records() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let plan_path = write_ultra_plan(dir.path());
@@ -763,6 +774,7 @@ fn in_flight_provider_interrupt_finishes_before_sleep_and_writes_terminal_record
 
 #[test]
 fn in_flight_bash_interrupt_force_finalizes_without_waiting_for_grace() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let plan_path = write_ultra_plan(dir.path());
@@ -810,6 +822,7 @@ fn in_flight_bash_interrupt_force_finalizes_without_waiting_for_grace() {
 
 #[test]
 fn tui_ultra_plan_run_smoke_fake_clients() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let mut step_plan = anvilminimal::planner::step_plan::StepPlan::single("write app");
     step_plan.steps[0].kind = "implement".to_string();
@@ -886,6 +899,7 @@ fn tui_ultra_plan_run_smoke_fake_clients() {
 
 #[test]
 fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     #[cfg(unix)]
     let port = free_local_port();
@@ -1073,6 +1087,7 @@ fn tui_slash_promoted_profile_reflected_in_terminal_summary() {
 
 #[test]
 fn tui_runs_lists_recent_runs_without_emitting_command_events() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/current/events.jsonl");
     let previous_run = dir.path().join(".anvil/runs/018f2222-bbbb");
@@ -1123,6 +1138,7 @@ fn tui_runs_lists_recent_runs_without_emitting_command_events() {
 
 #[test]
 fn tui_help_lists_recovery_commands_without_emitting_events() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/current/events.jsonl");
     let mut cfg = config(dir.path().to_path_buf());
@@ -1153,6 +1169,7 @@ fn tui_help_lists_recovery_commands_without_emitting_events() {
 
 #[test]
 fn tui_resume_runs_recovery_plan_remaining_phases_and_records_lineage() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/current/events.jsonl");
     std::fs::create_dir_all(dir.path().join(".anvil/plans")).unwrap();
@@ -1304,6 +1321,7 @@ phases:
 
 #[test]
 fn tui_slash_failure_records_run_events_and_failure_stage() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let mut cfg = config(dir.path().to_path_buf());
@@ -1346,6 +1364,7 @@ fn tui_slash_failure_records_run_events_and_failure_stage() {
 
 #[test]
 fn tui_slash_failure_rewrites_existing_partial_summary_with_phase_breakdown() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let mut cfg = config(dir.path().to_path_buf());
@@ -1379,6 +1398,7 @@ fn tui_slash_failure_rewrites_existing_partial_summary_with_phase_breakdown() {
 
 #[test]
 fn tui_slash_success_with_partial_release_gate_is_not_complete_only() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let mut cfg = config(dir.path().to_path_buf());
@@ -1451,6 +1471,7 @@ fn tui_slash_success_with_partial_release_gate_is_not_complete_only() {
 
 #[test]
 fn tui_slash_completion_guard_records_aborted_on_panic() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let mut cfg = config(dir.path().to_path_buf());
@@ -1486,6 +1507,7 @@ fn tui_slash_completion_guard_records_aborted_on_panic() {
 
 #[test]
 fn tui_slash_ultra_panic_records_diagnostics_and_terminal_summary() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let plan_path = write_ultra_plan(dir.path());
@@ -1541,6 +1563,7 @@ fn tui_slash_ultra_panic_records_diagnostics_and_terminal_summary() {
 
 #[test]
 fn tui_slash_completion_guard_records_interrupted_mid_phase() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let plan_path = write_ultra_plan(dir.path());
@@ -1578,6 +1601,7 @@ fn tui_slash_completion_guard_records_interrupted_mid_phase() {
 
 #[test]
 fn tui_slash_ultra_plan_completion_records_phase_breakdown_and_acceptance() {
+    let _guard = tui_integration_test_lock();
     let dir = tempfile::tempdir().unwrap();
     let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
     let plan_path = write_ultra_plan(dir.path());
@@ -1640,6 +1664,7 @@ fn tui_slash_ultra_plan_completion_records_phase_breakdown_and_acceptance() {
 
 #[test]
 fn plain_renderer_keeps_raw_output() {
+    let _guard = tui_integration_test_lock();
     let renderer = anvilminimal::tui::markdown::PlainRenderer;
     renderer
         .render_assistant("<think>secret</think>raw")

@@ -2048,7 +2048,7 @@ fn run_step(
         phase_scope,
         contract_setup_authority,
     );
-    if step_short_circuit_precheck_applicable(step, &step_config) {
+    if step_short_circuit_precheck_applicable(step) {
         let (report, build_lifecycles) = verify_step_completion_observed(
             config,
             &runtime_step,
@@ -3176,11 +3176,25 @@ fn plan_expected_paths(plan: &StepPlan) -> Vec<String> {
     out
 }
 
-fn step_short_circuit_precheck_applicable(step: &PlanStep, config: &Config) -> bool {
+fn step_short_circuit_precheck_applicable(step: &PlanStep) -> bool {
     if step.expected_paths.is_empty() && step.verify.is_empty() {
         return false;
     }
-    !(step.step_kind() == StepKind::Implement && config.completion_contract_path.is_some())
+    match step.step_kind() {
+        StepKind::Setup => setup_short_circuit_instruction(&step.instruction),
+        StepKind::Verify => !step.expected_paths.is_empty(),
+        _ => false,
+    }
+}
+
+fn setup_short_circuit_instruction(instruction: &str) -> bool {
+    let lower = instruction.to_ascii_lowercase();
+    lower.contains("setup")
+        || lower.contains("set up")
+        || lower.contains("scaffold")
+        || lower.contains("pre-scaffold")
+        || lower.contains("pre-provision")
+        || lower.contains("already present")
 }
 
 fn verify_step_completion_observed(

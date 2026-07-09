@@ -1110,6 +1110,7 @@ pub(crate) fn run_session_with_outcome_with_options(
 
     for iteration in 0..iteration_limit {
         if iteration > 0
+            && pending_feedback.is_none()
             && let Some(outcome) = maybe_short_circuit_satisfied_step(
                 config,
                 &options,
@@ -2474,14 +2475,19 @@ fn maybe_short_circuit_satisfied_step(
     verify_attempts: &mut usize,
     at: StepShortCircuitAt,
 ) -> anyhow::Result<Option<RunSessionOutcome>> {
-    if required_paths.is_empty() && !contract.is_some_and(CompletionContract::has_verify) {
+    if at == StepShortCircuitAt::Start && options.step_kind == Some(RunSessionStepKind::Implement) {
+        return Ok(None);
+    }
+    let has_contract_gate = contract.is_some_and(CompletionContract::has_verify);
+    if required_paths.is_empty() {
         return Ok(None);
     }
     let missing = missing_paths(&config.workspace_root, required_paths);
     if !missing.is_empty() {
         return Ok(None);
     }
-    if let Some(contract) = contract.filter(|contract| contract.has_verify()) {
+    if let Some(contract) = contract.filter(|_| has_contract_gate) {
+        let attempts_before_probe = *verify_attempts;
         match verify_completion_contract_with_enforcement(
             &config.workspace_root,
             config.eval_events_path.as_deref(),
@@ -2516,8 +2522,14 @@ fn maybe_short_circuit_satisfied_step(
                 }));
             }
             ContractVerificationOutcome::NeedsRepair(_)
-            | ContractVerificationOutcome::ObservationIncomplete(_) => return Ok(None),
+            | ContractVerificationOutcome::ObservationIncomplete(_) => {
+                *verify_attempts = attempts_before_probe;
+                return Ok(None);
+            }
         }
+    }
+    if !setup_short_circuit_allowed(options, user_prompt) {
+        return Ok(None);
     }
     emit_step_short_circuited(config, options, required_paths, *verify_attempts, at);
     Ok(Some(RunSessionOutcome {
@@ -2555,6 +2567,44 @@ fn emit_step_short_circuited(
             "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
         }),
     );
+}
+
+fn setup_short_circuit_allowed(options: &RunSessionOptions, user_prompt: &str) -> bool {
+    if options.step_kind != Some(RunSessionStepKind::Setup) {
+        return false;
+    }
+    let instruction = current_step_instruction(user_prompt).unwrap_or(user_prompt);
+    if setup_short_circuit_instruction(instruction) {
+        return true;
+    }
+    let phase_scope = options
+        .phase_scope
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    phase_scope.contains("setup") || phase_scope.contains("scaffold")
+}
+
+fn current_step_instruction(prompt: &str) -> Option<&str> {
+    let marker = "Current step instruction:\n";
+    let after_marker = prompt.split_once(marker)?.1;
+    Some(
+        after_marker
+            .split("\n\n")
+            .next()
+            .unwrap_or(after_marker)
+            .trim(),
+    )
+}
+
+fn setup_short_circuit_instruction(instruction: &str) -> bool {
+    let lower = instruction.to_ascii_lowercase();
+    lower.contains("setup")
+        || lower.contains("set up")
+        || lower.contains("scaffold")
+        || lower.contains("pre-scaffold")
+        || lower.contains("pre-provision")
+        || lower.contains("already present")
 }
 
 fn non_scaffold_missing_paths(config: &Config, missing_paths: &[String]) -> Vec<String> {
