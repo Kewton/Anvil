@@ -20,7 +20,8 @@ use crate::state::{ConversationMessage, SessionSnapshot, ToolCall};
 use crate::tools::args_recovery::recover_tool_arguments;
 use crate::tools::bash::BashOutcomeKind;
 use crate::tools::path_guard::{
-    resolve_existing, resolve_optional_existing, validate_workspace_relative,
+    normalize_workspace_path, resolve_existing, resolve_optional_existing,
+    validate_workspace_relative,
 };
 use crate::tools::registry::{
     ToolContext, ToolRegistry, missing_arg_name, recoverable_tool_error, tool_error_kind,
@@ -4794,17 +4795,25 @@ fn recoverable_tool_feedback(
 }
 
 fn edit_anchor_tracking_path(root: &Path, arguments: &serde_json::Value) -> Option<String> {
-    let raw = arguments.get("path")?.as_str()?;
-    let path = resolve_optional_existing(root, raw).ok()?;
+    let normalized = normalized_tool_path_arg(root, arguments)?;
+    let path = resolve_optional_existing(root, &normalized).ok()?;
     let root = root.canonicalize().ok()?;
     Some(crate::tools::path_guard::relative_display(&root, &path))
 }
 
 fn changed_path_from_call(root: &Path, arguments: &serde_json::Value) -> Option<String> {
-    let raw = arguments.get("path")?.as_str()?;
-    let path = resolve_existing(root, raw).ok()?;
+    let normalized = normalized_tool_path_arg(root, arguments)?;
+    let path = resolve_existing(root, &normalized).ok()?;
     let root = root.canonicalize().ok()?;
     Some(crate::tools::path_guard::relative_display(&root, &path))
+}
+
+fn normalized_tool_path_arg(root: &Path, arguments: &serde_json::Value) -> Option<String> {
+    let raw = arguments.get("path")?.as_str()?;
+    match normalize_workspace_path(root, raw).ok()? {
+        Some(normalization) => Some(normalization.relative),
+        None => Some(raw.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -6646,6 +6655,19 @@ export default function Page(){
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"event\":\"tool_args_path_near_root_corruption\""));
         assert!(!event_text.contains("\"method\":\"required_path\""));
+    }
+
+    #[test]
+    fn changed_path_tracking_normalizes_absolute_workspace_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        let path = dir.path().join("src/app/page.tsx");
+        std::fs::write(&path, "ok").unwrap();
+
+        let changed =
+            changed_path_from_call(dir.path(), &json!({"path": path.display().to_string()}));
+
+        assert_eq!(changed.as_deref(), Some("src/app/page.tsx"));
     }
 
     #[test]

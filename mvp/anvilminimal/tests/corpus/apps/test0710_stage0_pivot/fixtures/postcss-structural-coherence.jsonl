@@ -1,0 +1,2 @@
+{"event":"profile_contract_failed","profile":"nextjs","reason":"tailwind_contract_failure: PostCSS config must export a plugins key","schema_version":"1"}
+{"event":"profile_coherence_repair","profile":"nextjs","path":"postcss.config.js","repair":"canonical_rewrite","content":"module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n","schema_version":"1"}

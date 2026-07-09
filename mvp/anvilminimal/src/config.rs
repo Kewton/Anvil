@@ -1188,6 +1188,46 @@ narration = "quiet"
     }
 
     #[test]
+    fn hybrid_a3b_preset_keeps_planner_and_executor_models_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+        std::fs::write(
+            dir.path().join(".anvil/config.toml"),
+            r#"
+[preset.hybrid-a3b]
+provider = "ollama"
+model = "qwen3.6:35b-a3b-coding-nvfp4"
+planner_provider = "gemini"
+planner_model = "gemini-3.5-flash"
+context_budget = 65536
+chat_timeout_secs = 600
+profile = "nextjs"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--preset",
+            "hybrid-a3b",
+            "--ultra-plan-run",
+            "Web app",
+        ]))
+        .unwrap();
+
+        assert_eq!(config.provider, Provider::Ollama);
+        assert_eq!(config.model, "qwen3.6:35b-a3b-coding-nvfp4");
+        assert_eq!(config.planner_provider, Provider::Gemini);
+        assert_eq!(config.planner_model, "gemini-3.5-flash");
+        assert_ne!(config.model, config.planner_model);
+        assert_eq!(config.field_sources.model, "preset:hybrid-a3b");
+        assert_eq!(config.field_sources.planner_model, "preset:hybrid-a3b");
+    }
+
+    #[test]
     fn prompt_layout_flag_wins_over_config_and_defaults_legacy() {
         let default = Config::from_cli(Cli::parse_from(["anvilminimal"])).unwrap();
         assert_eq!(default.prompt_layout, PromptLayout::Legacy);

@@ -1,0 +1,56 @@
+case_id = "test0710_stage0_pivot"
+source = "stage-0 hybrid/depth pivot coverage fixtures"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["stage0", "near-root", "postcss", "depth", "hybrid", "quoting"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/diagnosis.md = [
+  "test0710_camp_001",
+  "not present in the local corpus",
+  "model-authored args"
+]
+fixtures/stale-path-near-root-corruption.jsonl = [
+  "\"event\":\"tool_args_path_near_root_corruption\"",
+  "\"root\":\"/Users/<user>/share/work/localwork/commandagent_mvp/01/test0710_camp_002\"",
+  "\"accepted\":false",
+  "\"error_kind\":\"tool_args_path_near_root_corruption\""
+]
+fixtures/postcss-structural-coherence.jsonl = [
+  "PostCSS config must export a plugins key",
+  "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };"
+]
+fixtures/depth-profile.jsonl = [
+  "\"event\":\"depth_profile\"",
+  "route_bound_source_lines=",
+  "data_anvil_action_kinds=",
+  "input_types_with_observed_state_change="
+]
+fixtures/hybrid-a3b-preset.jsonl = [
+  "\"provider\":\"ollama\"",
+  "\"model\":\"qwen3.6:35b-a3b-coding-nvfp4\"",
+  "\"planner_provider\":\"gemini\"",
+  "\"planner_model\":\"gemini-3.5-flash\""
+]
+fixtures/node-p-quoting-and-path-normalization.jsonl = [
+  "unbalanced shell quotes",
+  "node -p \\\"require('./package.json').scripts.dev\\\"",
+  "\"normalized_changed_path\":\"src/app/page.tsx\""
+]

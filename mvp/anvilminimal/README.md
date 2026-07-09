@@ -57,11 +57,27 @@ These are examples only; Anvil does not auto-create them:
 # profile = "generic"
 # narration = "normal"
 # footer = "on"
+#
+# [preset.hybrid-a3b]
+# provider = "ollama"
+# model = "qwen3.6:35b-a3b-coding-nvfp4"
+# planner_provider = "gemini"
+# planner_model = "gemini-3.5-flash"
+# context_budget = 65536
+# chat_timeout_secs = 600
+# profile = "nextjs"
+# narration = "normal"
+# footer = "on"
 ```
 
 ```bash
 anvilminimal --preset local --ultra-plan-run "Build a small CLI tool"
 ```
+
+Hybrid presets use the planner provider/model only for planning calls and the
+main provider/model for execution calls. With a local a3b executor, budget RAM
+for the Ollama model residency separately from any remote planner; Ollama
+requests keep `keep_alive=10m` for the executor model between turns.
 
 ## TUI
 

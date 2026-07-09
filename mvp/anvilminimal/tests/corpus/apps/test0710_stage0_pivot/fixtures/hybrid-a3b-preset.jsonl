@@ -1,0 +1,3 @@
+{"event":"run_start","provider":"ollama","model":"qwen3.6:35b-a3b-coding-nvfp4","planner_provider":"gemini","planner_model":"gemini-3.5-flash","chat_timeout_secs":600,"chat_timeout_source":"preset:hybrid-a3b","schema_version":"1"}
+{"event":"provider_request","scope":"planner","provider":"gemini","model":"gemini-3.5-flash","schema_version":"1"}
+{"event":"provider_request","scope":"executor","provider":"ollama","model":"qwen3.6:35b-a3b-coding-nvfp4","keep_alive":"10m","schema_version":"1"}

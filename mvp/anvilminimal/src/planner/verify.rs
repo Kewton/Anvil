@@ -1641,6 +1641,16 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
     if crate::tools::bash::blocked_reason(&normalized, false).is_some() {
         return verify_command_violation(normalized, VerifyCommandViolationKind::Blocked, None);
     }
+    if shell_words_with_spans(&normalized).is_none() {
+        return verify_command_violation(
+            normalized,
+            VerifyCommandViolationKind::ShellControlSyntax,
+            Some(
+                "verify command has unbalanced shell quotes; fix quoting by closing the node -p expression, e.g. `node -p \"require('./package.json').scripts.dev\"`"
+                    .to_string(),
+            ),
+        );
+    }
     if let Some(repair) = normalize_verify_command_for_oracle_repair(&normalized) {
         let violation = match repair.kind {
             "package_json_script_assertion" => VerifyCommandViolationKind::PackageJsonScriptGrep,
@@ -3007,6 +3017,23 @@ mod tests {
                 .unwrap_or_default()
                 .contains("split multiple checks into separate verify commands"),
             "{pipe:?}"
+        );
+    }
+
+    #[test]
+    fn verify_command_diagnoses_node_print_unbalanced_quote_with_remedy() {
+        let diagnosis =
+            diagnose_verify_command(r#"node -p "require('./package.json').scripts.dev"#);
+
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::ShellControlSyntax)
+        );
+        let reason = diagnosis.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("unbalanced shell quotes"), "{diagnosis:?}");
+        assert!(
+            reason.contains(r#"node -p "require('./package.json').scripts.dev""#),
+            "{diagnosis:?}"
         );
     }
 
