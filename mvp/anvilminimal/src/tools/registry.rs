@@ -203,6 +203,13 @@ fn normalize_path_arg(context: &ToolContext, tool: &str, raw: &str) -> anyhow::R
         }
         Ok(None) => Ok(raw.to_string()),
         Err(err) => {
+            if err
+                .to_string()
+                .contains("tool_args_path_near_root_corruption")
+            {
+                emit_path_near_root_corruption(context, tool, raw);
+                return Err(err);
+            }
             if err.to_string().contains("tool_args_path_malformed") {
                 emit_path_malformed(context, tool, raw, false, None);
             }
@@ -324,6 +331,19 @@ fn emit_path_malformed(
     );
 }
 
+fn emit_path_near_root_corruption(context: &ToolContext, tool: &str, original: &str) {
+    eval_events::emit(
+        context.eval_events_path.as_deref(),
+        json!({
+            "event": "tool_args_path_near_root_corruption",
+            "tool": tool,
+            "original": original,
+            "root": context.root.display().to_string(),
+            "accepted": false,
+        }),
+    );
+}
+
 fn emit_bash_path_confinement_rejected(
     context: &ToolContext,
     command: &str,
@@ -427,6 +447,8 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
     let message = err.to_string();
     if message.starts_with("missing string argument `") {
         "missing_arg"
+    } else if message.contains("tool_args_path_near_root_corruption") {
+        "tool_args_path_near_root_corruption"
     } else if message.contains("tool_args_path_malformed") {
         "tool_args_path_malformed"
     } else if message.contains("stale_absolute_path_recoverable") {
@@ -477,6 +499,7 @@ pub fn recoverable_tool_error(err: &anyhow::Error) -> bool {
         tool_error_kind(err),
         "missing_arg"
             | "unknown_tool"
+            | "tool_args_path_near_root_corruption"
             | "tool_args_path_malformed"
             | "bash_path_confinement_error"
             | "stale_absolute_path_recoverable"
@@ -776,6 +799,48 @@ mod tests {
         assert!(event_text.contains(r#""method":"required_path""#));
         assert!(event_text.contains(r#""accepted":false"#));
         assert!(event_text.contains(r#""normalized":"src/app/page.tsx""#));
+    }
+
+    #[test]
+    fn near_root_digit_variance_write_rejects_without_expected_path_salvage() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0710_camp_002");
+        std::fs::create_dir_all(&root).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+            expected_paths: vec!["src/app/page.tsx".to_string()],
+        };
+        let raw = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0710_camp_001/src/app/page.tsx");
+
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path": raw.display().to_string(), "content":"no"}),
+                &context,
+            )
+            .unwrap_err();
+
+        assert_eq!(tool_error_kind(&err), "tool_args_path_near_root_corruption");
+        assert!(recoverable_tool_error(&err));
+        let message = err.to_string();
+        assert!(message.contains(&root.display().to_string()), "{message}");
+        assert!(!root.join("src/app/page.tsx").exists());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"tool_args_path_near_root_corruption""#));
+        assert!(event_text.contains(r#""accepted":false"#));
+        assert!(!event_text.contains(r#""method":"required_path""#));
     }
 
     #[test]

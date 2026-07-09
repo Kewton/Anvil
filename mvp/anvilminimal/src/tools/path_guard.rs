@@ -94,7 +94,15 @@ pub fn normalize_workspace_path(
                 kind: WorkspacePathNormalizationKind::AbsoluteInsideWorkspace,
             }))
         }
-        Ok(_) => {
+        Ok(canonical) => {
+            if looks_like_near_root_digit_variance(&root, &canonical)
+                || looks_like_near_root_digit_variance(&root, path)
+            {
+                bail!(
+                    "tool_args_path_near_root_corruption: current workspace root `{}`; rejected absolute path `{raw}` because it differs by digit variance; {EXPECTED_PATH_FORM}",
+                    root.display()
+                );
+            }
             if let Some(relative) = root_anchor_salvage(&root, path) {
                 Ok(Some(WorkspacePathNormalization {
                     relative,
@@ -105,6 +113,12 @@ pub fn normalize_workspace_path(
             }
         }
         Err(err) => {
+            if looks_like_near_root_digit_variance(&root, path) {
+                bail!(
+                    "tool_args_path_near_root_corruption: current workspace root `{}`; rejected absolute path `{raw}` because it differs by digit variance; {EXPECTED_PATH_FORM}",
+                    root.display()
+                );
+            }
             if let Some(relative) = root_anchor_salvage(&root, path) {
                 Ok(Some(WorkspacePathNormalization {
                     relative,
@@ -363,6 +377,53 @@ fn looks_like_missing_leading_slash_absolute(raw: &str) -> bool {
     matches!(first.as_ref(), "Users" | "home") && components.next().is_some()
 }
 
+fn looks_like_near_root_digit_variance(root: &Path, raw: &Path) -> bool {
+    let root_components = normal_components(root);
+    let raw_components = normal_components(raw);
+    near_root_digit_variance_components(&root_components, &raw_components)
+        || (root_components
+            .first()
+            .is_some_and(|component| component == "private")
+            && near_root_digit_variance_components(&root_components[1..], &raw_components))
+}
+
+fn near_root_digit_variance_components(
+    root_components: &[String],
+    raw_components: &[String],
+) -> bool {
+    if raw_components.len() < root_components.len() || root_components.is_empty() {
+        return false;
+    }
+    let mut digit_variance_components = 0usize;
+    for (root, raw) in root_components.iter().zip(raw_components.iter()) {
+        if root == raw {
+            continue;
+        }
+        if same_shape_with_digit_variance(root, raw) {
+            digit_variance_components += 1;
+        } else {
+            return false;
+        }
+    }
+    digit_variance_components == 1
+}
+
+fn same_shape_with_digit_variance(left: &str, right: &str) -> bool {
+    let mut saw_digit_difference = false;
+    let mut left_chars = left.chars();
+    let mut right_chars = right.chars();
+    loop {
+        match (left_chars.next(), right_chars.next()) {
+            (Some(left), Some(right)) if left == right => {}
+            (Some(left), Some(right)) if left.is_ascii_digit() && right.is_ascii_digit() => {
+                saw_digit_difference = true;
+            }
+            (None, None) => return saw_digit_difference,
+            _ => return false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +518,27 @@ mod tests {
             err.to_string().contains("tool_args_path_malformed"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn rejects_current_root_digit_variance_without_cross_workspace_salvage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0710_camp_002");
+        std::fs::create_dir_all(&root).unwrap();
+        let raw = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0710_camp_001/src/app/page.tsx");
+
+        let err = normalize_workspace_path(&root, raw.to_str().unwrap()).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("tool_args_path_near_root_corruption"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(root.to_str().unwrap()), "{err}");
     }
 
     #[test]

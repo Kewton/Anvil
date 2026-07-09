@@ -516,6 +516,7 @@ pub fn repair_tailwind_contract(root: &Path, goal: &str, reason: &str) -> anyhow
     }
     if reason.contains("PostCSS config must include the Tailwind plugin")
         || reason.contains("PostCSS config must include autoprefixer")
+        || reason.contains("PostCSS config must export a plugins key")
     {
         changed |= ensure_package_json_changed(project_root, goal)?;
         changed |= repair_postcss_plugins(project_root)?;
@@ -851,6 +852,9 @@ fn repair_postcss_plugins(root: &Path) -> anyhow::Result<bool> {
     };
     let content = std::fs::read_to_string(&path).unwrap_or_default();
     let lower = content.to_ascii_lowercase();
+    if !postcss_has_plugins_key(&lower) {
+        return write_file_if_changed(&path, canonical_postcss_config());
+    }
     let needs_tailwind = !(lower.contains("tailwindcss") || lower.contains("@tailwindcss/postcss"));
     let needs_autoprefixer = !lower.contains("autoprefixer");
     if !needs_tailwind && !needs_autoprefixer {
@@ -933,6 +937,21 @@ fn find_plugins_object_block(content: &str) -> Option<(usize, usize)> {
         return Some((cursor, close));
     }
     None
+}
+
+fn postcss_has_plugins_key(lower_content: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(relative) = lower_content[search_from..].find("plugins") {
+        let index = search_from + relative;
+        let before = lower_content[..index].chars().next_back();
+        let after = lower_content[index + "plugins".len()..].chars().next();
+        if before.is_some_and(is_identifier_char) || after.is_some_and(is_identifier_char) {
+            search_from = index + "plugins".len();
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 fn is_identifier_char(ch: char) -> bool {
@@ -1501,6 +1520,9 @@ fn tailwind_contract_failure(root: &Path, package: &Value) -> Option<String> {
     }
     let postcss_config = std::fs::read_to_string(postcss_config).unwrap_or_default();
     let postcss_lower = postcss_config.to_ascii_lowercase();
+    if find_plugins_object_block(&postcss_config).is_none() {
+        return Some(tailwind_failure("PostCSS config must export a plugins key"));
+    }
     if !(postcss_lower.contains("tailwindcss") || postcss_lower.contains("@tailwindcss/postcss")) {
         return Some(tailwind_failure(
             "PostCSS config must include the Tailwind plugin",
@@ -2699,6 +2721,22 @@ export default function Page() {
         assert!(!repair_tailwind_contract(dir.path(), "3011", &reason).unwrap());
         let after = std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn repair_tailwind_contract_rewrites_postcss_config_missing_plugins_key() {
+        let dir =
+            complete_tailwind_app("module.exports = { tailwindcss: {}, autoprefixer: {} };\n");
+        let report = verify_invariant(dir.path(), "3011");
+        let reason = report.primary_reason();
+        assert!(reason.contains("PostCSS config must export a plugins key"));
+
+        assert!(repair_tailwind_contract(dir.path(), "3011", &reason).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("postcss.config.js")).unwrap(),
+            canonical_postcss_config()
+        );
+        assert!(verify_invariant(dir.path(), "3011").is_pass());
     }
 
     #[test]

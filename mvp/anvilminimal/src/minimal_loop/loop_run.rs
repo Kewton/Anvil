@@ -4772,6 +4772,11 @@ fn recoverable_tool_feedback(
             "Tool call `{name}` used an absolute path outside the current workspace and was rejected: {err_text}. Retry with the workspace-relative path named in the error; do not use an absolute path from another workspace."
         );
     }
+    if err_text.contains("tool_args_path_near_root_corruption") {
+        return format!(
+            "Tool call `{name}` used a path that appears to reconstruct the current workspace root with a digit variance and was rejected. Do not salvage or write across workspaces; retry with a workspace-relative path under the exact current root quoted in the error: {err_text}."
+        );
+    }
     if let Some((path, count)) = edit_anchor_failure {
         let mut feedback = format!(
             "Tool call `{name}` was rejected with a recoverable validation error: {err_text}. Retry with the Edit tool using the deterministic best-match excerpt and re-anchor mandate from the error."
@@ -6570,6 +6575,77 @@ export default function Page(){
         assert!(event_text.contains("\"method\":\"required_path\""));
         assert!(event_text.contains("\"accepted\":false"));
         assert!(event_text.contains("\"normalized\":\"src/app/page.tsx\""));
+    }
+
+    #[test]
+    fn near_root_digit_variance_feedback_quotes_exact_current_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0710_camp_002");
+        std::fs::create_dir_all(&root).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(root.clone());
+        cfg.eval_events_path = Some(events.clone());
+        let stale = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0710_camp_001/src/app/page.tsx");
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path": stale.display().to_string(), "content": "wrong"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path": "src/app/page.tsx", "content": "ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create the page.",
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/app/page.tsx")).unwrap(),
+            "ok"
+        );
+        let root_display = root.canonicalize().unwrap().display().to_string();
+        assert!(session.messages.iter().any(|message| {
+            message
+                .content
+                .contains("tool_args_path_near_root_corruption")
+                && message.content.contains(&root_display)
+                && message
+                    .content
+                    .contains("Do not salvage or write across workspaces")
+        }));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"tool_args_path_near_root_corruption\""));
+        assert!(!event_text.contains("\"method\":\"required_path\""));
     }
 
     #[test]
