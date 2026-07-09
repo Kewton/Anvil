@@ -41,6 +41,12 @@ If that value is missing from the campaign report, reconstruct it in the next
 analysis pass and add it to the campaign checklist instead of backfilling it
 silently.
 
+Repair follow-through note correction: the test0708_009 zero-edit recurrence is
+not yet attributable to qwen27b model variance. The harvested fixture is a
+single-file compile failure that reached compact zero-edit without a
+`repair_regeneration` or skip-decision event, so the result must be re-judged
+after the regeneration rung is confirmed reachable on that path.
+
 ## Speed Track 1 Prefix Audit
 
 Audit source: reconstructed prompts from the corpus event fixtures

@@ -58,6 +58,8 @@ fixtures/recovery-prompt.md = [
 ]
 fixtures/summary.md = [
   "Compile-repair recurrence (test0708_009):",
-  "attempts 1/2 used appended repair sessions; attempt 3 used compact",
+  "attempt 1 used an appended repair session and edited `src/app/page.tsx`",
+  "attempt 2 used an appended repair session with `changed_paths=[]`; attempt 3 used compact",
+  "historical fixture gap: single-file compile failure reached compact zero-edit without any `repair_regeneration`",
   "run_stop false-success recording (historical): process exit success with release-gate failure"
 ]
