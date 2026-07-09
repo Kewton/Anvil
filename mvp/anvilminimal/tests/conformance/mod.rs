@@ -616,12 +616,46 @@ fn conformance_negative_timeout_loop_requires_honest_terminal_reason() {
     );
 }
 
+#[test]
+fn conformance_negative_compile_exhaustion_requires_regeneration_decision() {
+    let trace = Trace {
+        scenario: MatrixScenario::Nextjs,
+        events: vec![
+            json!({
+                "event": "step_verify_repair",
+                "step_id": "verify-build",
+                "repair_session_mode": "compact",
+                "failure_kind": "compile_repair_no_source_change",
+                "compile_repair_no_source_change": true,
+                "changed_paths": [],
+            }),
+            json!({
+                "event": "loop_stop",
+                "reason": "compile_repair_no_source_change",
+                "step_id": "verify-build",
+            }),
+            terminal_stop("failed"),
+        ],
+        summary: terminal_summary("failed"),
+        output: String::new(),
+    };
+
+    assert_contract_fails(
+        "compile_regeneration_visibility",
+        check_compile_regeneration_visibility(&trace),
+    );
+}
+
 fn assert_conformance_contracts(trace: &Trace) {
     for (name, result) in [
         ("earned_assurance", check_earned_assurance(trace)),
         ("monotonic_rebind", check_monotonic_rebind(trace)),
         ("authority_symmetry", check_authority_symmetry(trace)),
         ("detect_repair_pairing", check_detect_repair_pairing(trace)),
+        (
+            "compile_regeneration_visibility",
+            check_compile_regeneration_visibility(trace),
+        ),
         ("honest_terminal", check_honest_terminal(trace)),
         (
             "known_profile_contract_bound",
@@ -923,6 +957,41 @@ fn check_detect_repair_pairing(trace: &Trace) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn check_compile_regeneration_visibility(trace: &Trace) -> Result<(), String> {
+    for (index, event) in trace.events.iter().enumerate() {
+        if !compile_repair_exhaustion_event(event) {
+            continue;
+        }
+        let has_decision = trace.events[..index].iter().any(|candidate| {
+            string_field(candidate, "event") == Some("repair_regeneration")
+                && matches!(
+                    string_field(candidate, "lifecycle_stage"),
+                    Some("step_repair" | "final_acceptance_repair" | "dependency_setup_build")
+                )
+        });
+        if !has_decision {
+            return Err(format!(
+                "compile_regeneration_visibility: compile exhaustion lacked repair_regeneration decision before {event}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn compile_repair_exhaustion_event(event: &Value) -> bool {
+    match string_field(event, "event") {
+        Some("loop_stop") => string_field(event, "reason")
+            .is_some_and(|reason| reason.contains("compile_repair_no_source_change")),
+        Some("final_acceptance_repair_exhausted") => event
+            .get("compile_errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| !errors.is_empty()),
+        Some("ultra_phase_failed") => string_field(event, "reason")
+            .is_some_and(|reason| reason.contains("compile_repair_no_source_change")),
+        _ => false,
+    }
 }
 
 fn check_honest_terminal(trace: &Trace) -> Result<(), String> {

@@ -5580,6 +5580,39 @@ pub fn run_ultra_plan_with_ui(
                 break;
             }
         }
+        if !acceptance_report.is_pass() && !acceptance_report.compile_errors.is_empty() {
+            let expected_paths =
+                final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
+            if exhausted_reason == "bounded_repair_wall_clock_cap" {
+                emit_compile_regeneration_event(
+                    config,
+                    None,
+                    "final_acceptance_repair",
+                    false,
+                    false,
+                    0,
+                    None,
+                    "bounded_repair_wall_clock_cap",
+                    acceptance_report.compile_errors.len(),
+                    acceptance_report.compile_errors.len(),
+                    &[],
+                );
+            } else {
+                let _accepted_compile_regeneration = try_final_acceptance_compile_regeneration(
+                    execution,
+                    config,
+                    plan,
+                    &mut ultra_context,
+                    &mut acceptance_report,
+                    &mut deterministic_remedies_applied,
+                    &mut setup_authority_state,
+                    attempts_run,
+                    &expected_paths,
+                    &repair_config,
+                    ui,
+                )?;
+            }
+        }
         if !acceptance_report.is_pass()
             && !acceptance_report.compile_errors.is_empty()
             && let Some(rollback) = try_compile_rollback_after_repair_exhaustion(
@@ -13398,6 +13431,193 @@ Regeneration mandate:\n\
 }
 
 #[allow(clippy::too_many_arguments)]
+fn try_final_acceptance_compile_regeneration(
+    execution: &mut dyn ChatClient,
+    config: &Config,
+    plan: &UltraPlan,
+    ultra_context: &mut UltraRunContext,
+    acceptance_report: &mut VerificationReport,
+    deterministic_remedies_applied: &mut Vec<String>,
+    setup_authority_state: &mut UltraRunSetupAuthorityState,
+    cycle_index: usize,
+    expected_paths: &[String],
+    repair_config: &Config,
+    ui: &dyn InteractionUi,
+) -> anyhow::Result<bool> {
+    if acceptance_report.compile_errors.is_empty() {
+        return Ok(false);
+    }
+    let before_error_count = acceptance_report.compile_errors.len();
+    let target_path = match single_compile_regeneration_target(acceptance_report) {
+        Ok(path) => path,
+        Err(reason) => {
+            emit_compile_regeneration_event(
+                config,
+                None,
+                "final_acceptance_repair",
+                false,
+                false,
+                0,
+                None,
+                &reason,
+                before_error_count,
+                before_error_count,
+                &[],
+            );
+            return Ok(false);
+        }
+    };
+    let Some(target_abs) = writable_workspace_source_path(&config.workspace_root, &target_path)
+    else {
+        emit_compile_regeneration_event(
+            config,
+            None,
+            "final_acceptance_repair",
+            false,
+            false,
+            0,
+            Some(&target_path),
+            "target_path_rejected",
+            before_error_count,
+            before_error_count,
+            &[],
+        );
+        return Ok(false);
+    };
+    let before_content = match std::fs::read(&target_abs) {
+        Ok(content) => content,
+        Err(err) => {
+            emit_compile_regeneration_event(
+                config,
+                None,
+                "final_acceptance_repair",
+                false,
+                false,
+                0,
+                Some(&target_path),
+                &format!("snapshot_read_error:{err}"),
+                before_error_count,
+                before_error_count,
+                &[],
+            );
+            return Ok(false);
+        }
+    };
+    let repair_context = RepairContext {
+        profile: Some(plan.profile.clone()),
+        overall_goal: Some(plan.goal.clone()),
+        required_final_artifacts: expected_paths.to_vec(),
+        expected_paths: expected_paths.to_vec(),
+        missing_paths: acceptance_report.missing_paths.clone(),
+        workspace_root: Some(config.workspace_root.clone()),
+        prompt_layout: config.prompt_layout,
+        compile_reanchored_retry: true,
+        ..RepairContext::default()
+    };
+    let regeneration_prompt = build_compile_regeneration_prompt_with_context(
+        "final-acceptance",
+        acceptance_report,
+        &repair_context,
+        &target_path,
+    );
+    let mut regeneration_session = SessionSnapshot::new();
+    let regeneration = run_final_acceptance_repair_with_ultra_session(
+        execution,
+        &mut regeneration_session,
+        &regeneration_prompt,
+        std::slice::from_ref(&target_path),
+        repair_config,
+        ui,
+    );
+    let regeneration = match regeneration {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = std::fs::write(&target_abs, &before_content);
+            emit_compile_regeneration_event(
+                config,
+                None,
+                "final_acceptance_repair",
+                true,
+                false,
+                0,
+                Some(&target_path),
+                &format!(
+                    "regeneration_turn_error:{}",
+                    eval_events::body_snippet(&err.to_string())
+                ),
+                before_error_count,
+                before_error_count,
+                &[],
+            );
+            return Ok(false);
+        }
+    };
+    let mut regeneration_changed_paths = regeneration.changed_paths.clone();
+    regeneration_changed_paths.sort();
+    regeneration_changed_paths.dedup();
+    let one_file_write = changed_paths_only_target(&regeneration_changed_paths, &target_path);
+    clear_final_acceptance_browser_probe_evidence(config);
+    let (regenerated_report, regenerated_deterministic_remedies) =
+        ultra_final_acceptance_report_with_deterministic_remedies(
+            plan,
+            config,
+            cycle_index,
+            setup_authority_state,
+        )?;
+    let after_error_count = regenerated_report.compile_errors.len();
+    let error_delta = before_error_count as i64 - after_error_count as i64;
+    if one_file_write && error_delta > 0 {
+        emit_compile_regeneration_event(
+            config,
+            None,
+            "final_acceptance_repair",
+            true,
+            true,
+            error_delta,
+            Some(&target_path),
+            "accepted",
+            before_error_count,
+            after_error_count,
+            &regeneration_changed_paths,
+        );
+        push_context_items_capped(
+            &mut ultra_context.created_or_changed_paths,
+            &regeneration_changed_paths,
+            ULTRA_CONTEXT_MAX_PATHS,
+            &mut ultra_context.truncated,
+        );
+        push_context_items_capped(
+            &mut ultra_context.last_repair_changed_paths,
+            &regeneration_changed_paths,
+            ULTRA_CONTEXT_MAX_PATHS,
+            &mut ultra_context.truncated,
+        );
+        *deterministic_remedies_applied = regenerated_deterministic_remedies;
+        *acceptance_report = regenerated_report;
+        return Ok(true);
+    }
+    let _ = std::fs::write(&target_abs, &before_content);
+    emit_compile_regeneration_event(
+        config,
+        None,
+        "final_acceptance_repair",
+        true,
+        false,
+        error_delta,
+        Some(&target_path),
+        if one_file_write {
+            "compile_error_count_not_decreased"
+        } else {
+            "changed_paths_not_single_target"
+        },
+        before_error_count,
+        after_error_count,
+        &regeneration_changed_paths,
+    );
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_evidence_regeneration_event(
     config: &Config,
     fired: bool,
@@ -13456,6 +13676,7 @@ fn emit_compile_regeneration_event(
             "after_compile_error_count": after_errors,
             "changed_paths": changed_paths,
             "repair_session_mode": if fired { "compact_regeneration" } else { "" },
+            "regeneration_skipped_reason": if fired { "" } else { reason },
         }),
     );
 }
@@ -24463,6 +24684,88 @@ export default function Page() {
         }
     }
 
+    struct EditThenRegenerationCompileRepairClient {
+        messages: Vec<Vec<ConversationMessage>>,
+        initial_done: bool,
+        read_followup_pending: bool,
+        appended_repair_calls: usize,
+        compact_repair_calls: usize,
+        regeneration_calls: usize,
+    }
+
+    impl EditThenRegenerationCompileRepairClient {
+        fn new() -> Self {
+            Self {
+                messages: Vec::new(),
+                initial_done: false,
+                read_followup_pending: false,
+                appended_repair_calls: 0,
+                compact_repair_calls: 0,
+                regeneration_calls: 0,
+            }
+        }
+    }
+
+    impl ChatClient for EditThenRegenerationCompileRepairClient {
+        fn label(&self) -> &str {
+            "edit-then-regeneration-aware"
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            messages: &[ConversationMessage],
+            _tools: &[ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            self.messages.push(messages.to_vec());
+            let prompt = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !self.initial_done {
+                self.initial_done = true;
+                return Ok(api_mismatch_initial_reply(3011));
+            }
+            if self.read_followup_pending {
+                self.read_followup_pending = false;
+                return Ok(AssistantReply::text(
+                    "The file was inspected, but no source behavior changed.",
+                ));
+            }
+            if prompt.contains("Repair session mode: compact regeneration") {
+                self.regeneration_calls += 1;
+                return Ok(api_mismatch_poll_fix_reply());
+            }
+            if prompt.contains("Repair session mode: compact") {
+                self.compact_repair_calls += 1;
+                self.read_followup_pending = true;
+                return Ok(api_mismatch_read_only_reply());
+            }
+            if prompt.contains("Compile error frames and remedies")
+                || prompt.contains("implementation_compile_error")
+                || prompt.contains("Type error:")
+            {
+                self.appended_repair_calls += 1;
+                if self.appended_repair_calls == 1 {
+                    return Ok(AssistantReply {
+                        content: String::new(),
+                        tool_calls: vec![crate::state::ToolCall::new(
+                            "Write",
+                            serde_json::json!({"path":"src/app/SpaceInvadersGame.tsx","content":api_mismatch_insufficient_game_source()}),
+                        )],
+                        prompt_tokens: None,
+                        completion_tokens: None,
+                    });
+                }
+                self.read_followup_pending = true;
+                return Ok(api_mismatch_read_only_reply());
+            }
+            anyhow::bail!("edit-then-regeneration fake client received unexpected prompt")
+        }
+    }
+
     struct FlakyClient {
         replies: Vec<AssistantReply>,
         messages: Vec<Vec<ConversationMessage>>,
@@ -25917,6 +26220,20 @@ exit 2\n";
         }
     }
 
+    fn api_mismatch_insufficient_game_source() -> &'static str {
+        r#""use client";
+import { useRef, useState } from "react";
+import { SpaceInvadersEngine, type GameState } from "../lib/game-engine";
+
+export default function SpaceInvadersGame() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [gameState] = useState<GameState>({ score: 0, status: "ready" });
+  void SpaceInvadersEngine;
+  return <main data-anvil-state={JSON.stringify(gameState)}><canvas ref={canvasRef} /></main>;
+}
+"#
+    }
+
     fn api_mismatch_broken_game_source() -> &'static str {
         r#""use client";
 import { useEffect, useRef, useState } from "react";
@@ -26590,6 +26907,51 @@ exit 2\n",
 
     #[test]
     #[cfg(unix)]
+    fn step_verify_compile_regeneration_fires_after_edit_but_fail_then_compact_zero_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir
+            .path()
+            .join(".anvil/runs/regeneration-after-edit-fail/events.jsonl");
+        write_api_mismatch_build_shim(dir.path());
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let mut execution = EditThenRegenerationCompileRepairClient::new();
+
+        let result =
+            run_step_plan(&mut execution, &api_mismatch_step_plan(), &cfg).unwrap_or_else(|err| {
+                let event_text = std::fs::read_to_string(&events).unwrap_or_default();
+                panic!("{err}\nEvents:\n{event_text}");
+            });
+
+        assert!(result.contains("plan-run complete"), "{result}");
+        assert_eq!(execution.appended_repair_calls, 2);
+        assert_eq!(execution.compact_repair_calls, 1);
+        assert_eq!(execution.regeneration_calls, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/SpaceInvadersGame.tsx")).unwrap(),
+            api_mismatch_poll_fixed_game_source()
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"repair_follow_through\":\"target_matched\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"repair_session_mode\":\"compact\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"event\":\"repair_regeneration\""),
+            "{event_text}"
+        );
+        assert!(event_text.contains("\"fired\":true"), "{event_text}");
+        assert!(event_text.contains("\"accepted\":true"), "{event_text}");
+        assert!(event_text.contains("\"error_delta\":1"), "{event_text}");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn step_verify_compile_regeneration_restores_snapshot_when_not_improved() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir
@@ -26660,6 +27022,45 @@ exit 2\n",
         assert_eq!(
             single_compile_regeneration_target(&report).unwrap_err(),
             "multi_file_compile_failure"
+        );
+    }
+
+    #[test]
+    fn compile_regeneration_skip_event_records_decision_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir
+            .path()
+            .join(".anvil/runs/regeneration-skip/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+
+        emit_compile_regeneration_event(
+            &cfg,
+            Some("verify-build"),
+            "step_repair",
+            false,
+            false,
+            0,
+            None,
+            "multi_file_compile_failure",
+            2,
+            2,
+            &[],
+        );
+
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(
+            event_text.contains("\"event\":\"repair_regeneration\""),
+            "{event_text}"
+        );
+        assert!(event_text.contains("\"fired\":false"), "{event_text}");
+        assert!(
+            event_text.contains("\"reason\":\"multi_file_compile_failure\""),
+            "{event_text}"
+        );
+        assert!(
+            event_text.contains("\"regeneration_skipped_reason\":\"multi_file_compile_failure\""),
+            "{event_text}"
         );
     }
 
