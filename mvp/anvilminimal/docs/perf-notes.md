@@ -36,8 +36,11 @@ settings.
 The committed comparison surface is the `Time profile:` line in `summary.md`.
 Record:
 
-- provider prefill share: `prompt_eval_count` versus `eval_count` when the
-  provider reports both fields;
+- provider duration split: `prompt_eval_duration`, `eval_duration`, and
+  `load_duration` when the provider reports them;
+- prompt-eval counts remain for observability, but they do not prove cache
+  reuse on Ollama 0.31.1 because `prompt_eval_count` reports the total prompt
+  equivalent even on cache hits;
 - total wall clock from the same profile line;
 - whether the run used single-model planner/executor and Ollama keep-alive.
 
@@ -52,9 +55,9 @@ Measurement-discipline correction:
 - use the A/B stableA completed run as the baseline for this track
   (`4/4` phases, `40m12s`, `prompt_eval=893185`);
 - treat the post-fix completed run as the first valid comparison point;
-- use late-turn `prompt_eval_count` deltas as the cache-effect signal, since
-  the history-heavy turns show the 106C prefix-stability effect more clearly
-  than the first turn.
+- use late-turn `prefill_seconds` and prompt growth together as the cache
+  effect signal, since `prompt_eval_count` is count-equivalent noise on Ollama
+  0.31.1 rather than a reuse indicator.
 
 ## Prompt Layout A/B Protocol
 
@@ -74,8 +77,8 @@ per layout:
 
 Use the same model, host, profile, context budget, keep-alive setting, and
 scenario prompt. Record the `Time profile:` line and provider telemetry for each
-run, especially whether `prompt_eval_count` drops after the first turn in the
-same session.
+run, especially whether `prefill_seconds` stays small after the first turn even
+as prompt growth continues in the same session.
 
 Pre-committed discrimination rule: if setup-phase `no_tool_missing_artifacts`
 stagnation occurs in one layout and not the other, prompt layout is the cause.
@@ -93,15 +96,20 @@ Decision outcomes:
 Verdict for test0708_018:
 
 - stable-layout behavioral regression confirmed;
-- measured cache benefit zero: prompt_eval stayed near the estimated prompt
-  size instead of dropping after turn 1;
+- measured cache benefit verdict invalidated by calibration: the count-based
+  proxy was not a valid cache signal on Ollama 0.31.1;
 - default `prompt_layout` now resolves to `legacy`, with `stable` retained
   behind the flag for A/B runs and replay.
 
-Cache verdict for the current Ollama 0.31.x chat path:
+Calibration note for the current Ollama 0.31.1 chat path:
 
-- prefix reuse was not observed in the chat path, so the probe script stays
-  parked as a triggered backlog item rather than a speed win.
+- KV cache is effective in generate/chat/tools-chat, but `prompt_eval_count`
+  still reports the total prompt equivalent on cache hits. Cache judgments that
+  relied on count deltas are therefore `INVALIDATED-METRIC`.
+- The current cache signal is duration-based: small `prefill_seconds` while
+  prompt size grows.
+- The stable-layout behavioral regression verdict remains unchanged because it
+  is based on behavior evidence, not token counts.
 
 ## History-Size Audit
 
