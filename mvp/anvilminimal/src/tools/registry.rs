@@ -23,6 +23,7 @@ pub struct ToolContext {
     pub offline: bool,
     pub workspace_policy: WorkspacePolicy,
     pub eval_events_path: Option<PathBuf>,
+    pub expected_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -161,19 +162,66 @@ impl ToolRegistry {
 }
 
 fn normalize_path_arg(context: &ToolContext, tool: &str, raw: &str) -> anyhow::Result<String> {
-    match normalize_workspace_path(&context.root, raw)? {
-        Some(normalization) => {
+    match normalize_workspace_path(&context.root, raw) {
+        Ok(Some(normalization)) => {
             match normalization.kind {
                 WorkspacePathNormalizationKind::AbsoluteInsideWorkspace => {
                     emit_path_normalized(context, tool, raw, &normalization.relative);
                 }
                 WorkspacePathNormalizationKind::RootAnchorSalvage => {
+                    emit_path_fallback_evaluated(
+                        context,
+                        tool,
+                        raw,
+                        "root_anchor",
+                        true,
+                        Some(&normalization.relative),
+                        None,
+                    );
                     emit_path_salvaged(context, tool, raw, &normalization.relative);
                 }
             }
             Ok(normalization.relative)
         }
-        None => Ok(raw.to_string()),
+        Ok(None) => Ok(raw.to_string()),
+        Err(err) => {
+            if std::path::Path::new(raw).is_absolute() && !context.expected_paths.is_empty() {
+                emit_path_fallback_evaluated(context, tool, raw, "root_anchor", false, None, None);
+                let candidate_count =
+                    required_path_suffix_candidate_count(raw, &context.expected_paths);
+                if let Some(normalized) =
+                    required_path_suffix_fallback(raw, &context.expected_paths)
+                {
+                    emit_path_fallback_evaluated(
+                        context,
+                        tool,
+                        raw,
+                        "required_path",
+                        true,
+                        Some(&normalized),
+                        Some(candidate_count),
+                    );
+                    return Ok(normalized);
+                }
+                let nearest = nearest_expected_path(raw, &context.expected_paths);
+                emit_path_fallback_evaluated(
+                    context,
+                    tool,
+                    raw,
+                    "required_path",
+                    false,
+                    nearest.as_deref(),
+                    Some(candidate_count),
+                );
+                if let Some(nearest) = nearest {
+                    bail!(
+                        "stale_absolute_path_recoverable: rejected absolute path `{raw}` outside current workspace root `{}`; use workspace-relative path `{nearest}`",
+                        context.root.display()
+                    );
+                }
+            }
+            Err(err)
+        }
     }
 }
 
@@ -212,6 +260,29 @@ fn emit_path_salvaged(context: &ToolContext, tool: &str, original: &str, normali
     );
 }
 
+fn emit_path_fallback_evaluated(
+    context: &ToolContext,
+    tool: &str,
+    original: &str,
+    method: &str,
+    accepted: bool,
+    normalized: Option<&str>,
+    candidate_count: Option<usize>,
+) {
+    eval_events::emit(
+        context.eval_events_path.as_deref(),
+        json!({
+            "event": "path_fallback_evaluated",
+            "tool": tool,
+            "original": original,
+            "method": method,
+            "accepted": accepted,
+            "normalized": normalized.unwrap_or(""),
+            "candidate_count": candidate_count,
+        }),
+    );
+}
+
 fn emit_edit_anchor_salvaged(context: &ToolContext, path: &str, output: &str) {
     eval_events::emit(
         context.eval_events_path.as_deref(),
@@ -235,6 +306,58 @@ fn is_mutating(name: &str) -> bool {
     matches!(name, "Write" | "Edit" | "Bash")
 }
 
+fn required_path_suffix_fallback(raw: &str, expected_paths: &[String]) -> Option<String> {
+    let matches = required_path_suffix_matches(raw, expected_paths);
+    (matches.len() == 1).then(|| matches[0].clone())
+}
+
+fn required_path_suffix_candidate_count(raw: &str, expected_paths: &[String]) -> usize {
+    required_path_suffix_matches(raw, expected_paths).len()
+}
+
+fn required_path_suffix_matches(raw: &str, expected_paths: &[String]) -> Vec<String> {
+    let raw_components = path_components(raw);
+    expected_paths
+        .iter()
+        .filter(|path| super::path_guard::validate_workspace_relative(path).is_ok())
+        .filter(|path| {
+            let expected_components = path_components(path);
+            !expected_components.is_empty()
+                && raw_components.len() >= expected_components.len()
+                && raw_components[raw_components.len() - expected_components.len()..]
+                    == expected_components
+        })
+        .cloned()
+        .collect()
+}
+
+fn nearest_expected_path(raw: &str, expected_paths: &[String]) -> Option<String> {
+    let raw_components = path_components(raw);
+    expected_paths
+        .iter()
+        .filter(|path| super::path_guard::validate_workspace_relative(path).is_ok())
+        .max_by_key(|path| common_suffix_len(&raw_components, &path_components(path)))
+        .cloned()
+}
+
+fn common_suffix_len(left: &[String], right: &[String]) -> usize {
+    left.iter()
+        .rev()
+        .zip(right.iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn path_components(raw: &str) -> Vec<String> {
+    std::path::Path::new(raw)
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 pub fn required_string<'a>(value: &'a Value, key: &str) -> anyhow::Result<&'a str> {
     value
         .get(key)
@@ -246,6 +369,8 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
     let message = err.to_string();
     if message.starts_with("missing string argument `") {
         "missing_arg"
+    } else if message.contains("stale_absolute_path_recoverable") {
+        "stale_absolute_path_recoverable"
     } else if message.starts_with("unknown tool:") {
         "unknown_tool"
     } else if message.contains("path escapes workspace")
@@ -290,6 +415,7 @@ pub fn recoverable_tool_error(err: &anyhow::Error) -> bool {
         tool_error_kind(err),
         "missing_arg"
             | "unknown_tool"
+            | "stale_absolute_path_recoverable"
             | "path_not_found_recoverable"
             | "command_timeout"
             | "verify_command_policy_error"
@@ -375,6 +501,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: None,
+            expected_paths: Vec::new(),
         };
         assert!(
             registry
@@ -395,6 +522,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: None,
+            expected_paths: Vec::new(),
         };
         registry
             .execute("Write", &json!({"path":"a/b.txt","content":"ok"}), &context)
@@ -419,6 +547,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: Some(events.clone()),
+            expected_paths: Vec::new(),
         };
 
         let output = registry
@@ -452,6 +581,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: Some(events.clone()),
+            expected_paths: Vec::new(),
         };
         let absolute = dir.path().join("src/app/page.tsx");
 
@@ -487,6 +617,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: Some(events.clone()),
+            expected_paths: Vec::new(),
         };
         let raw = dir
             .path()
@@ -512,6 +643,78 @@ mod tests {
     }
 
     #[test]
+    fn stale_absolute_write_falls_back_to_unique_expected_path_suffix() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("current/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+            expected_paths: vec!["package.json".to_string(), "src/app/page.tsx".to_string()],
+        };
+        let raw = "/Users/example/share/work/old-run/package.json";
+
+        registry
+            .execute("Write", &json!({"path": raw, "content": "{}"}), &context)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("package.json")).unwrap(),
+            "{}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"path_fallback_evaluated""#));
+        assert!(event_text.contains(r#""method":"root_anchor""#));
+        assert!(event_text.contains(r#""accepted":false"#));
+        assert!(event_text.contains(r#""method":"required_path""#));
+        assert!(event_text.contains(r#""accepted":true"#));
+        assert!(event_text.contains(r#""normalized":"package.json""#));
+    }
+
+    #[test]
+    fn stale_absolute_write_rejection_names_current_root_and_nearest_expected_path() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("current/workspace");
+        std::fs::create_dir_all(&root).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+            expected_paths: vec!["src/app/page.tsx".to_string()],
+        };
+        let raw = "/Users/example/share/work/old-run/src/app/layout.tsx";
+
+        let err = registry
+            .execute("Write", &json!({"path": raw, "content": "no"}), &context)
+            .unwrap_err();
+
+        assert_eq!(tool_error_kind(&err), "stale_absolute_path_recoverable");
+        assert!(recoverable_tool_error(&err));
+        let message = err.to_string();
+        assert!(message.contains(&root.display().to_string()), "{message}");
+        assert!(message.contains("src/app/page.tsx"), "{message}");
+        assert!(!root.join("src/app/layout.tsx").exists());
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""method":"root_anchor""#));
+        assert!(event_text.contains(r#""method":"required_path""#));
+        assert!(event_text.contains(r#""accepted":false"#));
+        assert!(event_text.contains(r#""normalized":"src/app/page.tsx""#));
+    }
+
+    #[test]
     fn absolute_outside_write_is_rejected_as_path_confinement() {
         let registry = ToolRegistry::default();
         let dir = tempfile::tempdir().unwrap();
@@ -524,6 +727,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: None,
+            expected_paths: Vec::new(),
         };
         let outside_path = outside.path().join("escape.txt");
 
@@ -555,6 +759,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: None,
+            expected_paths: Vec::new(),
         };
         let raw = dir.path().join("out/escape.txt");
 
@@ -583,6 +788,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: Some(events.clone()),
+            expected_paths: Vec::new(),
         };
 
         let output = registry
@@ -626,6 +832,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: None,
+            expected_paths: Vec::new(),
         };
 
         let err = registry
@@ -675,6 +882,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: None,
+            expected_paths: Vec::new(),
         };
         let err = registry
             .execute("Read", &json!({"path":".anvil/session.json"}), &context)
@@ -698,6 +906,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: None,
+            expected_paths: Vec::new(),
         };
         let output = registry
             .execute("Glob", &json!({"pattern":"**/*"}), &context)
@@ -719,6 +928,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: None,
+            expected_paths: Vec::new(),
         };
         let err = registry
             .execute("Read", &json!({"path":"workdir/a.txt"}), &context)
@@ -749,6 +959,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: None,
+            expected_paths: Vec::new(),
         };
         registry
             .execute(
@@ -775,6 +986,7 @@ mod tests {
             offline: false,
             workspace_policy: WorkspacePolicy::NormalTask,
             eval_events_path: None,
+            expected_paths: Vec::new(),
         };
         let err = registry
             .execute(

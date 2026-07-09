@@ -140,6 +140,14 @@ mvp/anvilminimal/scripts/snapshot-uat-corpus.sh \
 `gemma4:31b-cloud` honest exhaustion datum where restart/input capability
 evidence remained pending and the terminal reason names those keys.
 
+The a3b five-run blocker harvest records two live classes and the probe
+correlation:
+
+| Class | Fixture | Diagnosis | Probe card predicted class 2? |
+| --- | --- | --- | --- |
+| setup `model_stagnation:no_progress_recorded` | `test0708_018/fixtures/events-a3b-setup-no-progress.jsonl` | Expected paths were already present (`initially_missing_paths=[]`), but no deterministic step completion fired before the model loop exhausted. | No. `absolute_path_rate` / `corrupted_path_count` do not predict already-satisfied setup steps. |
+| stale absolute-path confinement | `test0708_013/fixtures/events-path-salvage-miss.jsonl` and `events-stale-path-remediation.jsonl` | Historical rejected path: `/Users/example/share/work/commandagent_mvp/01/test0708_013/package.json`; only a `root_anchor` field was recorded, required-path fallback was not evaluated, and feedback was the generic `path_outside_workspace`. Remediation fixture records root-anchor fallback evaluated false, required-path fallback evaluated true for `/Users/example/share/work/old-run/package.json` -> `package.json`; rejected path `/Users/example/share/work/old-run/src/app/layout.tsx` reports the current workspace root and nearest expected relative path `src/app/page.tsx`, after which the model retries with `src/app/page.tsx`. | Yes. Elevated `absolute_path_rate` predicts this class; `corrupted_path_count` is adjacent but not required for stale absolute-path reproduction. |
+
 The confirmed Q1-full diagnosis harvests are:
 
 ```sh

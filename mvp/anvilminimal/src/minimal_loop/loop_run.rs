@@ -218,6 +218,7 @@ pub(crate) struct RunSessionOptions {
     pub step_kind: Option<RunSessionStepKind>,
     pub dependency_setup_authority: NodeDependencySetupAuthority,
     pub step_wall_clock_cap: Option<Duration>,
+    pub path_fallback_candidates: Vec<String>,
 }
 
 impl Default for RunSessionOptions {
@@ -233,6 +234,7 @@ impl Default for RunSessionOptions {
             step_kind: None,
             dependency_setup_authority: NodeDependencySetupAuthority::None,
             step_wall_clock_cap: None,
+            path_fallback_candidates: Vec::new(),
         }
     }
 }
@@ -269,6 +271,7 @@ impl RunSessionOptions {
             step_kind: Some(step_kind),
             dependency_setup_authority: NodeDependencySetupAuthority::None,
             step_wall_clock_cap: None,
+            path_fallback_candidates: Vec::new(),
         }
     }
 
@@ -277,6 +280,11 @@ impl RunSessionOptions {
         authority: NodeDependencySetupAuthority,
     ) -> Self {
         self.dependency_setup_authority = authority;
+        self
+    }
+
+    pub(crate) fn with_path_fallback_candidates(mut self, candidates: Vec<String>) -> Self {
+        self.path_fallback_candidates = candidates;
         self
     }
 
@@ -1686,6 +1694,7 @@ pub(crate) fn run_session_with_outcome_with_options(
             offline: config.offline,
             workspace_policy: crate::tools::workspace_policy::WorkspacePolicy::for_task_request(),
             eval_events_path: config.eval_events_path.clone(),
+            expected_paths: tool_context_expected_paths(&required_paths, &options),
         };
         let mut names_seen = BTreeSet::new();
         let mut batch_had_edit = false;
@@ -2929,6 +2938,23 @@ fn effective_required_path_sources(
         completion_contract_paths,
         effective_required_paths: out,
     }
+}
+
+fn tool_context_expected_paths(
+    required_paths: &[String],
+    options: &RunSessionOptions,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for path in required_paths
+        .iter()
+        .chain(options.path_fallback_candidates.iter())
+    {
+        if seen.insert(path.clone()) {
+            out.push(path.clone());
+        }
+    }
+    out
 }
 
 fn emit_step_obligation_scope(
@@ -4661,6 +4687,11 @@ fn recoverable_tool_feedback(
     if err_text.contains("verify_command_policy_error") {
         return format!(
             "Tool call `{name}` was rejected by deterministic verify policy: {err_text}. Allowed alternatives: use one bounded verifier command such as `npm run build`, `cargo test`, `python -m compileall -q src`, or `test -f relative/path`; create files with the Write tool; keep verify to one deterministic command; python-cli behavior-probe fixture CSVs already exist when required; move dependency installation or dev-server startup to setup/runtime phases, not verify."
+        );
+    }
+    if err_text.contains("stale_absolute_path_recoverable") {
+        return format!(
+            "Tool call `{name}` used an absolute path outside the current workspace and was rejected: {err_text}. Retry with the workspace-relative path named in the error; do not use an absolute path from another workspace."
         );
     }
     if let Some((path, count)) = edit_anchor_failure {
@@ -6396,6 +6427,135 @@ export default function Page(){
         assert!(dir.path().join("src/app/page.tsx").is_file());
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(!event_text.contains("\"event\":\"step_short_circuited\""));
+    }
+
+    #[test]
+    fn stale_absolute_path_feedback_names_root_and_model_can_adapt() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({
+                            "path": "/Users/example/share/work/old-run/src/app/layout.tsx",
+                            "content": "wrong"
+                        }),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path": "src/app/page.tsx", "content": "ok"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create the page.",
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert_eq!(outcome.tool_calls, 2);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
+            "ok"
+        );
+        assert!(session.messages.iter().any(|message| {
+            message.role == "tool"
+                && message.content.contains("outside the current workspace")
+                && message.content.contains("src/app/page.tsx")
+        }));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"method\":\"root_anchor\""));
+        assert!(event_text.contains("\"method\":\"required_path\""));
+        assert!(event_text.contains("\"accepted\":false"));
+        assert!(event_text.contains("\"normalized\":\"src/app/page.tsx\""));
+    }
+
+    #[test]
+    fn stale_absolute_path_fallback_uses_current_plan_artifact_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut fake = Fake {
+            replies: vec![
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({
+                            "path": "/Users/example/share/work/old-run/src/app/page.tsx",
+                            "content": "page"
+                        }),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+                Ok(AssistantReply {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall::new(
+                        "Write",
+                        json!({"path": "package.json", "content": "{}"}),
+                    )],
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                }),
+            ],
+        };
+        let mut session = SessionSnapshot::new();
+        let options = RunSessionOptions::plan_step(RunSessionStepKind::Setup)
+            .with_path_fallback_candidates(vec!["src/app/page.tsx".to_string()]);
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Create package and page artifacts.",
+            &["package.json".to_string()],
+            &cfg,
+            &NOOP_UI,
+            options,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
+            "page"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            "{}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"method\":\"required_path\""));
+        assert!(event_text.contains("\"accepted\":true"));
+        assert!(event_text.contains("\"normalized\":\"src/app/page.tsx\""));
     }
 
     #[test]

@@ -1,0 +1,10 @@
+{"event":"tool_call_raw","name":"Write","arguments_shape":{"path":"/Users/example/share/work/old-run/package.json"}}
+{"accepted":false,"candidate_count":null,"event":"path_fallback_evaluated","method":"root_anchor","normalized":"","original":"/Users/example/share/work/old-run/package.json","tool":"Write"}
+{"accepted":true,"candidate_count":1,"event":"path_fallback_evaluated","method":"required_path","normalized":"package.json","original":"/Users/example/share/work/old-run/package.json","tool":"Write"}
+{"event":"tool_execute","name":"Write","status":"ok"}
+{"event":"tool_call_raw","name":"Write","arguments_shape":{"path":"/Users/example/share/work/old-run/src/app/layout.tsx"}}
+{"accepted":false,"candidate_count":null,"event":"path_fallback_evaluated","method":"root_anchor","normalized":"","original":"/Users/example/share/work/old-run/src/app/layout.tsx","tool":"Write"}
+{"accepted":false,"candidate_count":0,"event":"path_fallback_evaluated","method":"required_path","normalized":"src/app/page.tsx","original":"/Users/example/share/work/old-run/src/app/layout.tsx","tool":"Write"}
+{"error_kind":"stale_absolute_path_recoverable","event":"tool_validation_error","feedback":"Tool call `Write` used an absolute path outside the current workspace and was rejected: stale_absolute_path_recoverable: rejected absolute path `/Users/example/share/work/old-run/src/app/layout.tsx` outside current workspace root `/Users/example/share/work/localwork/commandagent_mvp/01/test0708_013`; use workspace-relative path `src/app/page.tsx`. Retry with the workspace-relative path named in the error; do not use an absolute path from another workspace.","name":"Write","repeat_count":1}
+{"event":"tool_call_raw","name":"Write","arguments_shape":{"path":"src/app/page.tsx"}}
+{"event":"tool_execute","name":"Write","status":"ok"}

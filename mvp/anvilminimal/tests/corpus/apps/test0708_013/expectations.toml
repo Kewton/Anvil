@@ -37,3 +37,12 @@ fixtures/events-path-salvage-miss.jsonl = [
   "\"error_kind\":\"path_outside_workspace\"",
   "\"root_anchor\":\"01/test0708_013\""
 ]
+fixtures/events-stale-path-remediation.jsonl = [
+  "\"method\":\"root_anchor\"",
+  "\"method\":\"required_path\"",
+  "\"normalized\":\"package.json\"",
+  "\"error_kind\":\"stale_absolute_path_recoverable\"",
+  "current workspace root",
+  "workspace-relative path `src/app/page.tsx`",
+  "\"path\":\"src/app/page.tsx\""
+]

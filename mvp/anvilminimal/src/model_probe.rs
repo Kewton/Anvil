@@ -455,6 +455,7 @@ fn probe_run_options(step_kind: RunSessionStepKind) -> RunSessionOptions {
         dependency_setup_authority:
             crate::minimal_loop::dependency_setup::NodeDependencySetupAuthority::None,
         step_wall_clock_cap: None,
+        path_fallback_candidates: Vec::new(),
     }
 }
 

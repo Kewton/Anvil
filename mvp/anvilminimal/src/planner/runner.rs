@@ -2042,6 +2042,7 @@ fn run_step(
     let contract_setup_authority =
         step_contract_setup_authority(plan, step, phase_scope, run_authority);
     let step_options = step_run_session_options(
+        plan,
         step,
         contract_enforcement,
         phase_scope,
@@ -3145,6 +3146,7 @@ fn apply_runtime_command_normalizations(step: &mut PlanStep, report: &Verificati
 }
 
 fn step_run_session_options(
+    plan: &StepPlan,
     step: &PlanStep,
     contract_enforcement: ContractEnforcement,
     phase_scope: Option<&str>,
@@ -3156,6 +3158,22 @@ fn step_run_session_options(
         phase_scope.map(str::to_string),
     )
     .with_dependency_setup_authority(setup_authority)
+    .with_path_fallback_candidates(plan_expected_paths(plan))
+}
+
+fn plan_expected_paths(plan: &StepPlan) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for path in plan
+        .steps
+        .iter()
+        .flat_map(|step| step.expected_paths.iter())
+    {
+        if seen.insert(path.clone()) {
+            out.push(path.clone());
+        }
+    }
+    out
 }
 
 fn step_short_circuit_precheck_applicable(step: &PlanStep, config: &Config) -> bool {

@@ -38,6 +38,12 @@ fixtures/events-no-tool-setup-stagnation.jsonl = [
   "\"trigger\":\"exhausted\"",
   "\"paths\":[\"src/app/page.tsx\"]"
 ]
+fixtures/events-a3b-setup-no-progress.jsonl = [
+  "\"model\":\"qwen3.6:35b-a3b-coding-nvfp4\"",
+  "\"initially_missing_paths\":[]",
+  "\"reason\":\"model_stagnation:no_progress_recorded\"",
+  "no deterministic step completion fired"
+]
 fixtures/step-plan-stable.md = [
   "Prompt layout: stable",
   "Stable prefix",
