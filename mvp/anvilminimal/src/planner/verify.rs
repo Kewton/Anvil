@@ -1669,7 +1669,7 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
             return verify_command_violation(
                 normalized,
                 VerifyCommandViolationKind::ShellControlSyntax,
-                Some("verify command may not create or write files with shell redirects; create files with the Write tool; keep verify to one deterministic command. For python-cli behavior probes, fixture CSVs already exist when required; verify should run the deterministic python command against those fixtures.".to_string()),
+                Some("verify command may not create or write files with shell redirects; create files with the Write tool; keep verify to one deterministic command. For python-cli behavior probes, fixture CSVs already exist when required; python-cli behavior-probe fixture CSVs already exist; verify should run the deterministic python command against those fixtures.".to_string()),
             );
         }
         if let Some(diagnosis) = diagnose_leading_cd_verify_command(&normalized) {
@@ -1893,14 +1893,11 @@ fn strip_fallback_true(command: &str) -> Option<String> {
 fn strip_success_failure_echo(command: &str) -> Option<String> {
     let trimmed = command.trim();
     let (success_part, failure_part) = split_once_outside_quotes_sequence(trimmed, "||")?;
-    if !is_plain_status_echo(failure_part.trim(), &["fail", "failed", "false"]) {
+    if !is_plain_echo_command(failure_part.trim()) {
         return None;
     }
     let (base, success_echo) = split_once_outside_quotes_sequence(success_part.trim(), "&&")?;
-    if !is_plain_status_echo(
-        success_echo.trim(),
-        &["pass", "passed", "success", "ok", "true"],
-    ) {
+    if !is_plain_echo_command(success_echo.trim()) {
         return None;
     }
     let base = strip_trailing_stderr_merge(base.trim()).trim();
@@ -1910,15 +1907,14 @@ fn strip_success_failure_echo(command: &str) -> Option<String> {
     Some(base.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-fn is_plain_status_echo(command: &str, allowed: &[&str]) -> bool {
+fn is_plain_echo_command(command: &str) -> bool {
     let Some(tokens) = shell_words_with_spans(command) else {
         return false;
     };
     if tokens.len() != 2 || tokens[0].value != "echo" {
         return false;
     }
-    let value = tokens[1].value.to_ascii_lowercase();
-    allowed.iter().any(|allowed| value == *allowed)
+    !contains_shell_control_syntax(tokens[1].value.as_str())
 }
 
 fn strip_redundant_stderr_merge(command: &str) -> Option<String> {
@@ -3071,6 +3067,24 @@ mod tests {
             r#"node -p "require('./package.json').scripts.build""#
         );
         assert_eq!(plan.segments[2].command.as_str(), "test -f package.json");
+    }
+
+    #[test]
+    fn runtime_bash_normalizer_strips_custom_status_echo_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = normalize_runtime_bash_command_for_boundary(
+            r#"test -f src/app/page.tsx && echo "EXISTS" || echo "MISSING""#,
+            dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.normalization_kind, "success_failure_echo_stripped");
+        assert_eq!(plan.segments.len(), 1);
+        assert_eq!(plan.segments[0].connector, RuntimeCommandConnector::Always);
+        assert_eq!(
+            plan.segments[0].command.as_str(),
+            "test -f src/app/page.tsx"
+        );
     }
 
     #[test]

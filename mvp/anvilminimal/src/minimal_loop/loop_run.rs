@@ -4533,9 +4533,9 @@ fn recoverable_tool_feedback(
             "Tool call `{name}` was rejected with a recoverable validation error: {err_text}. Retry with the Edit tool using the deterministic best-match excerpt and re-anchor mandate from the error."
         );
         if count >= 2 {
-            feedback.push_str(&format!(
-                " This is edit anchor failure #{count} for `{path}` in this step; switch to the Write tool and write the complete corrected file content for that one file."
-            ));
+            feedback = format!(
+                "Tool call `{name}` was rejected with a recoverable validation error: {err_text}. This is edit anchor failure #{count} for `{path}` in this step; switch to the Write tool and write the complete corrected file content for that one file."
+            );
         }
         return feedback;
     }
@@ -5761,7 +5761,7 @@ export default function Page(){
     }
 
     #[test]
-    fn verify_step_runtime_strips_status_echo_shell_control_before_policy_bail() {
+    fn verify_step_runtime_strips_custom_status_echo_shell_control_before_policy_bail() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
         std::fs::write(
@@ -5777,7 +5777,7 @@ export default function Page(){
                 content: String::new(),
                 tool_calls: vec![ToolCall::new(
                     "Bash",
-                    json!({"command":"test -f src/app/page.tsx && echo \"pass\" || echo \"fail\""}),
+                    json!({"command":"test -f src/app/page.tsx && echo \"EXISTS\" || echo \"MISSING\""}),
                 )],
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -5804,7 +5804,7 @@ export default function Page(){
             .unwrap_or_default();
         assert!(bash_result.contains("outcome: Success"), "{bash_result}");
         assert!(bash_result.contains("command succeeded"), "{bash_result}");
-        assert!(!bash_result.contains("echo \"pass\""), "{bash_result}");
+        assert!(!bash_result.contains("echo \"EXISTS\""), "{bash_result}");
         let events = event_values(&events_path);
         assert!(
             !events.iter().any(

@@ -44,6 +44,18 @@ Record:
 Treat movement as observational unless the run identity, hardware, model
 residency, and scenario prompt are held constant.
 
+Measurement-discipline correction:
+
+- compare completed runs only;
+- keep the compared scope equal across layouts, profiles, and scenario
+  prompts;
+- use the A/B stableA completed run as the baseline for this track
+  (`4/4` phases, `40m12s`, `prompt_eval=893185`);
+- treat the post-fix completed run as the first valid comparison point;
+- use late-turn `prompt_eval_count` deltas as the cache-effect signal, since
+  the history-heavy turns show the 106C prefix-stability effect more clearly
+  than the first turn.
+
 ## Prompt Layout A/B Protocol
 
 The `prompt_layout` setting is an instrumentation toggle for discriminating

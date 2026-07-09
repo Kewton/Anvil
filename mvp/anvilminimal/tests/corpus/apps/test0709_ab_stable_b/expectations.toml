@@ -1,0 +1,33 @@
+case_id = "test0709_ab_stable_b"
+source = "prompt layout stable vs legacy A/B"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["prompt", "layout", "stable", "legacy"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/uat-report.md = [
+  "prompt_layout=stable",
+  "Status: failed",
+  "stableA completed without recovery handoff artifacts"
+]
+fixtures/events-stable-layout-regression.jsonl = [
+  "\"event\":\"time_profile\"",
+  "\"prompt_layout\":\"stable\""
+]

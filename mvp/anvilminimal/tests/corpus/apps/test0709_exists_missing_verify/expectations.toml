@@ -1,0 +1,29 @@
+case_id = "test0709_exists_missing_verify"
+source = "Post-106 verify rejection fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["exists", "missing", "verify"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/events-verify-exists-missing.jsonl = [
+  "test -f src/app/page.tsx && echo \\\"EXISTS\\\" || echo \\\"MISSING\\\"",
+  "\"verify_command_violation_kind\":\"shell_control_syntax\"",
+  "\"policy_error_kind\":\"verify_command_policy_error\""
+]

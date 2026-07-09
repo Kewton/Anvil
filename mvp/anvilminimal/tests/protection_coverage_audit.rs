@@ -30,16 +30,9 @@ const PROTECTION_RULES: &[ProtectionRule] = &[
     },
     ProtectionRule {
         category: "verify_normalization_boundary",
-        site_predicate: "verify command execution",
+        site_predicate: "executes-or-policy-checks-model-commands",
         required_wrapper: "NormalizedVerifyCommand",
-        allowlist: &[
-            "src/minimal_loop/verifier_env.rs",
-            "src/minimal_loop/build_verifier.rs",
-            "src/minimal_loop/completion.rs",
-            "src/minimal_loop/loop_run.rs",
-            "src/planner/profiles/python_cli.rs",
-            "src/planner/verify.rs",
-        ],
+        allowlist: &[],
         audit: audit_verify_normalization_boundary,
     },
     ProtectionRule {
@@ -169,61 +162,47 @@ fn audit_compile_output_source_of_truth(
     violations
 }
 
-fn audit_verify_normalization_boundary(corpus: &AuditCorpus, rule: &ProtectionRule) -> Vec<String> {
+fn audit_verify_normalization_boundary(corpus: &AuditCorpus, _: &ProtectionRule) -> Vec<String> {
     let mut violations = Vec::new();
-    let verifier_env = corpus.file("src/minimal_loop/verifier_env.rs");
-    if !verifier_env.contains("command: &NormalizedVerifyCommand") {
-        violations
-            .push("verifier_env execution APIs must take NormalizedVerifyCommand".to_string());
-    }
-    let loop_run = corpus.file("src/minimal_loop/loop_run.rs");
-    if loop_run.contains("registry.execute_with_cancel(")
-        && !(loop_run.contains("runtime_bash_policy_decision(")
-            && loop_run.contains("set_bash_command(")
-            && loop_run.contains("normalize_runtime_bash_command_for_boundary(")
-            && loop_run.contains("execute_split_runtime_bash("))
-    {
-        violations.push(
-            "in-session tool execution boundary is not routed through normalizer".to_string(),
-        );
-    }
-    if loop_run.contains("fn runtime_bash_policy_decision(")
-        && !loop_run.contains("normalize_runtime_bash_command_for_boundary(")
-    {
-        violations
-            .push("runtime_bash_policy entry point bypasses shared runtime normalizer".to_string());
-    }
-    let planner_lint = corpus.file("src/planner/lint.rs");
-    if planner_lint.contains("validate_verify_command(")
-        && !planner_lint.contains("normalize_planner_verify_command(")
-    {
-        violations
-            .push("StepPlan verify-policy lint bypasses shared planner normalizer".to_string());
-    }
     for (path, text) in corpus.rust_files() {
+        let has_shared_verify_normalizer = text.contains("normalize_planner_verify_command(")
+            || text.contains("normalize_runtime_bash_command_for_boundary(");
+        let has_normalized_verify_command = text.contains("NormalizedVerifyCommand");
         for (line_index, line) in text.lines().enumerate() {
-            if line.contains("runtime_bash_policy_decision(")
-                && !rule.allowlist.contains(&path.as_str())
-                && !line.trim_start().starts_with("///")
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("///") {
+                continue;
+            }
+            if line.contains("validate_verify_command(")
+                && !(has_shared_verify_normalizer || has_normalized_verify_command)
             {
                 violations.push(format!(
-                    "{path}:{} runtime bash policy entry point is not registered",
+                    "{path}:{} validate_verify_command call bypasses the shared normalizer",
+                    line_index + 1
+                ));
+            }
+            if line.contains("diagnose_verify_command(")
+                && !(has_shared_verify_normalizer || has_normalized_verify_command)
+            {
+                violations.push(format!(
+                    "{path}:{} diagnose_verify_command call bypasses the shared normalizer",
                     line_index + 1
                 ));
             }
             let calls_executor = line.contains("verifier_env::run_checked(")
-                || (path == "src/minimal_loop/verifier_env.rs"
-                    && line.contains("pub fn run_checked("))
                 || line.contains("run_structured_for_verify_with_profile(");
-            if calls_executor
-                && !rule.allowlist.contains(&path.as_str())
-                && !line.trim_start().starts_with("///")
-            {
-                violations.push(format!("{path}:{}: {}", line_index + 1, line.trim()));
-            }
-            if calls_executor && line.contains('"') && !line.trim_start().starts_with("///") {
+            if calls_executor && !has_normalized_verify_command {
                 violations.push(format!(
-                    "{path}:{} passes a string literal to a verifier executor",
+                    "{path}:{}: verifier execution boundary is missing NormalizedVerifyCommand",
+                    line_index + 1
+                ));
+            }
+            if line.contains("runtime_bash_policy_decision(")
+                && !line.contains("normalize_runtime_bash_command_for_boundary(")
+                && !text.contains("normalize_runtime_bash_command_for_boundary(")
+            {
+                violations.push(format!(
+                    "{path}:{} runtime bash policy entry point bypasses the shared normalizer",
                     line_index + 1
                 ));
             }

@@ -15551,6 +15551,7 @@ mod tests {
     fn repair_prompt_prefix_is_shared_across_anchored_and_compact_rungs() {
         let report = VerificationReport::missing_path("src/app/page.tsx");
         let context = RepairContext {
+            prompt_layout: crate::config::PromptLayout::Stable,
             overall_goal: Some("Build app".to_string()),
             required_final_artifacts: vec!["src/app/page.tsx".to_string()],
             ..RepairContext::default()
