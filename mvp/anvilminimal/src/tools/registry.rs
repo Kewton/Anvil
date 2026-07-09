@@ -185,11 +185,27 @@ fn normalize_path_arg(context: &ToolContext, tool: &str, raw: &str) -> anyhow::R
                     );
                     emit_path_salvaged(context, tool, raw, &normalization.relative);
                 }
+                WorkspacePathNormalizationKind::MissingLeadingSlashRootAnchorSalvage => {
+                    emit_path_malformed(context, tool, raw, true, Some(&normalization.relative));
+                    emit_path_fallback_evaluated(
+                        context,
+                        tool,
+                        raw,
+                        "root_anchor",
+                        true,
+                        Some(&normalization.relative),
+                        None,
+                    );
+                    emit_path_salvaged(context, tool, raw, &normalization.relative);
+                }
             }
             Ok(normalization.relative)
         }
         Ok(None) => Ok(raw.to_string()),
         Err(err) => {
+            if err.to_string().contains("tool_args_path_malformed") {
+                emit_path_malformed(context, tool, raw, false, None);
+            }
             if std::path::Path::new(raw).is_absolute() && !context.expected_paths.is_empty() {
                 emit_path_fallback_evaluated(context, tool, raw, "root_anchor", false, None, None);
                 let candidate_count =
@@ -411,6 +427,8 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
     let message = err.to_string();
     if message.starts_with("missing string argument `") {
         "missing_arg"
+    } else if message.contains("tool_args_path_malformed") {
+        "tool_args_path_malformed"
     } else if message.contains("stale_absolute_path_recoverable") {
         "stale_absolute_path_recoverable"
     } else if message.starts_with("unknown tool:") {
@@ -758,6 +776,74 @@ mod tests {
         assert!(event_text.contains(r#""method":"required_path""#));
         assert!(event_text.contains(r#""accepted":false"#));
         assert!(event_text.contains(r#""normalized":"src/app/page.tsx""#));
+    }
+
+    #[test]
+    fn missing_leading_slash_write_is_malformed_then_root_anchor_salvaged() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0709_camp_003");
+        std::fs::create_dir_all(&root).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: root.clone(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+            expected_paths: Vec::new(),
+        };
+        let raw = "Users/maenokota/share/work/localwork/commandagent_mvp/01/test0709_camp_003/src/app/page.tsx";
+
+        registry
+            .execute("Write", &json!({"path": raw, "content":"ok"}), &context)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/app/page.tsx")).unwrap(),
+            "ok"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"tool_args_path_malformed""#));
+        assert!(event_text.contains(r#""accepted":true"#));
+        assert!(event_text.contains(r#""event":"tool_args_path_salvaged""#));
+        assert!(event_text.contains(r#""normalized":"src/app/page.tsx""#));
+    }
+
+    #[test]
+    fn missing_leading_slash_write_without_anchor_is_rejected_as_malformed() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0709_camp_003");
+        std::fs::create_dir_all(&root).unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root,
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+            expected_paths: Vec::new(),
+        };
+        let raw = "Users/maenokota/share/work/other-run/src/App.js";
+
+        let err = registry
+            .execute("Write", &json!({"path": raw, "content":"no"}), &context)
+            .unwrap_err();
+
+        assert_eq!(tool_error_kind(&err), "tool_args_path_malformed");
+        assert!(recoverable_tool_error(&err));
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"tool_args_path_malformed""#));
+        assert!(event_text.contains(r#""accepted":false"#));
     }
 
     #[test]

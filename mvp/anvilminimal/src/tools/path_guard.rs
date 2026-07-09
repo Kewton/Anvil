@@ -8,6 +8,7 @@ const EXPECTED_PATH_FORM: &str = "use workspace-relative paths";
 pub enum WorkspacePathNormalizationKind {
     AbsoluteInsideWorkspace,
     RootAnchorSalvage,
+    MissingLeadingSlashRootAnchorSalvage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +59,20 @@ pub fn normalize_workspace_path(
     }
     let path = Path::new(raw);
     if !path.is_absolute() {
+        if looks_like_missing_leading_slash_absolute(raw) {
+            let root = root
+                .canonicalize()
+                .context("workspace root is not accessible")?;
+            if let Some(relative) = root_anchor_salvage(&root, path) {
+                return Ok(Some(WorkspacePathNormalization {
+                    relative,
+                    kind: WorkspacePathNormalizationKind::MissingLeadingSlashRootAnchorSalvage,
+                }));
+            }
+            bail!(
+                "tool_args_path_malformed: path looks like an absolute path missing its leading slash; {EXPECTED_PATH_FORM}"
+            );
+        }
         return Ok(None);
     }
     reject_parent_components(path)?;
@@ -338,6 +353,16 @@ fn looks_like_windows_absolute(raw: &str) -> bool {
             && (bytes[2] == b'\\' || bytes[2] == b'/'))
 }
 
+fn looks_like_missing_leading_slash_absolute(raw: &str) -> bool {
+    let path = Path::new(raw);
+    let mut components = path.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    let first = first.to_string_lossy();
+    matches!(first.as_ref(), "Users" | "home") && components.next().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +421,42 @@ mod tests {
         );
         let path = resolve_existing(&root, &normalization.relative).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "{}");
+    }
+
+    #[test]
+    fn salvages_missing_leading_slash_path_with_unique_root_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0709_camp_003");
+        std::fs::create_dir_all(&root).unwrap();
+        let raw = format!(
+            "Users/maenokota/share/work/localwork/commandagent_mvp/01/test0709_camp_003/src/app/page.tsx"
+        );
+
+        let normalization = normalize_workspace_path(&root, &raw).unwrap().unwrap();
+
+        assert_eq!(normalization.relative, "src/app/page.tsx");
+        assert_eq!(
+            normalization.kind,
+            WorkspacePathNormalizationKind::MissingLeadingSlashRootAnchorSalvage
+        );
+    }
+
+    #[test]
+    fn rejects_missing_leading_slash_path_without_unique_root_anchor_as_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .join("localwork/commandagent_mvp/01/test0709_camp_003");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let err = normalize_workspace_path(&root, "Users/maenokota/other/src/App.js").unwrap_err();
+
+        assert!(
+            err.to_string().contains("tool_args_path_malformed"),
+            "{err}"
+        );
     }
 
     #[test]

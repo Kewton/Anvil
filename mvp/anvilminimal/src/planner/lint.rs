@@ -451,6 +451,16 @@ pub fn step_plan_quality_report(
         );
     }
 
+    if looks_next_profile && let Some(evidence) = nextjs_profile_shape_drift_evidence(plan) {
+        report.push(
+            PlanQualitySeverity::RetryableQuality,
+            "profile_shape_drift",
+            "nextjs profile cannot use CRA shapes such as react-scripts, src/App.js, or src/index.js; retry with App Router equivalents: src/app/page.tsx and package scripts using next build/next dev",
+            None,
+            Some(evidence),
+        );
+    }
+
     if looks_code_task(&lower_goal, &all_paths) && !has_strong_verify {
         let severity = if !verify_commands.is_empty()
             || (looks_next_profile
@@ -611,6 +621,49 @@ fn is_fresh_create_workspace(context: &PlanQualityContext) -> bool {
             context.task_intent.as_str(),
             "create" | "scaffold" | "new" | "docs"
         )
+}
+
+fn nextjs_profile_shape_drift_evidence(plan: &StepPlan) -> Option<String> {
+    let mut evidence = Vec::new();
+    for step in &plan.steps {
+        let instruction = step.instruction.to_ascii_lowercase();
+        if instruction.contains("react-scripts") {
+            evidence.push(format!("{}:instruction:react-scripts", step.id));
+        }
+        for path in &step.expected_paths {
+            if is_cra_entrypoint_path(path) {
+                evidence.push(format!("{}:expected_path:{path}", step.id));
+            }
+        }
+        for command in &step.verify {
+            let command_lower = command.to_ascii_lowercase();
+            if command_lower.contains("react-scripts") {
+                evidence.push(format!("{}:verify:react-scripts", step.id));
+            }
+            if command_lower.contains("src/app.js") || command_lower.contains("src/index.js") {
+                evidence.push(format!("{}:verify:{command}", step.id));
+            }
+        }
+    }
+    if evidence.is_empty() {
+        None
+    } else {
+        evidence.sort();
+        evidence.dedup();
+        Some(evidence.join(", "))
+    }
+}
+
+fn is_cra_entrypoint_path(path: &str) -> bool {
+    matches!(
+        path.replace('\\', "/").to_ascii_lowercase().as_str(),
+        "src/app.js"
+            | "src/app.jsx"
+            | "src/app.tsx"
+            | "src/index.js"
+            | "src/index.jsx"
+            | "src/index.tsx"
+    )
 }
 
 fn validate_step_kind_contract(step: &crate::planner::step_plan::PlanStep) -> anyhow::Result<()> {
@@ -1702,6 +1755,71 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.category == "profile_verify_missing")
+        );
+    }
+
+    #[test]
+    fn quality_report_marks_cra_shape_drift_under_nextjs_profile() {
+        let plan = StepPlan {
+            goal: "Build a Next.js app".to_string(),
+            steps: vec![PlanStep {
+                id: "cra-app".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create a React app that uses react-scripts".to_string(),
+                expected_paths: vec![
+                    "package.json".to_string(),
+                    "src/App.js".to_string(),
+                    "src/index.js".to_string(),
+                ],
+                verify: vec!["npm run build".to_string()],
+            }],
+        };
+
+        let report = step_plan_quality_report(&plan, &nextjs_quality_context());
+
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.category == "profile_shape_drift")
+            .expect("profile_shape_drift issue");
+        assert_eq!(issue.severity, PlanQualitySeverity::RetryableQuality);
+        assert!(issue.message.contains("src/app/page.tsx"));
+        assert!(issue.message.contains("next build"));
+        assert!(issue.message.contains("next dev"));
+        assert!(
+            issue
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("src/App.js")
+                    && evidence.contains("src/index.js")
+                    && evidence.contains("react-scripts")),
+            "{issue:?}"
+        );
+    }
+
+    #[test]
+    fn quality_report_marks_react_scripts_verify_as_nextjs_shape_drift() {
+        let plan = StepPlan {
+            goal: "Build a Next.js app".to_string(),
+            steps: vec![PlanStep {
+                id: "app".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Create src/app/page.tsx".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: vec!["react-scripts build".to_string()],
+            }],
+        };
+
+        let report = step_plan_quality_report(&plan, &nextjs_quality_context());
+
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "profile_shape_drift"),
+            "{report:?}"
         );
     }
 
