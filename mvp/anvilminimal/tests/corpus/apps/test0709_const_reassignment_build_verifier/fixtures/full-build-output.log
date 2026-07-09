@@ -1,0 +1,9 @@
+Failed to compile.
+
+./src/components/SpaceInvaders.tsx:4:3
+Type error: Cannot assign to 'playerX' because it is a constant.
+
+  2 | export default function SpaceInvaders() {
+  3 |   const [playerX, setPlayerX] = useState(0);
+> 4 |   playerX = playerX + 1;
+    |   ^

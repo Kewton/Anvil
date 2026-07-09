@@ -1,0 +1,8 @@
+{
+  "status": "failed",
+  "ok": false,
+  "failure_kind": "build_verifier_failed",
+  "browser_failure_kind": "build_verifier_failed",
+  "output_excerpt": "command failed: npm run build outcome: CommandFailed status: exit status: 1 elapsed_ms: 2010 summary: Failed to compile. Type error: Cannot assign to 'playerX' because it is a constant.",
+  "build_output_path": "fixtures/full-build-output.log"
+}

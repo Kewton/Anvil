@@ -1,0 +1,42 @@
+case_id = "test0709_const_reassignment_build_verifier"
+source = "UAT final acceptance build_verifier_failed const reassignment shape"
+required_paths = ["package.json", "src/components/SpaceInvaders.tsx"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "nextjs_route", "stateful_interaction"]
+required_evidence = ["nextjs_route_evidence", "build_command_or_dependency_missing_boundary", "implementation_artifact", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence", "interactive_ui_source_evidence", "non_static_screen_evidence"]
+required_obligations = ["implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["SpaceInvaders", "playerX", "build_verifier_failed", "constant"]
+
+[route_closure]
+include = ["src/components/SpaceInvaders.tsx"]
+exclude = ["src/app/global.d.ts"]
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "build_failed"
+
+[json_fields]
+fixtures/browser-readiness.json:status = "failed"
+fixtures/browser-readiness.json:failure_kind = "build_verifier_failed"
+fixtures/browser-readiness.json:build_output_path = "fixtures/full-build-output.log"
+
+[fixture_contains]
+fixtures/browser-readiness.json = [
+  "Cannot assign to 'playerX' because it is a constant.",
+  "full-build-output.log"
+]
+fixtures/full-build-output.log = [
+  "./src/components/SpaceInvaders.tsx:4:3",
+  "Cannot assign to 'playerX' because it is a constant."
+]
+fixtures/events-final-acceptance.jsonl = [
+  "\"failure_kind\":\"build_verifier_failed\"",
+  "\"repair_target\":\"test_or_evidence\"",
+  "\"compile_errors\":[]"
+]

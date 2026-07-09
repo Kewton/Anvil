@@ -98,6 +98,11 @@ Verdict for test0708_018:
 - default `prompt_layout` now resolves to `legacy`, with `stable` retained
   behind the flag for A/B runs and replay.
 
+Cache verdict for the current Ollama 0.31.x chat path:
+
+- prefix reuse was not observed in the chat path, so the probe script stays
+  parked as a triggered backlog item rather than a speed win.
+
 ## History-Size Audit
 
 The corpus audit shows prompt growth is dominated by tool-result echoes rather

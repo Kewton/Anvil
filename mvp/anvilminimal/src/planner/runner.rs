@@ -6988,6 +6988,14 @@ fn ultra_final_acceptance_report_inner(
                 eval_events::body_snippet(&observation.output_excerpt)
             ));
         }
+        if observation.failure_kind == "build_verifier_failed"
+            && !observation.compile_errors.is_empty()
+        {
+            report.push_compile_errors(
+                "browser readiness build verifier",
+                observation.compile_errors.clone(),
+            );
+        }
     }
     Ok(report)
 }
@@ -27181,6 +27189,118 @@ export default function Page() {\n\
             prompt.contains(
                 "remove the extra argument, or extend the signature -- keep call sites consistent"
             ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn browser_probe_build_verifier_failure_routes_to_compile_ladder() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_local_port();
+        enable_dev_server_probe_test_override(dir.path());
+        let contract = write_compile_error_nextjs_workspace(dir.path(), port);
+        std::fs::write(
+            dir.path().join("src/components/SpaceInvaders.tsx"),
+            "import { useState } from \"react\";\n\
+export default function SpaceInvaders() {\n\
+  const [playerX, setPlayerX] = useState(0);\n\
+  const reset = () => setPlayerX(0);\n\
+  playerX = playerX + 1;\n\
+  return <main><button onClick={reset}>Restart</button><canvas /><p>{playerX}</p></main>;\n\
+}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("browser-build-output.log"),
+            "Failed to compile.\n\n\
+./src/components/SpaceInvaders.tsx:5:3\n\
+Type error: Cannot assign to 'playerX' because it is a constant.\n\n\
+  2 | export default function SpaceInvaders() {\n\
+  3 |   const [playerX, setPlayerX] = useState(0);\n\
+  4 |   const reset = () => setPlayerX(0);\n\
+> 5 |   playerX = playerX + 1;\n\
+    |   ^\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("browser-readiness.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "failed",
+                "ok": false,
+                "failure_kind": "build_verifier_failed",
+                "output_excerpt": "command failed: npm run build summary: Failed to compile. Type error: Cannot assign to 'playerX' because it is a constant.",
+                "build_output_path": "browser-build-output.log"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.completion_contract_path = Some(contract);
+        let gate = browser_release_gate(&cfg);
+        assert_eq!(gate.status, "failed", "{gate:?}");
+        assert_eq!(
+            gate.browser_readiness_status,
+            "failed:build_verifier_failed"
+        );
+        assert!(
+            gate.browser_readiness_evidence_path
+                .ends_with("browser-readiness.json"),
+            "{gate:?}"
+        );
+        assert_eq!(
+            release_recovery_repair_targets(&gate, None),
+            vec![
+                "fix_compile_error".to_string(),
+                "implementation".to_string()
+            ]
+        );
+        let mut report = VerificationReport::pass();
+        append_release_gate_observation_failures(&mut report, &gate);
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::Implementation,
+            "{report:?}"
+        );
+        assert_eq!(report.compile_errors.len(), 1, "{report:?}");
+        assert_eq!(
+            report.compile_errors[0].path,
+            "src/components/SpaceInvaders.tsx"
+        );
+        assert_eq!(report.compile_errors[0].line, 5);
+        assert_eq!(report.compile_errors[0].column, 3);
+        let prompt = final_acceptance_repair_prompt(
+            dir.path(),
+            PromptLayout::Stable,
+            &UltraPlan {
+                goal: "Create an interactive browser game".to_string(),
+                profile: "nextjs".to_string(),
+                style: "default".to_string(),
+                intent: "create".to_string(),
+                phases: vec![UltraPhase {
+                    id: "final".to_string(),
+                    prompt: "Finalize the interactive browser game.".to_string(),
+                }],
+            },
+            &report,
+            &UltraRunContext::default(),
+            RepairTarget::Implementation.as_str(),
+            &["src/components/SpaceInvaders.tsx".to_string()],
+            &[],
+            (1, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
+            false,
+            false,
+        );
+        assert!(
+            prompt.contains("TypeScript const-reassignment repair for `playerX`"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Declaration site for `playerX` in src/components/SpaceInvaders.tsx:3"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("declare with let, or lift into state if it changes per frame -- keep declaration and all assignments consistent"),
             "{prompt}"
         );
     }

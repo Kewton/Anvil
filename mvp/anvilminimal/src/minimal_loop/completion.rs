@@ -828,6 +828,9 @@ pub(crate) fn compile_error_repair_guidance_with_root(
             if let Some(guidance) = call_arity_repair_guidance(root, error) {
                 lines.extend(guidance);
             }
+            if let Some(guidance) = const_reassignment_repair_guidance(root, error) {
+                lines.extend(guidance);
+            }
             if let Some(guidance) = duplicate_binding_repair_guidance(error) {
                 lines.push(guidance);
             }
@@ -895,6 +898,72 @@ fn call_arity_repair_guidance(root: Option<&Path>, error: &CompileError) -> Opti
             "TypeScript call-arity remedy menu for `{callee}`: remove the extra argument, or extend the signature -- keep call sites consistent."
         ),
     ])
+}
+
+fn const_reassignment_repair_guidance(
+    root: Option<&Path>,
+    error: &CompileError,
+) -> Option<Vec<String>> {
+    if !typescript_const_reassignment_message(&error.message) {
+        return None;
+    }
+    let symbol = error
+        .symbol
+        .clone()
+        .or_else(|| extract_first_quoted_symbol(&error.message))?;
+    let symbol = symbol.as_str();
+    let root = root?;
+    let content = std::fs::read_to_string(root.join(&error.path)).ok()?;
+    let (declaration_line, declaration_excerpt) =
+        const_reassignment_declaration_site(&content, symbol)?;
+    Some(vec![
+        format!(
+            "TypeScript const-reassignment repair for `{symbol}`: {}",
+            error.summary()
+        ),
+        format!(
+            "Declaration site for `{symbol}` in {}:{}: {}",
+            error.path, declaration_line, declaration_excerpt
+        ),
+        format!(
+            "TypeScript const-reassignment remedy menu for `{symbol}`: declare with let, or lift into state if it changes per frame -- keep declaration and all assignments consistent."
+        ),
+    ])
+}
+
+fn typescript_const_reassignment_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("cannot assign to")
+        || lower.contains("read only property")
+        || lower.contains("reassign")
+        || lower.contains("constant")
+}
+
+fn const_reassignment_declaration_site(content: &str, symbol: &str) -> Option<(usize, String)> {
+    for (index, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if const_reassignment_declares_symbol(trimmed, symbol) {
+            return Some((index + 1, trimmed.to_string()));
+        }
+    }
+    None
+}
+
+fn const_reassignment_declares_symbol(line: &str, symbol: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if !lower.starts_with("const ") {
+        return false;
+    }
+    if line.contains(&format!("const {symbol} "))
+        || line.contains(&format!("const {symbol}="))
+        || line.contains(&format!("const {symbol},"))
+        || line.contains(&format!("const {symbol})"))
+        || line.contains(&format!("const {symbol}]"))
+    {
+        return true;
+    }
+    line.starts_with("const [") && line.contains(symbol)
+        || line.starts_with("const {") && line.contains(symbol)
 }
 
 fn typescript_call_arity_message(message: &str) -> Option<(usize, usize)> {
@@ -1989,6 +2058,55 @@ export default function Page() {\n\
         assert!(
             prompt.contains(
                 "lines 359 and 479 both declare `player`; remove or rename the later redeclaration (line 479); the earlier binding (line 359) is already in scope in this block"
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn compile_repair_prompt_includes_const_reassignment_declaration_and_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/components")).unwrap();
+        std::fs::write(
+            dir.path().join("src/components/SpaceInvaders.tsx"),
+            "import { useState } from \"react\";\n\
+export default function SpaceInvaders() {\n\
+  const [playerX, setPlayerX] = useState(0);\n\
+  playerX = playerX + 1;\n\
+  return <main>{playerX}</main>;\n\
+}\n",
+        )
+        .unwrap();
+        let prompt = compile_repair_prompt_section_with_root(
+            Some(dir.path()),
+            &[CompileError {
+                path: "src/components/SpaceInvaders.tsx".to_string(),
+                line: 4,
+                column: 3,
+                message: "Type error: Cannot assign to 'playerX' because it is a constant."
+                    .to_string(),
+                excerpt: "4 |   playerX = playerX + 1;\n  |   ^".to_string(),
+                symbol: Some("playerX".to_string()),
+                route_bound: Some(true),
+            }],
+            CompileRepairPromptProtection::default(),
+        );
+
+        assert!(
+            prompt.contains(
+                "TypeScript const-reassignment repair for `playerX`: src/components/SpaceInvaders.tsx:4:3"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "Declaration site for `playerX` in src/components/SpaceInvaders.tsx:3: const [playerX, setPlayerX] = useState(0);"
+            ),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "declare with let, or lift into state if it changes per frame -- keep declaration and all assignments consistent"
             ),
             "{prompt}"
         );
