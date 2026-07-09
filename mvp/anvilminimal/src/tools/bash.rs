@@ -8,6 +8,7 @@ use crate::bounded_process::{self, BoundedProcessOutcomeKind};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_STREAM_BYTES: usize = 24_000;
+const OUTSIDE_WORKSPACE_MARKER: &str = "[outside workspace root — do not reference]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BashOutcomeKind {
@@ -145,8 +146,8 @@ where
     )
     .with_context(|| format!("failed to spawn command: {command}"))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = annotate_outside_workspace_output(&String::from_utf8_lossy(&output.stdout), root);
+    let stderr = annotate_outside_workspace_output(&String::from_utf8_lossy(&output.stderr), root);
     match output.kind {
         BoundedProcessOutcomeKind::Exited => {
             let status = output
@@ -244,6 +245,63 @@ fn truncate_stream(value: &str) -> String {
         MAX_STREAM_BYTES,
         &format!("[anvilminimal: bash output truncated at {MAX_STREAM_BYTES} bytes]"),
     )
+}
+
+fn annotate_outside_workspace_output(value: &str, root: &Path) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut annotated = String::with_capacity(value.len());
+    for segment in value.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map(|line| (line, "\n"))
+            .unwrap_or((segment, ""));
+        if line_references_outside_workspace(line, &root)
+            && !line.contains(OUTSIDE_WORKSPACE_MARKER)
+        {
+            annotated.push_str(line);
+            annotated.push(' ');
+            annotated.push_str(OUTSIDE_WORKSPACE_MARKER);
+            annotated.push_str(newline);
+        } else {
+            annotated.push_str(segment);
+        }
+    }
+    annotated
+}
+
+fn line_references_outside_workspace(line: &str, root: &Path) -> bool {
+    for candidate in absolute_path_candidates(line) {
+        let path = Path::new(candidate);
+        let comparable = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if path.is_absolute() && candidate != "/" && !comparable.starts_with(root) {
+            return true;
+        }
+    }
+    false
+}
+
+fn absolute_path_candidates(line: &str) -> impl Iterator<Item = &str> {
+    let mut candidates = Vec::new();
+    let mut index = 0usize;
+    while let Some(offset) = line[index..].find('/') {
+        let start = index + offset;
+        let end = line[start..]
+            .find(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(ch, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']')
+            })
+            .map(|offset| start + offset)
+            .unwrap_or(line.len());
+        candidates.push(&line[start..end]);
+        index = end.saturating_add(1);
+        if index >= line.len() {
+            break;
+        }
+    }
+    candidates.into_iter()
 }
 
 fn build_summary(command: &str, kind: BashOutcomeKind, stdout: &str, stderr: &str) -> String {
@@ -383,5 +441,42 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.kind, BashOutcomeKind::CommandFailed);
         assert!(outcome.summary.contains("Error: broken"));
+    }
+
+    #[test]
+    fn bash_output_marks_absolute_paths_outside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir
+            .path()
+            .parent()
+            .unwrap()
+            .join("sibling-project/file.txt");
+        let command = format!(
+            "printf 'found {}\\ninside {}\\n'",
+            outside.display(),
+            dir.path().display()
+        );
+        let outcome =
+            run_structured(&command, dir.path(), false, DEFAULT_TIMEOUT, || false).unwrap();
+
+        let outside_line = outcome
+            .stdout
+            .lines()
+            .find(|line| line.contains("sibling-project/file.txt"))
+            .unwrap();
+        assert!(
+            outside_line.contains(OUTSIDE_WORKSPACE_MARKER),
+            "{outside_line}"
+        );
+
+        let inside_line = outcome
+            .stdout
+            .lines()
+            .find(|line| line.contains(dir.path().to_str().unwrap()))
+            .unwrap();
+        assert!(
+            !inside_line.contains(OUTSIDE_WORKSPACE_MARKER),
+            "{inside_line}"
+        );
     }
 }
