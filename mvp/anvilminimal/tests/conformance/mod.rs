@@ -646,6 +646,34 @@ fn conformance_negative_compile_exhaustion_requires_regeneration_decision() {
     );
 }
 
+#[test]
+fn conformance_negative_evidence_exhaustion_requires_regeneration_decision() {
+    let trace = Trace {
+        scenario: MatrixScenario::Nextjs,
+        events: vec![
+            json!({
+                "event": "final_acceptance_repair_complete",
+                "lifecycle_stage": "final_acceptance_repair",
+                "changed_paths": ["src/app/page.tsx"],
+            }),
+            json!({
+                "event": "final_acceptance_repair_exhausted",
+                "lifecycle_stage": "final_acceptance_repair",
+                "compile_errors": [],
+                "pending_capability_evidence": ["restart_or_recoverable_state_evidence"],
+            }),
+            terminal_stop("failed"),
+        ],
+        summary: terminal_summary("failed"),
+        output: String::new(),
+    };
+
+    assert_contract_fails(
+        "evidence_regeneration_visibility",
+        check_evidence_regeneration_visibility(&trace),
+    );
+}
+
 fn assert_conformance_contracts(trace: &Trace) {
     for (name, result) in [
         ("earned_assurance", check_earned_assurance(trace)),
@@ -655,6 +683,10 @@ fn assert_conformance_contracts(trace: &Trace) {
         (
             "compile_regeneration_visibility",
             check_compile_regeneration_visibility(trace),
+        ),
+        (
+            "evidence_regeneration_visibility",
+            check_evidence_regeneration_visibility(trace),
         ),
         ("honest_terminal", check_honest_terminal(trace)),
         (
@@ -978,6 +1010,42 @@ fn check_compile_regeneration_visibility(trace: &Trace) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn check_evidence_regeneration_visibility(trace: &Trace) -> Result<(), String> {
+    for (index, event) in trace.events.iter().enumerate() {
+        if !evidence_repair_exhaustion_event(event) {
+            continue;
+        }
+        let has_decision = trace.events[..index].iter().any(|candidate| {
+            string_field(candidate, "event") == Some("repair_regeneration")
+                && string_field(candidate, "lifecycle_stage") == Some("final_acceptance_repair")
+                && candidate.get("before_missing_evidence").is_some()
+        });
+        if !has_decision {
+            return Err(format!(
+                "evidence_regeneration_visibility: evidence exhaustion lacked repair_regeneration decision before {event}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn evidence_repair_exhaustion_event(event: &Value) -> bool {
+    if string_field(event, "event") != Some("final_acceptance_repair_exhausted") {
+        return false;
+    }
+    let has_compile_errors = event
+        .get("compile_errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| !errors.is_empty());
+    if has_compile_errors {
+        return false;
+    }
+    event
+        .get("pending_capability_evidence")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
 }
 
 fn compile_repair_exhaustion_event(event: &Value) -> bool {

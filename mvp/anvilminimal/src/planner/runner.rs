@@ -5220,6 +5220,7 @@ pub fn run_ultra_plan_with_ui(
         let mut exhausted_reason = "bounded_repair_exhausted".to_string();
         let mut compile_no_source_change_count = 0usize;
         let mut evidence_no_source_change_count = 0usize;
+        let mut evidence_regeneration_decision_emitted = false;
         let mut compile_no_snapshot_narrow_retry_used = false;
         let mut max_repair_attempts = FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS;
         for attempt in 1..=FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS
@@ -5260,6 +5261,7 @@ pub fn run_ultra_plan_with_ui(
                         &[],
                         "target_path_rejected",
                     );
+                    evidence_regeneration_decision_emitted = true;
                     break;
                 };
                 let before_content = match std::fs::read(&target_abs) {
@@ -5275,6 +5277,7 @@ pub fn run_ultra_plan_with_ui(
                             &[],
                             &format!("snapshot_read_error:{err}"),
                         );
+                        evidence_regeneration_decision_emitted = true;
                         break;
                     }
                 };
@@ -5311,6 +5314,7 @@ pub fn run_ultra_plan_with_ui(
                                 eval_events::body_snippet(&err.to_string())
                             ),
                         );
+                        evidence_regeneration_decision_emitted = true;
                         exhausted_reason = "evidence_repair_no_source_change".to_string();
                         break;
                     }
@@ -5347,6 +5351,7 @@ pub fn run_ultra_plan_with_ui(
                         "build_or_dependency_regressed"
                     },
                 );
+                evidence_regeneration_decision_emitted = true;
                 if accepted {
                     push_context_items_capped(
                         &mut ultra_context.created_or_changed_paths,
@@ -5505,6 +5510,34 @@ pub fn run_ultra_plan_with_ui(
                             }
                             break;
                         }
+                        continue;
+                    }
+                    if acceptance_report.compile_errors.is_empty()
+                        && evidence_zero_edit_eligible
+                        && err_text.contains("missing tool call for action prompt")
+                    {
+                        evidence_no_source_change_count += 1;
+                        exhausted_reason = "evidence_repair_no_source_change".to_string();
+                        max_repair_attempts = FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS
+                            + FINAL_ACCEPTANCE_EVIDENCE_NO_CHANGE_EXTRA_ATTEMPTS;
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "final_acceptance_repair_no_source_change",
+                                "cycle_index": attempt,
+                                "lifecycle_stage": "final_acceptance_repair",
+                                "attempt": attempt,
+                                "max_attempts": FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS,
+                                "failure_kind": "evidence_repair_no_source_change",
+                                "repair_target": repair_target.as_str(),
+                                "repair_error": eval_events::body_snippet(&err_text),
+                                "repair_session_mode": repair_session_mode,
+                                "evidence_no_source_change_count": evidence_no_source_change_count,
+                                "reanchored_retry": evidence_reanchored_retry,
+                                "compact_retry": evidence_compact_retry,
+                                "proceed_to_regeneration": evidence_no_source_change_count >= 3,
+                            }),
+                        );
                         continue;
                     }
                     eval_events::emit(
@@ -5770,6 +5803,31 @@ pub fn run_ultra_plan_with_ui(
             let exhausted_reason_for_event = pending_reason
                 .clone()
                 .unwrap_or_else(|| exhausted_reason.clone());
+            if acceptance_report.compile_errors.is_empty()
+                && !missing_signals.is_empty()
+                && !evidence_regeneration_decision_emitted
+            {
+                let target_path =
+                    final_acceptance_repair_expected_paths(plan, config, &acceptance_report)
+                        .ok()
+                        .and_then(|paths| {
+                            final_acceptance_evidence_regeneration_target(
+                                &config.workspace_root,
+                                &plan.profile,
+                                &paths,
+                            )
+                        });
+                emit_evidence_regeneration_event(
+                    config,
+                    false,
+                    false,
+                    target_path.as_deref(),
+                    &missing_signals,
+                    &missing_signals,
+                    &[],
+                    &exhausted_reason_for_event,
+                );
+            }
             let reason = pending_reason
                 .as_ref()
                 .map(|pending| format!("{pending}; {base_reason}"))
@@ -17391,6 +17449,49 @@ dependencies = ["requests"]
         assert!(
             event
                 .get("resolved_missing_evidence")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| item.as_str() == Some("restart_or_recoverable_state_evidence"))),
+            "{event}"
+        );
+    }
+
+    #[test]
+    fn final_acceptance_evidence_regeneration_event_records_skip_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        emit_evidence_regeneration_event(
+            &cfg,
+            false,
+            false,
+            Some("src/app/page.tsx"),
+            &["restart_or_recoverable_state_evidence".to_string()],
+            &["restart_or_recoverable_state_evidence".to_string()],
+            &[],
+            "capability_evidence_unresolved:restart_or_recoverable_state_evidence",
+        );
+
+        let event = latest_event(&events, "repair_regeneration");
+        assert_eq!(event.get("fired").and_then(Value::as_bool), Some(false));
+        assert_eq!(event.get("accepted").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            event
+                .get("changed_paths")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            event.get("repair_session_mode").and_then(Value::as_str),
+            Some("")
+        );
+        assert!(
+            event
+                .get("before_missing_evidence")
                 .and_then(Value::as_array)
                 .is_some_and(|items| items
                     .iter()
