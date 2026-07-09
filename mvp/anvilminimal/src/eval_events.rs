@@ -234,6 +234,7 @@ pub struct CompletionSnapshot {
     pub persistence_after_reload: String,
     pub persistence_after_reload_reason: String,
     pub evidence_arbitration_summary: String,
+    pub depth_profile_summary: String,
     pub recovery_prompt_path: String,
     pub recovery_ultra_plan_path: String,
     pub suggested_recovery_command: String,
@@ -295,6 +296,7 @@ impl CompletionSnapshot {
             persistence_after_reload: "not_applicable".to_string(),
             persistence_after_reload_reason: String::new(),
             evidence_arbitration_summary: String::new(),
+            depth_profile_summary: String::new(),
             recovery_prompt_path: String::new(),
             recovery_ultra_plan_path: String::new(),
             suggested_recovery_command: String::new(),
@@ -368,6 +370,7 @@ pub struct CompletionProjection {
     pub persistence_after_reload: String,
     pub persistence_after_reload_reason: String,
     pub evidence_arbitration_summary: String,
+    pub depth_profile_summary: String,
     pub release_quality_completion: String,
     pub next_action: String,
     pub recovery_prompt_path: String,
@@ -460,6 +463,9 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
     snapshot.display_substituted_count = diagnostics.display_substituted_count;
     snapshot.context_truncation_warning_count = diagnostics.context_truncation_warning_count;
     snapshot.compile_rollback_summaries = compile_rollback_summaries_from_events(&events);
+    if let Some(summary) = latest_depth_profile_summary(&events) {
+        snapshot.depth_profile_summary = summary;
+    }
     recovery_fields.apply_to(&mut snapshot);
     persistence_fields.apply_to(&mut snapshot);
     snapshot
@@ -614,6 +620,11 @@ pub fn apply_tui_command_stop_projection(projection: &mut CompletionProjection, 
         event,
         "release_quality_completion",
     );
+    overlay_string(
+        &mut projection.depth_profile_summary,
+        event,
+        "depth_profile_summary",
+    );
     overlay_string(&mut projection.next_action, event, "next_action");
     overlay_string(
         &mut projection.recovery_prompt_path,
@@ -679,6 +690,15 @@ fn overlay_usize(target: &mut usize, event: &Value, field: &str) {
     if let Some(value) = event.get(field).and_then(Value::as_u64) {
         *target = value as usize;
     }
+}
+
+fn latest_depth_profile_summary(events: &[Value]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.get("event").and_then(Value::as_str) == Some("depth_profile"))
+        .and_then(|event| event.get("depth_profile_summary").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
 }
 
 pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> CompletionProjection {
@@ -764,6 +784,7 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
         persistence_after_reload: snapshot.persistence_after_reload.clone(),
         persistence_after_reload_reason: snapshot.persistence_after_reload_reason.clone(),
         evidence_arbitration_summary: snapshot.evidence_arbitration_summary.clone(),
+        depth_profile_summary: snapshot.depth_profile_summary.clone(),
         release_quality_completion,
         next_action,
         recovery_prompt_path: snapshot.recovery_prompt_path.clone(),
@@ -2119,6 +2140,11 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        depth_profile_summary: event
+            .get("depth_profile_summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         recovery_prompt_path: event
             .get("recovery_prompt_path")
             .and_then(Value::as_str)
@@ -2537,6 +2563,10 @@ fn render_completion_summary(
         format!(
             "Evidence arbitration: {}",
             missing_if_empty(&projection.evidence_arbitration_summary)
+        ),
+        format!(
+            "Depth profile: {}",
+            missing_if_empty(&projection.depth_profile_summary)
         ),
         format!(
             "completion_contract_verification_enabled={}",
@@ -3765,6 +3795,7 @@ mod tests {
                 "final_acceptance_status": "pass",
                 "release_gate_status": "pass",
                 "evidence_arbitration_summary": "behavioral (probe ok)",
+                "depth_profile_summary": "route_bound_source_lines=42 state_dimensions=2 data_anvil_action_kinds=2 input_types_with_observed_state_change=1",
                 "state_dimensions_changed": ["player", "score"],
                 "action_hooks": ["primary", "restart"],
                 "surface_fit_summary": "canvas overflows viewport (right: 22px)",
@@ -3788,6 +3819,10 @@ mod tests {
 
         assert!(
             summary.contains("Evidence arbitration: behavioral (probe ok)"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Depth profile: route_bound_source_lines=42 state_dimensions=2 data_anvil_action_kinds=2 input_types_with_observed_state_change=1"),
             "{summary}"
         );
         assert!(

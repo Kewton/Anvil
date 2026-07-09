@@ -259,6 +259,15 @@ struct PlanAdherenceReport {
     missing: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct DepthProfile {
+    route_bound_source_line_count: usize,
+    state_dimensions_count: usize,
+    data_anvil_action_kind_count: usize,
+    input_types_with_observed_state_change_count: usize,
+    summary: String,
+}
+
 impl ReleaseRecoveryHandoffSummary {
     fn has_artifact(&self) -> bool {
         !self.recovery_prompt_path.is_empty() || !self.recovery_ultra_plan_path.is_empty()
@@ -3575,6 +3584,14 @@ fn verify_plan_final_contract(
     let surface_fit = interaction_surface_fit_from_path(&release_gate.interaction_evidence_path);
     let text_telemetry =
         interaction_text_telemetry_from_path(&release_gate.interaction_evidence_path);
+    let depth_profile = depth_profile(
+        &config.workspace_root,
+        &config.profile,
+        &state_dimensions_changed,
+        &action_hooks,
+        &release_gate.interaction_evidence_path,
+        &text_telemetry,
+    );
     let requested_port = effective_requested_port(&config.profile, &plan.goal, None);
     let primary_reason = if !missing_final_artifacts.is_empty() {
         format!(
@@ -3757,6 +3774,11 @@ fn verify_plan_final_contract(
             "ok": ok,
             "primary_reason": eval_events::body_snippet(&primary_reason),
         }),
+    );
+    emit_depth_profile(
+        config.eval_events_path.as_deref(),
+        "plan_final_contract",
+        &depth_profile,
     );
     if ok {
         return Ok(());
@@ -6350,6 +6372,135 @@ fn route_bound_source_paths(root: &Path, profile: &str) -> Vec<String> {
         .collect()
 }
 
+fn depth_profile(
+    root: &Path,
+    profile: &str,
+    state_dimensions_changed: &[String],
+    action_hooks: &[String],
+    interaction_evidence_path: &str,
+    text_telemetry: &InteractionTextTelemetry,
+) -> DepthProfile {
+    let route_bound_source_line_count = route_bound_source_paths(root, profile)
+        .iter()
+        .map(|path| source_line_count(&root.join(path)))
+        .sum();
+    let state_dimensions_count = state_dimensions_changed
+        .iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let source_action_kinds = route_bound_data_anvil_action_kinds(root, profile);
+    let data_anvil_action_kind_count = source_action_kinds
+        .iter()
+        .chain(action_hooks.iter())
+        .filter(|value| !value.trim().is_empty())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let input_types_with_observed_state_change_count =
+        input_types_with_observed_state_change(interaction_evidence_path, text_telemetry).len();
+    let summary = format!(
+        "route_bound_source_lines={} state_dimensions={} data_anvil_action_kinds={} input_types_with_observed_state_change={}",
+        route_bound_source_line_count,
+        state_dimensions_count,
+        data_anvil_action_kind_count,
+        input_types_with_observed_state_change_count
+    );
+    DepthProfile {
+        route_bound_source_line_count,
+        state_dimensions_count,
+        data_anvil_action_kind_count,
+        input_types_with_observed_state_change_count,
+        summary,
+    }
+}
+
+fn source_line_count(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|content| content.lines().count())
+        .unwrap_or(0)
+}
+
+fn route_bound_data_anvil_action_kinds(root: &Path, profile: &str) -> Vec<String> {
+    route_bound_source_paths(root, profile)
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(root.join(path)).ok())
+        .flat_map(|content| data_anvil_action_kinds_from_source(&content))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn data_anvil_action_kinds_from_source(source: &str) -> Vec<String> {
+    ["data-anvil-action=\"", "data-anvil-action='"]
+        .into_iter()
+        .flat_map(|needle| {
+            let quote = needle.chars().last().unwrap_or('"');
+            let mut out = Vec::new();
+            let mut rest = source;
+            while let Some(index) = rest.find(needle) {
+                let after = &rest[index + needle.len()..];
+                let Some(end) = after.find(quote) else {
+                    break;
+                };
+                let value = after[..end].trim();
+                if !value.is_empty() {
+                    out.push(value.to_string());
+                }
+                rest = &after[end + quote.len_utf8()..];
+            }
+            out
+        })
+        .collect()
+}
+
+fn input_types_with_observed_state_change(
+    interaction_evidence_path: &str,
+    text_telemetry: &InteractionTextTelemetry,
+) -> BTreeSet<String> {
+    let mut types = BTreeSet::new();
+    if text_telemetry.text_input_state_change == Some(true)
+        && let Some(input_type) =
+            input_type_from_text_entry_target(&text_telemetry.text_entry_target)
+    {
+        types.insert(input_type);
+    }
+    if let Some(value) = read_json_file(interaction_evidence_path)
+        && raw_bool_field_deep(&value, "input_state_change") == Some(true)
+        && types.is_empty()
+    {
+        types.insert("control".to_string());
+    }
+    types
+}
+
+fn input_type_from_text_entry_target(target: &str) -> Option<String> {
+    let input_type = target.split(':').next()?.trim();
+    (!input_type.is_empty()).then(|| input_type.to_string())
+}
+
+fn read_json_file(path: &str) -> Option<Value> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn emit_depth_profile(path: Option<&Path>, source_event: &str, profile: &DepthProfile) {
+    eval_events::emit(
+        path,
+        json!({
+            "event": "depth_profile",
+            "source_event": source_event,
+            "depth_profile_summary": profile.summary.as_str(),
+            "route_bound_source_line_count": profile.route_bound_source_line_count,
+            "state_dimensions_count": profile.state_dimensions_count,
+            "data_anvil_action_kind_count": profile.data_anvil_action_kind_count,
+            "input_types_with_observed_state_change_count": profile.input_types_with_observed_state_change_count,
+        }),
+    );
+}
+
 fn snapshot_paths(root: &Path, paths: &[String]) -> BTreeMap<String, Option<Vec<u8>>> {
     let mut snapshot = BTreeMap::new();
     for path in paths {
@@ -6959,6 +7110,14 @@ fn ultra_final_acceptance_report_inner(
     let surface_fit = interaction_surface_fit_from_path(&release_gate.interaction_evidence_path);
     let text_telemetry =
         interaction_text_telemetry_from_path(&release_gate.interaction_evidence_path);
+    let depth_profile = depth_profile(
+        &config.workspace_root,
+        &effective_profile,
+        &state_dimensions_changed,
+        &action_hooks,
+        &release_gate.interaction_evidence_path,
+        &text_telemetry,
+    );
     let plan_adherence = plan_adherence_report(plan, &config.workspace_root);
     let phase_signal_text = ultra_plan_phase_signal_text(plan);
     let requested_port =
@@ -7137,6 +7296,11 @@ fn ultra_final_acceptance_report_inner(
             "handoff_saved_not_success": recovery_handoff.is_some(),
             "primary_reason": eval_events::body_snippet(&primary_reason),
         }),
+    );
+    emit_depth_profile(
+        config.eval_events_path.as_deref(),
+        "ultra_final_acceptance",
+        &depth_profile,
     );
     let mut report = VerificationReport::pass();
     for path in missing {
@@ -17635,6 +17799,33 @@ export default function Memo() {
                 .get("release_gate_status")
                 .and_then(Value::as_str),
             Some("pass")
+        );
+        let depth = latest_event(&events, "depth_profile");
+        assert_eq!(
+            depth.get("source_event").and_then(Value::as_str),
+            Some("ultra_final_acceptance")
+        );
+        assert!(
+            depth
+                .get("route_bound_source_line_count")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0),
+            "{depth}"
+        );
+        assert!(
+            depth
+                .get("data_anvil_action_kind_count")
+                .and_then(Value::as_u64)
+                .is_some(),
+            "{depth}"
+        );
+        assert!(
+            depth
+                .get("depth_profile_summary")
+                .and_then(Value::as_str)
+                .is_some_and(|summary| summary.contains("route_bound_source_lines=")
+                    && summary.contains("data_anvil_action_kinds=")),
+            "{depth}"
         );
         let complete = latest_event(&events, "ultra_plan_complete");
         assert_eq!(
