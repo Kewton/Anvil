@@ -148,6 +148,22 @@ Verdict for test0708_018:
 - default `prompt_layout` now resolves to `legacy`, with `stable` retained
   behind the flag for A/B runs and replay.
 
+## a3b Campaign Gate
+
+The 20-run a3b campaign starts only after a 5-run round reaches at least 3/5
+full completions with zero stranding. Until that gate is met, continue 5-run
+rounds and harvest one fixture per new failure class before changing runtime
+behavior.
+
+The a3b re-measurement round recorded one full completion at 15m30s
+target-adjacent runtime, which is speed-feasible evidence but below the
+campaign-start quality gate. The bs_002 five-run distribution remained 0/5:
+three setup `model_stagnation:no_progress_recorded` failures and two stale
+absolute-path confinement failures. Probe correlation was absent or weak for
+the harvested events: `absolute_path_rate`/`corrupted_path_count` do not predict
+setup no-progress, evidence repair follow-through, or missing-tool-call ladder
+coverage; stale absolute paths remain adjacent to absolute-path-rate risk.
+
 Calibration note for the current Ollama 0.31.1 chat path:
 
 - KV cache is effective in generate/chat/tools-chat, but `prompt_eval_count`

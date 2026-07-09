@@ -1,0 +1,65 @@
+case_id = "test0709_a3b_remeasurement"
+source = "a3b re-measurement diagnosis harvest, 2026-07-09"
+required_paths = ["package.json", "src/app/layout.tsx", "src/app/page.tsx", "src/app/globals.css"]
+verify_commands = []
+required_capabilities = []
+required_evidence = ["nextjs_route_evidence", "implementation_artifact"]
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["diagnostic", "a3b", "space"]
+acceptance_passed = true
+primary_reason = "pass"
+
+[route_closure]
+include = ["src/app/page.tsx", "src/app/layout.tsx", "src/app/globals.css"]
+exclude = ["src/app/global.d.ts"]
+
+[evidence]
+implementation_artifact = "Strong"
+nextjs_route_evidence = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/events-stale-path-injection.jsonl = [
+  "\"event\":\"tool_call_raw\"",
+  "\"name\":\"Bash\"",
+  "cat /Users/<user>/share/work/commandagent_mvp/01/test0709_bs_002/test0709_camp_003/package.json",
+  "\"event\":\"runtime_bash_policy\"",
+  "\"blocked\":false",
+  "\"reason\":\"runtime Bash is not deterministic verifier evidence\"",
+  "\"reason\":\"model_stagnation:no_progress_recorded\""
+]
+fixtures/events-evidence-repair-followthrough.jsonl = [
+  "\"event\":\"final_acceptance_repair_start\"",
+  "\"selected_evidence_keys\":[\"restart_or_recoverable_state_evidence\"]",
+  "\"event\":\"final_acceptance_repair_complete\"",
+  "\"changed_paths\":[\"src/components/SpaceInvaders.tsx\"]",
+  "\"event\":\"final_acceptance_repair_exhausted\"",
+  "\"pending_capability_evidence\":[\"restart_or_recoverable_state_evidence\"]"
+]
+fixtures/events-missing-tool-ladder.jsonl = [
+  "\"event\":\"read_only_stagnation_feedback\"",
+  "\"stage\":\"compact_restatement\"",
+  "\"read_only_streak\":5",
+  "\"event\":\"step_verify_repair\"",
+  "\"repair_session_mode\":\"compact\"",
+  "\"repair_follow_through\":\"no_change\"",
+  "\"event\":\"repair_regeneration\"",
+  "\"reason\":\"regeneration_turn_error:model_stagnation:no_progress_recorded"
+]
+fixtures/diagnosis.md = [
+  "FIRST stale foreign occurrence: bs_002 camp_003 events.jsonl line 38",
+  "No earlier tool-output event introduced the foreign literal",
+  "Root-anchor/required-path fallback was not reached because this occurrence was a Bash command argument",
+  "Evidence repair ladder fired with one changed path, then exhausted without an evidence regeneration decision in the harvested run",
+  "Missing-tool-call class is represented by compact no-change repair followed by regeneration_turn_error:model_stagnation:no_progress_recorded",
+  "pre-run probe card: absent from harvested events; absolute_path_rate/corrupted_path_count did not predict setup no-progress or evidence follow-through"
+]

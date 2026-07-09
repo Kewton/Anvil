@@ -148,6 +148,15 @@ correlation:
 | setup `model_stagnation:no_progress_recorded` | `test0708_018/fixtures/events-a3b-setup-no-progress.jsonl` | Expected paths were already present (`initially_missing_paths=[]`), but no deterministic step completion fired before the model loop exhausted. | No. `absolute_path_rate` / `corrupted_path_count` do not predict already-satisfied setup steps. |
 | stale absolute-path confinement | `test0708_013/fixtures/events-path-salvage-miss.jsonl` and `events-stale-path-remediation.jsonl` | Historical rejected path: `/Users/example/share/work/commandagent_mvp/01/test0708_013/package.json`; only a `root_anchor` field was recorded, required-path fallback was not evaluated, and feedback was the generic `path_outside_workspace`. Remediation fixture records root-anchor fallback evaluated false, required-path fallback evaluated true for `/Users/example/share/work/old-run/package.json` -> `package.json`; rejected path `/Users/example/share/work/old-run/src/app/layout.tsx` reports the current workspace root and nearest expected relative path `src/app/page.tsx`, after which the model retries with `src/app/page.tsx`. | Yes. Elevated `absolute_path_rate` predicts this class; `corrupted_path_count` is adjacent but not required for stale absolute-path reproduction. |
 
+The a3b re-measurement harvest is `test0709_a3b_remeasurement`. It records one
+fixture per live class:
+
+| Class | Fixture | Diagnosis | Probe card predicted class 2? |
+| --- | --- | --- | --- |
+| stale path injection | `test0709_a3b_remeasurement/fixtures/events-stale-path-injection.jsonl` | The first foreign literal was the Bash command argument `cat /Users/<user>/share/work/commandagent_mvp/01/test0709_bs_002/test0709_camp_003/package.json`; no earlier tool-output event introduced it, and guarded path fallback was not reached because this was not a Write/Edit path rejection. | Partially. The class is adjacent to high absolute-path-rate risk, but the harvested run had no pre-run probe card in events and the first occurrence was model-authored. |
+| evidence repair follow-through | `test0709_a3b_remeasurement/fixtures/events-evidence-repair-followthrough.jsonl` | Final acceptance repair edited `src/components/SpaceInvaders.tsx`, re-probed, then exhausted on `restart_or_recoverable_state_evidence` without an evidence regeneration decision in the harvested run. | No. `absolute_path_rate` / `corrupted_path_count` do not predict evidence repair follow-through. |
+| missing-tool-call ladder coverage | `test0709_a3b_remeasurement/fixtures/events-missing-tool-ladder.jsonl` | Read-only stagnation reached compact restatement; compile repair then compacted with no changes and recorded regeneration failure as `model_stagnation:no_progress_recorded`. Evidence-shaped `missing tool call` now follows the same no-source-change ladder. | No. The probe card is not a no-tool/repair-ladder predictor. |
+
 The confirmed Q1-full diagnosis harvests are:
 
 ```sh
