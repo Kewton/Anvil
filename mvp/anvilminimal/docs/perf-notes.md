@@ -22,6 +22,25 @@ existing time profile. It groups provider turns by caller scope
 (`full-file Write`, `Edit`, `prose-only`, `tool-call`) so the volume shape stays
 visible even when the run itself is duration-only.
 
+## 15-Minute Verdict
+
+The measured successful-run median is `66,590` eval tokens. At roughly `28
+tok/s`, the implied generation floor is about `40m`, so a `15m` wall-clock
+target is physically unreachable on qwen27b at the current artifact scale.
+
+Decision options:
+
+- run the same campaign on a faster model family, such as the a3b class;
+- move the workload onto hardware or a quantization setup that raises
+  throughput materially;
+- split the target into two tiers: qwen27b accepts the `40m` floor, and the
+  fast tier keeps the `15m` goal.
+
+The current report does not expose a bottom-up token verification `V1` result.
+If that value is missing from the campaign report, reconstruct it in the next
+analysis pass and add it to the campaign checklist instead of backfilling it
+silently.
+
 ## Speed Track 1 Prefix Audit
 
 Audit source: reconstructed prompts from the corpus event fixtures
