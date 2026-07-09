@@ -1,0 +1,4 @@
+{"event":"final_acceptance_repair_start","lifecycle_stage":"final_acceptance_repair","attempt":1,"repair_target":"implementation","schema_version":"1"}
+{"event":"read_only_stagnation_feedback","stage":"intervention","read_only_streak":3,"session_scope":"plan-run-step","step_kind":"implement","phase_scope":"","schema_version":"1"}
+{"event":"read_only_stagnation_feedback","stage":"compact_restatement","read_only_streak":5,"session_scope":"plan-run-step","step_kind":"implement","phase_scope":"","schema_version":"1"}
+{"event":"loop_stop","reason":"model_stagnation:read_only_loop","read_only_streak":5,"schema_version":"1"}

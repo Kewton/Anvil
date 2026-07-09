@@ -1,0 +1,2 @@
+{"event":"tool_args_path_malformed","tool":"Write","original":"Users/maenokota/share/work/localwork/commandagent_mvp/01/test0709_camp_003/src/app/page.tsx","accepted":true,"normalized":"src/app/page.tsx","kind":"missing_leading_slash_absolute","schema_version":"1"}
+{"event":"tool_args_path_salvaged","tool":"Write","original":"Users/maenokota/share/work/localwork/commandagent_mvp/01/test0709_camp_003/src/app/page.tsx","normalized":"src/app/page.tsx","method":"root_anchor_last_two_components","schema_version":"1"}

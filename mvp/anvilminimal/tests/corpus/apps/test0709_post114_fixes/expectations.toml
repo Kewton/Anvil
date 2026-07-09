@@ -1,0 +1,52 @@
+case_id = "test0709_post114_fixes"
+source = "post-114 fix coverage fixtures"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["post114", "bash", "acceptance", "shape", "path"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/bash-path-confinement.jsonl = [
+  "\"event\":\"bash_path_confinement_rejected\"",
+  "\"path\":\"/Users/<user>/share/work/localwork/commandagent_mvp/01/test0709_camp_003\"",
+  "\"root\":\"/tmp/current/test0709_camp_003\"",
+  "\"nearest_relative\":\"test0709_camp_003\""
+]
+fixtures/final-acceptance-read-only-repair.jsonl = [
+  "\"event\":\"final_acceptance_repair_start\"",
+  "\"event\":\"read_only_stagnation_feedback\"",
+  "\"stage\":\"intervention\"",
+  "\"stage\":\"compact_restatement\"",
+  "\"reason\":\"model_stagnation:read_only_loop\""
+]
+fixtures/nextjs-profile-shape-drift.jsonl = [
+  "\"planner_quality_category\":\"profile_shape_drift\"",
+  "react-scripts",
+  "src/App.js",
+  "src/index.js",
+  "src/app/page.tsx",
+  "next build/next dev"
+]
+fixtures/missing-leading-slash-path.jsonl = [
+  "\"event\":\"tool_args_path_malformed\"",
+  "\"kind\":\"missing_leading_slash_absolute\"",
+  "\"accepted\":true",
+  "\"event\":\"tool_args_path_salvaged\"",
+  "\"normalized\":\"src/app/page.tsx\""
+]
