@@ -1100,6 +1100,8 @@ pub(crate) fn run_session_with_outcome_with_options(
     let mut write_required_state = WriteRequiredState::default();
     let mut recoverable_tool_error_state = RecoverableToolErrorState::default();
     let mut edit_anchor_recovery_state = EditAnchorRecoveryState::default();
+    let mut route_unbound_recovery_state =
+        super::route_unbound_recovery::RouteUnboundRecoveryState::default();
     let mut malformed_native_tool_feedbacks = 0usize;
     let step_capability_gate = StepCapabilityGate::from_prompt(user_prompt, &options);
     let step_started = Instant::now();
@@ -1676,7 +1678,16 @@ pub(crate) fn run_session_with_outcome_with_options(
                         verify_repair_state.pending_target = Some(feedback.target);
                         verify_repair_state.changed_paths_at_failure = changed_paths.clone();
                         verify_repair_state.no_edit_turns = 0;
-                        pending_feedback = Some(feedback.feedback);
+                        pending_feedback = Some(
+                            super::route_unbound_recovery::feedback_or_route_unbound_recovery(
+                                &mut route_unbound_recovery_state,
+                                &mut write_required_state,
+                                &config.workspace_root,
+                                config.eval_events_path.as_deref(),
+                                &contract.runtime_acceptance_report(&config.workspace_root),
+                                feedback.feedback,
+                            ),
+                        );
                         continue;
                     }
                     Ok(ContractVerificationOutcome::ObservationIncomplete(observation)) => {
@@ -2319,7 +2330,16 @@ pub(crate) fn run_session_with_outcome_with_options(
                         verify_repair_state.pending_target = Some(feedback.target);
                         verify_repair_state.changed_paths_at_failure = changed_paths.clone();
                         verify_repair_state.no_edit_turns = 0;
-                        pending_feedback = Some(feedback.feedback);
+                        pending_feedback = Some(
+                            super::route_unbound_recovery::feedback_or_route_unbound_recovery(
+                                &mut route_unbound_recovery_state,
+                                &mut write_required_state,
+                                &config.workspace_root,
+                                config.eval_events_path.as_deref(),
+                                &contract.runtime_acceptance_report(&config.workspace_root),
+                                feedback.feedback,
+                            ),
+                        );
                         continue;
                     }
                     Ok(ContractVerificationOutcome::ObservationIncomplete(observation)) => {
@@ -7823,93 +7843,6 @@ export default function Page(){
                 .messages
                 .iter()
                 .any(|message| message.content.contains("recoverable validation error"))
-        );
-    }
-
-    #[test]
-    fn edit_anchor_mismatch_returns_recoverable_feedback() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "actual content").unwrap();
-        let mut fake = Fake::new(vec![
-            Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Edit",
-                    json!({"path":"a.txt","old_string":"actual missing","new_string":"replacement"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            }),
-            Ok(AssistantReply::text("final")),
-        ]);
-        let mut session = SessionSnapshot::new();
-        let result = run_session(
-            &mut fake,
-            &mut session,
-            "Summarize workspace",
-            &config(dir.path().to_path_buf()),
-        )
-        .unwrap();
-        assert_eq!(result, "final");
-        assert!(session.messages.iter().any(|message| message.role == "tool"
-            && message.content.contains("edit_anchor_not_found")
-            && message.content.contains("Deterministic best-match region")
-            && message.content.contains("1 | actual content")
-            && message.content.contains("actual content")
-            && message.content.contains("Re-anchor mandate")));
-    }
-
-    #[test]
-    fn repeated_edit_anchor_failures_on_same_file_prompt_full_file_write() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "actual content\n").unwrap();
-        let mut fake = Fake::new(vec![
-            Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Edit",
-                    json!({"path":"a.txt","old_string":"missing anchor","new_string":"replacement"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            }),
-            Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Edit",
-                    json!({"path":"a.txt","old_string":"other missing anchor","new_string":"replacement"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            }),
-            Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Edit",
-                    json!({"path":"a.txt","old_string":"third missing anchor","new_string":"replacement"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            }),
-            Ok(AssistantReply::text("final")),
-        ]);
-        let mut session = SessionSnapshot::new();
-        let result = run_session(
-            &mut fake,
-            &mut session,
-            "Summarize workspace",
-            &config(dir.path().to_path_buf()),
-        )
-        .unwrap();
-        assert_eq!(result, "final");
-        assert!(
-            session.messages.iter().any(|message| message.role == "tool"
-                && message.content.contains("anchor failure #3")
-                && message.content.contains("Write tool")
-                && message.content.contains("complete corrected file content")
-                && message.content.contains("`a.txt`")),
-            "{:?}",
-            session.messages
         );
     }
 

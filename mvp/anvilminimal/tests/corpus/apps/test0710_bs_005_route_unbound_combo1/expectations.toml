@@ -1,0 +1,38 @@
+case_id = "test0710_bs_005_route_unbound_combo1"
+source = "bs_005 combo1 route-unbound capability wiring regression fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["route_unbound", "page", "hook", "write_required"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/route-unbound-recovery.jsonl = [
+  "test0710_bs_005/combo1",
+  "\"event\":\"route_unbound_recovery\"",
+  "\"stage\":\"deterministic_guidance\"",
+  "\"stage\":\"write_required\"",
+  "\"route_bound_path\":\"src/app/page.tsx\"",
+  "\"unbound_path\":\"src/app/game-engine.ts\"",
+  "\"failure_count\":5",
+  "import and render `src/app/game-engine.ts`",
+  "data-anvil-action=\\\"primary\\\"",
+  "data-anvil-action=\\\"restart\\\"",
+  "data-anvil-state",
+  "\"selection_reason\":\"evidence_mapped\""
+]
