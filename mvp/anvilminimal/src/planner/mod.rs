@@ -11,6 +11,7 @@ pub mod signals;
 pub mod state_binding_scan;
 pub mod step_plan;
 pub mod ultra_plan;
+pub mod ultra_preset;
 pub mod verify;
 pub mod profiles {
     pub mod data;

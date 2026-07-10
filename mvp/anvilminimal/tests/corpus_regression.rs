@@ -6,8 +6,8 @@ use anvilminimal::minimal_loop::import_scan::route_bound_closure;
 use anvilminimal::minimal_loop::interaction_probe::static_html_probe_selection;
 use anvilminimal::planner::profile::{
     ProfileSnapshot, profile_expected_paths, profile_generation_rules, profile_guidance,
-    profile_quality_expectations, profile_runtime_contract, profile_setup_scaffold_paths,
-    verify_profile_final, verify_profile_invariant,
+    profile_preset_ultra_plan, profile_quality_expectations, profile_runtime_contract,
+    profile_setup_scaffold_paths, verify_profile_final, verify_profile_invariant,
 };
 use anvilminimal::planner::profiles::nextjs;
 
@@ -269,6 +269,11 @@ fn assert_nextjs_profile_matches_direct_impl(case_dir: &Path, display: &str) {
         profile_quality_expectations(case_dir, "nextjs", goal),
         nextjs::quality_expectations(case_dir, goal),
         "{display}: Next.js quality expectations changed behind DomainProfile"
+    );
+    assert_eq!(
+        profile_preset_ultra_plan("nextjs", goal, "default", "create"),
+        nextjs::preset_ultra_plan(goal, "default", "create"),
+        "{display}: Next.js preset UltraPlan changed behind DomainProfile"
     );
 }
 

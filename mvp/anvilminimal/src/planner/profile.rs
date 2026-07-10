@@ -9,6 +9,7 @@ use crate::minimal_loop::dependency_setup::{
 use crate::minimal_loop::evidence::required_evidence_for_capability;
 use crate::planner::signals;
 use crate::planner::step_plan::StepPlan;
+use crate::planner::ultra_plan::UltraPlan;
 use crate::planner::verify::VerificationReport;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -138,6 +139,10 @@ pub trait DomainProfile: Sync {
         _root: &Path,
         _goal: &str,
     ) -> Option<ProfileDeterministicStepPlan> {
+        None
+    }
+
+    fn preset_ultra_plan(&self, _goal: &str, _style: &str, _intent: &str) -> Option<UltraPlan> {
         None
     }
 
@@ -412,6 +417,10 @@ impl DomainProfile for NextjsProfile {
         goal: &str,
     ) -> Option<ProfileDeterministicStepPlan> {
         crate::planner::profiles::nextjs::deterministic_step_plan(phase_prompt, root, goal)
+    }
+
+    fn preset_ultra_plan(&self, goal: &str, style: &str, intent: &str) -> Option<UltraPlan> {
+        crate::planner::profiles::nextjs::preset_ultra_plan(goal, style, intent)
     }
 
     fn quality_expectations(&self, root: &Path, goal: &str) -> ProfileQualityExpectations {
@@ -890,6 +899,15 @@ pub fn profile_deterministic_step_plan(
     goal: &str,
 ) -> Option<ProfileDeterministicStepPlan> {
     domain_profile(profile).deterministic_step_plan(phase_prompt, root, goal)
+}
+
+pub fn profile_preset_ultra_plan(
+    profile: &str,
+    goal: &str,
+    style: &str,
+    intent: &str,
+) -> Option<UltraPlan> {
+    domain_profile(profile).preset_ultra_plan(goal, style, intent)
 }
 
 pub fn profile_runtime_contract(profile: &str, intent: &str, goal: &str) -> String {

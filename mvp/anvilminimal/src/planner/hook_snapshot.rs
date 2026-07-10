@@ -487,6 +487,7 @@ mod tests {
             model: "test".to_string(),
             provider: Provider::Ollama,
             prompt_layout: PromptLayout::Stable,
+            plan_preset: crate::config::PlanPreset::None,
             planner_model: "test".to_string(),
             planner_provider: Provider::Ollama,
             ollama_host: String::new(),

@@ -4697,6 +4697,14 @@ pub fn generate_ultra_plan_with_ui(
     }
     let model = model_for(config, true);
     let intent = detect_intent(goal);
+    if let Some(plan) = crate::planner::ultra_preset::maybe_preset_ultra_plan(config, goal, intent)?
+    {
+        crate::tui::presentation::emit_ultra_plan_card(
+            &plan,
+            &crate::tui::presentation::PlanProgress::default(),
+        );
+        return Ok(plan);
+    }
     let mut messages = ultra_plan_generation_messages(goal, config);
     let mut last_error = None;
     for attempt in 1..=ULTRA_PLAN_GENERATION_ATTEMPTS {
@@ -29249,6 +29257,7 @@ Type error: Cannot find name 'player'. Did you mean 'PLAYER_W'?\n\n\
             model: "m".to_string(),
             provider: crate::config::Provider::Ollama,
             prompt_layout: crate::config::PromptLayout::Stable,
+            plan_preset: crate::config::PlanPreset::None,
             planner_model: "m".to_string(),
             planner_provider: crate::config::Provider::Ollama,
             ollama_host: "http://localhost:11434".to_string(),

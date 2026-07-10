@@ -5125,6 +5125,7 @@ mod tests {
             model: "m".to_string(),
             provider: crate::config::Provider::Ollama,
             prompt_layout: crate::config::PromptLayout::Stable,
+            plan_preset: crate::config::PlanPreset::None,
             planner_model: "m".to_string(),
             planner_provider: crate::config::Provider::Ollama,
             ollama_host: "http://localhost:11434".to_string(),

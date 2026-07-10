@@ -13,6 +13,7 @@ use crate::planner::profile::{
 };
 use crate::planner::signals::requested_port_from_text;
 use crate::planner::step_plan::{PlanStep, StepPlan};
+use crate::planner::ultra_plan::{UltraPhase, UltraPlan};
 use crate::planner::verify::{VerificationReport, VerifyStatus};
 use crate::tools::path_guard::validate_workspace_relative;
 
@@ -356,6 +357,41 @@ pub fn deterministic_step_plan(
         return Some(build_verify_step_plan(phase_prompt, root, goal));
     }
     None
+}
+
+pub fn preset_ultra_plan(goal: &str, style: &str, intent: &str) -> Option<UltraPlan> {
+    if !style.eq_ignore_ascii_case("default") || !intent.eq_ignore_ascii_case("create") {
+        return None;
+    }
+    Some(UltraPlan {
+        goal: goal.to_string(),
+        profile: "nextjs".to_string(),
+        style: "default".to_string(),
+        intent: "create".to_string(),
+        phases: vec![
+            UltraPhase {
+                id: "project-setup".to_string(),
+                prompt: "Scaffold and setup the Next.js App Router project shell. Create or complete the package manifest, TypeScript config, styling config, and route-bound scaffold so the deterministic nextjs-scaffold template owns setup artifacts."
+                    .to_string(),
+            },
+            UltraPhase {
+                id: "core-implementation".to_string(),
+                prompt: format!(
+                    "Implement the core task-specific behavior for: {goal}. Keep one route-bound implementation, extend the instrumented skeleton instead of replacing it, and keep the implementation in the Next.js route-bound source."
+                ),
+            },
+            UltraPhase {
+                id: "contract-wiring".to_string(),
+                prompt: "Wire controls and data-anvil observability. Preserve or add data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, every restart affordance (game-over, victory, and in-play when present) should carry data-anvil-action=\"restart\"; the initial primary action alone cannot satisfy recovery verification."
+                    .to_string(),
+            },
+            UltraPhase {
+                id: "build-verification".to_string(),
+                prompt: "Run build verification for the deterministic Next.js scaffold. Verify package scripts, dependency boundary, and npm run build / next build only; keep this final phase verification-only."
+                    .to_string(),
+            },
+        ],
+    })
 }
 
 fn scaffold_step_plan(phase_prompt: &str, root: &Path, goal: &str) -> ProfileDeterministicStepPlan {
@@ -2489,6 +2525,87 @@ Phase task: Scaffold the Next.js app and configure package scripts";
             lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
             "{plan:?}"
         );
+    }
+
+    #[test]
+    fn nextjs_preset_ultra_plan_create_default_has_four_phases_and_goal() {
+        let goal = "Build a Next.js score tracker";
+        let plan = preset_ultra_plan(goal, "default", "create").unwrap();
+
+        assert_eq!(plan.goal, goal);
+        assert_eq!(plan.profile, "nextjs");
+        assert_eq!(plan.style, "default");
+        assert_eq!(plan.intent, "create");
+        assert_eq!(plan.phases.len(), 4);
+        assert_eq!(plan.phases[0].id, "project-setup");
+        assert_eq!(plan.phases[3].id, "build-verification");
+        assert!(plan.phases[1].prompt.contains(goal));
+    }
+
+    #[test]
+    fn nextjs_preset_ultra_plan_skips_fix_and_non_default_styles() {
+        assert!(preset_ultra_plan("Build an app", "default", "fix").is_none());
+        assert!(preset_ultra_plan("Build an app", "tdd", "create").is_none());
+        assert!(preset_ultra_plan("Build an app", "test-hardening", "create").is_none());
+    }
+
+    #[test]
+    fn nextjs_preset_ultra_plan_phases_hit_deterministic_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan =
+            preset_ultra_plan("Build a browser game on port 3011", "default", "create").unwrap();
+        let scaffold_prompt = format!(
+            "Original ultra goal: {}\nPhase id: {}\nPhase task: {}",
+            plan.goal, plan.phases[0].id, plan.phases[0].prompt
+        );
+        let build_prompt = format!(
+            "Original ultra goal: {}\nPhase id: {}\nPhase task: {}",
+            plan.goal, plan.phases[3].id, plan.phases[3].prompt
+        );
+
+        assert_eq!(
+            deterministic_step_plan(&scaffold_prompt, dir.path(), &plan.goal)
+                .unwrap()
+                .template_id,
+            "nextjs-scaffold"
+        );
+        assert_eq!(
+            deterministic_step_plan(&build_prompt, dir.path(), &plan.goal)
+                .unwrap()
+                .template_id,
+            "nextjs-build-verification"
+        );
+    }
+
+    #[test]
+    fn nextjs_preset_ultra_plan_passes_lint_and_template_sanitizer() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan =
+            preset_ultra_plan("Build a browser game on port 3011", "default", "create").unwrap();
+
+        assert!(
+            crate::planner::lint::lint_ultra_plan_report(&plan).is_pass(),
+            "{plan:?}"
+        );
+        for phase in [&plan.phases[0], &plan.phases[3]] {
+            let prompt = format!(
+                "Original ultra goal: {}\nPhase id: {}\nPhase task: {}",
+                plan.goal, phase.id, phase.prompt
+            );
+            let mut step_plan = deterministic_step_plan(&prompt, dir.path(), &plan.goal)
+                .unwrap()
+                .plan;
+            repair_generated_step_plan_contract(&mut step_plan);
+            let report = sanitize_step_plan_against_policy(&mut step_plan, Some(dir.path()));
+            assert!(report.shell_control_splits.is_empty(), "{report:?}");
+            for command in step_plan.steps.iter().flat_map(|step| step.verify.iter()) {
+                normalize_verify_command(command).unwrap();
+            }
+            assert!(
+                lint_step_plan_report_with_workspace(&step_plan, Some(dir.path())).is_pass(),
+                "{step_plan:?}"
+            );
+        }
     }
 
     #[test]

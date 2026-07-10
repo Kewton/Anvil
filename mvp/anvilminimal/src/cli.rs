@@ -21,6 +21,12 @@ pub enum PromptLayoutArg {
     Legacy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PlanPresetArg {
+    Profile,
+    None,
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "anvilminimal")]
 #[command(about = "Minimal loop + YAML plan runner MVP")]
@@ -43,6 +49,13 @@ pub struct Cli {
         help = "Choose prompt section order for A/B measurement"
     )]
     pub prompt_layout: Option<PromptLayoutArg>,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "profile|none",
+        help = "Opt into deterministic UltraPlan presets"
+    )]
+    pub plan_preset: Option<PlanPresetArg>,
     #[arg(long)]
     pub planner_model: Option<String>,
     #[arg(long, value_enum)]
@@ -156,6 +169,13 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--prompt-layout"));
         assert!(help.contains("stable|legacy"));
+    }
+
+    #[test]
+    fn help_includes_plan_preset() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--plan-preset"));
+        assert!(help.contains("profile|none"));
     }
 
     #[test]

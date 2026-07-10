@@ -112,3 +112,10 @@ fixtures/deterministic-step-plan-used.jsonl = [
   "\"template_id\":\"nextjs-scaffold\"",
   "\"planner_skipped\":true"
 ]
+fixtures/preset-ultra-plan-used.jsonl = [
+  "test0710_bs_004/combo2",
+  "\"event\":\"preset_ultra_plan_used\"",
+  "\"profile\":\"nextjs\"",
+  "\"template_id\":\"nextjs-create-default-ultra\"",
+  "\"planner_skipped\":true"
+]
