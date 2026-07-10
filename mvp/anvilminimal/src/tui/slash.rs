@@ -842,11 +842,16 @@ mod tests {
     use crate::state::ConversationMessage;
     use crate::tools::registry::ToolSpec;
 
+    #[derive(Clone)]
     struct DummyClient;
 
     impl ChatClient for DummyClient {
         fn label(&self) -> &str {
             "dummy"
+        }
+
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
 
         fn chat(

@@ -43,6 +43,13 @@ const PROTECTION_RULES: &[ProtectionRule] = &[
         audit: audit_bounded_execution_chokepoints,
     },
     ProtectionRule {
+        category: "provider_timeout_enforcement",
+        site_predicate: "ChatClient implementors",
+        required_wrapper: "required boxed_clone worker path",
+        allowlist: &["src/providers/mod.rs", "src/provider_call.rs"],
+        audit: audit_provider_timeout_enforcement,
+    },
+    ProtectionRule {
         category: "workspace_policy_tool_paths",
         site_predicate: "ToolRegistry path arguments",
         required_wrapper: "resolve_policy_checked_path / ensure_tool_path_allowed",
@@ -75,6 +82,14 @@ fn protection_coverage_table_rejects_unregistered_mock_sites() {
         (
             "src/new_provider.rs",
             r#"fn f(client: &mut dyn Client) { let _ = client.chat("m", &[], &[], false); }"#,
+        ),
+        (
+            "src/providers/mod.rs",
+            r#"pub trait ChatClient { fn boxed_clone(&self) -> Option<Box<dyn ChatClient>> { None } }"#,
+        ),
+        (
+            "src/provider_call.rs",
+            r#"fn f(client: &mut dyn ChatClient) { let Some(mut worker_client) = client.boxed_clone() else { return client.chat("m", &[], &[], false); }; }"#,
         ),
         (
             "src/new_spawn.rs",
@@ -114,6 +129,7 @@ fn protection_coverage_table_rejects_unregistered_mock_sites() {
         "compile_output_source_of_truth",
         "verify_normalization_boundary",
         "bounded_execution_chokepoints",
+        "provider_timeout_enforcement",
         "workspace_policy_tool_paths",
         "terminal_records",
     ] {
@@ -251,6 +267,31 @@ fn audit_bounded_execution_chokepoints(corpus: &AuditCorpus, _: &ProtectionRule)
             {
                 in_test_mod = true;
             }
+        }
+    }
+    violations
+}
+
+fn audit_provider_timeout_enforcement(corpus: &AuditCorpus, _: &ProtectionRule) -> Vec<String> {
+    let mut violations = Vec::new();
+    let providers = corpus.file("src/providers/mod.rs");
+    if !providers.contains("fn boxed_clone(&self) -> Box<dyn ChatClient>;") {
+        violations.push("ChatClient::boxed_clone must be a required Box return".to_string());
+    }
+    if providers.contains("fn boxed_clone(&self) -> Option")
+        || providers.contains("boxed_clone(&self) -> Option")
+    {
+        violations.push("ChatClient::boxed_clone is optional".to_string());
+    }
+    let provider_call = corpus.file("src/provider_call.rs");
+    for forbidden in [
+        "let Some(mut worker_client) = client.boxed_clone() else",
+        "client.chat(model, messages, tools, native_tools_enabled)",
+    ] {
+        if provider_call.contains(forbidden) {
+            violations.push(format!(
+                "provider_call contains synchronous timeout fallback marker `{forbidden}`"
+            ));
         }
     }
     violations

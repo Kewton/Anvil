@@ -4823,15 +4823,32 @@ mod tests {
     use crate::providers::AssistantReply;
     use crate::state::ToolCall;
     use serde_json::json;
+    use std::sync::{Arc, Mutex, MutexGuard};
 
+    #[derive(Clone)]
     struct Fake {
-        replies: Vec<anyhow::Result<AssistantReply>>,
+        replies: Arc<Mutex<Vec<anyhow::Result<AssistantReply>>>>,
+    }
+
+    impl Fake {
+        fn new(replies: Vec<anyhow::Result<AssistantReply>>) -> Self {
+            Self {
+                replies: Arc::new(Mutex::new(replies)),
+            }
+        }
+
+        fn remaining_replies(&self) -> usize {
+            self.replies.lock().unwrap().len()
+        }
     }
 
     impl ChatClient for Fake {
         fn label(&self) -> &str {
             "fake"
         }
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
+        }
         fn supports_native_tools(&self, _model: &str) -> bool {
             true
         }
@@ -4842,18 +4859,30 @@ mod tests {
             _tools: &[crate::tools::registry::ToolSpec],
             _native_tools_enabled: bool,
         ) -> anyhow::Result<AssistantReply> {
-            self.replies.remove(0)
+            self.replies.lock().unwrap().remove(0)
         }
     }
 
+    #[derive(Clone)]
     struct DelayedFake {
-        replies: Vec<(Duration, anyhow::Result<AssistantReply>)>,
+        replies: Arc<Mutex<Vec<(Duration, anyhow::Result<AssistantReply>)>>>,
+    }
+
+    impl DelayedFake {
+        fn new(replies: Vec<(Duration, anyhow::Result<AssistantReply>)>) -> Self {
+            Self {
+                replies: Arc::new(Mutex::new(replies)),
+            }
+        }
     }
 
     impl ChatClient for DelayedFake {
         fn label(&self) -> &str {
             "delayed-fake"
         }
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
+        }
         fn supports_native_tools(&self, _model: &str) -> bool {
             true
         }
@@ -4864,20 +4893,37 @@ mod tests {
             _tools: &[crate::tools::registry::ToolSpec],
             _native_tools_enabled: bool,
         ) -> anyhow::Result<AssistantReply> {
-            let (delay, reply) = self.replies.remove(0);
+            let (delay, reply) = self.replies.lock().unwrap().remove(0);
             std::thread::sleep(delay);
             reply
         }
     }
 
+    #[derive(Clone)]
     struct RecordingFake {
-        replies: Vec<anyhow::Result<AssistantReply>>,
-        requests: Vec<Vec<ConversationMessage>>,
+        replies: Arc<Mutex<Vec<anyhow::Result<AssistantReply>>>>,
+        requests: Arc<Mutex<Vec<Vec<ConversationMessage>>>>,
+    }
+
+    impl RecordingFake {
+        fn new(replies: Vec<anyhow::Result<AssistantReply>>) -> Self {
+            Self {
+                replies: Arc::new(Mutex::new(replies)),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> MutexGuard<'_, Vec<Vec<ConversationMessage>>> {
+            self.requests.lock().unwrap()
+        }
     }
 
     impl ChatClient for RecordingFake {
         fn label(&self) -> &str {
             "recording-fake"
+        }
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
         fn supports_native_tools(&self, _model: &str) -> bool {
             true
@@ -4889,8 +4935,8 @@ mod tests {
             _tools: &[crate::tools::registry::ToolSpec],
             _native_tools_enabled: bool,
         ) -> anyhow::Result<AssistantReply> {
-            self.requests.push(messages.to_vec());
-            self.replies.remove(0)
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.replies.lock().unwrap().remove(0)
         }
     }
 
@@ -4983,9 +5029,8 @@ mod tests {
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 8;
-        let mut fake = DelayedFake {
-            replies: vec![(Duration::from_millis(5), Ok(read_reply("notes.md")))],
-        };
+        let mut fake =
+            DelayedFake::new(vec![(Duration::from_millis(5), Ok(read_reply("notes.md")))]);
         let mut session = SessionSnapshot::new();
         let mut options = RunSessionOptions::plan_step(RunSessionStepKind::Implement);
         options.step_wall_clock_cap = Some(Duration::from_millis(1));
@@ -5025,20 +5070,18 @@ mod tests {
     #[test]
     fn fake_write_then_final() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.txt","content":"ok"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+        ]);
         let mut session = SessionSnapshot::new();
         let result = run_session_with_required_paths(
             &mut fake,
@@ -5062,14 +5105,12 @@ mod tests {
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 1;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(empty_reply()),
-                Ok(empty_reply()),
-                Ok(empty_reply()),
-                Ok(empty_reply()),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(empty_reply()),
+            Ok(empty_reply()),
+            Ok(empty_reply()),
+            Ok(empty_reply()),
+        ]);
         let mut session = SessionSnapshot::new();
         let err = run_session_with_outcome_with_ui(
             &mut fake,
@@ -5135,18 +5176,16 @@ mod tests {
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
         cfg.chat_timeout_secs = 0;
-        let mut fake = DelayedFake {
-            replies: vec![
-                (
-                    Duration::from_millis(1),
-                    Ok(AssistantReply::text("discarded first reply")),
-                ),
-                (
-                    Duration::from_millis(1),
-                    Ok(AssistantReply::text("discarded second reply")),
-                ),
-            ],
-        };
+        let mut fake = DelayedFake::new(vec![
+            (
+                Duration::from_millis(1),
+                Ok(AssistantReply::text("discarded first reply")),
+            ),
+            (
+                Duration::from_millis(1),
+                Ok(AssistantReply::text("discarded second reply")),
+            ),
+        ]);
         let mut session = SessionSnapshot::new();
 
         let err = run_session_with_outcome_with_ui(
@@ -5220,22 +5259,20 @@ mod tests {
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 2;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(empty_reply()),
-                Ok(empty_reply()),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.txt","content":"ok"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(empty_reply()),
+            Ok(empty_reply()),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_ui(
             &mut fake,
@@ -5262,24 +5299,21 @@ mod tests {
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 2;
-        let mut fake = RecordingFake {
-            replies: vec![
-                Ok(empty_reply()),
-                Ok(empty_reply()),
-                Ok(empty_reply()),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.txt","content":"ok"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-            ],
-            requests: Vec::new(),
-        };
+        let mut fake = RecordingFake::new(vec![
+            Ok(empty_reply()),
+            Ok(empty_reply()),
+            Ok(empty_reply()),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_ui(
             &mut fake,
@@ -5291,8 +5325,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.stop_reason, RunStopReason::AssistantFinal);
-        assert_eq!(fake.requests.len(), 5);
-        let fresh_request = &fake.requests[3];
+        let requests = fake.requests();
+        assert_eq!(requests.len(), 5);
+        let fresh_request = &requests[3];
         assert_eq!(
             fresh_request
                 .iter()
@@ -5316,17 +5351,15 @@ mod tests {
     #[test]
     fn default_run_session_options_preserve_prompt_artifact_extraction() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Write",
-                    json!({"path":"a.txt","content":"ok"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Write",
+                json!({"path":"a.txt","content":"ok"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_ui(
             &mut fake,
@@ -5347,9 +5380,7 @@ mod tests {
     #[test]
     fn plan_step_disables_prompt_required_artifact_extraction() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply::text("workspace inspected"))],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply::text("workspace inspected"))]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5372,9 +5403,7 @@ mod tests {
         std::fs::write(&contract, "not json").unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply::text("workspace inspected"))],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply::text("workspace inspected"))]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5438,28 +5467,26 @@ export default function Page(){
   return <main tabIndex={0} onKeyDown={() => setScore(score + 1)}><canvas /><p>enemy collision score {score} {gameState}</p></main>;
 }
 "#;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/page.tsx","content":static_page}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/page.tsx","content":interactive_page}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":static_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":interactive_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let prompt = "Execute exactly one StepPlan step.\n\nCurrent step kind:\nimplement\n\nRequired final capabilities:\n- stateful_interaction\n- player_control\n- adversary_or_challenge\n- progression_or_score\n- failure_or_collision_rule\n\nRequired final evidence:\n- implementation_artifact\n- visible_interactive_surface_evidence\n- user_input_handler_evidence\n- stateful_update_evidence\n- challenge_or_adversary_evidence\n- score_or_progression_evidence\n- failure_or_collision_evidence\n\nExpected paths after this step:\n- src/app/page.tsx";
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
@@ -5488,17 +5515,15 @@ export default function Page(){
     #[test]
     fn plan_step_non_interactive_completion_preserves_path_only_success() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Write",
-                    json!({"path":"a.txt","content":"ok"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Write",
+                json!({"path":"a.txt","content":"ok"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5520,17 +5545,15 @@ export default function Page(){
     #[test]
     fn verify_step_with_bash_then_final_text_is_allowed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Bash", json!({"command":"true"}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("verification passed")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command":"true"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("verification passed")),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5549,14 +5572,12 @@ export default function Page(){
     #[test]
     fn verify_step_with_bash_only_can_delegate_to_runner() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new("Bash", json!({"command":"true"}))],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new("Bash", json!({"command":"true"}))],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5580,28 +5601,26 @@ export default function Page(){
         let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events_path.clone());
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Bash",
-                        json!({"command":"cat package.json | grep 3011"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Bash",
-                        json!({"command":"test -f package.json"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Bash",
+                    json!({"command":"cat package.json | grep 3011"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Bash",
+                    json!({"command":"test -f package.json"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5663,17 +5682,15 @@ export default function Page(){
         let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events_path.clone());
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Bash",
-                    json!({"command":"ls -R src/app && node -p \"require('./package.json').scripts.build\""}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Bash",
+                json!({"command":"ls -R src/app && node -p \"require('./package.json').scripts.build\""}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5734,17 +5751,15 @@ export default function Page(){
         let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events_path.clone());
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Bash",
-                    json!({"command":"npm install && test -f package.json"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Bash",
+                json!({"command":"npm install && test -f package.json"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5790,20 +5805,18 @@ export default function Page(){
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events_path.clone());
         cfg.max_iterations = 2;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Bash",
-                        json!({"command":"test -f package.json\npython -m compileall -q src"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Bash",
+                    json!({"command":"test -f package.json\npython -m compileall -q src"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5849,20 +5862,18 @@ export default function Page(){
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events_path);
         cfg.max_iterations = 2;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Bash",
-                        json!({"command":"cat > fixtures/input.csv\npython src/main.py fixtures/input.csv"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Bash",
+                    json!({"command":"cat > fixtures/input.csv\npython src/main.py fixtures/input.csv"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5899,14 +5910,12 @@ export default function Page(){
     #[test]
     fn verify_step_runtime_preserves_and_short_circuit() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new("Bash", json!({"command":"false && echo x"}))],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new("Bash", json!({"command":"false && echo x"}))],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -5946,14 +5955,12 @@ export default function Page(){
             "cd {} && test -f missing-marker.txt 2>&1 | tail -80",
             dir.path().display()
         );
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new("Bash", json!({"command": command}))],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new("Bash", json!({"command": command}))],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -6030,17 +6037,15 @@ export default function Page(){
         let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events_path.clone());
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Bash",
-                    json!({"command":"test -f src/app/page.tsx && echo \"EXISTS\" || echo \"MISSING\""}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Bash",
+                json!({"command":"test -f src/app/page.tsx && echo \"EXISTS\" || echo \"MISSING\""}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -6138,17 +6143,15 @@ export default function Page(){
         let events_path = dir.path().join(".anvil/runs/test/events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events_path.clone());
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Bash",
-                    json!({"command":"printf ok && printf done"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Bash",
+                json!({"command":"printf ok && printf done"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -6199,17 +6202,15 @@ export default function Page(){
         .unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Write",
-                    json!({"path":"a.txt","content":"ok"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Write",
+                json!({"path":"a.txt","content":"ok"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_ui(
             &mut fake,
@@ -6237,28 +6238,26 @@ export default function Page(){
         .unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![
-                    ToolCall::new("Write", json!({"path":"package.json","content":"{}"})),
-                    ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main/>;}\n"}),
-                    ),
-                    ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/layout.tsx","content":"export default function RootLayout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>}\n"}),
-                    ),
-                    ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";\n"}),
-                    ),
-                ],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![
+                ToolCall::new("Write", json!({"path":"package.json","content":"{}"})),
+                ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":"export default function Page(){return <main/>;}\n"}),
+                ),
+                ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/layout.tsx","content":"export default function RootLayout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>}\n"}),
+                ),
+                ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";\n"}),
+                ),
+            ],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let err = run_session_with_outcome_with_ui(
             &mut fake,
@@ -6289,33 +6288,31 @@ export default function Page(){
         cfg.max_iterations = 1;
         let required_paths = crate::planner::profiles::nextjs::setup_scaffold_paths(dir.path());
         let page = "export default function Page(){return <main>ready</main>;}\n";
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![
-                        ToolCall::new("Write", json!({"path":"package.json","content":"{}"})),
-                        ToolCall::new("Write", json!({"path":"tsconfig.json","content":"{}"})),
-                        ToolCall::new(
-                            "Write",
-                            json!({"path":"src/app/layout.tsx","content":"import './globals.css';\nexport default function RootLayout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>}\n"}),
-                        ),
-                        ToolCall::new("Write", json!({"path":"src/app/page.tsx","content":page})),
-                        ToolCall::new(
-                            "Write",
-                            json!({"path":"src/app/globals.css","content":"@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"}),
-                        ),
-                        ToolCall::new(
-                            "Write",
-                            json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";\n"}),
-                        ),
-                    ],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(empty_reply()),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![
+                    ToolCall::new("Write", json!({"path":"package.json","content":"{}"})),
+                    ToolCall::new("Write", json!({"path":"tsconfig.json","content":"{}"})),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/layout.tsx","content":"import './globals.css';\nexport default function RootLayout({children}:{children:React.ReactNode}){return <html><body>{children}</body></html>}\n"}),
+                    ),
+                    ToolCall::new("Write", json!({"path":"src/app/page.tsx","content":page})),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/globals.css","content":"@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"}),
+                    ),
+                    ToolCall::new(
+                        "Write",
+                        json!({"path":"src/app/global.d.ts","content":"declare module \"*.css\";\n"}),
+                    ),
+                ],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(empty_reply()),
+        ]);
         let mut session = SessionSnapshot::new();
 
         let outcome = run_session_with_outcome_with_options(
@@ -6366,14 +6363,12 @@ export default function Page(){
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 1;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(empty_reply()),
-                Ok(empty_reply()),
-                Ok(empty_reply()),
-                Ok(empty_reply()),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(empty_reply()),
+            Ok(empty_reply()),
+            Ok(empty_reply()),
+            Ok(empty_reply()),
+        ]);
         let mut session = SessionSnapshot::new();
 
         let outcome = run_session_with_outcome_with_options(
@@ -6407,14 +6402,12 @@ export default function Page(){
         cfg.profile = "nextjs".to_string();
         cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 8;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply::text("I will create the page.")),
-                Ok(AssistantReply::text("Still preparing.")),
-                Ok(AssistantReply::text("I need to write it.")),
-                Ok(AssistantReply::text("Scaffold now.")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply::text("I will create the page.")),
+            Ok(AssistantReply::text("Still preparing.")),
+            Ok(AssistantReply::text("I need to write it.")),
+            Ok(AssistantReply::text("Scaffold now.")),
+        ]);
         let mut session = SessionSnapshot::new();
 
         let outcome = run_session_with_outcome_with_options(
@@ -6453,9 +6446,7 @@ export default function Page(){
         std::fs::write(dir.path().join("src/app/page.tsx"), "ok").unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
-        let mut fake = Fake {
-            replies: Vec::new(),
-        };
+        let mut fake = Fake::new(Vec::new());
         let mut session = SessionSnapshot::new();
 
         let outcome = run_session_with_outcome_with_options(
@@ -6469,7 +6460,7 @@ export default function Page(){
         )
         .unwrap();
 
-        assert_eq!(fake.replies.len(), 0);
+        assert_eq!(fake.remaining_replies(), 0);
         assert_eq!(outcome.iterations, 0);
         assert_eq!(outcome.tool_calls, 0);
         assert_eq!(
@@ -6489,17 +6480,15 @@ export default function Page(){
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Write",
-                    json!({"path": "src/app/page.tsx", "content": "ok"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Write",
+                json!({"path": "src/app/page.tsx", "content": "ok"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
 
         let outcome = run_session_with_outcome_with_options(
@@ -6513,7 +6502,7 @@ export default function Page(){
         )
         .unwrap();
 
-        assert_eq!(fake.replies.len(), 0);
+        assert_eq!(fake.remaining_replies(), 0);
         assert_eq!(outcome.iterations, 1);
         assert_eq!(outcome.tool_calls, 1);
         assert!(dir.path().join("src/app/page.tsx").is_file());
@@ -6527,31 +6516,29 @@ export default function Page(){
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({
-                            "path": "/Users/example/share/work/old-run/src/app/layout.tsx",
-                            "content": "wrong"
-                        }),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path": "src/app/page.tsx", "content": "ok"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({
+                        "path": "/Users/example/share/work/old-run/src/app/layout.tsx",
+                        "content": "wrong"
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path": "src/app/page.tsx", "content": "ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
 
         let outcome = run_session_with_outcome_with_options(
@@ -6599,28 +6586,26 @@ export default function Page(){
         let stale = dir
             .path()
             .join("localwork/commandagent_mvp/01/test0710_camp_001/src/app/page.tsx");
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path": stale.display().to_string(), "content": "wrong"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path": "src/app/page.tsx", "content": "ok"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path": stale.display().to_string(), "content": "wrong"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path": "src/app/page.tsx", "content": "ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
 
         let outcome = run_session_with_outcome_with_options(
@@ -6676,31 +6661,29 @@ export default function Page(){
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({
-                            "path": "/Users/example/share/work/old-run/src/app/page.tsx",
-                            "content": "page"
-                        }),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path": "package.json", "content": "{}"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({
+                        "path": "/Users/example/share/work/old-run/src/app/page.tsx",
+                        "content": "page"
+                    }),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path": "package.json", "content": "{}"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let options = RunSessionOptions::plan_step(RunSessionStepKind::Setup)
             .with_path_fallback_candidates(vec!["src/app/page.tsx".to_string()]);
@@ -6742,9 +6725,7 @@ export default function Page(){
         cfg.profile = "python-cli".to_string();
         cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 1;
-        let mut fake = Fake {
-            replies: vec![Ok(empty_reply()), Ok(empty_reply())],
-        };
+        let mut fake = Fake::new(vec![Ok(empty_reply()), Ok(empty_reply())]);
         let mut session = SessionSnapshot::new();
 
         let outcome = run_session_with_outcome_with_options(
@@ -6783,28 +6764,26 @@ export default function Page(){
         .unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.py","content":"def fixed():\n    return 1\n"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.py","content":"def fixed():\n    return 1\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_ui(
             &mut fake,
@@ -6842,17 +6821,15 @@ export default function Page(){
         .unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Write",
-                    json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Write",
+                json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let err = run_session_with_outcome_with_ui(
             &mut fake,
@@ -6878,37 +6855,35 @@ export default function Page(){
         .unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Glob", json!({"pattern":"**/*"}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Grep", json!({"pattern":"date"}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Bash", json!({"command":"ls"}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"date-helper.js","content":"module.exports = {};\n"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Glob", json!({"pattern":"**/*"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Grep", json!({"pattern":"date"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command":"ls"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"date-helper.js","content":"module.exports = {};\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_ui(
             &mut fake,
@@ -6934,24 +6909,21 @@ export default function Page(){
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 4;
-        let mut fake = RecordingFake {
-            replies: vec![
-                Ok(read_reply("notes.md")),
-                Ok(read_reply("notes.md")),
-                Ok(read_reply("notes.md")),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"implemented.txt","content":"done\n"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-            ],
-            requests: Vec::new(),
-        };
+        let mut fake = RecordingFake::new(vec![
+            Ok(read_reply("notes.md")),
+            Ok(read_reply("notes.md")),
+            Ok(read_reply("notes.md")),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"implemented.txt","content":"done\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -6978,7 +6950,7 @@ export default function Page(){
             Some("intervention")
         );
         assert!(
-            fake.requests.iter().any(|request| {
+            fake.requests().iter().any(|request| {
                 request.iter().any(|message| {
                     message
                         .content
@@ -6986,7 +6958,7 @@ export default function Page(){
                 })
             }),
             "{:#?}",
-            fake.requests
+            fake.requests()
         );
     }
 
@@ -6998,9 +6970,7 @@ export default function Page(){
         let mut cfg = config(dir.path().to_path_buf());
         cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 2;
-        let mut fake = Fake {
-            replies: (0..5).map(|_| Ok(read_reply("notes.md"))).collect(),
-        };
+        let mut fake = Fake::new((0..5).map(|_| Ok(read_reply("notes.md"))).collect());
         let mut session = SessionSnapshot::new();
         let err = run_session_with_outcome_with_options(
             &mut fake,
@@ -7067,7 +7037,7 @@ export default function Page(){
                 completion_tokens: None,
             }));
         }
-        let mut fake = Fake { replies };
+        let mut fake = Fake::new(replies);
         let mut session = SessionSnapshot::new();
         let err = run_session_with_outcome_with_ui(
             &mut fake,
@@ -7096,40 +7066,38 @@ export default function Page(){
         cfg.completion_contract_path = Some(contract);
         cfg.eval_events_path = Some(events.clone());
         cfg.max_iterations = 6;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Read", json!({"path":"a.py"}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Bash",
-                        json!({"command":"python3 -m py_compile a.py"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Read", json!({"path":"a.py"}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Read", json!({"path":"a.py"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Bash",
+                    json!({"command":"python3 -m py_compile a.py"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Read", json!({"path":"a.py"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let err = run_session_with_outcome_with_ui(
             &mut fake,
@@ -7173,22 +7141,20 @@ export default function Page(){
         cfg.max_iterations = 6;
         let static_page =
             "export default function Page(){ return <main><canvas>ready</canvas></main>; }";
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/page.tsx","content":static_page}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text(
-                    "I inspected the page but made no edit.",
-                )),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":static_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text(
+                "I inspected the page but made no edit.",
+            )),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -7251,22 +7217,20 @@ export default function Page(){
         cfg.max_iterations = 6;
         let static_page =
             "export default function Page(){ return <main><canvas>ready</canvas></main>; }";
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/page.tsx","content":static_page}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text(
-                    "I inspected the page but made no edit.",
-                )),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":static_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text(
+                "I inspected the page but made no edit.",
+            )),
+        ]);
         let mut session = SessionSnapshot::new();
         let err = run_session_with_outcome_with_options(
             &mut fake,
@@ -7308,28 +7272,26 @@ export default function Page(){
         .unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.py","content":"def broken(:\n    pass\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let err = run_session_with_outcome_with_ui(
             &mut fake,
@@ -7585,28 +7547,26 @@ export default function Page(){
   return <main><button onClick={fire}>Start</button><button onClick={restart}>Restart</button><button onClick={fire}>Fire</button><p>enemy collision score {score} {gameOver ? "game over" : "playing"}</p></main>;
 }
 "#;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/page.tsx","content":partial_page}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/page.tsx","content":repaired_page}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":partial_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":repaired_page}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_ui(
             &mut fake,
@@ -7630,9 +7590,7 @@ export default function Page(){
     #[test]
     fn run_session_string_wrapper_preserves_existing_cli_behavior() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply::text("plain final"))],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply::text("plain final"))]);
         let mut session = SessionSnapshot::new();
         let result = run_session(
             &mut fake,
@@ -7647,17 +7605,15 @@ export default function Page(){
     #[test]
     fn changed_paths_are_workspace_relative_after_tool_success() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new(
-                    "Write",
-                    json!({"path":"src/app/page.tsx","content":"export default function Page(){return null;}"}),
-                )],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new(
+                "Write",
+                json!({"path":"src/app/page.tsx","content":"export default function Page(){return null;}"}),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_ui(
             &mut fake,
@@ -7678,26 +7634,24 @@ export default function Page(){
     #[test]
     fn missing_tool_argument_feedback_allows_retry() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Grep", json!({}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.txt","content":"ok"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Grep", json!({}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+        ]);
         let mut session = SessionSnapshot::new();
         let result = run_session_with_required_paths(
             &mut fake,
@@ -7724,20 +7678,18 @@ export default function Page(){
     fn edit_anchor_mismatch_returns_recoverable_feedback() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "actual content").unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Edit",
-                        json!({"path":"a.txt","old_string":"actual missing","new_string":"replacement"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("final")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Edit",
+                    json!({"path":"a.txt","old_string":"actual missing","new_string":"replacement"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("final")),
+        ]);
         let mut session = SessionSnapshot::new();
         let result = run_session(
             &mut fake,
@@ -7758,29 +7710,27 @@ export default function Page(){
     fn repeated_edit_anchor_failures_on_same_file_prompt_full_file_write() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "actual content\n").unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Edit",
-                        json!({"path":"a.txt","old_string":"missing anchor","new_string":"replacement"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Edit",
-                        json!({"path":"a.txt","old_string":"other missing anchor","new_string":"replacement"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("final")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Edit",
+                    json!({"path":"a.txt","old_string":"missing anchor","new_string":"replacement"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Edit",
+                    json!({"path":"a.txt","old_string":"other missing anchor","new_string":"replacement"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("final")),
+        ]);
         let mut session = SessionSnapshot::new();
         let result = run_session(
             &mut fake,
@@ -7804,20 +7754,18 @@ export default function Page(){
     #[test]
     fn prompt_requested_artifact_feedback_then_write() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply::text("done")),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.txt","content":"ok"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply::text("done")),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let result = run_session(
             &mut fake,
@@ -7842,21 +7790,19 @@ export default function Page(){
     #[test]
     fn completion_without_write_feedback_then_write_then_complete() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply::text("done")),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.txt","content":"ok"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply::text("done")),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+        ]);
         let mut session = SessionSnapshot::new();
         let result = run_session(
             &mut fake,
@@ -7875,12 +7821,10 @@ export default function Page(){
     #[test]
     fn empty_response_gets_one_retry_feedback() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply::text("")),
-                Ok(AssistantReply::text("final")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply::text("")),
+            Ok(AssistantReply::text("final")),
+        ]);
         let mut session = SessionSnapshot::new();
         let result = run_session(
             &mut fake,
@@ -7901,12 +7845,10 @@ export default function Page(){
     #[test]
     fn repeated_planned_action_without_tool_returns_error() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply::text("I will create it.")),
-                Ok(AssistantReply::text("I will create it now.")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply::text("I will create it.")),
+            Ok(AssistantReply::text("I will create it now.")),
+        ]);
         let mut session = SessionSnapshot::new();
         let err = run_session(
             &mut fake,
@@ -7929,14 +7871,32 @@ export default function Page(){
         )));
     }
 
+    #[derive(Clone)]
     struct ParseRetryFake {
-        replies: Vec<anyhow::Result<AssistantReply>>,
-        native_flags: Vec<bool>,
+        replies: Arc<Mutex<Vec<anyhow::Result<AssistantReply>>>>,
+        native_flags: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl ParseRetryFake {
+        fn new(replies: Vec<anyhow::Result<AssistantReply>>) -> Self {
+            Self {
+                replies: Arc::new(Mutex::new(replies)),
+                native_flags: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn native_flags(&self) -> Vec<bool> {
+            self.native_flags.lock().unwrap().clone()
+        }
     }
 
     impl ChatClient for ParseRetryFake {
         fn label(&self) -> &str {
             "parse-retry-fake"
+        }
+
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
 
         fn supports_native_tools(&self, _model: &str) -> bool {
@@ -7954,31 +7914,28 @@ export default function Page(){
             _tools: &[crate::tools::registry::ToolSpec],
             native_tools_enabled: bool,
         ) -> anyhow::Result<AssistantReply> {
-            self.native_flags.push(native_tools_enabled);
-            self.replies.remove(0)
+            self.native_flags.lock().unwrap().push(native_tools_enabled);
+            self.replies.lock().unwrap().remove(0)
         }
     }
 
     #[test]
     fn malformed_native_tool_call_retries_with_native_tools_before_fallback() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = ParseRetryFake {
-            replies: vec![
-                Err(anyhow::anyhow!(
-                    "OpenAI function_call arguments are not valid JSON"
-                )),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.txt","content":"ok"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-            native_flags: Vec::new(),
-        };
+        let mut fake = ParseRetryFake::new(vec![
+            Err(anyhow::anyhow!(
+                "OpenAI function_call arguments are not valid JSON"
+            )),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let result = run_session_with_required_paths(
             &mut fake,
@@ -7990,28 +7947,25 @@ export default function Page(){
         .unwrap();
 
         assert_eq!(result, "required artifacts satisfied: a.txt");
-        assert_eq!(fake.native_flags, vec![true, true]);
+        assert_eq!(fake.native_flags(), vec![true, true]);
         assert!(!session.native_tools_disabled);
     }
 
     #[test]
     fn repeated_malformed_native_tool_call_eventually_uses_xml_fallback() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = ParseRetryFake {
-            replies: vec![
-                Err(anyhow::anyhow!(
-                    "OpenAI function_call arguments are not valid JSON"
-                )),
-                Err(anyhow::anyhow!(
-                    "OpenAI function_call arguments are not valid JSON"
-                )),
-                Err(anyhow::anyhow!(
-                    "OpenAI function_call arguments are not valid JSON"
-                )),
-                Ok(AssistantReply::text("final")),
-            ],
-            native_flags: Vec::new(),
-        };
+        let mut fake = ParseRetryFake::new(vec![
+            Err(anyhow::anyhow!(
+                "OpenAI function_call arguments are not valid JSON"
+            )),
+            Err(anyhow::anyhow!(
+                "OpenAI function_call arguments are not valid JSON"
+            )),
+            Err(anyhow::anyhow!(
+                "OpenAI function_call arguments are not valid JSON"
+            )),
+            Ok(AssistantReply::text("final")),
+        ]);
         let mut session = SessionSnapshot::new();
         let result = run_session(
             &mut fake,
@@ -8022,7 +7976,7 @@ export default function Page(){
         .unwrap();
 
         assert_eq!(result, "final");
-        assert_eq!(fake.native_flags, vec![true, true, true, false]);
+        assert_eq!(fake.native_flags(), vec![true, true, true, false]);
         assert!(session.native_tools_disabled);
     }
 
@@ -8068,30 +8022,28 @@ Required final artifacts:
     #[test]
     fn missing_relative_import_gets_repair_prompt_before_final() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"src/page.tsx","content":"import Widget from './Widget';\nexport default function Page(){return <Widget/>;}"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"src/Widget.tsx","content":"export default function Widget(){return <div/>;}"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/page.tsx","content":"import Widget from './Widget';\nexport default function Page(){return <Widget/>;}"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/Widget.tsx","content":"export default function Widget(){return <div/>;}"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+        ]);
         let mut session = SessionSnapshot::new();
         let result = run_session(
             &mut fake,
@@ -8115,28 +8067,26 @@ Required final artifacts:
     #[test]
     fn required_artifact_success_waits_for_missing_relative_imports() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/page.tsx","content":"import './layout.css';\nexport default function Page(){return <main/>;}"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"src/app/layout.css","content":"main { color: white; }\n"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":"import './layout.css';\nexport default function Page(){return <main/>;}"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/layout.css","content":"main { color: white; }\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_ui(
             &mut fake,
@@ -8161,28 +8111,26 @@ Required final artifacts:
         std::fs::write(dir.path().join("a.txt"), "ok").unwrap();
         let mut cfg = config(dir.path().to_path_buf());
         cfg.max_iterations = 8;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Read", json!({"path":"workdir/a.txt"}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let err = run_session(&mut fake, &mut session, "read a.txt", &cfg)
             .unwrap_err()
@@ -8199,23 +8147,21 @@ Required final artifacts:
         cfg.eval_events_path = Some(events_path.clone());
         cfg.max_iterations = 5;
         let rejected = "npm run build | grep error";
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Bash", json!({"command": rejected}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new("Bash", json!({"command": rejected}))],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply::text("done")),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command": rejected}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command": rejected}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("done")),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
@@ -8283,46 +8229,44 @@ Required final artifacts:
         let mut cfg = config(dir.path().to_path_buf());
         cfg.completion_contract_path = Some(contract);
         cfg.max_iterations = 6;
-        let mut fake = Fake {
-            replies: vec![
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"scratch1.txt","content":"x"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"scratch2.txt","content":"x"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"scratch3.txt","content":"x"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-                Ok(AssistantReply {
-                    content: String::new(),
-                    tool_calls: vec![ToolCall::new(
-                        "Write",
-                        json!({"path":"a.txt","content":"ok"}),
-                    )],
-                    prompt_tokens: None,
-                    completion_tokens: None,
-                }),
-            ],
-        };
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"scratch1.txt","content":"x"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"scratch2.txt","content":"x"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"scratch3.txt","content":"x"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"a.txt","content":"ok"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
         let mut session = SessionSnapshot::new();
         let outcome = run_session_with_outcome_with_ui(
             &mut fake,
@@ -8362,7 +8306,7 @@ Required final artifacts:
                 completion_tokens: None,
             }));
         }
-        let mut fake = Fake { replies };
+        let mut fake = Fake::new(replies);
         let mut session = SessionSnapshot::new();
         let err = run_session_with_outcome_with_ui(
             &mut fake,
@@ -8383,14 +8327,12 @@ Required final artifacts:
     #[test]
     fn dangerous_command_remains_hard_error() {
         let dir = tempfile::tempdir().unwrap();
-        let mut fake = Fake {
-            replies: vec![Ok(AssistantReply {
-                content: String::new(),
-                tool_calls: vec![ToolCall::new("Bash", json!({"command":"rm -rf /"}))],
-                prompt_tokens: None,
-                completion_tokens: None,
-            })],
-        };
+        let mut fake = Fake::new(vec![Ok(AssistantReply {
+            content: String::new(),
+            tool_calls: vec![ToolCall::new("Bash", json!({"command":"rm -rf /"}))],
+            prompt_tokens: None,
+            completion_tokens: None,
+        })]);
         let mut session = SessionSnapshot::new();
         let err = run_session(
             &mut fake,

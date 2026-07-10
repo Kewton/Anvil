@@ -46,8 +46,8 @@ impl ChatClient for GeminiClient {
         "gemini"
     }
 
-    fn boxed_clone(&self) -> Option<Box<dyn ChatClient>> {
-        Some(Box::new(self.clone()))
+    fn boxed_clone(&self) -> Box<dyn ChatClient> {
+        Box::new(self.clone())
     }
 
     fn supports_native_tools(&self, _model: &str) -> bool {

@@ -1228,6 +1228,7 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use crate::tools::registry::ToolSpec;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn scripted_probe_run_computes_metrics_card_and_cleans_scratch() {
@@ -1361,16 +1362,17 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct ScriptedProbeClient {
         label: &'static str,
-        calls: Vec<String>,
+        calls: Arc<Mutex<Vec<String>>>,
     }
 
     impl ScriptedProbeClient {
         fn new(label: &'static str) -> Self {
             Self {
                 label,
-                calls: Vec::new(),
+                calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1378,6 +1380,10 @@ mod tests {
     impl ChatClient for ScriptedProbeClient {
         fn label(&self) -> &str {
             self.label
+        }
+
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
 
         fn supports_native_tools(&self, _model: &str) -> bool {
@@ -1397,12 +1403,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             let task = task_id(&joined).unwrap_or("unknown");
-            let prior_same_task = self
-                .calls
+            let mut calls = self.calls.lock().unwrap();
+            let prior_same_task = calls
                 .iter()
                 .filter(|call| task_id(call).is_some_and(|prior| prior == task))
                 .count();
-            self.calls.push(joined.clone());
+            calls.push(joined.clone());
             let root = workspace_root_from_messages(messages);
             if prior_same_task > 0 && task != "verify_json" {
                 return Ok(reply_text("no further tool action after probe feedback"));

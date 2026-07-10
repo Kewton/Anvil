@@ -469,9 +469,8 @@ fn planner_chat_for_step_plan_attempt(
     ui: &dyn InteractionUi,
     session_mode: PlannerSessionMode,
 ) -> anyhow::Result<AssistantReply> {
-    if session_mode == PlannerSessionMode::FreshCompact
-        && let Some(mut fresh_client) = client.boxed_clone()
-    {
+    if session_mode == PlannerSessionMode::FreshCompact {
+        let mut fresh_client = client.boxed_clone();
         return planner_chat_with_request_retry(
             fresh_client.as_mut(),
             config,
@@ -15338,6 +15337,7 @@ mod tests {
     use crate::providers::{AssistantReply, ChatClient};
     use crate::state::ConversationMessage;
     use crate::tools::registry::ToolSpec;
+    use std::sync::{Arc, Mutex};
 
     fn common_prefix(left: &str, right: &str) -> String {
         left.chars()
@@ -15518,7 +15518,7 @@ mod tests {
         let result = run_plan_file(&mut fake, &path, &cfg).unwrap();
 
         assert_eq!(result, "plan-run complete: 1 steps");
-        assert_eq!(fake.messages.len(), 0);
+        assert_eq!(fake.messages().len(), 0);
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"event\":\"step_short_circuited\""));
         assert!(event_text.contains("\"at\":\"start\""));
@@ -15621,8 +15621,8 @@ mod tests {
         let plan = generate_step_plan(&mut planner, "goal", &cfg).unwrap();
 
         assert_eq!(plan.goal, "goal");
-        assert_eq!(planner.messages.len(), 3);
-        let compact_prompt = planner.messages[1]
+        assert_eq!(planner.messages().len(), 3);
+        let compact_prompt = planner.messages()[1]
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
@@ -15630,7 +15630,7 @@ mod tests {
         assert!(compact_prompt.contains("Compact StepPlan recovery"));
         assert!(compact_prompt.contains("Required JSON shape"));
         assert!(compact_prompt.contains("Minimal phase context"));
-        let fresh_prompt = planner.messages[2]
+        let fresh_prompt = planner.messages()[2]
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
@@ -16249,7 +16249,8 @@ mod tests {
         }]);
         let result = run_step_plan(&mut fake, &plan, &config(dir.path().to_path_buf())).unwrap();
         assert_eq!(result, "plan-run complete: 1 steps");
-        let messages = fake.messages.first().expect("execution prompt");
+        let recorded_messages = fake.messages();
+        let messages = recorded_messages.first().expect("execution prompt");
         let prompt = messages
             .iter()
             .map(|message| message.content.as_str())
@@ -16300,15 +16301,15 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert_eq!(fake.messages.len(), 1, "{err}");
+        assert_eq!(fake.messages().len(), 1, "{err}");
         assert!(
-            fake.messages.iter().all(|messages| {
+            fake.messages().iter().all(|messages| {
                 !messages
                     .iter()
                     .any(|message| message.content.contains("Repair step `verify-usage-error`"))
             }),
             "{:#?}",
-            fake.messages
+            fake.messages()
         );
         assert!(err.contains("deterministic_verify_command_bug"), "{err}");
         let event_text = std::fs::read_to_string(events).unwrap();
@@ -16389,7 +16390,7 @@ mod tests {
 
         let plan = generate_step_plan(&mut planner, "Project setup phase", &cfg).unwrap();
 
-        assert_eq!(planner.messages.len(), 1);
+        assert_eq!(planner.messages().len(), 1);
         assert_eq!(plan.steps[0].kind, "setup");
         assert_eq!(plan.steps[0].verify, vec!["npm install"]);
         assert!(plan.steps[1].verify.is_empty());
@@ -16439,7 +16440,7 @@ mod tests {
 
         let plan = generate_step_plan(&mut planner, "Create a Rust helper", &cfg).unwrap();
 
-        assert_eq!(planner.messages.len(), 1);
+        assert_eq!(planner.messages().len(), 1);
         assert!(plan.steps[0].verify.is_empty());
         assert_eq!(plan.steps[1].verify, vec!["cargo test"]);
         assert_eq!(plan.steps[1].instruction, "Create src/lib.rs.");
@@ -16514,7 +16515,7 @@ Phase task: Scaffold and initialize the Next.js project shell on port 3011";
         let plan = generate_step_plan(&mut planner, goal, &cfg).unwrap();
 
         let expected_paths = crate::planner::profiles::nextjs::setup_scaffold_paths(dir.path());
-        assert_eq!(planner.messages.len(), 3);
+        assert_eq!(planner.messages().len(), 3);
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].kind, "setup");
         assert_eq!(plan.steps[0].expected_paths, expected_paths);
@@ -16577,7 +16578,7 @@ Phase task: Set up the Python CLI package scaffold";
         let plan = generate_step_plan(&mut planner, goal, &cfg).unwrap();
 
         let expected_paths = profile_setup_scaffold_paths(dir.path(), "python-cli");
-        assert_eq!(planner.messages.len(), 3);
+        assert_eq!(planner.messages().len(), 3);
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].kind, "setup");
         assert_eq!(plan.steps[0].expected_paths, expected_paths);
@@ -16615,7 +16616,8 @@ Phase task: Set up the Python CLI package scaffold";
             FakeClient::new(vec![AssistantReply::text(generated_step_plan_json("goal"))]);
         let _ =
             generate_step_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
-        let messages = planner.messages.first().expect("messages");
+        let recorded_messages = planner.messages();
+        let messages = recorded_messages.first().expect("messages");
         assert_eq!(messages[0].role, "system");
         assert!(messages[0].content.contains("Return only one JSON object"));
         assert_eq!(messages[1].role, "user");
@@ -16634,7 +16636,7 @@ Phase task: Set up the Python CLI package scaffold";
         let plan =
             generate_step_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
 
-        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(planner.messages().len(), 2);
         assert_eq!(plan.goal, "goal");
     }
 
@@ -16714,7 +16716,7 @@ Phase task: Set up the Python CLI package scaffold";
         ]);
         let plan =
             generate_ultra_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
-        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(planner.messages().len(), 2);
         assert_eq!(plan.goal, "goal");
         assert_eq!(plan.phases.len(), 2);
     }
@@ -16731,7 +16733,7 @@ Phase task: Set up the Python CLI package scaffold";
         let plan =
             generate_ultra_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
 
-        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(planner.messages().len(), 2);
         assert_eq!(plan.goal, "goal");
         assert_eq!(plan.phases.len(), 2);
     }
@@ -16753,7 +16755,7 @@ Phase task: Set up the Python CLI package scaffold";
         ]);
         let plan =
             generate_ultra_plan(&mut planner, "goal", &config(dir.path().to_path_buf())).unwrap();
-        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(planner.messages().len(), 2);
         assert_eq!(plan.phases[0].id, "scaffold");
     }
 
@@ -16838,7 +16840,7 @@ Phase task: Set up the Python CLI package scaffold";
         let plan = generate_step_plan(&mut planner, "Verify the existing Next.js app", &cfg)
             .expect("workspace entrypoint and manifest should satisfy generation lint");
 
-        assert_eq!(planner.messages.len(), 1);
+        assert_eq!(planner.messages().len(), 1);
         assert_eq!(plan.steps[0].id, "final-verify");
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(!event_text.contains("\"event\":\"planner_error\""));
@@ -16893,7 +16895,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
 
         let plan = generate_step_plan(&mut planner, &long_phase_prompt, &cfg).unwrap();
 
-        assert_eq!(planner.messages.len(), 1);
+        assert_eq!(planner.messages().len(), 1);
         assert_eq!(
             plan.goal,
             "Build the arcade UI and local storage persistence."
@@ -16921,7 +16923,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             AssistantReply::text(strong),
         ]);
         let plan = generate_step_plan(&mut planner, "Build a Next.js game app", &cfg).unwrap();
-        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(planner.messages().len(), 2);
         assert!(
             plan.steps
                 .iter()
@@ -16948,7 +16950,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             AssistantReply::text(degraded),
         ]);
         let plan = generate_step_plan(&mut planner, "Build a Next.js game app", &cfg).unwrap();
-        assert_eq!(planner.messages.len(), 3);
+        assert_eq!(planner.messages().len(), 3);
         assert_eq!(plan.steps[0].id, "make-app");
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("planner_quality_retry_degraded"));
@@ -16965,7 +16967,7 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n\n{}
             &config(dir.path().to_path_buf()),
         )
         .unwrap();
-        assert_eq!(planner.messages.len(), 1);
+        assert_eq!(planner.messages().len(), 1);
         assert_eq!(plan.steps[0].id, "docs");
     }
 
@@ -18780,7 +18782,7 @@ if __name__ == "__main__":
         let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
 
         assert_eq!(result, "ultra-plan-run complete: 2 phases");
-        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(planner.messages().len(), 2);
         assert!(dir.path().join("phase-1.txt").is_file());
         assert!(dir.path().join("phase-2.txt").is_file());
         let event_text = std::fs::read_to_string(events).unwrap();
@@ -18895,7 +18897,7 @@ if __name__ == "__main__":
         let result = run_ultra_plan(&mut planner, &mut execution, &plan, &cfg).unwrap();
 
         assert_eq!(result, "ultra-plan-run complete: 2 phases");
-        assert_eq!(planner.messages.len(), 2);
+        assert_eq!(planner.messages().len(), 2);
         assert!(!dir.path().join(".anvil/repairs").exists());
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"reason\":\"verify_repair_no_change_observed\""));
@@ -19206,7 +19208,7 @@ if __name__ == "__main__":
                 .join("browser-readiness.json")
                 .is_file()
         );
-        assert!(!execution.messages.iter().flatten().any(|message| {
+        assert!(!execution.messages().iter().flatten().any(|message| {
             message
                 .content
                 .contains("Repair the final acceptance failure")
@@ -19331,7 +19333,7 @@ if __name__ == "__main__":
         );
         assert!(event_text.contains("interaction_unverified:probe_unavailable"));
         assert!(!event_text.contains("\"event\":\"final_acceptance_repair_start\""));
-        assert!(!execution.messages.iter().flatten().any(|message| {
+        assert!(!execution.messages().iter().flatten().any(|message| {
             message
                 .content
                 .contains("Repair the final acceptance failure")
@@ -19615,7 +19617,7 @@ if __name__ == "__main__":
         assert!(dir.path().join("repair.txt").is_file());
         assert!(outcome.changed_paths.contains(&"repair.txt".to_string()));
         let first_request = fake
-            .messages
+            .messages()
             .first()
             .expect("profile repair request")
             .iter()
@@ -19746,7 +19748,7 @@ if __name__ == "__main__":
         assert!(event_text.contains("\"handoff_saved_not_success\":true"));
         assert!(event_text.contains("\"recovery_handoff_saved\":true"));
         let repair_prompt = execution
-            .messages
+            .messages()
             .iter()
             .map(|messages| {
                 messages
@@ -20014,7 +20016,7 @@ if __name__ == "__main__":
             .unwrap_err()
             .to_string();
 
-        assert_eq!(planner.messages.len(), PLANNER_PROVIDER_REQUEST_ATTEMPTS);
+        assert_eq!(planner.messages().len(), PLANNER_PROVIDER_REQUEST_ATTEMPTS);
         assert!(err.contains("phase scaffold failed"), "{err}");
         assert!(
             err.contains("provider request failed after 2 attempts"),
@@ -20610,7 +20612,7 @@ export default function Page() {
         assert_eq!(result, "ultra-plan-run complete: 2 phases");
         assert!(dir.path().join("src/app/page.tsx").is_file());
         let prompts = execution
-            .messages
+            .messages()
             .iter()
             .map(|messages| {
                 messages
@@ -20633,7 +20635,7 @@ export default function Page() {
             "{prompts:#?}"
         );
         assert!(
-            execution.messages.len() >= 3,
+            execution.messages().len() >= 3,
             "expected initial phase, follow-up phase, and repair prompts: {prompts:#?}"
         );
     }
@@ -22158,8 +22160,8 @@ if __name__ == "__main__":
                 let event_text = std::fs::read_to_string(&events).unwrap_or_default();
                 panic!(
                     "slash command failed: {err}; planner_requests={}; execution_requests={}; events={event_text}",
-                    planner.messages.len(),
-                    execution.messages.len()
+                    planner.messages().len(),
+                    execution.messages().len()
                 );
             }
         };
@@ -22706,7 +22708,7 @@ if __name__ == "__main__":
             "{event_text}"
         );
         let repair_prompt = execution
-            .messages
+            .messages()
             .iter()
             .map(|messages| {
                 messages
@@ -23435,7 +23437,7 @@ if __name__ == "__main__":
             "{event_text}"
         );
         let repair_prompt = execution
-            .messages
+            .messages()
             .iter()
             .map(|messages| {
                 messages
@@ -24794,7 +24796,7 @@ export default function Page() {
             .to_string();
 
         assert!(err.contains("dependency_setup_authority_required"), "{err}");
-        assert_eq!(fake.messages.len(), 1);
+        assert_eq!(fake.messages().len(), 1);
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"event\":\"repair_unreachable\""));
         assert!(event_text.contains("\"reason\":\"dependency_setup_authority_required\""));
@@ -25082,7 +25084,12 @@ export default function Page() {
         parse_ultra_plan(&std::fs::read_to_string(&paths[0]).unwrap()).unwrap()
     }
 
+    #[derive(Clone)]
     struct FakeClient {
+        state: Arc<Mutex<FakeClientState>>,
+    }
+
+    struct FakeClientState {
         replies: Vec<AssistantReply>,
         messages: Vec<Vec<ConversationMessage>>,
     }
@@ -25090,15 +25097,25 @@ export default function Page() {
     impl FakeClient {
         fn new(replies: Vec<AssistantReply>) -> Self {
             Self {
-                replies,
-                messages: Vec::new(),
+                state: Arc::new(Mutex::new(FakeClientState {
+                    replies,
+                    messages: Vec::new(),
+                })),
             }
+        }
+
+        fn messages(&self) -> Vec<Vec<ConversationMessage>> {
+            self.state.lock().unwrap().messages.clone()
         }
     }
 
     impl ChatClient for FakeClient {
         fn label(&self) -> &str {
             "fake"
+        }
+
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
 
         fn chat(
@@ -25108,15 +25125,21 @@ export default function Page() {
             _tools: &[ToolSpec],
             _native_tools_enabled: bool,
         ) -> anyhow::Result<AssistantReply> {
-            self.messages.push(messages.to_vec());
-            if self.replies.is_empty() {
+            let mut state = self.state.lock().unwrap();
+            state.messages.push(messages.to_vec());
+            if state.replies.is_empty() {
                 anyhow::bail!("fake client exhausted")
             }
-            Ok(self.replies.remove(0))
+            Ok(state.replies.remove(0))
         }
     }
 
+    #[derive(Clone)]
     struct CompactAwareCompileRepairClient {
+        state: Arc<Mutex<CompactAwareCompileRepairState>>,
+    }
+
+    struct CompactAwareCompileRepairState {
         messages: Vec<Vec<ConversationMessage>>,
         initial_done: bool,
         appended_repair_calls: usize,
@@ -25126,17 +25149,35 @@ export default function Page() {
     impl CompactAwareCompileRepairClient {
         fn new() -> Self {
             Self {
-                messages: Vec::new(),
-                initial_done: false,
-                appended_repair_calls: 0,
-                compact_repair_calls: 0,
+                state: Arc::new(Mutex::new(CompactAwareCompileRepairState {
+                    messages: Vec::new(),
+                    initial_done: false,
+                    appended_repair_calls: 0,
+                    compact_repair_calls: 0,
+                })),
             }
+        }
+
+        fn messages(&self) -> Vec<Vec<ConversationMessage>> {
+            self.state.lock().unwrap().messages.clone()
+        }
+
+        fn appended_repair_calls(&self) -> usize {
+            self.state.lock().unwrap().appended_repair_calls
+        }
+
+        fn compact_repair_calls(&self) -> usize {
+            self.state.lock().unwrap().compact_repair_calls
         }
     }
 
     impl ChatClient for CompactAwareCompileRepairClient {
         fn label(&self) -> &str {
             "compact-aware"
+        }
+
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
 
         fn chat(
@@ -25146,23 +25187,24 @@ export default function Page() {
             _tools: &[ToolSpec],
             _native_tools_enabled: bool,
         ) -> anyhow::Result<AssistantReply> {
-            self.messages.push(messages.to_vec());
+            let mut state = self.state.lock().unwrap();
+            state.messages.push(messages.to_vec());
             let prompt = messages
                 .iter()
                 .map(|message| message.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !self.initial_done {
-                self.initial_done = true;
+            if !state.initial_done {
+                state.initial_done = true;
                 return Ok(api_mismatch_initial_reply(3011));
             }
             if prompt.contains("Repair session mode: compact") {
-                self.compact_repair_calls += 1;
+                state.compact_repair_calls += 1;
                 return Ok(api_mismatch_poll_fix_reply());
             }
             if prompt.contains("Property 'onStateChange'") {
-                self.appended_repair_calls += 1;
-                if self.appended_repair_calls == 1 {
+                state.appended_repair_calls += 1;
+                if state.appended_repair_calls == 1 {
                     return Ok(api_mismatch_read_only_reply());
                 }
                 return Ok(AssistantReply::text(
@@ -25173,7 +25215,12 @@ export default function Page() {
         }
     }
 
+    #[derive(Clone)]
     struct RegenerationCompileRepairClient {
+        state: Arc<Mutex<RegenerationCompileRepairState>>,
+    }
+
+    struct RegenerationCompileRepairState {
         messages: Vec<Vec<ConversationMessage>>,
         initial_done: bool,
         appended_repair_calls: usize,
@@ -25185,19 +25232,33 @@ export default function Page() {
     impl RegenerationCompileRepairClient {
         fn new(regeneration_reply: AssistantReply) -> Self {
             Self {
-                messages: Vec::new(),
-                initial_done: false,
-                appended_repair_calls: 0,
-                compact_repair_calls: 0,
-                regeneration_calls: 0,
-                regeneration_reply,
+                state: Arc::new(Mutex::new(RegenerationCompileRepairState {
+                    messages: Vec::new(),
+                    initial_done: false,
+                    appended_repair_calls: 0,
+                    compact_repair_calls: 0,
+                    regeneration_calls: 0,
+                    regeneration_reply,
+                })),
             }
+        }
+
+        fn messages(&self) -> Vec<Vec<ConversationMessage>> {
+            self.state.lock().unwrap().messages.clone()
+        }
+
+        fn regeneration_calls(&self) -> usize {
+            self.state.lock().unwrap().regeneration_calls
         }
     }
 
     impl ChatClient for RegenerationCompileRepairClient {
         fn label(&self) -> &str {
             "regeneration-aware"
+        }
+
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
 
         fn chat(
@@ -25207,29 +25268,30 @@ export default function Page() {
             _tools: &[ToolSpec],
             _native_tools_enabled: bool,
         ) -> anyhow::Result<AssistantReply> {
-            self.messages.push(messages.to_vec());
+            let mut state = self.state.lock().unwrap();
+            state.messages.push(messages.to_vec());
             let prompt = messages
                 .iter()
                 .map(|message| message.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !self.initial_done {
-                self.initial_done = true;
+            if !state.initial_done {
+                state.initial_done = true;
                 return Ok(api_mismatch_initial_reply(3011));
             }
             if prompt.contains("Repair session mode: compact regeneration") {
-                self.regeneration_calls += 1;
-                return Ok(self.regeneration_reply.clone());
+                state.regeneration_calls += 1;
+                return Ok(state.regeneration_reply.clone());
             }
             if prompt.contains("Repair session mode: compact") {
-                self.compact_repair_calls += 1;
+                state.compact_repair_calls += 1;
                 return Ok(AssistantReply::text(
                     "I understand the compile frame, but no edit is needed.",
                 ));
             }
             if prompt.contains("Property 'onStateChange'") {
-                self.appended_repair_calls += 1;
-                if self.appended_repair_calls == 1 {
+                state.appended_repair_calls += 1;
+                if state.appended_repair_calls == 1 {
                     return Ok(api_mismatch_read_only_reply());
                 }
                 return Ok(AssistantReply::text(
@@ -25240,7 +25302,12 @@ export default function Page() {
         }
     }
 
+    #[derive(Clone)]
     struct EditThenRegenerationCompileRepairClient {
+        state: Arc<Mutex<EditThenRegenerationCompileRepairState>>,
+    }
+
+    struct EditThenRegenerationCompileRepairState {
         messages: Vec<Vec<ConversationMessage>>,
         initial_done: bool,
         read_followup_pending: bool,
@@ -25252,19 +25319,37 @@ export default function Page() {
     impl EditThenRegenerationCompileRepairClient {
         fn new() -> Self {
             Self {
-                messages: Vec::new(),
-                initial_done: false,
-                read_followup_pending: false,
-                appended_repair_calls: 0,
-                compact_repair_calls: 0,
-                regeneration_calls: 0,
+                state: Arc::new(Mutex::new(EditThenRegenerationCompileRepairState {
+                    messages: Vec::new(),
+                    initial_done: false,
+                    read_followup_pending: false,
+                    appended_repair_calls: 0,
+                    compact_repair_calls: 0,
+                    regeneration_calls: 0,
+                })),
             }
+        }
+
+        fn appended_repair_calls(&self) -> usize {
+            self.state.lock().unwrap().appended_repair_calls
+        }
+
+        fn compact_repair_calls(&self) -> usize {
+            self.state.lock().unwrap().compact_repair_calls
+        }
+
+        fn regeneration_calls(&self) -> usize {
+            self.state.lock().unwrap().regeneration_calls
         }
     }
 
     impl ChatClient for EditThenRegenerationCompileRepairClient {
         fn label(&self) -> &str {
             "edit-then-regeneration-aware"
+        }
+
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
 
         fn chat(
@@ -25274,37 +25359,38 @@ export default function Page() {
             _tools: &[ToolSpec],
             _native_tools_enabled: bool,
         ) -> anyhow::Result<AssistantReply> {
-            self.messages.push(messages.to_vec());
+            let mut state = self.state.lock().unwrap();
+            state.messages.push(messages.to_vec());
             let prompt = messages
                 .iter()
                 .map(|message| message.content.as_str())
                 .collect::<Vec<_>>()
                 .join("\n");
-            if !self.initial_done {
-                self.initial_done = true;
+            if !state.initial_done {
+                state.initial_done = true;
                 return Ok(api_mismatch_initial_reply(3011));
             }
-            if self.read_followup_pending {
-                self.read_followup_pending = false;
+            if state.read_followup_pending {
+                state.read_followup_pending = false;
                 return Ok(AssistantReply::text(
                     "The file was inspected, but no source behavior changed.",
                 ));
             }
             if prompt.contains("Repair session mode: compact regeneration") {
-                self.regeneration_calls += 1;
+                state.regeneration_calls += 1;
                 return Ok(api_mismatch_poll_fix_reply());
             }
             if prompt.contains("Repair session mode: compact") {
-                self.compact_repair_calls += 1;
-                self.read_followup_pending = true;
+                state.compact_repair_calls += 1;
+                state.read_followup_pending = true;
                 return Ok(api_mismatch_read_only_reply());
             }
             if prompt.contains("Compile error frames and remedies")
                 || prompt.contains("implementation_compile_error")
                 || prompt.contains("Type error:")
             {
-                self.appended_repair_calls += 1;
-                if self.appended_repair_calls == 1 {
+                state.appended_repair_calls += 1;
+                if state.appended_repair_calls == 1 {
                     return Ok(AssistantReply {
                         content: String::new(),
                         tool_calls: vec![crate::state::ToolCall::new(
@@ -25315,14 +25401,19 @@ export default function Page() {
                         completion_tokens: None,
                     });
                 }
-                self.read_followup_pending = true;
+                state.read_followup_pending = true;
                 return Ok(api_mismatch_read_only_reply());
             }
             anyhow::bail!("edit-then-regeneration fake client received unexpected prompt")
         }
     }
 
+    #[derive(Clone)]
     struct FlakyClient {
+        state: Arc<Mutex<FlakyClientState>>,
+    }
+
+    struct FlakyClientState {
         replies: Vec<AssistantReply>,
         messages: Vec<Vec<ConversationMessage>>,
         failures_remaining: usize,
@@ -25336,11 +25427,17 @@ export default function Page() {
             replies: Vec<AssistantReply>,
         ) -> Self {
             Self {
-                replies,
-                messages: Vec::new(),
-                failures_remaining,
-                failure_message: failure_message.into(),
+                state: Arc::new(Mutex::new(FlakyClientState {
+                    replies,
+                    messages: Vec::new(),
+                    failures_remaining,
+                    failure_message: failure_message.into(),
+                })),
             }
+        }
+
+        fn messages(&self) -> Vec<Vec<ConversationMessage>> {
+            self.state.lock().unwrap().messages.clone()
         }
     }
 
@@ -25349,6 +25446,10 @@ export default function Page() {
             "flaky"
         }
 
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
+        }
+
         fn chat(
             &mut self,
             _model: &str,
@@ -25356,19 +25457,25 @@ export default function Page() {
             _tools: &[ToolSpec],
             _native_tools_enabled: bool,
         ) -> anyhow::Result<AssistantReply> {
-            self.messages.push(messages.to_vec());
-            if self.failures_remaining > 0 {
-                self.failures_remaining -= 1;
-                anyhow::bail!("{}", self.failure_message);
+            let mut state = self.state.lock().unwrap();
+            state.messages.push(messages.to_vec());
+            if state.failures_remaining > 0 {
+                state.failures_remaining -= 1;
+                anyhow::bail!("{}", state.failure_message);
             }
-            if self.replies.is_empty() {
+            if state.replies.is_empty() {
                 anyhow::bail!("flaky client exhausted")
             }
-            Ok(self.replies.remove(0))
+            Ok(state.replies.remove(0))
         }
     }
 
+    #[derive(Clone)]
     struct EchoGoalPlanner {
+        state: Arc<Mutex<EchoGoalPlannerState>>,
+    }
+
+    struct EchoGoalPlannerState {
         messages: Vec<Vec<ConversationMessage>>,
         calls: usize,
     }
@@ -25376,9 +25483,15 @@ export default function Page() {
     impl EchoGoalPlanner {
         fn new() -> Self {
             Self {
-                messages: Vec::new(),
-                calls: 0,
+                state: Arc::new(Mutex::new(EchoGoalPlannerState {
+                    messages: Vec::new(),
+                    calls: 0,
+                })),
             }
+        }
+
+        fn messages(&self) -> Vec<Vec<ConversationMessage>> {
+            self.state.lock().unwrap().messages.clone()
         }
     }
 
@@ -25387,6 +25500,10 @@ export default function Page() {
             "echo-planner"
         }
 
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
+        }
+
         fn chat(
             &mut self,
             _model: &str,
@@ -25394,19 +25511,20 @@ export default function Page() {
             _tools: &[ToolSpec],
             _native_tools_enabled: bool,
         ) -> anyhow::Result<AssistantReply> {
-            self.messages.push(messages.to_vec());
-            self.calls += 1;
+            let mut state = self.state.lock().unwrap();
+            state.messages.push(messages.to_vec());
+            state.calls += 1;
             let echoed_goal = messages
                 .iter()
                 .rev()
                 .find(|message| message.role == "user")
                 .map(|message| message.content.clone())
                 .unwrap_or_default();
-            let path = format!("phase-{}.txt", self.calls);
+            let path = format!("phase-{}.txt", state.calls);
             let plan = StepPlan {
                 goal: echoed_goal,
                 steps: vec![PlanStep {
-                    id: format!("phase-{}", self.calls),
+                    id: format!("phase-{}", state.calls),
                     kind: "implement".to_string(),
                     expected_result: "pass".to_string(),
                     instruction: format!("Create {path} for this phase."),
@@ -25621,7 +25739,7 @@ export default function Memo(){
     }
 
     fn planner_request_text(client: &FakeClient, index: usize) -> String {
-        client.messages[index]
+        client.messages()[index]
             .iter()
             .map(|message| message.content.as_str())
             .collect::<Vec<_>>()
@@ -27293,7 +27411,7 @@ exit 2\n",
 
         assert!(result.contains("plan-run complete"), "{result}");
         let repair_prompt = execution
-            .messages
+            .messages()
             .iter()
             .map(|messages| {
                 messages
@@ -27352,10 +27470,10 @@ exit 2\n",
             });
 
         assert!(result.contains("plan-run complete"), "{result}");
-        assert_eq!(execution.compact_repair_calls, 1);
-        assert!(execution.appended_repair_calls >= 2);
+        assert_eq!(execution.compact_repair_calls(), 1);
+        assert!(execution.appended_repair_calls() >= 2);
         let prompts = execution
-            .messages
+            .messages()
             .iter()
             .map(|messages| {
                 messages
@@ -27411,13 +27529,13 @@ exit 2\n",
             });
 
         assert!(result.contains("plan-run complete"), "{result}");
-        assert_eq!(execution.regeneration_calls, 1);
+        assert_eq!(execution.regeneration_calls(), 1);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("src/app/SpaceInvadersGame.tsx")).unwrap(),
             api_mismatch_poll_fixed_game_source()
         );
         let prompts = execution
-            .messages
+            .messages()
             .iter()
             .map(|messages| {
                 messages
@@ -27481,9 +27599,9 @@ exit 2\n",
             });
 
         assert!(result.contains("plan-run complete"), "{result}");
-        assert_eq!(execution.appended_repair_calls, 2);
-        assert_eq!(execution.compact_repair_calls, 1);
-        assert_eq!(execution.regeneration_calls, 1);
+        assert_eq!(execution.appended_repair_calls(), 2);
+        assert_eq!(execution.compact_repair_calls(), 1);
+        assert_eq!(execution.regeneration_calls(), 1);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("src/app/SpaceInvadersGame.tsx")).unwrap(),
             api_mismatch_poll_fixed_game_source()
@@ -27532,7 +27650,7 @@ exit 2\n",
             .to_string();
 
         assert!(err.contains("compile_repair_no_source_change"), "{err}");
-        assert_eq!(execution.regeneration_calls, 1);
+        assert_eq!(execution.regeneration_calls(), 1);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("src/app/SpaceInvadersGame.tsx")).unwrap(),
             api_mismatch_broken_game_source()
@@ -27645,7 +27763,7 @@ exit 2\n",
 
         assert!(err.contains("compile_repair_no_source_change"), "{err}");
         let prompts = execution
-            .messages
+            .messages()
             .iter()
             .map(|messages| {
                 messages
@@ -27843,7 +27961,7 @@ exit 2\n",
             std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
             static_good_page_source()
         );
-        assert_eq!(planner.messages.len(), 3);
+        assert_eq!(planner.messages().len(), 3);
         let phase_three_prompt = planner_request_text(&planner, 2);
         assert!(
             phase_three_prompt.contains("Carry-forward guidance"),

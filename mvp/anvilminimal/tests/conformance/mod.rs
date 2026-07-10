@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anvilminimal::config::{Action, Config, Provider};
 use anvilminimal::planner::step_plan::{PlanStep, StepPlan};
@@ -1730,8 +1730,13 @@ fn config(root: PathBuf) -> Config {
     }
 }
 
+#[derive(Clone)]
 struct FakeClient {
     label: &'static str,
+    state: Arc<Mutex<FakeClientState>>,
+}
+
+struct FakeClientState {
     replies: Vec<AssistantReply>,
     requests: Vec<Vec<ConversationMessage>>,
 }
@@ -1740,8 +1745,10 @@ impl FakeClient {
     fn new(label: &'static str, replies: Vec<AssistantReply>) -> Self {
         Self {
             label,
-            replies,
-            requests: Vec::new(),
+            state: Arc::new(Mutex::new(FakeClientState {
+                replies,
+                requests: Vec::new(),
+            })),
         }
     }
 }
@@ -1755,6 +1762,10 @@ impl ChatClient for FakeClient {
         true
     }
 
+    fn boxed_clone(&self) -> Box<dyn ChatClient> {
+        Box::new(self.clone())
+    }
+
     fn chat(
         &mut self,
         _model: &str,
@@ -1762,11 +1773,12 @@ impl ChatClient for FakeClient {
         _tools: &[ToolSpec],
         _native_tools_enabled: bool,
     ) -> anyhow::Result<AssistantReply> {
-        self.requests.push(messages.to_vec());
-        if self.replies.is_empty() {
+        let mut state = self.state.lock().unwrap();
+        state.requests.push(messages.to_vec());
+        if state.replies.is_empty() {
             anyhow::bail!("{} fake replies exhausted", self.label);
         }
-        Ok(self.replies.remove(0))
+        Ok(state.replies.remove(0))
     }
 }
 
@@ -1788,6 +1800,13 @@ impl ChatClient for PanicClient {
 
     fn supports_native_tools(&self, _model: &str) -> bool {
         true
+    }
+
+    fn boxed_clone(&self) -> Box<dyn ChatClient> {
+        Box::new(PanicClient {
+            label: self.label,
+            message: self.message,
+        })
     }
 
     fn chat(

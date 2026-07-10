@@ -47,8 +47,13 @@ fn config(root: PathBuf) -> Config {
     }
 }
 
+#[derive(Clone)]
 struct FakeClient {
     label: &'static str,
+    state: Arc<Mutex<FakeClientState>>,
+}
+
+struct FakeClientState {
     replies: Vec<AssistantReply>,
     requests: Vec<Vec<ConversationMessage>>,
 }
@@ -57,9 +62,15 @@ impl FakeClient {
     fn new(label: &'static str, replies: Vec<AssistantReply>) -> Self {
         Self {
             label,
-            replies,
-            requests: Vec::new(),
+            state: Arc::new(Mutex::new(FakeClientState {
+                replies,
+                requests: Vec::new(),
+            })),
         }
+    }
+
+    fn requests(&self) -> MutexGuard<'_, FakeClientState> {
+        self.state.lock().unwrap()
     }
 }
 
@@ -72,6 +83,10 @@ impl ChatClient for FakeClient {
         true
     }
 
+    fn boxed_clone(&self) -> Box<dyn ChatClient> {
+        Box::new(self.clone())
+    }
+
     fn chat(
         &mut self,
         _model: &str,
@@ -79,13 +94,14 @@ impl ChatClient for FakeClient {
         _tools: &[ToolSpec],
         _native_tools_enabled: bool,
     ) -> anyhow::Result<AssistantReply> {
-        self.requests.push(messages.to_vec());
+        let mut state = self.state.lock().unwrap();
+        state.requests.push(messages.to_vec());
         assert!(
-            !self.replies.is_empty(),
+            !state.replies.is_empty(),
             "{} fake replies exhausted",
             self.label
         );
-        Ok(self.replies.remove(0))
+        Ok(state.replies.remove(0))
     }
 }
 
@@ -107,6 +123,13 @@ impl ChatClient for PanicClient {
 
     fn supports_native_tools(&self, _model: &str) -> bool {
         true
+    }
+
+    fn boxed_clone(&self) -> Box<dyn ChatClient> {
+        Box::new(PanicClient {
+            label: self.label,
+            message: self.message,
+        })
     }
 
     fn chat(
@@ -224,8 +247,8 @@ impl ChatClient for SleepingCloneClient {
         true
     }
 
-    fn boxed_clone(&self) -> Option<Box<dyn ChatClient>> {
-        Some(Box::new(self.clone()))
+    fn boxed_clone(&self) -> Box<dyn ChatClient> {
+        Box::new(self.clone())
     }
 
     fn chat(
@@ -886,14 +909,19 @@ fn tui_ultra_plan_run_smoke_fake_clients() {
     )
     .unwrap();
     assert_eq!(result, "ultra-plan-run complete: 2 phases");
-    assert_eq!(planner.requests.len(), 2);
-    assert_eq!(planner.requests[0].len(), planner.requests[1].len());
-    assert_eq!(execution.requests.len(), 2);
+    let planner_requests = planner.requests();
+    let execution_requests = execution.requests();
+    assert_eq!(planner_requests.requests.len(), 2);
+    assert_eq!(
+        planner_requests.requests[0].len(),
+        planner_requests.requests[1].len()
+    );
+    assert_eq!(execution_requests.requests.len(), 2);
     assert!(
-        execution.requests[1].len() > execution.requests[0].len(),
+        execution_requests.requests[1].len() > execution_requests.requests[0].len(),
         "phase 2 execution should reuse the ultra execution session"
     );
-    let second_request = format!("{:?}", execution.requests[1]);
+    let second_request = format!("{:?}", execution_requests.requests[1]);
     assert!(second_request.contains("phase1"));
 }
 
@@ -1281,8 +1309,8 @@ phases:
         output.contains("ultra-plan-run complete: 2 phases"),
         "{output}"
     );
-    assert_eq!(planner.requests.len(), 2);
-    assert_eq!(execution.requests.len(), 2);
+    assert_eq!(planner.requests().requests.len(), 2);
+    assert_eq!(execution.requests().requests.len(), 2);
     let events = std::fs::read_to_string(&events_path).unwrap();
     assert!(events.contains("\"event\":\"resume_start\""), "{events}");
     assert!(events.contains("\"resumed_from\":\"018f6666\""), "{events}");

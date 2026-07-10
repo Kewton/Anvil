@@ -116,6 +116,11 @@ struct ProviderWorkerResult {
     timing: Option<ResponseTiming>,
 }
 
+enum ProviderWorkerMessage {
+    Completed(ProviderWorkerResult),
+    Panicked(Box<dyn std::any::Any + Send + 'static>),
+}
+
 pub fn chat(
     client: &mut dyn ChatClient,
     config: &Config,
@@ -193,44 +198,7 @@ where
         );
     }
 
-    let Some(mut worker_client) = client.boxed_clone() else {
-        let result = client.chat(model, messages, tools, native_tools_enabled);
-        let timing = client.take_response_timing();
-        let elapsed = started.elapsed();
-        crate::tui::status_bus::publish_provider_finished(elapsed);
-        if result.is_ok() {
-            crate::tui::presentation::emit_provider_turn_completed(
-                scope.as_str(),
-                elapsed.as_secs(),
-            );
-        }
-        emit_provider_turn_duration(
-            config,
-            provider_turn_telemetry_from_result(
-                ProviderTurnTelemetryBase {
-                    scope,
-                    provider: &provider,
-                    model,
-                    tool_count: tools.len(),
-                    native_tools_enabled,
-                    estimated_prompt_tokens,
-                    estimated_stable_prefix_chars,
-                    elapsed,
-                    timed_out: elapsed >= timeout,
-                    aborted_by_user: false,
-                },
-                &result,
-                timing,
-            ),
-        );
-        return ProviderCallOutcome {
-            result,
-            elapsed,
-            timed_out: elapsed >= timeout,
-            aborted_by_user: false,
-        };
-    };
-
+    let mut worker_client = client.boxed_clone();
     let model = model.to_string();
     let tool_count = tools.len();
     let messages = messages.to_vec();
@@ -238,9 +206,16 @@ where
     let worker_model = model.clone();
     let (tx, rx) = mpsc::sync_channel(1);
     std::thread::spawn(move || {
-        let result = worker_client.chat(&worker_model, &messages, &tools, native_tools_enabled);
-        let timing = worker_client.take_response_timing();
-        let _ = tx.send(ProviderWorkerResult { result, timing });
+        let worker_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = worker_client.chat(&worker_model, &messages, &tools, native_tools_enabled);
+            let timing = worker_client.take_response_timing();
+            ProviderWorkerResult { result, timing }
+        }));
+        let message = match worker_result {
+            Ok(result) => ProviderWorkerMessage::Completed(result),
+            Err(payload) => ProviderWorkerMessage::Panicked(payload),
+        };
+        let _ = tx.send(message);
     });
 
     loop {
@@ -309,7 +284,7 @@ where
         emit_provider_progress_if_due(started, config.chat_timeout_secs, &mut next_progress_at);
         let slice = PROVIDER_WAIT_SLICE.min(timeout.saturating_sub(elapsed));
         match rx.recv_timeout(slice) {
-            Ok(worker_result) => {
+            Ok(ProviderWorkerMessage::Completed(worker_result)) => {
                 let ProviderWorkerResult { result, timing } = worker_result;
                 let elapsed = started.elapsed();
                 crate::tui::status_bus::publish_provider_finished(elapsed);
@@ -344,6 +319,38 @@ where
                     timed_out: false,
                     aborted_by_user: false,
                 };
+            }
+            Ok(ProviderWorkerMessage::Panicked(payload)) => {
+                let elapsed = started.elapsed();
+                crate::tui::status_bus::publish_provider_finished(elapsed);
+                emit_provider_turn_duration(
+                    config,
+                    ProviderTurnTelemetry {
+                        scope,
+                        provider: &provider,
+                        model: &model,
+                        tool_count,
+                        native_tools_enabled,
+                        estimated_prompt_tokens,
+                        estimated_stable_prefix_chars,
+                        prompt_eval_count: None,
+                        eval_count: None,
+                        prompt_eval_duration: None,
+                        eval_duration: None,
+                        load_duration: None,
+                        total_duration: None,
+                        prefill_seconds: None,
+                        generation_seconds: None,
+                        load_seconds: None,
+                        tokens_per_second_eval: None,
+                        finish_reason: "panic".to_string(),
+                        elapsed,
+                        timed_out: false,
+                        aborted_by_user: false,
+                        ok: false,
+                    },
+                );
+                std::panic::resume_unwind(payload);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -758,8 +765,8 @@ mod tests {
             "hanging"
         }
 
-        fn boxed_clone(&self) -> Option<Box<dyn ChatClient>> {
-            Some(Box::new(self.clone()))
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
 
         fn chat(
@@ -774,11 +781,16 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct TokenClient;
 
     impl ChatClient for TokenClient {
         fn label(&self) -> &str {
             "token-mock"
+        }
+
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
 
         fn chat(
@@ -797,11 +809,16 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
     struct TimingClient;
 
     impl ChatClient for TimingClient {
         fn label(&self) -> &str {
             "timing-mock"
+        }
+
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
         }
 
         fn chat(
@@ -826,6 +843,29 @@ mod tests {
                 load_duration: Some(1_000_000_000),
                 total_duration: Some(7_000_000_000),
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct PanicClient;
+
+    impl ChatClient for PanicClient {
+        fn label(&self) -> &str {
+            "panic-mock"
+        }
+
+        fn boxed_clone(&self) -> Box<dyn ChatClient> {
+            Box::new(self.clone())
+        }
+
+        fn chat(
+            &mut self,
+            _model: &str,
+            _messages: &[ConversationMessage],
+            _tools: &[ToolSpec],
+            _native_tools_enabled: bool,
+        ) -> anyhow::Result<AssistantReply> {
+            panic!("provider worker panic")
         }
     }
 
@@ -948,6 +988,32 @@ mod tests {
         assert!(events.contains("\"classification\":\"aborted_by_user\""));
         assert!(events.contains("\"event\":\"provider_turn_aborted_by_user\""));
         assert!(!events.contains("\"event\":\"provider_turn_timeout\""));
+    }
+
+    #[test]
+    fn cloned_provider_call_resumes_worker_panic_on_caller_thread() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let events_path = tmp.path().join("events.jsonl");
+        let config = test_config(tmp.path(), events_path.clone(), 30);
+        let mut client = PanicClient;
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = chat(
+                &mut client,
+                &config,
+                ProviderCallScope::Executor,
+                "m",
+                &[ConversationMessage::user("execute".to_string())],
+                &[],
+                false,
+            );
+        }));
+
+        assert!(panic.is_err());
+        let events = std::fs::read_to_string(events_path).expect("events");
+        assert!(events.contains("\"event\":\"provider_turn_duration\""));
+        assert!(events.contains("\"finish_reason\":\"panic\""));
+        assert!(events.contains("\"ok\":false"));
     }
 
     #[test]

@@ -44,9 +44,7 @@ impl AssistantReply {
 
 pub trait ChatClient: Send {
     fn label(&self) -> &str;
-    fn boxed_clone(&self) -> Option<Box<dyn ChatClient>> {
-        None
-    }
+    fn boxed_clone(&self) -> Box<dyn ChatClient>;
     fn supports_native_tools(&self, _model: &str) -> bool {
         false
     }

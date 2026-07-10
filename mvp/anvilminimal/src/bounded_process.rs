@@ -49,8 +49,75 @@ impl BoundedProcessOutput {
 }
 
 pub fn spawn_child(command: &mut Command) -> io::Result<Child> {
+    apply_child_env_allowlist(command);
     configure_process_group(command);
     command.spawn()
+}
+
+fn apply_child_env_allowlist(command: &mut Command) {
+    let explicit_env = command
+        .get_envs()
+        .map(|(key, value)| (key.to_os_string(), value.map(|value| value.to_os_string())))
+        .collect::<Vec<_>>();
+    command.env_clear();
+    for (key, value) in std::env::vars_os() {
+        if child_env_allowed(&key, EnvSource::Parent) {
+            command.env(key, value);
+        }
+    }
+    for (key, value) in explicit_env {
+        match value {
+            Some(value) if child_env_allowed(&key, EnvSource::Explicit) => {
+                command.env(key, value);
+            }
+            Some(_) => {}
+            None => {
+                command.env_remove(key);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvSource {
+    Parent,
+    Explicit,
+}
+
+fn child_env_allowed(key: &std::ffi::OsStr, source: EnvSource) -> bool {
+    let Some(key) = key.to_str() else {
+        return false;
+    };
+    matches!(key, "PATH" | "HOME" | "LANG" | "TERM" | "NODE_ENV")
+        || key.starts_with("LC_")
+        || key.starts_with("npm_config_")
+        || (source == EnvSource::Explicit
+            && matches!(
+                key,
+                "NODE_OPTIONS"
+                    | "NODE_PATH"
+                    | "NEXT_TELEMETRY_DISABLED"
+                    | "PORT"
+                    | "ANVIL_FOREIGN_TOOLCHAIN_ROOT"
+                    | "ANVIL_FOREIGN_TOOLCHAIN_EVENTS"
+            ))
+        || (source == EnvSource::Explicit && test_control_env_allowed(key))
+}
+
+#[cfg(test)]
+fn test_control_env_allowed(key: &str) -> bool {
+    matches!(
+        key,
+        "ANVIL_BROWSER_PROBE_MOCK_CHILD"
+            | "ANVIL_BROWSER_PROBE_MOCK_PORT"
+            | "ANVIL_BROWSER_PROBE_MOCK_STATUS"
+            | "ANVIL_BROWSER_PROBE_MOCK_DELAY_MS"
+    )
+}
+
+#[cfg(not(test))]
+fn test_control_env_allowed(_key: &str) -> bool {
+    false
 }
 
 pub fn register_server_child(
@@ -371,6 +438,9 @@ fn configure_process_group(command: &mut Command) {
 mod tests {
     use super::*;
     use std::process::Stdio;
+    use std::sync::Mutex;
+
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn run_with_timeout_kills_hanging_child() {
@@ -385,6 +455,40 @@ mod tests {
         let output = run_with_timeout(&mut command, Duration::from_millis(100)).unwrap();
         assert_eq!(output.kind, BoundedProcessOutcomeKind::TimedOut);
         assert!(output.elapsed < Duration::from_secs(2), "{output:?}");
+    }
+
+    #[test]
+    fn child_env_uses_allowlist_without_provider_keys() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let _env_guard = TestEnvGuard::set([
+            ("OLLAMA_API_KEY", "ollama-secret"),
+            ("GEMINI_API_KEY", "gemini-secret"),
+            ("OPENAI_API_KEY", "openai-secret"),
+            ("ANVIL_TEST_UNRELATED_PARENT_SECRET", "parent-secret"),
+        ]);
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("env | sort")
+            .env("NODE_ENV", "test")
+            .env("npm_config_cache", cache_dir.path())
+            .env("GEMINI_API_KEY", "explicit-secret")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = run_with_timeout(&mut command, Duration::from_secs(2)).unwrap();
+
+        assert!(output.success(), "{output:?}");
+        let env = String::from_utf8(output.stdout).unwrap();
+        assert!(env.contains("PATH="), "{env}");
+        assert!(env.contains("NODE_ENV=test"), "{env}");
+        assert!(env.contains("npm_config_cache="), "{env}");
+        assert!(!env.contains("OLLAMA_API_KEY"), "{env}");
+        assert!(!env.contains("GEMINI_API_KEY"), "{env}");
+        assert!(!env.contains("OPENAI_API_KEY"), "{env}");
+        assert!(!env.contains("ANVIL_TEST_UNRELATED_PARENT_SECRET"), "{env}");
     }
 
     #[test]
@@ -496,5 +600,31 @@ mod tests {
         );
         let _ = child_b.wait();
         assert!(registered_server_child(pid_b).is_none());
+    }
+
+    struct TestEnvGuard {
+        keys: Vec<&'static str>,
+    }
+
+    impl TestEnvGuard {
+        fn set<const N: usize>(pairs: [(&'static str, &'static str); N]) -> Self {
+            let keys = pairs.iter().map(|(key, _)| *key).collect();
+            for (key, value) in pairs {
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            }
+            Self { keys }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            for key in &self.keys {
+                unsafe {
+                    std::env::remove_var(key);
+                }
+            }
+        }
     }
 }
