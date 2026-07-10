@@ -43,6 +43,13 @@ const PROTECTION_RULES: &[ProtectionRule] = &[
         audit: audit_bounded_execution_chokepoints,
     },
     ProtectionRule {
+        category: "workspace_policy_tool_paths",
+        site_predicate: "ToolRegistry path arguments",
+        required_wrapper: "resolve_policy_checked_path / ensure_tool_path_allowed",
+        allowlist: &["src/tools/registry.rs"],
+        audit: audit_workspace_policy_tool_paths,
+    },
+    ProtectionRule {
         category: "terminal_records",
         site_predicate: "CLI command exit paths",
         required_wrapper: "DirectCommandCompletionGuard / tui_command_stop",
@@ -90,6 +97,10 @@ fn protection_coverage_table_rejects_unregistered_mock_sites() {
             r#"fn f(excerpt: &str) { let _ = crate::minimal_loop::build_verifier::parse_compile_errors(excerpt); }"#,
         ),
         (
+            "src/tools/registry.rs",
+            r#"fn default_tool_specs() { spec("Read", "", json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})); spec("Write", "", json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})); } fn execute() { let _ = resolve_existing(&context.root, raw); }"#,
+        ),
+        (
             "src/config.rs",
             "pub enum Action { Repl, Prompt(String), NewEntry(String) }",
         ),
@@ -103,6 +114,7 @@ fn protection_coverage_table_rejects_unregistered_mock_sites() {
         "compile_output_source_of_truth",
         "verify_normalization_boundary",
         "bounded_execution_chokepoints",
+        "workspace_policy_tool_paths",
         "terminal_records",
     ] {
         assert!(
@@ -244,6 +256,43 @@ fn audit_bounded_execution_chokepoints(corpus: &AuditCorpus, _: &ProtectionRule)
     violations
 }
 
+fn audit_workspace_policy_tool_paths(corpus: &AuditCorpus, _: &ProtectionRule) -> Vec<String> {
+    let mut violations = Vec::new();
+    let registry = corpus.file("src/tools/registry.rs");
+    if registry.is_empty() {
+        violations.push("src/tools/registry.rs is missing from audit corpus".to_string());
+        return violations;
+    }
+    if !registry.contains("fn resolve_policy_checked_path(") {
+        violations.push("missing resolve_policy_checked_path helper".to_string());
+    }
+    for tool in registry_path_argument_tools(registry) {
+        if !contains_policy_checked_tool_call(registry, &tool) {
+            violations.push(format!(
+                "ToolRegistry `{tool}` path argument does not use resolve_policy_checked_path"
+            ));
+        }
+    }
+    let helper = function_body(registry, "resolve_policy_checked_path").unwrap_or_default();
+    if !helper.contains("ensure_tool_path_allowed(") {
+        violations
+            .push("resolve_policy_checked_path does not call ensure_tool_path_allowed".to_string());
+    }
+    let registry_without_helper = registry.replace(&helper, "");
+    for raw_resolver in [
+        "resolve_existing(&context.root",
+        "resolve_for_create(&context.root",
+        "resolve_optional_existing(&context.root",
+    ] {
+        if registry_without_helper.contains(raw_resolver) {
+            violations.push(format!(
+                "ToolRegistry path resolver bypasses policy helper: {raw_resolver}"
+            ));
+        }
+    }
+    violations
+}
+
 fn audit_terminal_records(corpus: &AuditCorpus, _: &ProtectionRule) -> Vec<String> {
     let mut violations = Vec::new();
     let lib = corpus.file("src/lib.rs");
@@ -299,6 +348,68 @@ fn action_variants(config_source: &str) -> Vec<String> {
             (!token.is_empty()).then(|| token.to_string())
         })
         .collect()
+}
+
+fn registry_path_argument_tools(registry: &str) -> Vec<String> {
+    let mut tools = Vec::new();
+    let mut rest = registry;
+    while let Some(index) = rest.find("spec(") {
+        rest = &rest[index + "spec(".len()..];
+        let Some(end) = rest.find("),") else {
+            break;
+        };
+        let call = &rest[..end];
+        if call.contains(r#""path""#)
+            && let Some(tool) = first_string_literal(call)
+        {
+            tools.push(tool);
+        }
+        rest = &rest[end + 2..];
+    }
+    tools
+}
+
+fn contains_policy_checked_tool_call(registry: &str, tool: &str) -> bool {
+    let lines = registry.lines().collect::<Vec<_>>();
+    lines.iter().enumerate().any(|(index, line)| {
+        if !line.contains("resolve_policy_checked_path(") {
+            return false;
+        }
+        let call = lines
+            .iter()
+            .skip(index)
+            .take(6)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        call.contains(&format!("\"{tool}\""))
+    })
+}
+
+fn first_string_literal(value: &str) -> Option<String> {
+    let start = value.find('"')? + 1;
+    let end = value[start..].find('"')? + start;
+    Some(value[start..end].to_string())
+}
+
+fn function_body(source: &str, name: &str) -> Option<String> {
+    let start = source.find(&format!("fn {name}("))?;
+    let body_start = source[start..].find('{')? + start;
+    let mut depth = 0usize;
+    for (offset, ch) in source[body_start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = body_start + offset + 1;
+                    return Some(source[start..end].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn raw_process_invocation(line: &str) -> bool {

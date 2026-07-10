@@ -2,7 +2,14 @@ use std::path::Path;
 
 use anyhow::bail;
 
-pub fn run(path: &Path, old: &str, new: &str, replace_all: bool) -> anyhow::Result<String> {
+pub fn run(
+    root: &Path,
+    path: &Path,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> anyhow::Result<String> {
+    crate::tools::write::ensure_mutation_allowed(root, path)?;
     let content = std::fs::read_to_string(path)?;
     if old == new {
         bail!("edit_noop: old_string and new_string are identical");
@@ -18,7 +25,7 @@ pub fn run(path: &Path, old: &str, new: &str, replace_all: bool) -> anyhow::Resu
     }
     if !content.contains(old) {
         if let Some(salvage) = normalized_anchor_salvage(&content, old, new) {
-            std::fs::write(path, salvage.edited)?;
+            crate::tools::write::write_checked(root, path, &salvage.edited)?;
             return Ok(format!(
                 "edited {} via edit_anchor_salvaged at line {}",
                 path.display(),
@@ -46,7 +53,7 @@ pub fn run(path: &Path, old: &str, new: &str, replace_all: bool) -> anyhow::Resu
     } else {
         content.replacen(old, new, 1)
     };
-    std::fs::write(path, edited)?;
+    crate::tools::write::write_checked(root, path, &edited)?;
     Ok(format!("edited {}", path.display()))
 }
 
@@ -179,7 +186,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "new").unwrap();
-        let output = run(&path, "old", "new", false).unwrap();
+        let output = run(dir.path(), &path, "old", "new", false).unwrap();
         assert!(output.contains("already_applied"));
     }
 
@@ -188,7 +195,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "same").unwrap();
-        let err = run(&path, "same", "same", false).unwrap_err().to_string();
+        let err = run(dir.path(), &path, "same", "same", false)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("edit_noop"));
     }
 
@@ -197,7 +206,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "const  x = 1;\n").unwrap();
-        let output = run(&path, "const x = 1;", "const x = 2;", false).unwrap();
+        let output = run(dir.path(), &path, "const x = 1;", "const x = 2;", false).unwrap();
         assert!(output.contains("edit_anchor_salvaged"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "const x = 2;\n");
     }
@@ -208,6 +217,7 @@ mod tests {
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "function run() {\n  return   1;\n}\n").unwrap();
         let output = run(
+            dir.path(),
             &path,
             "function run() {\nreturn 1;\n}",
             "function run() {\n  return 2;\n}",
@@ -226,7 +236,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "alpha middle omega").unwrap();
-        let err = run(&path, "alpha changed omega", "done", false)
+        let err = run(dir.path(), &path, "alpha changed omega", "done", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("edit_anchor_not_found"));
@@ -241,7 +251,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "alpha one omega\nalpha two omega\n").unwrap();
-        let err = run(&path, "alpha changed omega", "done", false)
+        let err = run(dir.path(), &path, "alpha changed omega", "done", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("edit_anchor_not_found"));

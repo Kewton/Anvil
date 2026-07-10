@@ -10,7 +10,7 @@ use crate::mode::ExecutionMode;
 use super::args_recovery::recover_tool_arguments;
 use super::path_guard::{
     WorkspacePathNormalizationKind, normalize_absolute_workspace_glob, normalize_workspace_path,
-    resolve_existing, resolve_for_create, resolve_optional_existing,
+    resolve_existing, resolve_for_create,
 };
 use super::workspace_policy::{WorkspacePolicy, ensure_tool_path_allowed};
 
@@ -103,9 +103,8 @@ impl ToolRegistry {
             }
             "Read" => {
                 let raw = required_string(arguments, "path")?;
-                let normalized = normalize_path_arg(context, "Read", raw)?;
-                let path = resolve_existing(&context.root, &normalized)?;
-                ensure_tool_path_allowed(&context.root, &path, context.workspace_policy)?;
+                let path =
+                    resolve_policy_checked_path(context, "Read", raw, PathResolution::Existing)?;
                 crate::tools::read::run(
                     &context.root,
                     &path,
@@ -116,22 +115,27 @@ impl ToolRegistry {
             }
             "Write" => {
                 let raw = required_string(arguments, "path")?;
-                let normalized = normalize_path_arg(context, "Write", raw)?;
-                let path = resolve_for_create(&context.root, &normalized)?;
+                let path =
+                    resolve_policy_checked_path(context, "Write", raw, PathResolution::Create)?;
                 let content = required_string(arguments, "content")?;
-                crate::tools::write::run(&path, content)
+                crate::tools::write::run(&context.root, &path, content)
             }
             "Edit" => {
                 let raw = required_string(arguments, "path")?;
                 let normalized = normalize_path_arg(context, "Edit", raw)?;
-                let path = resolve_optional_existing(&context.root, &normalized)?;
+                let path = resolve_policy_checked_path(
+                    context,
+                    "Edit",
+                    &normalized,
+                    PathResolution::Create,
+                )?;
                 let old = required_string(arguments, "old_string")?;
                 let new = required_string(arguments, "new_string")?;
                 let replace_all = arguments
                     .get("replace_all")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let output = crate::tools::edit::run(&path, old, new, replace_all)?;
+                let output = crate::tools::edit::run(&context.root, &path, old, new, replace_all)?;
                 if output.contains("edit_anchor_salvaged") {
                     emit_edit_anchor_salvaged(context, &normalized, &output);
                 }
@@ -164,6 +168,27 @@ impl ToolRegistry {
             other => bail!("unknown tool: {other}"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PathResolution {
+    Existing,
+    Create,
+}
+
+fn resolve_policy_checked_path(
+    context: &ToolContext,
+    tool: &str,
+    raw: &str,
+    resolution: PathResolution,
+) -> anyhow::Result<PathBuf> {
+    let normalized = normalize_path_arg(context, tool, raw)?;
+    let path = match resolution {
+        PathResolution::Existing => resolve_existing(&context.root, &normalized)?,
+        PathResolution::Create => resolve_for_create(&context.root, &normalized)?,
+    };
+    ensure_tool_path_allowed(&context.root, &path, context.workspace_policy)?;
+    Ok(path)
 }
 
 fn normalize_path_arg(context: &ToolContext, tool: &str, raw: &str) -> anyhow::Result<String> {
@@ -461,6 +486,7 @@ pub fn tool_error_kind(err: &anyhow::Error) -> &'static str {
         || message.contains("path may not contain ..")
         || message.contains("absolute path is not allowed")
         || message.contains("path contains NUL byte")
+        || message.contains("symlink_write_blocked")
     {
         "path_confinement_error"
     } else if message.contains("path_not_found_recoverable") {
@@ -617,6 +643,65 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a/b.txt")).unwrap(),
             "ok"
+        );
+    }
+
+    #[test]
+    fn normal_workspace_policy_blocks_anvil_metadata_write() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
+            expected_paths: Vec::new(),
+        };
+
+        let err = registry
+            .execute(
+                "Write",
+                &json!({"path":".anvil/x","content":"no"}),
+                &context,
+            )
+            .unwrap_err();
+
+        assert_eq!(tool_error_kind(&err), "workspace_policy_blocked");
+        assert!(!dir.path().join(".anvil/x").exists());
+    }
+
+    #[test]
+    fn normal_workspace_policy_blocks_git_metadata_edit() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "old").unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
+            expected_paths: Vec::new(),
+        };
+
+        let err = registry
+            .execute(
+                "Edit",
+                &json!({"path":".git/config","old_string":"old","new_string":"new"}),
+                &context,
+            )
+            .unwrap_err();
+
+        assert_eq!(tool_error_kind(&err), "workspace_policy_blocked");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".git/config")).unwrap(),
+            "old"
         );
     }
 
@@ -970,6 +1055,72 @@ mod tests {
 
         assert_eq!(tool_error_kind(&err), "path_confinement_error");
         assert!(!outside.path().join("escape.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_rejects_target_symlink_to_outside() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("escape.txt"), "outside").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("escape.txt"), dir.path().join("file"))
+            .unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
+            expected_paths: Vec::new(),
+        };
+
+        let err = registry
+            .execute("Write", &json!({"path":"file","content":"no"}), &context)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symlink_write_blocked"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("escape.txt")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_rejects_target_symlink_to_outside_before_read() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("escape.txt"), "old").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("escape.txt"), dir.path().join("file"))
+            .unwrap();
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: None,
+            expected_paths: Vec::new(),
+        };
+
+        let err = registry
+            .execute(
+                "Edit",
+                &json!({"path":"file","old_string":"old","new_string":"new"}),
+                &context,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("symlink_write_blocked"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("escape.txt")).unwrap(),
+            "old"
+        );
     }
 
     #[test]
