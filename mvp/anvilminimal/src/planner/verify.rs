@@ -2324,6 +2324,10 @@ fn package_json_script_grep_check_command(tokens: &[ShellWord]) -> Option<String
 }
 
 fn package_json_script_check_command(pattern: &str) -> Option<String> {
+    if let Some(port) = package_json_port_only_pattern(pattern) {
+        return Some(package_json_port_script_check_command(&port));
+    }
+
     let lower = pattern.to_ascii_lowercase();
     let script = if lower.contains("next build") || lower.contains("scripts.build") {
         Some("build")
@@ -2348,6 +2352,43 @@ fn package_json_script_check_command(pattern: &str) -> Option<String> {
     Some(format!(
         "node -p \"String(require('./package.json').scripts.{script}).includes('{pattern}') ? true : process.exit(1)\""
     ))
+}
+
+fn package_json_port_only_pattern(pattern: &str) -> Option<String> {
+    let port = pattern
+        .chars()
+        .filter(|ch| !matches!(ch, '"' | '\'' | ':') && !ch.is_whitespace())
+        .collect::<String>();
+    if (2..=5).contains(&port.len()) && port.chars().all(|ch| ch.is_ascii_digit()) {
+        Some(port)
+    } else {
+        None
+    }
+}
+
+fn package_json_port_script_check_command(port: &str) -> String {
+    // Keep the expression free of shell-control bytes so repaired commands can be revalidated.
+    format!(
+        concat!(
+            "node -p \"",
+            "['dev','start'].some(function(k){{",
+            "return String(Object(require('./package.json').scripts)[k]).split(' ')",
+            ".some(function(t,i,a){{",
+            "return t=='next' ? a.slice(i+1).find(function(x){{return x}})==k : false",
+            "}}) ? ",
+            "String(Object(require('./package.json').scripts)[k]).split(' ')",
+            ".some(function(t,i,a){{",
+            "return t=='--port={port}' ? true : ",
+            "t=='-p' ? a.slice(i+1).find(function(x){{return x}})=='{port}' : ",
+            "t=='-p{port}' ? true : ",
+            "t=='--port' ? a.slice(i+1).find(function(x){{return x}})=='{port}' : ",
+            "false",
+            "}}) : false",
+            "}}) ? true : process.exit(1)",
+            "\""
+        ),
+        port = port
+    )
 }
 
 fn is_setup_or_dev_server_verify_command(lower: &str) -> bool {
@@ -2898,6 +2939,58 @@ mod tests {
     fn verify_command_prefers_json_parser_for_package_script_grep() {
         let diagnosis = diagnose_verify_command(r#"grep -q "next dev -p 3011" package.json"#);
 
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::PackageJsonScriptGrep)
+        );
+        assert_eq!(
+            diagnosis.normalized,
+            r#"node -p "String(require('./package.json').scripts.dev).includes('next dev -p 3011') ? true : process.exit(1)""#
+        );
+    }
+
+    #[test]
+    fn verify_command_prefers_json_parser_for_package_port_only_grep() {
+        for command in [
+            r#"grep -q '"3011"' package.json"#,
+            "grep -q :3011 package.json",
+            "grep -q 3011 package.json",
+        ] {
+            let diagnosis = diagnose_verify_command(command);
+
+            assert_eq!(
+                diagnosis.violation,
+                Some(VerifyCommandViolationKind::PackageJsonScriptGrep),
+                "{command}: {diagnosis:?}"
+            );
+            assert!(
+                diagnosis.normalized.starts_with("node -p "),
+                "{diagnosis:?}"
+            );
+            assert!(
+                diagnosis.normalized.contains("'--port=3011'"),
+                "{diagnosis:?}"
+            );
+            assert!(diagnosis.normalized.contains("'-p'"), "{diagnosis:?}");
+            assert!(
+                validate_verify_command(&diagnosis.normalized).is_ok(),
+                "{diagnosis:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_command_keeps_unrelated_grep_outside_package_port_repair() {
+        assert_eq!(
+            diagnose_verify_command("grep -q 3011 README.md").violation,
+            None
+        );
+        assert_eq!(
+            diagnose_verify_command(r#"grep -q "port 3011" package.json"#).violation,
+            None
+        );
+
+        let diagnosis = diagnose_verify_command(r#"grep -q "next dev -p 3011" package.json"#);
         assert_eq!(
             diagnosis.violation,
             Some(VerifyCommandViolationKind::PackageJsonScriptGrep)
@@ -3818,6 +3911,45 @@ EOF\n\
         }
     }
 
+    fn package_port_token_verify_step(command: &str) -> PlanStep {
+        PlanStep {
+            id: "verify-package-port-token".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Verify the package script uses port 3011".to_string(),
+            expected_paths: vec!["package.json".to_string()],
+            verify: vec![command.to_string()],
+        }
+    }
+
+    fn write_package_scripts(root: &Path, dev: &str, start: &str) {
+        std::fs::write(
+            root.join("package.json"),
+            serde_json::json!({
+                "scripts": {
+                    "dev": dev,
+                    "start": start,
+                    "build": "next build"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn package_port_token_report(command: &str, dev: &str, start: &str) -> VerificationReport {
+        let dir = tempfile::tempdir().unwrap();
+        write_package_scripts(dir.path(), dev, start);
+        verify_step_with_setup_observed_with_offline_and_events(
+            dir.path(),
+            &package_port_token_verify_step(command),
+            NodeDependencySetupAuthority::None,
+            false,
+            None,
+        )
+        .0
+    }
+
     #[test]
     fn runtime_oracle_repairs_grep_dash_pattern_false_negative_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -3883,6 +4015,58 @@ EOF\n\
             classify_repair_target(&report),
             RepairTarget::Implementation
         );
+    }
+
+    #[test]
+    fn runtime_oracle_repairs_package_port_only_grep_to_json_check() {
+        for command in [
+            r#"grep -q '"3011"' package.json"#,
+            "grep -q :3011 package.json",
+            "grep -q 3011 package.json",
+        ] {
+            let report =
+                package_port_token_report(command, "next dev -p 3011", "next start -p 3011");
+
+            assert!(report.is_pass(), "{command}: {report:?}");
+            assert!(report.command_failures.is_empty(), "{command}: {report:?}");
+            assert!(
+                report.verifier_command_false_negatives.is_empty(),
+                "{command}: {report:?}"
+            );
+
+            let failing = package_port_token_report(command, "next dev", "next start");
+            assert!(!failing.is_pass(), "{command}: {failing:?}");
+            assert_eq!(failing.command_failures.len(), 1, "{command}: {failing:?}");
+            assert!(
+                failing.command_failures[0].command.starts_with("node -p "),
+                "{command}: {failing:?}"
+            );
+            assert!(
+                failing.verifier_command_false_negatives.is_empty(),
+                "{command}: {failing:?}"
+            );
+
+            let boundary_miss =
+                package_port_token_report(command, "next dev -p 30110", "next start --port=30110");
+            assert!(!boundary_miss.is_pass(), "{command}: {boundary_miss:?}");
+        }
+    }
+
+    #[test]
+    fn runtime_package_port_only_grep_accepts_long_port_flags() {
+        let equals_report = package_port_token_report(
+            r#"grep -q '"3011"' package.json"#,
+            "next dev --port=3011",
+            "next start",
+        );
+        assert!(equals_report.is_pass(), "{equals_report:?}");
+
+        let spaced_report = package_port_token_report(
+            r#"grep -q '"3011"' package.json"#,
+            "next dev",
+            "next start --port 3011",
+        );
+        assert!(spaced_report.is_pass(), "{spaced_report:?}");
     }
 
     #[test]

@@ -54,3 +54,9 @@ fixtures/node-p-quoting-and-path-normalization.jsonl = [
   "node -p \\\"require('./package.json').scripts.dev\\\"",
   "\"normalized_changed_path\":\"src/app/page.tsx\""
 ]
+fixtures/package-port-only-grep-normalization.jsonl = [
+  "test0710_bs_002/combo2-002",
+  "literal grep expected a quoted port token",
+  "package_json_script_assertion",
+  "--port=3011"
+]
