@@ -8,6 +8,7 @@ use crate::minimal_loop::dependency_setup::{
 };
 use crate::minimal_loop::evidence::required_evidence_for_capability;
 use crate::planner::signals;
+use crate::planner::step_plan::StepPlan;
 use crate::planner::verify::VerificationReport;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -77,6 +78,12 @@ impl ProfileBehaviorProbeReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileDeterministicStepPlan {
+    pub template_id: String,
+    pub plan: StepPlan,
+}
+
 pub trait DomainProfile: Sync {
     fn id(&self) -> &'static str;
 
@@ -122,6 +129,15 @@ pub trait DomainProfile: Sync {
     }
 
     fn guidance(&self, _goal: &str) -> Option<String> {
+        None
+    }
+
+    fn deterministic_step_plan(
+        &self,
+        _phase_prompt: &str,
+        _root: &Path,
+        _goal: &str,
+    ) -> Option<ProfileDeterministicStepPlan> {
         None
     }
 
@@ -387,6 +403,15 @@ impl DomainProfile for NextjsProfile {
 
     fn generation_rules(&self, intent: &str) -> Option<&'static str> {
         Some(crate::planner::profiles::nextjs::generation_rules(intent))
+    }
+
+    fn deterministic_step_plan(
+        &self,
+        phase_prompt: &str,
+        root: &Path,
+        goal: &str,
+    ) -> Option<ProfileDeterministicStepPlan> {
+        crate::planner::profiles::nextjs::deterministic_step_plan(phase_prompt, root, goal)
     }
 
     fn quality_expectations(&self, root: &Path, goal: &str) -> ProfileQualityExpectations {
@@ -856,6 +881,15 @@ pub fn profile_after_phase(
 
 pub fn profile_guidance(profile: &str, goal: &str) -> Option<String> {
     domain_profile(profile).guidance(goal)
+}
+
+pub fn profile_deterministic_step_plan(
+    root: &Path,
+    profile: &str,
+    phase_prompt: &str,
+    goal: &str,
+) -> Option<ProfileDeterministicStepPlan> {
+    domain_profile(profile).deterministic_step_plan(phase_prompt, root, goal)
 }
 
 pub fn profile_runtime_contract(profile: &str, intent: &str, goal: &str) -> String {

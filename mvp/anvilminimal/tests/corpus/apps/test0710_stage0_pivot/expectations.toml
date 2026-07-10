@@ -96,3 +96,10 @@ fixtures/hook-snapshot-primary-restore.jsonl = [
   "\"event\":\"hook_snapshot_restored\"",
   "\"restored_path\":\"src/app/page.tsx\""
 ]
+fixtures/deterministic-step-plan-used.jsonl = [
+  "test0710_bs_003/combo1",
+  "test0710_bs_003/combo2",
+  "\"event\":\"deterministic_step_plan_used\"",
+  "\"template_id\":\"nextjs-scaffold\"",
+  "\"planner_skipped\":true"
+]

@@ -1181,6 +1181,10 @@ fn check_bounded_provider_turns(trace: &Trace) -> Result<(), String> {
                     saw_duration = true;
                     break;
                 }
+                Some("deterministic_step_plan_used") => {
+                    saw_duration = true;
+                    break;
+                }
                 Some(name) if is_phase_boundary_event(name) => break,
                 _ => {}
             }

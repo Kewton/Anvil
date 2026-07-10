@@ -61,8 +61,8 @@ use crate::planner::lint::{
 use crate::planner::profile::{
     GENERIC_INTERACTIVE_CONTRACT_CAPABILITY, PhaseVerificationMode, ProfileBehaviorProbeReport,
     ProfileInferenceSource, ProfileSnapshot, canonical_profile_name, domain_profile, infer_profile,
-    is_nextjs_profile, profile_auto_repair, profile_before_phase, profile_expected_paths,
-    profile_generation_rules, profile_guidance, profile_post_step_repair,
+    is_nextjs_profile, profile_auto_repair, profile_before_phase, profile_deterministic_step_plan,
+    profile_expected_paths, profile_generation_rules, profile_guidance, profile_post_step_repair,
     profile_quality_expectations, profile_runtime_contract, profile_setup_scaffold_paths,
     verify_profile_final, verify_profile_invariant,
 };
@@ -510,6 +510,14 @@ fn generate_step_plan_with_ui_for_phase(
     if ui.interrupted() {
         anyhow::bail!("interrupted by user");
     }
+    let model = model_for(config, true);
+    if phase_label.is_some() {
+        if let Some(plan) =
+            deterministic_step_plan_for_phase(client.label(), model, goal, config, phase_label)?
+        {
+            return Ok(plan);
+        }
+    }
     let mut prompt = build_step_plan_user_prompt(goal, config);
     if let Some(guidance) = profile_guidance(&config.profile, goal) {
         prompt.push_str("\n\nProfile contract:\n");
@@ -518,7 +526,6 @@ fn generate_step_plan_with_ui_for_phase(
             "\nInclude expected_paths on the final step so deterministic verification can catch missing artifacts.",
         );
     }
-    let model = model_for(config, true);
     let mut last_error = None;
     let mut last_valid_plan: Option<StepPlan> = None;
     let mut lint_categories_seen = BTreeSet::new();
@@ -732,6 +739,73 @@ fn generate_step_plan_with_ui_for_phase(
         "invalid StepPlan after corrective retries: {}",
         last_error.unwrap_or_else(|| "unknown parse error".to_string())
     )
+}
+
+fn deterministic_step_plan_for_phase(
+    provider: &str,
+    model: &str,
+    phase_prompt: &str,
+    config: &Config,
+    phase_label: Option<&str>,
+) -> anyhow::Result<Option<StepPlan>> {
+    let Some(template) = profile_deterministic_step_plan(
+        &config.workspace_root,
+        &config.profile,
+        phase_prompt,
+        phase_prompt,
+    ) else {
+        return Ok(None);
+    };
+    let template_id = template.template_id;
+    let mut plan = template.plan;
+    let verify_before_repair = collect_step_verify_commands(&plan);
+    repair_generated_step_plan_contract(&mut plan);
+    let verify_after_repair = collect_step_verify_commands(&plan);
+    emit_planner_verify_command_normalized(
+        config,
+        provider,
+        model,
+        1,
+        &verify_before_repair,
+        &verify_after_repair,
+    );
+    strengthen_step_plan_for_profile(&mut plan, config);
+    repair_generated_step_plan_contract(&mut plan);
+    let sanitizer_report =
+        sanitize_step_plan_against_policy(&mut plan, Some(&config.workspace_root));
+    emit_planner_plan_sanitized(config, provider, model, 1, &sanitizer_report);
+    let lint_report = lint_step_plan_report_with_workspace(&plan, Some(&config.workspace_root));
+    if !lint_report.is_pass() {
+        emit_planner_error_for_lint(config, provider, model, &lint_report, 1);
+        anyhow::bail!(
+            "deterministic StepPlan template `{}` failed lint: {}",
+            template_id,
+            lint_report.primary_message()
+        );
+    }
+    emit_deterministic_step_plan_used(config, phase_label, &template_id, &plan);
+    emit_step_plan_presentation(phase_label, &plan, Some(&sanitizer_report));
+    Ok(Some(plan))
+}
+
+fn emit_deterministic_step_plan_used(
+    config: &Config,
+    phase_label: Option<&str>,
+    template_id: &str,
+    plan: &StepPlan,
+) {
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "deterministic_step_plan_used",
+            "phase_id": phase_label.unwrap_or(""),
+            "template_id": template_id,
+            "profile": config.profile,
+            "step_count": plan.steps.len(),
+            "expected_paths": plan.steps.iter().flat_map(|step| step.expected_paths.iter()).cloned().collect::<Vec<_>>(),
+            "verify": collect_step_verify_commands(plan),
+        }),
+    );
 }
 
 fn emit_step_plan_presentation(
@@ -16721,6 +16795,111 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_nextjs_scaffold_skips_planner_and_emits_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Original ultra goal: Build a browser game on port 3011\n\
+Profile: nextjs\n\
+Intent: create\n\
+Phase id: project-setup\n\
+Phase task: Scaffold and initialize the Next.js project shell";
+        let mut planner = FakeClient::new(Vec::new());
+
+        let plan = generate_step_plan_with_ui_for_phase(
+            &mut planner,
+            goal,
+            &cfg,
+            &NOOP_UI,
+            Some("project-setup"),
+        )
+        .unwrap();
+
+        assert!(planner.messages().is_empty());
+        assert_eq!(plan.steps[0].id, "nextjs-scaffold");
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"deterministic_step_plan_used\""));
+        assert!(event_text.contains("\"phase_id\":\"project-setup\""));
+        assert!(event_text.contains("\"template_id\":\"nextjs-scaffold\""));
+        assert!(!event_text.contains("\"event\":\"planner_raw_output_shape\""));
+    }
+
+    #[test]
+    fn deterministic_nextjs_implementation_phase_uses_planner() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Original ultra goal: Build a browser game on port 3011\n\
+Profile: nextjs\n\
+Intent: create\n\
+Phase id: gameplay\n\
+Phase task: Implement game logic, player control, collision, score, and canvas behavior";
+        let plan_json = serde_json::to_string(&StepPlan {
+            goal: "Implement gameplay".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "setup-nextjs".to_string(),
+                    kind: "setup".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction:
+                        "Ensure package.json and src/app/page.tsx exist before build verification."
+                            .to_string(),
+                    expected_paths: vec![
+                        "package.json".to_string(),
+                        "src/app/page.tsx".to_string(),
+                    ],
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "implement-gameplay".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Implement the route-bound gameplay surface.".to_string(),
+                    expected_paths: vec!["src/app/page.tsx".to_string()],
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "verify-build".to_string(),
+                    kind: "verify".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Verify the Next.js build.".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: vec!["npm run build".to_string()],
+                },
+            ],
+        })
+        .unwrap();
+        let mut planner = FakeClient::new(vec![AssistantReply::text(plan_json)]);
+
+        let plan = generate_step_plan_with_ui_for_phase(
+            &mut planner,
+            goal,
+            &cfg,
+            &NOOP_UI,
+            Some("gameplay"),
+        )
+        .unwrap();
+
+        assert_eq!(planner.messages().len(), 1);
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.id == "implement-gameplay")
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(!event_text.contains("\"event\":\"deterministic_step_plan_used\""));
+        assert!(event_text.contains("\"event\":\"planner_raw_output_shape\""));
+    }
+
+    #[test]
     fn setup_phase_fallback_generates_profile_scaffold_after_invalid_attempts() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
@@ -20213,7 +20392,7 @@ if __name__ == "__main__":
     }
 
     #[test]
-    fn ultra_phase_scaffold_provider_error_names_terminal_reason() {
+    fn ultra_phase_planner_provider_error_names_terminal_reason() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
@@ -20232,8 +20411,8 @@ if __name__ == "__main__":
             intent: "create".to_string(),
             phases: vec![
                 crate::planner::ultra_plan::UltraPhase {
-                    id: "web-game-scaffold".to_string(),
-                    prompt: "Scaffold the interactive web game".to_string(),
+                    id: "web-game-implementation".to_string(),
+                    prompt: "Implement game logic, player control, collision, score, and canvas behavior".to_string(),
                 },
                 crate::planner::ultra_plan::UltraPhase {
                     id: "final-verify".to_string(),

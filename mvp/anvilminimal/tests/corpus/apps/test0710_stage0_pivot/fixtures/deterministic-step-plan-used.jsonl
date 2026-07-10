@@ -1,0 +1,2 @@
+{"case":"test0710_bs_003/combo1","event":"deterministic_step_plan_used","phase_id":"project-setup","template_id":"nextjs-scaffold","profile":"nextjs","planner_skipped":true,"reason":"scaffold/setup phase is covered by the Next.js deterministic StepPlan template"}
+{"case":"test0710_bs_003/combo2","event":"deterministic_step_plan_used","phase_id":"project-setup","template_id":"nextjs-scaffold","profile":"nextjs","planner_skipped":true,"reason":"scaffold/setup phase is covered by the Next.js deterministic StepPlan template"}

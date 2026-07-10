@@ -8,10 +8,13 @@ use crate::minimal_loop::import_scan::{
 };
 use crate::planner::profile::profile_failure;
 use crate::planner::profile::{
-    ProfileHookAttribute, ProfileHookSnapshotTarget, ProfileQualityExpectations,
+    ProfileDeterministicStepPlan, ProfileHookAttribute, ProfileHookSnapshotTarget,
+    ProfileQualityExpectations,
 };
 use crate::planner::signals::requested_port_from_text;
+use crate::planner::step_plan::{PlanStep, StepPlan};
 use crate::planner::verify::{VerificationReport, VerifyStatus};
+use crate::tools::path_guard::validate_workspace_relative;
 
 pub const DEFAULT_REQUESTED_PORT: u16 = 3011;
 
@@ -329,6 +332,360 @@ pub fn filter_setup_invariant_paths(root: &Path, paths: Vec<String>) -> Vec<Stri
 
 pub fn expected_paths(root: &Path, _goal: &str) -> Vec<String> {
     setup_scaffold_paths(root)
+}
+
+pub fn deterministic_step_plan(
+    phase_prompt: &str,
+    root: &Path,
+    goal: &str,
+) -> Option<ProfileDeterministicStepPlan> {
+    let phase_text = phase_id_and_task_text(phase_prompt).unwrap_or_else(|| phase_prompt.into());
+    let phase_id = phase_field(phase_prompt, "Phase id:").unwrap_or_default();
+    let phase_id_lower = phase_id.to_ascii_lowercase();
+    let lower = phase_text.to_ascii_lowercase();
+    if looks_like_implementation_phase(&lower) {
+        return None;
+    }
+    if looks_like_scaffold_phase(&lower) && looks_like_scaffold_phase_id(&phase_id_lower) {
+        return Some(scaffold_step_plan(phase_prompt, root, goal));
+    }
+    if looks_like_port_script_phase(&lower) {
+        return Some(port_script_step_plan(phase_prompt, goal));
+    }
+    if looks_like_build_verify_phase(&lower) {
+        return Some(build_verify_step_plan(phase_prompt, root, goal));
+    }
+    None
+}
+
+fn scaffold_step_plan(phase_prompt: &str, root: &Path, goal: &str) -> ProfileDeterministicStepPlan {
+    let mut expected_paths = setup_scaffold_paths(root);
+    merge_required_final_artifacts(&mut expected_paths, phase_prompt);
+    let port = requested_or_default_port(goal);
+    ProfileDeterministicStepPlan {
+        template_id: "nextjs-scaffold".to_string(),
+        plan: StepPlan {
+            goal: "Create the deterministic Next.js scaffold.".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "nextjs-scaffold".to_string(),
+                    kind: "setup".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: format!(
+                        "Create or complete the Next.js App Router scaffold, package manifest, TypeScript config, styling config, and route-bound page. Keep package.json dev/start scripts on port {port}. Required files: {}.",
+                        expected_paths.join(", ")
+                    ),
+                    expected_paths,
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "nextjs-profile-verify".to_string(),
+                    kind: "verify".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction:
+                        "Verify package scripts use the requested port and the Next.js build command remains executable."
+                            .to_string(),
+                    expected_paths: Vec::new(),
+                    verify: profile_verify_commands(port),
+                },
+            ],
+        },
+    }
+}
+
+fn port_script_step_plan(phase_prompt: &str, goal: &str) -> ProfileDeterministicStepPlan {
+    let port = requested_or_default_port(goal);
+    let mut expected_paths = vec!["package.json".to_string()];
+    merge_required_final_artifacts(&mut expected_paths, phase_prompt);
+    ProfileDeterministicStepPlan {
+        template_id: "nextjs-port-scripts".to_string(),
+        plan: StepPlan {
+            goal: "Configure deterministic Next.js package scripts.".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "configure-nextjs-port-scripts".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: format!(
+                        "Update package.json so scripts.dev runs next dev on port {port}, scripts.start runs next start on port {port} when present, and scripts.build remains next build."
+                    ),
+                    expected_paths,
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "verify-nextjs-port-scripts".to_string(),
+                    kind: "verify".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Verify package scripts preserve the requested Next.js port."
+                        .to_string(),
+                    expected_paths: Vec::new(),
+                    verify: package_script_port_verify_commands(port),
+                },
+            ],
+        },
+    }
+}
+
+fn build_verify_step_plan(
+    phase_prompt: &str,
+    root: &Path,
+    goal: &str,
+) -> ProfileDeterministicStepPlan {
+    let mut expected_paths = setup_scaffold_paths(root);
+    merge_required_final_artifacts(&mut expected_paths, phase_prompt);
+    let port = requested_or_default_port(goal);
+    ProfileDeterministicStepPlan {
+        template_id: "nextjs-build-verification".to_string(),
+        plan: StepPlan {
+            goal: "Verify the deterministic Next.js build.".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "ensure-nextjs-build-inputs".to_string(),
+                    kind: "setup".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: format!(
+                        "Ensure the Next.js scaffold and route-bound entrypoint exist before build verification. Required files: {}.",
+                        expected_paths.join(", ")
+                    ),
+                    expected_paths,
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "verify-nextjs-build".to_string(),
+                    kind: "verify".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Run deterministic package script and Next.js build verification."
+                        .to_string(),
+                    expected_paths: Vec::new(),
+                    verify: profile_verify_commands(port),
+                },
+            ],
+        },
+    }
+}
+
+fn profile_verify_commands(port: u16) -> Vec<String> {
+    let mut verify = package_script_port_verify_commands(port);
+    verify.push(package_build_script_verify_command());
+    verify.push("npm run build".to_string());
+    verify
+}
+
+fn package_script_port_verify_commands(port: u16) -> Vec<String> {
+    vec![
+        package_script_required_port_verify_command("dev", port),
+        package_script_optional_port_verify_command("start", port),
+    ]
+}
+
+fn package_script_required_port_verify_command(script: &str, port: u16) -> String {
+    format!(
+        concat!(
+            "node -p \"",
+            "['{script}'].every(function(k){{",
+            "return String(Object(require('./package.json').scripts)[k]).split(' ')",
+            ".some(function(t,i,a){{return t=='next' ? a.slice(i+1).find(function(x){{return x}})==k : false}}) ? ",
+            "String(Object(require('./package.json').scripts)[k]).split(' ')",
+            ".some(function(t,i,a){{",
+            "return t=='--port={port}' ? true : ",
+            "t=='-p' ? a.slice(i+1).find(function(x){{return x}})=='{port}' : ",
+            "t=='-p{port}' ? true : ",
+            "t=='--port' ? a.slice(i+1).find(function(x){{return x}})=='{port}' : ",
+            "false",
+            "}}) : false",
+            "}}) ? true : process.exit(1)",
+            "\""
+        ),
+        script = script,
+        port = port
+    )
+}
+
+fn package_script_optional_port_verify_command(script: &str, port: u16) -> String {
+    format!(
+        concat!(
+            "node -p \"",
+            "['{script}'].every(function(k){{",
+            "return Object(require('./package.json').scripts)[k] ? ",
+            "String(Object(require('./package.json').scripts)[k]).split(' ')",
+            ".some(function(t,i,a){{return t=='next' ? a.slice(i+1).find(function(x){{return x}})==k : false}}) ? ",
+            "String(Object(require('./package.json').scripts)[k]).split(' ')",
+            ".some(function(t,i,a){{",
+            "return t=='--port={port}' ? true : ",
+            "t=='-p' ? a.slice(i+1).find(function(x){{return x}})=='{port}' : ",
+            "t=='-p{port}' ? true : ",
+            "t=='--port' ? a.slice(i+1).find(function(x){{return x}})=='{port}' : ",
+            "false",
+            "}}) : false : true",
+            "}}) ? true : process.exit(1)",
+            "\""
+        ),
+        script = script,
+        port = port
+    )
+}
+
+fn package_build_script_verify_command() -> String {
+    "node -p \"String(require('./package.json').scripts.build)=='next build' ? true : process.exit(1)\""
+        .to_string()
+}
+
+fn merge_required_final_artifacts(paths: &mut Vec<String>, phase_prompt: &str) {
+    for path in required_final_artifact_paths(phase_prompt) {
+        push_unique_path(paths, &path);
+    }
+}
+
+fn required_final_artifact_paths(phase_prompt: &str) -> Vec<String> {
+    let mut in_section = false;
+    let mut out = Vec::new();
+    for line in phase_prompt.lines() {
+        let trimmed = line.trim();
+        if trimmed == "Required final artifacts:" {
+            in_section = true;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if trimmed.starts_with('-') {
+            if let Some(path) = normalize_required_artifact_line(trimmed.trim_start_matches('-')) {
+                push_unique_path(&mut out, &path);
+            }
+            continue;
+        }
+        if !trimmed.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+fn normalize_required_artifact_line(line: &str) -> Option<String> {
+    let raw = line.trim();
+    let token = raw
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_matches(['`', '"', '\''])
+        .trim_end_matches([',', ';']);
+    if token.is_empty() || validate_workspace_relative(token).is_err() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+fn phase_id_and_task_text(phase_prompt: &str) -> Option<String> {
+    let mut out = Vec::new();
+    for line in phase_prompt.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("Phase id:") || trimmed.starts_with("Phase task:") {
+            out.push(trimmed.to_string());
+        }
+    }
+    (!out.is_empty()).then(|| out.join("\n"))
+}
+
+fn phase_field(phase_prompt: &str, prefix: &str) -> Option<String> {
+    phase_prompt.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix(prefix)
+            .map(|value| value.trim().to_string())
+    })
+}
+
+fn looks_like_scaffold_phase(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "scaffold",
+            "setup",
+            "set up",
+            "project shell",
+            "initialize",
+            "initialise",
+            "bootstrap",
+            "app router scaffold",
+            "初期",
+            "セットアップ",
+        ],
+    )
+}
+
+fn looks_like_scaffold_phase_id(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "scaffold",
+            "setup",
+            "set-up",
+            "project-setup",
+            "bootstrap",
+            "initialize",
+            "initialise",
+        ],
+    )
+}
+
+fn looks_like_port_script_phase(lower: &str) -> bool {
+    (lower.contains("port") || lower.contains("ポート"))
+        && contains_any(
+            lower,
+            &[
+                "script",
+                "package",
+                "package.json",
+                "dev/start",
+                "dev script",
+                "start script",
+                "設定",
+            ],
+        )
+}
+
+fn looks_like_build_verify_phase(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "build verification",
+            "verify build",
+            "build verifier",
+            "npm run build",
+            "next build",
+            "ビルド検証",
+        ],
+    )
+}
+
+fn looks_like_implementation_phase(lower: &str) -> bool {
+    contains_any(
+        lower,
+        &[
+            "game logic",
+            "gameplay",
+            "mechanic",
+            "adversary",
+            "challenge",
+            "collision",
+            "failure rule",
+            "score",
+            "player control",
+            "canvas",
+            "stateful update",
+            "user input",
+            "interactive surface",
+            "ゲームロジック",
+            "衝突",
+            "スコア",
+            "敵",
+            "プレイヤー",
+            "操作",
+        ],
+    )
+}
+
+fn contains_any(text: &str, tokens: &[&str]) -> bool {
+    tokens.iter().any(|token| text.contains(token))
 }
 
 pub fn complete_scaffold(root: &Path, missing_paths: &[String]) -> anyhow::Result<Vec<String>> {
@@ -1980,7 +2337,11 @@ fn semver_major(version: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::planner::lint::lint_step_plan_report_with_workspace;
+    use crate::planner::sanitizer::sanitize_step_plan_against_policy;
+    use crate::planner::step_plan::repair_generated_step_plan_contract;
     use crate::planner::verify::VerifyStatus;
+    use crate::planner::verify::normalize_verify_command;
 
     fn package_json() -> &'static str {
         r#"{"dependencies":{"next":"^14.2.0","react":"^18.3.0","react-dom":"^18.3.0"},"devDependencies":{"typescript":"^5.5.0","@types/node":"^20.14.0","@types/react":"^18.3.0","@types/react-dom":"^18.3.0"},"scripts":{"build":"next build","dev":"next dev -p 3011"}}"#
@@ -2071,6 +2432,86 @@ mod tests {
                 .iter()
                 .all(|target| target.required_attributes.len() == 3)
         );
+    }
+
+    #[test]
+    fn nextjs_deterministic_scaffold_prompt_returns_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = "Original ultra goal: Build a browser game on port 3011\n\
+Phase id: project-setup\n\
+Phase task: Scaffold and initialize the Next.js project shell";
+
+        let template = deterministic_step_plan(prompt, dir.path(), prompt).unwrap();
+
+        assert_eq!(template.template_id, "nextjs-scaffold");
+        assert!(
+            template.plan.steps[0]
+                .expected_paths
+                .contains(&"src/app/page.tsx".to_string())
+        );
+        assert!(
+            template
+                .plan
+                .steps
+                .iter()
+                .flat_map(|step| step.verify.iter())
+                .any(|command| command == "npm run build")
+        );
+    }
+
+    #[test]
+    fn nextjs_deterministic_implementation_prompt_falls_back_to_planner() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = "Original ultra goal: Build a browser game on port 3011\n\
+Phase id: gameplay\n\
+Phase task: Implement game logic, player control, collision, score, and canvas behavior";
+
+        assert!(deterministic_step_plan(prompt, dir.path(), prompt).is_none());
+    }
+
+    #[test]
+    fn nextjs_deterministic_template_passes_sanitizer_and_lint() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = "Original ultra goal: Build a Next.js app on port 3011\n\
+Phase id: project-setup\n\
+Phase task: Scaffold the Next.js app and configure package scripts";
+        let mut plan = deterministic_step_plan(prompt, dir.path(), prompt)
+            .unwrap()
+            .plan;
+
+        repair_generated_step_plan_contract(&mut plan);
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+        assert!(report.shell_control_splits.is_empty(), "{report:?}");
+        for command in plan.steps.iter().flat_map(|step| step.verify.iter()) {
+            normalize_verify_command(command).unwrap();
+        }
+        assert!(
+            lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn nextjs_deterministic_template_preserves_required_final_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt = "Required final artifacts:\n\
+- src/app/page.tsx\n\
+- src/components/Game.tsx\n\n\
+Original ultra goal: Build a Next.js app on port 3011\n\
+Phase id: project-setup\n\
+Phase task: Scaffold the Next.js app";
+
+        let template = deterministic_step_plan(prompt, dir.path(), prompt).unwrap();
+        let paths = template
+            .plan
+            .steps
+            .iter()
+            .flat_map(|step| step.expected_paths.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"src/app/page.tsx".to_string()));
+        assert!(paths.contains(&"src/components/Game.tsx".to_string()));
     }
 
     #[test]
