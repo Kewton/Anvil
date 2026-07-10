@@ -223,6 +223,10 @@ pub struct CompletionSnapshot {
     pub interaction_evidence_execution_status: String,
     pub interaction_evidence_status: String,
     pub interaction_evidence_path: String,
+    pub probe_preflight_status: String,
+    pub probe_preflight_reason: String,
+    pub probe_preflight_remediation: String,
+    pub probe_preflight_message: String,
     pub state_dimensions_changed: Vec<String>,
     pub action_hooks: Vec<String>,
     pub surface_fit_summary: String,
@@ -285,6 +289,10 @@ impl CompletionSnapshot {
             interaction_evidence_execution_status: "not_applicable".to_string(),
             interaction_evidence_status: "not_applicable".to_string(),
             interaction_evidence_path: String::new(),
+            probe_preflight_status: String::new(),
+            probe_preflight_reason: String::new(),
+            probe_preflight_remediation: String::new(),
+            probe_preflight_message: String::new(),
             state_dimensions_changed: Vec::new(),
             action_hooks: Vec::new(),
             surface_fit_summary: String::new(),
@@ -359,6 +367,10 @@ pub struct CompletionProjection {
     pub interaction_evidence_execution_status: String,
     pub interaction_evidence: String,
     pub interaction_evidence_path: String,
+    pub probe_preflight_status: String,
+    pub probe_preflight_reason: String,
+    pub probe_preflight_remediation: String,
+    pub probe_preflight_message: String,
     pub state_dimensions_changed: Vec<String>,
     pub action_hooks: Vec<String>,
     pub surface_fit_summary: String,
@@ -428,6 +440,8 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
     let diagnostics = planner_diagnostics_from_events(&events);
     let recovery_fields = latest_recovery_fields(&events);
     let persistence_fields = latest_persistence_fields(&events);
+    let probe_preflight =
+        crate::minimal_loop::probe_preflight::latest_interaction_probe_preflight(&events);
     let mut snapshot = CompletionSnapshot::empty();
     let mut latest_completion_index = None;
     for (index, event) in events.iter().enumerate() {
@@ -466,6 +480,10 @@ pub fn latest_completion_snapshot(path: Option<&Path>) -> CompletionSnapshot {
     if let Some(summary) = latest_depth_profile_summary(&events) {
         snapshot.depth_profile_summary = summary;
     }
+    snapshot.probe_preflight_status = probe_preflight.status;
+    snapshot.probe_preflight_reason = probe_preflight.reason;
+    snapshot.probe_preflight_remediation = probe_preflight.remediation;
+    snapshot.probe_preflight_message = probe_preflight.message;
     recovery_fields.apply_to(&mut snapshot);
     persistence_fields.apply_to(&mut snapshot);
     snapshot
@@ -773,6 +791,10 @@ pub fn project_completion(ok: bool, snapshot: &CompletionSnapshot) -> Completion
             .clone(),
         interaction_evidence: snapshot.interaction_evidence_status.clone(),
         interaction_evidence_path: snapshot.interaction_evidence_path.clone(),
+        probe_preflight_status: snapshot.probe_preflight_status.clone(),
+        probe_preflight_reason: snapshot.probe_preflight_reason.clone(),
+        probe_preflight_remediation: snapshot.probe_preflight_remediation.clone(),
+        probe_preflight_message: snapshot.probe_preflight_message.clone(),
         state_dimensions_changed: snapshot.state_dimensions_changed.clone(),
         action_hooks: snapshot.action_hooks.clone(),
         surface_fit_summary: snapshot.surface_fit_summary.clone(),
@@ -2101,6 +2123,26 @@ fn snapshot_from_completion_event(event: &Value) -> Option<CompletionSnapshot> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
+        probe_preflight_status: event
+            .get("probe_preflight_status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        probe_preflight_reason: event
+            .get("probe_preflight_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        probe_preflight_remediation: event
+            .get("probe_preflight_remediation")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        probe_preflight_message: event
+            .get("probe_preflight_message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         state_dimensions_changed: event_string_array(event, "state_dimensions_changed"),
         action_hooks: event_string_array(event, "action_hooks"),
         surface_fit_summary: event
@@ -2752,6 +2794,18 @@ fn render_completion_summary(
             "Interaction verification: app interaction untested (probe infrastructure failure)."
                 .to_string(),
         );
+    }
+    if projection.probe_preflight_status == "failed" {
+        let remediation = if projection.probe_preflight_remediation.trim().is_empty() {
+            crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION
+        } else {
+            projection.probe_preflight_remediation.trim()
+        };
+        lines.push(format!(
+            "Interaction probe preflight: failed; preflight時点から基盤未準備: {}; {}.",
+            missing_if_empty(&projection.probe_preflight_reason),
+            remediation
+        ));
     }
     let host_env_contamination = crate::minimal_loop::verifier_env::host_env_contamination();
     if !host_env_contamination.is_empty() {
@@ -3936,6 +3990,71 @@ mod tests {
             summary.contains(
                 "Interaction verification: app interaction untested (probe infrastructure failure)."
             ),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn completion_summary_marks_probe_infrastructure_failed_since_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        emit(
+            Some(&path),
+            json!({
+                "event": "probe_preflight",
+                "probe": "interaction",
+                "status": "failed",
+                "ok": false,
+                "reason": "playwright_not_installed",
+                "remediation": crate::minimal_loop::interaction_probe::INTERACTION_PROBE_SETUP_REMEDIATION,
+                "message": "interaction probe preflight failed: playwright_not_installed; run /setup-interaction-probe (or anvilminimal --setup-interaction-probe) to enable interaction release checks",
+            }),
+        );
+        emit(
+            Some(&path),
+            json!({
+                "event": "ultra_final_acceptance",
+                "runtime_acceptance_status": "pass",
+                "final_acceptance_status": "failed",
+                "release_gate_status": "failed",
+                "release_gate_reasons": [
+                    "probe_infrastructure_failed:probe_script_error",
+                    "app interaction untested (probe infrastructure failure: probe_infrastructure_failed:probe_script_error)"
+                ],
+                "interaction_evidence_status": "failed:probe_infrastructure_failed:probe_script_error",
+                "evidence_arbitration_summary": "static (probe infrastructure failure: probe_infrastructure_failed:probe_script_error)",
+            }),
+        );
+
+        let snapshot = latest_completion_snapshot(Some(&path));
+        let projection = project_completion(false, &snapshot);
+        let summary = render_completion_summary(
+            "tui_command",
+            None,
+            Some("/ultra-plan-run"),
+            "failed",
+            "",
+            &projection,
+        );
+
+        assert_eq!(snapshot.probe_preflight_status, "failed");
+        assert_eq!(
+            projection.probe_preflight_reason,
+            "playwright_not_installed"
+        );
+        assert!(
+            summary.contains(
+                "Interaction verification: app interaction untested (probe infrastructure failure)."
+            ),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("preflight時点から基盤未準備: playwright_not_installed"),
+            "{summary}"
+        );
+        assert!(summary.contains("--setup-interaction-probe"), "{summary}");
+        assert!(
+            summary.contains("probe_infrastructure_failed:probe_script_error"),
             "{summary}"
         );
     }

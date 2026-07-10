@@ -7802,7 +7802,6 @@ fn maybe_run_ultra_final_browser_probe(
     );
     Some(observation)
 }
-
 fn run_ultra_final_browser_checks_before_arbitration(
     config: &Config,
     plan: &UltraPlan,
@@ -7818,6 +7817,13 @@ fn run_ultra_final_browser_checks_before_arbitration(
     let requested_port = effective_requested_port(effective_profile, &plan.goal, Some(&phase_text));
     let interaction_options =
         browser_interaction_probe_options(required_capabilities, required_evidence);
+    if ultra_browser_probe_runtime_enabled(config) {
+        crate::minimal_loop::probe_preflight::emit_interaction_probe_preflight(
+            config.eval_events_path.as_deref(),
+            &config.workspace_root,
+            "ultra_final_acceptance",
+        );
+    }
     let browser_probe = maybe_run_ultra_final_browser_probe(
         config,
         plan,

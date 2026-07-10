@@ -1,0 +1,38 @@
+case_id = "test0710_bs_006_probe_preflight_space_combo3"
+source = "bs_006 space_combo3 probe preflight infrastructure regression fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["probe_preflight", "space_combo3", "infrastructure"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/probe-preflight.jsonl = [
+  "test0710_bs_006/space_combo3",
+  "\"event\":\"probe_preflight\"",
+  "\"status\":\"failed\"",
+  "\"reason\":\"playwright_not_installed\"",
+  "anvilminimal --setup-interaction-probe",
+  "\"event\":\"browser_interaction_probe\"",
+  "\"failure_kind\":\"probe_infrastructure_failed:probe_script_error\"",
+  "\"failure_category\":\"infrastructure\"",
+  "\"event\":\"ultra_final_acceptance\"",
+  "\"interaction_evidence_status\":\"failed:probe_infrastructure_failed:probe_script_error\"",
+  "app interaction untested (probe infrastructure failure: probe_infrastructure_failed:probe_script_error)",
+  "preflight時点から基盤未準備"
+]
