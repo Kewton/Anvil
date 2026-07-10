@@ -85,3 +85,14 @@ fixtures/read-only-write-required-evidence-targets.jsonl = [
   "\"event\":\"write_required_off_target_write_allowed\"",
   "\"actual_path\":\"package.json\""
 ]
+fixtures/hook-snapshot-primary-restore.jsonl = [
+  "test0710_bs_003/combo3",
+  "\"event\":\"hook_snapshot_saved\"",
+  "\"event\":\"hook_snapshot_feedback\"",
+  "\"scope_id\":\"verify-primary-attribute\"",
+  "data-anvil-action=\\\"primary\\\"",
+  "--- last-known-good",
+  "+++ current",
+  "\"event\":\"hook_snapshot_restored\"",
+  "\"restored_path\":\"src/app/page.tsx\""
+]

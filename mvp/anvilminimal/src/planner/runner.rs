@@ -52,6 +52,7 @@ use crate::minimal_loop::repair_target::{
     RepairFollowThrough, RepairTarget, classify_repair_follow_through, classify_repair_target,
 };
 use crate::minimal_loop::verifier_env;
+use crate::planner::hook_snapshot;
 use crate::planner::intent::detect_intent;
 use crate::planner::lint::{
     PlanLintReport, PlanQualityContext, PlanQualityReport, lint_step_plan_report_with_workspace,
@@ -2237,6 +2238,8 @@ fn run_step(
     let mut no_change_repairs = 0usize;
     let mut target_not_followed_repairs = 0usize;
     let mut identical_no_change_repairs = 0usize;
+    let mut hook_snapshot_feedback_given = false;
+    let mut hook_snapshot_restore_used = false;
     let mut current_report_signature = verification_report_signature(&current_report);
     let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
     if !current_reachability.reachable {
@@ -2264,7 +2267,7 @@ fn run_step(
             context.repair_attempt = Some(attempt);
             context.compile_reanchored_retry = repair_session_mode == RepairSessionMode::Compact;
             context.compile_narrow_no_snapshot_retry = false;
-            let repair_prompt = if repair_session_mode == RepairSessionMode::Compact {
+            let mut repair_prompt = if repair_session_mode == RepairSessionMode::Compact {
                 build_compact_compile_repair_prompt_with_context(
                     &step.id,
                     &current_report,
@@ -2273,6 +2276,15 @@ fn run_step(
             } else {
                 build_repair_prompt_with_context(&step.id, &current_report, &context)
             };
+            repair_prompt = hook_snapshot::prefix_feedback_if_missing(
+                config,
+                &config.profile,
+                overall_goal,
+                "step_verify_repair",
+                Some(&step.id),
+                &mut hook_snapshot_feedback_given,
+                repair_prompt,
+            );
             let repair_result = match repair_session_mode {
                 RepairSessionMode::Appended => run_session_with_outcome_with_options(
                     client,
@@ -2519,6 +2531,104 @@ fn run_step(
                 outcome.primary_failure = None;
                 outcome.stop_reason = repair_stop_reason.clone();
                 return Ok(outcome);
+            }
+            if hook_snapshot_feedback_given && !hook_snapshot_restore_used {
+                match hook_snapshot::restore_first_missing(config, &config.profile, overall_goal) {
+                    Ok(Some(restored)) => {
+                        hook_snapshot_restore_used = true;
+                        merge_changed_files(
+                            &mut context,
+                            std::slice::from_ref(&restored.restored_path),
+                        );
+                        merge_unique_strings(
+                            &mut outcome.changed_paths,
+                            std::slice::from_ref(&restored.restored_path),
+                        );
+                        merge_unique_strings(
+                            &mut outcome.repair_changed_paths,
+                            std::slice::from_ref(&restored.restored_path),
+                        );
+                        let (restored_retry, restored_lifecycles) =
+                            verify_step_with_profile_setup_observed_with_offline_and_events(
+                                &config.workspace_root,
+                                &runtime_step,
+                                Some(&config.profile),
+                                setup_authority,
+                                config.offline,
+                                config.eval_events_path.as_deref(),
+                            );
+                        apply_runtime_command_normalizations(&mut runtime_step, &restored_retry);
+                        context.verify_commands = runtime_step.verify.clone();
+                        for lifecycle in &restored_lifecycles {
+                            emit_dependency_build_lifecycle(
+                                config.eval_events_path.as_deref(),
+                                mode,
+                                Some(&step.id),
+                                lifecycle,
+                            );
+                        }
+                        eval_events::emit(
+                            config.eval_events_path.as_deref(),
+                            json!({
+                                "event": "step_verify_repair",
+                                "step_id": step.id,
+                                "attempt": attempt,
+                                "ok": restored_retry.is_pass(),
+                                "repair_target": classify_repair_target(&restored_retry).as_str(),
+                                "previous_repair_target": retry_target.as_str(),
+                                "repair_target_followed": true,
+                                "target_relation": "hook_snapshot_restore",
+                                "repair_follow_through": "hook_snapshot_restore",
+                                "failure_kind": if restored_retry.is_pass() { "" } else { "hook_snapshot_restore_unresolved" },
+                                "primary_reason": eval_events::body_snippet(&restored_retry.primary_reason()),
+                                "changed_paths": [restored.restored_path.clone()],
+                                "repair_turn_changed_paths": [restored.restored_path.clone()],
+                                "repair_session_mode": "hook_snapshot_restore",
+                                "dependency_setup_authority": setup_authority.as_str(),
+                                "repair_reachable": true,
+                                "reachable": true,
+                            }),
+                        );
+                        if restored_retry.is_pass() {
+                            outcome.primary_failure = None;
+                            outcome.stop_reason = Some("hook_snapshot_restore_applied".to_string());
+                            return Ok(outcome);
+                        }
+                        let restored_reachability = assess_repair_reachability(
+                            &restored_retry,
+                            None,
+                            setup_authority,
+                            config.offline,
+                        );
+                        if !restored_reachability.reachable {
+                            terminal_repair_failure_kind =
+                                Some(reachability_failure_kind(&restored_reachability).to_string());
+                            terminal_blocked_requirements =
+                                restored_reachability.blocked_requirements.clone();
+                            context.progress_warning =
+                                Some(reachability_recovery_reason(&restored_reachability));
+                            current_report = restored_retry;
+                            emit_repair_unreachable(
+                                config,
+                                mode,
+                                &step.id,
+                                classify_repair_target(&current_report).as_str(),
+                                &current_report.primary_reason(),
+                                &restored_reachability,
+                            );
+                            break;
+                        }
+                        previous_missing = restored_retry.missing_paths.len();
+                        current_report_signature = verification_report_signature(&restored_retry);
+                        current_report = restored_retry;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        context.progress_warning =
+                            Some(format!("Hook snapshot restore failed: {err}"));
+                    }
+                }
             }
             if compile_repair_no_change && repair_session_mode == RepairSessionMode::Compact {
                 match single_compile_regeneration_target(&retry) {
@@ -3814,8 +3924,7 @@ fn fresh_profile_invariant_failure_evidence(
     snapshot: &ProfileSnapshot,
     required_paths: &[String],
 ) -> ProfileInvariantFailureEvidence {
-    let report =
-        verify_profile_invariant(&config.workspace_root, &plan.profile, &plan.goal, snapshot);
+    let report = verify_profile_invariant_with_hook_snapshot(config, plan, snapshot);
     let mut required =
         profile_invariant_expected_paths(&config.workspace_root, &plan.profile, required_paths);
     merge_unique_strings(
@@ -3848,6 +3957,16 @@ fn fresh_profile_invariant_failure_evidence(
         missing_paths,
         failure_evidence,
     }
+}
+
+fn verify_profile_invariant_with_hook_snapshot(
+    config: &Config,
+    plan: &UltraPlan,
+    snapshot: &ProfileSnapshot,
+) -> VerificationReport {
+    let report =
+        verify_profile_invariant(&config.workspace_root, &plan.profile, &plan.goal, snapshot);
+    hook_snapshot::report_missing_as_profile_failure(config, &plan.profile, &plan.goal, report)
 }
 
 fn profile_invariant_expected_paths(root: &Path, profile: &str, paths: &[String]) -> Vec<String> {
@@ -4950,12 +5069,8 @@ pub fn run_ultra_plan_with_ui(
             None,
             None,
         );
-        let mut invariant_report = verify_profile_invariant(
-            &config.workspace_root,
-            &plan.profile,
-            &plan.goal,
-            &profile_snapshot,
-        );
+        let mut invariant_report =
+            verify_profile_invariant_with_hook_snapshot(config, plan, &profile_snapshot);
         if !final_phase && !invariant_report.is_pass() {
             invariant_report = repair_intermediate_profile_invariant(
                 execution,
@@ -4993,12 +5108,8 @@ pub fn run_ultra_plan_with_ui(
                 &mut ultra_context.truncated,
             );
             emit_compile_rollback_context_carried(config, &rollback);
-            invariant_report = verify_profile_invariant(
-                &config.workspace_root,
-                &plan.profile,
-                &plan.goal,
-                &profile_snapshot,
-            );
+            invariant_report =
+                verify_profile_invariant_with_hook_snapshot(config, plan, &profile_snapshot);
         }
         if !invariant_report.is_pass() {
             let fresh_evidence = fresh_profile_invariant_failure_evidence(
@@ -5077,6 +5188,7 @@ pub fn run_ultra_plan_with_ui(
                 ));
             }
         } else {
+            hook_snapshot::save_phase_snapshots(config, &plan.profile, &plan.goal, &phase.id);
             emit_phase_verification_event(
                 config,
                 plan,
@@ -5143,6 +5255,9 @@ pub fn run_ultra_plan_with_ui(
         }
         let final_invariant_reason =
             (!invariant_report.is_pass()).then(|| invariant_report.primary_reason());
+        if invariant_report.is_pass() {
+            hook_snapshot::save_phase_snapshots(config, &plan.profile, &plan.goal, &phase.id);
+        }
         emit_phase_verification_event(
             config,
             plan,
@@ -5244,6 +5359,8 @@ pub fn run_ultra_plan_with_ui(
         let mut evidence_regeneration_decision_emitted = false;
         let mut compile_no_snapshot_narrow_retry_used = false;
         let mut max_repair_attempts = FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS;
+        let mut hook_snapshot_feedback_given = false;
+        let mut hook_snapshot_restore_used = false;
         for attempt in 1..=FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS
             + FINAL_ACCEPTANCE_COMPILE_NO_SNAPSHOT_EXTRA_ATTEMPTS
                 .max(FINAL_ACCEPTANCE_EVIDENCE_NO_CHANGE_EXTRA_ATTEMPTS)
@@ -5439,6 +5556,15 @@ pub fn run_ultra_plan_with_ui(
                     "Repair session mode: compact.\nEvidence repair compact mandate: use a fresh, minimal context and make the concrete Write/Edit change for the pending evidence keys. Do not inspect only.\n\n{repair_prompt}"
                 );
             }
+            repair_prompt = hook_snapshot::prefix_feedback_if_missing(
+                config,
+                &plan.profile,
+                &plan.goal,
+                "final_acceptance_repair",
+                Some(&fallback_phase.id),
+                &mut hook_snapshot_feedback_given,
+                repair_prompt,
+            );
             eval_events::emit(
                 config.eval_events_path.as_deref(),
                 json!({
@@ -5692,6 +5818,68 @@ pub fn run_ultra_plan_with_ui(
                     break;
                 }
                 continue;
+            }
+            if hook_snapshot_feedback_given && !hook_snapshot_restore_used {
+                match hook_snapshot::restore_first_missing(config, &plan.profile, &plan.goal) {
+                    Ok(Some(restored)) => {
+                        hook_snapshot_restore_used = true;
+                        push_context_items_capped(
+                            &mut ultra_context.created_or_changed_paths,
+                            std::slice::from_ref(&restored.restored_path),
+                            ULTRA_CONTEXT_MAX_PATHS,
+                            &mut ultra_context.truncated,
+                        );
+                        push_context_items_capped(
+                            &mut ultra_context.last_repair_changed_paths,
+                            std::slice::from_ref(&restored.restored_path),
+                            ULTRA_CONTEXT_MAX_PATHS,
+                            &mut ultra_context.truncated,
+                        );
+                        clear_final_acceptance_browser_probe_evidence(config);
+                        (acceptance_report, deterministic_remedies_applied) =
+                            ultra_final_acceptance_report_with_deterministic_remedies(
+                                plan,
+                                config,
+                                attempt,
+                                &mut setup_authority_state,
+                            )?;
+                        let remaining_keys = verification_missing_signals(&acceptance_report);
+                        let mut restored_changed_paths = actual_changed_paths.clone();
+                        merge_unique_strings(
+                            &mut restored_changed_paths,
+                            std::slice::from_ref(&restored.restored_path),
+                        );
+                        let mut restored_route_bound_paths = route_bound_changed_paths.clone();
+                        merge_unique_strings(
+                            &mut restored_route_bound_paths,
+                            std::slice::from_ref(&restored.restored_path),
+                        );
+                        let delta = FinalAcceptanceCycleDelta {
+                            cycle_index: attempt,
+                            resolved_keys: resolved_missing_signals(
+                                &before_missing_keys,
+                                &remaining_keys,
+                            ),
+                            remaining_keys,
+                            changed_paths: restored_changed_paths,
+                            route_bound_changed_paths: restored_route_bound_paths,
+                        };
+                        emit_final_acceptance_cycle_delta(
+                            config,
+                            &delta,
+                            acceptance_report.is_pass(),
+                        );
+                        final_acceptance_cycle_deltas.push(delta);
+                        if acceptance_report.is_pass() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        exhausted_reason = format!("hook_snapshot_restore_error:{err}");
+                    }
+                }
             }
             compile_no_source_change_count = 0;
             if actual_changed_paths.is_empty() {
@@ -5975,12 +6163,7 @@ fn repair_intermediate_profile_invariant(
                     setup_authority_state,
                 )?;
             }
-            retry = verify_profile_invariant(
-                &config.workspace_root,
-                &plan.profile,
-                &plan.goal,
-                profile_snapshot,
-            );
+            retry = verify_profile_invariant_with_hook_snapshot(config, plan, profile_snapshot);
             emit_profile_invariant_repair_event(
                 config,
                 plan,
@@ -6019,7 +6202,8 @@ fn repair_intermediate_profile_invariant(
         &plan.profile,
         &profile_expected_paths(&config.workspace_root, &plan.profile, &plan.goal),
     );
-    let repair_prompt = profile_invariant_model_repair_prompt(
+    let mut hook_snapshot_feedback_given = false;
+    let mut repair_prompt = profile_invariant_model_repair_prompt(
         plan,
         phase,
         &retry,
@@ -6027,6 +6211,15 @@ fn repair_intermediate_profile_invariant(
         &expected_paths,
         config,
         deterministic_error.as_deref(),
+    );
+    repair_prompt = hook_snapshot::prefix_feedback_if_missing(
+        config,
+        &plan.profile,
+        &plan.goal,
+        "profile_invariant_repair",
+        Some(&phase.id),
+        &mut hook_snapshot_feedback_given,
+        repair_prompt,
     );
     let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
     match run_profile_repair_with_ultra_session(
@@ -6059,12 +6252,7 @@ fn repair_intermediate_profile_invariant(
                 ultra_session.messages.len(),
                 true,
             );
-            retry = verify_profile_invariant(
-                &config.workspace_root,
-                &plan.profile,
-                &plan.goal,
-                profile_snapshot,
-            );
+            retry = verify_profile_invariant_with_hook_snapshot(config, plan, profile_snapshot);
             emit_profile_invariant_repair_event(
                 config,
                 plan,
@@ -6079,6 +6267,39 @@ fn repair_intermediate_profile_invariant(
                 return Ok(confirm_phase_build_after_profile_repair(
                     config, plan, phase, index, step_plan, retry,
                 ));
+            }
+            if hook_snapshot_feedback_given
+                && let Some(restored) =
+                    hook_snapshot::restore_first_missing(config, &plan.profile, &plan.goal)?
+            {
+                push_context_items_capped(
+                    &mut ultra_context.created_or_changed_paths,
+                    std::slice::from_ref(&restored.restored_path),
+                    ULTRA_CONTEXT_MAX_PATHS,
+                    &mut ultra_context.truncated,
+                );
+                push_context_items_capped(
+                    &mut ultra_context.last_repair_changed_paths,
+                    std::slice::from_ref(&restored.restored_path),
+                    ULTRA_CONTEXT_MAX_PATHS,
+                    &mut ultra_context.truncated,
+                );
+                retry = verify_profile_invariant_with_hook_snapshot(config, plan, profile_snapshot);
+                emit_profile_invariant_repair_event(
+                    config,
+                    plan,
+                    phase,
+                    index,
+                    "hook_snapshot_restore",
+                    true,
+                    retry.is_pass(),
+                    &retry.primary_reason(),
+                );
+                if retry.is_pass() {
+                    return Ok(confirm_phase_build_after_profile_repair(
+                        config, plan, phase, index, step_plan, retry,
+                    ));
+                }
             }
         }
         Err(err) => {
@@ -6997,6 +7218,12 @@ fn ultra_final_acceptance_report_inner(
         &effective_profile,
         &plan.goal,
         &ProfileSnapshot::None,
+    );
+    let profile_invariant_report = hook_snapshot::report_missing_as_profile_failure(
+        config,
+        &effective_profile,
+        &plan.goal,
+        profile_invariant_report,
     );
     let profile_report = if !profile_invariant_report.is_pass() {
         profile_invariant_report

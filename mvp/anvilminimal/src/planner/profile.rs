@@ -31,6 +31,29 @@ pub enum PhaseVerificationMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileHookSnapshotTarget {
+    pub relative_path: String,
+    pub required_attributes: Vec<ProfileHookAttribute>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ProfileHookAttribute {
+    PrimaryAction,
+    RestartAction,
+    State,
+}
+
+impl ProfileHookAttribute {
+    pub fn display(self) -> &'static str {
+        match self {
+            Self::PrimaryAction => "data-anvil-action=\"primary\"",
+            Self::RestartAction => "data-anvil-action=\"restart\"",
+            Self::State => "data-anvil-state",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileBuildOracle {
     pub command: String,
     pub profile: Option<String>,
@@ -180,6 +203,10 @@ pub trait DomainProfile: Sync {
     }
 
     fn evidence_repair_target_paths(&self, _root: &Path, _evidence_keys: &[String]) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn hook_snapshot_targets(&self, _root: &Path, _goal: &str) -> Vec<ProfileHookSnapshotTarget> {
         Vec::new()
     }
 
@@ -471,6 +498,10 @@ impl DomainProfile for NextjsProfile {
 
     fn evidence_repair_target_paths(&self, root: &Path, evidence_keys: &[String]) -> Vec<String> {
         crate::planner::profiles::nextjs::evidence_repair_target_paths(root, evidence_keys)
+    }
+
+    fn hook_snapshot_targets(&self, root: &Path, _goal: &str) -> Vec<ProfileHookSnapshotTarget> {
+        crate::planner::profiles::nextjs::hook_snapshot_targets(root)
     }
 
     fn infer_required_capabilities(&self, goal: &str) -> Vec<String> {
@@ -871,6 +902,14 @@ pub fn profile_evidence_repair_target_paths(
     evidence_keys: &[String],
 ) -> Vec<String> {
     domain_profile(profile).evidence_repair_target_paths(root, evidence_keys)
+}
+
+pub fn profile_hook_snapshot_targets(
+    root: &Path,
+    profile: &str,
+    goal: &str,
+) -> Vec<ProfileHookSnapshotTarget> {
+    domain_profile(profile).hook_snapshot_targets(root, goal)
 }
 
 pub fn profile_complete_scaffold(

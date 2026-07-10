@@ -6,8 +6,10 @@ use crate::minimal_loop::import_scan::{
     MissingImport, format_missing_import_findings, missing_import_target_path, route_bound_closure,
     scan_relative_imports,
 };
-use crate::planner::profile::ProfileQualityExpectations;
 use crate::planner::profile::profile_failure;
+use crate::planner::profile::{
+    ProfileHookAttribute, ProfileHookSnapshotTarget, ProfileQualityExpectations,
+};
 use crate::planner::signals::requested_port_from_text;
 use crate::planner::verify::{VerificationReport, VerifyStatus};
 
@@ -417,6 +419,20 @@ pub fn evidence_repair_target_paths(root: &Path, evidence_keys: &[String]) -> Ve
         push_unique_path(&mut out, rel);
     }
     out
+}
+
+pub fn hook_snapshot_targets(root: &Path) -> Vec<ProfileHookSnapshotTarget> {
+    route_bound_source_paths(root)
+        .into_iter()
+        .map(|relative_path| ProfileHookSnapshotTarget {
+            relative_path,
+            required_attributes: vec![
+                ProfileHookAttribute::PrimaryAction,
+                ProfileHookAttribute::RestartAction,
+                ProfileHookAttribute::State,
+            ],
+        })
+        .collect()
 }
 
 fn route_bound_source_paths(root: &Path) -> Vec<String> {
@@ -2024,6 +2040,37 @@ mod tests {
             Some("src/app/game.tsx")
         );
         assert!(targets.iter().any(|path| path == "src/app/page.tsx"));
+    }
+
+    #[test]
+    fn nextjs_hook_snapshot_targets_route_bound_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("package.json"), package_json()).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "import Game from './game';\nexport default function Page(){ return <Game />; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/game.tsx"),
+            "export default function Game(){ return <main data-anvil-state=\"{}\"><button data-anvil-action=\"primary\">Start</button><button data-anvil-action=\"restart\">Restart</button></main>; }\n",
+        )
+        .unwrap();
+
+        let targets = hook_snapshot_targets(dir.path());
+        let paths = targets
+            .iter()
+            .map(|target| target.relative_path.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"src/app/page.tsx"), "{paths:?}");
+        assert!(paths.contains(&"src/app/game.tsx"), "{paths:?}");
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.required_attributes.len() == 3)
+        );
     }
 
     #[test]
