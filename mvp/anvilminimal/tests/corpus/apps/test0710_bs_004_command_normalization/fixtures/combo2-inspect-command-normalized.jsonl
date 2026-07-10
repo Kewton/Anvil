@@ -1,0 +1,3 @@
+{"case":"test0710_bs_004/combo2","event":"command_timeout","command_summary":"ls -R","schema_version":"1"}
+{"case":"test0710_bs_004/combo2","event":"inspect_command_normalized","original":"ls -R","normalized":"find . -maxdepth 3 \\( -name node_modules -o -name .git -o -name .next -o -name .anvil \\) -prune -o -print | head -200","schema_version":"1"}
+{"case":"test0710_bs_004/combo2","event":"fallback_recovery_complete","reason":"timeout_fallback_recovered_after_bounded_inspection","schema_version":"1"}

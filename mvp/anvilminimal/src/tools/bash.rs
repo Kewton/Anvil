@@ -9,6 +9,8 @@ use crate::bounded_process::{self, BoundedProcessOutcomeKind};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_STREAM_BYTES: usize = 24_000;
 const OUTSIDE_WORKSPACE_MARKER: &str = "[outside workspace root — do not reference]";
+const INSPECT_MAX_DEPTH: usize = 3;
+const INSPECT_MAX_RESULTS: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BashOutcomeKind {
@@ -27,6 +29,12 @@ pub struct BashOutcome {
     pub stderr: String,
     pub elapsed_ms: u128,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectCommandNormalization {
+    pub original: String,
+    pub normalized: String,
 }
 
 impl BashOutcome {
@@ -124,7 +132,10 @@ where
     G: Fn() -> bool,
 {
     let started = Instant::now();
-    if let Some(reason) = blocked_reason(command, offline) {
+    let command = normalize_inspect_command(command, root)
+        .map(|normalization| normalization.normalized)
+        .unwrap_or_else(|| command.to_string());
+    if let Some(reason) = blocked_reason(&command, offline) {
         return Ok(BashOutcome {
             kind: BashOutcomeKind::Blocked,
             status: None,
@@ -134,7 +145,7 @@ where
             summary: reason,
         });
     }
-    if let Some(rejection) = path_confinement_rejection(command, root) {
+    if let Some(rejection) = path_confinement_rejection(&command, root) {
         return Ok(BashOutcome {
             kind: BashOutcomeKind::Blocked,
             status: None,
@@ -146,7 +157,7 @@ where
     }
 
     let mut process = Command::new("sh");
-    process.arg("-c").arg(command).current_dir(root);
+    process.arg("-c").arg(&command).current_dir(root);
     process.stdout(Stdio::piped()).stderr(Stdio::piped());
     let output = bounded_process::run_with_timeout_cancel_and_force(
         &mut process,
@@ -174,7 +185,7 @@ where
                 stdout: truncate_stream(&stdout),
                 stderr: truncate_stream(&stderr),
                 elapsed_ms: output.elapsed.as_millis(),
-                summary: build_summary(command, kind, &stdout, &stderr),
+                summary: build_summary(&command, kind, &stdout, &stderr),
             })
         }
         BoundedProcessOutcomeKind::Cancelled | BoundedProcessOutcomeKind::CommandAbortedByUser => {
@@ -216,6 +227,285 @@ pub fn format_outcome(outcome: &BashOutcome) -> String {
         outcome.stdout,
         outcome.stderr
     )
+}
+
+pub fn normalize_inspect_command(
+    command: &str,
+    root: &Path,
+) -> Option<InspectCommandNormalization> {
+    let original = command.trim();
+    if original.is_empty() || contains_unquoted_shell_control(original) {
+        return None;
+    }
+    let tokens = shell_words(original)?;
+    let normalized = match tokens.first().map(String::as_str)? {
+        "ls" => normalize_recursive_ls(&tokens, root),
+        "find" => normalize_broad_find(&tokens, root),
+        "du" => normalize_broad_du(&tokens, root),
+        "grep" => normalize_recursive_grep(&tokens, root),
+        _ => None,
+    }?;
+    (normalized != original).then(|| InspectCommandNormalization {
+        original: original.to_string(),
+        normalized,
+    })
+}
+
+fn normalize_recursive_ls(tokens: &[String], root: &Path) -> Option<String> {
+    let mut recursive = false;
+    let mut paths = Vec::new();
+    for token in &tokens[1..] {
+        if token == "--recursive" {
+            recursive = true;
+            continue;
+        }
+        if token.starts_with('-') && token.len() > 1 {
+            if token.trim_start_matches('-').contains('R') {
+                recursive = true;
+            }
+            continue;
+        }
+        paths.push(token.as_str());
+    }
+    if !recursive || !paths_are_workspace_root(&paths, root) {
+        return None;
+    }
+    Some(bounded_find_listing_command())
+}
+
+fn normalize_broad_find(tokens: &[String], root: &Path) -> Option<String> {
+    match tokens {
+        [program] if program == "find" => Some(bounded_find_listing_command()),
+        [program, path] if program == "find" && path_is_workspace_root(path, root) => {
+            Some(bounded_find_listing_command())
+        }
+        _ => None,
+    }
+}
+
+fn normalize_broad_du(tokens: &[String], root: &Path) -> Option<String> {
+    let mut recursive = false;
+    let mut paths = Vec::new();
+    for token in &tokens[1..] {
+        if token == "-a" || token == "--all" {
+            recursive = true;
+            continue;
+        }
+        if token.starts_with('-') && token.len() > 1 {
+            if token.trim_start_matches('-').contains('a') {
+                recursive = true;
+            }
+            continue;
+        }
+        paths.push(token.as_str());
+    }
+    if !recursive || !paths_are_workspace_root(&paths, root) {
+        return None;
+    }
+    Some(format!(
+        "{} -exec du -s {{}} + | head -{}",
+        bounded_find_pruned_prefix(),
+        INSPECT_MAX_RESULTS
+    ))
+}
+
+fn normalize_recursive_grep(tokens: &[String], root: &Path) -> Option<String> {
+    let mut recursive = false;
+    let mut index = 1usize;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if token == "-e" || token == "--regexp" {
+            index += 1;
+            break;
+        }
+        if token.starts_with("-e") && token.len() > 2 {
+            break;
+        }
+        if let Some(pattern) = token.strip_prefix("--regexp=")
+            && !pattern.is_empty()
+        {
+            break;
+        }
+        if token == "-r" || token == "-R" || token == "--recursive" {
+            recursive = true;
+            index += 1;
+            continue;
+        }
+        if token.starts_with('-') && token.len() > 1 {
+            if !grep_inspect_option_is_simple(token) {
+                return None;
+            }
+            let flags = token.trim_start_matches('-');
+            if flags.contains('r') || flags.contains('R') {
+                recursive = true;
+            }
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    if !recursive || index >= tokens.len() {
+        return None;
+    }
+    let pattern = tokens[index].as_str();
+    let paths = tokens[(index + 1)..]
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !paths_are_workspace_root(&paths, root) {
+        return None;
+    }
+    Some(format!(
+        "{} -type f -exec grep -H -- {} {{}} + | head -{}",
+        bounded_find_pruned_prefix(),
+        shell_quote(pattern),
+        INSPECT_MAX_RESULTS
+    ))
+}
+
+fn grep_inspect_option_is_simple(token: &str) -> bool {
+    if token.starts_with("--") {
+        return matches!(
+            token,
+            "--recursive" | "--ignore-case" | "--line-number" | "--with-filename" | "--no-filename"
+        );
+    }
+    token
+        .trim_start_matches('-')
+        .chars()
+        .all(|ch| matches!(ch, 'r' | 'R' | 'i' | 'n' | 'q' | 's' | 'H' | 'h' | 'I'))
+}
+
+fn bounded_find_listing_command() -> String {
+    format!(
+        "{} -print | head -{}",
+        bounded_find_pruned_prefix(),
+        INSPECT_MAX_RESULTS
+    )
+}
+
+fn bounded_find_pruned_prefix() -> String {
+    format!(
+        "find . -maxdepth {} \\( -name node_modules -o -name .git -o -name .next -o -name .anvil \\) -prune -o",
+        INSPECT_MAX_DEPTH
+    )
+}
+
+fn paths_are_workspace_root(paths: &[&str], root: &Path) -> bool {
+    paths.is_empty() || paths.iter().all(|path| path_is_workspace_root(path, root))
+}
+
+fn path_is_workspace_root(path: &str, root: &Path) -> bool {
+    let trimmed = path.trim();
+    if matches!(trimmed, "." | "./") {
+        return true;
+    }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return false;
+    }
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let comparable = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    comparable == root
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn shell_words(command: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut single = false;
+    let mut double = false;
+    for ch in command.chars() {
+        if single {
+            if ch == '\'' {
+                single = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if double {
+            if ch == '"' {
+                double = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if ch.is_whitespace() {
+            if in_word {
+                out.push(std::mem::take(&mut current));
+                in_word = false;
+            }
+            continue;
+        }
+        in_word = true;
+        match ch {
+            '\'' => single = true,
+            '"' => double = true,
+            _ => current.push(ch),
+        }
+    }
+    if single || double {
+        return None;
+    }
+    if in_word {
+        out.push(current);
+    }
+    Some(out)
+}
+
+fn contains_unquoted_shell_control(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut single = false;
+    let mut double = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' if !double => {
+                single = !single;
+                index += 1;
+            }
+            b'"' if !single => {
+                double = !double;
+                index += 1;
+            }
+            b'$' if !single && !double && index + 1 < bytes.len() && bytes[index + 1] == b'(' => {
+                return true;
+            }
+            byte if !single
+                && !double
+                && matches!(
+                    byte,
+                    b';' | b'&' | b'|' | b'<' | b'>' | b'`' | b'\n' | b'\r'
+                ) =>
+            {
+                return true;
+            }
+            _ => index += 1,
+        }
+    }
+    single || double
 }
 
 pub fn blocked_reason(command: &str, offline: bool) -> Option<String> {
@@ -621,5 +911,50 @@ mod tests {
         assert!(
             path_confinement_rejection(&format!("test -f {}", package.display()), root).is_none()
         );
+    }
+
+    #[test]
+    fn bash_normalizes_unbounded_recursive_ls_before_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("src/app/page.tsx"), "page").unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/index.js"), "pkg").unwrap();
+
+        let normalization = normalize_inspect_command("ls -R", dir.path()).unwrap();
+        assert!(normalization.normalized.contains("find . -maxdepth 3"));
+        assert!(normalization.normalized.contains("-name node_modules"));
+        assert!(normalization.normalized.contains("head -200"));
+
+        let outcome = run_structured("ls -R", dir.path(), false, DEFAULT_TIMEOUT, || false)
+            .expect("normalized ls should execute");
+        assert_eq!(outcome.kind, BashOutcomeKind::Success);
+        assert!(outcome.stdout.contains("./src/app"), "{}", outcome.stdout);
+        assert!(
+            !outcome.stdout.contains("node_modules"),
+            "{}",
+            outcome.stdout
+        );
+    }
+
+    #[test]
+    fn bash_keeps_path_limited_ls_and_plain_grep_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(normalize_inspect_command("ls src/app", dir.path()).is_none());
+        assert!(
+            normalize_inspect_command("grep -q primary src/app/page.tsx", dir.path()).is_none()
+        );
+    }
+
+    #[test]
+    fn bash_normalizes_pathless_recursive_grep_to_bounded_find() {
+        let dir = tempfile::tempdir().unwrap();
+        let normalization = normalize_inspect_command("grep -r TODO", dir.path()).unwrap();
+
+        assert!(normalization.normalized.contains("find . -maxdepth 3"));
+        assert!(normalization.normalized.contains("-name .git"));
+        assert!(normalization.normalized.contains("grep -H -- 'TODO'"));
+        assert!(normalization.normalized.contains("head -200"));
     }
 }

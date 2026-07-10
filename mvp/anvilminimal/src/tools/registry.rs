@@ -87,14 +87,28 @@ impl ToolRegistry {
         let arguments = &recovered.arguments;
         match name {
             "Bash" => {
-                let command = required_string(arguments, "command")?;
-                if let Some(rejection) =
-                    crate::tools::bash::path_confinement_rejection(command, &context.root)
+                let mut command = required_string(arguments, "command")?.to_string();
+                if let Some(normalization) =
+                    crate::tools::bash::normalize_inspect_command(&command, &context.root)
                 {
-                    emit_bash_path_confinement_rejected(context, command, &rejection);
+                    eval_events::emit(
+                        context.eval_events_path.as_deref(),
+                        json!({
+                            "event": "inspect_command_normalized",
+                            "schema_version": "1",
+                            "original": eval_events::body_snippet(&normalization.original),
+                            "normalized": eval_events::body_snippet(&normalization.normalized),
+                        }),
+                    );
+                    command = normalization.normalized;
+                }
+                if let Some(rejection) =
+                    crate::tools::bash::path_confinement_rejection(&command, &context.root)
+                {
+                    emit_bash_path_confinement_rejected(context, &command, &rejection);
                 }
                 crate::tools::bash::run_with_cancel_and_force(
-                    command,
+                    &command,
                     &context.root,
                     context.offline,
                     is_cancelled,
@@ -1234,6 +1248,38 @@ mod tests {
         assert!(message.contains("test0709_camp_003"), "{message}");
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains(r#""event":"bash_path_confinement_rejected""#));
+    }
+
+    #[test]
+    fn bash_normalized_inspection_command_emits_eval_event() {
+        let registry = ToolRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.path().join("src/app/page.tsx"), "page").unwrap();
+        std::fs::write(dir.path().join("node_modules/pkg/index.js"), "pkg").unwrap();
+        let events = dir.path().join("events.jsonl");
+        let context = ToolContext {
+            root: dir.path().to_path_buf(),
+            mode: ExecutionMode::Act,
+            auto_approve: true,
+            interactive_approval: false,
+            offline: false,
+            workspace_policy: WorkspacePolicy::NormalTask,
+            eval_events_path: Some(events.clone()),
+            expected_paths: Vec::new(),
+        };
+
+        let output = registry
+            .execute("Bash", &json!({"command":"ls -R"}), &context)
+            .unwrap();
+
+        assert!(output.contains("./src/app"), "{output}");
+        assert!(!output.contains("node_modules"), "{output}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"inspect_command_normalized""#));
+        assert!(event_text.contains(r#""original":"ls -R""#));
+        assert!(event_text.contains("find . -maxdepth 3"));
     }
 
     #[test]

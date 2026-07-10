@@ -1,3 +1,4 @@
+pub mod hook_attributes;
 pub mod hook_snapshot;
 pub mod intent;
 pub mod lint;

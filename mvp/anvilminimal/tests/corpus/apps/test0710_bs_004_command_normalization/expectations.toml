@@ -1,0 +1,40 @@
+case_id = "test0710_bs_004_command_normalization"
+source = "bs004 broad inspect and hook grep normalization fixtures"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["bs004", "combo2", "combo3", "normalization"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/combo2-inspect-command-normalized.jsonl = [
+  "test0710_bs_004/combo2",
+  "\"event\":\"inspect_command_normalized\"",
+  "\"original\":\"ls -R\"",
+  "find . -maxdepth 3",
+  "-name node_modules",
+  "\"event\":\"fallback_recovery_complete\""
+]
+fixtures/combo3-hook-grep-normalized.jsonl = [
+  "test0710_bs_004/combo3",
+  "data-anvil-action='primary'",
+  "data-anvil-action=\\\"primary\\\"",
+  "\"kind\":\"hook_attribute_grep\"",
+  "\"normalization_source\":\"hook_attribute_grep\"",
+  "\"event\":\"verify_command_normalized_at_runtime\""
+]

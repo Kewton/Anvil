@@ -63,6 +63,7 @@ const FALLBACK_TRUE_STRIPPED_REASON: &str =
 const SUCCESS_FAILURE_ECHO_STRIPPED_REASON: &str = "success_failure_echo_stripped: verifier exit status already records pass/fail; trailing echo branches mask the base command";
 const WORKSPACE_CD_NORMALIZED_REASON: &str =
     "workspace_cd_normalized: absolute workspace cd rewritten to workspace-relative verifier form";
+const HOOK_ATTRIBUTE_GREP_REASON: &str = "hook_attribute_grep: data-anvil hook grep replaced with quote- and JSX-brace-aware semantic check";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyCommandViolationKind {
@@ -73,6 +74,7 @@ pub enum VerifyCommandViolationKind {
     WorkspaceEscape,
     GrepDashPattern,
     PackageJsonScriptGrep,
+    HookAttributeGrep,
     OutputPipeStripped,
     StderrMergeStripped,
     ExitCodeEchoStripped,
@@ -91,6 +93,7 @@ impl VerifyCommandViolationKind {
             Self::WorkspaceEscape => "workspace_escape",
             Self::GrepDashPattern => "grep_dash_pattern",
             Self::PackageJsonScriptGrep => "package_json_script_grep",
+            Self::HookAttributeGrep => "hook_attribute_grep",
             Self::OutputPipeStripped => "output_pipe_stripped",
             Self::StderrMergeStripped => "stderr_merge_stripped",
             Self::ExitCodeEchoStripped => "exit_code_echo_stripped",
@@ -116,6 +119,9 @@ impl VerifyCommandViolationKind {
             Self::GrepDashPattern => "grep pattern begins with '-' but command lacks `--` or `-e`",
             Self::PackageJsonScriptGrep => {
                 "grep package.json script assertion should use JSON parser"
+            }
+            Self::HookAttributeGrep => {
+                "grep data-anvil hook assertion should use semantic hook detection"
             }
             Self::OutputPipeStripped => "verify command output-limiting pipe should be stripped",
             Self::StderrMergeStripped => "verify command stderr merge should be stripped",
@@ -1506,6 +1512,7 @@ pub fn normalize_verify_command(command: &str) -> anyhow::Result<NormalizedVerif
             violation,
             VerifyCommandViolationKind::GrepDashPattern
                 | VerifyCommandViolationKind::PackageJsonScriptGrep
+                | VerifyCommandViolationKind::HookAttributeGrep
                 | VerifyCommandViolationKind::OutputPipeStripped
                 | VerifyCommandViolationKind::StderrMergeStripped
                 | VerifyCommandViolationKind::ExitCodeEchoStripped
@@ -1654,6 +1661,7 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
     if let Some(repair) = normalize_verify_command_for_oracle_repair(&normalized) {
         let violation = match repair.kind {
             "package_json_script_assertion" => VerifyCommandViolationKind::PackageJsonScriptGrep,
+            "hook_attribute_grep" => VerifyCommandViolationKind::HookAttributeGrep,
             "output_pipe_stripped" => VerifyCommandViolationKind::OutputPipeStripped,
             "stderr_merge_stripped" => VerifyCommandViolationKind::StderrMergeStripped,
             "exit_code_echo_stripped" => VerifyCommandViolationKind::ExitCodeEchoStripped,
@@ -1766,6 +1774,13 @@ pub fn normalize_verify_command_for_oracle_repair(
             reason: "grep package.json script assertion replaced with JSON parser check"
                 .to_string(),
             kind: "package_json_script_assertion",
+        });
+    }
+    if let Some(hook_check) = hook_attribute_grep_check_command(&tokens) {
+        return Some(VerifyCommandOracleRepair {
+            normalized: hook_check,
+            reason: HOOK_ATTRIBUTE_GREP_REASON.to_string(),
+            kind: "hook_attribute_grep",
         });
     }
     let grep = grep_dash_pattern(&tokens)?;
@@ -2323,6 +2338,170 @@ fn package_json_script_grep_check_command(tokens: &[ShellWord]) -> Option<String
     package_json_script_check_command(&grep.pattern)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HookGrepAssertion {
+    Action { value: String },
+    State,
+}
+
+fn hook_attribute_grep_check_command(tokens: &[ShellWord]) -> Option<String> {
+    let grep = grep_pattern(tokens)?;
+    let assertion = parse_hook_grep_assertion(&grep.pattern)?;
+    let source_path = single_hook_grep_source_path(&tokens[(grep.pattern_index + 1)..])?;
+    Some(hook_attribute_check_command(&assertion, &source_path))
+}
+
+fn parse_hook_grep_assertion(pattern: &str) -> Option<HookGrepAssertion> {
+    parse_data_anvil_action_grep(pattern)
+        .map(|value| HookGrepAssertion::Action { value })
+        .or_else(|| parse_data_anvil_state_grep(pattern).then_some(HookGrepAssertion::State))
+}
+
+fn parse_data_anvil_action_grep(pattern: &str) -> Option<String> {
+    let rest = pattern
+        .trim()
+        .strip_prefix("data-anvil-action")?
+        .trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let (value, rest) = parse_hook_grep_value(rest)?;
+    rest.trim().is_empty().then_some(value)
+}
+
+fn parse_hook_grep_value(input: &str) -> Option<(String, &str)> {
+    let input = input.trim_start();
+    if let Some(rest) = input.strip_prefix('{') {
+        let (value, rest) = parse_hook_grep_value(rest)?;
+        return rest
+            .trim_start()
+            .strip_prefix('}')
+            .map(|rest| (value, rest));
+    }
+    let mut chars = input.char_indices();
+    let Some((_, first)) = chars.next() else {
+        return None;
+    };
+    if matches!(first, '"' | '\'' | '`') {
+        let quote = first;
+        let rest = &input[first.len_utf8()..];
+        let end = rest.find(quote)?;
+        let value = &rest[..end];
+        return safe_hook_action_value(value)
+            .then(|| (value.to_string(), &rest[(end + quote.len_utf8())..]));
+    }
+    let end = input
+        .find(|ch: char| !matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '-'))
+        .unwrap_or(input.len());
+    if end == 0 {
+        return None;
+    }
+    let value = &input[..end];
+    safe_hook_action_value(value).then(|| (value.to_string(), &input[end..]))
+}
+
+fn parse_data_anvil_state_grep(pattern: &str) -> bool {
+    let rest = match pattern.trim().strip_prefix("data-anvil-state") {
+        Some(rest) => rest.trim(),
+        None => return false,
+    };
+    rest.is_empty() || rest == "=" || rest.starts_with('=')
+}
+
+fn safe_hook_action_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .chars()
+            .all(|ch| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '-'))
+}
+
+fn single_hook_grep_source_path(tokens: &[ShellWord]) -> Option<String> {
+    let tokens = if tokens.first().is_some_and(|token| token.value == "--") {
+        &tokens[1..]
+    } else {
+        tokens
+    };
+    let [path] = tokens else {
+        return None;
+    };
+    hook_source_path(&path.value)
+}
+
+fn hook_source_path(path: &str) -> Option<String> {
+    let rel = path.trim().trim_start_matches("./").replace('\\', "/");
+    if rel.is_empty()
+        || rel.starts_with('/')
+        || rel.contains('\0')
+        || rel.chars().any(char::is_whitespace)
+        || rel.bytes().any(|byte| {
+            matches!(
+                byte,
+                b'\'' | b'"' | b'\\' | b';' | b'&' | b'|' | b'<' | b'>' | b'`'
+            )
+        })
+    {
+        return None;
+    }
+    validate_workspace_relative(&rel).ok()?;
+    let lower = rel.to_ascii_lowercase();
+    if lower == ".anvil"
+        || lower.starts_with(".anvil/")
+        || lower.contains("/.anvil/")
+        || lower == ".git"
+        || lower.starts_with(".git/")
+        || lower.contains("/.git/")
+        || lower == ".next"
+        || lower.starts_with(".next/")
+        || lower.contains("/.next/")
+        || lower == "node_modules"
+        || lower.starts_with("node_modules/")
+        || lower.contains("/node_modules/")
+    {
+        return None;
+    }
+    let ext = Path::new(&rel).extension().and_then(|ext| ext.to_str())?;
+    matches!(ext, "tsx" | "ts" | "jsx" | "js" | "mjs" | "cjs").then_some(rel)
+}
+
+fn hook_attribute_check_command(assertion: &HookGrepAssertion, source_path: &str) -> String {
+    match assertion {
+        HookGrepAssertion::Action { value } => {
+            format!(
+                concat!(
+                    "node -p '",
+                    "(function(s,w,d,q,b){{return [",
+                    "new RegExp(\"data-anvil-action\"+w+\"=\"+w+d+\"{value}\"+d),",
+                    "new RegExp(\"data-anvil-action\"+w+\"=\"+w+q+\"{value}\"+q),",
+                    "new RegExp(\"data-anvil-action\"+w+\"=\"+w+\"[{{]\"+w+d+\"{value}\"+d+w+\"[}}]\"),",
+                    "new RegExp(\"data-anvil-action\"+w+\"=\"+w+\"[{{]\"+w+q+\"{value}\"+q+w+\"[}}]\"),",
+                    "new RegExp(\"data-anvil-action\"+w+\"=\"+w+\"[{{]\"+w+b+\"{value}\"+b+w+\"[}}]\")",
+                    "].some(function(r){{return r.test(s)}})?true:process.exit(1)}})",
+                    "(String(require(\"fs\").readFileSync(\"{source_path}\")),",
+                    "String.fromCharCode(92)+\"s*\",String.fromCharCode(34),",
+                    "String.fromCharCode(39),String.fromCharCode(96))",
+                    "'"
+                ),
+                value = value,
+                source_path = source_path
+            )
+        }
+        HookGrepAssertion::State => {
+            format!(
+                concat!(
+                    "node -p '",
+                    "(function(s,w,b){{return [",
+                    "new RegExp(\"data-anvil-state\"+w+\"=\"),",
+                    "new RegExp(\"data-anvil-state\"+b)",
+                    "].some(function(r){{return r.test(s)}})?true:process.exit(1)}})",
+                    "(String(require(\"fs\").readFileSync(\"{source_path}\")),",
+                    "String.fromCharCode(92)+\"s*\",String.fromCharCode(92)+\"b\")",
+                    "'"
+                ),
+                source_path = source_path
+            )
+        }
+    }
+}
+
 fn package_json_script_check_command(pattern: &str) -> Option<String> {
     if let Some(port) = package_json_port_only_pattern(pattern) {
         return Some(package_json_port_script_check_command(&port));
@@ -2844,6 +3023,25 @@ mod tests {
         .unwrap();
     }
 
+    fn write_page(root: &Path, source: &str) {
+        std::fs::create_dir_all(root.join("src/app")).unwrap();
+        std::fs::write(root.join("src/app/page.tsx"), source).unwrap();
+    }
+
+    fn assert_hook_grep_passes(command: &str, source: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(dir.path(), source);
+        let diagnosis = diagnose_verify_command(command);
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::HookAttributeGrep),
+            "{diagnosis:?}"
+        );
+        let normalized = normalize_verify_command(command).unwrap();
+        crate::tools::bash::run_checked(normalized.as_str(), dir.path(), false)
+            .unwrap_or_else(|err| panic!("normalized hook grep failed: {err}"));
+    }
+
     #[test]
     fn missing_path_before_evidence() {
         let dir = tempfile::tempdir().unwrap();
@@ -2998,6 +3196,63 @@ mod tests {
         assert_eq!(
             diagnosis.normalized,
             r#"node -p "String(require('./package.json').scripts.dev).includes('next dev -p 3011') ? true : process.exit(1)""#
+        );
+    }
+
+    #[test]
+    fn verify_command_normalizes_hook_action_grep_across_quotes_and_jsx_braces() {
+        assert_hook_grep_passes(
+            r#"grep -q "data-anvil-action='primary'" src/app/page.tsx"#,
+            r#"export default function Page(){return <button data-anvil-action="primary">Go</button>}"#,
+        );
+        assert_hook_grep_passes(
+            r#"grep -q 'data-anvil-action="primary"' src/app/page.tsx"#,
+            r#"export default function Page(){return <button data-anvil-action='primary'>Go</button>}"#,
+        );
+        assert_hook_grep_passes(
+            r#"grep -q "data-anvil-action='primary'" src/app/page.tsx"#,
+            r#"export default function Page(){return <button data-anvil-action={"primary"}>Go</button>}"#,
+        );
+    }
+
+    #[test]
+    fn verify_command_normalizes_restart_input_and_state_hook_greps() {
+        assert_hook_grep_passes(
+            r#"grep -q 'data-anvil-action="restart"' src/app/page.tsx"#,
+            r#"export default function Page(){return <button data-anvil-action={"restart"}>Again</button>}"#,
+        );
+        assert_hook_grep_passes(
+            r#"grep -q "data-anvil-action='input'" src/app/page.tsx"#,
+            r#"export default function Page(){return <input data-anvil-action={"input"} />}"#,
+        );
+        assert_hook_grep_passes(
+            "grep -q data-anvil-state src/app/page.tsx",
+            r#"export default function Page(){return <main data-anvil-state={JSON.stringify({score:0})}>Game</main>}"#,
+        );
+    }
+
+    #[test]
+    fn verify_command_hook_grep_still_fails_when_hook_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#"export default function Page(){return <main>Missing hook</main>}"#,
+        );
+        let normalized =
+            normalize_verify_command(r#"grep -q "data-anvil-action='primary'" src/app/page.tsx"#)
+                .unwrap();
+
+        let err = crate::tools::bash::run_checked(normalized.as_str(), dir.path(), false)
+            .expect_err("missing hook should fail");
+
+        assert!(err.to_string().contains("command failed"), "{err}");
+    }
+
+    #[test]
+    fn verify_command_keeps_unrelated_grep_outside_hook_repair() {
+        assert_eq!(
+            diagnose_verify_command("grep -q primary src/app/page.tsx").violation,
+            None
         );
     }
 

@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::config::Config;
 use crate::eval_events;
+use crate::planner::hook_attributes::{hook_attribute_present, hook_attributes_present};
 use crate::planner::profile::{ProfileHookAttribute, profile_hook_snapshot_targets};
 use crate::planner::verify::VerificationReport;
 
@@ -328,29 +328,6 @@ fn profile_failure_reason(diagnostic: &HookSnapshotDiagnostic) -> String {
         diagnostic.missing_attributes.join(","),
         diagnostic.snapshot_phase
     )
-}
-
-fn hook_attributes_present(source: &str, attributes: &[ProfileHookAttribute]) -> bool {
-    attributes
-        .iter()
-        .all(|attribute| hook_attribute_present(source, *attribute))
-}
-
-fn hook_attribute_present(source: &str, attribute: ProfileHookAttribute) -> bool {
-    match attribute {
-        ProfileHookAttribute::PrimaryAction => data_anvil_action_present(source, "primary"),
-        ProfileHookAttribute::RestartAction => data_anvil_action_present(source, "restart"),
-        ProfileHookAttribute::State => Regex::new(r#"(?s)data-anvil-state(?:\s*=|\b)"#)
-            .is_ok_and(|regex| regex.is_match(source)),
-    }
-}
-
-fn data_anvil_action_present(source: &str, value: &str) -> bool {
-    let pattern = format!(
-        r#"(?s)data-anvil-action\s*=\s*(?:"{0}"|'{0}'|\{{\s*(?:"{0}"|'{0}'|`{0}`)\s*\}})"#,
-        regex::escape(value)
-    );
-    Regex::new(&pattern).is_ok_and(|regex| regex.is_match(source))
 }
 
 fn unified_diff_near_missing(
