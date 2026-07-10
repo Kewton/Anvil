@@ -373,6 +373,85 @@ pub fn app_source_paths(root: &Path) -> Vec<String> {
         .collect()
 }
 
+pub fn evidence_repair_target_paths(root: &Path, evidence_keys: &[String]) -> Vec<String> {
+    if !evidence_keys
+        .iter()
+        .any(|key| behavioral_repair_evidence(key))
+    {
+        return Vec::new();
+    }
+    let route_bound = route_bound_source_paths(root);
+    let mut out = Vec::new();
+    for rel in route_bound
+        .iter()
+        .filter(|rel| source_contains_data_anvil(root, rel))
+    {
+        push_unique_path(&mut out, rel);
+    }
+    for entrypoint in [
+        "src/app/page.tsx",
+        "src/app/page.jsx",
+        "src/app/page.ts",
+        "src/app/page.js",
+        "app/page.tsx",
+        "app/page.jsx",
+        "app/page.ts",
+        "app/page.js",
+        "pages/index.tsx",
+        "pages/index.jsx",
+        "pages/index.ts",
+        "pages/index.js",
+        "src/pages/index.tsx",
+        "src/pages/index.jsx",
+        "src/pages/index.ts",
+        "src/pages/index.js",
+    ] {
+        for rel in route_bound
+            .iter()
+            .filter(|rel| rel.as_str() == entrypoint || rel.ends_with(&format!("/{entrypoint}")))
+        {
+            push_unique_path(&mut out, rel);
+        }
+    }
+    for rel in &route_bound {
+        push_unique_path(&mut out, rel);
+    }
+    out
+}
+
+fn route_bound_source_paths(root: &Path) -> Vec<String> {
+    route_bound_closure(root, "nextjs")
+        .into_iter()
+        .map(|path| path.display().to_string().replace('\\', "/"))
+        .filter(|rel| is_import_scan_source_path(Path::new(rel)))
+        .collect()
+}
+
+fn source_contains_data_anvil(root: &Path, rel: &str) -> bool {
+    std::fs::read_to_string(root.join(rel)).is_ok_and(|content| content.contains("data-anvil-"))
+}
+
+fn behavioral_repair_evidence(key: &str) -> bool {
+    matches!(
+        key.trim(),
+        "restart_or_recoverable_state_evidence"
+            | "challenge_or_adversary_evidence"
+            | "failure_or_collision_evidence"
+            | "user_input_handler_evidence"
+            | "stateful_update_evidence"
+            | "visible_interactive_surface_evidence"
+            | "interactive_ui_source_evidence"
+            | "non_static_screen_evidence"
+            | "score_or_progression_evidence"
+    )
+}
+
+fn push_unique_path(out: &mut Vec<String>, path: &str) {
+    if !path.trim().is_empty() && !out.iter().any(|existing| existing == path) {
+        out.push(path.to_string());
+    }
+}
+
 pub fn quality_expectations(root: &Path, goal: &str) -> ProfileQualityExpectations {
     ProfileQualityExpectations {
         required_artifacts: expected_paths(root, goal),
@@ -1917,6 +1996,34 @@ mod tests {
             text.contains("unverified:terminal_state_not_reached"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn nextjs_evidence_repair_targets_route_bound_behavioral_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("package.json"), package_json()).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "import Game from './game';\nexport default function Page(){ return <Game />; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/game.tsx"),
+            "export default function Game(){ return <button data-anvil-action=\"restart\">Restart</button>; }\n",
+        )
+        .unwrap();
+
+        let targets = evidence_repair_target_paths(
+            dir.path(),
+            &["restart_or_recoverable_state_evidence".to_string()],
+        );
+
+        assert_eq!(
+            targets.first().map(String::as_str),
+            Some("src/app/game.tsx")
+        );
+        assert!(targets.iter().any(|path| path == "src/app/page.tsx"));
     }
 
     #[test]

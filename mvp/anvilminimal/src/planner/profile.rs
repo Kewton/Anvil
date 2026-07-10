@@ -179,6 +179,10 @@ pub trait DomainProfile: Sync {
         Vec::new()
     }
 
+    fn evidence_repair_target_paths(&self, _root: &Path, _evidence_keys: &[String]) -> Vec<String> {
+        Vec::new()
+    }
+
     fn infer_required_capabilities(&self, _goal: &str) -> Vec<String> {
         Vec::new()
     }
@@ -463,6 +467,10 @@ impl DomainProfile for NextjsProfile {
 
     fn source_paths(&self, root: &Path) -> Vec<String> {
         crate::planner::profiles::nextjs::app_source_paths(root)
+    }
+
+    fn evidence_repair_target_paths(&self, root: &Path, evidence_keys: &[String]) -> Vec<String> {
+        crate::planner::profiles::nextjs::evidence_repair_target_paths(root, evidence_keys)
     }
 
     fn infer_required_capabilities(&self, goal: &str) -> Vec<String> {
@@ -855,6 +863,14 @@ pub fn profile_expected_paths(root: &Path, profile: &str, goal: &str) -> Vec<Str
 
 pub fn profile_setup_scaffold_paths(root: &Path, profile: &str) -> Vec<String> {
     domain_profile(profile).setup_scaffold_paths(root)
+}
+
+pub fn profile_evidence_repair_target_paths(
+    root: &Path,
+    profile: &str,
+    evidence_keys: &[String],
+) -> Vec<String> {
+    domain_profile(profile).evidence_repair_target_paths(root, evidence_keys)
 }
 
 pub fn profile_complete_scaffold(

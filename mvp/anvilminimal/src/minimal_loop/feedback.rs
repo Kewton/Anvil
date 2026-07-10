@@ -182,23 +182,61 @@ pub fn read_only_stagnation_compact(objective: &str, streak: usize) -> String {
 }
 
 pub fn read_only_stagnation_write_required(
-    target_path: &str,
+    selected_targets: &[String],
     streak: usize,
     attempt_limit: usize,
 ) -> String {
+    let targets = format_target_list(selected_targets);
+    if selected_targets.len() == 1 {
+        let target = selected_targets[0].trim();
+        return format!(
+            "Read-only stagnation has escalated to write_required. Use a full-file Write or Edit for `{target}` now. Read, Grep, Glob, Bash, and prose-only responses are suspended until `{target}` is written. Write/Edit to a different path is allowed, but write_required remains active until the selected target is written. read_only_streak={streak}; write_required_no_write_limit={attempt_limit}"
+        );
+    }
     format!(
-        "Read-only stagnation has escalated to write_required. Use a full-file Write or Edit for `{target_path}` now. Read, Grep, Glob, Bash, prose-only responses, and Write/Edit to any other path are suspended until `{target_path}` is written. read_only_streak={streak}; write_required_no_write_limit={attempt_limit}"
+        "Read-only stagnation has escalated to write_required. Use a full-file Write or Edit for one of these targets now: {targets}. Read, Grep, Glob, Bash, and prose-only responses are suspended until one selected target is written. Write/Edit to a different path is allowed, but write_required remains active until a selected target is written. read_only_streak={streak}; write_required_no_write_limit={attempt_limit}"
     )
 }
 
 pub fn read_only_write_required_tool_rejected(
-    target_path: &str,
+    selected_targets: &[String],
     attempt: usize,
     attempt_limit: usize,
 ) -> String {
+    let targets = format_target_list(selected_targets);
     format!(
-        "read-only tools are suspended; write `{target_path}` now with Write/Edit. write_required_no_write_attempt={attempt}/{attempt_limit}"
+        "read-only tools are suspended; write one selected target now with Write/Edit: {targets}. write_required_no_write_attempt={attempt}/{attempt_limit}"
     )
+}
+
+pub fn read_only_write_required_off_target_write_allowed(
+    actual_path: &str,
+    selected_targets: &[String],
+) -> String {
+    let targets = format_target_list(selected_targets);
+    let actual = if actual_path.trim().is_empty() {
+        "the non-selected path".to_string()
+    } else {
+        format!("`{}`", actual_path.trim())
+    };
+    format!(
+        "Write/Edit to {actual} was allowed, but write_required remains active until one selected target is written: {targets}."
+    )
+}
+
+fn format_target_list(paths: &[String]) -> String {
+    let formatted = paths
+        .iter()
+        .filter_map(|path| {
+            let trimmed = path.trim();
+            (!trimmed.is_empty()).then(|| format!("`{trimmed}`"))
+        })
+        .collect::<Vec<_>>();
+    if formatted.is_empty() {
+        "`<none>`".to_string()
+    } else {
+        formatted.join(", ")
+    }
 }
 
 pub fn verify_repair_edit_required(

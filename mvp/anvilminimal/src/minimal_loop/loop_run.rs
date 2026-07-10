@@ -1728,7 +1728,7 @@ pub(crate) fn run_session_with_outcome_with_options(
         let mut batch_non_edit_tools = 0usize;
         let mut batch_all_read_only_tools = !tool_calls.is_empty();
         let mut batch_had_recoverable_tool_error = false;
-        let mut write_required_rejection: Option<(String, bool, usize, String)> = None;
+        let mut write_required_rejection: Option<(String, bool, usize, Vec<String>, String)> = None;
         let missing_before_batch = missing_paths(&config.workspace_root, &required_paths);
         for mut call in tool_calls {
             let mut split_bash_segments = Vec::new();
@@ -1752,7 +1752,11 @@ pub(crate) fn run_session_with_outcome_with_options(
                 batch_had_recoverable_tool_error = true;
                 last_blocking_reason = Some(READ_ONLY_STAGNATION_REASON.to_string());
                 let feedback = rejection.feedback.clone();
-                let target_path = write_required_state.target_path().unwrap_or("").to_string();
+                let selected_targets = write_required_state.selected_targets().to_vec();
+                let selection_reason = write_required_state
+                    .selection_reason()
+                    .map(|reason| reason.as_str().to_string())
+                    .unwrap_or_default();
                 session.messages.push(ConversationMessage::tool_result(
                     call.name,
                     Some(call.id),
@@ -1762,10 +1766,25 @@ pub(crate) fn run_session_with_outcome_with_options(
                     feedback,
                     rejection.exhausted,
                     rejection.no_write_attempts,
-                    target_path,
+                    selected_targets,
+                    selection_reason,
                 ));
                 break;
             }
+            let write_required_off_target_warning = write_required_state.off_target_write_warning(
+                &config.workspace_root,
+                config.eval_events_path.as_deref(),
+                &call,
+                ReadOnlyToolRejectionContext {
+                    read_only_streak,
+                    session_scope: options.scope.as_str(),
+                    step_kind: options
+                        .step_kind
+                        .map(RunSessionStepKind::as_str)
+                        .unwrap_or(""),
+                    phase_scope: options.phase_scope.as_deref(),
+                },
+            );
             let call_is_edit = matches!(call.name.as_str(), "Write" | "Edit");
             if !matches!(call.name.as_str(), "Read" | "Glob" | "Grep") {
                 batch_all_read_only_tools = false;
@@ -1930,8 +1949,11 @@ pub(crate) fn run_session_with_outcome_with_options(
                     if matches!(call.name.as_str(), "Write" | "Edit") {
                         write_or_edit_seen = true;
                         read_only_streak = 0;
-                        write_required_state
+                        let write_required_target_written = write_required_state
                             .note_successful_write(&config.workspace_root, &call.arguments);
+                        if write_required_target_written {
+                            pending_feedback = None;
+                        }
                         if let Some(path) =
                             changed_path_from_call(&config.workspace_root, &call.arguments)
                         {
@@ -2075,8 +2097,11 @@ pub(crate) fn run_session_with_outcome_with_options(
                 Some(call.id),
                 result,
             ));
+            if let Some(feedback) = write_required_off_target_warning {
+                pending_feedback = Some(feedback);
+            }
         }
-        if let Some((feedback, exhausted, no_write_attempts, target_path)) =
+        if let Some((feedback, exhausted, no_write_attempts, selected_targets, selection_reason)) =
             write_required_rejection
         {
             pending_feedback = Some(feedback);
@@ -2092,7 +2117,8 @@ pub(crate) fn run_session_with_outcome_with_options(
                             .map(RunSessionStepKind::as_str)
                             .unwrap_or(""),
                         options.phase_scope.as_deref(),
-                        &target_path,
+                        &selected_targets,
+                        &selection_reason,
                         &changed_paths,
                         read_only_streak,
                         no_write_attempts,
@@ -2131,10 +2157,13 @@ pub(crate) fn run_session_with_outcome_with_options(
             read_only_streak = read_only_streak.saturating_add(1);
             if let Some(feedback) = maybe_read_only_stagnation_feedback(
                 config.eval_events_path.as_deref(),
+                &config.workspace_root,
+                &config.profile,
                 user_prompt,
                 read_only_streak,
                 &options,
                 &mut write_required_state,
+                &verify_repair_state.pending_error_context,
                 &verify_repair_state.changed_paths_at_failure,
                 &required_paths,
                 &changed_paths,
@@ -4518,29 +4547,52 @@ fn read_only_objective_excerpt(user_prompt: &str) -> String {
     eval_events::body_snippet(user_prompt)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_read_only_stagnation_feedback(
     eval_events_path: Option<&Path>,
+    root: &Path,
+    profile: &str,
     user_prompt: &str,
     read_only_streak: usize,
     options: &RunSessionOptions,
     write_required_state: &mut WriteRequiredState,
+    pending_error_context: &RunSessionErrorContext,
     repair_changed_paths: &[String],
     required_paths: &[String],
     changed_paths: &[String],
 ) -> Option<String> {
     let stage = ReadOnlyStagnationStage::for_streak(read_only_streak)?;
-    let target_path = if stage == ReadOnlyStagnationStage::WriteRequired {
-        let target = super::stagnation_escalation::write_required_target_path(
+    let selection = if stage == ReadOnlyStagnationStage::WriteRequired {
+        let evidence_mapped_paths = super::stagnation_escalation::write_required_evidence_targets(
+            root,
+            profile,
+            &pending_error_context.missing_evidence,
+            &pending_error_context.missing_capabilities,
+        );
+        let selection = super::stagnation_escalation::write_required_target_selection(
+            &evidence_mapped_paths,
             repair_changed_paths,
             required_paths,
             changed_paths,
             &options.path_fallback_candidates,
         )?;
-        write_required_state.activate(target.clone());
-        Some(target)
+        write_required_state.activate(selection.clone());
+        Some(selection)
     } else {
         None
     };
+    let target_path = selection
+        .as_ref()
+        .and_then(|selection| selection.primary_target())
+        .unwrap_or("");
+    let selected_targets = selection
+        .as_ref()
+        .map(|selection| selection.selected_targets.clone())
+        .unwrap_or_default();
+    let selection_reason = selection
+        .as_ref()
+        .map(|selection| selection.selection_reason.as_str())
+        .unwrap_or("");
     let objective = read_only_objective_excerpt(user_prompt);
     eval_events::emit(
         eval_events_path,
@@ -4549,7 +4601,9 @@ fn maybe_read_only_stagnation_feedback(
             "stage": stage.as_str(),
             "read_only_streak": read_only_streak,
             "objective": objective,
-            "target_path": target_path.as_deref().unwrap_or(""),
+            "target_path": target_path,
+            "selected_targets": selected_targets,
+            "selection_reason": selection_reason,
             "session_scope": options.scope.as_str(),
             "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
             "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
@@ -4564,7 +4618,7 @@ fn maybe_read_only_stagnation_feedback(
         }
         ReadOnlyStagnationStage::WriteRequired => {
             super::stagnation_escalation::read_only_write_required_feedback(
-                target_path.as_deref().unwrap_or(""),
+                write_required_state.selected_targets(),
                 read_only_streak,
             )
         }
@@ -4956,11 +5010,13 @@ mod tests {
 
     #[derive(Clone)]
     struct DelayedFake {
-        replies: Arc<Mutex<Vec<(Duration, anyhow::Result<AssistantReply>)>>>,
+        replies: Arc<Mutex<Vec<DelayedReply>>>,
     }
 
+    type DelayedReply = (Duration, anyhow::Result<AssistantReply>);
+
     impl DelayedFake {
-        fn new(replies: Vec<(Duration, anyhow::Result<AssistantReply>)>) -> Self {
+        fn new(replies: Vec<DelayedReply>) -> Self {
             Self {
                 replies: Arc::new(Mutex::new(replies)),
             }

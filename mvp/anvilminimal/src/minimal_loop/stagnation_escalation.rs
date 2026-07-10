@@ -4,6 +4,8 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::eval_events;
+use crate::minimal_loop::evidence::required_evidence_for_capability;
+use crate::planner::profile::profile_evidence_repair_target_paths;
 use crate::state::ToolCall;
 use crate::tools::path_guard::normalize_workspace_path;
 
@@ -41,23 +43,65 @@ impl ReadOnlyStagnationStage {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct WriteRequiredState {
-    target_path: Option<String>,
+    selected_targets: Vec<String>,
+    selection_reason: Option<WriteRequiredSelectionReason>,
     no_write_attempts: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteRequiredSelectionReason {
+    EvidenceMapped,
+    RepairChanged,
+    RequiredPath,
+    Fallback,
+}
+
+impl WriteRequiredSelectionReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::EvidenceMapped => "evidence_mapped",
+            Self::RepairChanged => "repair_changed",
+            Self::RequiredPath => "required_path",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriteRequiredTargetSelection {
+    pub(crate) selected_targets: Vec<String>,
+    pub(crate) selection_reason: WriteRequiredSelectionReason,
+}
+
+impl WriteRequiredTargetSelection {
+    pub(crate) fn primary_target(&self) -> Option<&str> {
+        self.selected_targets.first().map(String::as_str)
+    }
+}
+
 impl WriteRequiredState {
-    pub(crate) fn activate(&mut self, target_path: String) {
-        self.target_path = Some(target_path);
+    pub(crate) fn activate(&mut self, selection: WriteRequiredTargetSelection) {
+        self.selected_targets = selection.selected_targets;
+        self.selection_reason = Some(selection.selection_reason);
         self.no_write_attempts = 0;
     }
 
     pub(crate) fn reset(&mut self) {
-        self.target_path = None;
+        self.selected_targets.clear();
+        self.selection_reason = None;
         self.no_write_attempts = 0;
     }
 
     pub(crate) fn target_path(&self) -> Option<&str> {
-        self.target_path.as_deref()
+        self.selected_targets.first().map(String::as_str)
+    }
+
+    pub(crate) fn selected_targets(&self) -> &[String] {
+        &self.selected_targets
+    }
+
+    pub(crate) fn selection_reason(&self) -> Option<WriteRequiredSelectionReason> {
+        self.selection_reason
     }
 
     pub(crate) fn reject_if_read_only_or_wrong_target(
@@ -67,11 +111,21 @@ impl WriteRequiredState {
         call: &ToolCall,
         event_context: ReadOnlyToolRejectionContext<'_>,
     ) -> Option<ReadOnlyToolRejection> {
-        let target_path = self.target_path.as_ref()?;
-        if tool_call_writes_target_path(root, call, target_path) {
+        if self.selected_targets.is_empty() {
+            return None;
+        }
+        if tool_call_writes_any_target_path(root, call, &self.selected_targets) {
+            return None;
+        }
+        if matches!(call.name.as_str(), "Write" | "Edit") {
             return None;
         }
         self.no_write_attempts = self.no_write_attempts.saturating_add(1);
+        let target_path = self.target_path().unwrap_or("");
+        let selection_reason = self
+            .selection_reason
+            .map(|reason| reason.as_str())
+            .unwrap_or("");
         eval_events::emit(
             eval_events_path,
             json!({
@@ -79,6 +133,8 @@ impl WriteRequiredState {
                 "stage": "write_required",
                 "tool_name": call.name.as_str(),
                 "target_path": target_path,
+                "selected_targets": self.selected_targets.clone(),
+                "selection_reason": selection_reason,
                 "read_only_streak": event_context.read_only_streak,
                 "write_required_no_write_attempts": self.no_write_attempts,
                 "write_required_no_write_limit": WRITE_REQUIRED_NO_WRITE_LIMIT,
@@ -88,7 +144,7 @@ impl WriteRequiredState {
             }),
         );
         let feedback = super::feedback::read_only_write_required_tool_rejected(
-            target_path,
+            &self.selected_targets,
             self.no_write_attempts,
             WRITE_REQUIRED_NO_WRITE_LIMIT,
         );
@@ -99,15 +155,57 @@ impl WriteRequiredState {
         })
     }
 
+    pub(crate) fn off_target_write_warning(
+        &self,
+        root: &Path,
+        eval_events_path: Option<&Path>,
+        call: &ToolCall,
+        event_context: ReadOnlyToolRejectionContext<'_>,
+    ) -> Option<String> {
+        if self.selected_targets.is_empty()
+            || !matches!(call.name.as_str(), "Write" | "Edit")
+            || tool_call_writes_any_target_path(root, call, &self.selected_targets)
+        {
+            return None;
+        }
+        let actual_path = normalized_tool_path_arg(root, &call.arguments).unwrap_or_default();
+        let selection_reason = self
+            .selection_reason
+            .map(|reason| reason.as_str())
+            .unwrap_or("");
+        let feedback = super::feedback::read_only_write_required_off_target_write_allowed(
+            &actual_path,
+            &self.selected_targets,
+        );
+        eval_events::emit(
+            eval_events_path,
+            json!({
+                "event": "write_required_off_target_write_allowed",
+                "stage": "write_required",
+                "tool_name": call.name.as_str(),
+                "target_path": self.target_path().unwrap_or(""),
+                "actual_path": actual_path,
+                "selected_targets": self.selected_targets.clone(),
+                "selection_reason": selection_reason,
+                "read_only_streak": event_context.read_only_streak,
+                "session_scope": event_context.session_scope,
+                "step_kind": event_context.step_kind,
+                "phase_scope": event_context.phase_scope.unwrap_or(""),
+                "feedback": eval_events::body_snippet(&feedback),
+            }),
+        );
+        Some(feedback)
+    }
+
     pub(crate) fn note_successful_write(
         &mut self,
         root: &Path,
         arguments: &serde_json::Value,
     ) -> bool {
-        let Some(target_path) = self.target_path.as_deref() else {
+        if self.selected_targets.is_empty() {
             return false;
-        };
-        if tool_arguments_path_matches(root, arguments, target_path) {
+        }
+        if tool_arguments_path_matches_any(root, arguments, &self.selected_targets) {
             self.reset();
             return true;
         }
@@ -130,31 +228,105 @@ pub(crate) struct ReadOnlyToolRejection {
     pub(crate) no_write_attempts: usize,
 }
 
+pub(crate) fn write_required_target_selection(
+    evidence_mapped_paths: &[String],
+    repair_changed_paths: &[String],
+    required_paths: &[String],
+    changed_paths: &[String],
+    path_fallback_candidates: &[String],
+) -> Option<WriteRequiredTargetSelection> {
+    for (paths, reason) in [
+        (
+            evidence_mapped_paths,
+            WriteRequiredSelectionReason::EvidenceMapped,
+        ),
+        (
+            repair_changed_paths,
+            WriteRequiredSelectionReason::RepairChanged,
+        ),
+        (required_paths, WriteRequiredSelectionReason::RequiredPath),
+        (changed_paths, WriteRequiredSelectionReason::Fallback),
+        (
+            path_fallback_candidates,
+            WriteRequiredSelectionReason::Fallback,
+        ),
+    ] {
+        let selected_targets = ordered_non_empty_paths(paths);
+        if !selected_targets.is_empty() {
+            return Some(WriteRequiredTargetSelection {
+                selected_targets,
+                selection_reason: reason,
+            });
+        }
+    }
+    None
+}
+
+pub(crate) fn write_required_evidence_targets(
+    root: &Path,
+    profile: &str,
+    missing_evidence: &[String],
+    missing_capabilities: &[String],
+) -> Vec<String> {
+    let evidence_keys = write_required_evidence_keys(missing_evidence, missing_capabilities);
+    if evidence_keys.is_empty() {
+        return Vec::new();
+    }
+    profile_evidence_repair_target_paths(root, profile, &evidence_keys)
+}
+
+fn write_required_evidence_keys(
+    missing_evidence: &[String],
+    missing_capabilities: &[String],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in missing_evidence {
+        push_unique_evidence_key(&mut out, key);
+    }
+    for capability in missing_capabilities {
+        for evidence in required_evidence_for_capability(capability) {
+            push_unique_evidence_key(&mut out, &evidence);
+        }
+    }
+    out
+}
+
+fn push_unique_evidence_key(out: &mut Vec<String>, key: &str) {
+    let trimmed = key.trim();
+    if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
+        out.push(trimmed.to_string());
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn write_required_target_path(
     repair_changed_paths: &[String],
     required_paths: &[String],
     changed_paths: &[String],
     path_fallback_candidates: &[String],
 ) -> Option<String> {
-    repair_changed_paths
-        .iter()
-        .chain(required_paths)
-        .chain(changed_paths)
-        .chain(path_fallback_candidates)
-        .find_map(|path| {
-            let trimmed = path.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
+    write_required_target_selection(
+        &[],
+        repair_changed_paths,
+        required_paths,
+        changed_paths,
+        path_fallback_candidates,
+    )
+    .and_then(|selection| selection.primary_target().map(str::to_string))
 }
 
-pub(crate) fn read_only_write_required_feedback(target_path: &str, streak: usize) -> String {
+pub(crate) fn read_only_write_required_feedback(
+    selected_targets: &[String],
+    streak: usize,
+) -> String {
     super::feedback::read_only_stagnation_write_required(
-        target_path,
+        selected_targets,
         streak,
         WRITE_REQUIRED_NO_WRITE_LIMIT,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn tool_call_writes_target_path(
     root: &Path,
     call: &ToolCall,
@@ -164,6 +336,30 @@ pub(crate) fn tool_call_writes_target_path(
         && tool_arguments_path_matches(root, &call.arguments, target_path)
 }
 
+pub(crate) fn tool_call_writes_any_target_path(
+    root: &Path,
+    call: &ToolCall,
+    target_paths: &[String],
+) -> bool {
+    matches!(call.name.as_str(), "Write" | "Edit")
+        && tool_arguments_path_matches_any(root, &call.arguments, target_paths)
+}
+
+fn tool_arguments_path_matches_any(
+    root: &Path,
+    arguments: &serde_json::Value,
+    target_paths: &[String],
+) -> bool {
+    let Some(actual) = normalized_tool_path_arg(root, arguments) else {
+        return false;
+    };
+    let actual = normalized_relative_for_compare(&actual);
+    target_paths
+        .iter()
+        .any(|target_path| actual == normalized_relative_for_compare(target_path))
+}
+
+#[cfg(test)]
 fn tool_arguments_path_matches(
     root: &Path,
     arguments: &serde_json::Value,
@@ -187,6 +383,24 @@ fn normalized_relative_for_compare(path: &str) -> String {
     path.trim().trim_start_matches("./").replace('\\', "/")
 }
 
+fn ordered_non_empty_paths(paths: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for path in paths {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = normalized_relative_for_compare(trimmed);
+        if !out
+            .iter()
+            .any(|existing| normalized_relative_for_compare(existing.as_str()) == normalized)
+        {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ReadOnlyRecoveryPaths {
     pub(crate) prompt_path: String,
@@ -202,12 +416,17 @@ pub(crate) fn save_read_only_write_required_handoff(
     session_scope: &str,
     step_kind: &str,
     phase_scope: Option<&str>,
-    target_path: &str,
+    selected_targets: &[String],
+    selection_reason: &str,
     changed_paths: &[String],
     read_only_streak: usize,
     no_write_attempts: usize,
 ) -> Option<ReadOnlyRecoveryPaths> {
     let failure_kind = READ_ONLY_STAGNATION_REASON;
+    let target_path = selected_targets
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default();
     let profile = if config.profile.trim().is_empty() {
         "generic"
     } else {
@@ -229,12 +448,16 @@ pub(crate) fn save_read_only_write_required_handoff(
             format!(
                 "write_required exhausted without Write/Edit to {target_path}: attempts={no_write_attempts}/{WRITE_REQUIRED_NO_WRITE_LIMIT}"
             ),
+            format!(
+                "write_required selected_targets={}; selection_reason={selection_reason}",
+                selected_targets.join(",")
+            ),
         ],
         missing_paths: Vec::new(),
         missing_capabilities: Vec::new(),
         verify_commands: Vec::new(),
         changed_paths: changed_paths.to_vec(),
-        repair_targets: vec![target_path.to_string()],
+        repair_targets: selected_targets.to_vec(),
     };
     let prompt_path = match crate::planner::repair::save_ultra_recovery_prompt(
         &config.workspace_root,
@@ -340,7 +563,8 @@ pub(crate) fn record_write_required_exhaustion_and_render_stop(
     session_scope: &str,
     step_kind: &str,
     phase_scope: Option<&str>,
-    target_path: &str,
+    selected_targets: &[String],
+    selection_reason: &str,
     changed_paths: &[String],
     read_only_streak: usize,
     no_write_attempts: usize,
@@ -348,13 +572,18 @@ pub(crate) fn record_write_required_exhaustion_and_render_stop(
     verify_attempts: usize,
     last_blocking_reason: Option<&str>,
 ) -> String {
+    let target_path = selected_targets
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default();
     let recovery_paths = save_read_only_write_required_handoff(
         config,
         objective,
         session_scope,
         step_kind,
         phase_scope,
-        target_path,
+        selected_targets,
+        selection_reason,
         changed_paths,
         read_only_streak,
         no_write_attempts,
@@ -368,6 +597,8 @@ pub(crate) fn record_write_required_exhaustion_and_render_stop(
             "write_required_no_write_attempts": no_write_attempts,
             "write_required_no_write_limit": WRITE_REQUIRED_NO_WRITE_LIMIT,
             "write_required_target_path": target_path,
+            "selected_targets": selected_targets,
+            "selection_reason": selection_reason,
             "tool_calls": tool_calls,
             "verify_attempts": verify_attempts,
             "last_blocking_reason": last_blocking_reason,
@@ -541,6 +772,70 @@ mod tests {
     }
 
     #[test]
+    fn write_required_selection_prefers_evidence_mapped_targets_over_required_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){ return <button data-anvil-action=\"restart\">Restart</button>; }\n",
+        )
+        .unwrap();
+        let evidence_targets = write_required_evidence_targets(
+            dir.path(),
+            "nextjs",
+            &["restart_or_recoverable_state_evidence".to_string()],
+            &[],
+        );
+
+        let selection = write_required_target_selection(
+            &evidence_targets,
+            &[],
+            &["package.json".to_string(), "src/app/page.tsx".to_string()],
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            selection.selection_reason,
+            WriteRequiredSelectionReason::EvidenceMapped
+        );
+        assert_eq!(selection.selected_targets, vec!["src/app/page.tsx"]);
+    }
+
+    #[test]
+    fn write_required_selection_keeps_legacy_order_without_evidence() {
+        let selection = write_required_target_selection(
+            &[],
+            &["repair.ts".to_string()],
+            &["required.ts".to_string()],
+            &["changed.ts".to_string()],
+            &["fallback.ts".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            selection.selection_reason,
+            WriteRequiredSelectionReason::RepairChanged
+        );
+        assert_eq!(selection.selected_targets, vec!["repair.ts"]);
+
+        let selection = write_required_target_selection(
+            &[],
+            &[],
+            &["required.ts".to_string()],
+            &["changed.ts".to_string()],
+            &["fallback.ts".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            selection.selection_reason,
+            WriteRequiredSelectionReason::RequiredPath
+        );
+        assert_eq!(selection.selected_targets, vec!["required.ts"]);
+    }
+
+    #[test]
     fn write_required_accepts_write_or_edit_to_target_only() {
         let root = tempfile::tempdir().unwrap();
         let absolute = root.path().join("src/app/page.tsx");
@@ -576,6 +871,68 @@ mod tests {
             ),
             "src/app/page.tsx"
         ));
+    }
+
+    #[test]
+    fn write_required_candidate_edit_clears_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = WriteRequiredState::default();
+        state.activate(WriteRequiredTargetSelection {
+            selected_targets: vec![
+                "src/app/page.tsx".to_string(),
+                "src/app/game.tsx".to_string(),
+            ],
+            selection_reason: WriteRequiredSelectionReason::EvidenceMapped,
+        });
+
+        assert!(state.note_successful_write(
+            root.path(),
+            &json!({"path":"src/app/game.tsx","old_string":"x","new_string":"y"})
+        ));
+        assert!(state.selected_targets().is_empty());
+        assert!(state.selection_reason().is_none());
+    }
+
+    #[test]
+    fn write_required_allows_off_target_write_with_warning() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = WriteRequiredState::default();
+        state.activate(WriteRequiredTargetSelection {
+            selected_targets: vec!["src/app/page.tsx".to_string()],
+            selection_reason: WriteRequiredSelectionReason::EvidenceMapped,
+        });
+        let call = ToolCall::new(
+            "Write",
+            json!({"path":"package.json","content":"{\"scripts\":{}}\n"}),
+        );
+
+        let rejection = state.reject_if_read_only_or_wrong_target(
+            root.path(),
+            None,
+            &call,
+            ReadOnlyToolRejectionContext {
+                read_only_streak: 7,
+                session_scope: "plan-run-step",
+                step_kind: "implement",
+                phase_scope: Some("final_acceptance"),
+            },
+        );
+        assert!(rejection.is_none());
+        let warning = state
+            .off_target_write_warning(
+                root.path(),
+                None,
+                &call,
+                ReadOnlyToolRejectionContext {
+                    read_only_streak: 7,
+                    session_scope: "plan-run-step",
+                    step_kind: "implement",
+                    phase_scope: Some("final_acceptance"),
+                },
+            )
+            .unwrap();
+        assert!(warning.contains("was allowed"), "{warning}");
+        assert_eq!(state.selected_targets(), &["src/app/page.tsx".to_string()]);
     }
 
     #[test]
@@ -641,6 +998,11 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.get("event").and_then(Value::as_str) == Some("read_only_tool_rejected")
                 && event.get("target_path").and_then(Value::as_str) == Some("target.txt")
+                && event
+                    .get("selected_targets")
+                    .and_then(Value::as_array)
+                    .is_some_and(|targets| targets.iter().any(|value| value == "target.txt"))
+                && event.get("selection_reason").and_then(Value::as_str) == Some("required_path")
         }));
         assert!(fake.requests().iter().any(|request| {
             request.iter().any(|message| {

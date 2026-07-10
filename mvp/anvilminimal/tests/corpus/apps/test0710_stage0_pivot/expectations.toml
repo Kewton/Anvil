@@ -76,3 +76,12 @@ fixtures/read-only-write-required.jsonl = [
   "\"reason\":\"model_stagnation:read_only_loop\"",
   "\"recovery_yaml_missing\":false"
 ]
+fixtures/read-only-write-required-evidence-targets.jsonl = [
+  "test0710_bs_003/combo1",
+  "\"pending_capability_evidence\":[\"restart_or_recoverable_state_evidence\"]",
+  "\"required_paths\":[\"package.json\",\"src/app/page.tsx\"]",
+  "\"selected_targets\":[\"src/app/page.tsx\"]",
+  "\"selection_reason\":\"evidence_mapped\"",
+  "\"event\":\"write_required_off_target_write_allowed\"",
+  "\"actual_path\":\"package.json\""
+]

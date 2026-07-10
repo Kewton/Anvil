@@ -491,9 +491,9 @@ mod tests {
             .path()
             .join("localwork/commandagent_mvp/01/test0709_camp_003");
         std::fs::create_dir_all(&root).unwrap();
-        let raw = format!(
+        let raw =
             "Users/maenokota/share/work/localwork/commandagent_mvp/01/test0709_camp_003/src/app/page.tsx"
-        );
+                .to_string();
 
         let normalization = normalize_workspace_path(&root, &raw).unwrap().unwrap();
 
