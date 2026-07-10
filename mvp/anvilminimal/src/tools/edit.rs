@@ -38,7 +38,7 @@ pub fn run(
                     " Deterministic best-match region: {}:{}\n{}\nRe-anchor mandate: retry using the exact current excerpt above, or use Write with the complete corrected file content if anchor failures repeat.",
                     path.display(),
                     region.line,
-                    region.excerpt.trim_end()
+                    line_numbered_excerpt(&region)
                 )
             })
             .unwrap_or_else(|| {
@@ -173,6 +173,19 @@ fn line_regions(content: &str) -> Vec<AnchorRegion> {
     out
 }
 
+fn line_numbered_excerpt(region: &AnchorRegion) -> String {
+    let lines = region.excerpt.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return format!("{:>4} | ", region.line);
+    }
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(offset, line)| format!("{:>4} | {}", region.line + offset, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn normalize_ws(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -241,6 +254,7 @@ mod tests {
             .to_string();
         assert!(err.contains("edit_anchor_not_found"));
         assert!(err.contains("Deterministic best-match region"));
+        assert!(err.contains("1 | alpha middle omega"));
         assert!(err.contains("alpha middle omega"));
         assert!(err.contains("Re-anchor mandate"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "alpha middle omega");

@@ -4,6 +4,7 @@ pub mod build_verifier;
 pub mod compact;
 pub mod completion;
 pub mod dependency_setup;
+pub mod edit_anchor_recovery;
 pub mod evidence;
 pub mod feedback;
 pub mod import_scan;

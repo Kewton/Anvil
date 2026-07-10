@@ -579,6 +579,40 @@ mod tests {
     }
 
     #[test]
+    fn full_file_write_hook_loss_is_reported_as_profile_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        write_nextjs_app(dir.path(), good_page());
+        let cfg = config(dir.path());
+        save_phase_snapshots(&cfg, "nextjs", "game", "phase-one");
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#"export default function Page() {
+  return <main>rewritten</main>;
+}
+"#,
+        )
+        .unwrap();
+
+        let diagnostic = detect_missing(&cfg, "nextjs", "game").unwrap();
+        let report =
+            report_missing_as_profile_failure(&cfg, "nextjs", "game", VerificationReport::pass());
+
+        assert!(
+            diagnostic
+                .missing_attributes
+                .contains(&r#"data-anvil-action="primary""#.to_string())
+        );
+        assert!(!report.is_pass());
+        assert!(
+            report
+                .profile_failures
+                .iter()
+                .any(|reason| reason.contains("hook_snapshot_regression:src/app/page.tsx")),
+            "{report:?}"
+        );
+    }
+
+    #[test]
     fn restore_after_feedback_reinstates_primary_hook() {
         let dir = tempfile::tempdir().unwrap();
         write_nextjs_app(dir.path(), good_page());

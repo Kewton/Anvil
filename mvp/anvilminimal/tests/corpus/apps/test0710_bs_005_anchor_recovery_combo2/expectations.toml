@@ -1,0 +1,35 @@
+case_id = "test0710_bs_005_anchor_recovery_combo2"
+source = "bs_005 combo2 anchor mismatch recovery ladder regression fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["anchor", "edit", "write", "recovery"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/anchor-recovery.jsonl = [
+  "test0710_bs_005/combo2",
+  "\"event\":\"edit_anchor_recovery\"",
+  "\"stage\":\"reanchor\"",
+  "\"stage\":\"full_file_write\"",
+  "\"path\":\"src/app/page.tsx\"",
+  "\"failure_count\":3",
+  "switch to the Write tool",
+  "\"reason\":\"recoverable_tool_error_repeated\"",
+  "\"error_kind\":\"edit_anchor_not_found\""
+]

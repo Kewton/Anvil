@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,10 @@ use super::completion::{
     CompletionContract, format_verify_feedback_with_contract, target_implementation_files,
 };
 use super::dependency_setup::{self, NodeDependencySetupAuthority, NodeDependencySetupStatus};
+use super::edit_anchor_recovery::{
+    EDIT_ANCHOR_FULL_FILE_WRITE_THRESHOLD, EditAnchorRecovery, EditAnchorRecoveryState,
+    emit_recovery_event,
+};
 use super::evidence::{RuntimeAcceptanceReport, verify_runtime_acceptance};
 use super::import_scan::{format_missing_import_feedback, scan_relative_imports};
 use super::prompt::{ToolPromptMode, build_request_messages};
@@ -1095,7 +1099,7 @@ pub(crate) fn run_session_with_outcome_with_options(
     let mut verify_repair_state = VerifyRepairState::default();
     let mut write_required_state = WriteRequiredState::default();
     let mut recoverable_tool_error_state = RecoverableToolErrorState::default();
-    let mut edit_anchor_failures_by_path: BTreeMap<String, usize> = BTreeMap::new();
+    let mut edit_anchor_recovery_state = EditAnchorRecoveryState::default();
     let mut malformed_native_tool_feedbacks = 0usize;
     let step_capability_gate = StepCapabilityGate::from_prompt(user_prompt, &options);
     let step_started = Instant::now();
@@ -1949,6 +1953,8 @@ pub(crate) fn run_session_with_outcome_with_options(
                     if matches!(call.name.as_str(), "Write" | "Edit") {
                         write_or_edit_seen = true;
                         read_only_streak = 0;
+                        edit_anchor_recovery_state
+                            .note_successful_write(&config.workspace_root, &call.arguments);
                         let write_required_target_written = write_required_state
                             .note_successful_write(&config.workspace_root, &call.arguments);
                         if write_required_target_written {
@@ -1999,6 +2005,16 @@ pub(crate) fn run_session_with_outcome_with_options(
                             "duration_ms": duration_ms,
                         }),
                     );
+                    let edit_anchor_recovery = if kind == "edit_anchor_not_found" {
+                        let recovery = edit_anchor_recovery_state
+                            .record_failure(&config.workspace_root, &call.arguments);
+                        if let Some(recovery) = &recovery {
+                            emit_recovery_event(config.eval_events_path.as_deref(), recovery);
+                        }
+                        recovery
+                    } else {
+                        None
+                    };
                     if kind == "command_timeout" {
                         let sink = command_timeout_sink_label(&err_text);
                         eval_events::emit(
@@ -2038,7 +2054,13 @@ pub(crate) fn run_session_with_outcome_with_options(
                             continue;
                         }
                     }
-                    if repeats > RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT {
+                    let recoverable_repeat_limit = if edit_anchor_recovery.is_some() {
+                        RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT
+                            .max(EDIT_ANCHOR_FULL_FILE_WRITE_THRESHOLD)
+                    } else {
+                        RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT
+                    };
+                    if repeats > recoverable_repeat_limit {
                         eval_events::emit(
                             config.eval_events_path.as_deref(),
                             json!({
@@ -2051,20 +2073,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                         );
                         bail!("recoverable tool error repeated: {kind}");
                     }
-                    let edit_anchor_failure = if kind == "edit_anchor_not_found" {
-                        edit_anchor_tracking_path(&config.workspace_root, &call.arguments).map(
-                            |path| {
-                                let count = edit_anchor_failures_by_path
-                                    .entry(path.clone())
-                                    .or_default();
-                                *count += 1;
-                                (path, *count)
-                            },
-                        )
-                    } else {
-                        None
-                    };
-                    recoverable_tool_feedback(&call.name, &err, edit_anchor_failure)
+                    recoverable_tool_feedback(&call.name, &err, edit_anchor_recovery.as_ref())
                 }
                 Err(err) => {
                     eval_events::emit(
@@ -4915,7 +4924,7 @@ fn looks_like_action_prompt(content: &str) -> bool {
 fn recoverable_tool_feedback(
     name: &str,
     err: &anyhow::Error,
-    edit_anchor_failure: Option<(String, usize)>,
+    edit_anchor_recovery: Option<&EditAnchorRecovery>,
 ) -> String {
     let err_text = err.to_string();
     if err_text.contains("verify_command_policy_error") {
@@ -4933,27 +4942,12 @@ fn recoverable_tool_feedback(
             "Tool call `{name}` used a path that appears to reconstruct the current workspace root with a digit variance and was rejected. Do not salvage or write across workspaces; retry with a workspace-relative path under the exact current root quoted in the error: {err_text}."
         );
     }
-    if let Some((path, count)) = edit_anchor_failure {
-        let mut feedback = format!(
-            "Tool call `{name}` was rejected with a recoverable validation error: {err_text}. Retry with the Edit tool using the deterministic best-match excerpt and re-anchor mandate from the error."
-        );
-        if count >= 2 {
-            feedback = format!(
-                "Tool call `{name}` was rejected with a recoverable validation error: {err_text}. This is edit anchor failure #{count} for `{path}` in this step; switch to the Write tool and write the complete corrected file content for that one file."
-            );
-        }
-        return feedback;
+    if let Some(recovery) = edit_anchor_recovery {
+        return super::edit_anchor_recovery::feedback(name, &err_text, recovery);
     }
     format!(
         "Tool call `{name}` was rejected with a recoverable validation error: {err}. Retry with the same tool or another available tool using a valid JSON object that matches the tool schema."
     )
-}
-
-fn edit_anchor_tracking_path(root: &Path, arguments: &serde_json::Value) -> Option<String> {
-    let normalized = normalized_tool_path_arg(root, arguments)?;
-    let path = resolve_optional_existing(root, &normalized).ok()?;
-    let root = root.canonicalize().ok()?;
-    Some(crate::tools::path_guard::relative_display(&root, &path))
 }
 
 fn changed_path_from_call(root: &Path, arguments: &serde_json::Value) -> Option<String> {
@@ -7860,6 +7854,7 @@ export default function Page(){
         assert!(session.messages.iter().any(|message| message.role == "tool"
             && message.content.contains("edit_anchor_not_found")
             && message.content.contains("Deterministic best-match region")
+            && message.content.contains("1 | actual content")
             && message.content.contains("actual content")
             && message.content.contains("Re-anchor mandate")));
     }
@@ -7887,6 +7882,15 @@ export default function Page(){
                 prompt_tokens: None,
                 completion_tokens: None,
             }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Edit",
+                    json!({"path":"a.txt","old_string":"third missing anchor","new_string":"replacement"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
             Ok(AssistantReply::text("final")),
         ]);
         let mut session = SessionSnapshot::new();
@@ -7900,7 +7904,7 @@ export default function Page(){
         assert_eq!(result, "final");
         assert!(
             session.messages.iter().any(|message| message.role == "tool"
-                && message.content.contains("anchor failure #2")
+                && message.content.contains("anchor failure #3")
                 && message.content.contains("Write tool")
                 && message.content.contains("complete corrected file content")
                 && message.content.contains("`a.txt`")),
