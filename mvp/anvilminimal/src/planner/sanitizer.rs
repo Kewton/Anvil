@@ -810,6 +810,19 @@ fn append_browser_readiness_note(step: &mut PlanStep) -> bool {
     if step.instruction.contains(BROWSER_READINESS_NOTE) {
         return false;
     }
+    if let Some(profile_contract_index) = step.instruction.find("\n\nProfile contract:") {
+        let mut prefix = step.instruction[..profile_contract_index]
+            .trim_end()
+            .to_string();
+        if !prefix.ends_with('.') {
+            prefix.push('.');
+        }
+        prefix.push(' ');
+        prefix.push_str(BROWSER_READINESS_NOTE);
+        prefix.push_str(&step.instruction[profile_contract_index..]);
+        step.instruction = prefix;
+        return true;
+    }
     if !step.instruction.trim_end().ends_with('.') {
         step.instruction.push('.');
     }
@@ -1404,6 +1417,45 @@ Profile runtime contract:\n- Preserve the workspace as a real Next.js app.\n- Ke
         assert!(
             lint_step_plan_report_with_workspace(&plan, Some(dir.path())).is_pass(),
             "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn sanitizer_keeps_browser_readiness_note_before_long_profile_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Scaffold a Next.js project".to_string(),
+            steps: vec![PlanStep {
+                id: "create-page".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: format!(
+                    "Create the app route\n\nProfile contract:\n{}",
+                    "Keep the generated app within the deterministic Next.js profile. ".repeat(80)
+                ),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: vec!["npm run dev & curl http://localhost:3011".to_string()],
+            }],
+        };
+
+        let report = sanitize_step_plan_against_policy(&mut plan, Some(dir.path()));
+
+        assert_eq!(report.removed_commands.len(), 1);
+        assert!(plan.steps[0].verify.is_empty());
+        assert!(
+            plan.steps[0]
+                .instruction
+                .contains("Browser readiness is verified by the runtime"),
+            "{}",
+            plan.steps[0].instruction
+        );
+        assert!(
+            plan.steps[0]
+                .instruction
+                .find("Browser readiness is verified by the runtime")
+                < plan.steps[0].instruction.find("Profile contract:"),
+            "{}",
+            plan.steps[0].instruction
         );
     }
 

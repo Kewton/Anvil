@@ -233,7 +233,7 @@ pub fn guidance(goal: &str) -> String {
          For TypeScript/TSX apps, create tsconfig.json before treating the app as complete. \
          Keep a single route-bound implementation; do not leave capability components unimported. \
          Do not use deprecated moduleResolution=node10 or target=ES5; prefer moduleResolution=bundler and target=ES2017 or newer. \
-         For interactive UI, expose task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state containing JSON for meaningful visible state after each render. When the contract includes start_or_restart_flow, every restart affordance (game-over, victory, and in-play when present) should carry data-anvil-action=\"restart\"; the initial primary action alone cannot satisfy recovery verification. A restart reachable during play (hook or R-key) allows behavioral verification, while an overlay-only restart may verify as unverified:terminal_state_not_reached (partial).{port}"
+         For interactive UI, expose task-agnostic observability hooks: data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state containing JSON for meaningful visible state after each render. The data-anvil-state snapshot must include at least one dimension that immediately responds to input, such as player/paddle x position. When the contract includes start_or_restart_flow, every restart affordance (game-over, victory, and in-play when present) should carry data-anvil-action=\"restart\"; the initial primary action alone cannot satisfy recovery verification. A restart reachable during play (hook or R-key) allows behavioral verification, while an overlay-only restart may verify as unverified:terminal_state_not_reached (partial).{port}"
     )
 }
 
@@ -382,7 +382,7 @@ pub fn preset_ultra_plan(goal: &str, style: &str, intent: &str) -> Option<UltraP
             },
             UltraPhase {
                 id: "contract-wiring".to_string(),
-                prompt: "Wire controls and data-anvil observability. Preserve or add data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. When the contract includes start_or_restart_flow, every restart affordance (game-over, victory, and in-play when present) should carry data-anvil-action=\"restart\"; the initial primary action alone cannot satisfy recovery verification."
+                prompt: "Wire controls and data-anvil observability. Preserve or add data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. The data-anvil-state snapshot must include at least one dimension that immediately responds to input, such as player/paddle x position. When the contract includes start_or_restart_flow, every restart affordance (game-over, victory, and in-play when present) should carry data-anvil-action=\"restart\"; the initial primary action alone cannot satisfy recovery verification."
                     .to_string(),
             },
             UltraPhase {
@@ -2398,6 +2398,11 @@ mod tests {
         assert!(text.contains("extend the instrumented skeleton"), "{text}");
         assert!(text.contains("JSON snapshot"), "{text}");
         assert!(
+            text.contains("immediately responds to input")
+                && text.contains("player/paddle x position"),
+            "{text}"
+        );
+        assert!(
             text.contains("every restart affordance")
                 && text.contains("data-anvil-action=\"restart\"")
                 && text
@@ -2540,6 +2545,12 @@ Phase task: Scaffold the Next.js app and configure package scripts";
         assert_eq!(plan.phases[0].id, "project-setup");
         assert_eq!(plan.phases[3].id, "build-verification");
         assert!(plan.phases[1].prompt.contains(goal));
+        assert!(
+            plan.phases[2]
+                .prompt
+                .contains("immediately responds to input"),
+            "{plan:?}"
+        );
     }
 
     #[test]

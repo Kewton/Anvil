@@ -1,0 +1,38 @@
+case_id = "test0710_bs_005_006_state_binding_input_coupled"
+source = "bs_005 combo2 and bs_006 space_combo2 state binding diagnosis regression fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["state_binding", "input_coupled", "snapshot", "useState"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/state-binding-input-coupled.jsonl = [
+  "test0710_bs_005/combo2",
+  "test0710_bs_006/space_combo2",
+  "\"event\":\"state_binding_diagnosis\"",
+  "\"diagnosis\":\"input_coupled_state_not_snapshotted\"",
+  "\"input_mutation_refs\":[\"playerRef\"]",
+  "\"input_mutation_refs\":[\"gameRef\"]",
+  "useState<'MENU' | 'PLAYING' | 'PAUSED' | 'GAMEOVER' | 'VICTORY'>",
+  "useState<GameState>",
+  "input-coupled ref mutation",
+  "入力は playerRef を変異させるが data-anvil-state に映らない",
+  "入力は gameRef を変異させるが data-anvil-state に映らない",
+  "immediately responds to input"
+]
