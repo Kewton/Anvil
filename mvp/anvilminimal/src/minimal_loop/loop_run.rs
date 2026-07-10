@@ -54,7 +54,8 @@ use super::repair_target::{
 };
 use super::stagnation_escalation::{
     READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD, READ_ONLY_STAGNATION_REASON,
-    ReadOnlyStagnationStage, ReadOnlyToolRejectionContext, WriteRequiredState,
+    ReadOnlyStagnationStage, ReadOnlyToolRejectionContext, WRITE_REQUIRED_NO_WRITE_LIMIT,
+    WriteRequiredState,
 };
 use super::verifier_bootstrap;
 
@@ -2187,6 +2188,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                 &verify_repair_state.changed_paths_at_failure,
                 &required_paths,
                 &changed_paths,
+                edit_anchor_recovery_state.strongest_failure(),
             ) {
                 last_blocking_reason = Some("model_stagnation:read_only_loop".to_string());
                 pending_feedback = Some(feedback);
@@ -4589,30 +4591,43 @@ fn maybe_read_only_stagnation_feedback(
     repair_changed_paths: &[String],
     required_paths: &[String],
     changed_paths: &[String],
+    anchor_failure: Option<super::edit_anchor_recovery::EditAnchorFailureSummary>,
 ) -> Option<String> {
-    let stage = ReadOnlyStagnationStage::for_streak(read_only_streak)?;
+    let decision = super::anchor_stagnation_interlock::read_only_stagnation_decision(
+        read_only_streak,
+        anchor_failure,
+    )?;
+    let stage = decision.stage;
     let selection = if stage == ReadOnlyStagnationStage::WriteRequired {
-        let evidence_mapped_paths = super::stagnation_escalation::write_required_evidence_targets(
-            root,
-            profile,
-            &pending_error_context.missing_evidence,
-            &pending_error_context.missing_capabilities,
-        );
-        let selection = super::stagnation_escalation::write_required_target_selection(
-            &evidence_mapped_paths,
-            repair_changed_paths,
-            required_paths,
-            changed_paths,
-            &options.path_fallback_candidates,
-        )?;
-        let state_binding_feedback = crate::planner::state_binding_scan::write_required_feedback(
-            root,
-            profile,
-            &pending_error_context.missing_evidence,
-            &pending_error_context.missing_capabilities,
-            eval_events_path,
-        );
-        write_required_state.activate_with_feedback(selection.clone(), state_binding_feedback);
+        let (selection, diagnostic_feedback) =
+            if let Some(selection) = decision.write_required_selection() {
+                (selection, decision.diagnostic_feedback())
+            } else {
+                let evidence_mapped_paths =
+                    super::stagnation_escalation::write_required_evidence_targets(
+                        root,
+                        profile,
+                        &pending_error_context.missing_evidence,
+                        &pending_error_context.missing_capabilities,
+                    );
+                let selection = super::stagnation_escalation::write_required_target_selection(
+                    &evidence_mapped_paths,
+                    repair_changed_paths,
+                    required_paths,
+                    changed_paths,
+                    &options.path_fallback_candidates,
+                )?;
+                let state_binding_feedback =
+                    crate::planner::state_binding_scan::write_required_feedback(
+                        root,
+                        profile,
+                        &pending_error_context.missing_evidence,
+                        &pending_error_context.missing_capabilities,
+                        eval_events_path,
+                    );
+                (selection, state_binding_feedback)
+            };
+        write_required_state.activate_with_feedback(selection.clone(), diagnostic_feedback);
         Some(selection)
     } else {
         None
@@ -4620,16 +4635,39 @@ fn maybe_read_only_stagnation_feedback(
     let target_path = selection
         .as_ref()
         .and_then(|selection| selection.primary_target())
+        .or_else(|| {
+            decision
+                .anchor_failure
+                .as_ref()
+                .map(|failure| failure.path.as_str())
+        })
         .unwrap_or("");
     let selected_targets = selection
         .as_ref()
         .map(|selection| selection.selected_targets.clone())
+        .or_else(|| {
+            decision
+                .anchor_failure
+                .as_ref()
+                .map(|failure| vec![failure.path.clone()])
+        })
         .unwrap_or_default();
     let selection_reason = selection
         .as_ref()
         .map(|selection| selection.selection_reason.as_str())
+        .or_else(|| decision.anchor_interlocked().then_some("anchor_failure"))
         .unwrap_or("");
     let objective = read_only_objective_excerpt(user_prompt);
+    super::anchor_stagnation_interlock::emit_interlock_event(
+        eval_events_path,
+        &decision,
+        options.scope.as_str(),
+        options
+            .step_kind
+            .map(RunSessionStepKind::as_str)
+            .unwrap_or(""),
+        options.phase_scope.as_deref(),
+    );
     eval_events::emit(
         eval_events_path,
         json!({
@@ -4646,12 +4684,31 @@ fn maybe_read_only_stagnation_feedback(
         }),
     );
     Some(match stage {
+        ReadOnlyStagnationStage::Intervention if decision.anchor_interlocked() => decision
+            .full_file_write_feedback(&objective)
+            .unwrap_or_else(|| super::feedback::read_only_stagnation(&objective, read_only_streak)),
         ReadOnlyStagnationStage::Intervention => {
             super::feedback::read_only_stagnation(&objective, read_only_streak)
         }
+        ReadOnlyStagnationStage::CompactRestatement if decision.anchor_interlocked() => decision
+            .full_file_write_feedback(&objective)
+            .unwrap_or_else(|| {
+                super::feedback::read_only_stagnation_compact(&objective, read_only_streak)
+            }),
         ReadOnlyStagnationStage::CompactRestatement => {
             super::feedback::read_only_stagnation_compact(&objective, read_only_streak)
         }
+        ReadOnlyStagnationStage::WriteRequired if decision.anchor_interlocked() => decision
+            .write_required_feedback(WRITE_REQUIRED_NO_WRITE_LIMIT)
+            .unwrap_or_else(|| {
+                super::stagnation_escalation::append_write_required_diagnostic(
+                    super::stagnation_escalation::read_only_write_required_feedback(
+                        write_required_state.selected_targets(),
+                        read_only_streak,
+                    ),
+                    write_required_state.diagnostic_feedback(),
+                )
+            }),
         ReadOnlyStagnationStage::WriteRequired => {
             super::stagnation_escalation::append_write_required_diagnostic(
                 super::stagnation_escalation::read_only_write_required_feedback(

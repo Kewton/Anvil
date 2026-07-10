@@ -43,6 +43,12 @@ pub(crate) struct EditAnchorRecoveryState {
     failures_by_path: BTreeMap<String, usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EditAnchorFailureSummary {
+    pub(crate) path: String,
+    pub(crate) failure_count: usize,
+}
+
 impl EditAnchorRecoveryState {
     pub(crate) fn record_failure(
         &mut self,
@@ -68,6 +74,20 @@ impl EditAnchorRecoveryState {
             return;
         };
         self.failures_by_path.remove(&path);
+    }
+
+    pub(crate) fn strongest_failure(&self) -> Option<EditAnchorFailureSummary> {
+        self.failures_by_path
+            .iter()
+            .max_by(|(left_path, left_count), (right_path, right_count)| {
+                left_count
+                    .cmp(right_count)
+                    .then_with(|| right_path.cmp(left_path))
+            })
+            .map(|(path, failure_count)| EditAnchorFailureSummary {
+                path: path.clone(),
+                failure_count: *failure_count,
+            })
     }
 }
 
@@ -239,6 +259,32 @@ mod tests {
 
         assert_eq!(next.failure_count, 1);
         assert_eq!(next.stage, EditAnchorRecoveryStage::Reanchor);
+    }
+
+    #[test]
+    fn strongest_failure_reports_anchor_interlock_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "actual").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "actual").unwrap();
+        let mut state = EditAnchorRecoveryState::default();
+
+        state
+            .record_failure(dir.path(), &serde_json::json!({"path":"a.txt"}))
+            .unwrap();
+        state
+            .record_failure(dir.path(), &serde_json::json!({"path":"b.txt"}))
+            .unwrap();
+        state
+            .record_failure(dir.path(), &serde_json::json!({"path":"b.txt"}))
+            .unwrap();
+
+        assert_eq!(
+            state.strongest_failure(),
+            Some(EditAnchorFailureSummary {
+                path: "b.txt".to_string(),
+                failure_count: 2,
+            })
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod anchor_stagnation_interlock;
 pub mod behavior_evidence;
 pub mod browser_probe;
 pub mod build_verifier;

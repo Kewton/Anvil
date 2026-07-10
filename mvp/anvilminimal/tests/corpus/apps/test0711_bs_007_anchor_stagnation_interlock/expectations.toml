@@ -1,0 +1,38 @@
+case_id = "test0711_bs_007_anchor_stagnation_interlock"
+source = "bs_007 #2 anchor recovery and read-only stagnation interlock regression fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["anchor", "read_only", "write_required", "full-file Write"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/anchor-stagnation-interlock.jsonl = [
+  "test0711_bs_001/#2",
+  "\"event\":\"edit_anchor_recovery\"",
+  "\"stage\":\"reanchor\"",
+  "\"failure_count\":2",
+  "\"event\":\"anchor_stagnation_interlock\"",
+  "\"anchor_failures\":2",
+  "\"streak\":3",
+  "\"effective_streak\":5",
+  "full-file Write",
+  "\"stage\":\"write_required\"",
+  "\"selection_reason\":\"anchor_failure\"",
+  "\"reason\":\"model_stagnation:read_only_loop\""
+]

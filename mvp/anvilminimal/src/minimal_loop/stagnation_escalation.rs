@@ -51,6 +51,7 @@ pub(crate) struct WriteRequiredState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteRequiredSelectionReason {
+    AnchorFailure,
     EvidenceMapped,
     RepairChanged,
     RequiredPath,
@@ -60,6 +61,7 @@ pub(crate) enum WriteRequiredSelectionReason {
 impl WriteRequiredSelectionReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::AnchorFailure => "anchor_failure",
             Self::EvidenceMapped => "evidence_mapped",
             Self::RepairChanged => "repair_changed",
             Self::RequiredPath => "required_path",
