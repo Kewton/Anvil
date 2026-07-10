@@ -6,6 +6,7 @@ use crate::minimal_loop::completion::{
     CompileRepairPromptProtection, compile_repair_prompt_section_with_root,
 };
 use crate::minimal_loop::repair_target::classify_repair_target;
+use crate::planner::contract_attribute_repair;
 use crate::planner::ultra_plan::{
     UltraPhase, UltraPlan, parse_ultra_plan, quote_yaml_string, render_ultra_plan,
 };
@@ -31,6 +32,7 @@ pub struct RepairContext {
     pub compile_reanchored_retry: bool,
     pub compile_narrow_no_snapshot_retry: bool,
     pub workspace_root: Option<PathBuf>,
+    pub eval_events_path: Option<PathBuf>,
     pub prompt_layout: PromptLayout,
 }
 
@@ -115,6 +117,15 @@ fn build_repair_prompt_stable(
             },
         ));
     }
+    let contract_attribute_guidance = contract_attribute_repair::guidance_section(
+        context.workspace_root.as_deref(),
+        report,
+        context.eval_events_path.as_deref(),
+    );
+    if !contract_attribute_guidance.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&contract_attribute_guidance);
+    }
     if let Some(expected) = &context.expected_result {
         prompt.push_str("\n\nExpected verification result:\n");
         prompt.push_str(expected);
@@ -191,6 +202,15 @@ Make the smallest bounded change, then stop.",
                 narrow_no_snapshot_retry: context.compile_narrow_no_snapshot_retry,
             },
         ));
+    }
+    let contract_attribute_guidance = contract_attribute_repair::guidance_section(
+        context.workspace_root.as_deref(),
+        report,
+        context.eval_events_path.as_deref(),
+    );
+    if !contract_attribute_guidance.is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(&contract_attribute_guidance);
     }
     if let Some(expected) = &context.expected_result {
         prompt.push_str("\n\nExpected verification result:\n");
@@ -804,6 +824,53 @@ mod tests {
         assert!(prompt.contains("Expected verification result:"));
         assert!(prompt.contains("attempt 1/4"));
         assert!(prompt.contains("Repair target:"));
+    }
+
+    #[test]
+    fn repair_prompt_includes_contract_attribute_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){ return <main><button data-anvil-action=\"primary\">Start</button><button data-anvil-action=\"restart\">Restart</button></main>; }\n",
+        )
+        .unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut report = VerificationReport::pass();
+        report.push_command_failure(
+            r#"node -p 'String(require("fs").readFileSync("src/app/page.tsx")).includes("data-anvil-state") ? true : process.exit(1)'"#,
+            "command failed",
+        );
+        let context = RepairContext {
+            workspace_root: Some(dir.path().to_path_buf()),
+            eval_events_path: Some(events.clone()),
+            ..RepairContext::default()
+        };
+
+        let prompt = build_repair_prompt_with_context("verify-anvil-attributes", &report, &context);
+
+        assert!(
+            prompt.contains("Repair target: contract_attribute_missing"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("missing attribute: `data-anvil-state`"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("target source file: `src/app/page.tsx`"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("input-coupled dimension"), "{prompt}");
+        assert!(prompt.contains("Existing hook locations:"), "{prompt}");
+        assert!(
+            prompt.contains(r#"data-anvil-state={JSON.stringify({ phase, score, playerX })}"#),
+            "{prompt}"
+        );
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains(r#""event":"contract_attribute_repair_guidance""#));
+        assert!(event_text.contains(r#""attribute":"data-anvil-state""#));
+        assert!(event_text.contains(r#""path":"src/app/page.tsx""#));
     }
 
     #[test]

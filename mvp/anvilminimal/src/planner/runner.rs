@@ -52,7 +52,6 @@ use crate::minimal_loop::repair_target::{
     RepairFollowThrough, RepairTarget, classify_repair_follow_through, classify_repair_target,
 };
 use crate::minimal_loop::verifier_env;
-use crate::planner::hook_snapshot;
 use crate::planner::intent::detect_intent;
 use crate::planner::lint::{
     PlanLintReport, PlanQualityContext, PlanQualityReport, lint_step_plan_report_with_workspace,
@@ -74,7 +73,6 @@ use crate::planner::repair::{
     workspace_relative_handoff_path,
 };
 use crate::planner::sanitizer::{SanitizerReport, sanitize_step_plan_against_policy};
-use crate::planner::signals;
 #[cfg(test)]
 use crate::planner::step_plan::parse_generated_step_plan_json;
 use crate::planner::step_plan::{
@@ -89,6 +87,9 @@ use crate::planner::verify::{
     VerificationReport, verify_setup_dependency_state_with_setup_observed_with_offline,
     verify_step_with_profile_setup_observed_with_offline,
     verify_step_with_profile_setup_observed_with_offline_and_events,
+};
+use crate::planner::{
+    contract_attribute_repair::merge_repair_target_paths, hook_snapshot, signals,
 };
 use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::{AssistantReply, ChatClient, model_for};
@@ -2293,7 +2294,7 @@ fn run_step(
         overall_goal: Some(overall_goal.to_string()),
         required_final_artifacts: prompt_context.required_final_artifacts.clone(),
         step_instruction: Some(step.instruction.clone()),
-        expected_paths: step.expected_paths.clone(),
+        expected_paths: merge_repair_target_paths(&report, &step.expected_paths),
         verify_commands: runtime_step.verify.clone(),
         expected_result: Some(step_expected_result(step).to_string()),
         max_repair_turns: Some(STEP_REPAIR_MAX_TURNS),
@@ -2301,6 +2302,7 @@ fn run_step(
         changed_files: initial.changed_paths.clone(),
         initial_stop_reason: Some(format!("{:?}", initial.stop_reason)),
         workspace_root: Some(config.workspace_root.clone()),
+        eval_events_path: config.eval_events_path.clone(),
         prompt_layout: config.prompt_layout,
         ..RepairContext::default()
     };
@@ -2364,7 +2366,7 @@ fn run_step(
                     client,
                     session,
                     &repair_prompt,
-                    &step.expected_paths,
+                    &context.expected_paths,
                     &repair_config,
                     ui,
                     step_options.clone(),
@@ -2375,7 +2377,7 @@ fn run_step(
                         client,
                         &mut compact_session,
                         &repair_prompt,
-                        &step.expected_paths,
+                        &context.expected_paths,
                         &repair_config,
                         ui,
                         step_options.clone(),
@@ -21253,14 +21255,10 @@ csv-stats = "csv_stats.main:main"
 import csv
 import sys
 from pathlib import Path
-
-
 def fmt(value: float) -> str:
     if value.is_integer():
         return str(int(value))
     return f"{value:.3f}".rstrip("0").rstrip(".")
-
-
 def main() -> None:
     if len(sys.argv) != 2:
         print("usage: csv-stats <file>", file=sys.stderr)

@@ -1,0 +1,38 @@
+case_id = "test0711_bs_001_6_contract_attribute_missing"
+source = "test0711_bs_001 #6 preset_space_combo3 contract attribute missing repair regression fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["contract", "attribute", "data-anvil-state", "write_required"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/contract-attribute-missing.jsonl = [
+  "test0711_bs_001/#6",
+  "preset_space_combo3",
+  "\"event\":\"contract_attribute_repair_guidance\"",
+  "\"attribute\":\"data-anvil-state\"",
+  "\"path\":\"src/app/page.tsx\"",
+  "\"repair_target\":\"contract_attribute_missing\"",
+  "meaningful visible-state JSON snapshot",
+  "input-coupled dimension",
+  "data-anvil-state={JSON.stringify({ phase, score, playerX })}",
+  "\"selection_reason\":\"required_path\"",
+  "\"stage\":\"write_required\"",
+  "\"reason\":\"verify_repair_progress_unchanged\""
+]

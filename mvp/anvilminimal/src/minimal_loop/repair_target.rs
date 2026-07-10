@@ -1,4 +1,5 @@
 use crate::minimal_loop::evidence::{SatisfactionChannel, evidence_satisfaction_channel};
+use crate::planner::contract_attribute_repair;
 use crate::planner::verify::VerificationReport;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7,6 +8,7 @@ pub enum RepairTarget {
     PackageConfig,
     FrameworkConfig,
     MissingEntrypoint,
+    ContractAttributeMissing,
     EmptyApp,
     CapabilityMissing,
     RequiredEvidenceMissing,
@@ -60,6 +62,9 @@ impl RepairTarget {
             Self::PackageConfig => "package_config",
             Self::FrameworkConfig => "framework_config",
             Self::MissingEntrypoint => "missing_entrypoint",
+            Self::ContractAttributeMissing => {
+                contract_attribute_repair::CONTRACT_ATTRIBUTE_MISSING_KIND
+            }
             Self::EmptyApp => "empty_app",
             Self::CapabilityMissing => "capability_missing",
             Self::RequiredEvidenceMissing => "required_evidence_missing",
@@ -83,6 +88,9 @@ impl RepairTarget {
             }
             Self::MissingEntrypoint => {
                 "Create or restore the executable entrypoint required by the selected profile."
+            }
+            Self::ContractAttributeMissing => {
+                "Add the missing data-anvil contract attribute to the source file read by the verifier."
             }
             Self::EmptyApp => {
                 "Replace metadata-only or static shell output with real application behavior."
@@ -114,6 +122,7 @@ impl RepairTarget {
             Self::PackageConfig => "edit_package_manifest_or_lockfile",
             Self::FrameworkConfig => "edit_framework_configuration_or_route_boundary",
             Self::MissingEntrypoint => "create_missing_entrypoint_artifact",
+            Self::ContractAttributeMissing => "edit_contract_attribute_source",
             Self::EmptyApp | Self::CapabilityMissing | Self::Implementation => {
                 "edit_task_implementation_artifact"
             }
@@ -129,6 +138,9 @@ impl RepairTarget {
 pub fn classify_repair_target(report: &VerificationReport) -> RepairTarget {
     if !report.verifier_command_false_negatives.is_empty() {
         return RepairTarget::VerifierCommand;
+    }
+    if contract_attribute_repair::is_contract_attribute_missing(report) {
+        return RepairTarget::ContractAttributeMissing;
     }
     if !report.compile_errors.is_empty() {
         return RepairTarget::Implementation;
@@ -401,6 +413,12 @@ pub fn repair_target_matches_changed_path(target: RepairTarget, path: &str) -> b
                 "app.py",
             ],
         ),
+        RepairTarget::ContractAttributeMissing => {
+            contains_any(
+                &lower,
+                &["src/", "app/", "pages/", ".ts", ".tsx", ".js", ".jsx"],
+            ) && !lower.ends_with("package.json")
+        }
         RepairTarget::EmptyApp | RepairTarget::CapabilityMissing => {
             contains_any(
                 &lower,
@@ -758,6 +776,28 @@ mod tests {
             classify_repair_target(&report),
             RepairTarget::MissingEntrypoint
         );
+    }
+
+    #[test]
+    fn classifies_contract_attribute_missing_before_missing_entrypoint() {
+        let mut report = VerificationReport::pass();
+        report.push_command_failure(
+            r#"node -p 'String(require("fs").readFileSync("src/app/page.tsx")).includes("data-anvil-state") ? true : process.exit(1)'"#,
+            "command failed",
+        );
+
+        assert_eq!(
+            classify_repair_target(&report),
+            RepairTarget::ContractAttributeMissing
+        );
+        assert_eq!(
+            RepairTarget::ContractAttributeMissing.as_str(),
+            "contract_attribute_missing"
+        );
+        assert!(repair_target_followed(
+            RepairTarget::ContractAttributeMissing,
+            &["src/app/page.tsx".to_string()]
+        ));
     }
 
     #[test]
