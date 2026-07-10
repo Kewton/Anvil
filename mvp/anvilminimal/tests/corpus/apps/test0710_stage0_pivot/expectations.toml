@@ -60,3 +60,11 @@ fixtures/package-port-only-grep-normalization.jsonl = [
   "package_json_script_assertion",
   "--port=3011"
 ]
+fixtures/static-import-guards.jsonl = [
+  "test0710_bs_002/combo1-001",
+  "missing_export",
+  "does not export `CANVAS_W`",
+  "test0710_bs_002/combo1-003",
+  "jsx_in_ts",
+  "rename it to .tsx or remove JSX"
+]

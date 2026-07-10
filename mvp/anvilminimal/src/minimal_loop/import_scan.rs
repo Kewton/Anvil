@@ -1,13 +1,54 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use regex::Regex;
 use serde::Serialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportScanIssue {
+    MissingModule,
+    MissingExport {
+        imported_name: String,
+        definition_path: String,
+    },
+    JsxInTs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MissingImport {
     pub source: String,
     pub specifier: String,
+    pub issue: ImportScanIssue,
+}
+
+impl MissingImport {
+    fn missing_module(source: &str, specifier: &str) -> Self {
+        Self {
+            source: source.to_string(),
+            specifier: specifier.to_string(),
+            issue: ImportScanIssue::MissingModule,
+        }
+    }
+
+    fn missing_export(source: &str, specifier: &str, imported_name: &str, target: &Path) -> Self {
+        Self {
+            source: source.to_string(),
+            specifier: specifier.to_string(),
+            issue: ImportScanIssue::MissingExport {
+                imported_name: imported_name.to_string(),
+                definition_path: normalize_pathbuf(target).display().to_string(),
+            },
+        }
+    }
+
+    fn jsx_in_ts(source: &str) -> Self {
+        Self {
+            source: source.to_string(),
+            specifier: String::new(),
+            issue: ImportScanIssue::JsxInTs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,23 +88,53 @@ pub fn scan_relative_imports(root: &Path, paths: &[String]) -> anyhow::Result<Ve
             continue;
         }
         let content = std::fs::read_to_string(&source_path)?;
+        if ts_file_contains_jsx(path, &content) {
+            push_unique_missing(&mut missing, MissingImport::jsx_in_ts(path));
+        }
         let parent = source_path.parent().unwrap_or(root);
         for specifier in extract_import_specifiers(&content) {
             if !is_relative_specifier(&specifier) {
                 continue;
             }
-            if !resolve_import(parent, &specifier)
-                .iter()
-                .any(|path| path.exists())
-            {
-                missing.push(MissingImport {
-                    source: path.clone(),
-                    specifier,
-                });
+            let candidates = resolve_import(parent, &specifier);
+            let Some(definition_path) = candidates.iter().find(|path| path.exists()) else {
+                push_unique_missing(
+                    &mut missing,
+                    MissingImport::missing_module(path, &specifier),
+                );
+                continue;
+            };
+            let Some(definition_file) = candidates.iter().find(|path| path.is_file()) else {
+                continue;
+            };
+            if !definition_path.starts_with(root) || !definition_file.starts_with(root) {
+                continue;
+            }
+            for imported_name in named_imported_symbols(&content, &specifier) {
+                if missing_export_symbol(root, definition_file, &imported_name)? {
+                    let definition_rel = definition_file
+                        .strip_prefix(root)
+                        .unwrap_or(definition_file.as_path());
+                    push_unique_missing(
+                        &mut missing,
+                        MissingImport::missing_export(
+                            path,
+                            &specifier,
+                            &imported_name,
+                            definition_rel,
+                        ),
+                    );
+                }
             }
         }
     }
     Ok(missing)
+}
+
+fn push_unique_missing(missing: &mut Vec<MissingImport>, item: MissingImport) {
+    if !missing.contains(&item) {
+        missing.push(item);
+    }
 }
 
 pub fn imported_symbol_definition_excerpt(
@@ -236,6 +307,128 @@ fn find_imported_symbol(content: &str, local_name: &str) -> Option<ImportedSymbo
         }
     }
     None
+}
+
+fn named_imported_symbols(content: &str, specifier: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for statement in import_statements(content) {
+        if import_statement_specifier(&statement).as_deref() != Some(specifier) {
+            continue;
+        }
+        let Some(head) = statement.split_once(" from ").map(|(head, _)| head) else {
+            continue;
+        };
+        let Some((named, _)) = head
+            .split_once('{')
+            .and_then(|(_, rest)| rest.split_once('}'))
+        else {
+            continue;
+        };
+        for item in named.split(',') {
+            let Some(imported) = named_imported_symbol(item) else {
+                continue;
+            };
+            if !out.contains(&imported) {
+                out.push(imported);
+            }
+        }
+    }
+    out
+}
+
+fn named_imported_symbol(item: &str) -> Option<String> {
+    let trimmed = item.trim().trim_start_matches("type ").trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let imported = trimmed
+        .split_once(" as ")
+        .map(|(imported, _)| imported.trim())
+        .unwrap_or(trimmed)
+        .trim_start_matches("type ")
+        .trim();
+    is_identifier_like(imported).then(|| imported.to_string())
+}
+
+fn missing_export_symbol(
+    root: &Path,
+    definition_file: &Path,
+    imported_name: &str,
+) -> anyhow::Result<bool> {
+    if !definition_file.starts_with(root) {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(definition_file)?;
+    let Some(exports) = exported_symbols(&content) else {
+        return Ok(false);
+    };
+    Ok(!exports.contains(imported_name))
+}
+
+fn exported_symbols(content: &str) -> Option<BTreeSet<String>> {
+    if has_export_star(content) {
+        return None;
+    }
+    let mut symbols = BTreeSet::new();
+    collect_direct_export_symbols(content, &mut symbols);
+    collect_export_list_symbols(content, &mut symbols);
+    if has_default_export(content) {
+        symbols.insert("default".to_string());
+    }
+    Some(symbols)
+}
+
+fn has_export_star(content: &str) -> bool {
+    Regex::new(r#"(?m)^\s*export\s*\*\s*from\s*["']"#)
+        .expect("valid export-star regex")
+        .is_match(content)
+}
+
+fn has_default_export(content: &str) -> bool {
+    Regex::new(r#"(?m)^\s*export\s+default\b"#)
+        .expect("valid default export regex")
+        .is_match(content)
+}
+
+fn collect_direct_export_symbols(content: &str, symbols: &mut BTreeSet<String>) {
+    let re = Regex::new(
+        r#"(?m)^\s*export\s+(?:declare\s+)?(?:(?:const|let|var|class|type|interface|enum)\s+|(?:async\s+)?function\s+)([A-Za-z_$][A-Za-z0-9_$]*)\b"#,
+    )
+    .expect("valid direct export regex");
+    for captures in re.captures_iter(content) {
+        if let Some(name) = captures.get(1) {
+            symbols.insert(name.as_str().to_string());
+        }
+    }
+}
+
+fn collect_export_list_symbols(content: &str, symbols: &mut BTreeSet<String>) {
+    let re = Regex::new(r#"(?s)\bexport\s*\{([^}]*)\}"#).expect("valid export-list regex");
+    for captures in re.captures_iter(content) {
+        let Some(list) = captures.get(1) else {
+            continue;
+        };
+        for item in list.as_str().split(',') {
+            let Some(exported) = export_list_symbol(item) else {
+                continue;
+            };
+            symbols.insert(exported);
+        }
+    }
+}
+
+fn export_list_symbol(item: &str) -> Option<String> {
+    let trimmed = item.trim().trim_start_matches("type ").trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let exported = trimmed
+        .split_once(" as ")
+        .map(|(_, exported)| exported.trim())
+        .unwrap_or(trimmed)
+        .trim_start_matches("type ")
+        .trim();
+    is_identifier_like(exported).then(|| exported.to_string())
 }
 
 fn unattached_ref_diagnostics_for_source(
@@ -923,6 +1116,32 @@ fn is_source_path(path: &str) -> bool {
     })
 }
 
+fn ts_file_contains_jsx(path: &str, content: &str) -> bool {
+    let path = Path::new(path);
+    if path.extension().and_then(|ext| ext.to_str()) != Some("ts") {
+        return false;
+    }
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".d.ts"))
+    {
+        return false;
+    }
+    CONSERVATIVE_JSX_PATTERNS
+        .iter()
+        .any(|re| re.is_match(content))
+}
+
+static CONSERVATIVE_JSX_PATTERNS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
+    let tag = r#"<(?:[A-Z][A-Za-z0-9_.]{1,}|[a-z][a-z0-9-]*)(?:\s[^>]*|/?>)"#;
+    [
+        Regex::new(&format!(r#"(?s)\breturn\s*\(?\s*{tag}"#)).expect("valid return JSX regex"),
+        Regex::new(&format!(r#"(?s)=>\s*\(?\s*{tag}"#)).expect("valid arrow JSX regex"),
+        Regex::new(&format!(r#"(?s)=\s*\(\s*{tag}"#)).expect("valid assigned JSX regex"),
+    ]
+});
+
 fn is_route_source_path(path: &Path) -> bool {
     path.extension().is_some_and(|ext| {
         matches!(
@@ -942,15 +1161,37 @@ fn should_skip_entry(name: &str) -> bool {
 pub fn format_missing_import_feedback(missing: &[MissingImport]) -> String {
     let entries = missing
         .iter()
-        .map(|item| format!("- {} imports missing `{}`", item.source, item.specifier))
+        .map(format_missing_import_feedback_entry)
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "One or more relative imports are unresolved. Create the missing module files or correct the import paths before final response:\n{entries}"
+        "One or more source import checks failed. Fix missing modules, missing exports, or JSX-in-.ts files before final response:\n{entries}"
     )
 }
 
+fn format_missing_import_feedback_entry(item: &MissingImport) -> String {
+    match &item.issue {
+        ImportScanIssue::MissingModule => {
+            format!("- {} imports missing `{}`", item.source, item.specifier)
+        }
+        ImportScanIssue::MissingExport {
+            imported_name,
+            definition_path,
+        } => format!(
+            "- {} imports `{{ {} }}` from `{}`, but {} does not export `{}`. Export it or correct the import name.",
+            item.source, imported_name, item.specifier, definition_path, imported_name
+        ),
+        ImportScanIssue::JsxInTs => format!(
+            "- {} contains JSX in a .ts file. Rename it to .tsx or remove JSX.",
+            item.source
+        ),
+    }
+}
+
 pub fn missing_import_target_path(root: &Path, missing: &MissingImport) -> Option<PathBuf> {
+    if !matches!(missing.issue, ImportScanIssue::MissingModule) {
+        return None;
+    }
     let source_path = root.join(&missing.source);
     let parent = source_path.parent().unwrap_or(root);
     let target = normalize_joined_path(&parent.join(&missing.specifier));
@@ -968,14 +1209,32 @@ pub fn missing_import_target_rel(root: &Path, missing: &MissingImport) -> Option
 pub fn format_missing_import_findings(root: &Path, missing: &[MissingImport]) -> Vec<String> {
     missing
         .iter()
-        .map(|item| match missing_import_target_rel(root, item) {
-            Some(target) => format!(
-                "{} imports {} which does not exist - create {}",
-                item.source, item.specifier, target
+        .map(|item| match &item.issue {
+            ImportScanIssue::MissingModule => match missing_import_target_rel(root, item) {
+                Some(target) => format!(
+                    "{} imports {} which does not exist - create {}",
+                    item.source, item.specifier, target
+                ),
+                None => format!(
+                    "{} imports {} which does not exist",
+                    item.source, item.specifier
+                ),
+            },
+            ImportScanIssue::MissingExport {
+                imported_name,
+                definition_path,
+            } => format!(
+                "{} imports {{{}}} from {} but {} does not export {} - export {} or correct the import",
+                item.source,
+                imported_name,
+                item.specifier,
+                definition_path,
+                imported_name,
+                imported_name
             ),
-            None => format!(
-                "{} imports {} which does not exist",
-                item.source, item.specifier
+            ImportScanIssue::JsxInTs => format!(
+                "{} contains JSX but has a .ts extension - rename it to .tsx or remove JSX",
+                item.source
             ),
         })
         .collect()
@@ -1163,9 +1422,142 @@ export default function Page() {
             missing,
             vec![MissingImport {
                 source: "src/page.tsx".to_string(),
-                specifier: "./Widget".to_string()
+                specifier: "./Widget".to_string(),
+                issue: ImportScanIssue::MissingModule
             }]
         );
+    }
+
+    #[test]
+    fn named_import_missing_export_is_reported_and_clears_after_export_added() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/SpaceInvaders.tsx"),
+            r#"import type { GameState } from "./game-engine";
+import { CANVAS_W } from "./game-engine";
+export default function SpaceInvaders(){ return CANVAS_W; }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/game-engine.ts"),
+            "export const CANVAS_H = 600;\n",
+        )
+        .unwrap();
+
+        let missing =
+            scan_relative_imports(dir.path(), &["src/SpaceInvaders.tsx".to_string()]).unwrap();
+
+        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert!(missing.iter().any(|item| matches!(
+            &item.issue,
+            ImportScanIssue::MissingExport { imported_name, definition_path }
+                if imported_name == "GameState" && definition_path == "src/game-engine.ts"
+        )));
+        assert!(missing.iter().any(|item| matches!(
+            &item.issue,
+            ImportScanIssue::MissingExport { imported_name, definition_path }
+                if imported_name == "CANVAS_W" && definition_path == "src/game-engine.ts"
+        )));
+        assert_eq!(
+            missing_import_target_rel(dir.path(), &missing[0]).as_deref(),
+            None
+        );
+        assert!(
+            format_missing_import_feedback(&missing).contains("does not export `CANVAS_W`"),
+            "{missing:?}"
+        );
+
+        std::fs::write(
+            dir.path().join("src/game-engine.ts"),
+            "export type GameState = { running: boolean };\nexport const CANVAS_W = 800;\n",
+        )
+        .unwrap();
+        let missing =
+            scan_relative_imports(dir.path(), &["src/SpaceInvaders.tsx".to_string()]).unwrap();
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    #[test]
+    fn named_export_collection_accepts_export_list_and_const_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/page.tsx"),
+            r#"import { CANVAS_W, CANVAS_H } from "./game-engine";"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/game-engine.ts"),
+            "const CANVAS_W = 800;\nexport { CANVAS_W };\nexport const CANVAS_H = 600;\n",
+        )
+        .unwrap();
+
+        let missing = scan_relative_imports(dir.path(), &["src/page.tsx".to_string()]).unwrap();
+
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    #[test]
+    fn named_export_scan_skips_export_star_modules_to_avoid_false_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/page.tsx"),
+            r#"import { CANVAS_W } from "./game-engine";"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/game-engine.ts"),
+            r#"export * from "./constants";"#,
+        )
+        .unwrap();
+
+        let missing = scan_relative_imports(dir.path(), &["src/page.tsx".to_string()]).unwrap();
+
+        assert!(missing.is_empty(), "{missing:?}");
+    }
+
+    #[test]
+    fn ts_file_with_jsx_is_reported_but_generics_and_tsx_are_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/game-engine.ts"),
+            "export function GameView(){ return <div data-testid=\"game\" />; }\n",
+        )
+        .unwrap();
+
+        let missing =
+            scan_relative_imports(dir.path(), &["src/app/game-engine.ts".to_string()]).unwrap();
+
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(matches!(missing[0].issue, ImportScanIssue::JsxInTs));
+        assert!(
+            format_missing_import_findings(dir.path(), &missing)[0]
+                .contains("rename it to .tsx or remove JSX"),
+            "{missing:?}"
+        );
+
+        std::fs::write(
+            dir.path().join("src/app/game-engine.ts"),
+            "const f = <T,>(x: T) => x;\ntype Registry = Map<string, number>;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/view.tsx"),
+            "export function View(){ return <div />; }\n",
+        )
+        .unwrap();
+        let missing = scan_relative_imports(
+            dir.path(),
+            &[
+                "src/app/game-engine.ts".to_string(),
+                "src/app/view.tsx".to_string(),
+            ],
+        )
+        .unwrap();
+        assert!(missing.is_empty(), "{missing:?}");
     }
 
     #[test]

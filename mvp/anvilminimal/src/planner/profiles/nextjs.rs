@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use crate::minimal_loop::import_scan::{
-    MissingImport, format_missing_import_findings, missing_import_target_path,
+    MissingImport, format_missing_import_findings, missing_import_target_path, route_bound_closure,
     scan_relative_imports,
 };
 use crate::planner::profile::ProfileQualityExpectations;
@@ -779,7 +779,15 @@ fn missing_app_relative_import_contract_failure(root: &Path) -> Option<String> {
 }
 
 fn missing_app_relative_imports(root: &Path) -> anyhow::Result<Vec<MissingImport>> {
-    scan_relative_imports(root, &project_app_source_paths(root))
+    let mut paths = project_app_source_paths(root);
+    paths.extend(
+        route_bound_closure(root, "nextjs")
+            .into_iter()
+            .map(|path| path.display().to_string()),
+    );
+    paths.sort();
+    paths.dedup();
+    scan_relative_imports(root, &paths)
 }
 
 fn repair_missing_css_import_artifacts(root: &Path) -> anyhow::Result<bool> {
@@ -1951,6 +1959,64 @@ mod tests {
             Some("next start -p 3011")
         );
         assert!(verify_invariant(dir.path(), "ブラウザで使えるメモアプリ").is_pass());
+    }
+
+    #[test]
+    fn nextjs_verify_rejects_route_bound_missing_named_export_before_build() {
+        let dir = complete_app();
+        std::fs::create_dir_all(dir.path().join("src/components")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "import SpaceInvaders from '../components/SpaceInvaders'; export default function Page(){ return <SpaceInvaders/>; }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/components/SpaceInvaders.tsx"),
+            "import { CANVAS_W } from './game-engine'; export default function SpaceInvaders(){ return <canvas width={CANVAS_W}/>; }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/components/game-engine.ts"),
+            "export const CANVAS_H = 600;\n",
+        )
+        .unwrap();
+
+        let report = verify(dir.path(), "3011");
+        let reason = report.primary_reason();
+
+        assert!(reason.contains("missing relative imports"), "{reason}");
+        assert!(reason.contains("does not export CANVAS_W"), "{reason}");
+
+        std::fs::write(
+            dir.path().join("src/components/game-engine.ts"),
+            "export const CANVAS_W = 800;\nexport const CANVAS_H = 600;\n",
+        )
+        .unwrap();
+        assert!(verify(dir.path(), "3011").is_pass());
+    }
+
+    #[test]
+    fn nextjs_verify_rejects_route_bound_jsx_in_ts_before_build() {
+        let dir = complete_app();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "import { GameView } from './game-engine'; export default function Page(){ return <GameView/>; }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/app/game-engine.ts"),
+            "export function GameView(){ return <div data-testid=\"game\" />; }\n",
+        )
+        .unwrap();
+
+        let report = verify(dir.path(), "3011");
+        let reason = report.primary_reason();
+
+        assert!(reason.contains("missing relative imports"), "{reason}");
+        assert!(
+            reason.contains("rename it to .tsx or remove JSX"),
+            "{reason}"
+        );
     }
 
     #[test]
