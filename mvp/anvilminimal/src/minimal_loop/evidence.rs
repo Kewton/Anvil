@@ -413,6 +413,48 @@ pub fn browser_interaction_evidence_for_dirs(
     }
 }
 
+fn browser_interaction_state_dimension_scan_text(root: &Path, extra_dirs: &[PathBuf]) -> String {
+    let mut seen = BTreeSet::new();
+    let mut dimensions = Vec::new();
+    for path in browser_evidence_candidate_paths(
+        root,
+        extra_dirs,
+        &[
+            "browser-interaction.json",
+            "interaction-evidence.json",
+            "interaction.json",
+        ],
+    ) {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if !value.is_object()
+            || classify_browser_evidence_json(BrowserEvidenceKind::Interaction, &value)
+                != BrowserEvidenceStatus::Passed
+        {
+            continue;
+        }
+        let details = value
+            .get("browser_details")
+            .or_else(|| value.get("details"))
+            .filter(|value| value.is_object());
+        for dimension in string_array_field_values_deep(&value, details, "state_dimensions_changed")
+        {
+            let dimension = dimension.trim();
+            if !dimension.is_empty() && seen.insert(dimension.to_string()) {
+                dimensions.push(dimension.to_string());
+            }
+        }
+    }
+    dimensions.join("\n")
+}
+
 fn read_browser_evidence(
     root: &Path,
     extra_dirs: &[PathBuf],
@@ -817,18 +859,43 @@ fn string_array_field_contains_deep(
     key: &str,
     needle: &str,
 ) -> bool {
-    string_array_field_contains(value, key, needle)
-        || details.is_some_and(|details| string_array_field_contains(details, key, needle))
+    string_array_field_values_deep(value, details, key)
+        .iter()
+        .any(|item| item.eq_ignore_ascii_case(needle))
 }
 
-fn string_array_field_contains(value: &Value, key: &str, needle: &str) -> bool {
-    value
+fn string_array_field_values_deep(
+    value: &Value,
+    details: Option<&Value>,
+    key: &str,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    push_string_array_field_values(value, key, &mut seen, &mut out);
+    if let Some(details) = details {
+        push_string_array_field_values(details, key, &mut seen, &mut out);
+    }
+    out
+}
+
+fn push_string_array_field_values(
+    value: &Value,
+    key: &str,
+    seen: &mut BTreeSet<String>,
+    out: &mut Vec<String>,
+) {
+    for item in value
         .get(key)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .any(|item| item.eq_ignore_ascii_case(needle))
+    {
+        let trimmed = item.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
 }
 
 pub fn required_evidence_for_capability(capability: &str) -> Vec<String> {
@@ -931,11 +998,14 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
     }
 
     let workspace = collect_workspace_evidence(root);
-    let artifact_obligations = artifact_obligation_evidence_with_hints(
+    let browser_state_dimension_scan_text =
+        browser_interaction_state_dimension_scan_text(root, browser_evidence_dirs);
+    let artifact_obligations = artifact_obligation_evidence_with_hints_and_scan_text(
         root,
         required_paths,
         required_capabilities,
         evidence_hint_tokens,
+        &browser_state_dimension_scan_text,
     );
     let mut required = BTreeSet::new();
     let mut missing_capabilities = Vec::new();
@@ -1066,7 +1136,11 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
             "challenge_or_adversary_evidence" => {
                 record_bool_evidence_tier(
                     evidence,
-                    has_challenge_or_adversary_evidence(&workspace, evidence_hint_tokens),
+                    has_challenge_or_adversary_evidence(
+                        &workspace,
+                        evidence_hint_tokens,
+                        &browser_state_dimension_scan_text,
+                    ),
                     &mut missing_evidence,
                     &mut evidence_tiers,
                 );
@@ -1074,7 +1148,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
             "score_or_progression_evidence" => {
                 record_source_signal(
                     evidence,
-                    score_or_progression_signal(&workspace),
+                    score_or_progression_signal(&workspace, &browser_state_dimension_scan_text),
                     &mut missing_evidence,
                     &mut weak_evidence,
                     &mut evidence_tiers,
@@ -1083,7 +1157,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
             "failure_or_collision_evidence" => {
                 record_source_signal(
                     evidence,
-                    failure_or_collision_signal(&workspace),
+                    failure_or_collision_signal(&workspace, &browser_state_dimension_scan_text),
                     &mut missing_evidence,
                     &mut weak_evidence,
                     &mut evidence_tiers,
@@ -1161,6 +1235,7 @@ pub fn verify_runtime_acceptance_with_browser_dirs_and_hints(
             &required,
             &missing_evidence,
             evidence_hint_tokens,
+            &browser_state_dimension_scan_text,
             &mut weak_evidence,
             &mut diagnostics,
         );
@@ -1302,6 +1377,22 @@ pub fn artifact_obligation_evidence_with_hints(
     required_capabilities: &[String],
     evidence_hint_tokens: &[String],
 ) -> Vec<ArtifactObligationEvidence> {
+    artifact_obligation_evidence_with_hints_and_scan_text(
+        root,
+        required_paths,
+        required_capabilities,
+        evidence_hint_tokens,
+        "",
+    )
+}
+
+fn artifact_obligation_evidence_with_hints_and_scan_text(
+    root: &Path,
+    required_paths: &[String],
+    required_capabilities: &[String],
+    evidence_hint_tokens: &[String],
+    extra_scan_text: &str,
+) -> Vec<ArtifactObligationEvidence> {
     let mut out = Vec::new();
     let route_bound_files = route_bound_closure(root, "nextjs");
     for path in required_paths {
@@ -1313,7 +1404,16 @@ pub fn artifact_obligation_evidence_with_hints(
         let route_bound = route_bound_files.contains(Path::new(path));
         let file = SourceFile::new_with_route_bound(path.clone(), content, route_bound);
         let role = artifact_role_for_file(&file);
-        let evidence = evidence_kinds_for_file(&file, evidence_hint_tokens)
+        let evidence_kinds = if extra_scan_text.trim().is_empty() {
+            evidence_kinds_for_file(&file, evidence_hint_tokens)
+        } else {
+            evidence_kinds_for_file_with_extra_scan_text(
+                &file,
+                evidence_hint_tokens,
+                extra_scan_text,
+            )
+        };
+        let evidence = evidence_kinds
             .into_iter()
             .map(|kind| kind.as_str().to_string())
             .collect::<BTreeSet<_>>();
@@ -1897,15 +1997,20 @@ fn collect_route_unbound_capability_evidence(
     required_evidence: &BTreeSet<String>,
     missing_evidence: &[String],
     evidence_hint_tokens: &[String],
+    extra_scan_text: &str,
     weak: &mut Vec<String>,
     diagnostics: &mut Vec<String>,
 ) {
     let missing = missing_evidence.iter().cloned().collect::<BTreeSet<_>>();
     for file in route_unbound_source_files(workspace) {
-        let route_scanned_kinds = evidence_kinds_for_file(file, evidence_hint_tokens)
-            .into_iter()
-            .filter(|kind| source_scanned_evidence_kind(*kind))
-            .collect::<Vec<_>>();
+        let route_scanned_kinds = evidence_kinds_for_file_with_extra_scan_text(
+            file,
+            evidence_hint_tokens,
+            extra_scan_text,
+        )
+        .into_iter()
+        .filter(|kind| source_scanned_evidence_kind(*kind))
+        .collect::<Vec<_>>();
         if route_scanned_kinds.is_empty() {
             continue;
         }
@@ -2264,17 +2369,33 @@ fn has_stateful_update_evidence(workspace: &WorkspaceEvidence) -> bool {
 fn has_challenge_or_adversary_evidence(
     workspace: &WorkspaceEvidence,
     evidence_hint_tokens: &[String],
+    extra_scan_text: &str,
 ) -> bool {
-    route_bound_source_files(workspace)
-        .any(|file| source_file_has_challenge_or_adversary(file, evidence_hint_tokens))
+    route_bound_source_files(workspace).any(|file| {
+        source_file_has_challenge_or_adversary_with_extra_scan_text(
+            file,
+            evidence_hint_tokens,
+            extra_scan_text,
+        )
+    })
 }
 
-fn score_or_progression_signal(workspace: &WorkspaceEvidence) -> SourceEvidenceSignal {
-    workspace_source_signal(workspace, source_file_score_or_progression_signal)
+fn score_or_progression_signal(
+    workspace: &WorkspaceEvidence,
+    extra_scan_text: &str,
+) -> SourceEvidenceSignal {
+    workspace_source_signal(workspace, |file| {
+        source_file_score_or_progression_signal_with_extra_scan_text(file, extra_scan_text)
+    })
 }
 
-fn failure_or_collision_signal(workspace: &WorkspaceEvidence) -> SourceEvidenceSignal {
-    workspace_source_signal(workspace, source_file_failure_or_collision_signal)
+fn failure_or_collision_signal(
+    workspace: &WorkspaceEvidence,
+    extra_scan_text: &str,
+) -> SourceEvidenceSignal {
+    workspace_source_signal(workspace, |file| {
+        source_file_failure_or_collision_signal_with_extra_scan_text(file, extra_scan_text)
+    })
 }
 
 fn restart_or_recoverable_state_signal(workspace: &WorkspaceEvidence) -> SourceEvidenceSignal {
@@ -2291,7 +2412,7 @@ fn has_live_preview_evidence(workspace: &WorkspaceEvidence) -> bool {
 
 fn workspace_source_signal(
     workspace: &WorkspaceEvidence,
-    signal_fn: fn(&SourceFile) -> SourceEvidenceSignal,
+    signal_fn: impl Fn(&SourceFile) -> SourceEvidenceSignal,
 ) -> SourceEvidenceSignal {
     let mut found_weak = SourceEvidenceSignal::Absent;
     for file in route_bound_source_files(workspace) {
@@ -2459,6 +2580,18 @@ fn evidence_kinds_for_file(
     file: &SourceFile,
     evidence_hint_tokens: &[String],
 ) -> Vec<EvidenceKind> {
+    debug_assert!(
+        is_evidence_bearing_implementation_candidate_path(&file.rel)
+            || !artifact_role_for_file(file).satisfies_implementation()
+    );
+    evidence_kinds_for_file_with_extra_scan_text(file, evidence_hint_tokens, "")
+}
+
+fn evidence_kinds_for_file_with_extra_scan_text(
+    file: &SourceFile,
+    evidence_hint_tokens: &[String],
+    extra_scan_text: &str,
+) -> Vec<EvidenceKind> {
     let mut kinds = Vec::new();
     match artifact_role_for_file(file) {
         ArtifactRoleLite::Implementation => kinds.push(EvidenceKind::ImplementationArtifact),
@@ -2498,17 +2631,21 @@ fn evidence_kinds_for_file(
     if source_file_has_stateful_update(file) {
         kinds.push(EvidenceKind::StatefulUpdateEvidence);
     }
-    if source_file_has_challenge_or_adversary(file, evidence_hint_tokens) {
+    if source_file_has_challenge_or_adversary_with_extra_scan_text(
+        file,
+        evidence_hint_tokens,
+        extra_scan_text,
+    ) {
         kinds.push(EvidenceKind::ChallengeOrAdversaryEvidence);
     }
     if matches!(
-        source_file_score_or_progression_signal(file),
+        source_file_score_or_progression_signal_with_extra_scan_text(file, extra_scan_text),
         SourceEvidenceSignal::Strong
     ) {
         kinds.push(EvidenceKind::ScoreOrProgressionEvidence);
     }
     if matches!(
-        source_file_failure_or_collision_signal(file),
+        source_file_failure_or_collision_signal_with_extra_scan_text(file, extra_scan_text),
         SourceEvidenceSignal::Strong
     ) {
         kinds.push(EvidenceKind::FailureOrCollisionEvidence);
@@ -2805,8 +2942,40 @@ fn source_file_has_challenge_or_adversary(
             && source_file_has_adversary_motion_or_interaction_signal(file))
 }
 
+fn source_file_has_challenge_or_adversary_with_extra_scan_text(
+    file: &SourceFile,
+    evidence_hint_tokens: &[String],
+    extra_scan_text: &str,
+) -> bool {
+    if extra_scan_text.trim().is_empty() {
+        return source_file_has_challenge_or_adversary(file, evidence_hint_tokens);
+    }
+    source_file_has_static_adversary_entity_with_extra_scan_text(file, extra_scan_text)
+        || (source_file_has_goal_adversary_hint_with_extra_scan_text(
+            file,
+            evidence_hint_tokens,
+            extra_scan_text,
+        ) && source_file_has_position_or_motion_update(file)
+            && source_file_has_adversary_motion_or_interaction_signal(file))
+}
+
 fn source_file_has_static_adversary_entity(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
+    source_text_has_static_adversary_entity(&lower)
+}
+
+fn source_file_has_static_adversary_entity_with_extra_scan_text(
+    file: &SourceFile,
+    extra_scan_text: &str,
+) -> bool {
+    if extra_scan_text.trim().is_empty() {
+        return source_file_has_static_adversary_entity(file);
+    }
+    let lower = source_scan_lower_with_extra(file, extra_scan_text);
+    source_text_has_static_adversary_entity(&lower)
+}
+
+fn source_text_has_static_adversary_entity(lower: &str) -> bool {
     let has_adversary_token = [
         "enemy",
         "enemies",
@@ -2826,7 +2995,22 @@ fn source_file_has_static_adversary_entity(file: &SourceFile) -> bool {
         "target",
         "challenge",
         "boss",
+        "brick",
+        "bricks",
+        "block",
+        "blocks",
+        "paddle",
+        "ball",
+        "puck",
+        "meteor",
+        "barrier",
+        "timer",
+        "countdown",
         "敵",
+        "ブロック",
+        "パドル",
+        "ボール",
+        "障害物",
         "インベーダー",
         "エイリアン",
         "モンスター",
@@ -2836,7 +3020,7 @@ fn source_file_has_static_adversary_entity(file: &SourceFile) -> bool {
     if !has_adversary_token {
         return false;
     }
-    source_text_has_adversary_entity_context(&lower)
+    source_text_has_adversary_entity_context(lower)
 }
 
 fn source_text_has_adversary_entity_context(lower: &str) -> bool {
@@ -2887,6 +3071,40 @@ fn source_file_has_goal_adversary_hint(file: &SourceFile, evidence_hint_tokens: 
         })
 }
 
+fn source_file_has_goal_adversary_hint_with_extra_scan_text(
+    file: &SourceFile,
+    evidence_hint_tokens: &[String],
+    extra_scan_text: &str,
+) -> bool {
+    if extra_scan_text.trim().is_empty() {
+        return source_file_has_goal_adversary_hint(file, evidence_hint_tokens);
+    }
+    let scan_text = source_scan_text_with_extra(file, extra_scan_text);
+    let lower = scan_text.to_ascii_lowercase();
+    evidence_hint_tokens
+        .iter()
+        .map(|token| token.trim())
+        .filter(|token| !token.is_empty())
+        .any(|token| {
+            if token.is_ascii() {
+                lower.contains(&token.to_ascii_lowercase())
+            } else {
+                scan_text.contains(token)
+            }
+        })
+}
+
+fn source_scan_text_with_extra(file: &SourceFile, extra_scan_text: &str) -> String {
+    if extra_scan_text.trim().is_empty() {
+        return file.scan_text().to_string();
+    }
+    format!("{}\n{}", file.scan_text(), extra_scan_text)
+}
+
+fn source_scan_lower_with_extra(file: &SourceFile, extra_scan_text: &str) -> String {
+    source_scan_text_with_extra(file, extra_scan_text).to_ascii_lowercase()
+}
+
 fn source_file_has_adversary_motion_or_interaction_signal(file: &SourceFile) -> bool {
     source_file_has_stateful_update(file)
         || source_file_has_failure_or_collision(file)
@@ -2932,6 +3150,21 @@ fn source_file_has_position_or_motion_update(file: &SourceFile) -> bool {
 
 fn source_file_has_score_or_progression_keyword(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
+    source_text_has_score_or_progression_keyword(&lower)
+}
+
+fn source_file_has_score_or_progression_keyword_with_extra_scan_text(
+    file: &SourceFile,
+    extra_scan_text: &str,
+) -> bool {
+    if extra_scan_text.trim().is_empty() {
+        return source_file_has_score_or_progression_keyword(file);
+    }
+    let lower = source_scan_lower_with_extra(file, extra_scan_text);
+    source_text_has_score_or_progression_keyword(&lower)
+}
+
+fn source_text_has_score_or_progression_keyword(lower: &str) -> bool {
     [
         "score",
         "points",
@@ -2958,6 +3191,21 @@ fn source_file_has_failure_or_collision(file: &SourceFile) -> bool {
 
 fn source_file_has_failure_or_collision_keyword(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
+    source_text_has_failure_or_collision_keyword(&lower)
+}
+
+fn source_file_has_failure_or_collision_keyword_with_extra_scan_text(
+    file: &SourceFile,
+    extra_scan_text: &str,
+) -> bool {
+    if extra_scan_text.trim().is_empty() {
+        return source_file_has_failure_or_collision_keyword(file);
+    }
+    let lower = source_scan_lower_with_extra(file, extra_scan_text);
+    source_text_has_failure_or_collision_keyword(&lower)
+}
+
+fn source_text_has_failure_or_collision_keyword(lower: &str) -> bool {
     [
         "collision",
         "collide",
@@ -3046,8 +3294,46 @@ fn source_file_score_or_progression_signal(file: &SourceFile) -> SourceEvidenceS
     }
 }
 
+fn source_file_score_or_progression_signal_with_extra_scan_text(
+    file: &SourceFile,
+    extra_scan_text: &str,
+) -> SourceEvidenceSignal {
+    if extra_scan_text.trim().is_empty() {
+        return source_file_score_or_progression_signal(file);
+    }
+    if !source_file_has_score_or_progression_keyword_with_extra_scan_text(file, extra_scan_text) {
+        return SourceEvidenceSignal::Absent;
+    }
+    if source_file_has_score_update_signal(file) {
+        SourceEvidenceSignal::Strong
+    } else {
+        SourceEvidenceSignal::Weak(
+            "score/progression needs an executable update such as score +=, score++, score =, or setScore(...)",
+        )
+    }
+}
+
 fn source_file_failure_or_collision_signal(file: &SourceFile) -> SourceEvidenceSignal {
     if !source_file_has_failure_or_collision_keyword(file) {
+        return SourceEvidenceSignal::Absent;
+    }
+    if source_file_has_game_over_transition(file) || source_file_has_collision_conditional(file) {
+        SourceEvidenceSignal::Strong
+    } else {
+        SourceEvidenceSignal::Weak(
+            "failure/collision needs a game-over transition or conditional overlap/intersect/distance comparison",
+        )
+    }
+}
+
+fn source_file_failure_or_collision_signal_with_extra_scan_text(
+    file: &SourceFile,
+    extra_scan_text: &str,
+) -> SourceEvidenceSignal {
+    if extra_scan_text.trim().is_empty() {
+        return source_file_failure_or_collision_signal(file);
+    }
+    if !source_file_has_failure_or_collision_keyword_with_extra_scan_text(file, extra_scan_text) {
         return SourceEvidenceSignal::Absent;
     }
     if source_file_has_game_over_transition(file) || source_file_has_collision_conditional(file) {
@@ -4354,6 +4640,214 @@ export default function Page() {
             report
                 .missing_evidence
                 .contains(&"challenge_or_adversary_evidence".to_string())
+        );
+    }
+
+    #[test]
+    fn breakout_bricks_array_and_collision_satisfy_challenge_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+type Brick = { x: number; y: number; alive: boolean };
+const makeBricks = (): Brick[] =>
+  Array.from({ length: 12 }, (_, index) => ({
+    x: 24 + (index % 6) * 42,
+    y: 30 + Math.floor(index / 6) * 18,
+    alive: true,
+  }));
+export default function Page() {
+  const [score, setScore] = useState(0);
+  const [bricks, setBricks] = useState<Brick[]>(makeBricks());
+  const [ball, setBall] = useState({ x: 120, y: 140, dx: 2, dy: -2 });
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setBall((current) => ({ ...current, x: current.x + current.dx, y: current.y + current.dy }));
+      setBricks((current) =>
+        current.map((brick) => {
+          const collision =
+            brick.alive &&
+            Math.abs(ball.x - brick.x) < 20 &&
+            Math.abs(ball.y - brick.y) < 12;
+          if (!collision) return brick;
+          setScore((value) => value + 10);
+          return { ...brick, alive: false };
+        }),
+      );
+    }, 16);
+    return () => clearInterval(timer);
+  }, [ball.x, ball.y]);
+  return <main><canvas /><p>score {score}</p><p>{bricks.filter((brick) => brick.alive).length}</p></main>;
+}
+"#,
+        )
+        .unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["challenge_or_adversary_evidence".to_string()],
+            &[],
+            &[],
+        );
+
+        assert!(report.passed, "{report:?}");
+        assert!(
+            report.artifact_obligations[0]
+                .evidence
+                .contains(&"challenge_or_adversary_evidence".to_string()),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn japanese_breakout_goal_hint_matches_english_brick_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#"export default function Page() {
+  let brickPosition = 0;
+  brickPosition += 2;
+  return <main>{brickPosition}</main>;
+}
+"#,
+        )
+        .unwrap();
+
+        let without_hints = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["challenge_or_adversary_evidence".to_string()],
+            &[],
+            &[],
+        );
+        assert!(!without_hints.passed, "{without_hints:?}");
+
+        let contract = crate::minimal_loop::completion::CompletionContract {
+            required_paths: vec!["src/app/page.tsx".to_string()],
+            verify_commands: Vec::new(),
+            profile: None,
+            goal: Some("ブロック崩し".to_string()),
+            required_capabilities: Vec::new(),
+            deterministic_oracles: Vec::new(),
+            required_evidence: vec!["challenge_or_adversary_evidence".to_string()],
+            evidence_hint_tokens: Vec::new(),
+            required_obligations: Vec::new(),
+            deferred_verify_requirements: Vec::new(),
+            verify_repair_cap: 2,
+        }
+        .validate(dir.path())
+        .unwrap();
+
+        assert!(
+            contract.evidence_hint_tokens.contains(&"brick".to_string()),
+            "{:?}",
+            contract.evidence_hint_tokens
+        );
+        let with_hints = contract.runtime_acceptance_report(dir.path());
+        assert!(with_hints.passed, "{with_hints:?}");
+    }
+
+    #[test]
+    fn passed_probe_state_dimension_contributes_to_adversary_scan_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useEffect, useState } from "react";
+type Tile = { x: number; y: number; active: boolean };
+export default function Page() {
+  const [tiles, setTiles] = useState<Tile[]>([{ x: 10, y: 20, active: true }]);
+  useEffect(() => {
+    setTiles((current) =>
+      current.map((tile) => ({ ...tile, x: tile.x + 1, active: tile.x < 200 })),
+    );
+  }, []);
+  return <main><canvas />{tiles.map((tile) => <span key={tile.x}>{tile.x}</span>)}</main>;
+}
+"#,
+        )
+        .unwrap();
+
+        let before_probe = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["challenge_or_adversary_evidence".to_string()],
+            &[],
+            &[],
+        );
+        assert!(!before_probe.passed, "{before_probe:?}");
+
+        std::fs::write(
+            dir.path().join("interaction-evidence.json"),
+            r#"{"ok":true,"interaction_success":true,"interaction_performed":true,"surface_visible":true,"start_control_found":false,"input_state_change":true,"input_event_observed":true,"state_changed":true,"state_dimensions_changed":["bricksRemaining"]}"#,
+        )
+        .unwrap();
+
+        let after_probe = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["challenge_or_adversary_evidence".to_string()],
+            &[],
+            &[],
+        );
+        assert!(after_probe.passed, "{after_probe:?}");
+    }
+
+    #[test]
+    fn counter_with_adversary_named_probe_dimension_still_lacks_challenge_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            r#""use client";
+import { useState } from "react";
+export default function Page() {
+  const [bricksRemaining, setBricksRemaining] = useState(10);
+  return (
+    <main>
+      <button onClick={() => setBricksRemaining((value) => value - 1)}>Count</button>
+      <p>{bricksRemaining}</p>
+    </main>
+  );
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("interaction-evidence.json"),
+            r#"{"ok":true,"interaction_success":true,"interaction_performed":true,"surface_visible":true,"start_control_found":false,"input_state_change":true,"input_event_observed":true,"state_changed":true,"state_dimensions_changed":["bricksRemaining"]}"#,
+        )
+        .unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["challenge_or_adversary_evidence".to_string()],
+            &[],
+            &[],
+        );
+
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report
+                .missing_evidence
+                .contains(&"challenge_or_adversary_evidence".to_string()),
+            "{report:?}"
         );
     }
 

@@ -1511,14 +1511,26 @@ fn normalize_evidence_hint_tokens(values: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for value in values {
         let normalized = normalize_evidence_hint_token(&value);
-        if !normalized.is_empty()
-            && !evidence_hint_stopword(&normalized)
-            && seen.insert(normalized.clone())
-        {
-            out.push(normalized);
+        push_normalized_evidence_hint_token(&normalized, &mut seen, &mut out);
+        for translation in evidence_hint_token_translations(&normalized) {
+            let translated = normalize_evidence_hint_token(translation);
+            push_normalized_evidence_hint_token(&translated, &mut seen, &mut out);
         }
     }
     out
+}
+
+fn push_normalized_evidence_hint_token(
+    normalized: &str,
+    seen: &mut BTreeSet<String>,
+    out: &mut Vec<String>,
+) {
+    if !normalized.is_empty()
+        && !evidence_hint_stopword(normalized)
+        && seen.insert(normalized.to_string())
+    {
+        out.push(normalized.to_string());
+    }
 }
 
 fn normalize_evidence_hint_token(value: &str) -> String {
@@ -1588,6 +1600,24 @@ fn is_katakana_hint_char(ch: char) -> bool {
 
 fn evidence_hint_stopword(token: &str) -> bool {
     ASCII_GOAL_HINT_STOPWORDS.contains(&token) || JAPANESE_GOAL_HINT_STOPWORDS.contains(&token)
+}
+
+fn evidence_hint_token_translations(token: &str) -> &'static [&'static str] {
+    match token {
+        "ブロック" => &["block", "brick"],
+        "ボール" => &["ball"],
+        "パドル" => &["paddle"],
+        "敵" => &["enemy"],
+        "インベーダー" => &["invader", "invaders"],
+        "ミサイル" => &["missile"],
+        "シューティング" => &["shooter"],
+        "エイリアン" => &["alien"],
+        "障害物" => &["obstacle", "barrier"],
+        "隕石" => &["meteor"],
+        "タイマー" => &["timer"],
+        "カウントダウン" => &["countdown", "timer"],
+        _ => &[],
+    }
 }
 
 const ASCII_GOAL_HINT_STOPWORDS: &[&str] = &[
@@ -2551,6 +2581,17 @@ export class SpaceInvadersEngine {\n\
             evidence_hint_tokens_for_goal("スペースインベーダー")
                 .contains(&"インベーダー".to_string())
         );
+        assert!(
+            contract
+                .evidence_hint_tokens
+                .contains(&"shooter".to_string()),
+            "{:?}",
+            contract.evidence_hint_tokens
+        );
+        let block_tokens = evidence_hint_tokens_for_goal("ブロック崩し");
+        assert!(block_tokens.contains(&"ブロック".to_string()));
+        assert!(block_tokens.contains(&"block".to_string()));
+        assert!(block_tokens.contains(&"brick".to_string()));
     }
 
     #[test]

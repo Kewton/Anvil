@@ -1,0 +1,2 @@
+{"event":"browser_interaction_probe","case_id":"test0710_bs_006 breakout_combo1","interaction_evidence_status":"passed","state_dimensions_changed":["bricksRemaining","score"],"input_dispatches":["keydown:ArrowLeft","keydown:ArrowRight"],"surface_fit":{"fits_viewport":true,"overflow_bottom_px":0}}
+{"event":"completion_verify","case_id":"test0710_bs_006 breakout_combo1","evidence_tiers":{"challenge_or_adversary_evidence":"strong","failure_or_collision_evidence":"strong","score_or_progression_evidence":"strong"},"missing_evidence":[],"primary_reason":"pass"}

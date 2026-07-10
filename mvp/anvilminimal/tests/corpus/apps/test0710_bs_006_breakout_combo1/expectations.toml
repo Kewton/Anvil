@@ -1,0 +1,46 @@
+case_id = "test0710_bs_006_breakout_combo1"
+source = "UAT test0710_bs_006 breakout_combo1 regression"
+required_paths = ["package.json", "src/app/page.tsx"]
+verify_commands = ["npm run build"]
+required_capabilities = ["buildable", "stateful_interaction", "player_control", "adversary_or_challenge", "progression_or_score", "failure_or_collision_rule", "nextjs_route"]
+required_evidence = ["nextjs_route_evidence", "build_command_or_dependency_missing_boundary", "implementation_artifact", "visible_interactive_surface_evidence", "user_input_handler_evidence", "stateful_update_evidence", "interactive_ui_source_evidence", "non_static_screen_evidence", "challenge_or_adversary_evidence", "score_or_progression_evidence", "failure_or_collision_evidence"]
+required_obligations = ["implementation"]
+deferred_verify_requirements = []
+evidence_hint_tokens = ["ブロック", "block", "brick", "ball", "paddle", "bricksRemaining"]
+acceptance_passed = true
+primary_reason = "pass"
+
+[route_closure]
+include = ["src/app/page.tsx"]
+exclude = []
+
+[evidence]
+implementation_artifact = "Strong"
+interactive_ui_source_evidence = "Strong"
+non_static_screen_evidence = "Strong"
+visible_interactive_surface_evidence = "Strong"
+user_input_handler_evidence = "Strong"
+stateful_update_evidence = "Strong"
+challenge_or_adversary_evidence = "Strong"
+score_or_progression_evidence = "Strong"
+failure_or_collision_evidence = "Strong"
+nextjs_route_evidence = "Strong"
+build_command_or_dependency_missing_boundary = "Strong"
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/events-breakout-combo1.jsonl = [
+  "test0710_bs_006 breakout_combo1",
+  "\"interaction_evidence_status\":\"passed\"",
+  "\"state_dimensions_changed\":[\"bricksRemaining\",\"score\"]",
+  "\"missing_evidence\":[]",
+  "\"challenge_or_adversary_evidence\":\"strong\""
+]
