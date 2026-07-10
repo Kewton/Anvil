@@ -269,6 +269,10 @@ struct ConfigFile {
 }
 
 impl Config {
+    pub fn plan_preset_origin(&self) -> &'static str {
+        config_source_origin(&self.field_sources.plan_preset)
+    }
+
     pub fn from_cli(cli: Cli) -> anyhow::Result<Self> {
         let workspace_root = cli
             .cwd
@@ -353,7 +357,9 @@ impl Config {
                     .and_then(|preset| preset.plan_preset.clone())
             })
             .or_else(|| config_file_plan_preset(&workspace_root))
-            .unwrap_or_else(|| sourced(PlanPreset::None, "default"));
+            .unwrap_or_else(|| {
+                default_plan_preset_for_planner(&planner_model.value, preset.is_some())
+            });
         let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
         let action = action_from_cli(&cli)?;
         let eval_events_path = crate::eval_events::path_from_env_or_default(&workspace_root);
@@ -439,6 +445,38 @@ impl Config {
             action,
         })
     }
+}
+
+fn config_source_origin(source: &str) -> &'static str {
+    if source == "flag" {
+        "cli"
+    } else if source.starts_with("preset:") || source.starts_with("config:") {
+        "config"
+    } else {
+        "default"
+    }
+}
+
+fn default_plan_preset_for_planner(
+    planner_model: &str,
+    named_preset_selected: bool,
+) -> Sourced<PlanPreset> {
+    if named_preset_selected && planner_model_is_qwen27(planner_model) {
+        sourced(PlanPreset::Profile, "default:qwen27_planner")
+    } else if named_preset_selected && planner_model_is_gemma(planner_model) {
+        sourced(PlanPreset::None, "default:gemma_planner")
+    } else {
+        sourced(PlanPreset::None, "default")
+    }
+}
+
+fn planner_model_is_qwen27(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("qwen") && (lower.contains("27b") || lower.contains("qwen27"))
+}
+
+fn planner_model_is_gemma(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("gemma")
 }
 
 fn load_named_preset(root: &Path, name: Option<&str>) -> anyhow::Result<Option<PresetConfig>> {
@@ -1408,6 +1446,77 @@ profile = "nextjs"
         .unwrap();
         assert_eq!(from_flag.plan_preset, PlanPreset::Profile);
         assert_eq!(from_flag.field_sources.plan_preset, "flag");
+        assert_eq!(from_flag.plan_preset_origin(), "cli");
+    }
+
+    #[test]
+    fn qwen27_planner_preset_defaults_profile_while_gemma_defaults_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
+        std::fs::write(
+            dir.path().join(".anvil/config.toml"),
+            r#"
+[preset.qwen27]
+provider = "ollama"
+model = "qwen3.6:27b-coding-nvfp4"
+planner_provider = "ollama"
+planner_model = "qwen3.6:27b-coding-nvfp4"
+profile = "nextjs"
+
+[preset.gemma]
+provider = "ollama"
+model = "qwen3.6:27b-coding-nvfp4"
+planner_provider = "ollama"
+planner_model = "gemma4:31b-cloud"
+profile = "nextjs"
+"#,
+        )
+        .unwrap();
+
+        let qwen = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--preset",
+            "qwen27",
+            "--ultra-plan-run",
+            "Web app",
+        ]))
+        .unwrap();
+        assert_eq!(qwen.plan_preset, PlanPreset::Profile);
+        assert_eq!(qwen.field_sources.plan_preset, "default:qwen27_planner");
+        assert_eq!(qwen.plan_preset_origin(), "default");
+
+        let gemma = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--preset",
+            "gemma",
+            "--ultra-plan-run",
+            "Web app",
+        ]))
+        .unwrap();
+        assert_eq!(gemma.plan_preset, PlanPreset::None);
+        assert_eq!(gemma.field_sources.plan_preset, "default:gemma_planner");
+        assert_eq!(gemma.plan_preset_origin(), "default");
+
+        let cli_override = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--preset",
+            "qwen27",
+            "--plan-preset",
+            "none",
+            "--ultra-plan-run",
+            "Web app",
+        ]))
+        .unwrap();
+        assert_eq!(cli_override.plan_preset, PlanPreset::None);
+        assert_eq!(cli_override.field_sources.plan_preset, "flag");
+        assert_eq!(cli_override.plan_preset_origin(), "cli");
     }
 
     #[test]

@@ -20,6 +20,15 @@ A profile owns:
 - invariants and deterministic repairs
 - goal capability inference and evidence vocabulary hooks
 
+Profile UltraPlan presets remain planner-tier gated rather than a global
+default. UAT test0711_bs_001 showed `--plan-preset profile` produced 4/4 full
+qwen27-planner runs and removed roughly half of planner time, while the
+gemma31-planner sample regressed and already planned in about 15-38 seconds.
+Named presets with qwen27 planner models therefore default to the profile
+UltraPlan preset when no `plan_preset` is configured, and gemma-family planner
+presets keep the `none` default; explicit CLI `--plan-preset` always overrides
+that config-derived default.
+
 Profiles must not special-case runner control flow. If a new domain needs a
 new lifecycle shape, extend `DomainProfile` first and keep the runner calling
 the trait.

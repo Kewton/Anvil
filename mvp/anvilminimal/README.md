@@ -62,6 +62,7 @@ These are examples only; Anvil does not auto-create them:
 # profile = "generic"
 # narration = "normal"
 # footer = "on"
+# plan_preset = "profile" # optional; qwen27 planner presets default to profile
 #
 # [preset.hybrid-a3b]
 # provider = "ollama"
@@ -83,6 +84,14 @@ Hybrid presets use the planner provider/model only for planning calls and the
 main provider/model for execution calls. With a local a3b executor, budget RAM
 for the Ollama model residency separately from any remote planner; Ollama
 requests keep `keep_alive=10m` for the executor model between turns.
+
+Plan presets are planner-tier gated, not globally enabled. In test0711_bs_001,
+`--plan-preset profile` made qwen27-planner runs full in 4/4 cases while roughly
+halving planner time, but the gemma31-planner sample regressed and already
+planned in about 15-38 seconds. Named presets whose planner model is qwen27
+therefore default to `plan_preset = "profile"` when omitted, while gemma-family
+planner presets default to `none`; an explicit `--plan-preset` CLI flag always
+wins over config.
 
 ## TUI
 

@@ -1,0 +1,39 @@
+case_id = "test0711_bs_001_plan_preset_tier"
+source = "test0711_bs_001 planner-tier gated plan preset regression fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["plan_preset", "qwen27", "gemma31", "profile"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/plan-preset-tier.jsonl = [
+  "test0711_bs_001",
+  "\"event\":\"plan_preset_resolved\"",
+  "\"plan_preset\":\"profile\"",
+  "\"origin\":\"default\"",
+  "\"source\":\"default:qwen27_planner\"",
+  "\"plan_preset\":\"none\"",
+  "\"source\":\"default:gemma_planner\"",
+  "\"origin\":\"cli\"",
+  "\"source\":\"flag\"",
+  "\"event\":\"preset_ultra_plan_used\"",
+  "\"planner_skipped\":true",
+  "qwen27 planner presets default to profile",
+  "gemma-family planner presets default to none"
+]

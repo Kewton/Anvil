@@ -513,6 +513,9 @@ fn emit_run_start(config: &Config) {
             "chat_timeout_secs": config.chat_timeout_secs,
             "chat_timeout_source": config.chat_timeout_source,
             "prompt_layout": config.prompt_layout.as_str(),
+            "plan_preset": config.plan_preset.as_str(),
+            "plan_preset_origin": config.plan_preset_origin(),
+            "plan_preset_source": config.field_sources.plan_preset,
             "profile": config.profile,
             "profile_inferred": config
                 .profile_inference
@@ -528,6 +531,15 @@ fn emit_run_start(config: &Config) {
             "build_commit": build_info::COMMIT,
             "build_dirty": build_info::dirty(),
             "build_timestamp": build_info::TIMESTAMP,
+        }),
+    );
+    eval_events::emit(
+        config.eval_events_path.as_deref(),
+        json!({
+            "event": "plan_preset_resolved",
+            "plan_preset": config.plan_preset.as_str(),
+            "origin": config.plan_preset_origin(),
+            "source": config.field_sources.plan_preset,
         }),
     );
     if let Some(inference) = config.profile_inference {
@@ -816,6 +828,27 @@ mod tests {
         assert!(summary.contains("Session/REPL status: process_exited"));
         assert!(summary.contains("Final acceptance: not_checked"));
         assert!(summary.contains("Stop reason: completed"));
+    }
+
+    #[test]
+    fn run_start_records_plan_preset_value_and_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.plan_preset = crate::config::PlanPreset::Profile;
+        cfg.field_sources.plan_preset = "default:qwen27_planner".to_string();
+
+        emit_run_start(&cfg);
+
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        assert!(event_text.contains("\"event\":\"run_start\""));
+        assert!(event_text.contains("\"plan_preset\":\"profile\""));
+        assert!(event_text.contains("\"plan_preset_origin\":\"default\""));
+        assert!(event_text.contains("\"plan_preset_source\":\"default:qwen27_planner\""));
+        assert!(event_text.contains("\"event\":\"plan_preset_resolved\""));
+        assert!(event_text.contains("\"origin\":\"default\""));
+        assert!(event_text.contains("\"source\":\"default:qwen27_planner\""));
     }
 
     #[test]
