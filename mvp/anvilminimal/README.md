@@ -3,6 +3,11 @@
 Copyable MVP for a minimal local-first coding loop, YAML step plans, plan run,
 ultra plan run, and deterministic verification.
 
+See [SECURITY.md](SECURITY.md) for the trusted-workspace threat model,
+`--yes` guidance, environment allowlist, and symlink policy.
+See [docs/dev-guardrails.md](docs/dev-guardrails.md) for the runner growth
+tripwire and module-boundary guardrails.
+
 ## Build
 
 ```bash

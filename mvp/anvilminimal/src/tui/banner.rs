@@ -103,6 +103,11 @@ pub fn render_startup_banner(config: &Config, style: BannerStyle) -> String {
             sanitize_banner_text(&path.display().to_string())
         ));
     }
+    if config.yes {
+        out.push_str(
+            "warning: --yes skips mutating-tool approval; use only in trusted workspaces\n",
+        );
+    }
     if crate::build_info::dirty() {
         out.push_str("warning: build stamp is dirty; rebuild cleanly before measurement runs\n");
     }
@@ -220,6 +225,7 @@ mod tests {
         assert!(out.contains("prompt_layout=legacy (default)"));
         assert!(out.contains("footer=on (default)"));
         assert!(out.contains("yes=true"));
+        assert!(out.contains("--yes skips mutating-tool approval"));
         assert!(!out.contains("╔═╗"));
     }
 }

@@ -130,6 +130,23 @@ fn nextjs_boundary_erosion_tripwire_keeps_dispatch_sites_audited() {
     );
 }
 
+#[test]
+fn runner_chokepoints_do_not_grow_past_interim_budget() {
+    for (path, baseline) in [
+        ("src/planner/runner.rs", 28_712usize),
+        ("src/minimal_loop/loop_run.rs", 8_347usize),
+    ] {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("failed to read {path}: {err}"));
+        let current = text.lines().count();
+        let allowed = baseline + ((baseline * 2).div_ceil(100));
+        assert!(
+            current <= allowed,
+            "{path} grew to {current} lines; baseline is {baseline}, allowed max is {allowed}. Move new subsystems to new modules or land a shrinking refactor first."
+        );
+    }
+}
+
 fn nextjs_literal_counts_outside_profiles() -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for path in rust_source_files(Path::new("src")) {
