@@ -46,6 +46,7 @@ pub(crate) struct WriteRequiredState {
     selected_targets: Vec<String>,
     selection_reason: Option<WriteRequiredSelectionReason>,
     no_write_attempts: usize,
+    diagnostic_feedback: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,16 +81,27 @@ impl WriteRequiredTargetSelection {
 }
 
 impl WriteRequiredState {
+    #[cfg(test)]
     pub(crate) fn activate(&mut self, selection: WriteRequiredTargetSelection) {
+        self.activate_with_feedback(selection, String::new());
+    }
+
+    pub(crate) fn activate_with_feedback(
+        &mut self,
+        selection: WriteRequiredTargetSelection,
+        diagnostic_feedback: String,
+    ) {
         self.selected_targets = selection.selected_targets;
         self.selection_reason = Some(selection.selection_reason);
         self.no_write_attempts = 0;
+        self.diagnostic_feedback = diagnostic_feedback;
     }
 
     pub(crate) fn reset(&mut self) {
         self.selected_targets.clear();
         self.selection_reason = None;
         self.no_write_attempts = 0;
+        self.diagnostic_feedback.clear();
     }
 
     pub(crate) fn target_path(&self) -> Option<&str> {
@@ -102,6 +114,10 @@ impl WriteRequiredState {
 
     pub(crate) fn selection_reason(&self) -> Option<WriteRequiredSelectionReason> {
         self.selection_reason
+    }
+
+    pub(crate) fn diagnostic_feedback(&self) -> &str {
+        &self.diagnostic_feedback
     }
 
     pub(crate) fn reject_if_read_only_or_wrong_target(
@@ -143,10 +159,13 @@ impl WriteRequiredState {
                 "phase_scope": event_context.phase_scope.unwrap_or(""),
             }),
         );
-        let feedback = super::feedback::read_only_write_required_tool_rejected(
-            &self.selected_targets,
-            self.no_write_attempts,
-            WRITE_REQUIRED_NO_WRITE_LIMIT,
+        let feedback = append_write_required_diagnostic(
+            super::feedback::read_only_write_required_tool_rejected(
+                &self.selected_targets,
+                self.no_write_attempts,
+                WRITE_REQUIRED_NO_WRITE_LIMIT,
+            ),
+            &self.diagnostic_feedback,
         );
         Some(ReadOnlyToolRejection {
             feedback,
@@ -173,9 +192,12 @@ impl WriteRequiredState {
             .selection_reason
             .map(|reason| reason.as_str())
             .unwrap_or("");
-        let feedback = super::feedback::read_only_write_required_off_target_write_allowed(
-            &actual_path,
-            &self.selected_targets,
+        let feedback = append_write_required_diagnostic(
+            super::feedback::read_only_write_required_off_target_write_allowed(
+                &actual_path,
+                &self.selected_targets,
+            ),
+            &self.diagnostic_feedback,
         );
         eval_events::emit(
             eval_events_path,
@@ -324,6 +346,15 @@ pub(crate) fn read_only_write_required_feedback(
         streak,
         WRITE_REQUIRED_NO_WRITE_LIMIT,
     )
+}
+
+pub(crate) fn append_write_required_diagnostic(mut feedback: String, diagnostic: &str) -> String {
+    let diagnostic = diagnostic.trim();
+    if !diagnostic.is_empty() {
+        feedback.push_str("\n\n");
+        feedback.push_str(diagnostic);
+    }
+    feedback
 }
 
 #[cfg(test)]

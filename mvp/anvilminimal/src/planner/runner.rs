@@ -5608,7 +5608,7 @@ pub fn run_ultra_plan_with_ui(
                 &expected_paths,
                 &[],
             );
-            let mut repair_prompt = final_acceptance_repair_prompt(
+            let mut repair_prompt = final_acceptance_repair_prompt_with_events(
                 &config.workspace_root,
                 config.prompt_layout,
                 plan,
@@ -5620,6 +5620,7 @@ pub fn run_ultra_plan_with_ui(
                 (attempt, FINAL_ACCEPTANCE_REPAIR_MAX_ATTEMPTS),
                 compile_reanchored_retry,
                 compile_narrow_no_snapshot_retry,
+                config.eval_events_path.as_deref(),
             );
             if evidence_reanchored_retry {
                 repair_prompt = format!(
@@ -14554,6 +14555,7 @@ fn final_acceptance_pending_evidence_guidance(
     render_prompt_bullets(&lines)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn final_acceptance_repair_prompt(
     root: &Path,
@@ -14568,6 +14570,37 @@ fn final_acceptance_repair_prompt(
     compile_reanchored_retry: bool,
     compile_narrow_no_snapshot_retry: bool,
 ) -> String {
+    final_acceptance_repair_prompt_with_events(
+        root,
+        layout,
+        plan,
+        report,
+        context,
+        repair_target,
+        expected_paths,
+        adherence_missing,
+        repair_budget,
+        compile_reanchored_retry,
+        compile_narrow_no_snapshot_retry,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn final_acceptance_repair_prompt_with_events(
+    root: &Path,
+    layout: PromptLayout,
+    plan: &UltraPlan,
+    report: &VerificationReport,
+    context: &UltraRunContext,
+    repair_target: &str,
+    expected_paths: &[String],
+    adherence_missing: &[String],
+    repair_budget: (usize, usize),
+    compile_reanchored_retry: bool,
+    compile_narrow_no_snapshot_retry: bool,
+    eval_events_path: Option<&Path>,
+) -> String {
     match layout {
         PromptLayout::Stable => final_acceptance_repair_prompt_stable(
             root,
@@ -14580,6 +14613,7 @@ fn final_acceptance_repair_prompt(
             repair_budget,
             compile_reanchored_retry,
             compile_narrow_no_snapshot_retry,
+            eval_events_path,
         ),
         PromptLayout::Legacy => final_acceptance_repair_prompt_legacy(
             root,
@@ -14592,6 +14626,7 @@ fn final_acceptance_repair_prompt(
             repair_budget,
             compile_reanchored_retry,
             compile_narrow_no_snapshot_retry,
+            eval_events_path,
         ),
     }
 }
@@ -14608,6 +14643,7 @@ fn final_acceptance_repair_prompt_stable(
     repair_budget: (usize, usize),
     compile_reanchored_retry: bool,
     compile_narrow_no_snapshot_retry: bool,
+    eval_events_path: Option<&Path>,
 ) -> String {
     let (attempt, max_attempts) = repair_budget;
     let expected = render_prompt_bullets(expected_paths);
@@ -14623,6 +14659,17 @@ fn final_acceptance_repair_prompt_stable(
         final_acceptance_restart_attachment_guidance(root, plan, report);
     let pending_evidence_guidance =
         final_acceptance_pending_evidence_guidance(root, &plan.profile, report);
+    let state_binding_guidance = crate::planner::state_binding_scan::final_acceptance_feedback(
+        root,
+        &plan.profile,
+        report,
+        eval_events_path,
+    );
+    let state_binding_guidance = if state_binding_guidance.is_empty() {
+        String::new()
+    } else {
+        format!("State binding repair guidance:\n{state_binding_guidance}\n\n")
+    };
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
     let compile_errors = compile_repair_prompt_section_with_root(
@@ -14643,6 +14690,7 @@ Bounded repair rules:\n\
 Original ultra goal:\n{goal}\n\n\
 Profile: {profile}\nIntent: {intent}\n\n\
 Pending capability evidence remedies:\n{pending_evidence_guidance}\n\n\
+{state_binding_guidance}\
 Missing paths:\n{missing}\n\n\
 Dependency failures:\n{dependencies}\n\n\
 Compile errors:\n{compile_errors}\n\n\
@@ -14666,6 +14714,7 @@ Final acceptance failure:\n\
         attempt = attempt,
         max_attempts = max_attempts,
         pending_evidence_guidance = pending_evidence_guidance,
+        state_binding_guidance = state_binding_guidance,
         missing = missing,
         dependencies = dependencies,
         compile_errors = compile_errors,
@@ -14691,6 +14740,7 @@ fn final_acceptance_repair_prompt_legacy(
     repair_budget: (usize, usize),
     compile_reanchored_retry: bool,
     compile_narrow_no_snapshot_retry: bool,
+    eval_events_path: Option<&Path>,
 ) -> String {
     let (attempt, max_attempts) = repair_budget;
     let expected = render_prompt_bullets(expected_paths);
@@ -14706,6 +14756,17 @@ fn final_acceptance_repair_prompt_legacy(
         final_acceptance_restart_attachment_guidance(root, plan, report);
     let pending_evidence_guidance =
         final_acceptance_pending_evidence_guidance(root, &plan.profile, report);
+    let state_binding_guidance = crate::planner::state_binding_scan::final_acceptance_feedback(
+        root,
+        &plan.profile,
+        report,
+        eval_events_path,
+    );
+    let state_binding_guidance = if state_binding_guidance.is_empty() {
+        String::new()
+    } else {
+        format!("State binding repair guidance:\n{state_binding_guidance}\n\n")
+    };
     let command_failures = command_failure_summaries(report);
     let command_failures = render_prompt_bullets(&command_failures);
     let compile_errors = compile_repair_prompt_section_with_root(
@@ -14725,6 +14786,7 @@ Final acceptance failure:\n\
 - repair target: {repair_target}\n\
 - attempt: {attempt}/{max_attempts}\n\n\
 Pending capability evidence remedies:\n{pending_evidence_guidance}\n\n\
+{state_binding_guidance}\
 Missing paths:\n{missing}\n\n\
 Dependency failures:\n{dependencies}\n\n\
 Compile errors:\n{compile_errors}\n\n\
@@ -14748,6 +14810,7 @@ Bounded repair rules:\n\
         attempt = attempt,
         max_attempts = max_attempts,
         pending_evidence_guidance = pending_evidence_guidance,
+        state_binding_guidance = state_binding_guidance,
         missing = missing,
         dependencies = dependencies,
         compile_errors = compile_errors,
@@ -22796,13 +22859,12 @@ if __name__ == "__main__":
         let mut report = VerificationReport::pass();
         report.push_profile_failure(format!("release gate failed: {}", gate.reasons.join("; ")));
         append_release_gate_observation_failures(&mut report, &gate);
-        let plan = UltraPlan {
-            goal: "Create an interactive browser game".to_string(),
-            profile: "nextjs".to_string(),
-            style: "default".to_string(),
-            intent: "create".to_string(),
-            phases: Vec::new(),
-        };
+        let plan = UltraPlan::deterministic(
+            "Create an interactive browser game",
+            "nextjs",
+            "default",
+            "create",
+        );
         let prompt = final_acceptance_repair_prompt(
             Path::new("."),
             PromptLayout::Stable,
@@ -23994,6 +24056,95 @@ if __name__ == "__main__":
             prompt.contains("Secondary plan-adherence guidance:\n- also close if in scope: keyboard, lives, pause"),
             "{prompt}"
         );
+    }
+
+    #[test]
+    fn final_acceptance_repair_prompt_includes_state_binding_diagnosis_for_interaction_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src/app");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("page.tsx"),
+            r#"
+import { useState } from "react";
+export default function Game() {
+  const [score, setScore] = useState(0);
+  return <main data-anvil-state={JSON.stringify({ score })} />;
+}
+"#,
+        )
+        .unwrap();
+        let report = VerificationReport::profile_failed(
+            "browser_interaction_failed:input_state_change_missing_after_start",
+        );
+        let plan = UltraPlan {
+            goal: "Create an interactive browser game".to_string(),
+            profile: "nextjs".to_string(),
+            style: "default".to_string(),
+            intent: "create".to_string(),
+            phases: Vec::new(),
+        };
+
+        let prompt = final_acceptance_repair_prompt(
+            dir.path(),
+            PromptLayout::Stable,
+            &plan,
+            &report,
+            &UltraRunContext::default(),
+            "required_evidence_missing",
+            &["src/app/page.tsx".to_string()],
+            &[],
+            (1, 1),
+            false,
+            false,
+        );
+
+        assert!(
+            prompt.contains("State binding repair guidance:"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("State binding diagnosis: setter_never_called"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("after start and after input, the `data-anvil-state` JSON value"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn final_acceptance_repair_prompt_omits_state_binding_diagnosis_for_compile_failure() {
+        let report = VerificationReport::command_failed(
+            "npm run build",
+            "implementation_compile_error: TS2304 missing name",
+        );
+        let plan = UltraPlan::deterministic(
+            "Create an interactive browser game",
+            "nextjs",
+            "default",
+            "create",
+        );
+
+        let prompt = final_acceptance_repair_prompt(
+            Path::new("."),
+            PromptLayout::Stable,
+            &plan,
+            &report,
+            &UltraRunContext::default(),
+            "compile_error",
+            &["src/app/page.tsx".to_string()],
+            &[],
+            (1, 1),
+            false,
+            false,
+        );
+
+        assert!(
+            !prompt.contains("State binding repair guidance:"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("setter_never_called"), "{prompt}");
     }
 
     #[test]

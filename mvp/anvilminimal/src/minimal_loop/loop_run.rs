@@ -4576,7 +4576,14 @@ fn maybe_read_only_stagnation_feedback(
             changed_paths,
             &options.path_fallback_candidates,
         )?;
-        write_required_state.activate(selection.clone());
+        let state_binding_feedback = crate::planner::state_binding_scan::write_required_feedback(
+            root,
+            profile,
+            &pending_error_context.missing_evidence,
+            &pending_error_context.missing_capabilities,
+            eval_events_path,
+        );
+        write_required_state.activate_with_feedback(selection.clone(), state_binding_feedback);
         Some(selection)
     } else {
         None
@@ -4617,9 +4624,12 @@ fn maybe_read_only_stagnation_feedback(
             super::feedback::read_only_stagnation_compact(&objective, read_only_streak)
         }
         ReadOnlyStagnationStage::WriteRequired => {
-            super::stagnation_escalation::read_only_write_required_feedback(
-                write_required_state.selected_targets(),
-                read_only_streak,
+            super::stagnation_escalation::append_write_required_diagnostic(
+                super::stagnation_escalation::read_only_write_required_feedback(
+                    write_required_state.selected_targets(),
+                    read_only_streak,
+                ),
+                write_required_state.diagnostic_feedback(),
             )
         }
     })

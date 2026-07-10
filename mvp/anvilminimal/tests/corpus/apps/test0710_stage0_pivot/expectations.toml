@@ -85,6 +85,15 @@ fixtures/read-only-write-required-evidence-targets.jsonl = [
   "\"event\":\"write_required_off_target_write_allowed\"",
   "\"actual_path\":\"package.json\""
 ]
+fixtures/state-binding-diagnosis.jsonl = [
+  "test0710_bs_004/combo1",
+  "\"event\":\"state_binding_diagnosis\"",
+  "\"diagnosis\":\"state_bound_to_ref\"",
+  "\"referenced_identifiers\":[\"gameRef\"]",
+  "input_state_change_missing_after_start",
+  "data-anvil-state",
+  "State binding diagnosis: state_bound_to_ref"
+]
 fixtures/hook-snapshot-primary-restore.jsonl = [
   "test0710_bs_003/combo3",
   "\"event\":\"hook_snapshot_saved\"",
