@@ -181,6 +181,26 @@ pub fn read_only_stagnation_compact(objective: &str, streak: usize) -> String {
     )
 }
 
+pub fn read_only_stagnation_write_required(
+    target_path: &str,
+    streak: usize,
+    attempt_limit: usize,
+) -> String {
+    format!(
+        "Read-only stagnation has escalated to write_required. Use a full-file Write or Edit for `{target_path}` now. Read, Grep, Glob, Bash, prose-only responses, and Write/Edit to any other path are suspended until `{target_path}` is written. read_only_streak={streak}; write_required_no_write_limit={attempt_limit}"
+    )
+}
+
+pub fn read_only_write_required_tool_rejected(
+    target_path: &str,
+    attempt: usize,
+    attempt_limit: usize,
+) -> String {
+    format!(
+        "read-only tools are suspended; write `{target_path}` now with Write/Edit. write_required_no_write_attempt={attempt}/{attempt_limit}"
+    )
+}
+
 pub fn verify_repair_edit_required(
     signature: &str,
     attempt: usize,

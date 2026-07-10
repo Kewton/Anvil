@@ -48,6 +48,10 @@ use super::repair_progress::{
 use super::repair_target::{
     RepairFollowThrough, RepairTarget, classify_repair_follow_through, classify_repair_target,
 };
+use super::stagnation_escalation::{
+    READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD, READ_ONLY_STAGNATION_REASON,
+    ReadOnlyStagnationStage, ReadOnlyToolRejectionContext, WriteRequiredState,
+};
 use super::verifier_bootstrap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,8 +139,6 @@ impl std::error::Error for RunSessionError {}
 
 const ARTIFACT_NON_EDIT_STAGNATION_THRESHOLD: usize = 3;
 const ARTIFACT_RECOVERY_ATTEMPT_LIMIT: usize = 3;
-const READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD: usize = 3;
-const READ_ONLY_STAGNATION_COMPACT_THRESHOLD: usize = 5;
 const VERIFY_REPAIR_NO_EDIT_LIMIT: usize = 1;
 const RECOVERABLE_TOOL_ERROR_REPEAT_LIMIT: usize = 2;
 const MALFORMED_NATIVE_TOOL_RETRY_LIMIT: usize = 2;
@@ -1091,6 +1093,7 @@ pub(crate) fn run_session_with_outcome_with_options(
     let mut read_only_streak = 0usize;
     let mut artifact_recovery_state = ArtifactRecoveryState::default();
     let mut verify_repair_state = VerifyRepairState::default();
+    let mut write_required_state = WriteRequiredState::default();
     let mut recoverable_tool_error_state = RecoverableToolErrorState::default();
     let mut edit_anchor_failures_by_path: BTreeMap<String, usize> = BTreeMap::new();
     let mut malformed_native_tool_feedbacks = 0usize;
@@ -1725,11 +1728,43 @@ pub(crate) fn run_session_with_outcome_with_options(
         let mut batch_non_edit_tools = 0usize;
         let mut batch_all_read_only_tools = !tool_calls.is_empty();
         let mut batch_had_recoverable_tool_error = false;
+        let mut write_required_rejection: Option<(String, bool, usize, String)> = None;
         let missing_before_batch = missing_paths(&config.workspace_root, &required_paths);
         for mut call in tool_calls {
             let mut split_bash_segments = Vec::new();
             if ui.interrupted() {
                 bail!("interrupted by user");
+            }
+            if let Some(rejection) = write_required_state.reject_if_read_only_or_wrong_target(
+                &config.workspace_root,
+                config.eval_events_path.as_deref(),
+                &call,
+                ReadOnlyToolRejectionContext {
+                    read_only_streak,
+                    session_scope: options.scope.as_str(),
+                    step_kind: options
+                        .step_kind
+                        .map(RunSessionStepKind::as_str)
+                        .unwrap_or(""),
+                    phase_scope: options.phase_scope.as_deref(),
+                },
+            ) {
+                batch_had_recoverable_tool_error = true;
+                last_blocking_reason = Some(READ_ONLY_STAGNATION_REASON.to_string());
+                let feedback = rejection.feedback.clone();
+                let target_path = write_required_state.target_path().unwrap_or("").to_string();
+                session.messages.push(ConversationMessage::tool_result(
+                    call.name,
+                    Some(call.id),
+                    feedback.clone(),
+                ));
+                write_required_rejection = Some((
+                    feedback,
+                    rejection.exhausted,
+                    rejection.no_write_attempts,
+                    target_path,
+                ));
+                break;
             }
             let call_is_edit = matches!(call.name.as_str(), "Write" | "Edit");
             if !matches!(call.name.as_str(), "Read" | "Glob" | "Grep") {
@@ -1895,6 +1930,8 @@ pub(crate) fn run_session_with_outcome_with_options(
                     if matches!(call.name.as_str(), "Write" | "Edit") {
                         write_or_edit_seen = true;
                         read_only_streak = 0;
+                        write_required_state
+                            .note_successful_write(&config.workspace_root, &call.arguments);
                         if let Some(path) =
                             changed_path_from_call(&config.workspace_root, &call.arguments)
                         {
@@ -2039,6 +2076,34 @@ pub(crate) fn run_session_with_outcome_with_options(
                 result,
             ));
         }
+        if let Some((feedback, exhausted, no_write_attempts, target_path)) =
+            write_required_rejection
+        {
+            pending_feedback = Some(feedback);
+            if exhausted {
+                let objective = read_only_objective_excerpt(user_prompt);
+                let stop_reason =
+                    super::stagnation_escalation::record_write_required_exhaustion_and_render_stop(
+                        config,
+                        &objective,
+                        options.scope.as_str(),
+                        options
+                            .step_kind
+                            .map(RunSessionStepKind::as_str)
+                            .unwrap_or(""),
+                        options.phase_scope.as_deref(),
+                        &target_path,
+                        &changed_paths,
+                        read_only_streak,
+                        no_write_attempts,
+                        tool_call_count,
+                        verify_attempts,
+                        last_blocking_reason.as_deref(),
+                    );
+                bail!("{stop_reason}");
+            }
+            continue;
+        }
         let missing_after_batch = missing_paths(&config.workspace_root, &required_paths);
         let batch_reduced_missing_paths = missing_after_batch.len() < missing_before_batch.len();
         if batch_reduced_missing_paths {
@@ -2069,6 +2134,10 @@ pub(crate) fn run_session_with_outcome_with_options(
                 user_prompt,
                 read_only_streak,
                 &options,
+                &mut write_required_state,
+                &verify_repair_state.changed_paths_at_failure,
+                &required_paths,
+                &changed_paths,
             ) {
                 last_blocking_reason = Some("model_stagnation:read_only_loop".to_string());
                 pending_feedback = Some(feedback);
@@ -4454,29 +4523,51 @@ fn maybe_read_only_stagnation_feedback(
     user_prompt: &str,
     read_only_streak: usize,
     options: &RunSessionOptions,
+    write_required_state: &mut WriteRequiredState,
+    repair_changed_paths: &[String],
+    required_paths: &[String],
+    changed_paths: &[String],
 ) -> Option<String> {
-    let stage = match read_only_streak {
-        READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD => "intervention",
-        READ_ONLY_STAGNATION_COMPACT_THRESHOLD => "compact_restatement",
-        _ => return None,
+    let stage = ReadOnlyStagnationStage::for_streak(read_only_streak)?;
+    let target_path = if stage == ReadOnlyStagnationStage::WriteRequired {
+        let target = super::stagnation_escalation::write_required_target_path(
+            repair_changed_paths,
+            required_paths,
+            changed_paths,
+            &options.path_fallback_candidates,
+        )?;
+        write_required_state.activate(target.clone());
+        Some(target)
+    } else {
+        None
     };
     let objective = read_only_objective_excerpt(user_prompt);
     eval_events::emit(
         eval_events_path,
         json!({
             "event": "read_only_stagnation_feedback",
-            "stage": stage,
+            "stage": stage.as_str(),
             "read_only_streak": read_only_streak,
             "objective": objective,
+            "target_path": target_path.as_deref().unwrap_or(""),
             "session_scope": options.scope.as_str(),
             "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
             "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
         }),
     );
-    Some(if stage == "compact_restatement" {
-        super::feedback::read_only_stagnation_compact(&objective, read_only_streak)
-    } else {
-        super::feedback::read_only_stagnation(&objective, read_only_streak)
+    Some(match stage {
+        ReadOnlyStagnationStage::Intervention => {
+            super::feedback::read_only_stagnation(&objective, read_only_streak)
+        }
+        ReadOnlyStagnationStage::CompactRestatement => {
+            super::feedback::read_only_stagnation_compact(&objective, read_only_streak)
+        }
+        ReadOnlyStagnationStage::WriteRequired => {
+            super::stagnation_escalation::read_only_write_required_feedback(
+                target_path.as_deref().unwrap_or(""),
+                read_only_streak,
+            )
+        }
     })
 }
 

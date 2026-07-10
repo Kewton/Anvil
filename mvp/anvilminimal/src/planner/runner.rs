@@ -19017,7 +19017,10 @@ if __name__ == "__main__":
                     .to_string()
             })
             .collect::<Vec<_>>();
-        assert_eq!(stages, vec!["intervention", "compact_restatement"]);
+        assert_eq!(
+            stages,
+            vec!["intervention", "compact_restatement", "write_required"]
+        );
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"lifecycle_stage\":\"final_acceptance_repair\""));
     }

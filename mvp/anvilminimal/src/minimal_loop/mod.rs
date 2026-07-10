@@ -13,6 +13,7 @@ pub mod prompt;
 pub mod reachability;
 pub mod repair_progress;
 pub mod repair_target;
+pub mod stagnation_escalation;
 pub mod verifier_bootstrap;
 pub mod verifier_env;
 

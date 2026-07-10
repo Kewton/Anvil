@@ -68,3 +68,11 @@ fixtures/static-import-guards.jsonl = [
   "jsx_in_ts",
   "rename it to .tsx or remove JSX"
 ]
+fixtures/read-only-write-required.jsonl = [
+  "test0710_bs_002/combo1-005",
+  "\"stage\":\"write_required\"",
+  "\"event\":\"read_only_tool_rejected\"",
+  "read-only tools are suspended; write",
+  "\"reason\":\"model_stagnation:read_only_loop\"",
+  "\"recovery_yaml_missing\":false"
+]
