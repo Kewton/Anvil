@@ -15,6 +15,8 @@ pub mod probe_preflight;
 pub mod prompt;
 pub mod reachability;
 pub mod read_only_stagnation_feedback;
+#[allow(dead_code)] // Connected incrementally by the repair-pressure integration commits.
+pub mod repair_pressure;
 pub mod repair_progress;
 pub mod repair_target;
 pub mod route_unbound_recovery;
