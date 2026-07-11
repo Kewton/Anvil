@@ -35,6 +35,9 @@ pub fn merge_repair_target_paths(report: &VerificationReport, paths: &[String]) 
     if let Some(issue) = detect(report) {
         push_unique(&mut out, issue.path);
     }
+    for error in &report.compile_errors {
+        push_unique(&mut out, error.path.clone());
+    }
     for path in paths {
         push_unique(&mut out, path.clone());
     }
@@ -346,6 +349,29 @@ mod tests {
         let report = report_with_failure(
             r#"node -p 'String(require("fs").readFileSync("src/app/page.tsx")).includes("data-anvil-state") ? true : process.exit(1)'"#,
             "command failed",
+        );
+
+        assert_eq!(
+            merge_repair_target_paths(&report, &["package.json".to_string()]),
+            vec!["src/app/page.tsx", "package.json"]
+        );
+    }
+
+    #[test]
+    fn repair_target_paths_prepend_compile_error_source_before_package() {
+        let mut report = VerificationReport::pass();
+        report.push_compile_errors(
+            "npm run build",
+            vec![crate::minimal_loop::build_verifier::CompileError {
+                path: "src/app/page.tsx".to_string(),
+                line: 43,
+                column: 13,
+                message: "Type error: TS2552: Cannot find name 'player'. Did you mean 'PLAYER_W'?"
+                    .to_string(),
+                excerpt: "43 |   return <main>{player}</main>;".to_string(),
+                symbol: Some("player".to_string()),
+                route_bound: Some(true),
+            }],
         );
 
         assert_eq!(

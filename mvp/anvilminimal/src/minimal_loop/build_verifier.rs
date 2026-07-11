@@ -10,6 +10,8 @@ use crate::minimal_loop::verifier_env;
 use crate::planner::profile::{build_oracle_for_command, profile_for_build_requirement};
 use crate::planner::verify::{NormalizedVerifyCommand, normalize_verify_command};
 
+const MAX_COMPILE_ERROR_DIAGNOSTICS: usize = 5;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CompileError {
     pub path: String,
@@ -281,10 +283,79 @@ pub fn emit_dependency_build_lifecycle(
             "compile_errors": lifecycle.final_observation().compile_errors.clone(),
         }),
     );
+    emit_compile_error_extraction(eval_events_path, mode, step_id, lifecycle);
     emit_foreign_toolchain_detected(eval_events_path, mode, step_id, &lifecycle.before_setup);
     if let Some(after_setup) = lifecycle.after_setup.as_ref() {
         emit_foreign_toolchain_detected(eval_events_path, mode, step_id, after_setup);
     }
+}
+
+fn emit_compile_error_extraction(
+    eval_events_path: Option<&Path>,
+    mode: &str,
+    step_id: Option<&str>,
+    lifecycle: &BuildVerifierLifecycleObservation,
+) {
+    if let Some(event) = compile_error_extraction_event(mode, step_id, lifecycle) {
+        eval_events::emit(eval_events_path, event);
+    }
+}
+
+fn compile_error_extraction_event(
+    mode: &str,
+    step_id: Option<&str>,
+    lifecycle: &BuildVerifierLifecycleObservation,
+) -> Option<serde_json::Value> {
+    let observation = lifecycle.final_observation();
+    if observation.status != BuildVerifierStatus::Failed {
+        return None;
+    }
+    if !observation.compile_errors.is_empty() {
+        let paths = observation
+            .compile_errors
+            .iter()
+            .map(|error| error.path.clone())
+            .collect::<Vec<_>>();
+        return Some(serde_json::json!({
+            "event": "compile_error_extraction",
+            "mode": mode,
+            "step_id": step_id.unwrap_or_default(),
+            "status": "extracted",
+            "compile_error_count": observation.compile_errors.len(),
+            "source_paths": paths,
+            "selected_target": observation.compile_errors.first().map(|error| error.path.as_str()).unwrap_or_default(),
+            "output_path": observation.output_path.as_str(),
+        }));
+    }
+    let output = compile_error_extraction_output(observation);
+    if !compile_output_needs_source_diagnostic(&output) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "event": "compile_error_extraction",
+        "mode": mode,
+        "step_id": step_id.unwrap_or_default(),
+        "status": "fallback",
+        "reason": if compile_output_has_unusable_internal_location(&output) {
+            "webpack_internal_location_only"
+        } else {
+            "no_source_diagnostic"
+        },
+        "compile_error_count": 0,
+        "output_path": observation.output_path.as_str(),
+    }))
+}
+
+fn compile_error_extraction_output(observation: &BuildVerifierObservation) -> String {
+    if !observation.output_path.is_empty()
+        && let Ok(output) = std::fs::read_to_string(&observation.output_path)
+    {
+        return output;
+    }
+    format!(
+        "{}\n{}",
+        observation.primary_reason, observation.output_snippet
+    )
 }
 
 fn emit_foreign_toolchain_detected(
@@ -713,7 +784,14 @@ fn parse_compile_errors_text(output: &str) -> Vec<CompileError> {
     let clean = strip_ansi_sequences(output);
     let lines = clean.lines().collect::<Vec<_>>();
     let mut errors = Vec::new();
+    parse_typescript_diagnostic_blocks(&lines, &mut errors);
     for (index, line) in lines.iter().enumerate() {
+        if errors.len() >= MAX_COMPILE_ERROR_DIAGNOSTICS {
+            break;
+        }
+        if !errors.is_empty() {
+            continue;
+        }
         if let Some((path, line_number, column)) = parse_compile_location_line(line) {
             let details = compile_error_details_after_location(&lines, index);
             let message = compile_message_after_location(&lines, index)
@@ -748,6 +826,9 @@ fn parse_compile_errors_text(output: &str) -> Vec<CompileError> {
 }
 
 fn push_compile_error(errors: &mut Vec<CompileError>, error: CompileError) {
+    if errors.len() >= MAX_COMPILE_ERROR_DIAGNOSTICS {
+        return;
+    }
     if !errors.iter().any(|existing| {
         existing.path == error.path
             && existing.line == error.line
@@ -756,6 +837,139 @@ fn push_compile_error(errors: &mut Vec<CompileError>, error: CompileError) {
     }) {
         errors.push(error);
     }
+}
+
+fn parse_typescript_diagnostic_blocks(lines: &[&str], errors: &mut Vec<CompileError>) {
+    for (index, line) in lines.iter().enumerate() {
+        if errors.len() >= MAX_COMPILE_ERROR_DIAGNOSTICS {
+            break;
+        }
+        if let Some((path, line_number, column, message)) = parse_inline_tsc_location_message(line)
+        {
+            let excerpt = typescript_code_frame_after(lines, index);
+            push_compile_error(
+                errors,
+                CompileError {
+                    path,
+                    line: line_number,
+                    column,
+                    excerpt,
+                    symbol: cannot_find_name_symbol(&message),
+                    message,
+                    route_bound: None,
+                },
+            );
+            continue;
+        }
+        let Some((path, line_number, column)) = parse_compile_location_line(line) else {
+            continue;
+        };
+        let Some((message_index, message)) = typescript_message_after_location(lines, index) else {
+            continue;
+        };
+        let excerpt = typescript_code_frame_after(lines, message_index);
+        push_compile_error(
+            errors,
+            CompileError {
+                path,
+                line: line_number,
+                column,
+                excerpt,
+                symbol: cannot_find_name_symbol(&message),
+                message,
+                route_bound: None,
+            },
+        );
+    }
+}
+
+fn parse_inline_tsc_location_message(line: &str) -> Option<(String, usize, usize, String)> {
+    let trimmed = trim_compile_line(line);
+    let (location, message) = trimmed
+        .split_once(" - error ")
+        .or_else(|| trimmed.split_once(": error "))?;
+    let (path, line_number, column) = parse_compile_location_line(location)?;
+    let message = message.trim().to_string();
+    (!message.is_empty()).then_some((path, line_number, column, message))
+}
+
+fn typescript_message_after_location(
+    lines: &[&str],
+    location_index: usize,
+) -> Option<(usize, String)> {
+    lines
+        .iter()
+        .enumerate()
+        .skip(location_index + 1)
+        .take(8)
+        .find_map(|(index, line)| {
+            let line = trim_compile_line(line);
+            if line.is_empty() {
+                return None;
+            }
+            let is_message = line.contains("Type error:")
+                || line.contains("Syntax error:")
+                || line.starts_with("error TS")
+                || line.contains(" error TS");
+            is_message.then(|| (index, line.to_string()))
+        })
+}
+
+fn typescript_code_frame_after(lines: &[&str], start_index: usize) -> String {
+    let mut frame = Vec::new();
+    let mut started = false;
+    for line in lines.iter().skip(start_index + 1).take(12) {
+        let trimmed = trim_compile_line(line);
+        if trimmed.is_empty() {
+            if started {
+                break;
+            }
+            continue;
+        }
+        if parse_compile_location_line(trimmed).is_some()
+            || parse_inline_tsc_location_message(trimmed).is_some()
+            || trimmed.contains("Build failed because")
+            || trimmed.contains("Failed to compile")
+        {
+            break;
+        }
+        if typescript_code_frame_line(trimmed)
+            || (started && typescript_code_frame_continuation(trimmed))
+        {
+            started = true;
+            frame.push(trimmed.to_string());
+            continue;
+        }
+        if started {
+            break;
+        }
+    }
+    frame.join("\n")
+}
+
+fn typescript_code_frame_line(line: &str) -> bool {
+    if swc_code_frame_line(line) {
+        return true;
+    }
+    let trimmed = line.trim();
+    if trimmed
+        .trim_start_matches('>')
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_digit())
+    {
+        return true;
+    }
+    typescript_code_frame_continuation(trimmed)
+}
+
+fn typescript_code_frame_continuation(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| matches!(ch, '^' | '~' | '|' | ' ' | '\t'))
 }
 
 fn parse_compile_location_line(line: &str) -> Option<(String, usize, usize)> {
@@ -775,13 +989,7 @@ fn parse_compile_location_line(line: &str) -> Option<(String, usize, usize)> {
 }
 
 fn parse_inline_tsc_error(line: &str) -> Option<CompileError> {
-    let trimmed = trim_compile_line(line);
-    let marker = " - error ";
-    let (location, message) = trimmed
-        .split_once(marker)
-        .or_else(|| trimmed.split_once(": error "))?;
-    let (path, line_number, column) = parse_compile_location_line(location)?;
-    let message = message.trim().to_string();
+    let (path, line_number, column, message) = parse_inline_tsc_location_message(line)?;
     Some(CompileError {
         path,
         line: line_number,
@@ -1049,11 +1257,32 @@ fn normalize_compile_error_path(raw: &str) -> Option<String> {
 }
 
 fn compile_error_path_is_supported(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    if normalized
+        .split('/')
+        .any(|segment| segment == "node_modules" || segment == ".next")
+        || normalized.contains("next/dist/build/webpack-build/")
+    {
+        return false;
+    }
     let path = Path::new(path);
     matches!(
         path.extension().and_then(|ext| ext.to_str()),
         Some("tsx" | "ts" | "jsx" | "js" | "css")
     )
+}
+
+fn compile_output_needs_source_diagnostic(output: &str) -> bool {
+    compile_output_has_unusable_internal_location(output)
+        || output.contains("Failed to compile")
+        || output.contains("Build failed because of webpack errors")
+        || output.contains("Type error:")
+        || output.contains(" error TS")
+}
+
+fn compile_output_has_unusable_internal_location(output: &str) -> bool {
+    output.contains("node_modules/next/dist/build/webpack-build/impl.js")
+        || output.contains("next/dist/build/webpack-build/impl.js")
 }
 
 fn cannot_find_name_symbol(message: &str) -> Option<String> {
@@ -1211,6 +1440,107 @@ Type error: Cannot find name 'reset'.
         assert_eq!(errors[0].column, 28);
         assert_eq!(errors[0].symbol.as_deref(), Some("reset"));
         assert_eq!(errors[0].route_bound, None);
+    }
+
+    #[test]
+    fn parse_typescript_diagnostic_block_preserves_code_frame_and_suggestion() {
+        let output = r#"
+> next build
+
+Failed to compile.
+
+./src/app/page.tsx:43:13
+Type error: TS2552: Cannot find name 'player'. Did you mean 'PLAYER_W'?
+
+  41 | const PLAYER_W = 42;
+  42 | export default function Page() {
+> 43 |   return <main>{player}</main>;
+     |             ^
+  44 | }
+
+    at node_modules/next/dist/build/webpack-build/impl.js:137:22
+"#;
+
+        let output = FullCommandOutput::from_test_text(output);
+        let errors = parse_compile_errors(&output);
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "src/app/page.tsx");
+        assert_eq!(errors[0].line, 43);
+        assert_eq!(errors[0].column, 13);
+        assert_eq!(
+            errors[0].message,
+            "Type error: TS2552: Cannot find name 'player'. Did you mean 'PLAYER_W'?"
+        );
+        assert_eq!(errors[0].symbol.as_deref(), Some("player"));
+        assert!(
+            errors[0]
+                .excerpt
+                .contains("43 |   return <main>{player}</main>;"),
+            "{errors:?}"
+        );
+        assert!(errors[0].excerpt.contains("|             ^"), "{errors:?}");
+    }
+
+    #[test]
+    fn parse_compile_errors_ignores_webpack_internal_location_without_source_target() {
+        let output = r#"
+Error: Build failed because of webpack errors
+    at node_modules/next/dist/build/webpack-build/impl.js:137:22
+    at async Span.traceAsyncFn (node_modules/next/dist/trace/trace.js:154:20)
+"#;
+
+        let output = FullCommandOutput::from_test_text(output);
+        let errors = parse_compile_errors(&output);
+
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn compile_error_extraction_event_records_fallback_for_internal_location_only() {
+        let requirement = requirement_from_deferred(
+            "npm run build",
+            Some("nextjs"),
+            "final build check",
+            "profile:nextjs",
+            "pending",
+        )
+        .unwrap();
+        let observation = BuildVerifierObservation {
+            command: requirement.command.clone(),
+            profile: requirement.profile.clone(),
+            authority: requirement.authority.clone(),
+            required_for_completion: requirement.required_for_completion,
+            requires_dependency_setup: requirement.requires_dependency_setup,
+            dependency_ready: true,
+            attempted: true,
+            status: BuildVerifierStatus::Failed,
+            primary_reason:
+                "Error: Build failed because of webpack errors\nat node_modules/next/dist/build/webpack-build/impl.js:137:22"
+                    .to_string(),
+            output_snippet: String::new(),
+            output_path: String::new(),
+            compile_errors: Vec::new(),
+            foreign_toolchain: None,
+        };
+        let lifecycle = BuildVerifierLifecycleObservation {
+            requirement,
+            before_setup: observation,
+            setup: None,
+            after_setup: None,
+            final_status: BuildVerifierStatus::Failed,
+            final_reason: "failed".to_string(),
+        };
+
+        let event =
+            compile_error_extraction_event("ultra-plan-run", Some("verify-build"), &lifecycle)
+                .expect("fallback event");
+
+        assert_eq!(event["event"], "compile_error_extraction");
+        assert_eq!(event["status"], "fallback");
+        assert_eq!(event["reason"], "webpack_internal_location_only");
+        assert_eq!(event["compile_error_count"], 0);
+        assert_eq!(event["step_id"], "verify-build");
     }
 
     #[test]

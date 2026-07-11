@@ -2224,6 +2224,46 @@ export default function Page() {\n\
     }
 
     #[test]
+    fn compile_repair_prompt_injects_extracted_ts_diagnostic_frame() {
+        let prompt = compile_repair_prompt_section(
+            &[CompileError {
+                path: "src/app/page.tsx".to_string(),
+                line: 43,
+                column: 13,
+                message:
+                    "Type error: TS2552: Cannot find name 'player'. Did you mean 'PLAYER_W'?"
+                        .to_string(),
+                excerpt: "41 | const PLAYER_W = 42;\n42 | export default function Page() {\n43 |   return <main>{player}</main>;\n|             ^"
+                    .to_string(),
+                symbol: Some("player".to_string()),
+                route_bound: Some(true),
+            }],
+            CompileRepairPromptProtection::default(),
+        );
+
+        assert!(
+            prompt.contains("Compile error: src/app/page.tsx:43:13"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Compile error excerpt for src/app/page.tsx:43:13"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("43 |   return <main>{player}</main>;"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Compiler suggestion: Did you mean 'PLAYER_W'?"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("You MUST modify src/app/page.tsx using the edit tool"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
     fn compile_repair_prompt_includes_imported_hook_context_for_missing_property() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src/app")).unwrap();

@@ -1,0 +1,44 @@
+case_id = "test0711_bs_008_compile_diagnostic_extraction"
+source = "bs_002 #8 compile repair source diagnostic extraction regression fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["compile", "typescript", "webpack", "write_required"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/compile-diagnostic-extraction.jsonl = [
+  "test0711_bs_002/#8",
+  "node_modules/next/dist/build/webpack-build/impl.js:137:22",
+  "\"event\":\"compile_error_extraction\"",
+  "\"status\":\"extracted\"",
+  "\"source_paths\":[\"src/app/page.tsx\"]",
+  "\"status\":\"fallback\"",
+  "\"reason\":\"webpack_internal_location_only\"",
+  "\"path\":\"src/app/page.tsx\"",
+  "\"line\":43",
+  "Type error: TS2552: Cannot find name 'player'. Did you mean 'PLAYER_W'?",
+  "Compiler suggestion: Did you mean 'PLAYER_W'?",
+  "Compile repair edit mandate: edit one of these source files using the edit tool: src/app/page.tsx.",
+  "\"event\":\"final_acceptance_repair_start\"",
+  "\"selected_target\":\"src/app/page.tsx\"",
+  "\"selected_targets\":[\"src/app/page.tsx\"]",
+  "\"event\":\"read_only_stagnation_feedback\"",
+  "\"stage\":\"write_required\"",
+  "Write the complete corrected file via the Write tool"
+]
