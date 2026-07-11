@@ -13,14 +13,13 @@ use super::edit_anchor_recovery::{EditAnchorFailureSummary, EditAnchorRecovery};
 use super::loop_run::{
     RunSessionOptions, RunSessionOutcome, run_session_with_outcome_with_options,
 };
-use super::stagnation_escalation::READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD;
+#[cfg(test)]
+use super::repair_pressure::READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD;
+use super::repair_pressure::{CarriedPressure, PressureSeed, pressure_seed};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct EscalationCarryoverState {
-    read_only_streak: usize,
-    anchor_failure: Option<EditAnchorFailureSummary>,
-    write_required_exhausted: bool,
-    pending_evidence: Vec<String>,
+    pressure: CarriedPressure,
 }
 
 #[derive(Debug, Clone)]
@@ -28,47 +27,26 @@ pub(crate) struct EscalationCarryoverHandle {
     state: Arc<Mutex<EscalationCarryoverState>>,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct EscalationCarryoverSeed {
-    pub(crate) initial_read_only_streak: usize,
-    pub(crate) carried_streak: usize,
-    pub(crate) carried_anchor_failures: usize,
-    pub(crate) pre_advanced: bool,
-    pub(crate) carried_write_required_exhausted: bool,
-}
+pub(crate) type EscalationCarryoverSeed = PressureSeed;
 
 impl EscalationCarryoverHandle {
     pub(crate) fn new() -> Self {
+        Self::from_pressure(CarriedPressure::default())
+    }
+
+    pub(crate) fn from_pressure(pressure: CarriedPressure) -> Self {
         Self {
-            state: Arc::new(Mutex::new(EscalationCarryoverState::default())),
+            state: Arc::new(Mutex::new(EscalationCarryoverState { pressure })),
         }
     }
 
     pub(crate) fn seed_for_session(&self, repair_turn_budget: usize) -> EscalationCarryoverSeed {
         let state = self.state.lock().unwrap().clone();
-        let carried_anchor_failures = state
-            .anchor_failure
-            .as_ref()
-            .map(|failure| failure.failure_count)
-            .unwrap_or_default();
-        let distance = distance_to_write_required(state.read_only_streak, carried_anchor_failures);
-        let pre_advanced = state.write_required_exhausted
-            || (repair_turn_budget > 0 && repair_turn_budget < distance);
-        EscalationCarryoverSeed {
-            initial_read_only_streak: if pre_advanced {
-                READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD.saturating_sub(1)
-            } else {
-                state.read_only_streak
-            },
-            carried_streak: state.read_only_streak,
-            carried_anchor_failures,
-            pre_advanced,
-            carried_write_required_exhausted: state.write_required_exhausted,
-        }
+        pressure_seed(Some(&state.pressure), repair_turn_budget)
     }
 
     pub(crate) fn record_read_only_streak(&self, read_only_streak: usize) {
-        self.state.lock().unwrap().read_only_streak = read_only_streak;
+        self.state.lock().unwrap().pressure.read_only_streak = read_only_streak;
     }
 
     pub(crate) fn record_anchor_failure(&self, failure: EditAnchorFailureSummary) {
@@ -76,35 +54,36 @@ impl EscalationCarryoverHandle {
             return;
         }
         let mut state = self.state.lock().unwrap();
-        let replace = state
-            .anchor_failure
-            .as_ref()
-            .map(|current| {
-                failure.failure_count > current.failure_count
-                    || (failure.failure_count == current.failure_count
-                        && failure.path < current.path)
-            })
-            .unwrap_or(true);
+        let replace = failure.failure_count > state.pressure.anchor_failures
+            || (failure.failure_count == state.pressure.anchor_failures
+                && state
+                    .pressure
+                    .anchor_target
+                    .as_ref()
+                    .is_none_or(|current| failure.path < *current));
         if replace {
-            state.anchor_failure = Some(failure);
+            state.pressure.anchor_failures = failure.failure_count;
+            state.pressure.anchor_target = Some(failure.path);
         }
     }
 
     pub(crate) fn note_successful_write_path(&self, path: &str) {
         let mut state = self.state.lock().unwrap();
-        state.read_only_streak = 0;
-        state.write_required_exhausted = false;
+        state.pressure.read_only_streak = 0;
+        state.pressure.write_required_exhausted = false;
         if state
-            .anchor_failure
+            .pressure
+            .anchor_target
             .as_ref()
-            .is_some_and(|failure| normalized_path(&failure.path) == normalized_path(path))
+            .is_some_and(|target| normalized_path(target) == normalized_path(path))
         {
-            state.anchor_failure = None;
+            state.pressure.anchor_failures = 0;
+            state.pressure.anchor_target = None;
         }
     }
 
     pub(crate) fn note_write_required_exhausted(&self) {
-        self.state.lock().unwrap().write_required_exhausted = true;
+        self.state.lock().unwrap().pressure.write_required_exhausted = true;
     }
 
     pub(crate) fn set_pending_evidence(&self, pending_evidence: &[String]) {
@@ -115,7 +94,7 @@ impl EscalationCarryoverHandle {
                 normalized.push(evidence.to_string());
             }
         }
-        self.state.lock().unwrap().pending_evidence = normalized;
+        self.state.lock().unwrap().pressure.pending_evidence = normalized;
     }
 
     pub(crate) fn carry_pending_evidence(
@@ -133,11 +112,16 @@ impl EscalationCarryoverHandle {
     }
 
     pub(crate) fn pending_evidence(&self) -> Vec<String> {
-        self.state.lock().unwrap().pending_evidence.clone()
+        self.state.lock().unwrap().pressure.pending_evidence.clone()
     }
 
     pub(crate) fn strongest_anchor_failure(&self) -> Option<EditAnchorFailureSummary> {
-        self.state.lock().unwrap().anchor_failure.clone()
+        let state = self.state.lock().unwrap();
+        let path = state.pressure.anchor_target.clone()?;
+        (state.pressure.anchor_failures > 0).then_some(EditAnchorFailureSummary {
+            path,
+            failure_count: state.pressure.anchor_failures,
+        })
     }
 }
 
@@ -289,11 +273,6 @@ pub(crate) fn run_final_acceptance_repair_with_carryover(
         ui,
         attach_to_options(RunSessionOptions::final_acceptance_repair(), carryover),
     )
-}
-
-fn distance_to_write_required(read_only_streak: usize, anchor_failures: usize) -> usize {
-    READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD
-        .saturating_sub(read_only_streak.saturating_add(anchor_failures))
 }
 
 fn strongest(

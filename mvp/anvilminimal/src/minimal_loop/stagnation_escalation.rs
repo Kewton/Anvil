@@ -17,10 +17,10 @@ use super::repair_pressure::{PressureInputs, PressureLevel, PressureState, trans
 #[cfg(test)]
 pub(crate) use super::repair_pressure::{
     READ_ONLY_STAGNATION_COMPACT_THRESHOLD, READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD,
+    READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD,
 };
 pub(crate) use super::repair_pressure::{
-    READ_ONLY_STAGNATION_REASON, READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD,
-    WRITE_REQUIRED_NO_WRITE_LIMIT,
+    READ_ONLY_STAGNATION_REASON, WRITE_REQUIRED_NO_WRITE_LIMIT,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

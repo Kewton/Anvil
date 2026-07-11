@@ -47,6 +47,7 @@ use crate::minimal_loop::reachability::{
     RepairReachability, assess_repair_reachability, reachability_failure_kind,
     reachability_recovery_reason,
 };
+use crate::minimal_loop::repair_pressure::CarriedPressure;
 use crate::minimal_loop::repair_target::{
     RepairFollowThrough, RepairTarget, classify_repair_follow_through, classify_repair_target,
 };
@@ -2299,7 +2300,7 @@ fn run_step(
     let mut hook_snapshot_restore_used = false;
     let mut current_report_signature = verification_report_signature(&current_report);
     let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
-    let escalation_carryover = EscalationCarryoverHandle::new();
+    let escalation_carryover = EscalationCarryoverHandle::from_pressure(CarriedPressure::default());
     if !current_reachability.reachable {
         terminal_repair_failure_kind =
             Some(reachability_failure_kind(&current_reachability).to_string());
