@@ -5458,8 +5458,32 @@ pub fn run_ultra_plan_with_ui(
             }
             attempts_run = attempt;
             let repair_target = classify_repair_target(&acceptance_report);
-            let expected_paths =
+            let mut expected_paths =
                 final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
+            let mut pending_repair_evidence = verification_missing_signals(&acceptance_report);
+            merge_unique_strings(
+                &mut pending_repair_evidence,
+                &ultra_context.pending_capability_evidence,
+            );
+            let contract_attribute_paths =
+                contract_attribute_repair_target_paths(&acceptance_report);
+            let target_selection =
+                crate::planner::repair_target_resolution::resolve_final_acceptance_repair_targets(
+                    crate::planner::repair_target_resolution::FinalAcceptanceRepairTargetInput {
+                        root: &config.workspace_root,
+                        profile: &plan.profile,
+                        pending_evidence: &pending_repair_evidence,
+                        contract_attribute_paths: &contract_attribute_paths,
+                        repair_changed_paths: &ultra_context.last_repair_changed_paths,
+                        required_paths: &expected_paths,
+                    },
+                );
+            merge_unique_strings(&mut expected_paths, &target_selection.selected_targets);
+            let repair_required_paths = if target_selection.selected_targets.is_empty() {
+                expected_paths.clone()
+            } else {
+                target_selection.selected_targets.clone()
+            };
             let evidence_zero_edit_eligible =
                 evidence_repair_zero_edit_eligible(&acceptance_report, repair_target);
             if evidence_zero_edit_eligible
@@ -5467,6 +5491,7 @@ pub fn run_ultra_plan_with_ui(
                 && let Some(target_path) = final_acceptance_evidence_regeneration_target(
                     &config.workspace_root,
                     &plan.profile,
+                    &acceptance_report,
                     &expected_paths,
                 )
             {
@@ -5664,6 +5689,9 @@ pub fn run_ultra_plan_with_ui(
                     "profile_failures": acceptance_report.profile_failures.clone(),
                     "deterministic_remedies_applied": deterministic_remedies_applied.clone(),
                     "selected_evidence_keys": before_missing_keys.clone(),
+                    "selected_target": target_selection.primary_target().unwrap_or_default(),
+                    "selected_targets": target_selection.selected_targets.clone(),
+                    "selection_reason": target_selection.selection_reason.clone(),
                     "selected_interaction_failure": final_acceptance_app_behavior_failure_kind(&acceptance_report)
                         .unwrap_or_default(),
                     "bounded_repair": true,
@@ -5682,7 +5710,7 @@ pub fn run_ultra_plan_with_ui(
                     execution,
                     &mut compact_session,
                     &repair_prompt,
-                    &expected_paths,
+                    &repair_required_paths,
                     &repair_config,
                     ui,
                 )
@@ -5691,7 +5719,7 @@ pub fn run_ultra_plan_with_ui(
                     execution,
                     &mut ultra_session,
                     &repair_prompt,
-                    &expected_paths,
+                    &repair_required_paths,
                     &repair_config,
                     ui,
                 )
@@ -6108,6 +6136,7 @@ pub fn run_ultra_plan_with_ui(
                             final_acceptance_evidence_regeneration_target(
                                 &config.workspace_root,
                                 &plan.profile,
+                                &acceptance_report,
                                 &paths,
                             )
                         });
@@ -6601,22 +6630,9 @@ fn snapshot_source_candidates(
     merge_source_candidates(&mut paths, profile_paths.iter().map(String::as_str));
     merge_source_candidates(
         &mut paths,
-        [
-            "src/app/page.tsx",
-            "src/app/page.jsx",
-            "src/app/page.ts",
-            "src/app/page.js",
-            "src/app/layout.tsx",
-            "src/app/layout.jsx",
-            "app/page.tsx",
-            "app/page.jsx",
-            "app/page.ts",
-            "app/page.js",
-            "pages/index.tsx",
-            "pages/index.jsx",
-            "pages/index.ts",
-            "pages/index.js",
-        ],
+        crate::planner::repair_target_resolution::default_repair_target_candidates(root, profile)
+            .iter()
+            .map(String::as_str),
     );
     for dir in ["src/app", "app", "pages", "src/components", "components"] {
         collect_source_files_under(root, dir, &mut paths, 0);
@@ -6640,21 +6656,11 @@ fn final_acceptance_source_snapshot(
     merge_final_acceptance_snapshot_candidates(&mut paths, extra_paths.iter().map(String::as_str));
     merge_final_acceptance_snapshot_candidates(
         &mut paths,
-        [
-            "package.json",
-            "tsconfig.json",
-            "next.config.js",
-            "next.config.mjs",
-            "next.config.ts",
-            "postcss.config.js",
-            "postcss.config.mjs",
-            "tailwind.config.js",
-            "tailwind.config.ts",
-            "vite.config.js",
-            "vite.config.ts",
-            "Cargo.toml",
-            "pyproject.toml",
-        ],
+        crate::planner::repair_target_resolution::final_acceptance_snapshot_candidates(
+            root, profile,
+        )
+        .iter()
+        .map(String::as_str),
     );
     for path in route_bound_source_paths(root, profile) {
         if !paths.contains(&path) {
@@ -7094,44 +7100,13 @@ fn profile_invariant_relevant_paths(root: &Path, profile: &str, reason: &str) ->
         return out;
     }
     let tailwind_failure = reason.contains("tailwind_contract_failure");
-    let rels: &[&str] = if tailwind_failure {
-        &[
-            "package.json",
-            "postcss.config.js",
-            "postcss.config.cjs",
-            "postcss.config.mjs",
-            "postcss.config",
-            "tailwind.config.js",
-            "tailwind.config.cjs",
-            "tailwind.config.mjs",
-            "tailwind.config.ts",
-            "src/app/layout.tsx",
-            "src/app/layout.jsx",
-            "src/app/layout.ts",
-            "src/app/layout.js",
-            "app/layout.tsx",
-            "app/layout.jsx",
-            "app/layout.ts",
-            "app/layout.js",
-            "src/app/globals.css",
-            "src/app/global.css",
-            "app/globals.css",
-            "app/global.css",
-            "src/styles/globals.css",
-            "styles/globals.css",
-        ]
-    } else {
-        &[
-            "package.json",
-            "tsconfig.json",
-            "src/app/page.tsx",
-            "src/app/layout.tsx",
-            "app/page.tsx",
-            "app/layout.tsx",
-        ]
-    };
+    let rels = crate::planner::repair_target_resolution::profile_invariant_excerpt_candidates(
+        root,
+        profile,
+        tailwind_failure,
+    );
     for project_root in profile_excerpt_project_roots(root) {
-        for rel in rels {
+        for rel in &rels {
             let path = project_root.join(rel);
             if path.is_file() && !out.contains(&path) {
                 out.push(path);
@@ -13981,6 +13956,12 @@ fn final_acceptance_repair_expected_paths(
     Ok(expected)
 }
 
+fn contract_attribute_repair_target_paths(report: &VerificationReport) -> Vec<String> {
+    crate::planner::contract_attribute_repair::detect(report)
+        .map(|issue| vec![issue.path])
+        .unwrap_or_default()
+}
+
 fn compile_error_paths(errors: &[CompileError]) -> Vec<String> {
     errors
         .iter()
@@ -14041,16 +14022,29 @@ fn evidence_repair_retry_mode(
 fn final_acceptance_evidence_regeneration_target(
     root: &Path,
     profile: &str,
+    report: &VerificationReport,
     expected_paths: &[String],
 ) -> Option<String> {
-    route_bound_source_paths(root, profile)
-        .into_iter()
-        .next()
-        .or_else(|| {
-            expected_paths
-                .iter()
-                .find_map(|path| safe_source_rel_path(path))
-        })
+    let pending_evidence = verification_missing_signals(report);
+    let contract_attribute_paths = contract_attribute_repair_target_paths(report);
+    crate::planner::repair_target_resolution::resolve_repair_targets(
+        crate::planner::repair_target_resolution::RepairTargetResolutionInput {
+            root,
+            profile,
+            pending_evidence: &pending_evidence,
+            missing_capabilities: &[],
+            contract_attribute_paths: &contract_attribute_paths,
+            repair_changed_paths: &[],
+            required_paths: expected_paths,
+            fallback_paths: &[],
+        },
+    )
+    .and_then(|selection| {
+        selection
+            .selected_targets
+            .into_iter()
+            .find_map(|path| safe_source_rel_path(&path))
+    })
 }
 
 fn build_final_acceptance_evidence_regeneration_prompt(
@@ -18047,6 +18041,7 @@ dependencies = ["requests"]
         let target = final_acceptance_evidence_regeneration_target(
             dir.path(),
             "nextjs",
+            &report,
             &["src/app/page.tsx".to_string()],
         )
         .expect("evidence regeneration target");

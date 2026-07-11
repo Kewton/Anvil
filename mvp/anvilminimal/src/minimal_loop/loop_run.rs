@@ -4603,20 +4603,25 @@ fn maybe_read_only_stagnation_feedback(
             if let Some(selection) = decision.write_required_selection() {
                 (selection, decision.diagnostic_feedback())
             } else {
-                let evidence_mapped_paths =
-                    super::stagnation_escalation::write_required_evidence_targets(
+                let mut fallback_candidates = changed_paths.to_vec();
+                for path in &options.path_fallback_candidates {
+                    if !fallback_candidates.iter().any(|existing| existing == path) {
+                        fallback_candidates.push(path.clone());
+                    }
+                }
+                let selection = crate::planner::repair_target_resolution::resolve_repair_targets(
+                    crate::planner::repair_target_resolution::RepairTargetResolutionInput {
                         root,
                         profile,
-                        &pending_error_context.missing_evidence,
-                        &pending_error_context.missing_capabilities,
-                    );
-                let selection = super::stagnation_escalation::write_required_target_selection(
-                    &evidence_mapped_paths,
-                    repair_changed_paths,
-                    required_paths,
-                    changed_paths,
-                    &options.path_fallback_candidates,
-                )?;
+                        pending_evidence: &pending_error_context.missing_evidence,
+                        missing_capabilities: &pending_error_context.missing_capabilities,
+                        contract_attribute_paths: &[],
+                        repair_changed_paths,
+                        required_paths,
+                        fallback_paths: &fallback_candidates,
+                    },
+                )?
+                .into();
                 let state_binding_feedback =
                     crate::planner::state_binding_scan::write_required_feedback(
                         root,

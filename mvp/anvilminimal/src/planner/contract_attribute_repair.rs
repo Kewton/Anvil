@@ -49,6 +49,14 @@ pub fn guidance_section(
     let Some(issue) = detect(report) else {
         return String::new();
     };
+    guidance_for_issue(root, &issue, eval_events_path)
+}
+
+pub(crate) fn guidance_for_issue(
+    root: Option<&Path>,
+    issue: &ContractAttributeIssue,
+    eval_events_path: Option<&Path>,
+) -> String {
     emit_guidance_event(eval_events_path, &issue);
     format!(
         "Contract attribute repair guidance:\n\
@@ -185,13 +193,33 @@ fn hook_location_excerpts(root: Option<&Path>, path: &str) -> String {
         .take(3)
         .collect::<Vec<_>>();
     if hook_indexes.is_empty() {
-        return "- no existing data-anvil hook lines found in the target file".to_string();
+        return jsx_location_excerpt(&lines).unwrap_or_else(|| {
+            "- no existing data-anvil hook lines found in the target file".to_string()
+        });
     }
     hook_indexes
         .into_iter()
         .map(|index| line_numbered_excerpt(&lines, index))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn jsx_location_excerpt(lines: &[&str]) -> Option<String> {
+    let index = lines.iter().position(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("return <")
+            || trimmed.starts_with("return (")
+            || trimmed.starts_with("<main")
+            || trimmed.starts_with("<section")
+            || trimmed.starts_with("<div")
+            || trimmed.contains("return <main")
+            || trimmed.contains("return <section")
+            || trimmed.contains("return <div")
+    })?;
+    Some(format!(
+        "- no existing data-anvil hook lines found; likely insertion area\n{}",
+        line_numbered_excerpt(lines, index)
+    ))
 }
 
 fn line_numbered_excerpt(lines: &[&str], index: usize) -> String {

@@ -4,8 +4,14 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::eval_events;
-use crate::minimal_loop::evidence::required_evidence_for_capability;
-use crate::planner::profile::profile_evidence_repair_target_paths;
+use crate::planner::repair_target_resolution::{
+    RepairTargetSelection, RepairTargetSelectionReason,
+};
+#[cfg(test)]
+use crate::planner::{
+    profile::profile_evidence_repair_target_paths,
+    repair_target_resolution::{RepairTargetPathBuckets, select_repair_targets_from_paths},
+};
 use crate::state::ToolCall;
 use crate::tools::path_guard::normalize_workspace_path;
 
@@ -53,6 +59,7 @@ pub(crate) struct WriteRequiredState {
 pub(crate) enum WriteRequiredSelectionReason {
     AnchorFailure,
     EvidenceMapped,
+    ContractAttribute,
     RepairChanged,
     RequiredPath,
     Fallback,
@@ -63,6 +70,7 @@ impl WriteRequiredSelectionReason {
         match self {
             Self::AnchorFailure => "anchor_failure",
             Self::EvidenceMapped => "evidence_mapped",
+            Self::ContractAttribute => "contract_attribute",
             Self::RepairChanged => "repair_changed",
             Self::RequiredPath => "required_path",
             Self::Fallback => "fallback",
@@ -74,6 +82,29 @@ impl WriteRequiredSelectionReason {
 pub(crate) struct WriteRequiredTargetSelection {
     pub(crate) selected_targets: Vec<String>,
     pub(crate) selection_reason: WriteRequiredSelectionReason,
+}
+
+impl From<RepairTargetSelection> for WriteRequiredTargetSelection {
+    fn from(selection: RepairTargetSelection) -> Self {
+        Self {
+            selected_targets: selection.selected_targets,
+            selection_reason: match selection.selection_reason {
+                RepairTargetSelectionReason::EvidenceMapped => {
+                    WriteRequiredSelectionReason::EvidenceMapped
+                }
+                RepairTargetSelectionReason::ContractAttribute => {
+                    WriteRequiredSelectionReason::ContractAttribute
+                }
+                RepairTargetSelectionReason::RepairChanged => {
+                    WriteRequiredSelectionReason::RepairChanged
+                }
+                RepairTargetSelectionReason::RequiredPath => {
+                    WriteRequiredSelectionReason::RequiredPath
+                }
+                RepairTargetSelectionReason::Fallback => WriteRequiredSelectionReason::Fallback,
+            },
+        }
+    }
 }
 
 impl WriteRequiredTargetSelection {
@@ -252,6 +283,7 @@ pub(crate) struct ReadOnlyToolRejection {
     pub(crate) no_write_attempts: usize,
 }
 
+#[cfg(test)]
 pub(crate) fn write_required_target_selection(
     evidence_mapped_paths: &[String],
     repair_changed_paths: &[String],
@@ -259,67 +291,35 @@ pub(crate) fn write_required_target_selection(
     changed_paths: &[String],
     path_fallback_candidates: &[String],
 ) -> Option<WriteRequiredTargetSelection> {
-    for (paths, reason) in [
-        (
-            evidence_mapped_paths,
-            WriteRequiredSelectionReason::EvidenceMapped,
-        ),
-        (
-            repair_changed_paths,
-            WriteRequiredSelectionReason::RepairChanged,
-        ),
-        (required_paths, WriteRequiredSelectionReason::RequiredPath),
-        (changed_paths, WriteRequiredSelectionReason::Fallback),
-        (
-            path_fallback_candidates,
-            WriteRequiredSelectionReason::Fallback,
-        ),
-    ] {
-        let selected_targets = ordered_non_empty_paths(paths);
-        if !selected_targets.is_empty() {
-            return Some(WriteRequiredTargetSelection {
-                selected_targets,
-                selection_reason: reason,
-            });
-        }
+    let mut fallback_paths = ordered_non_empty_paths(changed_paths);
+    for path in path_fallback_candidates {
+        push_unique_path(&mut fallback_paths, path);
     }
-    None
+    select_repair_targets_from_paths(RepairTargetPathBuckets {
+        evidence_mapped_paths,
+        contract_attribute_paths: &[],
+        repair_changed_paths,
+        required_paths,
+        fallback_paths: &fallback_paths,
+    })
+    .map(WriteRequiredTargetSelection::from)
 }
 
+#[cfg(test)]
 pub(crate) fn write_required_evidence_targets(
     root: &Path,
     profile: &str,
     missing_evidence: &[String],
     missing_capabilities: &[String],
 ) -> Vec<String> {
-    let evidence_keys = write_required_evidence_keys(missing_evidence, missing_capabilities);
+    let evidence_keys = crate::planner::repair_target_resolution::repair_evidence_keys(
+        missing_evidence,
+        missing_capabilities,
+    );
     if evidence_keys.is_empty() {
         return Vec::new();
     }
     profile_evidence_repair_target_paths(root, profile, &evidence_keys)
-}
-
-fn write_required_evidence_keys(
-    missing_evidence: &[String],
-    missing_capabilities: &[String],
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for key in missing_evidence {
-        push_unique_evidence_key(&mut out, key);
-    }
-    for capability in missing_capabilities {
-        for evidence in required_evidence_for_capability(capability) {
-            push_unique_evidence_key(&mut out, &evidence);
-        }
-    }
-    out
-}
-
-fn push_unique_evidence_key(out: &mut Vec<String>, key: &str) {
-    let trimmed = key.trim();
-    if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
-        out.push(trimmed.to_string());
-    }
 }
 
 #[cfg(test)]
@@ -416,22 +416,28 @@ fn normalized_relative_for_compare(path: &str) -> String {
     path.trim().trim_start_matches("./").replace('\\', "/")
 }
 
+#[cfg(test)]
 fn ordered_non_empty_paths(paths: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for path in paths {
-        let trimmed = path.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let normalized = normalized_relative_for_compare(trimmed);
-        if !out
-            .iter()
-            .any(|existing| normalized_relative_for_compare(existing.as_str()) == normalized)
-        {
-            out.push(trimmed.to_string());
-        }
+        push_unique_path(&mut out, path);
     }
     out
+}
+
+#[cfg(test)]
+fn push_unique_path(out: &mut Vec<String>, path: &str) {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let normalized = normalized_relative_for_compare(trimmed);
+    if !out
+        .iter()
+        .any(|existing| normalized_relative_for_compare(existing.as_str()) == normalized)
+    {
+        out.push(trimmed.to_string());
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -85,6 +85,17 @@ fixtures/read-only-write-required-evidence-targets.jsonl = [
   "\"event\":\"write_required_off_target_write_allowed\"",
   "\"actual_path\":\"package.json\""
 ]
+fixtures/final-acceptance-target-resolution.jsonl = [
+  "test0711_bs_002/#1",
+  "\"event\":\"final_acceptance_repair_start\"",
+  "\"selected_evidence_keys\":[\"restart_or_recoverable_state_evidence\"]",
+  "\"required_paths\":[\"package.json\",\"src/app/page.tsx\"]",
+  "\"selected_target\":\"src/app/page.tsx\"",
+  "\"selected_targets\":[\"src/app/page.tsx\"]",
+  "\"selection_reason\":\"evidence_mapped\"",
+  "\"phase_scope\":\"final_acceptance_repair\"",
+  "\"event\":\"read_only_tool_rejected\""
+]
 fixtures/state-binding-diagnosis.jsonl = [
   "test0710_bs_004/combo1",
   "\"event\":\"state_binding_diagnosis\"",

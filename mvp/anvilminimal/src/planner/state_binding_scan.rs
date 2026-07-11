@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde_json::json;
@@ -129,11 +129,22 @@ fn feedback_for_triggered_scan(
 ) -> String {
     let diagnosis = diagnose_route_bound_state_binding(root, profile);
     emit_state_binding_diagnosis(eval_events_path, &diagnosis);
-    if diagnosis.diagnosis.feedback_worthy() {
-        state_binding_feedback_for_diagnosis(&diagnosis)
-    } else {
-        String::new()
+    if !diagnosis.diagnosis.feedback_worthy() {
+        return String::new();
     }
+    let mut feedback = state_binding_feedback_for_diagnosis(&diagnosis);
+    if let Some(issue) = contract_attribute_issue_for_no_expression(&diagnosis) {
+        let guidance = crate::planner::contract_attribute_repair::guidance_for_issue(
+            Some(root),
+            &issue,
+            eval_events_path,
+        );
+        if !guidance.is_empty() {
+            feedback.push_str("\n\n");
+            feedback.push_str(&guidance);
+        }
+    }
+    feedback
 }
 
 pub(crate) fn diagnose_route_bound_state_binding(
@@ -141,7 +152,7 @@ pub(crate) fn diagnose_route_bound_state_binding(
     profile: &str,
 ) -> StateBindingDiagnosis {
     let mut fallback: Option<StateBindingDiagnosis> = None;
-    for rel in route_bound_closure(root, profile) {
+    for rel in state_binding_scan_paths(root, profile) {
         let rel_text = rel.to_string_lossy().replace('\\', "/");
         if !is_source_path(&rel_text) {
             continue;
@@ -172,6 +183,74 @@ pub(crate) fn diagnose_route_bound_state_binding(
             UndeterminableReason::NoExpression,
         )
     })
+}
+
+fn contract_attribute_issue_for_no_expression(
+    diagnosis: &StateBindingDiagnosis,
+) -> Option<crate::planner::contract_attribute_repair::ContractAttributeIssue> {
+    if diagnosis.diagnosis != StateBindingDiagnosisKind::Undeterminable
+        || diagnosis.undeterminable_reason != Some(UndeterminableReason::NoExpression)
+        || diagnosis.path.trim().is_empty()
+    {
+        return None;
+    }
+    Some(
+        crate::planner::contract_attribute_repair::ContractAttributeIssue {
+            attribute: "data-anvil-state".to_string(),
+            path: diagnosis.path.clone(),
+        },
+    )
+}
+
+fn state_binding_scan_paths(root: &Path, profile: &str) -> Vec<PathBuf> {
+    let mut route_entries = Vec::new();
+    let mut non_layout = Vec::new();
+    for rel in route_bound_closure(root, profile) {
+        let rel_text = rel.to_string_lossy().replace('\\', "/");
+        if layout_source_path(&rel_text) {
+            continue;
+        }
+        if route_entry_source_path(&rel_text) {
+            route_entries.push(rel);
+        } else {
+            non_layout.push(rel);
+        }
+    }
+    route_entries.sort();
+    non_layout.sort();
+    route_entries.extend(non_layout);
+    route_entries
+}
+
+fn route_entry_source_path(path: &str) -> bool {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "page.tsx"
+            | "page.ts"
+            | "page.jsx"
+            | "page.js"
+            | "index.tsx"
+            | "index.ts"
+            | "index.jsx"
+            | "index.js"
+    )
+}
+
+fn layout_source_path(path: &str) -> bool {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "layout.tsx" | "layout.ts" | "layout.jsx" | "layout.js"
+    )
 }
 
 fn emit_state_binding_diagnosis(
@@ -1416,5 +1495,77 @@ export default function Game() {
             None,
         );
         assert!(feedback.contains("State binding diagnosis: state_bound_to_ref"));
+    }
+
+    #[test]
+    fn no_expression_feedback_includes_contract_attribute_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src/app");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("page.tsx"),
+            r#"
+export default function Game() {
+  return <main><button data-anvil-action="primary">Start</button></main>;
+}
+"#,
+        )
+        .unwrap();
+        let report = VerificationReport::profile_failed(
+            "missing_required_evidence:stateful_update_evidence",
+        );
+
+        let feedback = final_acceptance_feedback(dir.path(), "nextjs", &report, None);
+
+        assert!(feedback.contains("State binding diagnosis: undeterminable"));
+        assert!(
+            feedback.contains("Contract attribute repair guidance:"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("contract_attribute_missing"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("missing attribute: `data-anvil-state`"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("target source file: `src/app/page.tsx`"),
+            "{feedback}"
+        );
+        assert!(
+            feedback.contains("data-anvil-state={JSON.stringify({ phase, score, playerX })}"),
+            "{feedback}"
+        );
+    }
+
+    #[test]
+    fn route_entry_is_diagnosed_before_layout_for_no_expression() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src/app");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("layout.tsx"),
+            "export default function Layout({children}){ return <html><body>{children}</body></html>; }",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("page.tsx"),
+            "export default function Page(){ return <main>Game</main>; }",
+        )
+        .unwrap();
+
+        let diagnosis = diagnose_route_bound_state_binding(dir.path(), "nextjs");
+
+        assert_eq!(
+            diagnosis.diagnosis,
+            StateBindingDiagnosisKind::Undeterminable
+        );
+        assert_eq!(
+            diagnosis.undeterminable_reason,
+            Some(UndeterminableReason::NoExpression)
+        );
+        assert_eq!(diagnosis.path, "src/app/page.tsx");
     }
 }
