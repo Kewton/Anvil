@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::eval_events;
 use crate::mode::ExecutionMode;
 use crate::planner::profile::{profile_complete_scaffold, profile_setup_scaffold_paths};
+use crate::planner::setup_step_policy;
 use crate::planner::verify::{
     RuntimeCommandConnector, RuntimeNormalizedCommand, RuntimeNormalizedCommandSegment,
     VerifyInstallCommandFamily, diagnose_verify_command,
@@ -301,6 +302,11 @@ impl RunSessionOptions {
 
     pub(crate) fn with_path_fallback_candidates(mut self, candidates: Vec<String>) -> Self {
         self.path_fallback_candidates = candidates;
+        self
+    }
+
+    pub(crate) fn with_required_mutation_before_short_circuit(mut self, required: bool) -> Self {
+        self.require_mutation_before_contract_short_circuit |= required;
         self
     }
 
@@ -1583,7 +1589,19 @@ pub(crate) fn run_session_with_outcome_with_options(
                 no_tool_feedbacks += 1;
                 session.messages.pop();
                 last_blocking_reason = Some("progress text without tool call".to_string());
-                pending_feedback = Some(super::feedback::no_tool_progress());
+                let verify_commands =
+                    setup_step_policy::verification_commands_from_prompt(user_prompt);
+                let feedback = super::feedback::no_tool_progress(&verify_commands);
+                eval_events::emit(
+                    config.eval_events_path.as_deref(),
+                    json!({
+                        "event": "no_progress_feedback",
+                        "attempt": no_tool_feedbacks,
+                        "verify_commands": verify_commands,
+                        "feedback": eval_events::body_snippet(&feedback),
+                    }),
+                );
+                pending_feedback = Some(feedback);
                 continue;
             }
             let mut import_scan_paths = changed_paths.clone();
@@ -2664,10 +2682,10 @@ fn maybe_short_circuit_satisfied_step(
     if !missing.is_empty() {
         return Ok(None);
     }
+    if options.require_mutation_before_contract_short_circuit && !write_or_edit_seen {
+        return Ok(None);
+    }
     if let Some(contract) = contract.filter(|_| has_contract_gate) {
-        if options.require_mutation_before_contract_short_circuit && !write_or_edit_seen {
-            return Ok(None);
-        }
         let attempts_before_probe = *verify_attempts;
         match verify_completion_contract_with_enforcement(
             &config.workspace_root,
@@ -2754,8 +2772,7 @@ fn setup_short_circuit_allowed(options: &RunSessionOptions, user_prompt: &str) -
     if options.step_kind != Some(RunSessionStepKind::Setup) {
         return false;
     }
-    let instruction = current_step_instruction(user_prompt).unwrap_or(user_prompt);
-    if setup_short_circuit_instruction(instruction) {
+    if setup_step_policy::prompt_mentions_setup(user_prompt) {
         return true;
     }
     let phase_scope = options
@@ -2764,28 +2781,6 @@ fn setup_short_circuit_allowed(options: &RunSessionOptions, user_prompt: &str) -
         .unwrap_or("")
         .to_ascii_lowercase();
     phase_scope.contains("setup") || phase_scope.contains("scaffold")
-}
-
-fn current_step_instruction(prompt: &str) -> Option<&str> {
-    let marker = "Current step instruction:\n";
-    let after_marker = prompt.split_once(marker)?.1;
-    Some(
-        after_marker
-            .split("\n\n")
-            .next()
-            .unwrap_or(after_marker)
-            .trim(),
-    )
-}
-
-fn setup_short_circuit_instruction(instruction: &str) -> bool {
-    let lower = instruction.to_ascii_lowercase();
-    lower.contains("setup")
-        || lower.contains("set up")
-        || lower.contains("scaffold")
-        || lower.contains("pre-scaffold")
-        || lower.contains("pre-provision")
-        || lower.contains("already present")
 }
 
 fn non_scaffold_missing_paths(config: &Config, missing_paths: &[String]) -> Vec<String> {
@@ -6561,7 +6556,7 @@ export default function Page(){
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
             &mut session,
-            "Scaffold the already present page.",
+            "Current step id:\nsetup-scripts\n\nCurrent step instruction:\nConfirm the already present page.",
             &["src/app/page.tsx".to_string()],
             &cfg,
             &NOOP_UI,
@@ -6603,7 +6598,7 @@ export default function Page(){
         let outcome = run_session_with_outcome_with_options(
             &mut fake,
             &mut session,
-            "Scaffold the missing page.",
+            "Current step id:\nsetup-scripts\n\nCurrent step instruction:\nConfirm the missing page.",
             &["src/app/page.tsx".to_string()],
             &cfg,
             &NOOP_UI,
@@ -7891,6 +7886,39 @@ export default function Page(){
         .unwrap_err()
         .to_string();
         assert!(err.contains("missing tool call for action prompt"));
+    }
+
+    #[test]
+    fn no_progress_feedback_includes_declared_profile_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply::text("I will verify it.")),
+            Ok(AssistantReply::text("I will run the check now.")),
+            Ok(AssistantReply::text("I will run it next.")),
+            Ok(AssistantReply::text("Verification is complete.")),
+        ]);
+        let mut session = SessionSnapshot::new();
+        let prompt = "Execute exactly one StepPlan step.\n\nCurrent step id:\nsetup-scripts\n\nCurrent step instruction:\nConfirm scripts.\n\nVerification commands for this step:\n- node -p \"strict port check\"\n\nExpected verification result:\npass";
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            prompt,
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Setup),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.final_text, "Verification is complete.");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"no_progress_feedback\""));
+        assert!(event_text.contains(r#"node -p \"strict port check\""#));
+        assert!(event_text.contains("already satisfied"));
     }
 
     #[test]

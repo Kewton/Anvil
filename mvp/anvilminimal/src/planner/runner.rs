@@ -92,7 +92,7 @@ use crate::planner::verify::{
     verify_step_with_profile_setup_observed_with_offline_and_events,
 };
 use crate::planner::{
-    contract_attribute_repair::merge_repair_target_paths, hook_snapshot, signals,
+    contract_attribute_repair::merge_repair_target_paths, hook_snapshot, setup_step_policy, signals,
 };
 use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::{AssistantReply, ChatClient, model_for};
@@ -501,7 +501,7 @@ pub fn generate_step_plan_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<StepPlan> {
-    generate_step_plan_with_ui_for_phase(client, goal, config, ui, None)
+    generate_step_plan_with_ui_for_phase(client, goal, config, ui, None, false)
 }
 
 fn generate_step_plan_with_ui_for_phase(
@@ -510,6 +510,7 @@ fn generate_step_plan_with_ui_for_phase(
     config: &Config,
     ui: &dyn InteractionUi,
     phase_label: Option<&str>,
+    preset_phase: bool,
 ) -> anyhow::Result<StepPlan> {
     if ui.interrupted() {
         anyhow::bail!("interrupted by user");
@@ -604,9 +605,19 @@ fn generate_step_plan_with_ui_for_phase(
                 repair_generated_step_plan_contract(&mut plan);
                 let sanitizer_report =
                     sanitize_step_plan_against_policy(&mut plan, Some(&config.workspace_root));
+                let preset_converted = setup_step_policy::convert_preset_phase_setup_steps(
+                    &mut plan,
+                    &config.workspace_root,
+                    &config.profile,
+                    goal,
+                    phase_label,
+                    preset_phase,
+                    config.eval_events_path.as_deref(),
+                );
                 let plan_was_sanitized = verify_was_normalized
                     || !generated_sanitization.is_empty()
-                    || !sanitizer_report.is_empty();
+                    || !sanitizer_report.is_empty()
+                    || preset_converted > 0;
                 emit_planner_plan_sanitized(
                     config,
                     client.label(),
@@ -2106,9 +2117,15 @@ fn run_step(
     phase_scope: Option<&str>,
     mut run_setup_authority: Option<&mut UltraRunSetupAuthorityState>,
 ) -> Result<StepRunOutcome, StepRunError> {
-    let mut runtime_step = step.clone();
-    let instruction = build_step_prompt(plan, step, prompt_context, config.prompt_layout);
-    emit_step_prompt_contract(config, step, prompt_context, &instruction);
+    let (mut runtime_step, synthesized_precheck) =
+        setup_step_policy::runtime_step_with_profile_checks(
+            &config.workspace_root,
+            &config.profile,
+            &prompt_context.overall_goal,
+            step,
+        );
+    let instruction = build_step_prompt(plan, &runtime_step, prompt_context, config.prompt_layout);
+    emit_step_prompt_contract(config, &runtime_step, prompt_context, &instruction);
     if step.step_kind() == StepKind::Report
         && step.expected_paths.is_empty()
         && step.verify.is_empty()
@@ -2134,8 +2151,9 @@ fn run_step(
         contract_enforcement,
         phase_scope,
         contract_setup_authority,
-    );
-    if step_short_circuit_precheck_applicable(step) {
+    )
+    .with_required_mutation_before_short_circuit(synthesized_precheck);
+    if setup_step_policy::step_short_circuit_precheck_applicable(&runtime_step) {
         let (report, build_lifecycles) = verify_step_completion_observed(
             config,
             &runtime_step,
@@ -2155,9 +2173,9 @@ fn run_step(
         if report.is_pass() {
             emit_runner_step_short_circuited(
                 config,
-                step,
+                &runtime_step,
                 phase_scope,
-                &step.expected_paths,
+                &runtime_step.expected_paths,
                 "start",
             );
             if production_build_lifecycle_passed(&build_lifecycles) {
@@ -2167,7 +2185,7 @@ fn run_step(
                     Some(&step.id),
                     &config.profile,
                     prompt_context.overall_goal.as_str(),
-                    &step.expected_paths,
+                    &runtime_step.expected_paths,
                 );
             }
             return Ok(StepRunOutcome {
@@ -2180,7 +2198,7 @@ fn run_step(
         client,
         session,
         &instruction,
-        &step.expected_paths,
+        &runtime_step.expected_paths,
         &step_config,
         ui,
         step_options.clone(),
@@ -2260,7 +2278,7 @@ fn run_step(
                 Some(&step.id),
                 &config.profile,
                 overall_goal,
-                &step.expected_paths,
+                &runtime_step.expected_paths,
             );
         }
         return Ok(outcome);
@@ -2297,7 +2315,7 @@ fn run_step(
         overall_goal: Some(overall_goal.to_string()),
         required_final_artifacts: prompt_context.required_final_artifacts.clone(),
         step_instruction: Some(step.instruction.clone()),
-        expected_paths: merge_repair_target_paths(&report, &step.expected_paths),
+        expected_paths: merge_repair_target_paths(&report, &runtime_step.expected_paths),
         verify_commands: runtime_step.verify.clone(),
         expected_result: Some(step_expected_result(step).to_string()),
         max_repair_turns: Some(STEP_REPAIR_MAX_TURNS),
@@ -2607,7 +2625,7 @@ fn run_step(
                         Some(&step.id),
                         &config.profile,
                         &plan.goal,
-                        &step.expected_paths,
+                        &runtime_step.expected_paths,
                     );
                 }
                 outcome.primary_failure = None;
@@ -2865,7 +2883,7 @@ fn run_step(
                                         Some(&step.id),
                                         &config.profile,
                                         &plan.goal,
-                                        &step.expected_paths,
+                                        &runtime_step.expected_paths,
                                     );
                                 }
                                 outcome.primary_failure = None;
@@ -3374,27 +3392,6 @@ fn plan_expected_paths(plan: &StepPlan) -> Vec<String> {
         }
     }
     out
-}
-
-fn step_short_circuit_precheck_applicable(step: &PlanStep) -> bool {
-    if step.expected_paths.is_empty() && step.verify.is_empty() {
-        return false;
-    }
-    match step.step_kind() {
-        StepKind::Setup => setup_short_circuit_instruction(&step.instruction),
-        StepKind::Verify => !step.expected_paths.is_empty(),
-        _ => false,
-    }
-}
-
-fn setup_short_circuit_instruction(instruction: &str) -> bool {
-    let lower = instruction.to_ascii_lowercase();
-    lower.contains("setup")
-        || lower.contains("set up")
-        || lower.contains("scaffold")
-        || lower.contains("pre-scaffold")
-        || lower.contains("pre-provision")
-        || lower.contains("already present")
 }
 
 fn verify_step_completion_observed(
@@ -4930,6 +4927,7 @@ pub fn run_ultra_plan_with_ui(
     config: &Config,
     ui: &dyn InteractionUi,
 ) -> anyhow::Result<String> {
+    let preset_plan = crate::planner::ultra_preset::is_profile_preset_plan(config, plan);
     let mut active_plan = plan.clone();
     let mut active_config = config.clone();
     let plan = &mut active_plan;
@@ -4981,6 +4979,7 @@ pub fn run_ultra_plan_with_ui(
             config,
             ui,
             Some(&phase.id),
+            preset_plan,
         )
         .map_err(|err| {
             let message = err.to_string();
@@ -16896,6 +16895,7 @@ Phase task: Scaffold and initialize the Next.js project shell";
             &cfg,
             &NOOP_UI,
             Some("project-setup"),
+            false,
         )
         .unwrap();
 
@@ -16913,8 +16913,9 @@ Phase task: Scaffold and initialize the Next.js project shell";
     }
 
     #[test]
-    fn deterministic_nextjs_implementation_phase_uses_planner() {
+    fn preset_nextjs_implementation_phase_converts_duplicate_setup_step() {
         let dir = tempfile::tempdir().unwrap();
+        write_nextjs_profile_workspace(dir.path(), None, None, None);
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
         cfg.profile = "nextjs".to_string();
@@ -16922,7 +16923,7 @@ Phase task: Scaffold and initialize the Next.js project shell";
         let goal = "Original ultra goal: Build a browser game on port 3011\n\
 Profile: nextjs\n\
 Intent: create\n\
-Phase id: gameplay\n\
+Phase id: core-implementation\n\
 Phase task: Implement game logic, player control, collision, score, and canvas behavior";
         let plan_json = serde_json::to_string(&StepPlan {
             goal: "Implement gameplay".to_string(),
@@ -16966,19 +16967,18 @@ Phase task: Implement game logic, player control, collision, score, and canvas b
             goal,
             &cfg,
             &NOOP_UI,
-            Some("gameplay"),
+            Some("core-implementation"),
+            true,
         )
         .unwrap();
 
         assert_eq!(planner.messages().len(), 1);
-        assert!(
-            plan.steps
-                .iter()
-                .any(|step| step.id == "implement-gameplay")
-        );
+        assert_eq!(plan.steps[0].id, "setup-nextjs");
+        assert_eq!(plan.steps[0].kind, "verify");
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(!event_text.contains("\"event\":\"deterministic_step_plan_used\""));
         assert!(event_text.contains("\"event\":\"planner_raw_output_shape\""));
+        assert!(event_text.contains("\"event\":\"preset_step_converted\""));
     }
 
     #[test]

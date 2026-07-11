@@ -62,7 +62,7 @@ These are examples only; Anvil does not auto-create them:
 # profile = "generic"
 # narration = "normal"
 # footer = "on"
-# plan_preset = "profile" # optional; resolved qwen27 planners default to profile
+# plan_preset = "profile" # optional opt-in; omitted defaults to none
 #
 # [preset.hybrid-a3b]
 # provider = "ollama"
@@ -85,15 +85,14 @@ main provider/model for execution calls. With a local a3b executor, budget RAM
 for the Ollama model residency separately from any remote planner; Ollama
 requests keep `keep_alive=10m` for the executor model between turns.
 
-Plan presets are planner-tier gated, not globally enabled. In test0711_bs_001,
-`--plan-preset profile` made qwen27-planner runs full in 4/4 cases while roughly
-halving planner time, but the gemma31-planner sample regressed and already
-planned in about 15-38 seconds. A resolved qwen27 planner model therefore
-defaults to `plan_preset = "profile"` when omitted, while gemma-family and
-unmatched planner models default to `none`. Resolution is independent of
-whether the planner model came from a direct CLI option, the executor-model
-fallback, or a named config preset; an explicit `--plan-preset` CLI flag always
-wins over config and tier defaults.
+Plan presets are explicit opt-ins, not globally enabled. Although
+test0711_bs_001 showed a strong qwen27 sample, test0711_bs_004 exposed duplicate
+setup-step stagnation in preset implementation phases, so qwen27, gemma-family,
+and unmatched planner models currently default to `none`. Planner-tier
+resolution remains observable and is independent of whether the model came
+from a direct CLI option, the executor-model fallback, or a named config preset.
+Set `plan_preset = "profile"` in config or pass `--plan-preset profile` to opt in;
+an explicit CLI flag always wins over config and tier defaults.
 
 ## TUI
 

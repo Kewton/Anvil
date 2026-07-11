@@ -8,6 +8,7 @@ pub mod repair;
 pub mod repair_target_resolution;
 pub mod runner;
 pub mod sanitizer;
+pub mod setup_step_policy;
 pub mod side_effect_paths;
 pub mod signals;
 pub mod source_assertion;

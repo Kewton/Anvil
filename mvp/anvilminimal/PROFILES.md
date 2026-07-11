@@ -20,15 +20,13 @@ A profile owns:
 - invariants and deterministic repairs
 - goal capability inference and evidence vocabulary hooks
 
-Profile UltraPlan presets remain planner-tier gated rather than a global
-default. UAT test0711_bs_001 showed `--plan-preset profile` produced 4/4 full
-qwen27-planner runs and removed roughly half of planner time, while the
-gemma31-planner sample regressed and already planned in about 15-38 seconds.
-Resolved qwen27 planner models therefore default to the profile UltraPlan
-preset when no `plan_preset` is configured, and gemma-family or unmatched
-planner models keep the `none` default. This tier lookup uses the resolved
-planner model regardless of whether it came from CLI, executor-model fallback,
-or a named config preset; explicit CLI `--plan-preset` always overrides it.
+Profile UltraPlan presets are explicit opt-ins rather than a global default.
+UAT test0711_bs_004 exposed duplicate setup-step stagnation in preset
+implementation phases, so qwen27, gemma-family, and unmatched planner models
+currently default to `none`. Tier lookup and source recording still use the
+resolved planner model regardless of whether it came from CLI, executor-model
+fallback, or a named config preset. Set `plan_preset = "profile"` in config or
+pass `--plan-preset profile` to opt in; explicit CLI always overrides config.
 
 Profiles must not special-case runner control flow. If a new domain needs a
 new lifecycle shape, extend `DomainProfile` first and keep the runner calling

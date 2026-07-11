@@ -10,8 +10,19 @@ pub fn missing_artifacts(paths: &[String]) -> String {
     )
 }
 
-pub fn no_tool_progress() -> String {
-    "You described future work but did not call a tool. Use Write/Edit/Bash or explain why no workspace change is required.".to_string()
+pub fn no_tool_progress(verify_commands: &[String]) -> String {
+    let checks = if verify_commands.is_empty() {
+        "- use the step's declared deterministic verification".to_string()
+    } else {
+        verify_commands
+            .iter()
+            .map(|command| format!("- {command}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    format!(
+        "You described future work but did not call a tool. If this step's objective is already satisfied, run the verification below now and report completion with its result. Otherwise use Write/Edit/Bash to repair the step before responding.\nVerification to run:\n{checks}"
+    )
 }
 
 pub fn empty_response() -> String {
@@ -266,6 +277,19 @@ mod tests {
         );
         assert!(feedback.contains("- postcss.config.js"), "{feedback}");
         assert!(feedback.contains("- tailwind.config.ts"), "{feedback}");
+    }
+
+    #[test]
+    fn no_progress_feedback_requires_verification_and_includes_profile_check() {
+        let command = "node -p \"strict port check\"".to_string();
+        let feedback = no_tool_progress(std::slice::from_ref(&command));
+
+        assert!(feedback.contains("already satisfied"), "{feedback}");
+        assert!(
+            feedback.contains("run the verification below now"),
+            "{feedback}"
+        );
+        assert!(feedback.contains(&command), "{feedback}");
     }
 
     #[test]

@@ -849,7 +849,7 @@ mod tests {
 
         let event_text = std::fs::read_to_string(&events).unwrap();
         assert!(event_text.contains("\"event\":\"run_start\""));
-        assert!(event_text.contains("\"plan_preset\":\"profile\""));
+        assert!(event_text.contains("\"plan_preset\":\"none\""));
         assert!(event_text.contains("\"plan_preset_origin\":\"default\""));
         assert!(event_text.contains("\"plan_preset_source\":\"default:qwen27_planner\""));
         assert!(event_text.contains("\"event\":\"plan_preset_resolved\""));

@@ -34,6 +34,7 @@ fixtures/plan-preset-tier.jsonl = [
   "\"source\":\"flag\"",
   "\"event\":\"preset_ultra_plan_used\"",
   "\"planner_skipped\":true",
-  "qwen27 planner presets default to profile",
+  "qwen27 planner presets currently default to none",
+  "explicit qwen27 profile opt-in",
   "gemma-family planner presets default to none"
 ]

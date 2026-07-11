@@ -25,9 +25,10 @@ expect = "not_checked"
 fixtures/plan-preset-resolved-model.jsonl = [
   "test0711_bs_003/qwen27_cli_direct",
   "\"event\":\"plan_preset_resolved\"",
-  "\"plan_preset\":\"profile\"",
+  "\"plan_preset\":\"none\"",
   "\"origin\":\"default\"",
   "\"source\":\"default:qwen27_planner\"",
+  "test0711_bs_003/qwen27_cli_explicit_on",
   "\"event\":\"preset_ultra_plan_used\"",
   "test0711_bs_003/qwen27_cli_explicit_off",
   "\"origin\":\"cli\"",

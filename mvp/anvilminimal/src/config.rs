@@ -464,10 +464,7 @@ enum PlannerModelTier {
 
 impl PlannerModelTier {
     fn default_plan_preset(self) -> PlanPreset {
-        match self {
-            Self::Qwen27 => PlanPreset::Profile,
-            Self::Gemma | Self::Other => PlanPreset::None,
-        }
+        PlanPreset::None
     }
 
     fn default_source(self) -> &'static str {
@@ -1446,8 +1443,8 @@ profile = "nextjs"
     #[test]
     fn plan_preset_flag_config_and_preset_resolution_take_precedence() {
         let default = Config::from_cli(Cli::parse_from(["anvilminimal"])).unwrap();
-        assert_eq!(default.plan_preset, PlanPreset::Profile);
-        assert_eq!(default.plan_preset.as_str(), "profile");
+        assert_eq!(default.plan_preset, PlanPreset::None);
+        assert_eq!(default.plan_preset.as_str(), "none");
         assert_eq!(default.field_sources.plan_preset, "default:qwen27_planner");
 
         let dir = tempfile::tempdir().unwrap();
@@ -1491,7 +1488,7 @@ profile = "nextjs"
     }
 
     #[test]
-    fn qwen27_planner_preset_defaults_profile_while_gemma_defaults_none() {
+    fn qwen27_and_gemma_planners_default_none_while_explicit_opt_in_wins() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_string_lossy().to_string();
         std::fs::create_dir_all(dir.path().join(".anvil")).unwrap();
@@ -1525,7 +1522,7 @@ profile = "nextjs"
             "Web app",
         ]))
         .unwrap();
-        assert_eq!(qwen.plan_preset, PlanPreset::Profile);
+        assert_eq!(qwen.plan_preset, PlanPreset::None);
         assert_eq!(qwen.field_sources.plan_preset, "default:qwen27_planner");
         assert_eq!(qwen.plan_preset_origin(), "default");
 
@@ -1550,25 +1547,25 @@ profile = "nextjs"
             "--preset",
             "qwen27",
             "--plan-preset",
-            "none",
+            "profile",
             "--ultra-plan-run",
             "Web app",
         ]))
         .unwrap();
-        assert_eq!(cli_override.plan_preset, PlanPreset::None);
+        assert_eq!(cli_override.plan_preset, PlanPreset::Profile);
         assert_eq!(cli_override.field_sources.plan_preset, "flag");
         assert_eq!(cli_override.plan_preset_origin(), "cli");
     }
 
     #[test]
-    fn resolved_cli_planner_model_controls_plan_preset_default() {
+    fn resolved_cli_planner_model_controls_none_default_source() {
         let qwen = Config::from_cli(Cli::parse_from([
             "anvilminimal",
             "--planner-model",
             "Qwen3.6:27B-Coding-NVFP4",
         ]))
         .unwrap();
-        assert_eq!(qwen.plan_preset, PlanPreset::Profile);
+        assert_eq!(qwen.plan_preset, PlanPreset::None);
         assert_eq!(qwen.field_sources.plan_preset, "default:qwen27_planner");
         assert_eq!(qwen.plan_preset_origin(), "default");
 
@@ -1579,7 +1576,7 @@ profile = "nextjs"
         ]))
         .unwrap();
         assert_eq!(inherited.planner_model, "vendor/qwen-coder-27b");
-        assert_eq!(inherited.plan_preset, PlanPreset::Profile);
+        assert_eq!(inherited.plan_preset, PlanPreset::None);
         assert_eq!(
             inherited.field_sources.plan_preset,
             "default:qwen27_planner"

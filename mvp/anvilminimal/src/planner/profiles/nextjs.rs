@@ -320,6 +320,79 @@ pub fn setup_invariant_required_paths(root: &Path) -> Vec<String> {
     filter_setup_invariant_paths(root, setup_scaffold_paths(root))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupStepChecks {
+    pub ownership: &'static str,
+    pub expected_paths: Vec<String>,
+    pub verify_commands: Vec<String>,
+}
+
+pub fn setup_step_checks(
+    root: &Path,
+    goal: &str,
+    step_id: &str,
+    instruction: &str,
+) -> Option<SetupStepChecks> {
+    let text = format!("{step_id} {instruction}").to_ascii_lowercase();
+    let port = requested_or_default_port(goal);
+    if mentions_package_scripts(&text) {
+        let package_path = setup_scaffold_paths(root)
+            .into_iter()
+            .find(|path| path.ends_with("package.json"))
+            .unwrap_or_else(|| "package.json".to_string());
+        let mut verify_commands = package_script_port_verify_commands(port);
+        verify_commands.push(package_build_script_verify_command());
+        return Some(SetupStepChecks {
+            ownership: "package_manifest",
+            expected_paths: vec![package_path],
+            verify_commands,
+        });
+    }
+    if mentions_scaffold_configuration(&text) {
+        let expected_paths = setup_invariant_required_paths(root);
+        let mut verify_commands = expected_paths
+            .iter()
+            .map(|path| format!("test -f {}", shell_single_quote(path)))
+            .collect::<Vec<_>>();
+        verify_commands.extend(package_script_port_verify_commands(port));
+        verify_commands.push(package_build_script_verify_command());
+        return Some(SetupStepChecks {
+            ownership: "scaffold_configuration",
+            expected_paths,
+            verify_commands,
+        });
+    }
+    None
+}
+
+fn mentions_package_scripts(text: &str) -> bool {
+    text.contains("package.json")
+        || text.contains("package manifest")
+        || text.contains("package script")
+        || text.contains("port script")
+        || text
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|token| matches!(token, "script" | "scripts" | "manifest" | "port"))
+}
+
+fn mentions_scaffold_configuration(text: &str) -> bool {
+    text.contains("scaffold")
+        || text.contains("project shell")
+        || text.contains("tsconfig")
+        || text.contains("postcss")
+        || text.contains("tailwind")
+        || text
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|token| token == "config")
+        || ((text.contains("setup") || text.contains("set up"))
+            && text.contains("project")
+            && !text.contains("dependenc"))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 pub fn filter_setup_invariant_paths(root: &Path, paths: Vec<String>) -> Vec<String> {
     if plain_css_without_tailwind_artifacts(root) {
         paths

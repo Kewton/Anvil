@@ -1,0 +1,38 @@
+case_id = "test0711_bs_004_preset_setup_no_progress"
+source = "test0711_bs_004 #1/#7 duplicate preset setup and no-progress regression fixtures"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["setup-scripts", "preset_step_converted", "no_progress", "port"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/preset-setup-no-progress.jsonl = [
+  "test0711_bs_004/#1",
+  "test0711_bs_004/#7",
+  "model_stagnation:no_progress_recorded",
+  "\"id\":\"setup-scripts\"",
+  "\"id\":\"setup-package-scripts\"",
+  "\"event\":\"preset_step_converted\"",
+  "\"phase_id\":\"core-implementation\"",
+  "\"event\":\"step_short_circuited\"",
+  "\"at\":\"start\"",
+  "\"event\":\"no_progress_feedback\"",
+  "already satisfied",
+  "require('./package.json').scripts"
+]
