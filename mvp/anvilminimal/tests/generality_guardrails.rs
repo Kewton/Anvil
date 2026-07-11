@@ -135,8 +135,12 @@ fn nextjs_boundary_erosion_tripwire_keeps_dispatch_sites_audited() {
 #[test]
 fn runner_chokepoints_do_not_grow_past_interim_budget() {
     for (path, baseline) in [
-        ("src/planner/runner.rs", 28_712usize),
+        ("src/planner/runner.rs", 18_242usize),
         ("src/minimal_loop/loop_run.rs", 8_347usize),
+        ("src/planner/repair_targeting.rs", 597usize),
+        ("src/planner/final_acceptance.rs", 2_942usize),
+        ("src/planner/ultra_plan_flow.rs", 1_570usize),
+        ("src/planner/assurance.rs", 1_311usize),
     ] {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|err| panic!("failed to read {path}: {err}"));
