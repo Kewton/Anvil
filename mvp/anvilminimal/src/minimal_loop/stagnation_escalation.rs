@@ -13,8 +13,12 @@ use crate::planner::{
 use crate::state::ToolCall;
 use crate::tools::path_guard::normalize_workspace_path;
 
+use super::repair_pressure::{PressureInputs, PressureLevel, PressureState, transition};
+#[cfg(test)]
 pub(crate) use super::repair_pressure::{
     READ_ONLY_STAGNATION_COMPACT_THRESHOLD, READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD,
+};
+pub(crate) use super::repair_pressure::{
     READ_ONLY_STAGNATION_REASON, READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD,
     WRITE_REQUIRED_NO_WRITE_LIMIT,
 };
@@ -28,10 +32,14 @@ pub(crate) enum ReadOnlyStagnationStage {
 
 impl ReadOnlyStagnationStage {
     pub(crate) fn for_streak(streak: usize) -> Option<Self> {
-        match streak {
-            READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD => Some(Self::Intervention),
-            READ_ONLY_STAGNATION_COMPACT_THRESHOLD => Some(Self::CompactRestatement),
-            READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD => Some(Self::WriteRequired),
+        let state = transition(PressureInputs {
+            read_only_streak: streak,
+            ..PressureInputs::default()
+        });
+        match state.feedback_level {
+            Some(PressureLevel::Intervention) => Some(Self::Intervention),
+            Some(PressureLevel::CompactRestatement) => Some(Self::CompactRestatement),
+            Some(PressureLevel::WriteRequired) => Some(Self::WriteRequired),
             _ => None,
         }
     }
@@ -45,12 +53,21 @@ impl ReadOnlyStagnationStage {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriteRequiredState {
-    selected_targets: Vec<String>,
-    selection_reason: Option<WriteRequiredSelectionReason>,
-    no_write_attempts: usize,
+    pressure_inputs: PressureInputs,
+    pressure_state: PressureState,
     diagnostic_feedback: String,
+}
+
+impl Default for WriteRequiredState {
+    fn default() -> Self {
+        Self {
+            pressure_inputs: PressureInputs::default(),
+            pressure_state: PressureState::default(),
+            diagnostic_feedback: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +89,18 @@ impl WriteRequiredSelectionReason {
             Self::RepairChanged => "repair_changed",
             Self::RequiredPath => "required_path",
             Self::Fallback => "fallback",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "anchor_failure" => Some(Self::AnchorFailure),
+            "evidence_mapped" => Some(Self::EvidenceMapped),
+            "contract_attribute" => Some(Self::ContractAttribute),
+            "repair_changed" => Some(Self::RepairChanged),
+            "required_path" => Some(Self::RequiredPath),
+            "fallback" => Some(Self::Fallback),
+            _ => None,
         }
     }
 }
@@ -122,29 +151,37 @@ impl WriteRequiredState {
         selection: WriteRequiredTargetSelection,
         diagnostic_feedback: String,
     ) {
-        self.selected_targets = selection.selected_targets;
-        self.selection_reason = Some(selection.selection_reason);
-        self.no_write_attempts = 0;
+        self.pressure_inputs.write_required_active = true;
+        self.pressure_inputs.write_required_no_write_attempts = 0;
+        self.pressure_inputs.selected_targets = selection.selected_targets;
+        self.pressure_inputs.selection_reason =
+            Some(selection.selection_reason.as_str().to_string());
+        self.refresh_pressure_state();
         self.diagnostic_feedback = diagnostic_feedback;
     }
 
     pub(crate) fn reset(&mut self) {
-        self.selected_targets.clear();
-        self.selection_reason = None;
-        self.no_write_attempts = 0;
+        self.pressure_inputs = PressureInputs::default();
+        self.refresh_pressure_state();
         self.diagnostic_feedback.clear();
     }
 
     pub(crate) fn target_path(&self) -> Option<&str> {
-        self.selected_targets.first().map(String::as_str)
+        self.pressure_state
+            .selected_targets
+            .first()
+            .map(String::as_str)
     }
 
     pub(crate) fn selected_targets(&self) -> &[String] {
-        &self.selected_targets
+        &self.pressure_state.selected_targets
     }
 
     pub(crate) fn selection_reason(&self) -> Option<WriteRequiredSelectionReason> {
-        self.selection_reason
+        self.pressure_state
+            .selection_reason
+            .as_deref()
+            .and_then(WriteRequiredSelectionReason::from_str)
     }
 
     pub(crate) fn diagnostic_feedback(&self) -> &str {
@@ -158,19 +195,27 @@ impl WriteRequiredState {
         call: &ToolCall,
         event_context: ReadOnlyToolRejectionContext<'_>,
     ) -> Option<ReadOnlyToolRejection> {
-        if self.selected_targets.is_empty() {
+        if self.pressure_state.selected_targets.is_empty() {
             return None;
         }
-        if tool_call_writes_any_target_path(root, call, &self.selected_targets) {
+        if tool_call_writes_any_target_path(root, call, &self.pressure_state.selected_targets) {
             return None;
         }
         if matches!(call.name.as_str(), "Write" | "Edit") {
             return None;
         }
-        self.no_write_attempts = self.no_write_attempts.saturating_add(1);
+        self.pressure_inputs.write_required_no_write_attempts = self
+            .pressure_inputs
+            .write_required_no_write_attempts
+            .saturating_add(1);
+        self.refresh_pressure_state();
+        let no_write_attempts = self
+            .pressure_state
+            .counters
+            .write_required_no_write_attempts;
         let target_path = self.target_path().unwrap_or("");
         let selection_reason = self
-            .selection_reason
+            .selection_reason()
             .map(|reason| reason.as_str())
             .unwrap_or("");
         eval_events::emit(
@@ -180,10 +225,10 @@ impl WriteRequiredState {
                 "stage": "write_required",
                 "tool_name": call.name.as_str(),
                 "target_path": target_path,
-                "selected_targets": self.selected_targets.clone(),
+                "selected_targets": self.pressure_state.selected_targets.clone(),
                 "selection_reason": selection_reason,
                 "read_only_streak": event_context.read_only_streak,
-                "write_required_no_write_attempts": self.no_write_attempts,
+                "write_required_no_write_attempts": no_write_attempts,
                 "write_required_no_write_limit": WRITE_REQUIRED_NO_WRITE_LIMIT,
                 "session_scope": event_context.session_scope,
                 "step_kind": event_context.step_kind,
@@ -192,16 +237,16 @@ impl WriteRequiredState {
         );
         let feedback = append_write_required_diagnostic(
             super::feedback::read_only_write_required_tool_rejected(
-                &self.selected_targets,
-                self.no_write_attempts,
+                &self.pressure_state.selected_targets,
+                no_write_attempts,
                 WRITE_REQUIRED_NO_WRITE_LIMIT,
             ),
             &self.diagnostic_feedback,
         );
         Some(ReadOnlyToolRejection {
             feedback,
-            exhausted: self.no_write_attempts >= WRITE_REQUIRED_NO_WRITE_LIMIT,
-            no_write_attempts: self.no_write_attempts,
+            exhausted: self.pressure_state.level == PressureLevel::Exhausted,
+            no_write_attempts,
         })
     }
 
@@ -212,21 +257,21 @@ impl WriteRequiredState {
         call: &ToolCall,
         event_context: ReadOnlyToolRejectionContext<'_>,
     ) -> Option<String> {
-        if self.selected_targets.is_empty()
+        if self.pressure_state.selected_targets.is_empty()
             || !matches!(call.name.as_str(), "Write" | "Edit")
-            || tool_call_writes_any_target_path(root, call, &self.selected_targets)
+            || tool_call_writes_any_target_path(root, call, &self.pressure_state.selected_targets)
         {
             return None;
         }
         let actual_path = normalized_tool_path_arg(root, &call.arguments).unwrap_or_default();
         let selection_reason = self
-            .selection_reason
+            .selection_reason()
             .map(|reason| reason.as_str())
             .unwrap_or("");
         let feedback = append_write_required_diagnostic(
             super::feedback::read_only_write_required_off_target_write_allowed(
                 &actual_path,
-                &self.selected_targets,
+                &self.pressure_state.selected_targets,
             ),
             &self.diagnostic_feedback,
         );
@@ -238,7 +283,7 @@ impl WriteRequiredState {
                 "tool_name": call.name.as_str(),
                 "target_path": self.target_path().unwrap_or(""),
                 "actual_path": actual_path,
-                "selected_targets": self.selected_targets.clone(),
+                "selected_targets": self.pressure_state.selected_targets.clone(),
                 "selection_reason": selection_reason,
                 "read_only_streak": event_context.read_only_streak,
                 "session_scope": event_context.session_scope,
@@ -255,14 +300,18 @@ impl WriteRequiredState {
         root: &Path,
         arguments: &serde_json::Value,
     ) -> bool {
-        if self.selected_targets.is_empty() {
+        if self.pressure_state.selected_targets.is_empty() {
             return false;
         }
-        if tool_arguments_path_matches_any(root, arguments, &self.selected_targets) {
+        if tool_arguments_path_matches_any(root, arguments, &self.pressure_state.selected_targets) {
             self.reset();
             return true;
         }
         false
+    }
+
+    fn refresh_pressure_state(&mut self) {
+        self.pressure_state = transition(self.pressure_inputs.clone());
     }
 }
 

@@ -16,6 +16,12 @@ pub(crate) enum PressureLevel {
     Exhausted,
 }
 
+impl Default for PressureLevel {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
 impl PressureLevel {
     pub(crate) fn feedback_stage(self) -> Option<&'static str> {
         match self {
@@ -109,6 +115,12 @@ pub(crate) struct PressureState {
     pub(crate) selected_targets: Vec<String>,
     pub(crate) selection_reason: Option<String>,
     pub(crate) terminal_reason: Option<PressureTerminalReason>,
+}
+
+impl Default for PressureState {
+    fn default() -> Self {
+        transition(PressureInputs::default())
+    }
 }
 
 pub(crate) fn pressure_seed(
