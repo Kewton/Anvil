@@ -31,6 +31,7 @@ pub(crate) enum ReadOnlyStagnationStage {
 }
 
 impl ReadOnlyStagnationStage {
+    #[cfg(test)]
     pub(crate) fn for_streak(streak: usize) -> Option<Self> {
         let state = transition(PressureInputs {
             read_only_streak: streak,
