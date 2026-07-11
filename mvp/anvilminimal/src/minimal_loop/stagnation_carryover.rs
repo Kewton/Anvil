@@ -20,6 +20,7 @@ struct EscalationCarryoverState {
     read_only_streak: usize,
     anchor_failure: Option<EditAnchorFailureSummary>,
     write_required_exhausted: bool,
+    pending_evidence: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +105,35 @@ impl EscalationCarryoverHandle {
 
     pub(crate) fn note_write_required_exhausted(&self) {
         self.state.lock().unwrap().write_required_exhausted = true;
+    }
+
+    pub(crate) fn set_pending_evidence(&self, pending_evidence: &[String]) {
+        let mut normalized = Vec::new();
+        for evidence in pending_evidence {
+            let evidence = evidence.trim();
+            if !evidence.is_empty() && !normalized.iter().any(|item| item == evidence) {
+                normalized.push(evidence.to_string());
+            }
+        }
+        self.state.lock().unwrap().pending_evidence = normalized;
+    }
+
+    pub(crate) fn carry_pending_evidence(
+        &self,
+        mut pending_evidence: Vec<String>,
+        additional_evidence: &[String],
+    ) -> Vec<String> {
+        for evidence in additional_evidence {
+            if !pending_evidence.iter().any(|existing| existing == evidence) {
+                pending_evidence.push(evidence.clone());
+            }
+        }
+        self.set_pending_evidence(&pending_evidence);
+        pending_evidence
+    }
+
+    pub(crate) fn pending_evidence(&self) -> Vec<String> {
+        self.state.lock().unwrap().pending_evidence.clone()
     }
 
     pub(crate) fn strongest_anchor_failure(&self) -> Option<EditAnchorFailureSummary> {
@@ -521,6 +551,70 @@ mod tests {
                     .contains("Use a full-file Write or Edit for `target.txt` now")
             })
         }));
+    }
+
+    #[test]
+    fn final_acceptance_carryover_maps_prefixed_restart_evidence_for_write_required() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/app/page.tsx"),
+            "export default function Page(){ return <button>Restart</button>; }\n",
+        )
+        .unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 2;
+        cfg.profile = "nextjs".to_string();
+        let carryover = EscalationCarryoverHandle::new();
+        let pending_evidence = carryover.carry_pending_evidence(
+            Vec::new(),
+            &[
+                "weak_source_evidence:restart_or_recoverable_state_evidence:restart handler does not reset entities"
+                    .to_string(),
+            ],
+        );
+        assert_eq!(carryover.pending_evidence(), pending_evidence);
+        let mut fake = RecordingFake::new(vec![
+            Ok(read_reply("src/app/page.tsx")),
+            Ok(write_reply(
+                "src/app/page.tsx",
+                "export default function Page(){ return <button data-anvil-action=\"restart\">Restart</button>; }\n",
+            )),
+        ]);
+        let mut session = SessionSnapshot::new();
+
+        run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Implement restart behavior in src/app/page.tsx.",
+            &["package.json".to_string(), "src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            attach_to_options(RunSessionOptions::final_acceptance_repair(), carryover),
+        )
+        .unwrap();
+
+        let events = event_values(&events);
+        let write_required = events
+            .iter()
+            .find(|event| {
+                event.get("event").and_then(Value::as_str) == Some("read_only_stagnation_feedback")
+                    && event.get("stage").and_then(Value::as_str) == Some("write_required")
+            })
+            .unwrap();
+        assert_eq!(
+            write_required
+                .get("selection_reason")
+                .and_then(Value::as_str),
+            Some("evidence_mapped")
+        );
+        assert_eq!(
+            write_required.get("selected_targets"),
+            Some(&json!(["src/app/page.tsx"]))
+        );
     }
 
     #[test]

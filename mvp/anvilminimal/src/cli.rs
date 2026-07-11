@@ -53,7 +53,7 @@ pub struct Cli {
         long,
         value_enum,
         value_name = "profile|none",
-        help = "Opt into deterministic UltraPlan presets"
+        help = "Override planner-tier UltraPlan preset selection"
     )]
     pub plan_preset: Option<PlanPresetArg>,
     #[arg(long)]
@@ -176,6 +176,7 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--plan-preset"));
         assert!(help.contains("profile|none"));
+        assert!(help.contains("Override planner-tier UltraPlan preset selection"));
     }
 
     #[test]

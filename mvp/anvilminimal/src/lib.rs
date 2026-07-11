@@ -834,10 +834,16 @@ mod tests {
     fn run_start_records_plan_preset_value_and_origin() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
-        let mut cfg = config(dir.path().to_path_buf());
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut cfg = Config::from_cli(crate::cli::Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--planner-model",
+            "qwen3.6:27b-coding-nvfp4",
+        ]))
+        .unwrap();
         cfg.eval_events_path = Some(events.clone());
-        cfg.plan_preset = crate::config::PlanPreset::Profile;
-        cfg.field_sources.plan_preset = "default:qwen27_planner".to_string();
 
         emit_run_start(&cfg);
 

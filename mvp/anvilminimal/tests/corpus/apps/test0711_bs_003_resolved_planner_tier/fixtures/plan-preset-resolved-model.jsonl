@@ -1,0 +1,4 @@
+{"case":"test0711_bs_003/qwen27_cli_direct","event":"plan_preset_resolved","plan_preset":"profile","origin":"default","source":"default:qwen27_planner","planner_model":"qwen3.6:27b-coding-nvfp4","planner_model_source":"flag"}
+{"case":"test0711_bs_003/qwen27_cli_direct","event":"preset_ultra_plan_used","profile":"nextjs","template_id":"nextjs-create-default-ultra","planner_skipped":true}
+{"case":"test0711_bs_003/qwen27_cli_explicit_off","event":"plan_preset_resolved","plan_preset":"none","origin":"cli","source":"flag","planner_model":"qwen3.6:27b-coding-nvfp4","planner_model_source":"flag"}
+{"case":"test0711_bs_003/gemma_cli_direct","event":"plan_preset_resolved","plan_preset":"none","origin":"default","source":"default:gemma_planner","planner_model":"gemma4:31b-cloud","planner_model_source":"flag"}

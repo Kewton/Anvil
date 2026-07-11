@@ -163,7 +163,7 @@ pub(crate) fn repair_evidence_keys(
 ) -> Vec<String> {
     let mut out = Vec::new();
     for key in pending_evidence {
-        push_unique_trimmed(&mut out, key);
+        push_normalized_evidence_keys(&mut out, key);
     }
     for capability in missing_capabilities {
         for evidence in required_evidence_for_capability(capability) {
@@ -171,6 +171,30 @@ pub(crate) fn repair_evidence_keys(
         }
     }
     out
+}
+
+fn push_normalized_evidence_keys(out: &mut Vec<String>, raw: &str) {
+    let mut found = false;
+    for token in raw.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_')) {
+        if canonical_evidence_token(token) {
+            push_unique_trimmed(out, token);
+            found = true;
+        }
+    }
+    if !found {
+        push_unique_trimmed(out, raw);
+    }
+}
+
+fn canonical_evidence_token(token: &str) -> bool {
+    token.ends_with("_evidence")
+        && !matches!(
+            token,
+            "missing_required_evidence"
+                | "unsupported_required_evidence"
+                | "weak_source_evidence"
+                | "weak_verification_evidence"
+        )
 }
 
 pub(crate) fn default_repair_target_candidates(root: &Path, profile: &str) -> Vec<String> {
@@ -498,5 +522,33 @@ mod tests {
         assert_eq!(selection.primary_target(), Some("src/app/page.tsx"));
         assert_eq!(selection.selected_targets, vec!["src/app/page.tsx"]);
         assert_eq!(selection.selection_reason, "evidence_mapped");
+    }
+
+    #[test]
+    fn final_acceptance_normalizes_prefixed_restart_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        write_nextjs_route(dir.path());
+
+        for pending_evidence in [
+            "weak_source_evidence:restart_or_recoverable_state_evidence:restart handler does not reset entities",
+            "route_unbound_capability_artifact:src/game.tsx:restart_or_recoverable_state_evidence",
+        ] {
+            let selection =
+                resolve_final_acceptance_repair_targets(FinalAcceptanceRepairTargetInput {
+                    root: dir.path(),
+                    profile: "nextjs",
+                    pending_evidence: &[pending_evidence.to_string()],
+                    contract_attribute_paths: &[],
+                    repair_changed_paths: &[],
+                    required_paths: &["package.json".to_string(), "src/app/page.tsx".to_string()],
+                });
+
+            assert_eq!(selection.primary_target(), Some("src/app/page.tsx"));
+            assert_eq!(selection.selected_targets, vec!["src/app/page.tsx"]);
+            assert_eq!(
+                selection.selection_reason, "evidence_mapped",
+                "pending evidence was not normalized: {pending_evidence}"
+            );
+        }
     }
 }

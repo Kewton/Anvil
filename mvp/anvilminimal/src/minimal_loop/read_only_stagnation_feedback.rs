@@ -25,6 +25,17 @@ pub(crate) fn maybe_read_only_stagnation_feedback(
     changed_paths: &[String],
     anchor_failure: Option<EditAnchorFailureSummary>,
 ) -> Option<String> {
+    let mut pending_evidence = pending_error_context.missing_evidence.clone();
+    if let Some(carryover) = options.escalation_carryover.as_ref() {
+        for evidence in carryover.pending_evidence() {
+            if !pending_evidence
+                .iter()
+                .any(|existing| existing == &evidence)
+            {
+                pending_evidence.push(evidence);
+            }
+        }
+    }
     let decision = super::anchor_stagnation_interlock::read_only_stagnation_decision(
         read_only_streak,
         anchor_failure,
@@ -45,7 +56,7 @@ pub(crate) fn maybe_read_only_stagnation_feedback(
                     crate::planner::repair_target_resolution::RepairTargetResolutionInput {
                         root,
                         profile,
-                        pending_evidence: &pending_error_context.missing_evidence,
+                        pending_evidence: &pending_evidence,
                         missing_capabilities: &pending_error_context.missing_capabilities,
                         contract_attribute_paths: &[],
                         repair_changed_paths,
@@ -58,7 +69,7 @@ pub(crate) fn maybe_read_only_stagnation_feedback(
                     crate::planner::state_binding_scan::write_required_feedback(
                         root,
                         profile,
-                        &pending_error_context.missing_evidence,
+                        &pending_evidence,
                         &pending_error_context.missing_capabilities,
                         eval_events_path,
                     );
@@ -115,6 +126,7 @@ pub(crate) fn maybe_read_only_stagnation_feedback(
             "target_path": target_path,
             "selected_targets": selected_targets,
             "selection_reason": selection_reason,
+            "pending_capability_evidence": pending_evidence,
             "session_scope": options.scope.as_str(),
             "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
             "phase_scope": options.phase_scope.as_deref().unwrap_or(""),

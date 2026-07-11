@@ -357,9 +357,7 @@ impl Config {
                     .and_then(|preset| preset.plan_preset.clone())
             })
             .or_else(|| config_file_plan_preset(&workspace_root))
-            .unwrap_or_else(|| {
-                default_plan_preset_for_planner(&planner_model.value, preset.is_some())
-            });
+            .unwrap_or_else(|| default_plan_preset_for_planner(&planner_model.value));
         let state_dir = cli.state_dir.clone().unwrap_or_else(default_state_dir);
         let action = action_from_cli(&cli)?;
         let eval_events_path = crate::eval_events::path_from_env_or_default(&workspace_root);
@@ -457,26 +455,69 @@ fn config_source_origin(source: &str) -> &'static str {
     }
 }
 
-fn default_plan_preset_for_planner(
-    planner_model: &str,
-    named_preset_selected: bool,
-) -> Sourced<PlanPreset> {
-    if named_preset_selected && planner_model_is_qwen27(planner_model) {
-        sourced(PlanPreset::Profile, "default:qwen27_planner")
-    } else if named_preset_selected && planner_model_is_gemma(planner_model) {
-        sourced(PlanPreset::None, "default:gemma_planner")
-    } else {
-        sourced(PlanPreset::None, "default")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannerModelTier {
+    Qwen27,
+    Gemma,
+    Other,
+}
+
+impl PlannerModelTier {
+    fn default_plan_preset(self) -> PlanPreset {
+        match self {
+            Self::Qwen27 => PlanPreset::Profile,
+            Self::Gemma | Self::Other => PlanPreset::None,
+        }
+    }
+
+    fn default_source(self) -> &'static str {
+        match self {
+            Self::Qwen27 => "default:qwen27_planner",
+            Self::Gemma => "default:gemma_planner",
+            Self::Other => "default",
+        }
     }
 }
 
-fn planner_model_is_qwen27(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    lower.contains("qwen") && (lower.contains("27b") || lower.contains("qwen27"))
+#[derive(Debug, Clone, Copy)]
+struct PlannerModelTierRule {
+    family_pattern: &'static str,
+    variant_patterns: &'static [&'static str],
+    tier: PlannerModelTier,
 }
 
-fn planner_model_is_gemma(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("gemma")
+const PLANNER_MODEL_TIER_RULES: &[PlannerModelTierRule] = &[
+    PlannerModelTierRule {
+        family_pattern: "qwen",
+        variant_patterns: &["27b", "qwen27"],
+        tier: PlannerModelTier::Qwen27,
+    },
+    PlannerModelTierRule {
+        family_pattern: "gemma",
+        variant_patterns: &[],
+        tier: PlannerModelTier::Gemma,
+    },
+];
+
+fn default_plan_preset_for_planner(planner_model: &str) -> Sourced<PlanPreset> {
+    let tier = planner_model_tier(planner_model);
+    sourced(tier.default_plan_preset(), tier.default_source())
+}
+
+fn planner_model_tier(model: &str) -> PlannerModelTier {
+    let model = model.to_ascii_lowercase();
+    PLANNER_MODEL_TIER_RULES
+        .iter()
+        .find(|rule| {
+            model.contains(rule.family_pattern)
+                && (rule.variant_patterns.is_empty()
+                    || rule
+                        .variant_patterns
+                        .iter()
+                        .any(|pattern| model.contains(pattern)))
+        })
+        .map(|rule| rule.tier)
+        .unwrap_or(PlannerModelTier::Other)
 }
 
 fn load_named_preset(root: &Path, name: Option<&str>) -> anyhow::Result<Option<PresetConfig>> {
@@ -1403,11 +1444,11 @@ profile = "nextjs"
     }
 
     #[test]
-    fn plan_preset_flag_config_and_preset_resolution_are_opt_in() {
+    fn plan_preset_flag_config_and_preset_resolution_take_precedence() {
         let default = Config::from_cli(Cli::parse_from(["anvilminimal"])).unwrap();
-        assert_eq!(default.plan_preset, PlanPreset::None);
-        assert_eq!(default.plan_preset.as_str(), "none");
-        assert_eq!(default.field_sources.plan_preset, "default");
+        assert_eq!(default.plan_preset, PlanPreset::Profile);
+        assert_eq!(default.plan_preset.as_str(), "profile");
+        assert_eq!(default.field_sources.plan_preset, "default:qwen27_planner");
 
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_string_lossy().to_string();
@@ -1517,6 +1558,54 @@ profile = "nextjs"
         assert_eq!(cli_override.plan_preset, PlanPreset::None);
         assert_eq!(cli_override.field_sources.plan_preset, "flag");
         assert_eq!(cli_override.plan_preset_origin(), "cli");
+    }
+
+    #[test]
+    fn resolved_cli_planner_model_controls_plan_preset_default() {
+        let qwen = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--planner-model",
+            "Qwen3.6:27B-Coding-NVFP4",
+        ]))
+        .unwrap();
+        assert_eq!(qwen.plan_preset, PlanPreset::Profile);
+        assert_eq!(qwen.field_sources.plan_preset, "default:qwen27_planner");
+        assert_eq!(qwen.plan_preset_origin(), "default");
+
+        let inherited = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--model",
+            "vendor/qwen-coder-27b",
+        ]))
+        .unwrap();
+        assert_eq!(inherited.planner_model, "vendor/qwen-coder-27b");
+        assert_eq!(inherited.plan_preset, PlanPreset::Profile);
+        assert_eq!(
+            inherited.field_sources.plan_preset,
+            "default:qwen27_planner"
+        );
+
+        let explicit_off = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--planner-model",
+            "qwen3.6:27b-coding-nvfp4",
+            "--plan-preset",
+            "none",
+        ]))
+        .unwrap();
+        assert_eq!(explicit_off.plan_preset, PlanPreset::None);
+        assert_eq!(explicit_off.field_sources.plan_preset, "flag");
+        assert_eq!(explicit_off.plan_preset_origin(), "cli");
+
+        let gemma = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--planner-model",
+            "gemma4:31b-cloud",
+        ]))
+        .unwrap();
+        assert_eq!(gemma.plan_preset, PlanPreset::None);
+        assert_eq!(gemma.field_sources.plan_preset, "default:gemma_planner");
+        assert_eq!(gemma.plan_preset_origin(), "default");
     }
 
     #[test]

@@ -49,13 +49,15 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn opt_in_absent_does_not_use_profile_preset_or_emit_event() {
+    fn gemma_tier_does_not_use_profile_preset_or_emit_event() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_string_lossy().to_string();
         let mut config = Config::from_cli(Cli::parse_from([
             "anvilminimal",
             "--cwd",
             &cwd,
+            "--planner-model",
+            "gemma4:31b-cloud",
             "--profile",
             "nextjs",
             "--ultra-plan",
@@ -67,23 +69,25 @@ mod tests {
 
         let plan = maybe_preset_ultra_plan(&config, "Build a Next.js app", "create").unwrap();
 
+        assert_eq!(config.plan_preset, PlanPreset::None);
+        assert_eq!(config.field_sources.plan_preset, "default:gemma_planner");
         assert!(plan.is_none());
         let event_text = std::fs::read_to_string(events_path).unwrap_or_default();
         assert!(!event_text.contains("preset_ultra_plan_used"));
     }
 
     #[test]
-    fn profile_preset_emits_event_and_returns_plan() {
+    fn qwen27_tier_uses_profile_preset_without_flag() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().to_string_lossy().to_string();
         let mut config = Config::from_cli(Cli::parse_from([
             "anvilminimal",
             "--cwd",
             &cwd,
+            "--planner-model",
+            "qwen3.6:27b-coding-nvfp4",
             "--profile",
             "nextjs",
-            "--plan-preset",
-            "profile",
             "--ultra-plan",
             "Build a Next.js app",
         ]))
@@ -95,11 +99,45 @@ mod tests {
             .unwrap()
             .unwrap();
 
+        assert_eq!(config.plan_preset, PlanPreset::Profile);
+        assert_eq!(config.plan_preset_origin(), "default");
+        assert_eq!(config.field_sources.plan_preset, "default:qwen27_planner");
         assert_eq!(plan.phases.len(), 4);
         let event_text = std::fs::read_to_string(events_path).unwrap();
         assert!(event_text.contains("\"event\":\"preset_ultra_plan_used\""));
         assert!(event_text.contains("\"profile\":\"nextjs\""));
         assert!(event_text.contains("\"template_id\":\"nextjs-create-default-ultra\""));
         assert!(event_text.contains("\"planner_skipped\":true"));
+    }
+
+    #[test]
+    fn explicit_none_disables_qwen27_tier_profile_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().to_string();
+        let mut config = Config::from_cli(Cli::parse_from([
+            "anvilminimal",
+            "--cwd",
+            &cwd,
+            "--planner-model",
+            "qwen3.6:27b-coding-nvfp4",
+            "--profile",
+            "nextjs",
+            "--plan-preset",
+            "none",
+            "--ultra-plan",
+            "Build a Next.js app",
+        ]))
+        .unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        config.eval_events_path = Some(events_path.clone());
+
+        let plan = maybe_preset_ultra_plan(&config, "Build a Next.js app", "create").unwrap();
+
+        assert_eq!(config.plan_preset, PlanPreset::None);
+        assert_eq!(config.plan_preset_origin(), "cli");
+        assert_eq!(config.field_sources.plan_preset, "flag");
+        assert!(plan.is_none());
+        let event_text = std::fs::read_to_string(events_path).unwrap_or_default();
+        assert!(!event_text.contains("preset_ultra_plan_used"));
     }
 }

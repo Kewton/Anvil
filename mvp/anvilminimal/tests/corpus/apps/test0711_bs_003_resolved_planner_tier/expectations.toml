@@ -1,0 +1,47 @@
+case_id = "test0711_bs_003_resolved_planner_tier"
+source = "test0711_bs_003 resolved planner tier and prefixed evidence regression fixtures"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["plan_preset", "qwen27", "gemma", "restart"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/plan-preset-resolved-model.jsonl = [
+  "test0711_bs_003/qwen27_cli_direct",
+  "\"event\":\"plan_preset_resolved\"",
+  "\"plan_preset\":\"profile\"",
+  "\"origin\":\"default\"",
+  "\"source\":\"default:qwen27_planner\"",
+  "\"event\":\"preset_ultra_plan_used\"",
+  "test0711_bs_003/qwen27_cli_explicit_off",
+  "\"origin\":\"cli\"",
+  "\"source\":\"flag\"",
+  "test0711_bs_003/gemma_cli_direct",
+  "\"source\":\"default:gemma_planner\""
+]
+fixtures/prefixed-restart-evidence-target.jsonl = [
+  "test0711_bs_003/#1",
+  "weak_source_evidence:restart_or_recoverable_state_evidence",
+  "route_unbound_capability_artifact:src/game.tsx:restart_or_recoverable_state_evidence",
+  "\"selected_target\":\"src/app/page.tsx\"",
+  "\"selected_targets\":[\"src/app/page.tsx\"]",
+  "\"selection_reason\":\"evidence_mapped\"",
+  "\"event\":\"read_only_stagnation_feedback\"",
+  "\"stage\":\"write_required\""
+]

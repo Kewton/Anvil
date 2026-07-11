@@ -5467,9 +5467,8 @@ pub fn run_ultra_plan_with_ui(
             let repair_target = classify_repair_target(&acceptance_report);
             let mut expected_paths =
                 final_acceptance_repair_expected_paths(plan, config, &acceptance_report)?;
-            let mut pending_repair_evidence = verification_missing_signals(&acceptance_report);
-            merge_unique_strings(
-                &mut pending_repair_evidence,
+            let pending_repair_evidence = escalation_carryover.carry_pending_evidence(
+                verification_missing_signals(&acceptance_report),
                 &ultra_context.pending_capability_evidence,
             );
             let contract_attribute_paths =
