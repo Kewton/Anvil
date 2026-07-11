@@ -74,6 +74,10 @@ Named guarantees produced by the Generic Assurance Track:
   `dependency_setup_authority_required` failure, not a repair loop or full
   success.
 
+## Scenario matrix (nextjs)
+
+The verified `nextjs` profile scenario matrix is Space Invaders / Breakout / Quiz. Quiz is the non-game row: it contains no game vocabulary while still exercising a browser-interactive Next.js app with start, answer/input, score/progress state, and retry behavior. Any change that injects or broadens evidence vocabulary, contract wording, preset planning knowledge, or similar profile-specific guidance must be admitted only after regression measurement across this three-scenario matrix. The current basis is `test0710_bs_006`, where Breakout exposed vocabulary-dependent arbitration, and `test0711_bs_003`, where the first Quiz round reached 2/2 full.
+
 ## Recommended Model Tier
 
 Production-quality implementation outcomes require an implementation model in
