@@ -119,10 +119,11 @@ fn nextjs_boundary_erosion_tripwire_keeps_dispatch_sites_audited() {
         ("src/minimal_loop/evidence.rs".to_string(), 4),
         ("src/minimal_loop/import_scan.rs".to_string(), 1),
         ("src/minimal_loop/loop_run.rs".to_string(), 2),
+        ("src/planner/assurance.rs".to_string(), 1),
         ("src/planner/lint.rs".to_string(), 2),
         ("src/planner/final_acceptance.rs".to_string(), 1),
         ("src/planner/profile.rs".to_string(), 3),
-        ("src/planner/runner.rs".to_string(), 15),
+        ("src/planner/runner.rs".to_string(), 14),
         ("src/planner/verify.rs".to_string(), 3),
     ]);
     assert_eq!(
