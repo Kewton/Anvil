@@ -64,6 +64,8 @@ const SUCCESS_FAILURE_ECHO_STRIPPED_REASON: &str = "success_failure_echo_strippe
 const WORKSPACE_CD_NORMALIZED_REASON: &str =
     "workspace_cd_normalized: absolute workspace cd rewritten to workspace-relative verifier form";
 const HOOK_ATTRIBUTE_GREP_REASON: &str = "hook_attribute_grep: data-anvil hook grep replaced with quote- and JSX-brace-aware semantic check";
+const SOURCE_IMPLEMENTATION_GREP_REASON: &str =
+    "source implementation detail grep replaced with semantic equivalent assertion";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyCommandViolationKind {
@@ -75,6 +77,7 @@ pub enum VerifyCommandViolationKind {
     GrepDashPattern,
     PackageJsonScriptGrep,
     HookAttributeGrep,
+    SourceImplementationGrep,
     OutputPipeStripped,
     StderrMergeStripped,
     ExitCodeEchoStripped,
@@ -94,6 +97,7 @@ impl VerifyCommandViolationKind {
             Self::GrepDashPattern => "grep_dash_pattern",
             Self::PackageJsonScriptGrep => "package_json_script_grep",
             Self::HookAttributeGrep => "hook_attribute_grep",
+            Self::SourceImplementationGrep => "source_implementation_grep",
             Self::OutputPipeStripped => "output_pipe_stripped",
             Self::StderrMergeStripped => "stderr_merge_stripped",
             Self::ExitCodeEchoStripped => "exit_code_echo_stripped",
@@ -122,6 +126,9 @@ impl VerifyCommandViolationKind {
             }
             Self::HookAttributeGrep => {
                 "grep data-anvil hook assertion should use semantic hook detection"
+            }
+            Self::SourceImplementationGrep => {
+                "grep source implementation detail assertion should use semantic equivalent detection"
             }
             Self::OutputPipeStripped => "verify command output-limiting pipe should be stripped",
             Self::StderrMergeStripped => "verify command stderr merge should be stripped",
@@ -713,6 +720,19 @@ fn verify_step_with_setup_observed_with_options(
                             "dependency_setup_authority_required: {command}"
                         ));
                     }
+                } else if step.expected_result_kind() != ExpectedResult::Fail
+                    && crate::planner::source_assertion::can_demote_failed_source_assertion(
+                        &failed_command,
+                        step,
+                        !report.is_pass(),
+                    )
+                {
+                    crate::planner::source_assertion::emit_demoted_advisory(
+                        eval_events_path,
+                        &failed_command,
+                        &step.id,
+                        crate::planner::source_assertion::demotion_reason(),
+                    );
                 } else if step.expected_result_kind() != ExpectedResult::Fail {
                     report.push_command_failure(failed_command, reason);
                 }
@@ -1513,6 +1533,7 @@ pub fn normalize_verify_command(command: &str) -> anyhow::Result<NormalizedVerif
             VerifyCommandViolationKind::GrepDashPattern
                 | VerifyCommandViolationKind::PackageJsonScriptGrep
                 | VerifyCommandViolationKind::HookAttributeGrep
+                | VerifyCommandViolationKind::SourceImplementationGrep
                 | VerifyCommandViolationKind::OutputPipeStripped
                 | VerifyCommandViolationKind::StderrMergeStripped
                 | VerifyCommandViolationKind::ExitCodeEchoStripped
@@ -1662,6 +1683,7 @@ pub fn diagnose_verify_command(command: &str) -> VerifyCommandDiagnosis {
         let violation = match repair.kind {
             "package_json_script_assertion" => VerifyCommandViolationKind::PackageJsonScriptGrep,
             "hook_attribute_grep" => VerifyCommandViolationKind::HookAttributeGrep,
+            "source_impl_detail_assertion" => VerifyCommandViolationKind::SourceImplementationGrep,
             "output_pipe_stripped" => VerifyCommandViolationKind::OutputPipeStripped,
             "stderr_merge_stripped" => VerifyCommandViolationKind::StderrMergeStripped,
             "exit_code_echo_stripped" => VerifyCommandViolationKind::ExitCodeEchoStripped,
@@ -1781,6 +1803,15 @@ pub fn normalize_verify_command_for_oracle_repair(
             normalized: hook_check,
             reason: HOOK_ATTRIBUTE_GREP_REASON.to_string(),
             kind: "hook_attribute_grep",
+        });
+    }
+    if let Some(source_check) =
+        crate::planner::source_assertion::normalize_source_assertion_grep(command)
+    {
+        return Some(VerifyCommandOracleRepair {
+            normalized: source_check.normalized,
+            reason: SOURCE_IMPLEMENTATION_GREP_REASON.to_string(),
+            kind: source_check.kind,
         });
     }
     let grep = grep_dash_pattern(&tokens)?;
@@ -3254,6 +3285,130 @@ mod tests {
             diagnose_verify_command("grep -q primary src/app/page.tsx").violation,
             None
         );
+    }
+
+    #[test]
+    fn verify_command_normalizes_source_detail_keydown_grep_to_equivalent_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#"export default function Page(){return <main tabIndex={0} onKeyDown={() => {}}>Game</main>}"#,
+        );
+        let command = r#"grep -q "addEventListener('keydown'" src/app/page.tsx"#;
+        let diagnosis = diagnose_verify_command(command);
+
+        assert_eq!(
+            diagnosis.violation,
+            Some(VerifyCommandViolationKind::SourceImplementationGrep),
+            "{diagnosis:?}"
+        );
+        let normalized = normalize_verify_command(command).unwrap();
+        crate::tools::bash::run_checked(normalized.as_str(), dir.path(), false)
+            .unwrap_or_else(|err| panic!("normalized source assertion failed: {err}"));
+    }
+
+    #[test]
+    fn source_detail_grep_without_contract_check_is_not_demoted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#"export default function Page(){return <main>plain</main>}"#,
+        );
+        let events = dir.path().join("events.jsonl");
+        let step = PlanStep {
+            id: "verify-source-detail".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Verify a source detail".to_string(),
+            expected_paths: vec!["src/app/page.tsx".to_string()],
+            verify: vec![r#"grep -q "useState" src/app/page.tsx"#.to_string()],
+        };
+
+        let report = verify_step_with_setup_observed_with_offline_and_events(
+            dir.path(),
+            &step,
+            NodeDependencySetupAuthority::None,
+            false,
+            Some(&events),
+        )
+        .0;
+
+        assert!(!report.is_pass(), "{report:?}");
+        assert_eq!(report.command_failures.len(), 1, "{report:?}");
+        let event_text = std::fs::read_to_string(events).unwrap_or_default();
+        assert!(!event_text.contains("\"verify_demoted_advisory\""));
+    }
+
+    #[test]
+    fn source_detail_grep_demotes_to_advisory_after_contract_check_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#"export default function Page(){return <main data-anvil-state={JSON.stringify({score:0})}>plain</main>}"#,
+        );
+        let events = dir.path().join("events.jsonl");
+        let step = PlanStep {
+            id: "verify-source-detail".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Verify contract hook and avoid over-specific source detail".to_string(),
+            expected_paths: vec!["src/app/page.tsx".to_string()],
+            verify: vec![
+                "grep -q data-anvil-state src/app/page.tsx".to_string(),
+                r#"grep -q "useState" src/app/page.tsx"#.to_string(),
+            ],
+        };
+
+        let report = verify_step_with_setup_observed_with_offline_and_events(
+            dir.path(),
+            &step,
+            NodeDependencySetupAuthority::None,
+            false,
+            Some(&events),
+        )
+        .0;
+
+        assert!(report.is_pass(), "{report:?}");
+        assert!(report.command_failures.is_empty(), "{report:?}");
+        let event_text = std::fs::read_to_string(events).unwrap_or_default();
+        assert!(event_text.contains("\"event\":\"verify_demoted_advisory\""));
+        assert!(event_text.contains("\"step_id\":\"verify-source-detail\""));
+        assert!(event_text.contains("source_impl_detail_assertion"));
+    }
+
+    #[test]
+    fn contract_hook_check_failure_is_not_demoted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_page(
+            dir.path(),
+            r#"export default function Page(){return <main>Missing hook</main>}"#,
+        );
+        let events = dir.path().join("events.jsonl");
+        let step = PlanStep {
+            id: "verify-contract-hook".to_string(),
+            kind: "verify".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Verify the contract hook and source detail".to_string(),
+            expected_paths: vec!["src/app/page.tsx".to_string()],
+            verify: vec![
+                "grep -q data-anvil-state src/app/page.tsx".to_string(),
+                r#"grep -q "useState" src/app/page.tsx"#.to_string(),
+            ],
+        };
+
+        let report = verify_step_with_setup_observed_with_offline_and_events(
+            dir.path(),
+            &step,
+            NodeDependencySetupAuthority::None,
+            false,
+            Some(&events),
+        )
+        .0;
+
+        assert!(!report.is_pass(), "{report:?}");
+        assert!(!report.command_failures.is_empty(), "{report:?}");
+        let event_text = std::fs::read_to_string(events).unwrap_or_default();
+        assert!(!event_text.contains("\"verify_demoted_advisory\""));
     }
 
     #[test]

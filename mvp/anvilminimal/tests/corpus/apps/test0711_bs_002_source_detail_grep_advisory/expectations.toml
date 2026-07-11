@@ -1,0 +1,36 @@
+case_id = "test0711_bs_002_source_detail_grep_advisory"
+source = "bs_002 #3 planner-generated source implementation detail grep regression fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["verify", "grep", "source_detail", "advisory"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/source-detail-grep-advisory.jsonl = [
+  "test0711_bs_002/#3",
+  "grep -q \\\"addEventListener('keydown'\\\" src/app/page.tsx",
+  "\"classification\":\"source_implementation_grep\"",
+  "\"normalized_contains\":[\"addEventListener\",\"keydown\",\"onKeyDown\",\"keys[\"]",
+  "\"status\":\"passed_equivalent_onKeyDown\"",
+  "\"event\":\"verify_demoted_advisory\"",
+  "\"reason\":\"source_impl_detail_assertion: equivalent contract/build checks passed; implementation API spelling is advisory\"",
+  "\"contract_check\":\"data-anvil-state\"",
+  "\"contract_hook_failure_demoted\":false",
+  "\"phase_continued\":true"
+]
