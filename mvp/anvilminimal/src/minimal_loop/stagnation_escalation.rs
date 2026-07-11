@@ -4,13 +4,11 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::eval_events;
-use crate::planner::repair_target_resolution::{
-    RepairTargetSelection, RepairTargetSelectionReason,
-};
+use crate::planner::repair_targeting::{RepairTargetSelection, RepairTargetSelectionReason};
 #[cfg(test)]
 use crate::planner::{
     profile::profile_evidence_repair_target_paths,
-    repair_target_resolution::{RepairTargetPathBuckets, select_repair_targets_from_paths},
+    repair_targeting::{RepairTargetPathBuckets, select_repair_targets_from_paths},
 };
 use crate::state::ToolCall;
 use crate::tools::path_guard::normalize_workspace_path;
@@ -312,7 +310,7 @@ pub(crate) fn write_required_evidence_targets(
     missing_evidence: &[String],
     missing_capabilities: &[String],
 ) -> Vec<String> {
-    let evidence_keys = crate::planner::repair_target_resolution::repair_evidence_keys(
+    let evidence_keys = crate::planner::repair_targeting::repair_evidence_keys(
         missing_evidence,
         missing_capabilities,
     );

@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::minimal_loop::evidence::required_evidence_for_capability;
-use crate::minimal_loop::import_scan::route_bound_closure;
+use crate::minimal_loop::import_scan::{
+    MissingImport, missing_import_target_rel, route_bound_closure,
+};
 use crate::planner::profile::{is_nextjs_profile, profile_evidence_repair_target_paths};
+use crate::planner::runner::StepRunOutcome;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RepairTargetSelectionReason {
@@ -171,6 +174,46 @@ pub(crate) fn repair_evidence_keys(
         }
     }
     out
+}
+
+pub(crate) fn missing_import_target_paths(root: &Path, missing: &[MissingImport]) -> Vec<String> {
+    missing
+        .iter()
+        .filter_map(|missing| missing_import_target_rel(root, missing))
+        .collect()
+}
+
+pub(crate) fn ensure_session_error_repair_target(outcome: &mut StepRunOutcome) {
+    if !outcome.repair_targets.is_empty() {
+        return;
+    }
+    if !outcome.observed_missing_evidence.is_empty()
+        || !outcome.observed_missing_obligations.is_empty()
+    {
+        outcome
+            .repair_targets
+            .push("required_evidence_missing".to_string());
+    } else if !outcome.observed_missing_capabilities.is_empty() {
+        outcome
+            .repair_targets
+            .push("capability_missing".to_string());
+    }
+}
+
+pub(crate) fn missing_obligation_targets_from_text(text: &str) -> Vec<String> {
+    let Some((_, rest)) = text.split_once("missing_required_obligation_target:") else {
+        return Vec::new();
+    };
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | ')' | ']'))
+        .unwrap_or(rest.len());
+    rest[..end]
+        .split(',')
+        .filter_map(|value| value.split(':').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn push_normalized_evidence_keys(out: &mut Vec<String>, raw: &str) {

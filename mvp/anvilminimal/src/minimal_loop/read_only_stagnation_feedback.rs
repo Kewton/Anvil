@@ -52,8 +52,8 @@ pub(crate) fn maybe_read_only_stagnation_feedback(
                         fallback_candidates.push(path.clone());
                     }
                 }
-                let selection = crate::planner::repair_target_resolution::resolve_repair_targets(
-                    crate::planner::repair_target_resolution::RepairTargetResolutionInput {
+                let selection = crate::planner::repair_targeting::resolve_repair_targets(
+                    crate::planner::repair_targeting::RepairTargetResolutionInput {
                         root,
                         profile,
                         pending_evidence: &pending_evidence,

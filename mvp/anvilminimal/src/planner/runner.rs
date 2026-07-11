@@ -33,9 +33,8 @@ use crate::minimal_loop::feedback::{
     capability_evidence_remedy_lines, capability_evidence_unresolved_reason,
 };
 use crate::minimal_loop::import_scan::{
-    MissingImport, UnattachedRefDiagnostic, format_missing_import_findings,
-    missing_import_target_rel, route_bound_closure, route_bound_unattached_ref_diagnostics,
-    scan_relative_imports,
+    MissingImport, UnattachedRefDiagnostic, format_missing_import_findings, route_bound_closure,
+    route_bound_unattached_ref_diagnostics, scan_relative_imports,
 };
 use crate::minimal_loop::interaction_probe::{
     self, BrowserInteractionProbeOptions, InteractionProbeOutcome,
@@ -92,7 +91,8 @@ use crate::planner::verify::{
     verify_step_with_profile_setup_observed_with_offline_and_events,
 };
 use crate::planner::{
-    contract_attribute_repair::merge_repair_target_paths, hook_snapshot, setup_step_policy, signals,
+    contract_attribute_repair::merge_repair_target_paths, hook_snapshot, repair_targeting,
+    setup_step_policy, signals,
 };
 use crate::provider_call::{self, ProviderCallScope};
 use crate::providers::{AssistantReply, ChatClient, model_for};
@@ -1580,14 +1580,14 @@ impl StepPlanRunOutcome {
 }
 
 #[derive(Debug, Clone, Default)]
-struct StepRunOutcome {
+pub(crate) struct StepRunOutcome {
     changed_paths: Vec<String>,
-    observed_missing_capabilities: Vec<String>,
-    observed_missing_evidence: Vec<String>,
-    observed_missing_obligations: Vec<String>,
+    pub(crate) observed_missing_capabilities: Vec<String>,
+    pub(crate) observed_missing_evidence: Vec<String>,
+    pub(crate) observed_missing_obligations: Vec<String>,
     verify_failures: Vec<String>,
     primary_failure: Option<String>,
-    repair_targets: Vec<String>,
+    pub(crate) repair_targets: Vec<String>,
     command_failures: Vec<String>,
     repair_attempts: usize,
     repair_changed_paths: Vec<String>,
@@ -4017,7 +4017,7 @@ fn fresh_profile_invariant_failure_evidence(
     let import_findings = format_missing_import_findings(&config.workspace_root, &missing_imports);
     merge_unique_strings(
         &mut missing_paths,
-        &missing_import_target_paths(&config.workspace_root, &missing_imports),
+        &repair_targeting::missing_import_target_paths(&config.workspace_root, &missing_imports),
     );
     if missing_paths.is_empty() && !missing_imports.is_empty() {
         merge_unique_strings(&mut missing_paths, &import_findings);
@@ -4070,13 +4070,6 @@ fn profile_missing_relative_imports(root: &Path, profile: &str) -> Vec<MissingIm
         return Vec::new();
     }
     scan_relative_imports(root, &paths).unwrap_or_default()
-}
-
-fn missing_import_target_paths(root: &Path, missing: &[MissingImport]) -> Vec<String> {
-    missing
-        .iter()
-        .filter_map(|missing| missing_import_target_rel(root, missing))
-        .collect()
 }
 
 fn merge_unique_strings(out: &mut Vec<String>, incoming: &[String]) {
@@ -4140,24 +4133,7 @@ fn apply_session_error_observations(
         &mut outcome.observed_missing_obligations,
         &missing_obligations,
     );
-    ensure_session_error_repair_target(outcome);
-}
-
-fn ensure_session_error_repair_target(outcome: &mut StepRunOutcome) {
-    if !outcome.repair_targets.is_empty() {
-        return;
-    }
-    if !outcome.observed_missing_evidence.is_empty()
-        || !outcome.observed_missing_obligations.is_empty()
-    {
-        outcome
-            .repair_targets
-            .push("required_evidence_missing".to_string());
-    } else if !outcome.observed_missing_capabilities.is_empty() {
-        outcome
-            .repair_targets
-            .push("capability_missing".to_string());
-    }
+    repair_targeting::ensure_session_error_repair_target(outcome);
 }
 
 fn runtime_missing_signals(report: &RuntimeAcceptanceReport) -> Vec<String> {
@@ -4410,7 +4386,10 @@ fn missing_signals_from_text(text: &str) -> Vec<String> {
         &mut out,
         &missing_signal_values_after_prefix(text, "missing_required_obligations:"),
     );
-    merge_unique_strings(&mut out, &missing_obligation_targets_from_text(text));
+    merge_unique_strings(
+        &mut out,
+        &repair_targeting::missing_obligation_targets_from_text(text),
+    );
     out
 }
 
@@ -4433,22 +4412,6 @@ fn missing_signal_values_after_prefix(text: &str, prefix: &str) -> Vec<String> {
                 .trim();
             (!value.is_empty()).then(|| value.to_string())
         })
-        .collect()
-}
-
-fn missing_obligation_targets_from_text(text: &str) -> Vec<String> {
-    let Some((_, rest)) = text.split_once("missing_required_obligation_target:") else {
-        return Vec::new();
-    };
-    let end = rest
-        .find(|ch: char| ch.is_whitespace() || matches!(ch, ';' | ')' | ']'))
-        .unwrap_or(rest.len());
-    rest[..end]
-        .split(',')
-        .filter_map(|value| value.split(':').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
         .collect()
 }
 
@@ -5473,8 +5436,8 @@ pub fn run_ultra_plan_with_ui(
             let contract_attribute_paths =
                 contract_attribute_repair_target_paths(&acceptance_report);
             let target_selection =
-                crate::planner::repair_target_resolution::resolve_final_acceptance_repair_targets(
-                    crate::planner::repair_target_resolution::FinalAcceptanceRepairTargetInput {
+                crate::planner::repair_targeting::resolve_final_acceptance_repair_targets(
+                    crate::planner::repair_targeting::FinalAcceptanceRepairTargetInput {
                         root: &config.workspace_root,
                         profile: &plan.profile,
                         pending_evidence: &pending_repair_evidence,
@@ -6638,7 +6601,7 @@ fn snapshot_source_candidates(
     merge_source_candidates(&mut paths, profile_paths.iter().map(String::as_str));
     merge_source_candidates(
         &mut paths,
-        crate::planner::repair_target_resolution::default_repair_target_candidates(root, profile)
+        crate::planner::repair_targeting::default_repair_target_candidates(root, profile)
             .iter()
             .map(String::as_str),
     );
@@ -6664,11 +6627,9 @@ fn final_acceptance_source_snapshot(
     merge_final_acceptance_snapshot_candidates(&mut paths, extra_paths.iter().map(String::as_str));
     merge_final_acceptance_snapshot_candidates(
         &mut paths,
-        crate::planner::repair_target_resolution::final_acceptance_snapshot_candidates(
-            root, profile,
-        )
-        .iter()
-        .map(String::as_str),
+        crate::planner::repair_targeting::final_acceptance_snapshot_candidates(root, profile)
+            .iter()
+            .map(String::as_str),
     );
     for path in route_bound_source_paths(root, profile) {
         if !paths.contains(&path) {
@@ -7108,7 +7069,7 @@ fn profile_invariant_relevant_paths(root: &Path, profile: &str, reason: &str) ->
         return out;
     }
     let tailwind_failure = reason.contains("tailwind_contract_failure");
-    let rels = crate::planner::repair_target_resolution::profile_invariant_excerpt_candidates(
+    let rels = crate::planner::repair_targeting::profile_invariant_excerpt_candidates(
         root,
         profile,
         tailwind_failure,
@@ -14035,8 +13996,8 @@ fn final_acceptance_evidence_regeneration_target(
 ) -> Option<String> {
     let pending_evidence = verification_missing_signals(report);
     let contract_attribute_paths = contract_attribute_repair_target_paths(report);
-    crate::planner::repair_target_resolution::resolve_repair_targets(
-        crate::planner::repair_target_resolution::RepairTargetResolutionInput {
+    crate::planner::repair_targeting::resolve_repair_targets(
+        crate::planner::repair_targeting::RepairTargetResolutionInput {
             root,
             profile,
             pending_evidence: &pending_evidence,
