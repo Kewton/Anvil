@@ -47,6 +47,10 @@ use super::reachability::{
     RepairReachability, assess_repair_reachability, reachability_failure_kind,
     reachability_recovery_reason,
 };
+use super::repair_pressure::{
+    NO_PROGRESS_FEEDBACK_LIMIT, NO_PROGRESS_STAGNATION_REASON, PressureInputs, PressureState,
+    PressureTerminalReason, READ_ONLY_STAGNATION_REASON, transition,
+};
 use super::repair_progress::{
     RepairProgressVerdict, VerificationSignature, classify_repair_progress,
 };
@@ -54,10 +58,7 @@ use super::repair_target::{
     RepairFollowThrough, RepairTarget, classify_repair_follow_through, classify_repair_target,
 };
 use super::stagnation_carryover::{self, EscalationCarryoverHandle};
-use super::stagnation_escalation::{
-    READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD, READ_ONLY_STAGNATION_REASON,
-    ReadOnlyToolRejectionContext, WriteRequiredState,
-};
+use super::stagnation_escalation::{ReadOnlyToolRejectionContext, WriteRequiredState};
 use super::verifier_bootstrap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1090,7 +1091,6 @@ pub(crate) fn run_session_with_outcome_with_options(
     let mut last_blocking_reason: Option<String> = None;
     let last_provider_error: Option<String> = None;
     let mut write_or_edit_seen = false;
-    let mut no_tool_feedbacks = 0usize;
     let mut empty_feedbacks = 0usize;
     let mut empty_fresh_retry_pending = false;
     let mut provider_turn_timeouts = 0usize;
@@ -1121,11 +1121,17 @@ pub(crate) fn run_session_with_outcome_with_options(
     }
     .saturating_add(EMPTY_RESPONSE_RECOVERY_EXTRA_ITERATIONS);
     let escalation_carryover = options.escalation_carryover.as_ref();
-    let mut read_only_streak = stagnation_carryover::seed_from_options(
+    let initial_read_only_streak = stagnation_carryover::seed_from_options(
         &options,
         config.eval_events_path.as_deref(),
         config.max_iterations,
     );
+    let mut pressure_inputs = PressureInputs {
+        read_only_streak: initial_read_only_streak,
+        remaining_budget: config.max_iterations,
+        ..PressureInputs::default()
+    };
+    let mut pressure_state: PressureState;
     if let Some(outcome) = maybe_short_circuit_satisfied_step(
         config,
         &options,
@@ -1169,6 +1175,8 @@ pub(crate) fn run_session_with_outcome_with_options(
         }
         let iterations_used = iteration + 1;
         let remaining_iterations = iteration_limit.saturating_sub(iterations_used);
+        pressure_inputs.remaining_budget = remaining_iterations;
+        pressure_state = transition(pressure_inputs.clone());
         if step_started.elapsed() >= step_wall_clock_cap {
             let dominant = dominant_time_sink_text(&time_sinks);
             eval_events::emit(
@@ -1572,8 +1580,9 @@ pub(crate) fn run_session_with_outcome_with_options(
             if options.requires_action_tool_feedback(write_or_edit_seen, tool_call_count)
                 && looks_like_action_prompt(user_prompt)
             {
-                if no_tool_feedbacks < 1 {
-                    no_tool_feedbacks += 1;
+                if pressure_state.no_progress_feedback_available(1) {
+                    pressure_inputs.no_progress_streak =
+                        pressure_inputs.no_progress_streak.saturating_add(1);
                     session.messages.pop();
                     last_blocking_reason = Some("completion without write".to_string());
                     pending_feedback = Some(super::feedback::completion_without_write());
@@ -1584,9 +1593,10 @@ pub(crate) fn run_session_with_outcome_with_options(
             }
             if options.requires_action_tool_feedback(write_or_edit_seen, tool_call_count)
                 && looks_like_progress_without_tool(&reply.content)
-                && no_tool_feedbacks < 3
+                && pressure_state.no_progress_feedback_available(NO_PROGRESS_FEEDBACK_LIMIT)
             {
-                no_tool_feedbacks += 1;
+                pressure_inputs.no_progress_streak =
+                    pressure_inputs.no_progress_streak.saturating_add(1);
                 session.messages.pop();
                 last_blocking_reason = Some("progress text without tool call".to_string());
                 let verify_commands =
@@ -1596,7 +1606,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     config.eval_events_path.as_deref(),
                     json!({
                         "event": "no_progress_feedback",
-                        "attempt": no_tool_feedbacks,
+                        "attempt": pressure_inputs.no_progress_streak,
                         "verify_commands": verify_commands,
                         "feedback": eval_events::body_snippet(&feedback),
                     }),
@@ -1778,7 +1788,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                 config.eval_events_path.as_deref(),
                 &call,
                 ReadOnlyToolRejectionContext {
-                    read_only_streak,
+                    read_only_streak: pressure_state.read_only_streak(),
                     session_scope: options.scope.as_str(),
                     step_kind: options
                         .step_kind
@@ -1814,7 +1824,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                 config.eval_events_path.as_deref(),
                 &call,
                 ReadOnlyToolRejectionContext {
-                    read_only_streak,
+                    read_only_streak: pressure_state.read_only_streak(),
                     session_scope: options.scope.as_str(),
                     step_kind: options
                         .step_kind
@@ -1986,8 +1996,14 @@ pub(crate) fn run_session_with_outcome_with_options(
                     );
                     if matches!(call.name.as_str(), "Write" | "Edit") {
                         write_or_edit_seen = true;
-                        read_only_streak = 0;
-                        stagnation_carryover::record_streak(escalation_carryover, read_only_streak);
+                        pressure_inputs.read_only_streak = 0;
+                        pressure_inputs.anchor_failures = 0;
+                        pressure_inputs.anchor_target = None;
+                        pressure_state = transition(pressure_inputs.clone());
+                        stagnation_carryover::record_streak(
+                            escalation_carryover,
+                            pressure_state.read_only_streak(),
+                        );
                         edit_anchor_recovery_state
                             .note_successful_write(&config.workspace_root, &call.arguments);
                         let write_required_target_written = write_required_state
@@ -2173,7 +2189,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                         &selected_targets,
                         &selection_reason,
                         &changed_paths,
-                        read_only_streak,
+                        pressure_state.read_only_streak(),
                         no_write_attempts,
                         tool_call_count,
                         verify_attempts,
@@ -2187,8 +2203,14 @@ pub(crate) fn run_session_with_outcome_with_options(
         let batch_reduced_missing_paths = missing_after_batch.len() < missing_before_batch.len();
         if batch_reduced_missing_paths {
             artifact_non_edit_streak = 0;
-            read_only_streak = 0;
-            stagnation_carryover::record_streak(escalation_carryover, read_only_streak);
+            pressure_inputs.read_only_streak = 0;
+            pressure_inputs.anchor_failures = 0;
+            pressure_inputs.anchor_target = None;
+            pressure_state = transition(pressure_inputs.clone());
+            stagnation_carryover::record_streak(
+                escalation_carryover,
+                pressure_state.read_only_streak(),
+            );
             artifact_recovery_state.record_action("required_artifact_progress");
         } else {
             artifact_non_edit_streak += if batch_non_edit_tools > 0 {
@@ -2208,35 +2230,55 @@ pub(crate) fn run_session_with_outcome_with_options(
             && batch_all_read_only_tools
             && !batch_had_recoverable_tool_error
         {
-            read_only_streak = read_only_streak.saturating_add(1);
-            stagnation_carryover::record_streak(escalation_carryover, read_only_streak);
+            pressure_inputs.read_only_streak = pressure_inputs.read_only_streak.saturating_add(1);
             let anchor_failure = stagnation_carryover::strongest_anchor_failure(
                 edit_anchor_recovery_state.strongest_failure(),
                 escalation_carryover,
             );
-            if let Some(feedback) =
-                super::read_only_stagnation_feedback::maybe_read_only_stagnation_feedback(
-                    config.eval_events_path.as_deref(),
-                    &config.workspace_root,
-                    &config.profile,
-                    user_prompt,
-                    read_only_streak,
-                    &options,
-                    &mut write_required_state,
-                    &verify_repair_state.pending_error_context,
-                    &verify_repair_state.changed_paths_at_failure,
-                    &required_paths,
-                    &changed_paths,
-                    anchor_failure,
-                )
+            pressure_inputs.anchor_failures = anchor_failure
+                .as_ref()
+                .filter(|failure| failure.failure_count > 0 && !failure.path.trim().is_empty())
+                .map(|failure| failure.failure_count)
+                .unwrap_or_default();
+            pressure_inputs.anchor_target = anchor_failure
+                .as_ref()
+                .filter(|failure| failure.failure_count > 0 && !failure.path.trim().is_empty())
+                .map(|failure| failure.path.clone());
+            pressure_state = transition(pressure_inputs.clone());
+            stagnation_carryover::record_streak(
+                escalation_carryover,
+                pressure_state.read_only_streak(),
+            );
+            if pressure_state.feedback_level.is_some()
+                && let Some(feedback) =
+                    super::read_only_stagnation_feedback::maybe_read_only_stagnation_feedback(
+                        config.eval_events_path.as_deref(),
+                        &config.workspace_root,
+                        &config.profile,
+                        user_prompt,
+                        pressure_state.read_only_streak(),
+                        &options,
+                        &mut write_required_state,
+                        &verify_repair_state.pending_error_context,
+                        &verify_repair_state.changed_paths_at_failure,
+                        &required_paths,
+                        &changed_paths,
+                        anchor_failure,
+                    )
             {
-                last_blocking_reason = Some("model_stagnation:read_only_loop".to_string());
+                last_blocking_reason = Some(READ_ONLY_STAGNATION_REASON.to_string());
                 pending_feedback = Some(feedback);
                 continue;
             }
         } else if !batch_all_read_only_tools {
-            read_only_streak = 0;
-            stagnation_carryover::record_streak(escalation_carryover, read_only_streak);
+            pressure_inputs.read_only_streak = 0;
+            pressure_inputs.anchor_failures = 0;
+            pressure_inputs.anchor_target = None;
+            pressure_state = transition(pressure_inputs.clone());
+            stagnation_carryover::record_streak(
+                escalation_carryover,
+                pressure_state.read_only_streak(),
+            );
         }
         if required_paths.is_empty()
             && options.allows_tool_only_step_completion()
@@ -2557,22 +2599,23 @@ pub(crate) fn run_session_with_outcome_with_options(
     } else {
         None
     };
-    let read_only_stagnation_reason =
-        if missing.is_empty() && read_only_streak >= READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD {
-            Some("model_stagnation:read_only_loop".to_string())
-        } else {
-            None
-        };
-    let no_progress_stagnation_reason = if missing.is_empty()
-        && read_only_stagnation_reason.is_none()
-        && capability_exhaustion_reason.is_none()
-        && last_blocking_reason.is_none()
-        && last_provider_error.is_none()
-    {
-        Some("model_stagnation:no_progress_recorded".to_string())
-    } else {
-        None
-    };
+    pressure_inputs.missing_paths_present = !missing.is_empty();
+    pressure_inputs.missing_evidence_present = capability_exhaustion_reason.is_some();
+    pressure_inputs.blocking_reason_present = last_blocking_reason.is_some();
+    pressure_inputs.provider_error_present = last_provider_error.is_some();
+    pressure_inputs.remaining_budget = 0;
+    pressure_state = transition(pressure_inputs.clone());
+    let pressure_terminal_reason = super::repair_pressure::exhaustion_reason(&pressure_inputs);
+    let read_only_stagnation_reason = matches!(
+        pressure_terminal_reason,
+        Some(PressureTerminalReason::ReadOnlyLoop)
+    )
+    .then(|| READ_ONLY_STAGNATION_REASON.to_string());
+    let no_progress_stagnation_reason = matches!(
+        pressure_terminal_reason,
+        Some(PressureTerminalReason::NoProgressRecorded)
+    )
+    .then(|| NO_PROGRESS_STAGNATION_REASON.to_string());
     let reason = if !non_scaffold_missing.is_empty() {
         "artifact_follow_through_exhausted".to_string()
     } else if let Some(reason) = &capability_exhaustion_reason {
@@ -2595,7 +2638,7 @@ pub(crate) fn run_session_with_outcome_with_options(
             "missing_evidence": exhaustion_context.missing_evidence.clone(),
             "missing_obligations": exhaustion_context.missing_obligations.clone(),
             "artifact_stagnation_feedback_count": artifact_stagnation_feedback_count,
-            "read_only_streak": read_only_streak,
+            "read_only_streak": pressure_state.read_only_streak(),
             "verify_attempts": verify_attempts,
             "last_blocking_reason": last_blocking_reason,
             "last_provider_error": last_provider_error.as_deref().map(eval_events::body_snippet),

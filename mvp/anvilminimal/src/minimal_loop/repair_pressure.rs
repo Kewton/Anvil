@@ -27,6 +27,16 @@ impl PressureLevel {
     }
 }
 
+impl PressureState {
+    pub(crate) fn read_only_streak(&self) -> usize {
+        self.counters.read_only_streak
+    }
+
+    pub(crate) fn no_progress_feedback_available(&self, limit: usize) -> bool {
+        self.counters.no_progress_streak < limit
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PressureTerminalReason {
     ReadOnlyLoop,
@@ -216,14 +226,11 @@ pub(crate) fn transition(inputs: PressureInputs) -> PressureState {
 }
 
 pub(crate) fn exhaustion_reason(inputs: &PressureInputs) -> Option<PressureTerminalReason> {
-    if inputs.missing_paths_present {
+    if inputs.missing_paths_present || inputs.missing_evidence_present {
         return None;
     }
     if inputs.read_only_streak >= READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD {
         return Some(PressureTerminalReason::ReadOnlyLoop);
-    }
-    if inputs.missing_evidence_present {
-        return None;
     }
     if !inputs.blocking_reason_present && !inputs.provider_error_present {
         return Some(PressureTerminalReason::NoProgressRecorded);
@@ -441,6 +448,7 @@ mod tests {
         );
         assert_eq!(
             exhaustion_reason(&PressureInputs {
+                read_only_streak: 3,
                 missing_evidence_present: true,
                 ..PressureInputs::default()
             }),

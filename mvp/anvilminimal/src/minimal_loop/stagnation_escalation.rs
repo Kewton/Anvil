@@ -13,11 +13,11 @@ use crate::planner::{
 use crate::state::ToolCall;
 use crate::tools::path_guard::normalize_workspace_path;
 
-pub(crate) const READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD: usize = 3;
-pub(crate) const READ_ONLY_STAGNATION_COMPACT_THRESHOLD: usize = 5;
-pub(crate) const READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD: usize = 7;
-pub(crate) const WRITE_REQUIRED_NO_WRITE_LIMIT: usize = 2;
-pub(crate) const READ_ONLY_STAGNATION_REASON: &str = "model_stagnation:read_only_loop";
+pub(crate) use super::repair_pressure::{
+    READ_ONLY_STAGNATION_COMPACT_THRESHOLD, READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD,
+    READ_ONLY_STAGNATION_REASON, READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD,
+    WRITE_REQUIRED_NO_WRITE_LIMIT,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadOnlyStagnationStage {
