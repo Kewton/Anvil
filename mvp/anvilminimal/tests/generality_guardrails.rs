@@ -136,7 +136,8 @@ fn nextjs_boundary_erosion_tripwire_keeps_dispatch_sites_audited() {
 fn runner_chokepoints_do_not_grow_past_interim_budget() {
     for (path, baseline) in [
         ("src/planner/runner.rs", 18_242usize),
-        ("src/minimal_loop/loop_run.rs", 8_347usize),
+        ("src/minimal_loop/loop_run.rs", 7_444usize),
+        ("src/minimal_loop/repair_pressure.rs", 746usize),
         ("src/planner/repair_targeting.rs", 597usize),
         ("src/planner/final_acceptance.rs", 2_942usize),
         ("src/planner/ultra_plan_flow.rs", 1_570usize),

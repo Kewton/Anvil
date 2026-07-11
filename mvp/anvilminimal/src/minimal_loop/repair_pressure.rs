@@ -23,6 +23,7 @@ impl Default for PressureLevel {
 }
 
 impl PressureLevel {
+    #[allow(dead_code)]
     pub(crate) fn feedback_stage(self) -> Option<&'static str> {
         match self {
             Self::Intervention => Some("intervention"),
@@ -51,6 +52,7 @@ pub(crate) enum PressureTerminalReason {
 }
 
 impl PressureTerminalReason {
+    #[allow(dead_code)]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnlyLoop | Self::WriteRequiredExhausted => READ_ONLY_STAGNATION_REASON,

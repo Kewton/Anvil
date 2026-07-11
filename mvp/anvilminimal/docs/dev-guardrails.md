@@ -3,14 +3,15 @@
 ## Runner Growth Tripwire
 
 `src/planner/runner.rs` and `src/minimal_loop/loop_run.rs` are interim group-3
-chokepoints. The extracted planner leaf modules also have file-level growth
-budgets so they do not become replacement chokepoints.
+chokepoints. The extracted planner and minimal-loop leaf modules also have
+file-level growth budgets so they do not become replacement chokepoints.
 
 The CI/test guard records current baselines and fails if any file grows
 above baseline +2%:
 
 - `src/planner/runner.rs`: 18,242 lines
-- `src/minimal_loop/loop_run.rs`: 8,347 lines
+- `src/minimal_loop/loop_run.rs`: 7,444 lines
+- `src/minimal_loop/repair_pressure.rs`: 746 lines
 - `src/planner/repair_targeting.rs`: 597 lines
 - `src/planner/final_acceptance.rs`: 2,942 lines
 - `src/planner/ultra_plan_flow.rs`: 1,570 lines
