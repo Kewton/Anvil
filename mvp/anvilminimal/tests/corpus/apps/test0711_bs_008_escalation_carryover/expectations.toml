@@ -1,0 +1,40 @@
+case_id = "test0711_bs_008_escalation_carryover"
+source = "bs_008 #2 short repair budget escalation carryover regression fixture"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["read_only", "write_required", "escalation", "carryover"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/escalation-carryover.jsonl = [
+  "test0711_bs_008/#2",
+  "\"event\":\"anchor_stagnation_interlock\"",
+  "\"anchor_failures\":2",
+  "\"event\":\"escalation_carryover\"",
+  "\"carried_streak\":1",
+  "\"carried_anchor_failures\":2",
+  "\"pre_advanced\":true",
+  "\"event\":\"read_only_stagnation_feedback\"",
+  "\"stage\":\"write_required\"",
+  "\"phase_scope\":\"final_acceptance_repair\"",
+  "\"selected_targets\":[\"src/app/page.tsx\"]",
+  "\"selection_reason\":\"evidence_mapped\"",
+  "\"event\":\"read_only_tool_rejected\"",
+  "\"reason\":\"model_stagnation:read_only_loop\""
+]

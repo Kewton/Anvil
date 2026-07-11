@@ -51,6 +51,9 @@ use crate::minimal_loop::reachability::{
 use crate::minimal_loop::repair_target::{
     RepairFollowThrough, RepairTarget, classify_repair_follow_through, classify_repair_target,
 };
+use crate::minimal_loop::stagnation_carryover::{
+    EscalationCarryoverHandle, attach_to_options, run_final_acceptance_repair_with_carryover,
+};
 use crate::minimal_loop::verifier_env;
 use crate::planner::intent::detect_intent;
 use crate::planner::lint::{
@@ -2318,6 +2321,7 @@ fn run_step(
     let mut hook_snapshot_restore_used = false;
     let mut current_report_signature = verification_report_signature(&current_report);
     let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
+    let escalation_carryover = EscalationCarryoverHandle::new();
     if !current_reachability.reachable {
         terminal_repair_failure_kind =
             Some(reachability_failure_kind(&current_reachability).to_string());
@@ -2343,6 +2347,8 @@ fn run_step(
             context.repair_attempt = Some(attempt);
             context.compile_reanchored_retry = repair_session_mode == RepairSessionMode::Compact;
             context.compile_narrow_no_snapshot_retry = false;
+            let repair_options =
+                attach_to_options(step_options.clone(), escalation_carryover.clone());
             let mut repair_prompt = if repair_session_mode == RepairSessionMode::Compact {
                 build_compact_compile_repair_prompt_with_context(
                     &step.id,
@@ -2369,7 +2375,7 @@ fn run_step(
                     &context.expected_paths,
                     &repair_config,
                     ui,
-                    step_options.clone(),
+                    repair_options.clone(),
                 ),
                 RepairSessionMode::Compact => {
                     let mut compact_session = SessionSnapshot::new();
@@ -2380,7 +2386,7 @@ fn run_step(
                         &context.expected_paths,
                         &repair_config,
                         ui,
-                        step_options.clone(),
+                        repair_options.clone(),
                     )
                 }
             };
@@ -2767,7 +2773,7 @@ fn run_step(
                             std::slice::from_ref(&target_path),
                             &repair_config,
                             ui,
-                            step_options.clone(),
+                            repair_options.clone(),
                         );
                         let regeneration = match regeneration {
                             Ok(regeneration) => regeneration,
@@ -5435,6 +5441,7 @@ pub fn run_ultra_plan_with_ui(
             prompt: "Final acceptance".to_string(),
         });
         let repair_config = capped_config(config, STEP_REPAIR_MAX_ITERATIONS);
+        let escalation_carryover = EscalationCarryoverHandle::new();
         let repair_started = Instant::now();
         let mut attempts_run = 0;
         let mut exhausted_reason = "bounded_repair_exhausted".to_string();
@@ -5536,13 +5543,14 @@ pub fn run_ultra_plan_with_ui(
                     &target_path,
                 );
                 let mut regeneration_session = SessionSnapshot::new();
-                let regeneration = run_final_acceptance_repair_with_ultra_session(
+                let regeneration = run_final_acceptance_repair_with_carryover(
                     execution,
                     &mut regeneration_session,
                     &regeneration_prompt,
                     std::slice::from_ref(&target_path),
                     &repair_config,
                     ui,
+                    escalation_carryover.clone(),
                 );
                 let regeneration = match regeneration {
                     Ok(regeneration) => regeneration,
@@ -5706,22 +5714,24 @@ pub fn run_ultra_plan_with_ui(
             );
             let repair_outcome = match if evidence_compact_retry {
                 let mut compact_session = SessionSnapshot::new();
-                run_final_acceptance_repair_with_ultra_session(
+                run_final_acceptance_repair_with_carryover(
                     execution,
                     &mut compact_session,
                     &repair_prompt,
                     &repair_required_paths,
                     &repair_config,
                     ui,
+                    escalation_carryover.clone(),
                 )
             } else {
-                run_final_acceptance_repair_with_ultra_session(
+                run_final_acceptance_repair_with_carryover(
                     execution,
                     &mut ultra_session,
                     &repair_prompt,
                     &repair_required_paths,
                     &repair_config,
                     ui,
+                    escalation_carryover.clone(),
                 )
             } {
                 Ok(outcome) => outcome,
@@ -19445,7 +19455,7 @@ if __name__ == "__main__":
     }
 
     #[test]
-    fn ultra_final_acceptance_repair_read_only_stagnation_gets_nudges() {
+    fn ultra_final_acceptance_repair_short_budget_preadvances_to_write_required() {
         let dir = tempfile::tempdir().unwrap();
         let events = dir.path().join("events.jsonl");
         let mut cfg = config(dir.path().to_path_buf());
@@ -19497,12 +19507,11 @@ if __name__ == "__main__":
                     .to_string()
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            stages,
-            vec!["intervention", "compact_restatement", "write_required"]
-        );
+        assert_eq!(stages, vec!["write_required"]);
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(event_text.contains("\"lifecycle_stage\":\"final_acceptance_repair\""));
+        assert!(event_text.contains("\"event\":\"escalation_carryover\""));
+        assert!(event_text.contains("\"pre_advanced\":true"));
     }
 
     #[test]
@@ -19538,8 +19547,6 @@ if __name__ == "__main__":
                 prompt_tokens: None,
                 completion_tokens: None,
             },
-            read_static_page_reply(),
-            read_static_page_reply(),
             read_static_page_reply(),
             AssistantReply {
                 content: String::new(),

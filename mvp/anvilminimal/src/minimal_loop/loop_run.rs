@@ -52,10 +52,10 @@ use super::repair_progress::{
 use super::repair_target::{
     RepairFollowThrough, RepairTarget, classify_repair_follow_through, classify_repair_target,
 };
+use super::stagnation_carryover::{self, EscalationCarryoverHandle};
 use super::stagnation_escalation::{
     READ_ONLY_STAGNATION_INTERVENTION_THRESHOLD, READ_ONLY_STAGNATION_REASON,
-    ReadOnlyStagnationStage, ReadOnlyToolRejectionContext, WRITE_REQUIRED_NO_WRITE_LIMIT,
-    WriteRequiredState,
+    ReadOnlyToolRejectionContext, WriteRequiredState,
 };
 use super::verifier_bootstrap;
 
@@ -228,6 +228,7 @@ pub(crate) struct RunSessionOptions {
     pub step_wall_clock_cap: Option<Duration>,
     pub path_fallback_candidates: Vec<String>,
     pub require_mutation_before_contract_short_circuit: bool,
+    pub escalation_carryover: Option<EscalationCarryoverHandle>,
 }
 
 impl Default for RunSessionOptions {
@@ -245,6 +246,7 @@ impl Default for RunSessionOptions {
             step_wall_clock_cap: None,
             path_fallback_candidates: Vec::new(),
             require_mutation_before_contract_short_circuit: false,
+            escalation_carryover: None,
         }
     }
 }
@@ -285,10 +287,7 @@ impl RunSessionOptions {
             action_no_tool_policy: ActionNoToolPolicy::RequireToolOnlyIfNoToolSeen,
             scope: RunSessionScope::PlanRunStep,
             step_kind: Some(step_kind),
-            dependency_setup_authority: NodeDependencySetupAuthority::None,
-            step_wall_clock_cap: None,
-            path_fallback_candidates: Vec::new(),
-            require_mutation_before_contract_short_circuit: false,
+            ..Self::default()
         }
     }
 
@@ -456,7 +455,7 @@ impl ContractEnforcement {
 }
 
 impl RunSessionScope {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             RunSessionScope::MinimalLoop => "minimal-loop",
             RunSessionScope::PlanRunStep => "plan-run-step",
@@ -1095,7 +1094,6 @@ pub(crate) fn run_session_with_outcome_with_options(
     let artifact_recovery_enabled =
         explicit_required_paths || (contract_runtime_enabled && completion_contract.is_some());
     let mut artifact_non_edit_streak = 0usize;
-    let mut read_only_streak = 0usize;
     let mut artifact_recovery_state = ArtifactRecoveryState::default();
     let mut verify_repair_state = VerifyRepairState::default();
     let mut write_required_state = WriteRequiredState::default();
@@ -1116,6 +1114,12 @@ pub(crate) fn run_session_with_outcome_with_options(
         config.max_iterations
     }
     .saturating_add(EMPTY_RESPONSE_RECOVERY_EXTRA_ITERATIONS);
+    let escalation_carryover = options.escalation_carryover.as_ref();
+    let mut read_only_streak = stagnation_carryover::seed_from_options(
+        &options,
+        config.eval_events_path.as_deref(),
+        config.max_iterations,
+    );
     if let Some(outcome) = maybe_short_circuit_satisfied_step(
         config,
         &options,
@@ -1965,6 +1969,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     if matches!(call.name.as_str(), "Write" | "Edit") {
                         write_or_edit_seen = true;
                         read_only_streak = 0;
+                        stagnation_carryover::record_streak(escalation_carryover, read_only_streak);
                         edit_anchor_recovery_state
                             .note_successful_write(&config.workspace_root, &call.arguments);
                         let write_required_target_written = write_required_state
@@ -1975,6 +1980,10 @@ pub(crate) fn run_session_with_outcome_with_options(
                         if let Some(path) =
                             changed_path_from_call(&config.workspace_root, &call.arguments)
                         {
+                            stagnation_carryover::record_successful_write_path(
+                                escalation_carryover,
+                                &path,
+                            );
                             if !changed_paths.contains(&path) {
                                 changed_paths.push(path.clone());
                             }
@@ -2022,6 +2031,10 @@ pub(crate) fn run_session_with_outcome_with_options(
                             .record_failure(&config.workspace_root, &call.arguments);
                         if let Some(recovery) = &recovery {
                             emit_recovery_event(config.eval_events_path.as_deref(), recovery);
+                            stagnation_carryover::record_anchor_recovery(
+                                escalation_carryover,
+                                recovery,
+                            );
                         }
                         recovery
                     } else {
@@ -2127,6 +2140,7 @@ pub(crate) fn run_session_with_outcome_with_options(
         {
             pending_feedback = Some(feedback);
             if exhausted {
+                stagnation_carryover::record_write_required_exhaustion(escalation_carryover);
                 let objective = read_only_objective_excerpt(user_prompt);
                 let stop_reason =
                     super::stagnation_escalation::record_write_required_exhaustion_and_render_stop(
@@ -2156,6 +2170,7 @@ pub(crate) fn run_session_with_outcome_with_options(
         if batch_reduced_missing_paths {
             artifact_non_edit_streak = 0;
             read_only_streak = 0;
+            stagnation_carryover::record_streak(escalation_carryover, read_only_streak);
             artifact_recovery_state.record_action("required_artifact_progress");
         } else {
             artifact_non_edit_streak += if batch_non_edit_tools > 0 {
@@ -2176,26 +2191,34 @@ pub(crate) fn run_session_with_outcome_with_options(
             && !batch_had_recoverable_tool_error
         {
             read_only_streak = read_only_streak.saturating_add(1);
-            if let Some(feedback) = maybe_read_only_stagnation_feedback(
-                config.eval_events_path.as_deref(),
-                &config.workspace_root,
-                &config.profile,
-                user_prompt,
-                read_only_streak,
-                &options,
-                &mut write_required_state,
-                &verify_repair_state.pending_error_context,
-                &verify_repair_state.changed_paths_at_failure,
-                &required_paths,
-                &changed_paths,
+            stagnation_carryover::record_streak(escalation_carryover, read_only_streak);
+            let anchor_failure = stagnation_carryover::strongest_anchor_failure(
                 edit_anchor_recovery_state.strongest_failure(),
-            ) {
+                escalation_carryover,
+            );
+            if let Some(feedback) =
+                super::read_only_stagnation_feedback::maybe_read_only_stagnation_feedback(
+                    config.eval_events_path.as_deref(),
+                    &config.workspace_root,
+                    &config.profile,
+                    user_prompt,
+                    read_only_streak,
+                    &options,
+                    &mut write_required_state,
+                    &verify_repair_state.pending_error_context,
+                    &verify_repair_state.changed_paths_at_failure,
+                    &required_paths,
+                    &changed_paths,
+                    anchor_failure,
+                )
+            {
                 last_blocking_reason = Some("model_stagnation:read_only_loop".to_string());
                 pending_feedback = Some(feedback);
                 continue;
             }
         } else if !batch_all_read_only_tools {
             read_only_streak = 0;
+            stagnation_carryover::record_streak(escalation_carryover, read_only_streak);
         }
         if required_paths.is_empty()
             && options.allows_tool_only_step_completion()
@@ -4576,154 +4599,6 @@ fn implement_step(options: &RunSessionOptions) -> bool {
 
 fn read_only_objective_excerpt(user_prompt: &str) -> String {
     eval_events::body_snippet(user_prompt)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn maybe_read_only_stagnation_feedback(
-    eval_events_path: Option<&Path>,
-    root: &Path,
-    profile: &str,
-    user_prompt: &str,
-    read_only_streak: usize,
-    options: &RunSessionOptions,
-    write_required_state: &mut WriteRequiredState,
-    pending_error_context: &RunSessionErrorContext,
-    repair_changed_paths: &[String],
-    required_paths: &[String],
-    changed_paths: &[String],
-    anchor_failure: Option<super::edit_anchor_recovery::EditAnchorFailureSummary>,
-) -> Option<String> {
-    let decision = super::anchor_stagnation_interlock::read_only_stagnation_decision(
-        read_only_streak,
-        anchor_failure,
-    )?;
-    let stage = decision.stage;
-    let selection = if stage == ReadOnlyStagnationStage::WriteRequired {
-        let (selection, diagnostic_feedback) =
-            if let Some(selection) = decision.write_required_selection() {
-                (selection, decision.diagnostic_feedback())
-            } else {
-                let mut fallback_candidates = changed_paths.to_vec();
-                for path in &options.path_fallback_candidates {
-                    if !fallback_candidates.iter().any(|existing| existing == path) {
-                        fallback_candidates.push(path.clone());
-                    }
-                }
-                let selection = crate::planner::repair_target_resolution::resolve_repair_targets(
-                    crate::planner::repair_target_resolution::RepairTargetResolutionInput {
-                        root,
-                        profile,
-                        pending_evidence: &pending_error_context.missing_evidence,
-                        missing_capabilities: &pending_error_context.missing_capabilities,
-                        contract_attribute_paths: &[],
-                        repair_changed_paths,
-                        required_paths,
-                        fallback_paths: &fallback_candidates,
-                    },
-                )?
-                .into();
-                let state_binding_feedback =
-                    crate::planner::state_binding_scan::write_required_feedback(
-                        root,
-                        profile,
-                        &pending_error_context.missing_evidence,
-                        &pending_error_context.missing_capabilities,
-                        eval_events_path,
-                    );
-                (selection, state_binding_feedback)
-            };
-        write_required_state.activate_with_feedback(selection.clone(), diagnostic_feedback);
-        Some(selection)
-    } else {
-        None
-    };
-    let target_path = selection
-        .as_ref()
-        .and_then(|selection| selection.primary_target())
-        .or_else(|| {
-            decision
-                .anchor_failure
-                .as_ref()
-                .map(|failure| failure.path.as_str())
-        })
-        .unwrap_or("");
-    let selected_targets = selection
-        .as_ref()
-        .map(|selection| selection.selected_targets.clone())
-        .or_else(|| {
-            decision
-                .anchor_failure
-                .as_ref()
-                .map(|failure| vec![failure.path.clone()])
-        })
-        .unwrap_or_default();
-    let selection_reason = selection
-        .as_ref()
-        .map(|selection| selection.selection_reason.as_str())
-        .or_else(|| decision.anchor_interlocked().then_some("anchor_failure"))
-        .unwrap_or("");
-    let objective = read_only_objective_excerpt(user_prompt);
-    super::anchor_stagnation_interlock::emit_interlock_event(
-        eval_events_path,
-        &decision,
-        options.scope.as_str(),
-        options
-            .step_kind
-            .map(RunSessionStepKind::as_str)
-            .unwrap_or(""),
-        options.phase_scope.as_deref(),
-    );
-    eval_events::emit(
-        eval_events_path,
-        json!({
-            "event": "read_only_stagnation_feedback",
-            "stage": stage.as_str(),
-            "read_only_streak": read_only_streak,
-            "objective": objective,
-            "target_path": target_path,
-            "selected_targets": selected_targets,
-            "selection_reason": selection_reason,
-            "session_scope": options.scope.as_str(),
-            "step_kind": options.step_kind.map(RunSessionStepKind::as_str).unwrap_or(""),
-            "phase_scope": options.phase_scope.as_deref().unwrap_or(""),
-        }),
-    );
-    Some(match stage {
-        ReadOnlyStagnationStage::Intervention if decision.anchor_interlocked() => decision
-            .full_file_write_feedback(&objective)
-            .unwrap_or_else(|| super::feedback::read_only_stagnation(&objective, read_only_streak)),
-        ReadOnlyStagnationStage::Intervention => {
-            super::feedback::read_only_stagnation(&objective, read_only_streak)
-        }
-        ReadOnlyStagnationStage::CompactRestatement if decision.anchor_interlocked() => decision
-            .full_file_write_feedback(&objective)
-            .unwrap_or_else(|| {
-                super::feedback::read_only_stagnation_compact(&objective, read_only_streak)
-            }),
-        ReadOnlyStagnationStage::CompactRestatement => {
-            super::feedback::read_only_stagnation_compact(&objective, read_only_streak)
-        }
-        ReadOnlyStagnationStage::WriteRequired if decision.anchor_interlocked() => decision
-            .write_required_feedback(WRITE_REQUIRED_NO_WRITE_LIMIT)
-            .unwrap_or_else(|| {
-                super::stagnation_escalation::append_write_required_diagnostic(
-                    super::stagnation_escalation::read_only_write_required_feedback(
-                        write_required_state.selected_targets(),
-                        read_only_streak,
-                    ),
-                    write_required_state.diagnostic_feedback(),
-                )
-            }),
-        ReadOnlyStagnationStage::WriteRequired => {
-            super::stagnation_escalation::append_write_required_diagnostic(
-                super::stagnation_escalation::read_only_write_required_feedback(
-                    write_required_state.selected_targets(),
-                    read_only_streak,
-                ),
-                write_required_state.diagnostic_feedback(),
-            )
-        }
-    })
 }
 
 struct ArtifactRecoveryFeedbackContext<'a> {

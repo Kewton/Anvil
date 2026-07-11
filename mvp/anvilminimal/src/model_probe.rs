@@ -457,6 +457,7 @@ fn probe_run_options(step_kind: RunSessionStepKind) -> RunSessionOptions {
         step_wall_clock_cap: None,
         path_fallback_candidates: Vec::new(),
         require_mutation_before_contract_short_circuit: false,
+        escalation_carryover: None,
     }
 }
 

@@ -78,7 +78,8 @@ pub(crate) fn read_only_stagnation_decision(
         let stage = if effective_streak >= READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD {
             ReadOnlyStagnationStage::WriteRequired
         } else {
-            ReadOnlyStagnationStage::for_streak(read_only_streak)?
+            ReadOnlyStagnationStage::for_streak(effective_streak)
+                .or_else(|| ReadOnlyStagnationStage::for_streak(read_only_streak))?
         };
         return Some(AnchorStagnationDecision {
             stage,
