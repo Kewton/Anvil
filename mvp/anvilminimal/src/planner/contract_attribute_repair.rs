@@ -251,6 +251,58 @@ mod tests {
     use crate::planner::verify::VerificationReport;
     use serde_json::Value;
 
+    #[test]
+    fn embedded_contract_attribute_knowledge_matches_legacy_text() {
+        let contracts = &crate::planner::profiles::nextjs::knowledge::get().contracts;
+        let legacy_guidance = "Contract attribute repair guidance:\n\
+- classification: {classification}\n\
+- missing attribute: `{attribute}`\n\
+- target source file: `{path}`\n\
+- contract requirement: {requirement}\n\
+- location directive: add the missing attribute to the route-bound container, control, or status element in the same rendered hierarchy as the existing hooks below.\n\
+Existing hook locations:\n\
+{excerpts}\n\
+Generic one-line example:\n\
+- {example}\n";
+        assert_eq!(
+            contracts.contract_attribute_missing_kind,
+            CONTRACT_ATTRIBUTE_MISSING_KIND
+        );
+        assert_eq!(contracts.contract_attribute_guidance, legacy_guidance);
+        assert_eq!(
+            contracts.state_requirement,
+            requirement_for_attribute("data-anvil-state")
+        );
+        assert_eq!(
+            contracts.restart_requirement,
+            requirement_for_attribute("data-anvil-action=\"restart\"")
+        );
+        assert_eq!(
+            contracts.input_requirement,
+            requirement_for_attribute("data-anvil-action=\"input\"")
+        );
+        assert_eq!(
+            contracts.primary_requirement,
+            requirement_for_attribute("data-anvil-action=\"primary\"")
+        );
+        assert_eq!(
+            contracts.state_example,
+            example_for_attribute("data-anvil-state")
+        );
+        assert_eq!(
+            contracts.restart_example,
+            example_for_attribute("data-anvil-action=\"restart\"")
+        );
+        assert_eq!(
+            contracts.input_example,
+            example_for_attribute("data-anvil-action=\"input\"")
+        );
+        assert_eq!(
+            contracts.primary_example,
+            example_for_attribute("data-anvil-action=\"primary\"")
+        );
+    }
+
     fn report_with_failure(command: &str, reason: &str) -> VerificationReport {
         let mut report = VerificationReport::pass();
         report.push_command_failure(command, reason);

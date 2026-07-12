@@ -10,6 +10,10 @@ pub(crate) struct NextJsKnowledge {
     pub(crate) deterministic_keywords: DeterministicKeywords,
     pub(crate) setup_classifier: SetupClassifierKnowledge,
     pub(crate) template_owned_artifacts: TemplateOwnedArtifactKnowledge,
+    #[allow(dead_code)]
+    pub(crate) contracts: ContractKnowledge,
+    #[allow(dead_code)]
+    pub(crate) canonical: CanonicalKnowledge,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +62,42 @@ pub(crate) struct TemplateOwnedArtifactKnowledge {
     pub(crate) artifact_path_contains: Vec<String>,
     pub(crate) package_check_marker: String,
     pub(crate) scaffold_check_marker: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct ContractKnowledge {
+    pub(crate) state_binding_contract: String,
+    pub(crate) input_coupled_dimension_requirement: String,
+    pub(crate) contract_attribute_missing_kind: String,
+    pub(crate) contract_attribute_guidance: String,
+    pub(crate) state_requirement: String,
+    pub(crate) restart_requirement: String,
+    pub(crate) input_requirement: String,
+    pub(crate) primary_requirement: String,
+    pub(crate) state_example: String,
+    pub(crate) restart_example: String,
+    pub(crate) input_example: String,
+    pub(crate) primary_example: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct CanonicalKnowledge {
+    pub(crate) package_script_build: String,
+    pub(crate) package_script_dev: String,
+    pub(crate) package_script_start: String,
+    pub(crate) required_hooks: Vec<String>,
+    pub(crate) scaffold_files: Vec<String>,
+    pub(crate) tailwind_config_rels: Vec<String>,
+    pub(crate) tailwind_config: String,
+    pub(crate) tailwind_config_cjs: String,
+    pub(crate) package_json: String,
+    pub(crate) tsconfig: String,
+    pub(crate) postcss_config: String,
+    pub(crate) tailwind_css: String,
+    pub(crate) global_d_ts: String,
+    pub(crate) layout_tsx: String,
 }
 
 pub(crate) fn get() -> &'static NextJsKnowledge {
@@ -297,5 +337,63 @@ mod tests {
             knowledge.template_owned_artifacts.scaffold_check_marker,
             "scaffold tsconfig postcss tailwind"
         );
+    }
+
+    #[test]
+    fn canonical_values_match_legacy_rust_values() {
+        use crate::planner::profile::ProfileHookAttribute;
+
+        let canonical = &get().canonical;
+        assert_eq!(canonical.package_script_build, "next build");
+        assert_eq!(canonical.package_script_dev, "next dev -p {port}");
+        assert_eq!(canonical.package_script_start, "next start -p {port}");
+        assert_eq!(
+            canonical.required_hooks,
+            [
+                ProfileHookAttribute::PrimaryAction.display(),
+                ProfileHookAttribute::RestartAction.display(),
+                ProfileHookAttribute::State.display(),
+            ]
+        );
+        assert_eq!(
+            canonical.tailwind_config_rels,
+            strings(&[
+                "tailwind.config.ts",
+                "tailwind.config.js",
+                "tailwind.config.cjs",
+                "tailwind.config.mjs",
+            ])
+        );
+        assert_eq!(
+            canonical.tailwind_config,
+            super::super::canonical_tailwind_config()
+        );
+        assert_eq!(
+            canonical.tailwind_config_cjs,
+            super::super::canonical_tailwind_config_cjs()
+        );
+        assert_eq!(
+            canonical.package_json,
+            super::super::canonical_package_json()
+        );
+        assert_eq!(canonical.tsconfig, super::super::canonical_tsconfig());
+        assert_eq!(
+            canonical.postcss_config,
+            super::super::canonical_postcss_config()
+        );
+        assert_eq!(
+            canonical.tailwind_css,
+            super::super::canonical_tailwind_css()
+        );
+        assert_eq!(canonical.global_d_ts, super::super::canonical_global_d_ts());
+        assert_eq!(canonical.layout_tsx, super::super::canonical_layout_tsx());
+
+        let dir = tempfile::tempdir().unwrap();
+        let loaded_paths = canonical
+            .scaffold_files
+            .iter()
+            .map(|path| path.replace("{tailwind_config}", "tailwind.config.ts"))
+            .collect::<Vec<_>>();
+        assert_eq!(loaded_paths, super::super::setup_scaffold_paths(dir.path()));
     }
 }

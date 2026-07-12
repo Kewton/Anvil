@@ -1192,6 +1192,21 @@ fn missing_if_empty(value: &str) -> &str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn embedded_contract_knowledge_matches_legacy_state_binding_text() {
+        let contracts = &crate::planner::profiles::nextjs::knowledge::get().contracts;
+        assert_eq!(contracts.state_binding_contract, STATE_BINDING_CONTRACT);
+        assert_eq!(
+            contracts.input_coupled_dimension_requirement,
+            "入力は {mutation_refs} を変異させるが data-anvil-state に映らない。入力連動次元（例: プレイヤー/パドルのx座標）をReact stateにミラーしてスナップショットへ追加せよ。"
+        );
+        assert!(
+            contracts
+                .state_binding_contract
+                .contains("at least one dimension that immediately responds to input")
+        );
+    }
+
     fn fixture_source(name: &str) -> String {
         std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR"))
