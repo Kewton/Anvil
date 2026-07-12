@@ -1,0 +1,39 @@
+case_id = "test0712_declarative_knowledge"
+source = "declarative Next.js and evidence knowledge migration snapshot"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = []
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/knowledge-snapshot.jsonl = [
+  "project-setup",
+  "core-implementation",
+  "contract-wiring",
+  "build-verification",
+  "at least one dimension that immediately responds to input",
+  "data-anvil-action=\\\"restart\\\"",
+  "brick",
+  "block",
+  "paddle",
+  "ball",
+  "ブロック",
+  "restart_or_recoverable_state_evidence",
+  "src/app/page.tsx"
+]

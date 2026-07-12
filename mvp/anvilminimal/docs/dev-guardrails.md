@@ -16,8 +16,16 @@ above baseline +2%:
 - `src/planner/final_acceptance.rs`: 2,942 lines
 - `src/planner/ultra_plan_flow.rs`: 1,570 lines
 - `src/planner/assurance.rs`: 1,311 lines
+- `src/planner/profiles/nextjs.rs`: 3,684 lines
+- `src/minimal_loop/evidence.rs`: 6,702 lines
 
 When adding behavior, put new subsystems in new modules and call them from the
 runner. Refactors that shrink these files are allowed; lower the baseline only
 after the shrink is intentional and reviewed. Do not raise a baseline to admit
 growth.
+
+Declarative Next.js and evidence knowledge must be changed in
+`src/planner/profiles/nextjs/knowledge.toml` and
+`src/minimal_loop/evidence_knowledge.toml`, respectively. Before adopting a
+knowledge change, run and record the Space, Breakout, and Quiz scenario matrix
+so vocabulary or contract drift is measured independently from Rust logic.

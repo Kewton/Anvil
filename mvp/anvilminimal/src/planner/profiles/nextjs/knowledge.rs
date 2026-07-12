@@ -10,9 +10,7 @@ pub(crate) struct NextJsKnowledge {
     pub(crate) deterministic_keywords: DeterministicKeywords,
     pub(crate) setup_classifier: SetupClassifierKnowledge,
     pub(crate) template_owned_artifacts: TemplateOwnedArtifactKnowledge,
-    #[allow(dead_code)]
     pub(crate) contracts: ContractKnowledge,
-    #[allow(dead_code)]
     pub(crate) canonical: CanonicalKnowledge,
 }
 
@@ -65,7 +63,6 @@ pub(crate) struct TemplateOwnedArtifactKnowledge {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct ContractKnowledge {
     pub(crate) state_binding_contract: String,
     pub(crate) input_coupled_dimension_requirement: String,
@@ -82,7 +79,6 @@ pub(crate) struct ContractKnowledge {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub(crate) struct CanonicalKnowledge {
     pub(crate) package_script_build: String,
     pub(crate) package_script_dev: String,
@@ -111,289 +107,166 @@ pub(crate) fn get() -> &'static NextJsKnowledge {
 mod tests {
     use super::*;
 
-    const LEGACY_PRESET_PHASES: &[(&str, &str)] = &[
-        (
-            "project-setup",
-            "Scaffold and setup the Next.js App Router project shell. Create or complete the package manifest, TypeScript config, styling config, and route-bound scaffold so the deterministic nextjs-scaffold template owns setup artifacts.",
-        ),
-        (
-            "core-implementation",
-            "Implement the core task-specific behavior for: {goal}. Keep one route-bound implementation, extend the instrumented skeleton instead of replacing it, and keep the implementation in the Next.js route-bound source.",
-        ),
-        (
-            "contract-wiring",
-            "Wire controls and data-anvil observability. Preserve or add data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. The data-anvil-state snapshot must include at least one dimension that immediately responds to input, such as player/paddle x position. When the contract includes start_or_restart_flow, every restart affordance (game-over, victory, and in-play when present) should carry data-anvil-action=\"restart\"; the initial primary action alone cannot satisfy recovery verification.",
-        ),
-        (
-            "build-verification",
-            "Run build verification for the deterministic Next.js scaffold. Verify package scripts, dependency boundary, and npm run build / next build only; keep this final phase verification-only.",
-        ),
-    ];
-
-    const LEGACY_SCAFFOLD_PHASE: &[&str] = &[
-        "scaffold",
-        "setup",
-        "set up",
-        "project shell",
-        "initialize",
-        "initialise",
-        "bootstrap",
-        "app router scaffold",
-        "初期",
-        "セットアップ",
-    ];
-    const LEGACY_SCAFFOLD_PHASE_ID: &[&str] = &[
-        "scaffold",
-        "setup",
-        "set-up",
-        "project-setup",
-        "bootstrap",
-        "initialize",
-        "initialise",
-    ];
-    const LEGACY_PORT_SCRIPT_PHASE: &[&str] = &[
-        "script",
-        "package",
-        "package.json",
-        "dev/start",
-        "dev script",
-        "start script",
-        "設定",
-    ];
-    const LEGACY_BUILD_VERIFY_PHASE: &[&str] = &[
-        "build verification",
-        "verify build",
-        "build verifier",
-        "npm run build",
-        "next build",
-        "ビルド検証",
-    ];
-    const LEGACY_IMPLEMENTATION_PHASE: &[&str] = &[
-        "game logic",
-        "gameplay",
-        "mechanic",
-        "adversary",
-        "challenge",
-        "collision",
-        "failure rule",
-        "score",
-        "player control",
-        "canvas",
-        "stateful update",
-        "user input",
-        "interactive surface",
-        "ゲームロジック",
-        "衝突",
-        "スコア",
-        "敵",
-        "プレイヤー",
-        "操作",
-    ];
-
-    fn strings(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_string()).collect()
+    #[test]
+    fn embedded_preset_has_byte_stable_phase_body() {
+        let preset = &get().preset;
+        assert_eq!(preset.profile, "nextjs");
+        assert_eq!(preset.style, "default");
+        assert_eq!(preset.intent, "create");
+        assert_eq!(
+            preset
+                .phases
+                .iter()
+                .map(|phase| phase.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "project-setup",
+                "core-implementation",
+                "contract-wiring",
+                "build-verification",
+            ]
+        );
+        assert_eq!(
+            preset.phases[0].prompt,
+            "Scaffold and setup the Next.js App Router project shell. Create or complete the package manifest, TypeScript config, styling config, and route-bound scaffold so the deterministic nextjs-scaffold template owns setup artifacts."
+        );
+        assert_eq!(
+            preset.phases[1].prompt,
+            "Implement the core task-specific behavior for: {goal}. Keep one route-bound implementation, extend the instrumented skeleton instead of replacing it, and keep the implementation in the Next.js route-bound source."
+        );
+        assert!(
+            preset.phases[2]
+                .prompt
+                .contains("at least one dimension that immediately responds to input")
+        );
+        assert_eq!(
+            preset.phases[3].prompt,
+            "Run build verification for the deterministic Next.js scaffold. Verify package scripts, dependency boundary, and npm run build / next build only; keep this final phase verification-only."
+        );
     }
 
     #[test]
-    fn embedded_knowledge_parses_and_matches_legacy_preset_bytes() {
+    fn embedded_matcher_knowledge_keeps_required_tokens() {
         let knowledge = get();
-        assert_eq!(knowledge.preset.profile, "nextjs");
-        assert_eq!(knowledge.preset.style, "default");
-        assert_eq!(knowledge.preset.intent, "create");
-        assert_eq!(knowledge.preset.phases.len(), LEGACY_PRESET_PHASES.len());
-        for (phase, (legacy_id, legacy_prompt)) in knowledge
-            .preset
-            .phases
-            .iter()
-            .zip(LEGACY_PRESET_PHASES.iter())
-        {
-            assert_eq!(phase.id, *legacy_id);
-            assert_eq!(phase.prompt, *legacy_prompt);
+        for token in ["scaffold", "setup", "セットアップ"] {
+            assert!(
+                knowledge
+                    .deterministic_keywords
+                    .scaffold_phase
+                    .iter()
+                    .any(|candidate| candidate == token)
+            );
         }
-    }
-
-    #[test]
-    fn deterministic_keywords_match_legacy_arrays() {
-        let keywords = &get().deterministic_keywords;
-        assert_eq!(keywords.scaffold_phase, strings(LEGACY_SCAFFOLD_PHASE));
-        assert_eq!(
-            keywords.scaffold_phase_id,
-            strings(LEGACY_SCAFFOLD_PHASE_ID)
+        for token in ["game logic", "collision", "スコア", "敵"] {
+            assert!(
+                knowledge
+                    .deterministic_keywords
+                    .implementation_phase
+                    .iter()
+                    .any(|candidate| candidate == token)
+            );
+        }
+        assert!(
+            knowledge
+                .template_owned_artifacts
+                .package_phrases
+                .contains(&"port script".to_string())
         );
-        assert_eq!(keywords.port_phase_markers, strings(&["port", "ポート"]));
-        assert_eq!(
-            keywords.port_script_phase,
-            strings(LEGACY_PORT_SCRIPT_PHASE)
-        );
-        assert_eq!(
-            keywords.build_verify_phase,
-            strings(LEGACY_BUILD_VERIFY_PHASE)
-        );
-        assert_eq!(
-            keywords.implementation_phase,
-            strings(LEGACY_IMPLEMENTATION_PHASE)
+        assert!(
+            knowledge
+                .template_owned_artifacts
+                .artifact_path_contains
+                .contains(&"postcss.config.".to_string())
         );
     }
 
     #[test]
-    fn setup_and_template_owned_tokens_match_legacy_values() {
-        let knowledge = get();
+    fn embedded_contract_knowledge_keeps_required_body() {
+        let contracts = &get().contracts;
         assert_eq!(
-            knowledge.setup_classifier.package_phrases,
-            strings(&[
-                "package.json",
-                "package manifest",
-                "package script",
-                "port script",
-            ])
+            contracts.contract_attribute_missing_kind,
+            "contract_attribute_missing"
         );
+        assert!(
+            contracts
+                .state_binding_contract
+                .contains("after start and after input")
+        );
+        assert!(
+            contracts
+                .state_binding_contract
+                .contains("at least one dimension that immediately responds to input")
+        );
+        assert!(
+            contracts
+                .input_coupled_dimension_requirement
+                .contains("入力連動次元（例: プレイヤー/パドルのx座標）")
+        );
+        for placeholder in [
+            "{classification}",
+            "{attribute}",
+            "{path}",
+            "{requirement}",
+            "{excerpts}",
+            "{example}",
+        ] {
+            assert!(contracts.contract_attribute_guidance.contains(placeholder));
+        }
         assert_eq!(
-            knowledge.setup_classifier.package_tokens,
-            strings(&["script", "scripts", "manifest", "port"])
+            contracts.state_example,
+            "data-anvil-state={JSON.stringify({ phase, score, playerX })}"
         );
-        assert_eq!(
-            knowledge.setup_classifier.scaffold_phrases,
-            strings(&[
-                "scaffold",
-                "project shell",
-                "tsconfig",
-                "postcss",
-                "tailwind",
-            ])
-        );
-        assert_eq!(
-            knowledge.setup_classifier.scaffold_tokens,
-            strings(&["config"])
-        );
-        assert_eq!(
-            knowledge.setup_classifier.scaffold_setup_markers,
-            strings(&["setup", "set up"])
-        );
-        assert_eq!(
-            knowledge.setup_classifier.scaffold_project_marker,
-            "project"
-        );
-        assert_eq!(
-            knowledge.setup_classifier.scaffold_dependency_exclusion,
-            "dependenc"
-        );
-        assert_eq!(
-            knowledge.template_owned_artifacts.package_phrases,
-            strings(&[
-                "package.json",
-                "package manifest",
-                "package script",
-                "npm script",
-                "port script",
-                "dev script",
-                "start script",
-                "build script",
-            ])
-        );
-        assert_eq!(
-            knowledge.template_owned_artifacts.package_tokens,
-            strings(&["scripts", "port", "ports"])
-        );
-        assert_eq!(
-            knowledge.template_owned_artifacts.scaffold_phrases,
-            strings(&[
-                "tsconfig",
-                "postcss",
-                "tailwind",
-                "next.config",
-                "next-env.d.ts",
-                "src/app/layout.tsx",
-                "src/app/globals.css",
-                "src/app/global.d.ts",
-            ])
-        );
-        assert_eq!(
-            knowledge.template_owned_artifacts.scaffold_tokens,
-            strings(&["scaffold", "scaffolding"])
-        );
-        assert_eq!(
-            knowledge.template_owned_artifacts.package_manifest_names,
-            strings(&["package.json"])
-        );
-        assert_eq!(
-            knowledge.template_owned_artifacts.artifact_path_suffixes,
-            strings(&[
-                "tsconfig.json",
-                "next-env.d.ts",
-                "src/app/layout.tsx",
-                "src/app/globals.css",
-                "src/app/global.d.ts",
-            ])
-        );
-        assert_eq!(
-            knowledge.template_owned_artifacts.artifact_path_contains,
-            strings(&["postcss.config.", "tailwind.config.", "next.config."])
-        );
-        assert_eq!(
-            knowledge.template_owned_artifacts.package_check_marker,
-            "package.json scripts port"
-        );
-        assert_eq!(
-            knowledge.template_owned_artifacts.scaffold_check_marker,
-            "scaffold tsconfig postcss tailwind"
-        );
+        assert_eq!(contracts.restart_example, "data-anvil-action=\"restart\"");
+        assert_eq!(contracts.input_example, "data-anvil-action=\"input\"");
+        assert_eq!(contracts.primary_example, "data-anvil-action=\"primary\"");
     }
 
     #[test]
-    fn canonical_values_match_legacy_rust_values() {
-        use crate::planner::profile::ProfileHookAttribute;
-
+    fn embedded_canonical_knowledge_keeps_scaffold_contract() {
         let canonical = &get().canonical;
         assert_eq!(canonical.package_script_build, "next build");
         assert_eq!(canonical.package_script_dev, "next dev -p {port}");
         assert_eq!(canonical.package_script_start, "next start -p {port}");
         assert_eq!(
             canonical.required_hooks,
-            [
-                ProfileHookAttribute::PrimaryAction.display(),
-                ProfileHookAttribute::RestartAction.display(),
-                ProfileHookAttribute::State.display(),
+            vec![
+                "data-anvil-action=\"primary\"",
+                "data-anvil-action=\"restart\"",
+                "data-anvil-state",
             ]
         );
-        assert_eq!(
-            canonical.tailwind_config_rels,
-            strings(&[
-                "tailwind.config.ts",
-                "tailwind.config.js",
-                "tailwind.config.cjs",
-                "tailwind.config.mjs",
-            ])
-        );
-        assert_eq!(
-            canonical.tailwind_config,
-            super::super::canonical_tailwind_config()
-        );
-        assert_eq!(
-            canonical.tailwind_config_cjs,
-            super::super::canonical_tailwind_config_cjs()
-        );
-        assert_eq!(
-            canonical.package_json,
-            super::super::canonical_package_json()
-        );
-        assert_eq!(canonical.tsconfig, super::super::canonical_tsconfig());
+        assert_eq!(canonical.scaffold_files.len(), 8);
+        assert_eq!(canonical.scaffold_files[0], "package.json");
+        assert_eq!(canonical.scaffold_files[3], "{tailwind_config}");
+        assert_eq!(canonical.scaffold_files[7], "src/app/global.d.ts");
+        assert_eq!(canonical.tailwind_config_rels[0], "tailwind.config.ts");
+        assert_eq!(canonical.tailwind_config_rels.len(), 4);
+
+        let package: serde_json::Value = serde_json::from_str(&canonical.package_json).unwrap();
+        assert_eq!(package["scripts"]["build"], "next build");
+        assert_eq!(package["scripts"]["dev"], "next dev -p 3011");
+        assert_eq!(package["scripts"]["start"], "next start -p 3011");
+        assert!(canonical.package_json.ends_with("}\n"));
+        assert!(serde_json::from_str::<serde_json::Value>(&canonical.tsconfig).is_ok());
         assert_eq!(
             canonical.postcss_config,
-            super::super::canonical_postcss_config()
+            "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n"
         );
         assert_eq!(
             canonical.tailwind_css,
-            super::super::canonical_tailwind_css()
+            "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"
         );
-        assert_eq!(canonical.global_d_ts, super::super::canonical_global_d_ts());
-        assert_eq!(canonical.layout_tsx, super::super::canonical_layout_tsx());
-
-        let dir = tempfile::tempdir().unwrap();
-        let loaded_paths = canonical
-            .scaffold_files
-            .iter()
-            .map(|path| path.replace("{tailwind_config}", "tailwind.config.ts"))
-            .collect::<Vec<_>>();
-        assert_eq!(loaded_paths, super::super::setup_scaffold_paths(dir.path()));
+        assert_eq!(canonical.global_d_ts, "declare module \"*.css\";\n");
+        assert!(
+            canonical
+                .tailwind_config
+                .ends_with("export default config;\n")
+        );
+        assert!(canonical.tailwind_config_cjs.ends_with("};\n"));
+        assert!(
+            canonical
+                .layout_tsx
+                .contains("export default function RootLayout")
+        );
     }
 }

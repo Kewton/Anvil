@@ -47,3 +47,25 @@ reason strings. Converted verification paths are evidence dependencies rather
 than mutating ownership claims, so they do not conflict with an implementation
 step that owns the same path; duplicate ownership between mutating steps still
 fails lint. A failing port check still enters the executor repair path.
+
+## Declarative Knowledge Extraction (2026-07-12)
+
+The following values moved without byte changes to embedded TOML files:
+
+- `src/planner/profiles/nextjs/knowledge.toml`: preset UltraPlan phase ids and
+  prompts; deterministic scaffold, port, build, and implementation matcher
+  tokens; setup and template-owned artifact tokens; state-binding and contract
+  attribute guidance; canonical package scripts, required hooks, scaffold
+  paths, and scaffold file bodies.
+- `src/minimal_loop/evidence_knowledge.toml`: visible-surface, input-handler,
+  state-update, adversary, motion, score, failure, restart, and persistence
+  vocabulary; goal stopwords and Japanese-to-English translations; behavioral
+  evidence keys and ordered Next.js repair target candidates.
+
+Both files are embedded with `include_str!`, parsed once through `OnceLock`,
+and have no runtime fallback. Migration golden tests fixed the old Rust values
+before the final reference switch; retained tests cover the embedded body,
+ordering, translation lookup, contract wording, and canonical JSON structure.
+No functional issue was discovered during this extraction. The initial
+sandboxed full test run could not bind local browser-probe ports; the same test
+command passed when run with local-port permission, without a code change.

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use crate::minimal_loop::evidence_knowledge;
 use crate::minimal_loop::import_scan::{
     MissingImport, format_missing_import_findings, missing_import_target_path, route_bound_closure,
     scan_relative_imports,
@@ -306,16 +307,13 @@ pub fn setup_scaffold_paths(root: &Path) -> Vec<String> {
         .as_ref()
         .map(|project| project.path.as_path())
         .unwrap_or(root);
-    vec![
-        format!("{prefix}package.json"),
-        format!("{prefix}tsconfig.json"),
-        format!("{prefix}postcss.config.js"),
-        format!("{prefix}{}", setup_tailwind_config_rel(project_root)),
-        format!("{prefix}src/app/layout.tsx"),
-        format!("{prefix}src/app/page.tsx"),
-        format!("{prefix}src/app/globals.css"),
-        format!("{prefix}src/app/global.d.ts"),
-    ]
+    knowledge::get()
+        .canonical
+        .scaffold_files
+        .iter()
+        .map(|rel| rel.replace("{tailwind_config}", setup_tailwind_config_rel(project_root)))
+        .map(|rel| format!("{prefix}{rel}"))
+        .collect()
 }
 
 pub fn setup_invariant_required_paths(root: &Path) -> Vec<String> {
@@ -781,12 +779,17 @@ pub fn app_source_paths(root: &Path) -> Vec<String> {
 }
 
 pub fn evidence_repair_target_paths(root: &Path, evidence_keys: &[String]) -> Vec<String> {
-    if !evidence_keys
+    let Some(mapping) = evidence_knowledge::get()
+        .repair_targets
         .iter()
-        .any(|key| behavioral_repair_evidence(key))
-    {
+        .find(|mapping| {
+            evidence_keys
+                .iter()
+                .any(|key| mapping.evidence_kinds.iter().any(|kind| kind == key.trim()))
+        })
+    else {
         return Vec::new();
-    }
+    };
     let route_bound = route_bound_source_paths(root);
     let mut out = Vec::new();
     for rel in route_bound
@@ -795,28 +798,10 @@ pub fn evidence_repair_target_paths(root: &Path, evidence_keys: &[String]) -> Ve
     {
         push_unique_path(&mut out, rel);
     }
-    for entrypoint in [
-        "src/app/page.tsx",
-        "src/app/page.jsx",
-        "src/app/page.ts",
-        "src/app/page.js",
-        "app/page.tsx",
-        "app/page.jsx",
-        "app/page.ts",
-        "app/page.js",
-        "pages/index.tsx",
-        "pages/index.jsx",
-        "pages/index.ts",
-        "pages/index.js",
-        "src/pages/index.tsx",
-        "src/pages/index.jsx",
-        "src/pages/index.ts",
-        "src/pages/index.js",
-    ] {
-        for rel in route_bound
-            .iter()
-            .filter(|rel| rel.as_str() == entrypoint || rel.ends_with(&format!("/{entrypoint}")))
-        {
+    for entrypoint in &mapping.path_candidates {
+        for rel in route_bound.iter().filter(|rel| {
+            rel.as_str() == entrypoint.as_str() || rel.ends_with(&format!("/{entrypoint}"))
+        }) {
             push_unique_path(&mut out, rel);
         }
     }
@@ -831,11 +816,27 @@ pub fn hook_snapshot_targets(root: &Path) -> Vec<ProfileHookSnapshotTarget> {
         .into_iter()
         .map(|relative_path| ProfileHookSnapshotTarget {
             relative_path,
-            required_attributes: vec![
-                ProfileHookAttribute::PrimaryAction,
-                ProfileHookAttribute::RestartAction,
-                ProfileHookAttribute::State,
-            ],
+            required_attributes: required_hook_attributes(),
+        })
+        .collect()
+}
+
+fn required_hook_attributes() -> Vec<ProfileHookAttribute> {
+    let known = [
+        ProfileHookAttribute::PrimaryAction,
+        ProfileHookAttribute::RestartAction,
+        ProfileHookAttribute::State,
+    ];
+    knowledge::get()
+        .canonical
+        .required_hooks
+        .iter()
+        .map(|hook| {
+            known
+                .iter()
+                .copied()
+                .find(|attribute| attribute.display() == hook.as_str())
+                .unwrap_or_else(|| panic!("unsupported embedded Next.js required hook: {hook}"))
         })
         .collect()
 }
@@ -850,21 +851,6 @@ fn route_bound_source_paths(root: &Path) -> Vec<String> {
 
 fn source_contains_data_anvil(root: &Path, rel: &str) -> bool {
     std::fs::read_to_string(root.join(rel)).is_ok_and(|content| content.contains("data-anvil-"))
-}
-
-fn behavioral_repair_evidence(key: &str) -> bool {
-    matches!(
-        key.trim(),
-        "restart_or_recoverable_state_evidence"
-            | "challenge_or_adversary_evidence"
-            | "failure_or_collision_evidence"
-            | "user_input_handler_evidence"
-            | "stateful_update_evidence"
-            | "visible_interactive_surface_evidence"
-            | "interactive_ui_source_evidence"
-            | "non_static_screen_evidence"
-            | "score_or_progression_evidence"
-    )
 }
 
 fn push_unique_path(out: &mut Vec<String>, path: &str) {
@@ -1098,19 +1084,20 @@ fn locate_project_root(root: &Path) -> Result<ProjectRoot, String> {
     }
 }
 
-const TAILWIND_CONFIG_RELS: &[&str] = &[
-    "tailwind.config.ts",
-    "tailwind.config.js",
-    "tailwind.config.cjs",
-    "tailwind.config.mjs",
-];
-
 fn setup_tailwind_config_rel(project_root: &Path) -> &'static str {
-    TAILWIND_CONFIG_RELS
+    knowledge::get()
+        .canonical
+        .tailwind_config_rels
         .iter()
-        .copied()
+        .map(String::as_str)
         .find(|rel| project_root.join(rel).is_file())
-        .unwrap_or("tailwind.config.ts")
+        .unwrap_or_else(|| {
+            knowledge::get()
+                .canonical
+                .tailwind_config_rels
+                .first()
+                .expect("embedded Next.js tailwind config candidates must not be empty")
+        })
 }
 
 fn ensure_package_json(root: &Path, goal: &str) -> anyhow::Result<()> {
@@ -1146,12 +1133,17 @@ fn ensure_package_json(root: &Path, goal: &str) -> anyhow::Result<()> {
     }
     let scripts = object_entry(&mut package, "scripts");
     let requested_port = requested_or_default_port(goal);
-    let dev = format!("next dev -p {requested_port}");
+    let canonical = &knowledge::get().canonical;
+    let port = requested_port.to_string();
+    let dev = canonical.package_script_dev.replace("{port}", &port);
     scripts.insert("dev".to_string(), Value::String(dev));
-    scripts.insert("build".to_string(), Value::String("next build".to_string()));
+    scripts.insert(
+        "build".to_string(),
+        Value::String(canonical.package_script_build.clone()),
+    );
     scripts.insert(
         "start".to_string(),
-        Value::String(format!("next start -p {requested_port}")),
+        Value::String(canonical.package_script_start.replace("{port}", &port)),
     );
     let content = serde_json::to_string_pretty(&Value::Object(package))?;
     std::fs::write(path, format!("{content}\n"))?;
@@ -1219,52 +1211,35 @@ fn write_file_if_changed(path: &Path, content: &str) -> anyhow::Result<bool> {
 }
 
 fn canonical_tailwind_config() -> &'static str {
-    "import type { Config } from \"tailwindcss\";\n\nconst config: Config = {\n  content: [\n    \"./src/pages/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/components/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/app/**/*.{js,ts,jsx,tsx,mdx}\",\n  ],\n  theme: { extend: {} },\n  plugins: [],\n};\n\nexport default config;\n"
+    &knowledge::get().canonical.tailwind_config
 }
 
 fn canonical_tailwind_config_cjs() -> &'static str {
-    "module.exports = {\n  content: [\n    \"./src/pages/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/components/**/*.{js,ts,jsx,tsx,mdx}\",\n    \"./src/app/**/*.{js,ts,jsx,tsx,mdx}\",\n  ],\n  theme: { extend: {} },\n  plugins: [],\n};\n"
+    &knowledge::get().canonical.tailwind_config_cjs
 }
 
 fn canonical_package_json() -> &'static str {
-    "{\n  \"name\": \"anvilminimal-nextjs-app\",\n  \"version\": \"1.0.0\",\n  \"private\": true,\n  \"dependencies\": {\n    \"next\": \"^14.2.0\",\n    \"react\": \"^18.3.0\",\n    \"react-dom\": \"^18.3.0\"\n  },\n  \"devDependencies\": {\n    \"@types/node\": \"^20.14.0\",\n    \"@types/react\": \"^18.3.0\",\n    \"@types/react-dom\": \"^18.3.0\",\n    \"autoprefixer\": \"^10.4.20\",\n    \"postcss\": \"^8.5.15\",\n    \"tailwindcss\": \"^3.4.19\",\n    \"typescript\": \"^5.5.0\"\n  },\n  \"scripts\": {\n    \"build\": \"next build\",\n    \"dev\": \"next dev -p 3011\",\n    \"start\": \"next start -p 3011\"\n  }\n}\n"
+    &knowledge::get().canonical.package_json
 }
 
 fn canonical_tsconfig() -> &'static str {
-    r#"{"compilerOptions":{"target":"ES2017","lib":["dom","dom.iterable","esnext"],"allowJs":true,"skipLibCheck":true,"strict":true,"noEmit":true,"esModuleInterop":true,"module":"esnext","moduleResolution":"bundler","resolveJsonModule":true,"isolatedModules":true,"jsx":"preserve","incremental":true,"plugins":[{"name":"next"}],"baseUrl":".","paths":{"@/*":["./src/*"]}},"include":["next-env.d.ts","**/*.ts","**/*.tsx",".next/types/**/*.ts"],"exclude":["node_modules"]}"#
+    &knowledge::get().canonical.tsconfig
 }
 
 fn canonical_postcss_config() -> &'static str {
-    "module.exports = { plugins: { tailwindcss: {}, autoprefixer: {} } };\n"
+    &knowledge::get().canonical.postcss_config
 }
 
 fn canonical_tailwind_css() -> &'static str {
-    "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n"
+    &knowledge::get().canonical.tailwind_css
 }
 
 fn canonical_global_d_ts() -> &'static str {
-    "declare module \"*.css\";\n"
+    &knowledge::get().canonical.global_d_ts
 }
 
 fn canonical_layout_tsx() -> &'static str {
-    r#"import type { Metadata } from "next";
-import "./globals.css";
-
-export const metadata: Metadata = {
-  title: "Interactive Challenge",
-  description: "A compact interactive challenge generated by anvilminimal",
-};
-
-export default function RootLayout({
-  children,
-}: Readonly<{ children: React.ReactNode }>) {
-  return (
-    <html lang="en">
-      <body>{children}</body>
-    </html>
-  );
-}
-"#
+    &knowledge::get().canonical.layout_tsx
 }
 
 fn missing_app_relative_import_contract_failure(root: &Path) -> Option<String> {
@@ -2154,7 +2129,9 @@ fn has_tailwind_config(root: &Path) -> bool {
 }
 
 fn tailwind_config_paths(root: &Path) -> Vec<PathBuf> {
-    TAILWIND_CONFIG_RELS
+    knowledge::get()
+        .canonical
+        .tailwind_config_rels
         .iter()
         .map(|rel| root.join(rel))
         .filter(|path| path.is_file())

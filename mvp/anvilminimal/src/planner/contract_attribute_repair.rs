@@ -3,9 +3,12 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::eval_events;
+use crate::planner::profiles::nextjs::knowledge;
 use crate::planner::verify::VerificationReport;
 
-pub const CONTRACT_ATTRIBUTE_MISSING_KIND: &str = "contract_attribute_missing";
+pub fn missing_kind() -> &'static str {
+    &knowledge::get().contracts.contract_attribute_missing_kind
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractAttributeIssue {
@@ -61,21 +64,46 @@ pub(crate) fn guidance_for_issue(
     eval_events_path: Option<&Path>,
 ) -> String {
     emit_guidance_event(eval_events_path, &issue);
-    format!(
-        "Contract attribute repair guidance:\n\
-- classification: {CONTRACT_ATTRIBUTE_MISSING_KIND}\n\
-- missing attribute: `{attribute}`\n\
-- target source file: `{path}`\n\
-- contract requirement: {requirement}\n\
-- location directive: add the missing attribute to the route-bound container, control, or status element in the same rendered hierarchy as the existing hooks below.\n\
-Existing hook locations:\n{excerpts}\n\
-Generic one-line example:\n- {example}\n",
-        attribute = issue.attribute,
-        path = issue.path,
-        requirement = requirement_for_attribute(&issue.attribute),
-        excerpts = hook_location_excerpts(root, &issue.path),
-        example = example_for_attribute(&issue.attribute),
+    let contracts = &knowledge::get().contracts;
+    let requirement = requirement_for_attribute(&issue.attribute);
+    let excerpts = hook_location_excerpts(root, &issue.path);
+    let example = example_for_attribute(&issue.attribute);
+    render_guidance_template(
+        &contracts.contract_attribute_guidance,
+        &[
+            (
+                "{classification}",
+                contracts.contract_attribute_missing_kind.as_str(),
+            ),
+            ("{attribute}", &issue.attribute),
+            ("{path}", &issue.path),
+            ("{requirement}", requirement),
+            ("{excerpts}", &excerpts),
+            ("{example}", example),
+        ],
     )
+}
+
+fn render_guidance_template(template: &str, replacements: &[(&str, &str)]) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remaining = template;
+    loop {
+        let next = replacements
+            .iter()
+            .filter_map(|(placeholder, value)| {
+                remaining
+                    .find(placeholder)
+                    .map(|index| (index, *placeholder, *value))
+            })
+            .min_by_key(|(index, _, _)| *index);
+        let Some((index, placeholder, value)) = next else {
+            rendered.push_str(remaining);
+            return rendered;
+        };
+        rendered.push_str(&remaining[..index]);
+        rendered.push_str(value);
+        remaining = &remaining[index + placeholder.len()..];
+    }
 }
 
 fn emit_guidance_event(eval_events_path: Option<&Path>, issue: &ContractAttributeIssue) {
@@ -154,26 +182,28 @@ fn looks_like_source_path(path: &str) -> bool {
 }
 
 fn requirement_for_attribute(attribute: &str) -> &'static str {
+    let contracts = &knowledge::get().contracts;
     if attribute == "data-anvil-state" {
-        "provide a meaningful visible-state JSON snapshot after each render, and include at least one input-coupled dimension such as a player or paddle x coordinate."
+        &contracts.state_requirement
     } else if attribute.contains("restart") {
-        "mark every restart, retry, or new-game affordance that resets observable state; the primary action alone is not restart evidence."
+        &contracts.restart_requirement
     } else if attribute.contains("input") {
-        "mark the main text entry surface when one exists so interaction probes can target input behavior."
+        &contracts.input_requirement
     } else {
-        "mark the main start, submit, or primary action control so interaction probes can start the experience deterministically."
+        &contracts.primary_requirement
     }
 }
 
 fn example_for_attribute(attribute: &str) -> &'static str {
+    let contracts = &knowledge::get().contracts;
     if attribute == "data-anvil-state" {
-        r#"data-anvil-state={JSON.stringify({ phase, score, playerX })}"#
+        &contracts.state_example
     } else if attribute.contains("restart") {
-        r#"data-anvil-action="restart""#
+        &contracts.restart_example
     } else if attribute.contains("input") {
-        r#"data-anvil-action="input""#
+        &contracts.input_example
     } else {
-        r#"data-anvil-action="primary""#
+        &contracts.primary_example
     }
 }
 
@@ -252,23 +282,19 @@ mod tests {
     use serde_json::Value;
 
     #[test]
-    fn embedded_contract_attribute_knowledge_matches_legacy_text() {
-        let contracts = &crate::planner::profiles::nextjs::knowledge::get().contracts;
-        let legacy_guidance = "Contract attribute repair guidance:\n\
-- classification: {classification}\n\
-- missing attribute: `{attribute}`\n\
-- target source file: `{path}`\n\
-- contract requirement: {requirement}\n\
-- location directive: add the missing attribute to the route-bound container, control, or status element in the same rendered hierarchy as the existing hooks below.\n\
-Existing hook locations:\n\
-{excerpts}\n\
-Generic one-line example:\n\
-- {example}\n";
-        assert_eq!(
-            contracts.contract_attribute_missing_kind,
-            CONTRACT_ATTRIBUTE_MISSING_KIND
+    fn embedded_contract_attribute_knowledge_routes_required_body() {
+        let contracts = &knowledge::get().contracts;
+        assert_eq!(missing_kind(), "contract_attribute_missing");
+        assert!(
+            contracts
+                .contract_attribute_guidance
+                .starts_with("Contract attribute repair guidance:\n")
         );
-        assert_eq!(contracts.contract_attribute_guidance, legacy_guidance);
+        assert!(
+            contracts
+                .contract_attribute_guidance
+                .contains("Existing hook locations:\n{excerpts}\n")
+        );
         assert_eq!(
             contracts.state_requirement,
             requirement_for_attribute("data-anvil-state")
@@ -300,6 +326,17 @@ Generic one-line example:\n\
         assert_eq!(
             contracts.primary_example,
             example_for_attribute("data-anvil-action=\"primary\"")
+        );
+    }
+
+    #[test]
+    fn guidance_template_does_not_rewrite_inserted_placeholder_text() {
+        assert_eq!(
+            render_guidance_template(
+                "path={path}; example={example}",
+                &[("{path}", "src/{example}.tsx"), ("{example}", "hook")],
+            ),
+            "path=src/{example}.tsx; example=hook"
         );
     }
 
@@ -349,10 +386,7 @@ Generic one-line example:\n\
         assert_eq!(issue.path, "src/app/page.tsx");
 
         let guidance = guidance_section(Some(dir.path()), &report, Some(&events));
-        assert!(
-            guidance.contains(CONTRACT_ATTRIBUTE_MISSING_KIND),
-            "{guidance}"
-        );
+        assert!(guidance.contains(missing_kind()), "{guidance}");
         assert!(guidance.contains("data-anvil-state"), "{guidance}");
         assert!(
             guidance.contains("meaningful visible-state JSON snapshot"),

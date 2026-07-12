@@ -115,7 +115,6 @@ fn nextjs_boundary_erosion_tripwire_keeps_dispatch_sites_audited() {
     let actual = nextjs_literal_counts_outside_profiles();
     let expected = BTreeMap::from([
         ("src/minimal_loop/browser_probe.rs".to_string(), 2),
-        ("src/minimal_loop/completion.rs".to_string(), 1),
         ("src/minimal_loop/evidence.rs".to_string(), 4),
         ("src/minimal_loop/import_scan.rs".to_string(), 1),
         ("src/minimal_loop/loop_run.rs".to_string(), 2),
@@ -142,6 +141,8 @@ fn runner_chokepoints_do_not_grow_past_interim_budget() {
         ("src/planner/final_acceptance.rs", 2_942usize),
         ("src/planner/ultra_plan_flow.rs", 1_570usize),
         ("src/planner/assurance.rs", 1_311usize),
+        ("src/planner/profiles/nextjs.rs", 3_684usize),
+        ("src/minimal_loop/evidence.rs", 6_702usize),
     ] {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|err| panic!("failed to read {path}: {err}"));

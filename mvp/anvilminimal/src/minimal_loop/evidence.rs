@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::minimal_loop::evidence_knowledge;
 use crate::minimal_loop::import_scan::{
     route_bound_closure, route_bound_unattached_ref_diagnostics,
 };
@@ -2826,51 +2827,25 @@ fn source_file_has_visible_interactive_surface(file: &SourceFile) -> bool {
 
 fn source_file_has_generic_visible_surface_keyword(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
-    [
-        "button",
-        "form",
-        "input",
-        "textarea",
-        "select",
-        "screen",
-        "surface",
-        "view",
-        "onclick",
-        "click",
-        "tap",
-        "submit",
-        "画面",
-        "フォーム",
-        "入力",
-        "ボタン",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    evidence_knowledge::get()
+        .vocabulary
+        .generic_visible_surface
+        .iter()
+        .any(|needle| lower.contains(needle.as_str()))
 }
 
 fn source_file_has_user_input_handler_keyword(file: &SourceFile) -> bool {
     let content = file.scan_text();
     let lower = content.to_ascii_lowercase();
-    content.contains("addEventListener")
-        || lower.contains("onkeydown")
-        || lower.contains("onkeyup")
-        || lower.contains("onclick")
-        || lower.contains("onpointer")
-        || lower.contains("onmousedown")
-        || lower.contains("onmouseup")
-        || lower.contains("ontouch")
-        || lower.contains("onsubmit")
-        || lower.contains("onchange")
-        || lower.contains("keydown")
-        || lower.contains("keyup")
-        || lower.contains("pointerdown")
-        || lower.contains("touchstart")
-        || lower.contains("keypressed")
-        || lower.contains("mousepressed")
-        || lower.contains("inputhandler")
-        || lower.contains("input_handler")
-        || lower.contains("handleinput")
-        || lower.contains("handle_input")
+    let vocabulary = &evidence_knowledge::get().vocabulary;
+    vocabulary
+        .user_input_handler_case_sensitive
+        .iter()
+        .any(|needle| content.contains(needle.as_str()))
+        || vocabulary
+            .user_input_handler_lower
+            .iter()
+            .any(|needle| lower.contains(needle.as_str()))
 }
 
 fn source_file_has_live_preview(file: &SourceFile) -> bool {
@@ -2908,28 +2883,11 @@ fn source_file_has_stateful_update(file: &SourceFile) -> bool {
 
 fn source_file_has_generic_state_update_keyword(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
-    [
-        "state",
-        "status",
-        "update(",
-        "update_",
-        "render(",
-        "rerender",
-        "refresh",
-        "set_",
-        "set(",
-        "items",
-        "notes",
-        "todos",
-        "table.insert",
-        "push(",
-        "append(",
-        "score",
-        "count",
-        "counter",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    evidence_knowledge::get()
+        .vocabulary
+        .generic_state_update
+        .iter()
+        .any(|needle| lower.contains(needle.as_str()))
 }
 
 fn source_file_has_challenge_or_adversary(
@@ -2976,47 +2934,11 @@ fn source_file_has_static_adversary_entity_with_extra_scan_text(
 }
 
 fn source_text_has_static_adversary_entity(lower: &str) -> bool {
-    let has_adversary_token = [
-        "enemy",
-        "enemies",
-        "adversary",
-        "opponent",
-        "obstacle",
-        "hazard",
-        "invader",
-        "alien",
-        "ufo",
-        "asteroid",
-        "monster",
-        "zombie",
-        "mob",
-        "wave",
-        "spawn",
-        "target",
-        "challenge",
-        "boss",
-        "brick",
-        "bricks",
-        "block",
-        "blocks",
-        "paddle",
-        "ball",
-        "puck",
-        "meteor",
-        "barrier",
-        "timer",
-        "countdown",
-        "敵",
-        "ブロック",
-        "パドル",
-        "ボール",
-        "障害物",
-        "インベーダー",
-        "エイリアン",
-        "モンスター",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
+    let has_adversary_token = evidence_knowledge::get()
+        .vocabulary
+        .adversary_entity
+        .iter()
+        .any(|needle| lower.contains(needle.as_str()));
     if !has_adversary_token {
         return false;
     }
@@ -3024,36 +2946,11 @@ fn source_text_has_static_adversary_entity(lower: &str) -> bool {
 }
 
 fn source_text_has_adversary_entity_context(lower: &str) -> bool {
-    [
-        "x:",
-        "y:",
-        ".x",
-        ".y",
-        "array.from",
-        ".map(",
-        ".foreach(",
-        ".filter(",
-        "setenemies(",
-        "setinvaders(",
-        "enemy =",
-        "enemy=",
-        "enemies =",
-        "enemies=",
-        "invader =",
-        "invader=",
-        "invaders =",
-        "invaders=",
-        "const enemy",
-        "const enemies",
-        "const invader",
-        "const invaders",
-        "let enemy",
-        "let enemies",
-        "let invader",
-        "let invaders",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    evidence_knowledge::get()
+        .vocabulary
+        .adversary_entity_context
+        .iter()
+        .any(|needle| lower.contains(needle.as_str()))
 }
 
 fn source_file_has_goal_adversary_hint(file: &SourceFile, evidence_hint_tokens: &[String]) -> bool {
@@ -3113,38 +3010,15 @@ fn source_file_has_adversary_motion_or_interaction_signal(file: &SourceFile) -> 
 
 fn source_file_has_position_or_motion_update(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
-    let has_position_or_motion_token = [
-        "position",
-        "positions",
-        "velocity",
-        "speed",
-        "move",
-        "movement",
-        "direction",
-        ".x",
-        ".y",
-        "x:",
-        "y:",
-        "left",
-        "top",
-        "translate",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    let has_update_token = [
-        "+=",
-        "-=",
-        "map(",
-        "filter(",
-        "set",
-        "update",
-        "tick",
-        "frame",
-        "requestanimationframe",
-        "setinterval",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
+    let vocabulary = &evidence_knowledge::get().vocabulary;
+    let has_position_or_motion_token = vocabulary
+        .position_or_motion
+        .iter()
+        .any(|needle| lower.contains(needle.as_str()));
+    let has_update_token = vocabulary
+        .motion_update
+        .iter()
+        .any(|needle| lower.contains(needle.as_str()));
     has_position_or_motion_token && has_update_token
 }
 
@@ -3165,21 +3039,11 @@ fn source_file_has_score_or_progression_keyword_with_extra_scan_text(
 }
 
 fn source_text_has_score_or_progression_keyword(lower: &str) -> bool {
-    [
-        "score",
-        "points",
-        "level",
-        "stage",
-        "wave",
-        "combo",
-        "lives",
-        "life",
-        "health",
-        "progress",
-        "スコア",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    evidence_knowledge::get()
+        .vocabulary
+        .score_or_progression
+        .iter()
+        .any(|needle| lower.contains(needle.as_str()))
 }
 
 fn source_file_has_failure_or_collision(file: &SourceFile) -> bool {
@@ -3206,66 +3070,29 @@ fn source_file_has_failure_or_collision_keyword_with_extra_scan_text(
 }
 
 fn source_text_has_failure_or_collision_keyword(lower: &str) -> bool {
-    [
-        "collision",
-        "collide",
-        "hit",
-        "damage",
-        "gameover",
-        "game over",
-        "lives",
-        "life",
-        "health",
-        "intersect",
-        "overlap",
-        "bounds",
-        "lose",
-        "fail",
-        "衝突",
-        "当たり",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    evidence_knowledge::get()
+        .vocabulary
+        .failure_or_collision
+        .iter()
+        .any(|needle| lower.contains(needle.as_str()))
 }
 
 fn source_file_has_restart_or_recoverable_state_keyword(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
-    [
-        "start",
-        "restart",
-        "reset",
-        "pause",
-        "resume",
-        "gameover",
-        "game over",
-        "play again",
-        "try again",
-        "initgame",
-        "initstate",
-        "resetstate",
-        "newgame",
-        "newstate",
-        "newlevel",
-        "スタート",
-        "開始",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    evidence_knowledge::get()
+        .vocabulary
+        .restart_or_recoverable_state
+        .iter()
+        .any(|needle| lower.contains(needle.as_str()))
 }
 
 fn source_file_has_persistence(file: &SourceFile) -> bool {
     let lower = file.scan_text().to_ascii_lowercase();
-    [
-        "localstorage",
-        "sessionstorage",
-        "indexeddb",
-        ".setitem(",
-        ".getitem(",
-        "navigator.storage",
-        "caches.open(",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    evidence_knowledge::get()
+        .vocabulary
+        .persistence
+        .iter()
+        .any(|needle| lower.contains(needle.as_str()))
 }
 
 fn source_file_user_input_handler_signal(file: &SourceFile) -> SourceEvidenceSignal {

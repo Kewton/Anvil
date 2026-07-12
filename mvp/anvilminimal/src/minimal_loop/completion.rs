@@ -1582,8 +1582,11 @@ fn push_katakana_goal_token(tokens: &mut Vec<String>, current: &mut String) {
     if current.chars().count() >= 3 {
         let token = std::mem::take(current);
         tokens.push(token.clone());
-        for prefix in KATAKANA_GOAL_PREFIX_STOPWORDS {
-            if let Some(suffix) = token.strip_prefix(prefix)
+        for prefix in &crate::minimal_loop::evidence_knowledge::get()
+            .goal_hints
+            .katakana_prefix_stopwords
+        {
+            if let Some(suffix) = token.strip_prefix(prefix.as_str())
                 && suffix.chars().count() >= 3
             {
                 tokens.push(suffix.to_string());
@@ -1599,73 +1602,23 @@ fn is_katakana_hint_char(ch: char) -> bool {
 }
 
 fn evidence_hint_stopword(token: &str) -> bool {
-    ASCII_GOAL_HINT_STOPWORDS.contains(&token) || JAPANESE_GOAL_HINT_STOPWORDS.contains(&token)
+    let goal_hints = &crate::minimal_loop::evidence_knowledge::get().goal_hints;
+    goal_hints
+        .ascii_stopwords
+        .iter()
+        .chain(&goal_hints.japanese_stopwords)
+        .any(|stopword| stopword == token)
 }
 
-fn evidence_hint_token_translations(token: &str) -> &'static [&'static str] {
-    match token {
-        "ブロック" => &["block", "brick"],
-        "ボール" => &["ball"],
-        "パドル" => &["paddle"],
-        "敵" => &["enemy"],
-        "インベーダー" => &["invader", "invaders"],
-        "ミサイル" => &["missile"],
-        "シューティング" => &["shooter"],
-        "エイリアン" => &["alien"],
-        "障害物" => &["obstacle", "barrier"],
-        "隕石" => &["meteor"],
-        "タイマー" => &["timer"],
-        "カウントダウン" => &["countdown", "timer"],
-        _ => &[],
-    }
+fn evidence_hint_token_translations(token: &str) -> &'static [String] {
+    crate::minimal_loop::evidence_knowledge::get()
+        .goal_hints
+        .translations
+        .iter()
+        .find(|translation| translation.source == token)
+        .map(|translation| translation.targets.as_slice())
+        .unwrap_or_default()
 }
-
-const ASCII_GOAL_HINT_STOPWORDS: &[&str] = &[
-    "application",
-    "browser",
-    "build",
-    "canvas",
-    "client",
-    "component",
-    "create",
-    "develop",
-    "development",
-    "feature",
-    "game",
-    "games",
-    "implement",
-    "implementation",
-    "interactive",
-    "next",
-    "nextjs",
-    "page",
-    "playable",
-    "port",
-    "project",
-    "react",
-    "screen",
-    "shooting",
-    "space",
-    "typescript",
-    "using",
-    "with",
-];
-
-const JAPANESE_GOAL_HINT_STOPWORDS: &[&str] = &[
-    "アプリ",
-    "ゲーム",
-    "シューティング",
-    "スペース",
-    "ネクスト",
-    "ブラウザ",
-    "ページ",
-    "ポート",
-    "実装",
-    "作成",
-    "開発",
-];
-
-const KATAKANA_GOAL_PREFIX_STOPWORDS: &[&str] = &["スペース"];
 
 fn normalize_obligation_roles(values: Vec<String>) -> anyhow::Result<Vec<String>> {
     let mut seen = BTreeSet::new();

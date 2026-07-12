@@ -6,9 +6,8 @@ use serde_json::json;
 
 use crate::eval_events;
 use crate::minimal_loop::import_scan::route_bound_closure;
+use crate::planner::profiles::nextjs::knowledge;
 use crate::planner::verify::VerificationReport;
-
-const STATE_BINDING_CONTRACT: &str = "Minimum contract: after start and after input, the `data-anvil-state` JSON value must actually change. The snapshot must include at least one dimension that immediately responds to input, such as player/paddle x position. If refs are used, mirror meaningful state changes into React state so a render occurs.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StateBindingDiagnosisKind {
@@ -301,16 +300,19 @@ pub(crate) fn state_binding_feedback_for_diagnosis(diagnosis: &StateBindingDiagn
         lines.push(format!("- {item}"));
     }
     if diagnosis.diagnosis == StateBindingDiagnosisKind::InputCoupledStateNotSnapshotted {
-        lines.push(format!(
-            "入力は {} を変異させるが data-anvil-state に映らない。入力連動次元（例: プレイヤー/パドルのx座標）をReact stateにミラーしてスナップショットへ追加せよ。",
-            if diagnosis.input_mutation_refs.is_empty() {
-                "(unknown ref)".to_string()
-            } else {
-                diagnosis.input_mutation_refs.join(", ")
-            }
-        ));
+        let mutation_refs = if diagnosis.input_mutation_refs.is_empty() {
+            "(unknown ref)".to_string()
+        } else {
+            diagnosis.input_mutation_refs.join(", ")
+        };
+        lines.push(
+            knowledge::get()
+                .contracts
+                .input_coupled_dimension_requirement
+                .replace("{mutation_refs}", &mutation_refs),
+        );
     }
-    lines.push(STATE_BINDING_CONTRACT.to_string());
+    lines.push(knowledge::get().contracts.state_binding_contract.clone());
     lines.join("\n")
 }
 
@@ -1193,17 +1195,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_contract_knowledge_matches_legacy_state_binding_text() {
-        let contracts = &crate::planner::profiles::nextjs::knowledge::get().contracts;
-        assert_eq!(contracts.state_binding_contract, STATE_BINDING_CONTRACT);
-        assert_eq!(
-            contracts.input_coupled_dimension_requirement,
-            "入力は {mutation_refs} を変異させるが data-anvil-state に映らない。入力連動次元（例: プレイヤー/パドルのx座標）をReact stateにミラーしてスナップショットへ追加せよ。"
+    fn embedded_contract_knowledge_keeps_input_dimension_requirement() {
+        let contracts = &knowledge::get().contracts;
+        assert!(
+            contracts
+                .state_binding_contract
+                .starts_with("Minimum contract:")
         );
         assert!(
             contracts
                 .state_binding_contract
                 .contains("at least one dimension that immediately responds to input")
+        );
+        assert!(
+            contracts
+                .input_coupled_dimension_requirement
+                .contains("{mutation_refs}")
+        );
+        assert!(
+            contracts
+                .input_coupled_dimension_requirement
+                .contains("入力連動次元（例: プレイヤー/パドルのx座標）")
         );
     }
 

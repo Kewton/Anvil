@@ -62,9 +62,7 @@ impl RepairTarget {
             Self::PackageConfig => "package_config",
             Self::FrameworkConfig => "framework_config",
             Self::MissingEntrypoint => "missing_entrypoint",
-            Self::ContractAttributeMissing => {
-                contract_attribute_repair::CONTRACT_ATTRIBUTE_MISSING_KIND
-            }
+            Self::ContractAttributeMissing => contract_attribute_repair::missing_kind(),
             Self::EmptyApp => "empty_app",
             Self::CapabilityMissing => "capability_missing",
             Self::RequiredEvidenceMissing => "required_evidence_missing",
