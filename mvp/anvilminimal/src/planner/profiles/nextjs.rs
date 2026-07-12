@@ -1,3 +1,5 @@
+pub(crate) mod knowledge;
+
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -366,27 +368,31 @@ pub fn setup_step_checks(
 }
 
 fn mentions_package_scripts(text: &str) -> bool {
-    text.contains("package.json")
-        || text.contains("package manifest")
-        || text.contains("package script")
-        || text.contains("port script")
+    let classifier = &knowledge::get().setup_classifier;
+    classifier
+        .package_phrases
+        .iter()
+        .any(|phrase| text.contains(phrase))
         || text
             .split(|ch: char| !ch.is_ascii_alphanumeric())
-            .any(|token| matches!(token, "script" | "scripts" | "manifest" | "port"))
+            .any(|token| classifier.package_tokens.iter().any(|item| item == token))
 }
 
 fn mentions_scaffold_configuration(text: &str) -> bool {
-    text.contains("scaffold")
-        || text.contains("project shell")
-        || text.contains("tsconfig")
-        || text.contains("postcss")
-        || text.contains("tailwind")
+    let classifier = &knowledge::get().setup_classifier;
+    classifier
+        .scaffold_phrases
+        .iter()
+        .any(|phrase| text.contains(phrase))
         || text
             .split(|ch: char| !ch.is_ascii_alphanumeric())
-            .any(|token| token == "config")
-        || ((text.contains("setup") || text.contains("set up"))
-            && text.contains("project")
-            && !text.contains("dependenc"))
+            .any(|token| classifier.scaffold_tokens.iter().any(|item| item == token))
+        || (classifier
+            .scaffold_setup_markers
+            .iter()
+            .any(|marker| text.contains(marker))
+            && text.contains(&classifier.scaffold_project_marker)
+            && !text.contains(&classifier.scaffold_dependency_exclusion))
 }
 
 fn shell_single_quote(value: &str) -> String {
@@ -433,37 +439,26 @@ pub fn deterministic_step_plan(
 }
 
 pub fn preset_ultra_plan(goal: &str, style: &str, intent: &str) -> Option<UltraPlan> {
-    if !style.eq_ignore_ascii_case("default") || !intent.eq_ignore_ascii_case("create") {
+    let knowledge = knowledge::get();
+    if !style.eq_ignore_ascii_case(&knowledge.preset.style)
+        || !intent.eq_ignore_ascii_case(&knowledge.preset.intent)
+    {
         return None;
     }
     Some(UltraPlan {
         goal: goal.to_string(),
-        profile: "nextjs".to_string(),
-        style: "default".to_string(),
-        intent: "create".to_string(),
-        phases: vec![
-            UltraPhase {
-                id: "project-setup".to_string(),
-                prompt: "Scaffold and setup the Next.js App Router project shell. Create or complete the package manifest, TypeScript config, styling config, and route-bound scaffold so the deterministic nextjs-scaffold template owns setup artifacts."
-                    .to_string(),
-            },
-            UltraPhase {
-                id: "core-implementation".to_string(),
-                prompt: format!(
-                    "Implement the core task-specific behavior for: {goal}. Keep one route-bound implementation, extend the instrumented skeleton instead of replacing it, and keep the implementation in the Next.js route-bound source."
-                ),
-            },
-            UltraPhase {
-                id: "contract-wiring".to_string(),
-                prompt: "Wire controls and data-anvil observability. Preserve or add data-anvil-action=\"primary\" on the main start/submit/action control, data-anvil-action=\"input\" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. The data-anvil-state snapshot must include at least one dimension that immediately responds to input, such as player/paddle x position. When the contract includes start_or_restart_flow, every restart affordance (game-over, victory, and in-play when present) should carry data-anvil-action=\"restart\"; the initial primary action alone cannot satisfy recovery verification."
-                    .to_string(),
-            },
-            UltraPhase {
-                id: "build-verification".to_string(),
-                prompt: "Run build verification for the deterministic Next.js scaffold. Verify package scripts, dependency boundary, and npm run build / next build only; keep this final phase verification-only."
-                    .to_string(),
-            },
-        ],
+        profile: knowledge.preset.profile.clone(),
+        style: knowledge.preset.style.clone(),
+        intent: knowledge.preset.intent.clone(),
+        phases: knowledge
+            .preset
+            .phases
+            .iter()
+            .map(|phase| UltraPhase {
+                id: phase.id.clone(),
+                prompt: phase.prompt.replace("{goal}", goal),
+            })
+            .collect(),
     })
 }
 
@@ -706,94 +701,38 @@ fn phase_field(phase_prompt: &str, prefix: &str) -> Option<String> {
 fn looks_like_scaffold_phase(lower: &str) -> bool {
     contains_any(
         lower,
-        &[
-            "scaffold",
-            "setup",
-            "set up",
-            "project shell",
-            "initialize",
-            "initialise",
-            "bootstrap",
-            "app router scaffold",
-            "初期",
-            "セットアップ",
-        ],
+        &knowledge::get().deterministic_keywords.scaffold_phase,
     )
 }
 
 fn looks_like_scaffold_phase_id(lower: &str) -> bool {
     contains_any(
         lower,
-        &[
-            "scaffold",
-            "setup",
-            "set-up",
-            "project-setup",
-            "bootstrap",
-            "initialize",
-            "initialise",
-        ],
+        &knowledge::get().deterministic_keywords.scaffold_phase_id,
     )
 }
 
 fn looks_like_port_script_phase(lower: &str) -> bool {
-    (lower.contains("port") || lower.contains("ポート"))
-        && contains_any(
-            lower,
-            &[
-                "script",
-                "package",
-                "package.json",
-                "dev/start",
-                "dev script",
-                "start script",
-                "設定",
-            ],
-        )
+    let keywords = &knowledge::get().deterministic_keywords;
+    contains_any(lower, &keywords.port_phase_markers)
+        && contains_any(lower, &keywords.port_script_phase)
 }
 
 fn looks_like_build_verify_phase(lower: &str) -> bool {
     contains_any(
         lower,
-        &[
-            "build verification",
-            "verify build",
-            "build verifier",
-            "npm run build",
-            "next build",
-            "ビルド検証",
-        ],
+        &knowledge::get().deterministic_keywords.build_verify_phase,
     )
 }
 
 fn looks_like_implementation_phase(lower: &str) -> bool {
     contains_any(
         lower,
-        &[
-            "game logic",
-            "gameplay",
-            "mechanic",
-            "adversary",
-            "challenge",
-            "collision",
-            "failure rule",
-            "score",
-            "player control",
-            "canvas",
-            "stateful update",
-            "user input",
-            "interactive surface",
-            "ゲームロジック",
-            "衝突",
-            "スコア",
-            "敵",
-            "プレイヤー",
-            "操作",
-        ],
+        &knowledge::get().deterministic_keywords.implementation_phase,
     )
 }
 
-fn contains_any(text: &str, tokens: &[&str]) -> bool {
+fn contains_any(text: &str, tokens: &[String]) -> bool {
     tokens.iter().any(|token| text.contains(token))
 }
 

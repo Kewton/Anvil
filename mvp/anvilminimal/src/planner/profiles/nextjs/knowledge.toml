@@ -1,0 +1,126 @@
+[preset]
+profile = "nextjs"
+style = "default"
+intent = "create"
+
+[[preset.phases]]
+id = "project-setup"
+prompt = "Scaffold and setup the Next.js App Router project shell. Create or complete the package manifest, TypeScript config, styling config, and route-bound scaffold so the deterministic nextjs-scaffold template owns setup artifacts."
+
+[[preset.phases]]
+id = "core-implementation"
+prompt = "Implement the core task-specific behavior for: {goal}. Keep one route-bound implementation, extend the instrumented skeleton instead of replacing it, and keep the implementation in the Next.js route-bound source."
+
+[[preset.phases]]
+id = "contract-wiring"
+prompt = '''Wire controls and data-anvil observability. Preserve or add data-anvil-action="primary" on the main start/submit/action control, data-anvil-action="input" on the main text entry surface when one exists, and data-anvil-state with a JSON snapshot of meaningful visible state. The data-anvil-state snapshot must include at least one dimension that immediately responds to input, such as player/paddle x position. When the contract includes start_or_restart_flow, every restart affordance (game-over, victory, and in-play when present) should carry data-anvil-action="restart"; the initial primary action alone cannot satisfy recovery verification.'''
+
+[[preset.phases]]
+id = "build-verification"
+prompt = "Run build verification for the deterministic Next.js scaffold. Verify package scripts, dependency boundary, and npm run build / next build only; keep this final phase verification-only."
+
+[deterministic_keywords]
+scaffold_phase = [
+  "scaffold",
+  "setup",
+  "set up",
+  "project shell",
+  "initialize",
+  "initialise",
+  "bootstrap",
+  "app router scaffold",
+  "初期",
+  "セットアップ",
+]
+scaffold_phase_id = [
+  "scaffold",
+  "setup",
+  "set-up",
+  "project-setup",
+  "bootstrap",
+  "initialize",
+  "initialise",
+]
+port_phase_markers = ["port", "ポート"]
+port_script_phase = [
+  "script",
+  "package",
+  "package.json",
+  "dev/start",
+  "dev script",
+  "start script",
+  "設定",
+]
+build_verify_phase = [
+  "build verification",
+  "verify build",
+  "build verifier",
+  "npm run build",
+  "next build",
+  "ビルド検証",
+]
+implementation_phase = [
+  "game logic",
+  "gameplay",
+  "mechanic",
+  "adversary",
+  "challenge",
+  "collision",
+  "failure rule",
+  "score",
+  "player control",
+  "canvas",
+  "stateful update",
+  "user input",
+  "interactive surface",
+  "ゲームロジック",
+  "衝突",
+  "スコア",
+  "敵",
+  "プレイヤー",
+  "操作",
+]
+
+[setup_classifier]
+package_phrases = ["package.json", "package manifest", "package script", "port script"]
+package_tokens = ["script", "scripts", "manifest", "port"]
+scaffold_phrases = ["scaffold", "project shell", "tsconfig", "postcss", "tailwind"]
+scaffold_tokens = ["config"]
+scaffold_setup_markers = ["setup", "set up"]
+scaffold_project_marker = "project"
+scaffold_dependency_exclusion = "dependenc"
+
+[template_owned_artifacts]
+package_phrases = [
+  "package.json",
+  "package manifest",
+  "package script",
+  "npm script",
+  "port script",
+  "dev script",
+  "start script",
+  "build script",
+]
+package_tokens = ["scripts", "port", "ports"]
+scaffold_phrases = [
+  "tsconfig",
+  "postcss",
+  "tailwind",
+  "next.config",
+  "next-env.d.ts",
+  "src/app/layout.tsx",
+  "src/app/globals.css",
+  "src/app/global.d.ts",
+]
+scaffold_tokens = ["scaffold", "scaffolding"]
+package_manifest_names = ["package.json"]
+artifact_path_suffixes = [
+  "tsconfig.json",
+  "next-env.d.ts",
+  "src/app/layout.tsx",
+  "src/app/globals.css",
+  "src/app/global.d.ts",
+]
+artifact_path_contains = ["postcss.config.", "tailwind.config.", "next.config."]
+package_check_marker = "package.json scripts port"
+scaffold_check_marker = "scaffold tsconfig postcss tailwind"

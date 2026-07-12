@@ -141,9 +141,11 @@ fn profile_setup_checks(
     if !is_nextjs_profile(profile) {
         return None;
     }
+    let artifact_knowledge =
+        &crate::planner::profiles::nextjs::knowledge::get().template_owned_artifacts;
     let marker = match referenced_template_artifact(step)? {
-        TemplateOwnedArtifact::PackageManifest => "package.json scripts port",
-        TemplateOwnedArtifact::ScaffoldConfiguration => "scaffold tsconfig postcss tailwind",
+        TemplateOwnedArtifact::PackageManifest => &artifact_knowledge.package_check_marker,
+        TemplateOwnedArtifact::ScaffoldConfiguration => &artifact_knowledge.scaffold_check_marker,
     };
     crate::planner::profiles::nextjs::setup_step_checks(root, goal, marker, "")
 }
@@ -203,50 +205,50 @@ fn template_owned_text_reference(text: &str) -> Option<TemplateOwnedArtifact> {
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
-    let package_reference = lower.contains("package.json")
-        || lower.contains("package manifest")
-        || lower.contains("package script")
-        || lower.contains("npm script")
-        || lower.contains("port script")
-        || lower.contains("dev script")
-        || lower.contains("start script")
-        || lower.contains("build script")
+    let knowledge = &crate::planner::profiles::nextjs::knowledge::get().template_owned_artifacts;
+    let package_reference = knowledge
+        .package_phrases
+        .iter()
+        .any(|phrase| lower.contains(phrase))
         || tokens
             .iter()
-            .any(|token| matches!(*token, "scripts" | "port" | "ports"));
+            .any(|token| knowledge.package_tokens.iter().any(|item| item == *token));
     if package_reference {
         return Some(TemplateOwnedArtifact::PackageManifest);
     }
-    let scaffold_reference = lower.contains("tsconfig")
-        || lower.contains("postcss")
-        || lower.contains("tailwind")
-        || lower.contains("next.config")
-        || lower.contains("next-env.d.ts")
-        || lower.contains("src/app/layout.tsx")
-        || lower.contains("src/app/globals.css")
-        || lower.contains("src/app/global.d.ts")
+    let scaffold_reference = knowledge
+        .scaffold_phrases
+        .iter()
+        .any(|phrase| lower.contains(phrase))
         || tokens
             .iter()
-            .any(|token| matches!(*token, "scaffold" | "scaffolding"));
+            .any(|token| knowledge.scaffold_tokens.iter().any(|item| item == *token));
     scaffold_reference.then_some(TemplateOwnedArtifact::ScaffoldConfiguration)
 }
 
 fn package_manifest_path(path: &str) -> bool {
     let lower = path.replace('\\', "/").to_ascii_lowercase();
-    lower.rsplit('/').next() == Some("package.json")
+    lower.rsplit('/').next().is_some_and(|name| {
+        crate::planner::profiles::nextjs::knowledge::get()
+            .template_owned_artifacts
+            .package_manifest_names
+            .iter()
+            .any(|item| item == name)
+    })
 }
 
 fn template_owned_artifact_path(path: &str) -> bool {
     let lower = path.replace('\\', "/").to_ascii_lowercase();
+    let knowledge = &crate::planner::profiles::nextjs::knowledge::get().template_owned_artifacts;
     package_manifest_path(&lower)
-        || lower.ends_with("tsconfig.json")
-        || lower.contains("postcss.config.")
-        || lower.contains("tailwind.config.")
-        || lower.contains("next.config.")
-        || lower.ends_with("next-env.d.ts")
-        || lower.ends_with("src/app/layout.tsx")
-        || lower.ends_with("src/app/globals.css")
-        || lower.ends_with("src/app/global.d.ts")
+        || knowledge
+            .artifact_path_suffixes
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+        || knowledge
+            .artifact_path_contains
+            .iter()
+            .any(|fragment| lower.contains(fragment))
 }
 
 fn template_owned_step_scope(step: &PlanStep) -> bool {
