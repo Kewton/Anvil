@@ -1,0 +1,340 @@
+[vocabulary]
+generic_visible_surface = [
+  "button",
+  "form",
+  "input",
+  "textarea",
+  "select",
+  "screen",
+  "surface",
+  "view",
+  "onclick",
+  "click",
+  "tap",
+  "submit",
+  "画面",
+  "フォーム",
+  "入力",
+  "ボタン",
+]
+user_input_handler_case_sensitive = ["addEventListener"]
+user_input_handler_lower = [
+  "onkeydown",
+  "onkeyup",
+  "onclick",
+  "onpointer",
+  "onmousedown",
+  "onmouseup",
+  "ontouch",
+  "onsubmit",
+  "onchange",
+  "keydown",
+  "keyup",
+  "pointerdown",
+  "touchstart",
+  "keypressed",
+  "mousepressed",
+  "inputhandler",
+  "input_handler",
+  "handleinput",
+  "handle_input",
+]
+generic_state_update = [
+  "state",
+  "status",
+  "update(",
+  "update_",
+  "render(",
+  "rerender",
+  "refresh",
+  "set_",
+  "set(",
+  "items",
+  "notes",
+  "todos",
+  "table.insert",
+  "push(",
+  "append(",
+  "score",
+  "count",
+  "counter",
+]
+adversary_entity = [
+  "enemy",
+  "enemies",
+  "adversary",
+  "opponent",
+  "obstacle",
+  "hazard",
+  "invader",
+  "alien",
+  "ufo",
+  "asteroid",
+  "monster",
+  "zombie",
+  "mob",
+  "wave",
+  "spawn",
+  "target",
+  "challenge",
+  "boss",
+  "brick",
+  "bricks",
+  "block",
+  "blocks",
+  "paddle",
+  "ball",
+  "puck",
+  "meteor",
+  "barrier",
+  "timer",
+  "countdown",
+  "敵",
+  "ブロック",
+  "パドル",
+  "ボール",
+  "障害物",
+  "インベーダー",
+  "エイリアン",
+  "モンスター",
+]
+adversary_entity_context = [
+  "x:",
+  "y:",
+  ".x",
+  ".y",
+  "array.from",
+  ".map(",
+  ".foreach(",
+  ".filter(",
+  "setenemies(",
+  "setinvaders(",
+  "enemy =",
+  "enemy=",
+  "enemies =",
+  "enemies=",
+  "invader =",
+  "invader=",
+  "invaders =",
+  "invaders=",
+  "const enemy",
+  "const enemies",
+  "const invader",
+  "const invaders",
+  "let enemy",
+  "let enemies",
+  "let invader",
+  "let invaders",
+]
+position_or_motion = [
+  "position",
+  "positions",
+  "velocity",
+  "speed",
+  "move",
+  "movement",
+  "direction",
+  ".x",
+  ".y",
+  "x:",
+  "y:",
+  "left",
+  "top",
+  "translate",
+]
+motion_update = [
+  "+=",
+  "-=",
+  "map(",
+  "filter(",
+  "set",
+  "update",
+  "tick",
+  "frame",
+  "requestanimationframe",
+  "setinterval",
+]
+score_or_progression = [
+  "score",
+  "points",
+  "level",
+  "stage",
+  "wave",
+  "combo",
+  "lives",
+  "life",
+  "health",
+  "progress",
+  "スコア",
+]
+failure_or_collision = [
+  "collision",
+  "collide",
+  "hit",
+  "damage",
+  "gameover",
+  "game over",
+  "lives",
+  "life",
+  "health",
+  "intersect",
+  "overlap",
+  "bounds",
+  "lose",
+  "fail",
+  "衝突",
+  "当たり",
+]
+restart_or_recoverable_state = [
+  "start",
+  "restart",
+  "reset",
+  "pause",
+  "resume",
+  "gameover",
+  "game over",
+  "play again",
+  "try again",
+  "initgame",
+  "initstate",
+  "resetstate",
+  "newgame",
+  "newstate",
+  "newlevel",
+  "スタート",
+  "開始",
+]
+persistence = [
+  "localstorage",
+  "sessionstorage",
+  "indexeddb",
+  ".setitem(",
+  ".getitem(",
+  "navigator.storage",
+  "caches.open(",
+]
+
+[goal_hints]
+ascii_stopwords = [
+  "application",
+  "browser",
+  "build",
+  "canvas",
+  "client",
+  "component",
+  "create",
+  "develop",
+  "development",
+  "feature",
+  "game",
+  "games",
+  "implement",
+  "implementation",
+  "interactive",
+  "next",
+  "nextjs",
+  "page",
+  "playable",
+  "port",
+  "project",
+  "react",
+  "screen",
+  "shooting",
+  "space",
+  "typescript",
+  "using",
+  "with",
+]
+japanese_stopwords = [
+  "アプリ",
+  "ゲーム",
+  "シューティング",
+  "スペース",
+  "ネクスト",
+  "ブラウザ",
+  "ページ",
+  "ポート",
+  "実装",
+  "作成",
+  "開発",
+]
+katakana_prefix_stopwords = ["スペース"]
+
+[[goal_hints.translations]]
+source = "ブロック"
+targets = ["block", "brick"]
+
+[[goal_hints.translations]]
+source = "ボール"
+targets = ["ball"]
+
+[[goal_hints.translations]]
+source = "パドル"
+targets = ["paddle"]
+
+[[goal_hints.translations]]
+source = "敵"
+targets = ["enemy"]
+
+[[goal_hints.translations]]
+source = "インベーダー"
+targets = ["invader", "invaders"]
+
+[[goal_hints.translations]]
+source = "ミサイル"
+targets = ["missile"]
+
+[[goal_hints.translations]]
+source = "シューティング"
+targets = ["shooter"]
+
+[[goal_hints.translations]]
+source = "エイリアン"
+targets = ["alien"]
+
+[[goal_hints.translations]]
+source = "障害物"
+targets = ["obstacle", "barrier"]
+
+[[goal_hints.translations]]
+source = "隕石"
+targets = ["meteor"]
+
+[[goal_hints.translations]]
+source = "タイマー"
+targets = ["timer"]
+
+[[goal_hints.translations]]
+source = "カウントダウン"
+targets = ["countdown", "timer"]
+
+[[repair_targets]]
+evidence_kinds = [
+  "restart_or_recoverable_state_evidence",
+  "challenge_or_adversary_evidence",
+  "failure_or_collision_evidence",
+  "user_input_handler_evidence",
+  "stateful_update_evidence",
+  "visible_interactive_surface_evidence",
+  "interactive_ui_source_evidence",
+  "non_static_screen_evidence",
+  "score_or_progression_evidence",
+]
+path_candidates = [
+  "src/app/page.tsx",
+  "src/app/page.jsx",
+  "src/app/page.ts",
+  "src/app/page.js",
+  "app/page.tsx",
+  "app/page.jsx",
+  "app/page.ts",
+  "app/page.js",
+  "pages/index.tsx",
+  "pages/index.jsx",
+  "pages/index.ts",
+  "pages/index.js",
+  "src/pages/index.tsx",
+  "src/pages/index.jsx",
+  "src/pages/index.ts",
+  "src/pages/index.js",
+]

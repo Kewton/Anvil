@@ -7,6 +7,7 @@ pub mod completion;
 pub mod dependency_setup;
 pub mod edit_anchor_recovery;
 pub mod evidence;
+pub mod evidence_knowledge;
 pub mod feedback;
 pub mod import_scan;
 pub mod interaction_probe;
