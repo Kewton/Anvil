@@ -3193,34 +3193,41 @@ fn source_file_has_mutating_input_handler(file: &SourceFile) -> bool {
 }
 
 fn handler_segments(lower: &str) -> Vec<&str> {
+    boundary_safe_segments_for_needles(
+        lower,
+        &[
+            "restart",
+            "resetgame",
+            "restartgame",
+            "initgame",
+            "initstate",
+            "resetstate",
+            "startgame",
+            "newgame",
+            "onkeydown",
+            "onkeyup",
+            "onclick",
+            "onpointer",
+            "onmousedown",
+            "onmouseup",
+            "ontouch",
+            "onsubmit",
+            "onchange",
+            "pointerdown",
+            "touchstart",
+            "keydown",
+            "keyup",
+            "addeventlistener",
+        ],
+    )
+}
+
+fn boundary_safe_segments_for_needles<'a>(text: &'a str, needles: &[&str]) -> Vec<&'a str> {
     let mut segments = Vec::new();
-    for needle in [
-        "restart",
-        "resetgame",
-        "restartgame",
-        "initgame",
-        "initstate",
-        "resetstate",
-        "startgame",
-        "newgame",
-        "onkeydown",
-        "onkeyup",
-        "onclick",
-        "onpointer",
-        "onmousedown",
-        "onmouseup",
-        "ontouch",
-        "onsubmit",
-        "onchange",
-        "pointerdown",
-        "touchstart",
-        "keydown",
-        "keyup",
-        "addeventlistener",
-    ] {
-        for (index, _) in lower.match_indices(needle) {
-            let end = lower.len().min(index + 500);
-            segments.push(&lower[index..crate::util::floor_char_boundary(lower, end)]);
+    for needle in needles {
+        for (index, _) in text.match_indices(needle) {
+            let end = crate::util::floor_char_boundary(text, index.saturating_add(500));
+            segments.push(&text[index..end]);
         }
     }
     segments
@@ -3314,7 +3321,8 @@ fn segment_has_non_audio_gameplay_call(segment: &str) -> bool {
         while index < bytes.len() && is_identifier_continue(bytes[index]) {
             index += 1;
         }
-        let ident = &segment[start..index];
+        let ident_end = crate::util::floor_char_boundary(segment, index);
+        let ident = &segment[start..ident_end];
         let mut lookahead = index;
         while lookahead < bytes.len() && bytes[lookahead].is_ascii_whitespace() {
             lookahead += 1;
@@ -4022,29 +4030,25 @@ fn restart_function_is_referenced_from_handler(lower: &str, name: &str) -> bool 
 }
 
 fn handler_reference_segments(lower: &str) -> Vec<&str> {
-    let mut segments = Vec::new();
-    for needle in [
-        "onclick",
-        "onkeydown",
-        "onkeyup",
-        "onpointer",
-        "onmousedown",
-        "onmouseup",
-        "ontouch",
-        "onsubmit",
-        "onchange",
-        "pointerdown",
-        "touchstart",
-        "keydown",
-        "keyup",
-        "addeventlistener",
-    ] {
-        for (index, _) in lower.match_indices(needle) {
-            let end = lower.len().min(index + 500);
-            segments.push(&lower[index..end]);
-        }
-    }
-    segments
+    boundary_safe_segments_for_needles(
+        lower,
+        &[
+            "onclick",
+            "onkeydown",
+            "onkeyup",
+            "onpointer",
+            "onmousedown",
+            "onmouseup",
+            "ontouch",
+            "onsubmit",
+            "onchange",
+            "pointerdown",
+            "touchstart",
+            "keydown",
+            "keyup",
+            "addeventlistener",
+        ],
+    )
 }
 
 fn segment_contains_identifier(segment: &str, name: &str) -> bool {
@@ -4153,7 +4157,7 @@ export default function Page(){
             .find("\nfn ")
             .or_else(|| rest.find("\n#[cfg(test)]"))
             .unwrap_or(rest.len());
-        &rest[..end]
+        &rest[..crate::util::floor_char_boundary(rest, end)]
     }
 
     #[test]
@@ -6510,14 +6514,90 @@ export default function Page(){
     #[test]
     fn handler_segments_handles_japanese_boundary_after_input_handler() {
         let mut lower = "onclick".to_string();
-        lower.push_str(&"x".repeat(497));
+        lower.push_str(&"x".repeat(492));
         lower.push_str("除外日本語");
 
         let segments = handler_segments(&lower);
 
         assert_eq!(segments.len(), 1);
-        assert!(segments[0].len() <= 500);
+        assert_eq!(segments[0].len(), 499);
+        assert!(lower.is_char_boundary(segments[0].len()));
         assert!(lower.starts_with(segments[0]));
+    }
+
+    #[test]
+    fn handler_reference_segments_handle_japanese_boundary() {
+        let mut lower = "onclick".to_string();
+        lower.push_str(&"x".repeat(492));
+        lower.push_str("移動日本語");
+
+        let segments = handler_reference_segments(&lower);
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].len(), 499);
+        assert!(lower.is_char_boundary(segments[0].len()));
+        assert!(lower.starts_with(segments[0]));
+    }
+
+    #[test]
+    fn shared_segment_collector_floors_multibyte_end() {
+        let mut lower = "onclick".to_string();
+        lower.push_str(&"x".repeat(492));
+        lower.push_str("移動日本語");
+
+        let segments = boundary_safe_segments_for_needles(&lower, &["onclick"]);
+
+        assert_eq!(segments, vec![&lower[..499]]);
+        assert!(lower.is_char_boundary(segments[0].len()));
+    }
+
+    #[test]
+    fn ascii_identifier_scan_handles_adjacent_japanese_text() {
+        assert!(segment_has_non_audio_gameplay_call("日本語shoot()移動"));
+        assert!(segment_contains_identifier(
+            "日本語 restartGame 移動",
+            "restartGame"
+        ));
+    }
+
+    #[test]
+    fn evidence_source_function_body_handles_japanese_text() {
+        let source = "fn first() { let label = \"移動\"; }\nfn second() {}\n";
+        assert_eq!(
+            evidence_source_function_body(source, "fn first"),
+            "fn first() { let label = \"移動\"; }"
+        );
+    }
+
+    #[test]
+    fn gate3_multibyte_fixture_survives_full_evidence_scan() {
+        let fixture = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/evidence_scan/gate_bs001_run3_char_boundary_page.tsx"),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("src/app/page.tsx"), fixture).unwrap();
+
+        let report = verify_runtime_acceptance(
+            dir.path(),
+            &["src/app/page.tsx".to_string()],
+            &[],
+            &[],
+            &["restart_or_recoverable_state_evidence".to_string()],
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            report
+                .evidence_tiers
+                .get("restart_or_recoverable_state_evidence")
+                .map(String::as_str),
+            Some("strong"),
+            "{report:?}"
+        );
     }
 
     #[test]

@@ -1,0 +1,34 @@
+case_id = "test0712_utf8_evidence_boundary"
+source = "non-regression gate 3 UTF-8 evidence segment panic"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = []
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/gate3-utf8-boundary.jsonl = [
+  "gate_space_combo3_gemma31_plan_qwen35_exec_default_none_001",
+  "evidence.rs:4044:33",
+  "byte index 24565 is not a char boundary",
+  "inside '移'",
+  "gate_bs001_run3_char_boundary_page.tsx",
+  "2376b81fcb22f3bbcb083ef982030ca92f8b9160",
+  "full_evidence_scan_no_panic",
+  "floor_char_boundary"
+]

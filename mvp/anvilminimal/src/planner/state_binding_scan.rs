@@ -1040,7 +1040,8 @@ fn extract_referenced_identifiers(expression: &str) -> Vec<String> {
         while index < bytes.len() && identifier_continue(bytes[index]) {
             index += 1;
         }
-        let identifier = &expression[start..index];
+        let identifier_end = crate::util::floor_char_boundary(expression, index);
+        let identifier = &expression[start..identifier_end];
         if ignored_identifier(identifier)
             || previous_significant_byte(expression, start) == Some(b'.')
             || next_significant_byte(expression, index) == Some(b':')
@@ -1216,6 +1217,14 @@ mod tests {
             contracts
                 .input_coupled_dimension_requirement
                 .contains("入力連動次元（例: プレイヤー/パドルのx座標）")
+        );
+    }
+
+    #[test]
+    fn referenced_identifier_scan_handles_adjacent_japanese_text() {
+        assert_eq!(
+            extract_referenced_identifiers("日本語 playerX 移動 score"),
+            vec!["playerX".to_string(), "score".to_string()]
         );
     }
 
