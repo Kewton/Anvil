@@ -231,3 +231,39 @@ Summary:
 - Across 24 tasks: one rollback (T17), one deliberately unbuilt item (T7), and two replacements (T4→T20, T9→T16).
 - Every task has a motivating measured failure run; no speculative mechanism was admitted.
 - T17 is the concrete example of the "off until admitted" operating rule working end to end: adopt, measure, detect degradation, and roll back, with each step recorded.
+
+## Integration phase closure (2026-07-11 – 2026-07-12)
+
+Commit ranges and counts below were checked against `git log --oneline`.
+Reported file sizes are measured at the closing commit; this records
+`runner.rs` at 18,242 lines rather than the previously quoted 18,243.
+
+| 項目 | コミット | 結果 |
+|---|---|---|
+| 台帳バックフィル T1-T24 | `c28e6af` | 完了（T17の`rolled_back`履歴を含む） |
+| runner分解 | `b567dc0..f938b22`（5コミット、両端を含む） | `runner.rs` 29,286→18,242行（-38%）、`repair_targeting` / `final_acceptance` / `ultra_plan_flow` / `assurance` の4モジュール新設、各モジュールに成長予算 |
+| エスカレーション状態機械化 | `22ddb9a..233a192`（6コミット、両端を含む） | 5系統を`repair_pressure.rs`（純粋関数遷移表746行）へ統合。既知の穴（no_progress非昇圧）は明示エントリとして保存 |
+| 凍結例外 T24b | `76cb059` | 成果物鍵の述語でsetupステップ変種を無害化（ゲート基準を塞ぐ有界修正として例外承認） |
+| 欠陥修正 T25/T25b | `c226b9b` | UTF-8文字境界panic（約90run潜伏）の修正・重複統合・掃引・実クラッシュfixture固定 |
+| 知識外部化 Stage 1 | `460afe0..986daff`（4コミット、両端を含む） | Next.js `knowledge.toml`（252行）+ `evidence_knowledge.toml`（340行）、golden 8本（各知識群4本）、値バイト保存 |
+
+### Gate record
+
+Both report directories below were present when this closure was recorded.
+
+| 試行 | レポート | 結果 |
+|---|---|---|
+| gate #1 | `workspace/management/runs/uat-test0712-g-001/` | FAIL — #3 が `evidence.rs:4044` のUTF-8境界panicで不正直終端（exit=101、recovery artifacts無し）。ゲートが約90run潜伏の欠陥を捕捉 |
+| gate #2 | `workspace/management/runs/uat-test0712-g-002/` | PASS — G1〜G5全通過。8/8正直終端、偽成功ゼロ、既知クラス再発ゼロ、full 2/8（Quiz 2/2）、#3は同条件で正直終端に転化。`selection_reason=evidence_mapped` の実戦初確認 |
+
+### Summary
+
+(a) 挙動退行ゼロで構造統合を完了（凍結例外1件は例外プロセス内で処理）。
+
+(b) ゲート自体が不正直終端の欠陥を発見・根絶させた——ゲート運用が
+機能した実例として記録する。
+
+(c) 本フェーズ以降、runner / loop_run / 新4モジュール / repair_pressure /
+知識のRust所有境界（nextjs.rs / evidence.rs）に個別成長予算が存在する。
+知識TOML自体に個別行数予算はないが、知識の変更は `knowledge.toml` 編集＋
+シナリオ行列回帰が正規手順となる。
