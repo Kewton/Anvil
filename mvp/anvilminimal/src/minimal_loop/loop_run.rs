@@ -1579,6 +1579,7 @@ pub(crate) fn run_session_with_outcome_with_options(
             }
             if options.requires_action_tool_feedback(write_or_edit_seen, tool_call_count)
                 && looks_like_action_prompt(user_prompt)
+                && !setup_step_policy::prompt_references_template_owned_artifacts(user_prompt)
             {
                 if pressure_state.no_progress_feedback_available(1) {
                     pressure_inputs.no_progress_streak =

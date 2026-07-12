@@ -1009,4 +1009,69 @@ export default function Page(){
         assert!(event_text.contains(r#"node -p \"strict port check\""#));
         assert!(event_text.contains("already satisfied"));
     }
+
+    #[test]
+    fn implement_no_progress_feedback_uses_pressure_state_and_declared_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"next dev -p 3011","start":"next start -p 3011","build":"next build"}}"#,
+        )
+        .unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        let port_check = "node -p \"require('./package.json').scripts.dev.includes('-p 3011') ? true : process.exit(1)\"";
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply::text("I will verify it.")),
+            Ok(AssistantReply::text("I will run the check now.")),
+            Ok(AssistantReply::text("I will run it next.")),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new("Bash", json!({"command":port_check}))],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply::text("Verification is complete.")),
+        ]);
+        let mut session = SessionSnapshot::new();
+        let prompt = format!(
+            "Execute exactly one StepPlan step.\n\nCurrent step id:\nensure-port-scripts\n\nCurrent step kind:\nimplement\n\nCurrent step instruction:\nConfirm package.json port scripts.\n\nVerification commands for this step:\n- {port_check}\n\nExpected verification result:\npass"
+        );
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            &prompt,
+            &[],
+            &cfg,
+            &NOOP_UI,
+            RunSessionOptions::plan_step(RunSessionStepKind::Implement),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.final_text, "Verification is complete.");
+        let events = event_values(&events);
+        let feedback = events
+            .iter()
+            .filter(|event| event.get("event").and_then(Value::as_str) == Some("no_progress_feedback"))
+            .collect::<Vec<_>>();
+        assert_eq!(feedback.len(), 3, "{feedback:#?}");
+        assert!(feedback.iter().all(|event| {
+            event
+                .get("feedback")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("already satisfied"))
+        }));
+        assert!(feedback.iter().all(|event| {
+            event
+                .get("verify_commands")
+                .and_then(Value::as_array)
+                .is_some_and(|commands| {
+                    commands
+                        .iter()
+                        .any(|command| command.as_str() == Some(port_check))
+                })
+        }));
+    }
 }

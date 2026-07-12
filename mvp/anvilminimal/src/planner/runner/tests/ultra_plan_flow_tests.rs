@@ -155,10 +155,149 @@ Phase task: Implement game logic, player control, collision, score, and canvas b
         assert_eq!(planner.messages().len(), 1);
         assert_eq!(plan.steps[0].id, "setup-nextjs");
         assert_eq!(plan.steps[0].kind, "verify");
+        assert!(setup_step_policy::step_short_circuit_precheck_applicable(
+            &plan.steps[0]
+        ));
         let event_text = std::fs::read_to_string(events).unwrap();
         assert!(!event_text.contains("\"event\":\"deterministic_step_plan_used\""));
         assert!(event_text.contains("\"event\":\"planner_raw_output_shape\""));
         assert!(event_text.contains("\"event\":\"preset_step_converted\""));
+    }
+
+    #[test]
+    fn preset_nextjs_implementation_phase_converts_implement_port_step_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write_nextjs_profile_workspace(dir.path(), None, None, None);
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.eval_events_path = Some(events.clone());
+        let goal = "Original ultra goal: Build Breakout on port 3011\n\
+Profile: nextjs\n\
+Intent: create\n\
+Phase id: core-implementation\n\
+Phase task: Implement paddle movement, collisions, score, and canvas behavior";
+        let plan_json = serde_json::to_string(&StepPlan {
+            goal: "Implement Breakout".to_string(),
+            steps: vec![
+                PlanStep {
+                    id: "ensure-port-scripts".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Update package.json scripts to use port 3011.".to_string(),
+                    expected_paths: Vec::new(),
+                    verify: Vec::new(),
+                },
+                PlanStep {
+                    id: "implement-gameplay".to_string(),
+                    kind: "implement".to_string(),
+                    expected_result: "pass".to_string(),
+                    instruction: "Implement paddle movement, collision, and score behavior."
+                        .to_string(),
+                    expected_paths: vec!["src/app/page.tsx".to_string()],
+                    verify: vec!["npm run build".to_string()],
+                },
+            ],
+        })
+        .unwrap();
+        let mut planner = FakeClient::new(vec![AssistantReply::text(plan_json)]);
+
+        let plan = generate_step_plan_with_ui_for_phase(
+            &mut planner,
+            goal,
+            &cfg,
+            &NOOP_UI,
+            Some("core-implementation"),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(plan.steps[0].id, "ensure-port-scripts");
+        assert_eq!(plan.steps[0].kind, "verify");
+        assert_eq!(plan.steps[1].id, "implement-gameplay");
+        assert_eq!(plan.steps[1].kind, "implement");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        assert!(event_text.contains("\"event\":\"preset_step_converted\""));
+        assert!(event_text.contains("\"step_id\":\"ensure-port-scripts\""));
+        assert!(!event_text.contains("\"step_id\":\"implement-gameplay\""));
+    }
+
+    #[test]
+    fn implement_port_step_with_missing_port_runs_executor_instead_of_short_circuiting() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/.bin")).unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/next")).unwrap();
+        std::fs::write(dir.path().join("node_modules/.bin/next"), "").unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"next dev","start":"next start","build":"next build"}}"#,
+        )
+        .unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.profile = "nextjs".to_string();
+        cfg.offline = true;
+        cfg.eval_events_path = Some(events.clone());
+        let step = PlanStep {
+            id: "ensure-port-scripts".to_string(),
+            kind: "implement".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Update package.json scripts to use port 3011.".to_string(),
+            expected_paths: Vec::new(),
+            verify: Vec::new(),
+        };
+        let plan = StepPlan {
+            goal: "Ensure the Next.js port scripts".to_string(),
+            steps: vec![step.clone()],
+        };
+        let mut fake = FakeClient::new(vec![AssistantReply {
+            content: String::new(),
+            tool_calls: vec![crate::state::ToolCall::new(
+                "Write",
+                serde_json::json!({
+                    "path": "package.json",
+                    "content": "{\"scripts\":{\"dev\":\"next dev -p 3011\",\"start\":\"next start -p 3011\",\"build\":\"next build\"}}"
+                }),
+            )],
+            prompt_tokens: None,
+            completion_tokens: None,
+        }]);
+        let mut session = SessionSnapshot::new();
+        let context = StepPromptContext {
+            overall_goal: "Build a Next.js app on port 3011".to_string(),
+            ..StepPromptContext::default()
+        };
+
+        let outcome = run_step(
+            &mut fake,
+            &mut session,
+            &plan,
+            &step,
+            &context,
+            &cfg,
+            &NOOP_UI,
+            "test",
+            ContractEnforcement::Enforce,
+            Some("core-implementation"),
+            None,
+        )
+        .unwrap();
+
+        assert_ne!(outcome.stop_reason.as_deref(), Some("StepShortCircuited"));
+        assert!(!fake.messages().is_empty());
+        let package = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        assert!(package.contains("next dev -p 3011"), "{package}");
+        let event_text = std::fs::read_to_string(events).unwrap();
+        let short_circuited_at_start = event_text.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|event| {
+                event.get("event").and_then(serde_json::Value::as_str)
+                    == Some("step_short_circuited")
+                    && event.get("at").and_then(serde_json::Value::as_str) == Some("start")
+                    && event.get("step_id").and_then(serde_json::Value::as_str)
+                        == Some("ensure-port-scripts")
+            })
+        });
+        assert!(!short_circuited_at_start, "{event_text}");
     }
 
     #[test]

@@ -218,7 +218,9 @@ pub fn lint_step_plan_report_with_workspace(
                 report.push("contract", err.to_string());
                 continue;
             }
-            if let Some(owner) = path_owners.insert(path.as_str(), step.id.as_str()) {
+            if step.step_kind() != StepKind::Verify
+                && let Some(owner) = path_owners.insert(path.as_str(), step.id.as_str())
+            {
                 report.push(
                     "path_ownership",
                     format!(
@@ -1694,6 +1696,19 @@ mod tests {
             steps: vec![step("s1", "Create file"), step("s2", "Update file")],
         };
         assert!(lint_step_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn verification_paths_do_not_claim_artifact_ownership() {
+        let mut verification = step("verify-template", "Verify the template-owned file");
+        verification.kind = "verify".to_string();
+        verification.verify = vec!["test -f out.txt".to_string()];
+        let plan = StepPlan {
+            goal: "goal".to_string(),
+            steps: vec![verification, step("implement-output", "Update the file")],
+        };
+
+        assert!(lint_step_plan(&plan).is_ok());
     }
 
     #[test]

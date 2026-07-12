@@ -1,0 +1,39 @@
+case_id = "test0712_bs_001_preset_implement_port_no_progress"
+source = "test0712_bs_001 #3 implement-kind preset port-script no-progress regression"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["ensure-port-scripts", "preset_step_converted", "step_short_circuited", "no_progress"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/preset-implement-port-no-progress.jsonl = [
+  "test0712_bs_001/#3",
+  "model_stagnation:no_progress_recorded",
+  "\"id\":\"ensure-port-scripts\"",
+  "\"kind\":\"implement\"",
+  "\"id\":\"implement-gameplay\"",
+  "\"event\":\"preset_step_converted\"",
+  "\"step_id\":\"ensure-port-scripts\"",
+  "\"event\":\"step_short_circuited\"",
+  "\"step_kind\":\"verify\"",
+  "\"event\":\"no_progress_feedback\"",
+  "already satisfied",
+  "\"setup_script_no_progress_exhaustions\":0",
+  "\"converted_verify_path_ownership_conflicts\":0"
+]

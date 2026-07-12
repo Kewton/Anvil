@@ -13,11 +13,13 @@ pub(crate) fn runtime_step_with_profile_checks(
     goal: &str,
     step: &PlanStep,
 ) -> (PlanStep, bool) {
-    if step.step_kind() != StepKind::Setup || !step.verify.is_empty() {
+    if !step.verify.is_empty()
+        || !references_template_owned_artifacts(step)
+        || !profile_owns_declared_paths(root, profile, step)
+    {
         return (step.clone(), false);
     }
-    let Some(checks) = profile_setup_checks(root, profile, goal, &step.id, &step.instruction)
-    else {
+    let Some(checks) = profile_setup_checks(root, profile, goal, step) else {
         return (step.clone(), false);
     };
     let mut runtime_step = step.clone();
@@ -37,8 +39,12 @@ pub(crate) fn step_short_circuit_precheck_applicable(step: &PlanStep) -> bool {
     match step.step_kind() {
         StepKind::Setup => step_mentions_setup(&step.id, &step.instruction),
         StepKind::Verify => !step.expected_paths.is_empty(),
-        _ => false,
+        _ => references_template_owned_artifacts(step) && template_owned_step_scope(step),
     }
+}
+
+pub(crate) fn references_template_owned_artifacts(step: &PlanStep) -> bool {
+    referenced_template_artifact(step).is_some()
 }
 
 pub(crate) fn prompt_mentions_setup(prompt: &str) -> bool {
@@ -47,8 +53,32 @@ pub(crate) fn prompt_mentions_setup(prompt: &str) -> bool {
     step_mentions_setup(id, instruction)
 }
 
+pub(crate) fn prompt_references_template_owned_artifacts(prompt: &str) -> bool {
+    let Some(step_id) = prompt_field(prompt, "Current step id:\n") else {
+        return false;
+    };
+    let Some(instruction) = prompt_field(prompt, "Current step instruction:\n") else {
+        return false;
+    };
+    let step = PlanStep {
+        id: step_id.to_string(),
+        kind: prompt_field(prompt, "Current step kind:\n")
+            .unwrap_or_default()
+            .to_string(),
+        expected_result: String::new(),
+        instruction: instruction.to_string(),
+        expected_paths: list_from_prompt(prompt, "Expected paths after this step:\n"),
+        verify: verification_commands_from_prompt(prompt),
+    };
+    references_template_owned_artifacts(&step) && template_owned_step_scope(&step)
+}
+
 pub(crate) fn verification_commands_from_prompt(prompt: &str) -> Vec<String> {
-    prompt_field(prompt, "Verification commands for this step:\n")
+    list_from_prompt(prompt, "Verification commands for this step:\n")
+}
+
+fn list_from_prompt(prompt: &str, marker: &str) -> Vec<String> {
+    prompt_field(prompt, marker)
         .into_iter()
         .flat_map(str::lines)
         .filter_map(|line| line.trim().strip_prefix("- "))
@@ -71,14 +101,13 @@ pub(crate) fn convert_preset_phase_setup_steps(
     }
     let mut converted = 0;
     for step in &mut plan.steps {
-        if step.step_kind() != StepKind::Setup {
+        if !references_template_owned_artifacts(step) {
             continue;
         }
-        let Some(checks) = profile_setup_checks(root, profile, goal, &step.id, &step.instruction)
-        else {
+        let Some(checks) = profile_setup_checks(root, profile, goal, step) else {
             continue;
         };
-        if !profile_owns_declared_paths(root, profile, &step.expected_paths) {
+        if !profile_owns_declared_paths(root, profile, step) {
             continue;
         }
         step.kind = "verify".to_string();
@@ -107,21 +136,125 @@ fn profile_setup_checks(
     root: &Path,
     profile: &str,
     goal: &str,
-    step_id: &str,
-    instruction: &str,
+    step: &PlanStep,
 ) -> Option<SetupStepChecks> {
     if !is_nextjs_profile(profile) {
         return None;
     }
-    crate::planner::profiles::nextjs::setup_step_checks(root, goal, step_id, instruction)
+    let marker = match referenced_template_artifact(step)? {
+        TemplateOwnedArtifact::PackageManifest => "package.json scripts port",
+        TemplateOwnedArtifact::ScaffoldConfiguration => "scaffold tsconfig postcss tailwind",
+    };
+    crate::planner::profiles::nextjs::setup_step_checks(root, goal, marker, "")
 }
 
-fn profile_owns_declared_paths(root: &Path, profile: &str, paths: &[String]) -> bool {
+fn profile_owns_declared_paths(root: &Path, profile: &str, step: &PlanStep) -> bool {
     if !is_nextjs_profile(profile) {
         return false;
     }
     let owned = crate::planner::profiles::nextjs::setup_scaffold_paths(root);
-    paths.iter().all(|path| owned.contains(path))
+    step.expected_paths.iter().all(|path| owned.contains(path))
+        && (step.step_kind() == StepKind::Setup
+            || step
+                .expected_paths
+                .iter()
+                .all(|path| template_owned_artifact_path(path)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateOwnedArtifact {
+    PackageManifest,
+    ScaffoldConfiguration,
+}
+
+fn referenced_template_artifact(step: &PlanStep) -> Option<TemplateOwnedArtifact> {
+    let mut scaffold_referenced = false;
+    for path in &step.expected_paths {
+        if package_manifest_path(path) {
+            return Some(TemplateOwnedArtifact::PackageManifest);
+        }
+        scaffold_referenced |= template_owned_artifact_path(path);
+    }
+    let authored_instruction = step
+        .instruction
+        .split_once("\n\nProfile contract:")
+        .map(|(instruction, _)| instruction)
+        .unwrap_or(&step.instruction);
+    for text in std::iter::once(step.id.as_str())
+        .chain(std::iter::once(authored_instruction))
+        .chain(step.verify.iter().map(String::as_str))
+    {
+        match template_owned_text_reference(text) {
+            Some(TemplateOwnedArtifact::PackageManifest) => {
+                return Some(TemplateOwnedArtifact::PackageManifest);
+            }
+            Some(TemplateOwnedArtifact::ScaffoldConfiguration) => {
+                scaffold_referenced = true;
+            }
+            None => {}
+        }
+    }
+    scaffold_referenced.then_some(TemplateOwnedArtifact::ScaffoldConfiguration)
+}
+
+fn template_owned_text_reference(text: &str) -> Option<TemplateOwnedArtifact> {
+    let lower = text.replace('\\', "/").to_ascii_lowercase();
+    let tokens = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let package_reference = lower.contains("package.json")
+        || lower.contains("package manifest")
+        || lower.contains("package script")
+        || lower.contains("npm script")
+        || lower.contains("port script")
+        || lower.contains("dev script")
+        || lower.contains("start script")
+        || lower.contains("build script")
+        || tokens
+            .iter()
+            .any(|token| matches!(*token, "scripts" | "port" | "ports"));
+    if package_reference {
+        return Some(TemplateOwnedArtifact::PackageManifest);
+    }
+    let scaffold_reference = lower.contains("tsconfig")
+        || lower.contains("postcss")
+        || lower.contains("tailwind")
+        || lower.contains("next.config")
+        || lower.contains("next-env.d.ts")
+        || lower.contains("src/app/layout.tsx")
+        || lower.contains("src/app/globals.css")
+        || lower.contains("src/app/global.d.ts")
+        || tokens
+            .iter()
+            .any(|token| matches!(*token, "scaffold" | "scaffolding"));
+    scaffold_reference.then_some(TemplateOwnedArtifact::ScaffoldConfiguration)
+}
+
+fn package_manifest_path(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    lower.rsplit('/').next() == Some("package.json")
+}
+
+fn template_owned_artifact_path(path: &str) -> bool {
+    let lower = path.replace('\\', "/").to_ascii_lowercase();
+    package_manifest_path(&lower)
+        || lower.ends_with("tsconfig.json")
+        || lower.contains("postcss.config.")
+        || lower.contains("tailwind.config.")
+        || lower.contains("next.config.")
+        || lower.ends_with("next-env.d.ts")
+        || lower.ends_with("src/app/layout.tsx")
+        || lower.ends_with("src/app/globals.css")
+        || lower.ends_with("src/app/global.d.ts")
+}
+
+fn template_owned_step_scope(step: &PlanStep) -> bool {
+    step.step_kind() == StepKind::Setup
+        || step
+            .expected_paths
+            .iter()
+            .all(|path| template_owned_artifact_path(path))
 }
 
 fn merge_unique_paths(paths: &mut Vec<String>, additional: Vec<String>) {
@@ -183,6 +316,60 @@ mod tests {
         }
     }
 
+    fn ensure_port_scripts_implement_step() -> PlanStep {
+        PlanStep {
+            id: "ensure-port-scripts".to_string(),
+            kind: "implement".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Update package.json scripts to use port 3011.".to_string(),
+            expected_paths: Vec::new(),
+            verify: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn template_owned_artifact_predicate_uses_every_step_field_conservatively() {
+        let mut step = PlanStep {
+            id: "implement-gameplay".to_string(),
+            kind: "implement".to_string(),
+            expected_result: "pass".to_string(),
+            instruction: "Implement Breakout paddle movement and collision logic.".to_string(),
+            expected_paths: vec!["src/app/page.tsx".to_string()],
+            verify: vec!["npm run build".to_string()],
+        };
+        assert!(!references_template_owned_artifacts(&step));
+
+        step.id = "ensure-port-scripts".to_string();
+        assert!(references_template_owned_artifacts(&step));
+
+        step.id = "implement-gameplay".to_string();
+        step.instruction = "Check the existing tsconfig.json before continuing.".to_string();
+        assert!(references_template_owned_artifacts(&step));
+
+        step.instruction = "Configure the project before continuing.".to_string();
+        step.expected_paths = vec!["package.json".to_string()];
+        assert!(references_template_owned_artifacts(&step));
+
+        step.expected_paths.clear();
+        step.verify = vec!["node -p \"require('./package.json').scripts.dev\"".to_string()];
+        assert!(references_template_owned_artifacts(&step));
+
+        step.verify = vec!["npm run build".to_string()];
+        assert!(!references_template_owned_artifacts(&step));
+    }
+
+    #[test]
+    fn template_owned_prompt_feedback_rejects_mixed_final_acceptance_scope() {
+        let ensure_port = "Current step id:\nensure-port-scripts\n\nCurrent step kind:\nimplement\n\nCurrent step instruction:\nConfirm package.json scripts use port 3011.\n\nExpected paths after this step:\n- package.json\n\nVerification commands for this step:\n- node -p \"require('./package.json').scripts.dev\"";
+        assert!(prompt_references_template_owned_artifacts(ensure_port));
+
+        let mixed_repair = "Current step id:\nfinal-acceptance-repair\n\nCurrent step kind:\nimplement\n\nCurrent step instruction:\nRepair the compile failure.\n\nExpected paths after this step:\n- package.json\n- src/app/page.tsx\n\nVerification commands for this step:\n- npm run build";
+        assert!(!prompt_references_template_owned_artifacts(mixed_repair));
+        assert!(!prompt_references_template_owned_artifacts(
+            "Repair final acceptance for package.json and src/app/page.tsx."
+        ));
+    }
+
     #[test]
     fn setup_classification_uses_step_id_tokens() {
         for id in ["setup", "package-scripts", "app-config", "project-scaffold"] {
@@ -238,6 +425,32 @@ mod tests {
         );
 
         assert!(synthesized);
+        assert!(step_short_circuit_precheck_applicable(&runtime));
+        assert!(report.is_pass(), "{}", report.primary_reason());
+    }
+
+    #[test]
+    fn empty_verify_implement_port_step_synthesizes_passing_profile_precheck() {
+        let dir = tempfile::tempdir().unwrap();
+        write_package(dir.path(), "next dev -p 3011");
+
+        let (runtime, synthesized) = runtime_step_with_profile_checks(
+            dir.path(),
+            "nextjs",
+            "Build a Next.js app on port 3011",
+            &ensure_port_scripts_implement_step(),
+        );
+        let (report, _) = verify_step_with_profile_setup_observed_with_offline(
+            dir.path(),
+            &runtime,
+            Some("nextjs"),
+            NodeDependencySetupAuthority::None,
+            true,
+        );
+
+        assert!(synthesized);
+        assert_eq!(runtime.kind, "implement");
+        assert_eq!(runtime.expected_paths, ["package.json"]);
         assert!(step_short_circuit_precheck_applicable(&runtime));
         assert!(report.is_pass(), "{}", report.primary_reason());
     }
@@ -324,6 +537,65 @@ mod tests {
         let event = std::fs::read_to_string(events).unwrap();
         assert!(event.contains("\"event\":\"preset_step_converted\""));
         assert!(event.contains("\"step_id\":\"setup-scripts\""));
+    }
+
+    #[test]
+    fn preset_implementation_port_step_is_converted_independent_of_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut plan = StepPlan {
+            goal: "Implement the app".to_string(),
+            steps: vec![ensure_port_scripts_implement_step()],
+        };
+
+        let count = convert_preset_phase_setup_steps(
+            &mut plan,
+            dir.path(),
+            "nextjs",
+            "Build a Next.js app on port 3011",
+            Some("core-implementation"),
+            true,
+            Some(&events),
+        );
+
+        assert_eq!(count, 1);
+        assert_eq!(plan.steps[0].kind, "verify");
+        assert_eq!(plan.steps[0].expected_paths, ["package.json"]);
+        assert!(!plan.steps[0].verify.is_empty());
+        let event = std::fs::read_to_string(events).unwrap();
+        assert!(event.contains("\"event\":\"preset_step_converted\""));
+        assert!(event.contains("\"step_id\":\"ensure-port-scripts\""));
+    }
+
+    #[test]
+    fn preset_game_logic_implement_step_is_not_converted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = StepPlan {
+            goal: "Implement Breakout".to_string(),
+            steps: vec![PlanStep {
+                id: "implement-gameplay".to_string(),
+                kind: "implement".to_string(),
+                expected_result: "pass".to_string(),
+                instruction: "Implement paddle movement, ball collision, and scoring.\n\nProfile contract:\nKeep package scripts on port 3011.".to_string(),
+                expected_paths: vec!["src/app/page.tsx".to_string()],
+                verify: vec!["npm run build".to_string()],
+            }],
+        };
+
+        assert!(!references_template_owned_artifacts(&plan.steps[0]));
+        assert_eq!(
+            convert_preset_phase_setup_steps(
+                &mut plan,
+                dir.path(),
+                "nextjs",
+                "Build a Next.js app on port 3011",
+                Some("core-implementation"),
+                true,
+                None,
+            ),
+            0
+        );
+        assert_eq!(plan.steps[0].kind, "implement");
     }
 
     #[test]
