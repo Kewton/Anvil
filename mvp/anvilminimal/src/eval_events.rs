@@ -142,6 +142,16 @@ pub fn emit(path: Option<&Path>, mut event: Value) {
     }
 }
 
+pub(crate) fn append_event_failsafe(path: Option<&Path>, mut event: Value) -> anyhow::Result<()> {
+    let path = path.ok_or_else(|| anyhow::anyhow!("eval events path is unavailable"))?;
+    if let Value::Object(ref mut object) = event {
+        object
+            .entry("schema_version")
+            .or_insert_with(|| Value::String("1".to_string()));
+    }
+    append(path, &event)
+}
+
 fn append(path: &Path, event: &Value) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

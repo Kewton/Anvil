@@ -1,0 +1,36 @@
+case_id = "test0713_internal_panic_boundary"
+source = "gate 1 honest-terminal fault injection for CLI internal panic"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = []
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/internal-panic-terminal.jsonl = [
+  "\"event\":\"run_stop\"",
+  "\"reason\":\"internal_panic\"",
+  "\"ok\":false",
+  "\"panic_message\":\"fault injection: CLI run panic boundary\"",
+  "\"panic_location\":\"src/cli_panic_boundary.rs:",
+  "\"recovery_note_path\":\".anvil/repairs/repair-internal-panic-",
+  "\"process_completion_state\":\"failed\"",
+  "\"expected_exit_nonzero\":true",
+  "Reason: internal_panic",
+  "Reproduction command:"
+]

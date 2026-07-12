@@ -3,6 +3,7 @@
 pub mod bounded_process;
 pub mod build_info;
 pub mod cli;
+mod cli_panic_boundary;
 pub mod config;
 pub mod eval_events;
 pub mod minimal_loop;
@@ -35,6 +36,14 @@ use tui::markdown::{PlainRenderer, TerminalMarkdownRenderer};
 
 pub fn run(cli: Cli) -> anyhow::Result<()> {
     let config = Config::from_cli(cli)?;
+    run_resolved_config(config)
+}
+
+fn run_resolved_config(config: Config) -> anyhow::Result<()> {
+    cli_panic_boundary::catch_cli_run(&config, || run_config(config.clone()))
+}
+
+fn run_config(config: Config) -> anyhow::Result<()> {
     if matches!(config.action, Action::Runs) {
         println!("{}", runs::render_runs_table(&config.workspace_root));
         return Ok(());
@@ -42,6 +51,8 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     let _presentation_guard = tui::presentation::install(&config);
     emit_run_start(&config);
     let direct_command_guard = DirectCommandCompletionGuard::start(&config);
+    #[cfg(test)]
+    cli_panic_boundary::inject_test_fault_if_requested();
     let result = (|| -> anyhow::Result<()> {
         preflight::run_for_action(&config)?;
         match config.action.clone() {
@@ -304,6 +315,8 @@ impl DirectCommandCompletionGuard {
     }
 
     fn finalize_with_status(&self, result: &anyhow::Result<()>, status: DirectCommandStatus) {
+        #[cfg(test)]
+        cli_panic_boundary::inject_test_finalizer_fault_if_requested();
         if self.finalized.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -319,10 +332,24 @@ impl Drop for DirectCommandCompletionGuard {
         if self.finalized.load(Ordering::Acquire) {
             return;
         }
-        let result: anyhow::Result<()> = Err(anyhow::anyhow!(
+        let reason = if std::thread::panicking() {
+            "internal_panic"
+        } else {
             "direct CLI command exited before completion finalizer"
-        ));
-        self.finalize_with_status(&result, DirectCommandStatus::Failed);
+        };
+        let result: anyhow::Result<()> = Err(anyhow::anyhow!(reason));
+        if std::thread::panicking() {
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.finalize_with_status(&result, DirectCommandStatus::Failed);
+            })) {
+                cli_panic_boundary::report_secondary_panic(
+                    "finalizing a panicking direct CLI command",
+                    payload,
+                );
+            }
+        } else {
+            self.finalize_with_status(&result, DirectCommandStatus::Failed);
+        }
     }
 }
 
@@ -1045,6 +1072,147 @@ mod tests {
         assert!(event_text.contains("\"command\":\"--run-plan\""));
         assert!(event_text.contains("\"status\":\"failed\""));
         assert!(event_text.contains("\"failure_kind\":\"direct_cli_command_failed\""));
+    }
+
+    #[test]
+    fn cli_run_fault_injection_finalizes_with_internal_panic_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/internal-panic/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.action = Action::UltraPlanRun("fault injection".to_string());
+        cfg.eval_events_path = Some(events.clone());
+        cli_panic_boundary::request_test_fault();
+
+        let err = run_resolved_config(cfg).expect_err("fault injection must fail");
+
+        assert!(err.to_string().contains("internal_panic"), "{err:#}");
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        let event_values = event_text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let command_stops = event_values
+            .iter()
+            .filter(|event| {
+                event.get("event").and_then(serde_json::Value::as_str) == Some("tui_command_stop")
+            })
+            .collect::<Vec<_>>();
+        let run_stops = event_values
+            .iter()
+            .filter(|event| {
+                event.get("event").and_then(serde_json::Value::as_str) == Some("run_stop")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(command_stops.len(), 1, "{event_text}");
+        assert_eq!(run_stops.len(), 1, "{event_text}");
+        assert_eq!(
+            command_stops[0]
+                .get("stop_reason")
+                .and_then(serde_json::Value::as_str),
+            Some("internal_panic")
+        );
+        let stop = run_stops[0];
+        assert_eq!(
+            stop.get("reason").and_then(serde_json::Value::as_str),
+            Some("internal_panic")
+        );
+        assert_eq!(
+            stop.get("panic_message")
+                .and_then(serde_json::Value::as_str),
+            Some("fault injection: CLI run panic boundary")
+        );
+        assert!(
+            stop.get("panic_location")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|location| location.contains("cli_panic_boundary.rs")),
+            "{stop:#}"
+        );
+        for field in [
+            "completion_status",
+            "task_status",
+            "assurance_level",
+            "assurance_reason",
+            "effective_profile",
+            "contract_origin",
+            "runtime_acceptance_status",
+            "final_acceptance_status",
+            "release_gate_status",
+            "release_quality_completion",
+            "next_action",
+        ] {
+            if let Some(expected) = command_stops[0].get(field) {
+                assert_eq!(stop.get(field), Some(expected), "{field}");
+            }
+        }
+        let recovery = stop
+            .get("recovery_note_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(recovery.starts_with(".anvil/repairs/repair-internal-panic-"));
+        assert!(dir.path().join(recovery).is_file());
+        let summary = std::fs::read_to_string(events.parent().unwrap().join("summary.md")).unwrap();
+        assert!(summary.contains("Status: failed"), "{summary}");
+        assert!(
+            summary.contains("Failure kind: internal_panic"),
+            "{summary}"
+        );
+        assert!(!summary.contains("Status: running"), "{summary}");
+    }
+
+    #[test]
+    fn cli_run_keeps_handoff_when_completion_drop_also_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = dir.path().join(".anvil/runs/double-panic/events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.action = Action::UltraPlanRun("double panic fault injection".to_string());
+        cfg.eval_events_path = Some(events.clone());
+        cli_panic_boundary::request_test_fault();
+        cli_panic_boundary::request_test_finalizer_fault();
+
+        let err = run_resolved_config(cfg).expect_err("fault injection must fail");
+
+        assert!(err.to_string().contains("internal_panic"), "{err:#}");
+        assert!(
+            err.to_string()
+                .contains("fault injection: CLI run panic boundary"),
+            "{err:#}"
+        );
+        let event_text = std::fs::read_to_string(&events).unwrap();
+        let event_values = event_text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_values
+                .iter()
+                .filter(|event| {
+                    event.get("event").and_then(serde_json::Value::as_str) == Some("run_stop")
+                })
+                .count(),
+            1,
+            "{event_text}"
+        );
+        assert!(
+            event_values.iter().all(|event| {
+                event.get("event").and_then(serde_json::Value::as_str) != Some("tui_command_stop")
+            }),
+            "{event_text}"
+        );
+        let stop = event_values.last().unwrap();
+        assert_eq!(
+            stop.get("reason").and_then(serde_json::Value::as_str),
+            Some("internal_panic")
+        );
+        assert_eq!(
+            stop.get("panic_message")
+                .and_then(serde_json::Value::as_str),
+            Some("fault injection: CLI run panic boundary")
+        );
+        let recovery = stop
+            .get("recovery_note_path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(dir.path().join(recovery).is_file());
     }
 
     #[test]
