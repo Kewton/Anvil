@@ -1,0 +1,32 @@
+case_id = "test0712_code_line_measurement_split"
+source = "guardrail regression fixture for split production/test line measurement"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["guardrail", "line-count", "production", "test"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/code-line-measurement.jsonl = [
+  "\"fixture\":\"code_line_measurement_split\"",
+  "\"measurement\":\"runner_chokepoints\"",
+  "\"production_code\":\"#[cfg(test)] items are excluded from production counts\"",
+  "\"test_code\":\"#[cfg(test)] items are counted separately\"",
+  "\"total_budget\":\"legacy total baseline remains enforced\"",
+  "\"mod_tests_boundary\":\"#[cfg(test)] mod tests is treated as test code through EOF\""
+]

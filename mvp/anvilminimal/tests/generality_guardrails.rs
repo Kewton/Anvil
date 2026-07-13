@@ -5,6 +5,26 @@ use anvilminimal::eval_events::{
     CompletionSnapshot, append_completion_summary, project_completion,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodeLineCounts {
+    production: usize,
+    test: usize,
+}
+
+impl CodeLineCounts {
+    fn total(self) -> usize {
+        self.production + self.test
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChokepointBudget {
+    path: &'static str,
+    total_baseline: usize,
+    production_baseline: usize,
+    test_baseline: usize,
+}
+
 #[test]
 fn generic_profile_reduced_assurance_markers_still_render() {
     let dir = tempfile::tempdir().unwrap();
@@ -133,26 +153,135 @@ fn nextjs_boundary_erosion_tripwire_keeps_dispatch_sites_audited() {
 
 #[test]
 fn runner_chokepoints_do_not_grow_past_interim_budget() {
-    for (path, baseline) in [
-        ("src/planner/runner.rs", 18_242usize),
-        ("src/minimal_loop/loop_run.rs", 7_444usize),
-        ("src/minimal_loop/repair_pressure.rs", 746usize),
-        ("src/planner/repair_targeting.rs", 597usize),
-        ("src/planner/final_acceptance.rs", 2_942usize),
-        ("src/planner/ultra_plan_flow.rs", 1_570usize),
-        ("src/planner/assurance.rs", 1_311usize),
-        ("src/planner/profiles/nextjs.rs", 3_684usize),
-        ("src/minimal_loop/evidence.rs", 6_702usize),
+    for budget in [
+        ChokepointBudget {
+            path: "src/planner/runner.rs",
+            total_baseline: 18_242,
+            production_baseline: 9_904,
+            test_baseline: 8_339,
+        },
+        ChokepointBudget {
+            path: "src/minimal_loop/loop_run.rs",
+            total_baseline: 7_444,
+            production_baseline: 4_960,
+            test_baseline: 2_485,
+        },
+        ChokepointBudget {
+            path: "src/minimal_loop/repair_pressure.rs",
+            total_baseline: 746,
+            production_baseline: 278,
+            test_baseline: 468,
+        },
+        ChokepointBudget {
+            path: "src/planner/repair_targeting.rs",
+            total_baseline: 597,
+            production_baseline: 459,
+            test_baseline: 138,
+        },
+        ChokepointBudget {
+            path: "src/planner/final_acceptance.rs",
+            total_baseline: 2_942,
+            production_baseline: 2_937,
+            test_baseline: 5,
+        },
+        ChokepointBudget {
+            path: "src/planner/ultra_plan_flow.rs",
+            total_baseline: 1_570,
+            production_baseline: 1_570,
+            test_baseline: 0,
+        },
+        ChokepointBudget {
+            path: "src/planner/assurance.rs",
+            total_baseline: 1_311,
+            production_baseline: 1_305,
+            test_baseline: 6,
+        },
+        ChokepointBudget {
+            path: "src/planner/profiles/nextjs.rs",
+            total_baseline: 3_684,
+            production_baseline: 2_361,
+            test_baseline: 1_323,
+        },
+        ChokepointBudget {
+            path: "src/minimal_loop/evidence.rs",
+            total_baseline: 6_702,
+            production_baseline: 4_088,
+            test_baseline: 2_694,
+        },
     ] {
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|err| panic!("failed to read {path}: {err}"));
-        let current = text.lines().count();
-        let allowed = baseline + ((baseline * 2).div_ceil(100));
+        let text = std::fs::read_to_string(budget.path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", budget.path));
+        let counts = code_line_counts(&text);
+        assert_line_budget(
+            budget.path,
+            "production code",
+            counts.production,
+            budget.production_baseline,
+        );
+        assert_line_budget(budget.path, "test code", counts.test, budget.test_baseline);
+        let allowed = allowed_line_count(budget.total_baseline);
         assert!(
-            current <= allowed,
-            "{path} grew to {current} lines; baseline is {baseline}, allowed max is {allowed}. Move new subsystems to new modules or land a shrinking refactor first."
+            counts.total() <= allowed,
+            "{} grew to {} total lines (production {}, test {}); total baseline is {}, allowed max is {}. Move new subsystems to new modules or land a shrinking refactor first.",
+            budget.path,
+            counts.total(),
+            counts.production,
+            counts.test,
+            budget.total_baseline,
+            allowed,
         );
     }
+}
+
+#[test]
+fn code_line_counts_separate_cfg_test_blocks_and_items() {
+    let source = "\
+fn production_before() {}
+#[cfg(test)]
+use super::*;
+fn production_between() {}
+#[cfg(test)]
+fn test_helper() {
+    assert!(true);
+}
+fn production_after_helper() {}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn it_works() {}
+}
+";
+
+    let counts = code_line_counts(source);
+
+    assert_eq!(
+        counts,
+        CodeLineCounts {
+            production: 3,
+            test: 11,
+        }
+    );
+    assert_eq!(counts.total(), source.lines().count());
+    assert_eq!(
+        production_lines(source),
+        vec![
+            "fn production_before() {}".to_string(),
+            "fn production_between() {}".to_string(),
+            "fn production_after_helper() {}".to_string(),
+        ]
+    );
+}
+
+fn assert_line_budget(path: &str, kind: &str, current: usize, baseline: usize) {
+    let allowed = allowed_line_count(baseline);
+    assert!(
+        current <= allowed,
+        "{path} {kind} grew to {current} lines; {kind} baseline is {baseline}, allowed max is {allowed}. Move new subsystems to new modules or land a shrinking refactor first.",
+    );
+}
+
+fn allowed_line_count(baseline: usize) -> usize {
+    baseline + ((baseline * 2).div_ceil(100))
 }
 
 fn nextjs_literal_counts_outside_profiles() -> BTreeMap<String, usize> {
@@ -196,15 +325,50 @@ fn collect_rust_source_files(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn code_line_counts(text: &str) -> CodeLineCounts {
+    classified_rust_lines(text).into_iter().fold(
+        CodeLineCounts {
+            production: 0,
+            test: 0,
+        },
+        |mut counts, (_, class)| {
+            match class {
+                RustLineClass::Production => counts.production += 1,
+                RustLineClass::Test => counts.test += 1,
+            }
+            counts
+        },
+    )
+}
+
 fn production_lines(text: &str) -> Vec<String> {
+    classified_rust_lines(text)
+        .into_iter()
+        .filter_map(|(line, class)| (class == RustLineClass::Production).then(|| line.to_string()))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RustLineClass {
+    Production,
+    Test,
+}
+
+fn classified_rust_lines(text: &str) -> Vec<(&str, RustLineClass)> {
     let mut out = Vec::new();
     let mut skip_next_cfg_test_item = false;
     let mut skipping_cfg_test_block = false;
+    let mut test_mod_to_eof = false;
     let mut block_depth = 0i32;
 
     for line in text.lines() {
         let trimmed = line.trim();
+        if test_mod_to_eof {
+            out.push((line, RustLineClass::Test));
+            continue;
+        }
         if skipping_cfg_test_block {
+            out.push((line, RustLineClass::Test));
             block_depth += brace_delta(line);
             if block_depth <= 0 {
                 skipping_cfg_test_block = false;
@@ -214,11 +378,16 @@ fn production_lines(text: &str) -> Vec<String> {
         }
         if skip_next_cfg_test_item {
             if trimmed.starts_with("#[") {
+                out.push((line, RustLineClass::Test));
                 continue;
             }
             if trimmed.starts_with("mod tests") {
-                break;
+                out.push((line, RustLineClass::Test));
+                test_mod_to_eof = true;
+                skip_next_cfg_test_item = false;
+                continue;
             }
+            out.push((line, RustLineClass::Test));
             let delta = brace_delta(line);
             if delta > 0 {
                 skipping_cfg_test_block = true;
@@ -231,10 +400,11 @@ fn production_lines(text: &str) -> Vec<String> {
             continue;
         }
         if trimmed == "#[cfg(test)]" {
+            out.push((line, RustLineClass::Test));
             skip_next_cfg_test_item = true;
             continue;
         }
-        out.push(line.to_string());
+        out.push((line, RustLineClass::Production));
     }
     out
 }

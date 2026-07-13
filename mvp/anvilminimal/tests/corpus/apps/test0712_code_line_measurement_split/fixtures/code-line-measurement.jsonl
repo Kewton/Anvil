@@ -1,0 +1,1 @@
+{"fixture":"code_line_measurement_split","measurement":"runner_chokepoints","production_code":"#[cfg(test)] items are excluded from production counts","test_code":"#[cfg(test)] items are counted separately","total_budget":"legacy total baseline remains enforced","mod_tests_boundary":"#[cfg(test)] mod tests is treated as test code through EOF","template":"test0710_stage0_pivot"}
