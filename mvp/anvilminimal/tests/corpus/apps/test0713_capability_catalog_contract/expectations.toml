@@ -1,0 +1,45 @@
+case_id = "test0713_capability_catalog_contract"
+source = "capability catalog manifest contract fixtures"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["capability_catalog", "manifest", "whitelist"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/capability-catalog-contract.jsonl = [
+  "\"event\":\"capability_catalog_contract\"",
+  "\"free_shell_allowed\":false",
+  "\"id\":\"package_json_port_script\"",
+  "\"kind\":\"ShellCheck\"",
+  "\"params\":[{\"name\":\"port\",\"type\":\"u16\",\"required\":true}]",
+  "\"id\":\"hook_attribute_present\"",
+  "\"type\":\"enum[action,state]\"",
+  "\"id\":\"scaffold_files_present\"",
+  "\"type\":\"[path]\"",
+  "\"id\":\"browser_readiness\"",
+  "\"kind\":\"Probe\"",
+  "\"resolve_status\":\"unimplemented\""
+]
+fixtures/nextjs-port-script-catalog-routing.jsonl = [
+  "\"event\":\"deterministic_step_plan_catalog_routing\"",
+  "\"template_id\":\"nextjs-port-scripts\"",
+  "\"capability_id\":\"package_json_port_script\"",
+  "\"port\":4321",
+  "\"byte_compatible_with\":\"package_json_port_script_check_command\""
+]

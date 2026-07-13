@@ -18,6 +18,7 @@ above baseline +2%:
 - `src/planner/assurance.rs`: 1,311 lines
 - `src/planner/profiles/nextjs.rs`: 3,684 lines
 - `src/minimal_loop/evidence.rs`: 6,702 lines
+- `src/planner/capability_catalog.rs`: 614 lines
 
 The same guard also measures production code and `#[cfg(test)]` code
 separately. The total baseline above remains enforced; these split baselines
@@ -35,6 +36,7 @@ masking test bloat:
 | `src/planner/assurance.rs` | 1,305 | 6 |
 | `src/planner/profiles/nextjs.rs` | 2,361 | 1,323 |
 | `src/minimal_loop/evidence.rs` | 4,088 | 2,694 |
+| `src/planner/capability_catalog.rs` | 407 | 207 |
 
 When adding behavior, put new subsystems in new modules and call them from the
 runner. Refactors that shrink these files are allowed; lower the baseline only
@@ -46,3 +48,8 @@ Declarative Next.js and evidence knowledge must be changed in
 `src/minimal_loop/evidence_knowledge.toml`, respectively. Before adopting a
 knowledge change, run and record the Space, Breakout, and Quiz scenario matrix
 so vocabulary or contract drift is measured independently from Rust logic.
+
+Profile manifests may reference only capabilities registered in
+`src/planner/capability_catalog.rs`; free-form shell or logic-bearing templates
+must not be registered. New capabilities require implementation, schema, golden
+update, and tests in the same change.

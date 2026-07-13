@@ -521,7 +521,7 @@ fn port_script_step_plan(phase_prompt: &str, goal: &str) -> ProfileDeterministic
                     instruction: "Verify package scripts preserve the requested Next.js port."
                         .to_string(),
                     expected_paths: Vec::new(),
-                    verify: package_script_port_verify_commands(port),
+                    verify: vec![catalog_package_json_port_script_verify_command(port)],
                 },
             ],
         },
@@ -578,6 +578,17 @@ fn package_script_port_verify_commands(port: u16) -> Vec<String> {
         package_script_required_port_verify_command("dev", port),
         package_script_optional_port_verify_command("start", port),
     ]
+}
+
+fn catalog_package_json_port_script_verify_command(port: u16) -> String {
+    let mut params = toml::value::Table::new();
+    params.insert("port".to_string(), toml::Value::Integer(i64::from(port)));
+    match crate::planner::capability_catalog::resolve("package_json_port_script", &params)
+        .expect("package_json_port_script capability must resolve")
+    {
+        crate::planner::capability_catalog::ResolvedCapability::ShellCheck(command) => command,
+        other => panic!("package_json_port_script resolved to {other:?}"),
+    }
 }
 
 fn package_script_required_port_verify_command(script: &str, port: u16) -> String {
