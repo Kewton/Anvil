@@ -84,7 +84,9 @@ pub fn runtime_contract() -> String {
 pub fn required_artifacts() -> Vec<String> {
     vec![
         "pipeline/main.py".to_string(),
+        "output/inspection.json".to_string(),
         "output/results.json".to_string(),
+        "output/report.md".to_string(),
     ]
 }
 
