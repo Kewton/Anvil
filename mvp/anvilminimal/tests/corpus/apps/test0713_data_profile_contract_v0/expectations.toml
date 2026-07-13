@@ -1,0 +1,52 @@
+case_id = "test0713_data_profile_contract_v0"
+source = "fixed data-profile contract v0 conformance fixtures"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["data_profile", "reconciliation", "claims_binding", "rerun_consistency"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/full.jsonl = [
+  "\"case\":\"full\"",
+  "\"expected_assurance\":\"full\"",
+  "input/source.csv",
+  "pipeline/main.py",
+  "output/results.json",
+  "output/report.md",
+  "missing amount",
+  "Total {total:.1f}"
+]
+fixtures/fabricated-claim.jsonl = [
+  "\"case\":\"fabricated_claim\"",
+  "\"expected_assurance\":\"partial\"",
+  "Fabricated 999",
+  "data_claims_binding"
+]
+fixtures/unaccounted-exclusion.jsonl = [
+  "\"case\":\"unaccounted_exclusion\"",
+  "\"expected_assurance\":\"failed\"",
+  "excluded': []",
+  "data_reconciliation"
+]
+fixtures/time-dependent.jsonl = [
+  "\"case\":\"time_dependent\"",
+  "\"expected_assurance\":\"failed\"",
+  "time.time_ns()",
+  "data_rerun_consistency"
+]
