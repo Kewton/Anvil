@@ -34,7 +34,14 @@ fixtures/capability-catalog-contract.jsonl = [
   "\"type\":\"[path]\"",
   "\"id\":\"browser_readiness\"",
   "\"kind\":\"Probe\"",
-  "\"resolve_status\":\"unimplemented\""
+  "\"resolve_status\":\"unimplemented\"",
+  "\"id\":\"data_results_schema\"",
+  "\"id\":\"data_reconciliation\"",
+  "\"id\":\"data_claims_binding\"",
+  "\"id\":\"pipeline_probe\"",
+  "\"name\":\"timeout_seconds\"",
+  "\"id\":\"data_rerun_consistency\"",
+  "\"resolve_status\":\"typed\""
 ]
 fixtures/nextjs-port-script-catalog-routing.jsonl = [
   "\"event\":\"deterministic_step_plan_catalog_routing\"",

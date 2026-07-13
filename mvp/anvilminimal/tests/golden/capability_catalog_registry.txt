@@ -1,0 +1,22 @@
+package_json_port_script | ShellCheck
+  - port: u16 required default=-
+package_json_script_matches | ShellCheck
+  - pattern: string required default=-
+hook_attribute_present | ShellCheck
+  - attribute: enum[action,state] required default=-
+  - value: string required default=-
+  - path: path required default=-
+next_build_verify | ShellCheck
+scaffold_files_present | InternalCheck
+  - files: [path] required default=-
+browser_readiness | Probe
+browser_interaction | Probe
+data_results_schema | InternalCheck
+data_reconciliation | InternalCheck
+data_claims_binding | InternalCheck
+pipeline_probe | Probe
+  - entry: path required default=-
+  - timeout_seconds: u16 required default=-
+data_rerun_consistency | Probe
+  - entry: path required default=-
+  - timeout_seconds: u16 required default=-

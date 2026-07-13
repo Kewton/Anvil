@@ -6,6 +6,9 @@ use toml::value::Table;
 use crate::planner::verify;
 use crate::tools::path_guard::validate_workspace_relative;
 
+mod data;
+pub use data::{DataInternalCheck, ProbeCapability};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityKind {
     ShellCheck,
@@ -64,11 +67,13 @@ pub struct CapabilitySpec {
 pub enum ResolvedCapability {
     ShellCheck(String),
     Internal(InternalCapability),
+    Probe(ProbeCapability),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InternalCapability {
     ScaffoldFilesPresent { files: Vec<String> },
+    Data(DataInternalCheck),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +181,7 @@ static SCAFFOLD_FILES_PARAMS: [ParamSpec; 1] = [ParamSpec {
     default: None,
 }];
 
-static REGISTRY: [CapabilitySpec; 7] = [
+static BASE_REGISTRY: [CapabilitySpec; 7] = [
     CapabilitySpec {
         id: "package_json_port_script",
         kind: CapabilityKind::ShellCheck,
@@ -222,7 +227,7 @@ static REGISTRY: [CapabilitySpec; 7] = [
 ];
 
 pub fn registry() -> &'static [CapabilitySpec] {
-    &REGISTRY
+    data::combined_registry(&BASE_REGISTRY)
 }
 
 pub fn resolve(id: &str, params: &Table) -> Result<ResolvedCapability, CatalogError> {
@@ -271,7 +276,7 @@ pub fn resolve(id: &str, params: &Table) -> Result<ResolvedCapability, CatalogEr
         "browser_readiness" | "browser_interaction" => {
             Err(CatalogError::ProbeBindingUnimplemented { id: id.to_string() })
         }
-        _ => unreachable!("registry id without resolver: {}", spec.id),
+        _ => data::resolve(spec, params),
     }
 }
 
@@ -415,21 +420,7 @@ mod tests {
     fn registry_contract_snapshot_is_stable() {
         assert_eq!(
             registry_contract_snapshot(),
-            "\
-package_json_port_script | ShellCheck
-  - port: u16 required default=-
-package_json_script_matches | ShellCheck
-  - pattern: string required default=-
-hook_attribute_present | ShellCheck
-  - attribute: enum[action,state] required default=-
-  - value: string required default=-
-  - path: path required default=-
-next_build_verify | ShellCheck
-scaffold_files_present | InternalCheck
-  - files: [path] required default=-
-browser_readiness | Probe
-browser_interaction | Probe
-"
+            include_str!("../../tests/golden/capability_catalog_registry.txt")
         );
     }
 

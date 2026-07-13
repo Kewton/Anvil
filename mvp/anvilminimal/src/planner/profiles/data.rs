@@ -4,6 +4,8 @@ use std::path::Path;
 
 use crate::planner::verify::VerificationReport;
 
+pub mod checks;
+mod claims_binding;
 pub mod results_schema;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
