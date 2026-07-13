@@ -17,6 +17,7 @@ pub(crate) fn maybe_read_only_stagnation_feedback(
     profile: &str,
     user_prompt: &str,
     read_only_streak: usize,
+    no_progress_streak: usize,
     options: &RunSessionOptions,
     write_required_state: &mut WriteRequiredState,
     pending_error_context: &RunSessionErrorContext,
@@ -36,8 +37,9 @@ pub(crate) fn maybe_read_only_stagnation_feedback(
             }
         }
     }
-    let decision = super::anchor_stagnation_interlock::read_only_stagnation_decision(
+    let decision = super::anchor_stagnation_interlock::stagnation_decision(
         read_only_streak,
+        no_progress_streak,
         anchor_failure,
     )?;
     let stage = decision.stage;

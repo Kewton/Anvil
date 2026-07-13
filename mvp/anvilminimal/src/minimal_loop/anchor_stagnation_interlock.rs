@@ -69,14 +69,24 @@ impl AnchorStagnationDecision {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read_only_stagnation_decision(
     read_only_streak: usize,
+    anchor_failure: Option<EditAnchorFailureSummary>,
+) -> Option<AnchorStagnationDecision> {
+    stagnation_decision(read_only_streak, 0, anchor_failure)
+}
+
+pub(crate) fn stagnation_decision(
+    read_only_streak: usize,
+    no_progress_streak: usize,
     anchor_failure: Option<EditAnchorFailureSummary>,
 ) -> Option<AnchorStagnationDecision> {
     let anchor_failure = anchor_failure
         .filter(|failure| failure.failure_count > 0 && !failure.path.trim().is_empty());
     let pressure_state = transition(PressureInputs {
         read_only_streak,
+        no_progress_streak,
         anchor_failures: anchor_failure
             .as_ref()
             .map(|failure| failure.failure_count)

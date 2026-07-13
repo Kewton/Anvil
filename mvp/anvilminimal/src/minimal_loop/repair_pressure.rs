@@ -190,7 +190,11 @@ pub(crate) fn transition(inputs: PressureInputs) -> PressureState {
         };
     }
 
-    let feedback_level = if inputs.write_required_active {
+    let no_progress_requires_write = inputs.no_progress_streak > 0
+        && (inputs.no_progress_streak >= NO_PROGRESS_FEEDBACK_LIMIT
+            || effective_read_only_streak.saturating_add(inputs.no_progress_streak)
+                >= READ_ONLY_STAGNATION_WRITE_REQUIRED_THRESHOLD);
+    let feedback_level = if inputs.write_required_active || no_progress_requires_write {
         Some(PressureLevel::WriteRequired)
     } else {
         read_only_feedback_level(
@@ -223,8 +227,8 @@ pub(crate) fn transition(inputs: PressureInputs) -> PressureState {
         (inputs.selected_targets, inputs.selection_reason)
     };
 
-    // NOTE: The current no-progress path does not raise write pressure. See
-    // docs/integration-notes.md; this table intentionally preserves that gap.
+    // NOTE: T26b2 closes the former no-progress non-promotion entry; see
+    // docs/integration-notes.md for the bounded scope and regression evidence.
     PressureState {
         level,
         feedback_level,
@@ -433,25 +437,34 @@ mod tests {
     }
 
     #[test]
-    fn no_progress_is_recorded_but_does_not_raise_write_pressure() {
-        let state = transition(PressureInputs {
-            no_progress_streak: 4,
-            remaining_budget: 0,
-            ..PressureInputs::default()
-        });
-        assert_eq!(state.level, PressureLevel::Normal);
-        assert_eq!(state.counters.no_progress_streak, 4);
-        assert_eq!(state.terminal_reason, None);
-
-        let terminal = exhaustion_reason(&PressureInputs {
-            no_progress_streak: 4,
-            ..PressureInputs::default()
-        });
-        assert_eq!(terminal, Some(PressureTerminalReason::NoProgressRecorded));
+    fn no_progress_promotes_to_write_pressure_at_limit_or_preadvanced_threshold() {
         assert_eq!(
-            terminal.unwrap().as_str(),
-            "model_stagnation:no_progress_recorded"
+            transition(PressureInputs {
+                no_progress_streak: NO_PROGRESS_FEEDBACK_LIMIT - 1,
+                ..PressureInputs::default()
+            })
+            .level,
+            PressureLevel::Normal
         );
+        let state = transition(PressureInputs {
+            no_progress_streak: NO_PROGRESS_FEEDBACK_LIMIT,
+            ..PressureInputs::default()
+        });
+        // T26b intentionally closes the previously preserved non-promotion gap.
+        assert_eq!(state.level, PressureLevel::WriteRequired);
+        assert_eq!(
+            state.counters.no_progress_streak,
+            NO_PROGRESS_FEEDBACK_LIMIT
+        );
+        assert_eq!(state.terminal_reason, None);
+        let preadvanced = transition(PressureInputs {
+            no_progress_streak: 1,
+            remaining_budget: 2,
+            carried: Some(CarriedPressure::default()),
+            ..PressureInputs::default()
+        });
+        assert!(preadvanced.seed.pre_advanced);
+        assert_eq!(preadvanced.level, PressureLevel::WriteRequired);
     }
 
     #[test]

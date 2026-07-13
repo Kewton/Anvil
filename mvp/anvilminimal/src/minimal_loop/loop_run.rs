@@ -48,8 +48,8 @@ use super::reachability::{
     reachability_recovery_reason,
 };
 use super::repair_pressure::{
-    NO_PROGRESS_FEEDBACK_LIMIT, NO_PROGRESS_STAGNATION_REASON, PressureInputs, PressureState,
-    PressureTerminalReason, READ_ONLY_STAGNATION_REASON, transition,
+    NO_PROGRESS_FEEDBACK_LIMIT, NO_PROGRESS_STAGNATION_REASON, PressureInputs, PressureLevel,
+    PressureState, PressureTerminalReason, READ_ONLY_STAGNATION_REASON, transition,
 };
 use super::repair_progress::{
     RepairProgressVerdict, VerificationSignature, classify_repair_progress,
@@ -1177,6 +1177,36 @@ pub(crate) fn run_session_with_outcome_with_options(
         let remaining_iterations = iteration_limit.saturating_sub(iterations_used);
         pressure_inputs.remaining_budget = remaining_iterations;
         pressure_state = transition(pressure_inputs.clone());
+        if options.scope == RunSessionScope::PlanRunStep
+            && !implement_step(&options)
+            && pressure_state.feedback_level == Some(PressureLevel::WriteRequired)
+            && write_required_state.selected_targets().is_empty()
+        {
+            let anchor_failure = stagnation_carryover::strongest_anchor_failure(
+                edit_anchor_recovery_state.strongest_failure(),
+                escalation_carryover,
+            );
+            if let Some(feedback) =
+                super::read_only_stagnation_feedback::maybe_read_only_stagnation_feedback(
+                    config.eval_events_path.as_deref(),
+                    &config.workspace_root,
+                    &config.profile,
+                    user_prompt,
+                    pressure_state.read_only_streak(),
+                    pressure_inputs.no_progress_streak,
+                    &options,
+                    &mut write_required_state,
+                    &verify_repair_state.pending_error_context,
+                    &verify_repair_state.changed_paths_at_failure,
+                    &required_paths,
+                    &changed_paths,
+                    anchor_failure,
+                )
+            {
+                last_blocking_reason = Some(READ_ONLY_STAGNATION_REASON.to_string());
+                pending_feedback = Some(feedback);
+            }
+        }
         if step_started.elapsed() >= step_wall_clock_cap {
             let dominant = dominant_time_sink_text(&time_sinks);
             eval_events::emit(
@@ -1998,6 +2028,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                     if matches!(call.name.as_str(), "Write" | "Edit") {
                         write_or_edit_seen = true;
                         pressure_inputs.read_only_streak = 0;
+                        pressure_inputs.no_progress_streak = 0;
                         pressure_inputs.anchor_failures = 0;
                         pressure_inputs.anchor_target = None;
                         pressure_state = transition(pressure_inputs.clone());
@@ -2205,6 +2236,7 @@ pub(crate) fn run_session_with_outcome_with_options(
         if batch_reduced_missing_paths {
             artifact_non_edit_streak = 0;
             pressure_inputs.read_only_streak = 0;
+            pressure_inputs.no_progress_streak = 0;
             pressure_inputs.anchor_failures = 0;
             pressure_inputs.anchor_target = None;
             pressure_state = transition(pressure_inputs.clone());
@@ -2226,6 +2258,14 @@ pub(crate) fn run_session_with_outcome_with_options(
             } else if batch_non_edit_tools > 0 {
                 artifact_recovery_state.record_action("non_edit_tool");
             }
+        }
+        if options.scope == RunSessionScope::PlanRunStep
+            && !implement_step(&options)
+            && !batch_had_edit
+            && !batch_had_recoverable_tool_error
+        {
+            pressure_inputs.no_progress_streak =
+                pressure_inputs.no_progress_streak.saturating_add(1);
         }
         if implement_step(&options)
             && batch_all_read_only_tools
@@ -2258,6 +2298,7 @@ pub(crate) fn run_session_with_outcome_with_options(
                         &config.profile,
                         user_prompt,
                         pressure_state.read_only_streak(),
+                        pressure_inputs.no_progress_streak,
                         &options,
                         &mut write_required_state,
                         &verify_repair_state.pending_error_context,

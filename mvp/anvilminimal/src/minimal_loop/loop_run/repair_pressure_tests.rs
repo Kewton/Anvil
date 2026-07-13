@@ -1074,4 +1074,91 @@ export default function Page(){
                 })
         }));
     }
+
+    #[test]
+    fn compile_repair_no_progress_promotes_to_write_required() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/app")).unwrap();
+        std::fs::write(dir.path().join("src/app/page.tsx"), "const broken = initGame;\n")
+            .unwrap();
+        let events = dir.path().join("events.jsonl");
+        let mut cfg = config(dir.path().to_path_buf());
+        cfg.eval_events_path = Some(events.clone());
+        cfg.max_iterations = 3;
+        let mut fake = Fake::new(vec![
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Read",
+                    json!({"path":"src/app/page.tsx"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Read",
+                    json!({"path":"src/app/page.tsx"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+            Ok(AssistantReply {
+                content: String::new(),
+                tool_calls: vec![ToolCall::new(
+                    "Write",
+                    json!({"path":"src/app/page.tsx","content":"const ready = true;\n"}),
+                )],
+                prompt_tokens: None,
+                completion_tokens: None,
+            }),
+        ]);
+        let mut session = SessionSnapshot::new();
+        let options = stagnation_carryover::attach_to_options(
+            RunSessionOptions::plan_step(RunSessionStepKind::Verify)
+                .with_path_fallback_candidates(vec!["src/app/page.tsx".to_string()])
+                .with_required_mutation_before_short_circuit(true),
+            EscalationCarryoverHandle::new(),
+        );
+
+        let outcome = run_session_with_outcome_with_options(
+            &mut fake,
+            &mut session,
+            "Repair step `verify-build`: implementation_compile_error: Cannot find name `initGame`.",
+            &["src/app/page.tsx".to_string()],
+            &cfg,
+            &NOOP_UI,
+            options,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.stop_reason,
+            RunStopReason::RequiredArtifactsSatisfiedAfterTool
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/app/page.tsx")).unwrap(),
+            "const ready = true;\n"
+        );
+        let events = event_values(&events);
+        assert!(events.iter().any(|event| {
+            event["event"] == "escalation_carryover"
+                && event["pre_advanced"] == true
+                && event["initial_read_only_streak"] == 6
+        }));
+        assert!(events.iter().any(|event| {
+            event["event"] == "read_only_stagnation_feedback"
+                && event["stage"] == "write_required"
+                && event["selected_targets"] == json!(["src/app/page.tsx"])
+        }));
+        assert!(events.iter().any(|event| {
+            event["event"] == "read_only_tool_rejected"
+                && event["stage"] == "write_required"
+                && event["tool_name"] == "Read"
+        }));
+        assert!(!events.iter().any(|event| {
+            event["reason"] == "model_stagnation:no_progress_recorded"
+        }));
+    }
 }

@@ -1,0 +1,41 @@
+case_id = "test0713_no_progress_write_required"
+source = "uat-test0712-g-002 gate #2 #5 compile-repair no-progress promotion regression"
+required_paths = []
+verify_commands = []
+required_capabilities = []
+required_evidence = []
+required_obligations = []
+deferred_verify_requirements = []
+evidence_hint_tokens = ["no_progress", "write_required", "implementation_compile_error", "initGame"]
+
+[route_closure]
+include = []
+exclude = []
+
+[weak_evidence]
+contains = []
+
+[diagnostics]
+contains = []
+
+[compile]
+expect = "not_checked"
+
+[fixture_contains]
+fixtures/compile-repair-no-progress.jsonl = [
+  "uat-test0712-g-002/#5",
+  "model_stagnation:no_progress_recorded",
+  "implementation_compile_error",
+  "Cannot find name 'initGame'",
+  "\"event\":\"escalation_carryover\"",
+  "\"initial_read_only_streak\":6",
+  "\"pre_advanced\":true",
+  "\"event\":\"read_only_stagnation_feedback\"",
+  "\"stage\":\"write_required\"",
+  "\"selected_targets\":[\"src/app/page.tsx\"]",
+  "\"event\":\"read_only_tool_rejected\"",
+  "\"tool_name\":\"Read\"",
+  "\"event\":\"tool_execute\"",
+  "\"name\":\"Write\"",
+  "\"no_progress_recorded\":0"
+]

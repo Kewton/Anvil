@@ -6,14 +6,16 @@ The following pre-existing gaps were observed while consolidating repair
 pressure. They are recorded here because this integration preserves behavior
 and does not change thresholds, events, payloads, or terminal reasons.
 
-### No-Progress Does Not Raise Write Pressure [QUEUED]
+### No-Progress Does Not Raise Write Pressure [CLOSED]
 
-The no-progress streak drives `no_progress_feedback` and the
-`model_stagnation:no_progress_recorded` terminal path, but it does not activate
-`write_required`. Repeated no-progress turns can therefore terminate without a
-write-required intervention. The state-machine transition table and unit test
-preserve this gap explicitly. Closing it requires a separate measured task with
-a non-regression gate.
+The integration originally preserved a gap where the no-progress streak drove
+`no_progress_feedback` and `model_stagnation:no_progress_recorded` without
+activating `write_required`. T26b2 closes it: the feedback limit now promotes
+directly, while carried or short-budget read-only pressure combines with
+no-progress turns to reach the same write-required threshold earlier. Compile
+repair non-edit turns use the existing target selection, write enforcement,
+carryover, and exhaustion paths. The gate #2 #5 shape is fixed in corpus and
+loop-level regression tests.
 
 ### Dependency Setup Can Stall Network-Restricted Tests [OPEN (low priority)]
 
@@ -77,10 +79,12 @@ command passed when run with local-port permission, without a code change.
 Gate後タスクT26、最優先。`catch_unwind` でpanicを終端イベントとrecovery
 noteへ変換する境界を追加し、fault-injectionテストを完了条件に含む。
 
-### No-Progress to Write-Required Promotion [QUEUED]
+### No-Progress to Write-Required Promotion [CLOSED]
 
-`repair_pressure.rs` の遷移表1エントリ変更＋UAT計測で閉鎖する。gate #2の
-#5（コンパイル修復のno_progress枯渇）が受益クラス。
+T26b2で`repair_pressure.rs`の遷移表を変更し、no-progress上限または
+持ち越し・短予算による前倒し圧力との合算で`write_required`へ昇圧するよう
+閉鎖した。gate #2の#5（コンパイル修復のno_progress枯渇）をcorpusと
+loop-level回帰テストに固定した。バッチ検証では同クラスの件数を継続計測する。
 
 ### Undiagnosed package.json Observation [CLOSED]
 
