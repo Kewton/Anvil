@@ -80,23 +80,35 @@ The verified `nextjs` profile scenario matrix is Space Invaders / Breakout / Qui
 
 `challenge_or_adversary` is the general category for opposing elements, time pressure, or other sources of difficulty, while `failure_or_collision` is the general category for failure conditions; neither category is intrinsically game-specific. Contract inference scopes whether each category is required from the goal, and scenario-specific repair guidance must follow that inferred contract rather than the category name alone.
 
-## Measured capability bands (nextjs x create, local tier)
+## Measured capability bands (nextjs × create)
 
-The Phase A local-tier band measurement covers the post-hardening window from
+The Phase A band measurement covers the post-hardening window from
 `uat-test0711-bs-003` through `uat-test0713-g-001`, including
-`uat-test0713-28-001`. The target tier is planner
-`qwen3.6:27b-coding-nvfp4` with executors
-`qwen3.6:35b-a3b-coding-nvfp4` and `gemma4:31b-cloud`; the all-window
+`uat-test0713-28-001`. The target planner is
+`qwen3.6:27b-coding-nvfp4`; measured executors are
+`qwen3.6:35b-a3b-coding-nvfp4` and `gemma4:31b-cloud`. The all-window
 denominator is 78 Next.js create records. Of those records, 74 used the target
 qwen27 planner and four Space control rows used `gemma4:31b-cloud` as planner;
 the controls are retained because the band rule counts every run in the
 measurement window rather than selecting favorable rows.
 
-| scenario family | full rate | denominator | measured characteristic |
-|---|---:|---:|---|
-| Quiz | 88% | 23/26 | Most stable row. It is the non-game scenario and validates that browser-interactive contracts are not tied to game vocabulary. |
-| Breakout | 29% | 5/17 | Middle band. Full success recurs, but the honest non-full frontier remains high across partial, incomplete, and failed terminal states. |
-| Space | 9% | 3/35 | Hardest row. Restart/recoverable-state evidence is the local-model capability wall accepted on 2026-07-13; cloud follow-up is recommended. Full is not zero: `gemma4:31b-cloud` produced 2/8 Space full runs, while qwen35 produced 1/27. |
+| scenario family | executor | full | n | full rate | measured characteristic |
+|---|---|---:|---:|---:|---|
+| Quiz | `gemma4:31b-cloud` | 12 | 14 | 86% | Most stable row; validates non-game browser-interactive contracts. |
+| Quiz | `qwen3.6:35b-a3b-coding-nvfp4` | 11 | 12 | 92% | Fully local qwen35 executor is effectively tied with gemma31 here. |
+| Breakout | `gemma4:31b-cloud` | 3 | 6 | 50% n<10 | Middle band; cloud executor improves full recurrence. |
+| Breakout | `qwen3.6:35b-a3b-coding-nvfp4` | 2 | 11 | 18% | Fully local qwen35 retains a high honest non-full frontier. |
+| Space | `gemma4:31b-cloud` | 2 | 8 | 25% n<10 | Hardest row; full is not zero and cloud executor is the practical follow-up path. |
+| Space | `qwen3.6:35b-a3b-coding-nvfp4` | 1 | 27 | 4% | Fully local 20GB-class row; restart/recoverable-state evidence is the accepted capability wall. |
+
+`gemma4:31b-cloud` is a cloud-delivered model. For a fully local 20GB-class
+configuration, use the `qwen3.6:35b-a3b-coding-nvfp4` rows.
+The executor full-rate gradient widens with scenario complexity: Quiz is nearly
+tied, Breakout is about 2.7x, and Space is about 6x.
+Operational recommendation for complex state-machine scenarios at Space scale:
+use the gemma31 executor and recover failed runs with recovery YAML as cloud
+follow-up. If a fully local requirement is strict, plan around the 4% Space
+band.
 
 Full-run elapsed time across the measured window was 5m02s minimum, 7m02s
 median, and 12m53s maximum. Scenario medians were Space 6m25s, Breakout 7m49s,
